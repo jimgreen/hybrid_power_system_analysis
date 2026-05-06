@@ -36,9 +36,73 @@
 此方案满足用户所有要求：不引入最小二乘法（数学上等价但实现为线性系统），不做分组和分段求解，不假设连支电流为零，且能处理任意零阻抗支路拓扑。
 """
 
+import importlib
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix
-from scipy.sparse.linalg import spsolve
+try:
+    from scipy.sparse import coo_matrix, csr_matrix
+    from scipy.sparse.linalg import spsolve
+    SCIPY_AVAILABLE = True
+except ModuleNotFoundError:
+    SCIPY_AVAILABLE = False
+
+    class _DenseCSR:
+        """Small numpy-backed scipy sparse subset used when scipy is unavailable."""
+
+        def __init__(self, arg, shape=None):
+            if isinstance(arg, tuple):
+                data, (rows, cols) = arg
+                if shape is None:
+                    raise ValueError("shape is required for coordinate matrix input")
+                dtype = np.asarray(data).dtype if len(data) else float
+                self._dense = np.zeros(shape, dtype=dtype)
+                for value, row, col in zip(data, rows, cols):
+                    self._dense[int(row), int(col)] += value
+            else:
+                self._dense = np.asarray(arg)
+            self.shape = self._dense.shape
+
+        def dot(self, value):
+            return self._dense.dot(value)
+
+        def multiply(self, value):
+            return _DenseCSR(self._dense * np.asarray(value), shape=self.shape)
+
+        def setdiag(self, values):
+            diag_len = min(self._dense.shape)
+            self._dense[np.arange(diag_len), np.arange(diag_len)] = np.asarray(values)[:diag_len]
+
+        def diagonal(self):
+            return np.diag(self._dense)
+
+        def sum_duplicates(self):
+            return None
+
+        def tocoo(self):
+            rows, cols = np.nonzero(self._dense)
+            coo = _DenseCSR(self._dense, shape=self.shape)
+            coo.row = rows.astype(np.int32)
+            coo.col = cols.astype(np.int32)
+            coo.data = self._dense[rows, cols]
+            return coo
+
+        def tocsr(self):
+            return self
+
+        def toarray(self):
+            return self._dense.copy()
+
+        def __getitem__(self, key):
+            return _DenseCSR(self._dense[key], shape=np.asarray(self._dense[key]).shape)
+
+    coo_matrix = _DenseCSR
+    csr_matrix = _DenseCSR
+
+    def spsolve(matrix, rhs):
+        dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+        try:
+            return np.linalg.solve(dense, rhs)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(dense, rhs, rcond=None)[0]
 from collections import deque
 from pathlib import Path
 import sys
@@ -48,6 +112,64 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
+
+
+_OPTIONAL_SPARSE_SOLVERS = {}
+_OPTIONAL_SPARSE_MISSING = set()
+_OPTIONAL_SOLVER_CANDIDATES = {
+    "pypardiso": ("pypardiso", "spsolve"),
+    "umfpack": ("scikits.umfpack", "spsolve"),
+    "klu": ("sksparse.klu", "spsolve"),
+    "klu_alt": ("klu", "solve"),
+}
+
+
+def _load_named_sparse_solver(solver_name):
+    """Return a named optional sparse solver when installed."""
+    solver_name = str(solver_name).strip().lower()
+    if solver_name in _OPTIONAL_SPARSE_SOLVERS:
+        return _OPTIONAL_SPARSE_SOLVERS[solver_name]
+    if solver_name in _OPTIONAL_SPARSE_MISSING:
+        return None
+
+    candidate_names = ("umfpack", "klu", "klu_alt") if solver_name == "auto" else (solver_name,)
+    for candidate_name in candidate_names:
+        module_name, func_name = _OPTIONAL_SOLVER_CANDIDATES.get(candidate_name, (None, None))
+        if module_name is None:
+            continue
+        try:
+            if importlib.util.find_spec(module_name) is None:
+                continue
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+        try:
+            module = importlib.import_module(module_name)
+            solver = getattr(module, func_name, None)
+        except Exception:
+            continue
+        if solver is not None:
+            _OPTIONAL_SPARSE_SOLVERS[solver_name] = solver
+            return solver
+
+    _OPTIONAL_SPARSE_MISSING.add(solver_name)
+    return None
+
+
+def solve_sparse_system(matrix, rhs, solver_name="scipy"):
+    """Solve a sparse linear system, preferring optional high-performance bindings."""
+    solver_name = str(solver_name or "scipy").strip().lower()
+    if solver_name in {"scipy", "superlu", "default"}:
+        return spsolve(matrix, rhs)
+
+    if SCIPY_AVAILABLE:
+        solver = _load_named_sparse_solver(solver_name)
+        if solver is not None:
+            try:
+                return solver(matrix, rhs)
+            except Exception:
+                _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
+                _OPTIONAL_SPARSE_MISSING.add(solver_name)
+    return spsolve(matrix, rhs)
 
 
 def find_spanning_tree_edges(edges, n_nodes):
@@ -78,10 +200,12 @@ class DCPowerFlowCalc:
         model,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: PowerFlowParameters = None,
+        linear_solver: str = "scipy",
     ):
         self.model = model
         self.params = parameters or load_lf_parameters(parameter_file)
         self.runtime_params = self.params
+        self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -386,13 +510,44 @@ class DCPowerFlowCalc:
 
         return G, x
 
-    def get_jacobi(self, G, x):
-        """组装 DC Newton 方程的稀疏 Jacobian。"""
+    def _eval_newton_terms(self, G, x):
+        """Evaluate DC Newton quantities shared by residual and Jacobian."""
         V = x[:self.N]
         phi = x[self.N:self.N + self.N_phi]
         Pdc = x[self.N + self.N_phi:self.N + self.N_phi + self.N_dcdc * 2] if self.N_dcdc > 0 else np.array([])
-
         GV = G.dot(V)
+        terms = {
+            "V": V,
+            "phi": phi,
+            "Pdc": Pdc,
+            "GV": GV,
+        }
+        if self.zero_i.size:
+            terms["zero_current"] = phi[self.zero_phi_a] - phi[self.zero_phi_b]
+        else:
+            terms["zero_current"] = np.array([], dtype=np.float64)
+        if self.N_dcdc:
+            vi = V[self.dcdc_i]
+            vj = V[self.dcdc_j]
+            pi = Pdc[0::2]
+            pj = Pdc[1::2]
+            terms.update(
+                dcdc_vi=vi,
+                dcdc_vj=vj,
+                dcdc_pi=pi,
+                dcdc_pj=pj,
+                dcdc_vi2=vi * vi,
+                dcdc_vj2=vj * vj,
+                dcdc_pi2=pi * pi,
+                dcdc_pj2=pj * pj,
+            )
+        return terms
+
+    def _get_jacobi_from_terms(self, G, x, terms):
+        """组装 DC Newton 方程的稀疏 Jacobian。"""
+        V = terms["V"]
+        GV = terms["GV"]
+        Pdc = terms["Pdc"]
         rows_parts = []
         cols_parts = []
         data_parts = []
@@ -408,7 +563,7 @@ class DCPowerFlowCalc:
 
         # 8.2 零阻抗支路功率注入对 V/phi 的偏导
         if self.zero_i.size:
-            current = phi[self.zero_phi_a] - phi[self.zero_phi_b]
+            current = terms["zero_current"]
 
             eq_i = self.node_eq[self.zero_i]
             mask_i = eq_i >= 0
@@ -513,14 +668,14 @@ class DCPowerFlowCalc:
                     ).ravel()
                 )
 
-            vi = V[self.dcdc_i]
-            vj = V[self.dcdc_j]
-            pi = Pdc[0::2]
-            pj = Pdc[1::2]
-            vi2 = vi * vi
-            vj2 = vj * vj
-            pi2 = pi * pi
-            pj2 = pj * pj
+            vi = terms["dcdc_vi"]
+            vj = terms["dcdc_vj"]
+            pi = terms["dcdc_pi"]
+            pj = terms["dcdc_pj"]
+            vi2 = terms["dcdc_vi2"]
+            vj2 = terms["dcdc_vj2"]
+            pi2 = terms["dcdc_pi2"]
+            pj2 = terms["dcdc_pj2"]
             loss_data = np.empty(self.N_dcdc * 4, dtype=np.float64)
             loss_data[0::4] = vi2 * vj2 - 2.0 * self.dcdc_r1 * pi * vj2
             loss_data[1::4] = vi2 * vj2 - 2.0 * self.dcdc_r2 * pj * vi2
@@ -540,16 +695,21 @@ class DCPowerFlowCalc:
 
         return coo_matrix((J_data, (J_rows, J_cols)), shape=(self.total_eq, self.total_vars)).tocsr()
 
-    def get_f(self, x):
-        """计算 DC 残差：节点功率平衡、参考电压、零阻抗约束和 DCDC 约束。"""
-        V = x[:self.N]
-        phi = x[self.N:self.N + self.N_phi]
-        Pdc = x[self.N + self.N_phi:self.N + self.N_phi + self.N_dcdc * 2] if self.N_dcdc > 0 else np.array([])
+    def get_jacobi(self, G, x, terms=None):
+        """Public Jacobian API retained for tests and callers."""
+        terms = self._eval_newton_terms(G, x) if terms is None else terms
+        return self._get_jacobi_from_terms(G, x, terms)
 
-        P_inj = V * self.G.dot(V) + self.I_shunt * V - self.P_const
+    def _get_f_from_terms(self, x, terms):
+        """计算 DC 残差：节点功率平衡、参考电压、零阻抗约束和 DCDC 约束。"""
+        V = terms["V"]
+        phi = terms["phi"]
+        Pdc = terms["Pdc"]
+
+        P_inj = V * terms["GV"] + self.I_shunt * V - self.P_const
 
         if self.zero_i.size:
-            current = phi[self.zero_phi_a] - phi[self.zero_phi_b]
+            current = terms["zero_current"]
             np.add.at(P_inj, self.zero_i, V[self.zero_i] * current)
             np.add.at(P_inj, self.zero_j, -V[self.zero_j] * current)
 
@@ -574,8 +734,8 @@ class DCPowerFlowCalc:
         if self.N_dcdc:
             p_from = Pdc[0::2]
             p_to = Pdc[1::2]
-            vi = V[self.dcdc_i]
-            vj = V[self.dcdc_j]
+            vi = terms["dcdc_vi"]
+            vj = terms["dcdc_vj"]
             ctrl_values = np.empty(self.N_dcdc, dtype=np.float64)
             ctrl_values[self.dcdc_ctrl_p_mask] = p_from[self.dcdc_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_ctrl_p_mask]
             ctrl_values[self.dcdc_ctrl_v_mask] = vi[self.dcdc_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_ctrl_v_mask]
@@ -585,8 +745,8 @@ class DCPowerFlowCalc:
             )
             F[self.dcdc_eq_ctrl] = ctrl_values
 
-            vi2 = vi * vi
-            vj2 = vj * vj
+            vi2 = terms["dcdc_vi2"]
+            vj2 = terms["dcdc_vj2"]
             # 第二条方程保证两端端口功率与 r1/r2 损耗模型一致。
             F[self.dcdc_eq_loss] = (
                 vi2 * vj2 * (p_from + p_to)
@@ -595,6 +755,11 @@ class DCPowerFlowCalc:
             )
 
         return F
+
+    def get_f(self, x, terms=None):
+        """Public residual API retained for tests and callers."""
+        terms = self._eval_newton_terms(self.G, x) if terms is None else terms
+        return self._get_f_from_terms(x, terms)
 
     def update_lf_info(self, x):
         """将求解后的电压、电流和功率写回 DC 模型对象。"""
@@ -694,6 +859,13 @@ class DCPowerFlowCalc:
                 gen.p = share
                 gen.current = gen.p / V_final[node] if abs(V_final[node]) > self.runtime_params.min_voltage else 0.0
 
+    def _build_newton_system(self, G, x):
+        """Compute residual and Jacobian together for one DC Newton iteration."""
+        terms = self._eval_newton_terms(G, x)
+        F = self._get_f_from_terms(x, terms)
+        J = self._get_jacobi_from_terms(G, x, terms)
+        return F, J
+
 
     def run(
         self,
@@ -719,7 +891,7 @@ class DCPowerFlowCalc:
 
         # ---------- 7. 牛顿-拉夫逊迭代 ----------
         for it in range(params.max_iter):
-            F = self.get_f(x)
+            F, J = self._build_newton_system(G, x)
 
             # print("F", F)
             # 收敛检查
@@ -742,10 +914,8 @@ class DCPowerFlowCalc:
                 self.converged = False
                 break
 
-            J = self.get_jacobi(G,x)
-
             try:
-                delta = spsolve(J, -F)
+                delta = solve_sparse_system(J, -F, self.linear_solver)
             except Exception as e:
                 if self.verbose:
                     print(f"\n线性方程组求解失败: {e}")

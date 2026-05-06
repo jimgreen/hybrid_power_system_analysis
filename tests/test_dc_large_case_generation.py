@@ -6,6 +6,87 @@ from pathlib import Path
 
 
 class DCLargeCaseGenerationTest(unittest.TestCase):
+    def test_dc_solver_accepts_optional_solver_name_and_falls_back(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_model import DCPowerNetwork
+
+        network = DCPowerNetwork()
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.topo()
+        calc = DCPowerFlowCalc(network, linear_solver="not-installed-solver")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual("not-installed-solver", calc.linear_solver)
+
+    def test_run_reuses_combined_dc_newton_system_builder(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_model import DCPowerNetwork
+
+        class CountingDCPowerFlowCalc(DCPowerFlowCalc):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.combined_calls = 0
+                self.public_f_calls = 0
+                self.public_j_calls = 0
+
+            def _build_newton_system(self, G, x):
+                self.combined_calls += 1
+                return super()._build_newton_system(G, x)
+
+            def get_f(self, x, terms=None):
+                self.public_f_calls += 1
+                return super().get_f(x, terms=terms)
+
+            def get_jacobi(self, G, x, terms=None):
+                self.public_j_calls += 1
+                return super().get_jacobi(G, x, terms=terms)
+
+        network = DCPowerNetwork()
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.topo()
+        calc = CountingDCPowerFlowCalc(network)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertGreater(calc.combined_calls, 0)
+        self.assertEqual(0, calc.public_f_calls)
+        self.assertEqual(0, calc.public_j_calls)
+
+    def test_build_dc_ppc_from_e_file_creates_cached_array_model(self):
+        import numpy as np
+        from model.dc_array_model import (
+            BRANCH_COLS,
+            BUS_COLS,
+            DCDC_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            build_dc_ppc_from_e_file,
+        )
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        ppc = build_dc_ppc_from_e_file(e_file)
+        cached_ppc = build_dc_ppc_from_e_file(e_file)
+        copied_ppc = build_dc_ppc_from_e_file(e_file, copy_arrays=True)
+
+        self.assertIs(ppc, cached_ppc)
+        self.assertIsNot(ppc["bus"], copied_ppc["bus"])
+        self.assertEqual("dc_ppc_v1", ppc["format"])
+        self.assertEqual((30, len(BUS_COLS)), ppc["bus"].shape)
+        self.assertEqual((37, len(BRANCH_COLS)), ppc["branch"].shape)
+        self.assertEqual((16, len(LOAD_COLS)), ppc["load"].shape)
+        self.assertEqual((14, len(GEN_COLS)), ppc["gen"].shape)
+        self.assertEqual((9, len(DCDC_COLS)), ppc["dcdc"].shape)
+        self.assertEqual(1.0, ppc["bus"][0, BUS_COLS["voltage"]])
+        self.assertEqual(100.0, ppc["bus"][0, BUS_COLS["vbase"]])
+        self.assertEqual(100.0, ppc["base"]["p_base"])
+        np.testing.assert_array_equal(ppc["bus_name"][:3], np.asarray(["nd_1", "nd_2", "nd_3"], dtype=object))
+
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc
