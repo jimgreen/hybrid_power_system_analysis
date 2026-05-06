@@ -34,7 +34,7 @@ def _silent(func, *args, **kwargs):
         return func(*args, **kwargs)
 
 
-def run_case(case_name: str, repeats: int, profile: bool = False, algorithm: str = "nr"):
+def run_case(case_name: str, repeats: int, profile: bool = False, algorithm: str = "nr", linear_solver: str = "scipy"):
     e_file = _case_path(case_name)
     if not e_file.exists():
         raise FileNotFoundError(e_file)
@@ -54,6 +54,7 @@ def run_case(case_name: str, repeats: int, profile: bool = False, algorithm: str
             max_iter=300 if algorithm == "pq" else 50,
             algorithm=algorithm,
             keep_node_objects=False,
+            linear_solver=linear_solver,
         )
         calc_init_s = time.perf_counter() - stage_start
 
@@ -81,6 +82,7 @@ def run_case(case_name: str, repeats: int, profile: bool = False, algorithm: str
             "nodes": int(ppc["bus"].shape[0]),
             "states": int(calc.total_vars),
             "algorithm": calc.used_algorithm,
+            "linear_solver": calc.linear_solver,
         }
     last["times"] = runs
     last["avg"] = sum(runs) / len(runs)
@@ -90,11 +92,17 @@ def run_case(case_name: str, repeats: int, profile: bool = False, algorithm: str
     return last
 
 
-def run_cases(cases: Iterable[str], repeats: int, profile: bool, algorithm: str = "nr"):
-    return [run_case(case, repeats, profile, algorithm) for case in cases]
+def run_cases(cases: Iterable[str], repeats: int, profile: bool, algorithm: str = "nr", linear_solver: str = "scipy"):
+    return [run_case(case, repeats, profile, algorithm, linear_solver) for case in cases]
 
 
-def run_case_cold_process(case_name: str, repeats: int, profile: bool = False, algorithm: str = "nr"):
+def run_case_cold_process(
+    case_name: str,
+    repeats: int,
+    profile: bool = False,
+    algorithm: str = "nr",
+    linear_solver: str = "scipy",
+):
     runs = []
     profile_totals = {}
     last = None
@@ -109,6 +117,8 @@ def run_case_cold_process(case_name: str, repeats: int, profile: bool = False, a
             "--json",
             "--algorithm",
             algorithm,
+            "--linear-solver",
+            linear_solver,
         ]
         if profile:
             cmd.append("--profile")
@@ -133,14 +143,15 @@ def run_case_cold_process(case_name: str, repeats: int, profile: bool = False, a
     return last
 
 
-def run_cases_cold_process(cases: Iterable[str], repeats: int, profile: bool, algorithm: str = "nr"):
-    return [run_case_cold_process(case, repeats, profile, algorithm) for case in cases]
+def run_cases_cold_process(cases: Iterable[str], repeats: int, profile: bool, algorithm: str = "nr", linear_solver: str = "scipy"):
+    return [run_case_cold_process(case, repeats, profile, algorithm, linear_solver) for case in cases]
 
 
 def _print_result(result) -> None:
     times = " ".join(f"{item:.3f}" for item in result["times"])
     print(
-        f"{result['case']} [{result.get('algorithm', 'nr')}]: avg={result['avg']:.3f}s min={result['min']:.3f}s "
+        f"{result['case']} [{result.get('algorithm', 'nr')}/{result.get('linear_solver', 'scipy')}]: "
+        f"avg={result['avg']:.3f}s min={result['min']:.3f}s "
         f"runs=[{times}] converged={result['converged']} rc={result['rc']} "
         f"iter={result['iterations']} norm={result['norm']:.3e} "
         f"nodes={result['nodes']} states={result['states']}"
@@ -158,11 +169,12 @@ def main(argv: Sequence[str] = None) -> int:
     parser.add_argument("--profile", action="store_true", help="Print averaged stage timings.")
     parser.add_argument("--cold-process", action="store_true", help="Run each repeat in a fresh Python process.")
     parser.add_argument("--algorithm", choices=("nr", "pq"), default="nr", help="Power-flow algorithm.")
+    parser.add_argument("--linear-solver", choices=("scipy", "auto", "pypardiso", "umfpack", "klu"), default="scipy", help="Sparse linear solver for NR.")
     parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     runner = run_cases_cold_process if args.cold_process else run_cases
-    results = runner(args.cases, max(1, args.repeats), args.profile, args.algorithm)
+    results = runner(args.cases, max(1, args.repeats), args.profile, args.algorithm, args.linear_solver)
     if args.json:
         print(json.dumps(results[0] if len(results) == 1 else results, sort_keys=True))
         return 0 if all(item["converged"] and item["rc"] == 0 for item in results) else 1

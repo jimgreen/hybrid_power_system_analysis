@@ -140,16 +140,31 @@ from ac_array_model import (
 
 _SPARSE_SOLVER = None
 _SPARSE_SOLVER_NAME = None
+_OPTIONAL_SPARSE_SOLVERS = {}
+_OPTIONAL_SPARSE_MISSING = set()
 
 
-def _load_suitesparse_solver():
-    """Return an optional SuiteSparse-compatible sparse solver when installed."""
-    candidates = (
-        ("scikits.umfpack", "spsolve", "umfpack"),
-        ("sksparse.klu", "spsolve", "klu"),
-        ("klu", "solve", "klu"),
-    )
-    for module_name, func_name, solver_name in candidates:
+_OPTIONAL_SOLVER_CANDIDATES = {
+    "pypardiso": ("pypardiso", "spsolve"),
+    "umfpack": ("scikits.umfpack", "spsolve"),
+    "klu": ("sksparse.klu", "spsolve"),
+    "klu_alt": ("klu", "solve"),
+}
+
+
+def _load_named_sparse_solver(solver_name):
+    """Return a named optional sparse solver when installed."""
+    solver_name = str(solver_name).strip().lower()
+    if solver_name in _OPTIONAL_SPARSE_SOLVERS:
+        return _OPTIONAL_SPARSE_SOLVERS[solver_name]
+    if solver_name in _OPTIONAL_SPARSE_MISSING:
+        return None
+
+    candidate_names = ("umfpack", "klu", "klu_alt") if solver_name == "auto" else (solver_name,)
+    for candidate_name in candidate_names:
+        module_name, func_name = _OPTIONAL_SOLVER_CANDIDATES.get(candidate_name, (None, None))
+        if module_name is None:
+            continue
         try:
             if importlib.util.find_spec(module_name) is None:
                 continue
@@ -161,24 +176,27 @@ def _load_suitesparse_solver():
         except Exception:
             continue
         if solver is not None:
-            return solver_name, solver
-    return None, None
+            _OPTIONAL_SPARSE_SOLVERS[solver_name] = solver
+            return solver
+
+    _OPTIONAL_SPARSE_MISSING.add(solver_name)
+    return None
 
 
-def solve_sparse_system(matrix, rhs):
-    """Solve a sparse linear system, preferring SuiteSparse/KLU bindings when available."""
-    global _SPARSE_SOLVER, _SPARSE_SOLVER_NAME
+def solve_sparse_system(matrix, rhs, solver_name="scipy"):
+    """Solve a sparse linear system, preferring optional high-performance bindings."""
+    solver_name = str(solver_name or "scipy").strip().lower()
+    if solver_name in {"scipy", "superlu", "default"}:
+        return spsolve(matrix, rhs)
+
     if SCIPY_AVAILABLE:
-        if _SPARSE_SOLVER is None and _SPARSE_SOLVER_NAME is None:
-            _SPARSE_SOLVER_NAME, _SPARSE_SOLVER = _load_suitesparse_solver()
-            if _SPARSE_SOLVER is None:
-                _SPARSE_SOLVER_NAME = "scipy"
-        if _SPARSE_SOLVER is not None:
+        solver = _load_named_sparse_solver(solver_name)
+        if solver is not None:
             try:
-                return _SPARSE_SOLVER(matrix, rhs)
+                return solver(matrix, rhs)
             except Exception:
-                _SPARSE_SOLVER = None
-                _SPARSE_SOLVER_NAME = "scipy"
+                _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
+                _OPTIONAL_SPARSE_MISSING.add(solver_name)
     return spsolve(matrix, rhs)
 
 
@@ -299,6 +317,7 @@ class ACPowerFlowCalc:
         parameters: Optional[PowerFlowParameters] = None,
         algorithm: str = "nr",
         keep_node_objects: bool = True,
+        linear_solver: str = "scipy",
     ):
         # 基础配置
         algorithm = str(algorithm).strip().lower()
@@ -318,6 +337,7 @@ class ACPowerFlowCalc:
         self.min_voltage = self.params.min_voltage
         self.algorithm = algorithm
         self.used_algorithm = algorithm
+        self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self.target_island = island
         self.skipped_islands: List = []
         self.calc_islands: List = []
@@ -2525,7 +2545,7 @@ class ACPowerFlowCalc:
                 self._write_back()
                 return 0
 
-            delta = solve_sparse_system(J, F)
+            delta = solve_sparse_system(J, F, self.linear_solver)
             # 方程定义为 F(x)=0，这里使用 x_new = x - J^{-1}F。
             x -= delta
 
