@@ -265,8 +265,16 @@ def observability_rank_details(
         if diag.size == state_count and float(np.min(diag)) > tol:
             return state_count, 0, np.array([], dtype=np.float64), weak_states
     elif is_sparse_matrix(gram) and SP_SPLU is not None:
+        gram_csc = gram.tocsc()
         try:
-            lu = SP_SPLU(gram.tocsc())
+            lu = SP_SPLU(gram_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
+            diag = np.abs(lu.U.diagonal())
+            if diag.size == state_count and float(np.min(diag)) > tol:
+                return state_count, 0, np.array([], dtype=np.float64), weak_states
+        except Exception:
+            pass
+        try:
+            lu = SP_SPLU(gram_csc)
             diag = np.abs(lu.U.diagonal())
             if diag.size == state_count and float(np.min(diag)) > tol:
                 return state_count, 0, np.array([], dtype=np.float64), weak_states
@@ -423,7 +431,7 @@ def solve_normal_equations_with_factor(
         gain_csc = gain.tocsc()
         if SP_SPLU is not None:
             try:
-                lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0)
+                lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
                 return lu.solve(rhs), np.abs(lu.U.diagonal())
             except Exception:
                 pass

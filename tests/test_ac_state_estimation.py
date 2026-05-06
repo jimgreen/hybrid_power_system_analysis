@@ -44,6 +44,394 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(rhs, H_dense.T @ (weight * residual))
         self.assertIsInstance(gain, np.ndarray)
 
+    def test_load_measurements_uses_direct_measurement_parser(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Other>",
+                        "@ idx name",
+                        "# 1 ignored",
+                        "</Other>",
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345.6",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_ebook = ac_se.EBook
+
+            class RejectEBook:
+                def __init__(self, *_args, **_kwargs):
+                    raise AssertionError("measurement loading should not use the generic EBook parser")
+
+            ac_se.EBook = RejectEBook
+            try:
+                measurements = ACStateEstimator._load_measurements(meas_file)
+            finally:
+                ac_se.EBook = original_ebook
+
+        self.assertEqual(1, len(measurements))
+        measurement = measurements[0]
+        self.assertEqual(7, measurement.idx)
+        self.assertEqual("vm_bus_1", measurement.name)
+        self.assertEqual("ACNode", measurement.device_type)
+        self.assertEqual("bus_1", measurement.device_name)
+        self.assertEqual("V", measurement.meas_type)
+        self.assertEqual(2.5, measurement.weight)
+        self.assertTrue(measurement.valid)
+        self.assertEqual(345.6, measurement.value)
+
+    def test_measurement_objects_use_slots_and_support_dataclass_replace(self):
+        from dataclasses import replace
+        from secore.ac_se import Measurement
+
+        self.assertTrue(hasattr(Measurement, "__slots__"))
+        measurement = Measurement(1, "m1", "ACNode", "n1", "V", 1.0, True, 2.0)
+        updated = replace(measurement, value=3.0)
+
+        self.assertEqual(2.0, measurement.value)
+        self.assertEqual(3.0, updated.value)
+
+    def test_efile_factory_skips_generic_conversion_for_text_columns(self):
+        import efile_read
+
+        class_name = "FastEfileFactoryText"
+        data = {
+            class_name: {
+                "header_list": ["idx", "name", "value"],
+                "data": [{"idx": "7", "name": "load_1", "value": "3.5"}],
+            }
+        }
+        original_convert = efile_read._convert_cell
+
+        def fail_text_conversion(value):
+            if value == "load_1":
+                raise AssertionError("text columns should not use generic numeric conversion")
+            return original_convert(value)
+
+        efile_read._convert_cell = fail_text_conversion
+        try:
+            model = efile_read.efile_factory(data)
+        finally:
+            efile_read._convert_cell = original_convert
+
+        row = getattr(model, class_name)[0]
+        self.assertEqual(7, row.idx)
+        self.assertEqual("load_1", row.name)
+        self.assertEqual(3.5, row.value)
+
+    def test_efile_factory_uses_typed_numeric_converters(self):
+        import efile_read
+
+        class_name = "FastEfileFactoryTyped"
+        data = {
+            class_name: {
+                "header_list": ["idx", "name", "value"],
+                "data": [{"idx": "7", "name": "load_1", "value": "3.5"}],
+            }
+        }
+        original_convert = efile_read._convert_cell
+
+        def fail_generic_conversion(value):
+            raise AssertionError(f"typed E-file factory should not call _convert_cell for {value!r}")
+
+        efile_read._convert_cell = fail_generic_conversion
+        try:
+            model = efile_read.efile_factory(data)
+        finally:
+            efile_read._convert_cell = original_convert
+
+        row = getattr(model, class_name)[0]
+        self.assertEqual(7, row.idx)
+        self.assertEqual("load_1", row.name)
+        self.assertEqual(3.5, row.value)
+
+    def test_efile_factory_infers_column_types_from_first_nonempty_sample(self):
+        import efile_read
+
+        class_name = "FastEfileFactoryInference"
+        data = {
+            class_name: {
+                "header_list": ["idx", "name", "value"],
+                "data": [
+                    {"idx": str(idx), "name": f"load_{idx}", "value": f"{idx}.5"}
+                    for idx in range(100)
+                ],
+            }
+        }
+        original_kind = efile_read._numeric_cell_kind
+        calls = 0
+
+        def counted_kind(value):
+            nonlocal calls
+            calls += 1
+            return original_kind(value)
+
+        efile_read._numeric_cell_kind = counted_kind
+        try:
+            model = efile_read.efile_factory(data)
+        finally:
+            efile_read._numeric_cell_kind = original_kind
+
+        self.assertLessEqual(calls, 3)
+        self.assertEqual(100, len(getattr(model, class_name)))
+
+    def test_efile_factory_integer_inferred_column_accepts_float_text(self):
+        import efile_read
+
+        class_name = "FastEfileFactoryMixedNumeric"
+        data = {
+            class_name: {
+                "header_list": ["idx", "value"],
+                "data": [
+                    {"idx": "1", "value": "0"},
+                    {"idx": "2", "value": "0.5"},
+                ],
+            }
+        }
+
+        model = efile_read.efile_factory(data)
+        rows = getattr(model, class_name)
+
+        self.assertEqual(0, rows[0].value)
+        self.assertEqual(0.5, rows[1].value)
+
+    def test_efile_factory_generates_direct_initializers(self):
+        import efile_read
+
+        cls = efile_read._class_factory(
+            "FastEfileFactoryDirectInit",
+            ["idx", "name", "value"],
+            [efile_read._safe_int_cell, efile_read._identity_cell, efile_read._safe_float_cell],
+        )
+
+        self.assertEqual((), cls.__init__.__code__.co_freevars)
+        row = cls({"idx": "7", "name": "load_1", "value": "3.5"})
+        self.assertEqual(7, row.idx)
+        self.assertEqual("load_1", row.name)
+        self.assertEqual(3.5, row.value)
+
+    def test_efile_factory_inlines_builtin_column_converters(self):
+        import efile_read
+
+        cls = efile_read._class_factory(
+            "FastEfileFactoryInlineConverters",
+            ["idx", "name", "value"],
+            [efile_read._safe_int_cell, efile_read._identity_cell, efile_read._safe_float_cell],
+        )
+        self.assertFalse(any(name.startswith("_converter_") for name in cls.__init__.__code__.co_names))
+        original_int = efile_read._safe_int_cell
+        original_float = efile_read._safe_float_cell
+
+        def reject_converter(value):
+            raise AssertionError(f"generated initializer should inline converter for {value!r}")
+
+        efile_read._safe_int_cell = reject_converter
+        efile_read._safe_float_cell = reject_converter
+        try:
+            row = cls({"idx": "7", "name": "load_1", "value": "3.5"})
+            mixed = cls({"idx": "7.25", "name": "load_2", "value": "text"})
+        finally:
+            efile_read._safe_int_cell = original_int
+            efile_read._safe_float_cell = original_float
+
+        self.assertEqual(7, row.idx)
+        self.assertEqual("load_1", row.name)
+        self.assertEqual(3.5, row.value)
+        self.assertEqual(7.25, mixed.idx)
+        self.assertEqual("text", mixed.value)
+
+    def test_normalize_model_named_units_reuses_current_base_per_node(self):
+        import unit_system
+        from efile_read import efile_factory
+
+        data = {
+            "PowerBase": {
+                "header_list": ["p_base", "u_scale", "p_scale", "i_scale"],
+                "data": [{"p_base": "100000", "u_scale": "1000", "p_scale": "1000", "i_scale": "1"}],
+            },
+            "ACNode": {
+                "header_list": ["idx", "name", "vbase", "voltage", "angle", "run_stat"],
+                "data": [{"idx": "1", "name": "n1", "vbase": "345", "voltage": "345", "angle": "0", "run_stat": "1"}],
+            },
+            "ACBranch": {
+                "header_list": ["idx", "name", "i_node", "j_node", "r", "x", "b", "run_stat", "i_c", "j_c"],
+                "data": [
+                    {"idx": str(idx), "name": f"br_{idx}", "i_node": "1", "j_node": "1", "r": "0", "x": "0", "b": "0", "run_stat": "1", "i_c": "10", "j_c": "20"}
+                    for idx in range(20)
+                ],
+            },
+        }
+        model = efile_factory(data)
+        original = unit_system.ac_current_base_ka
+        calls = 0
+
+        def counted_current_base(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        unit_system.ac_current_base_ka = counted_current_base
+        try:
+            unit_system.normalize_model_named_units(model)
+        finally:
+            unit_system.ac_current_base_ka = original
+
+        self.assertEqual(1, calls)
+
+    def test_check_topo_scans_voltage_consistency_once(self):
+        from model.ac_model import ACPowerNetwork
+
+        net = ACPowerNetwork()
+        n1 = net.add_node(1, 1.0, 1.0, 0.0)
+        n1.name = "n1"
+        n2 = net.add_node(2, 1.0, 1.0, 0.0)
+        n2.name = "n2"
+        n3 = net.add_node(3, 1.0, 1.0, 0.0)
+        n3.name = "n3"
+        n4 = net.add_node(4, 1.0, 1.0, 0.0)
+        n4.name = "n4"
+        br1 = net.add_branch(1, 1, 2, 0.0)
+        br1.name = "br1"
+        br2 = net.add_branch(2, 3, 4, 0.0)
+        br2.name = "br2"
+        gen1 = net.add_generator(1, 1, "SLACK", 0.0, 0.0, 1.0)
+        gen1.name = "g1"
+        gen2 = net.add_generator(2, 3, "SLACK", 0.0, 0.0, 1.0)
+        gen2.name = "g2"
+        net.format_assoc()
+        net.topo()
+
+        class CountedBranches(list):
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        counted = CountedBranches(net.branches)
+        counted.iterations = 0
+        net.branches = counted
+
+        net.check_topo()
+
+        self.assertLessEqual(counted.iterations, 2)
+
+    def test_estimator_load_network_skips_topology_check(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original_check_topo = ac_se.ACPowerNetwork.check_topo
+
+        def reject_check_topo(self):
+            raise AssertionError("main state-estimation load path should not call check_topo")
+
+        ac_se.ACPowerNetwork.check_topo = reject_check_topo
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+        finally:
+            ac_se.ACPowerNetwork.check_topo = original_check_topo
+
+        self.assertTrue(estimator.nodes)
+
+    def test_measurement_unit_conversion_uses_precomputed_node_scales(self):
+        from secore.ac_se import ACStateEstimator, Measurement
+
+        class Device:
+            def __init__(self, i_node=None, j_node=None, node=None, idx=None):
+                self.i_node = i_node
+                self.j_node = j_node
+                self.node = node
+                self.idx = idx if idx is not None else node
+
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.p_base = 100.0
+        estimator.p_base_kW = 100.0
+        estimator.i_scale = 1.0
+        estimator.u_scale = 1000.0
+        estimator.node_by_name = {"n1": Device(node=1, idx=1), "n2": Device(node=2, idx=2)}
+        estimator.branch_by_name = {"br": Device(i_node=1, j_node=2)}
+        estimator.transformer_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.switch_by_name = {}
+        estimator.generator_by_name = {"gen": Device(node=1)}
+        estimator.load_by_name = {"load": Device(node=2)}
+        estimator.network = type(
+            "Network",
+            (),
+            {"node_dict": {1: type("Node", (), {"vbase": 1.0})(), 2: type("Node", (), {"vbase": 2.0})()}},
+        )()
+        estimator.measurements = [
+            Measurement(1, "v1", "ACNode", "n1", "V", 1.0, True, 1000.0),
+            Measurement(2, "i_from", "ACBranch", "br", "I_FROM", 1.0, True, 10.0),
+            Measurement(3, "i_to", "ACBranch", "br", "I_TO", 1.0, True, 20.0),
+            Measurement(4, "i_gen", "ACGenerator", "gen", "I_GEN", 1.0, True, 10.0),
+            Measurement(5, "i_load", "ACLoad", "load", "I_LOAD", 1.0, True, 20.0),
+        ]
+        estimator._node_current_base = lambda node_idx: (_ for _ in ()).throw(
+            AssertionError("_convert_measurements_to_pu should use precomputed current scales")
+        )
+        estimator._voltage_file_base = lambda node_idx: (_ for _ in ()).throw(
+            AssertionError("_convert_measurements_to_pu should use precomputed voltage scales")
+        )
+
+        estimator._convert_measurements_to_pu()
+
+        self.assertAlmostEqual(1.0, estimator.measurements[0].value)
+
+    def test_estimator_skips_separate_unavailable_measurement_scan(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original = ac_se.ACStateEstimator._disable_unavailable_measurements
+
+        def reject_scan(self):
+            raise AssertionError("availability filtering should be folded into unit conversion")
+
+        ac_se.ACStateEstimator._disable_unavailable_measurements = reject_scan
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+        finally:
+            ac_se.ACStateEstimator._disable_unavailable_measurements = original
+
+        self.assertTrue(estimator.active_measurements)
+
+    def test_estimator_skips_separate_measurement_summary_scan_after_conversion(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original = ac_se.ACStateEstimator._refresh_measurement_summary_cache
+
+        def reject_summary_scan(self):
+            raise AssertionError("measurement summary should be populated during unit conversion")
+
+        ac_se.ACStateEstimator._refresh_measurement_summary_cache = reject_summary_scan
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+        finally:
+            ac_se.ACStateEstimator._refresh_measurement_summary_cache = original
+
+        self.assertTrue(estimator.active_measurements)
+
     def test_ieee3k_flat_start_does_not_add_angle_pseudos(self):
         from secore.ac_se import ACStateEstimator
 
@@ -790,6 +1178,74 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertIs(cached[0], estimator.active_measurements)
 
+    def test_active_measurement_plans_use_dedicated_fast_path(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+
+        class RejectCache(dict):
+            def get(self, *args, **kwargs):
+                raise AssertionError("active plan lookup should not touch generic cache")
+
+        plan_cases = [
+            (
+                "_active_branch_transformer_vector_plan",
+                "_branch_transformer_vector_plan",
+                "_branch_transformer_vector_plan_cache",
+            ),
+            (
+                "_active_zero_current_vector_plan",
+                "_zero_current_vector_plan",
+                "_zero_current_vector_plan_cache",
+            ),
+            (
+                "_active_simple_jacobian_plan",
+                "_simple_jacobian_plan",
+                "_simple_jacobian_plan_cache",
+            ),
+            (
+                "_active_balance_measurement_plan",
+                "_balance_measurement_plan",
+                "_balance_measurement_plan_cache",
+            ),
+            (
+                "_active_generator_measurement_plan",
+                "_generator_measurement_plan",
+                "_generator_measurement_plan_cache",
+            ),
+        ]
+        for active_attr, method_name, cache_attr in plan_cases:
+            expected_plan = getattr(estimator, active_attr)
+            setattr(estimator, cache_attr, RejectCache())
+
+            plan = getattr(estimator, method_name)(estimator.active_measurements)
+
+            self.assertIs(expected_plan, plan)
+
+    def test_active_measurement_summary_reuses_initialization_cache(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+        expected_device_keys = set(estimator._active_device_keys())
+        expected_measurement_keys = set(estimator._active_measurement_keys())
+        expected_next_idx = max(meas.idx for meas in estimator.measurements) + 1
+
+        class RejectIteration(list):
+            def __iter__(self):
+                raise AssertionError("active measurement summary should use cached values")
+
+        estimator.measurements = RejectIteration(estimator.measurements)
+
+        self.assertEqual(expected_device_keys, estimator._active_device_keys())
+        self.assertEqual(expected_measurement_keys, estimator._active_measurement_keys())
+        self.assertEqual(expected_next_idx, estimator._next_measurement_idx())
+
     def test_initialization_prepares_active_measurement_vectors(self):
         from secore.ac_se import ACStateEstimator
 
@@ -828,88 +1284,67 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(estimator.branch_stamp_by_name)
         self.assertTrue(estimator.transformer_stamp_by_name)
 
-    def test_nonconverged_estimate_reuses_factor_for_observability(self):
-        import secore.ac_se as ac_se
-        from secore.ac_se import ACStateEstimator
-
-        estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
-            max_iter=1,
-        )
-        estimator.tol = 0.0
-
-        original = ac_se.observability_rank_details
-        factor_seen = False
-
-        def counted_rank_details(*args, **kwargs):
-            nonlocal factor_seen
-            factor_seen = kwargs.get("normal_factor_diag") is not None
-            return original(*args, **kwargs)
-
-        ac_se.observability_rank_details = counted_rank_details
-        try:
-            estimator.estimate()
-        finally:
-            ac_se.observability_rank_details = original
-
-        self.assertTrue(factor_seen)
-
-    def test_estimate_reuses_gain_matrix_for_observability(self):
-        import secore.ac_se as ac_se
-        from secore.ac_se import ACStateEstimator
+    def test_estimate_skips_final_observability_analysis(self):
+        from secore.ac_se import ACStateEstimator, ObservabilityResult
 
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
         )
+        initial_observability = ObservabilityResult(
+            True,
+            estimator.n_state,
+            estimator.n_state,
+            len(estimator.active_measurements),
+            0,
+            np.array([]),
+            [],
+        )
+        calls = 0
 
-        original = ac_se.observability_rank_details
-        normal_matrix_seen = False
+        def counted_observability(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return initial_observability
 
-        def counted_rank_details(*args, **kwargs):
-            nonlocal normal_matrix_seen
-            normal_matrix_seen = kwargs.get("normal_matrix") is not None
-            return original(*args, **kwargs)
-
-        ac_se.observability_rank_details = counted_rank_details
-        try:
-            result = estimator.estimate()
-        finally:
-            ac_se.observability_rank_details = original
+        estimator.observability_analysis = counted_observability
+        result = estimator.estimate()
 
         self.assertTrue(result.converged)
-        self.assertTrue(normal_matrix_seen)
+        self.assertIs(initial_observability, result.observability)
+        self.assertEqual(1, calls)
 
-    def test_estimate_reuses_cholesky_factor_for_observability(self):
-        import secore.ac_se as ac_se
-        import secore.se_math as se_math
-        from secore.ac_se import ACStateEstimator
-
-        if se_math.CHO_FACTOR is None or se_math.CHO_SOLVE is None:
-            self.skipTest("SciPy Cholesky solver is not available")
+    def test_custom_measurement_estimate_gets_pre_estimation_observability_once(self):
+        from secore.ac_se import ACStateEstimator, ObservabilityResult
 
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
         )
+        measurements = estimator.active_measurements[:]
+        initial_observability = ObservabilityResult(
+            True,
+            estimator.n_state,
+            estimator.n_state,
+            len(measurements),
+            0,
+            np.array([]),
+            [],
+        )
+        calls = 0
 
-        original = ac_se.observability_rank_details
-        factor_seen = False
+        def counted_observability(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            self.assertIs(measurements, args[1] if len(args) > 1 else kwargs.get("measurements"))
+            return initial_observability
 
-        def counted_rank_details(*args, **kwargs):
-            nonlocal factor_seen
-            factor_seen = kwargs.get("normal_factor_diag") is not None
-            return original(*args, **kwargs)
-
-        ac_se.observability_rank_details = counted_rank_details
-        try:
-            result = estimator.estimate()
-        finally:
-            ac_se.observability_rank_details = original
+        estimator.observability_analysis = counted_observability
+        result = estimator.estimate(measurements)
 
         self.assertTrue(result.converged)
-        self.assertTrue(factor_seen)
+        self.assertIs(initial_observability, result.observability)
+        self.assertEqual(1, calls)
 
     def test_estimate_passes_file_weights_to_normal_equation_builder(self):
         import secore.ac_se as ac_se
@@ -1451,8 +1886,83 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(calls)
         self.assertEqual(0.0, calls[0]["diag_pivot_thresh"])
+        self.assertEqual("MMD_AT_PLUS_A", calls[0]["permc_spec"])
         np.testing.assert_allclose(dx, np.ones(2))
         np.testing.assert_allclose(diag, np.ones(2))
+
+    def test_targeted_pseudo_reuses_observable_rank_result(self):
+        from secore.ac_se import ACStateEstimator, ObservabilityResult
+
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.targeted_pseudo_measurement_max = 10
+        estimator.measurements = []
+        calls = 0
+
+        def observable():
+            nonlocal calls
+            calls += 1
+            return ObservabilityResult(True, 1, 1, 1, 0, np.array([]), [])
+
+        estimator.observability_analysis = observable
+        estimator._active_measurement_keys = lambda: set()
+        estimator._append_targeted_observability_pseudo = lambda *args, **kwargs: (1, 0)
+        estimator._refresh_active_measurement_indexes = lambda: None
+        estimator._add_structural_rank_restoring_pseudo_measurements = lambda max_add: 0
+
+        self.assertEqual(0, estimator._add_targeted_observability_pseudo_measurements())
+        self.assertEqual(1, calls)
+
+    def test_initial_observability_reuses_targeted_pseudo_result(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+        )
+
+        original_jacobian_sparse = estimator.jacobian_sparse
+        calls = 0
+
+        def counted_jacobian(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_jacobian_sparse(*args, **kwargs)
+
+        estimator.jacobian_sparse = counted_jacobian
+        result = estimator.observability_analysis()
+
+        self.assertTrue(result.observable)
+        self.assertEqual(0, calls)
+
+    def test_sparse_observability_disables_dynamic_pivoting_for_speed(self):
+        from scipy.sparse import csc_matrix, eye
+        import secore.se_math as se_math
+
+        calls = []
+        original_splu = se_math.SP_SPLU
+
+        class FakeLU:
+            def __init__(self):
+                self.U = csc_matrix(np.eye(2))
+
+        def fake_splu(matrix, **kwargs):
+            calls.append(kwargs)
+            return FakeLU()
+
+        se_math.SP_SPLU = fake_splu
+        try:
+            rank, deficiency, _singular_values, _weak_states = se_math.observability_rank_details(
+                eye(2, format="csr"),
+                ["x0", "x1"],
+            )
+        finally:
+            se_math.SP_SPLU = original_splu
+
+        self.assertEqual(2, rank)
+        self.assertEqual(0, deficiency)
+        self.assertTrue(calls)
+        self.assertEqual(0.0, calls[0]["diag_pivot_thresh"])
+        self.assertEqual("MMD_AT_PLUS_A", calls[0]["permc_spec"])
 
     def test_ac_net_30_analytic_jacobian_matches_finite_difference(self):
         from secore.ac_se import ACStateEstimator

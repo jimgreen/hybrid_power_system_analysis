@@ -10,6 +10,43 @@ _EFILE_CACHE = {}
 _EFILE_CACHE_LOCK = threading.Lock()
 
 
+def _looks_numeric_cell(value):
+    if not isinstance(value, str) or not value:
+        return False
+    return value[0] in "+-.0123456789"
+
+
+def _numeric_cell_kind(value):
+    if not _looks_numeric_cell(value):
+        return None
+    return float if "." in value or "e" in value or "E" in value else int
+
+
+def _safe_int_cell(value):
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return value
+    return value
+
+
+def _safe_float_cell(value):
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _identity_cell(value):
+    return value
+
+
 def _split_data_row(text):
     """Split one E-file data row, using the regex path only when quotes exist."""
     text = text.lstrip()
@@ -204,20 +241,66 @@ class _Base:
         return f"{self.__class__.__name__}({self.__dict__})"
 
 
-def _class_factory(class_name, attrs):
+def _class_factory(class_name, attrs, converters=None):
     if not class_name:
         raise ValueError("JSON data must contain a 'data' key")
-    key = (class_name, tuple(attrs))
+    if converters is None:
+        converters = tuple(_convert_cell for _ in attrs)
+    else:
+        converters = tuple(converters)
+    key = (class_name, tuple(attrs), tuple(id(converter) for converter in converters))
     cached = _CLASS_CACHE.get(key)
     if cached is not None:
         return cached
     attr_names = tuple(attrs)
 
-    def __init__(self, row=None, **kwargs):
-        source = kwargs if row is None else row
-        convert = _convert_cell
-        for attr in attr_names:
-            setattr(self, attr, convert(source[attr]))
+    init_globals = {}
+    init_lines = [
+        "def __init__(self, row=None, **kwargs):",
+        "    source = kwargs if row is None else row",
+        "    values = self.__dict__",
+    ]
+    for idx, (attr, convert) in enumerate(zip(attr_names, converters)):
+        source_expr = f"source[{attr!r}]"
+        if convert is _identity_cell:
+            init_lines.append(f"    values[{attr!r}] = {source_expr}")
+        elif convert is _safe_int_cell:
+            value_name = f"_value_{idx}"
+            init_lines.extend(
+                [
+                    f"    {value_name} = {source_expr}",
+                    f"    if isinstance({value_name}, str):",
+                    "        try:",
+                    f"            values[{attr!r}] = int({value_name})",
+                    "        except ValueError:",
+                    "            try:",
+                    f"                values[{attr!r}] = float({value_name})",
+                    "            except ValueError:",
+                    f"                values[{attr!r}] = {value_name}",
+                    "    else:",
+                    f"        values[{attr!r}] = {value_name}",
+                ]
+            )
+        elif convert is _safe_float_cell:
+            value_name = f"_value_{idx}"
+            init_lines.extend(
+                [
+                    f"    {value_name} = {source_expr}",
+                    f"    if isinstance({value_name}, str):",
+                    "        try:",
+                    f"            values[{attr!r}] = float({value_name})",
+                    "        except ValueError:",
+                    f"            values[{attr!r}] = {value_name}",
+                    "    else:",
+                    f"        values[{attr!r}] = {value_name}",
+                ]
+            )
+        else:
+            converter_name = f"_converter_{idx}"
+            init_globals[converter_name] = convert
+            init_lines.append(f"    values[{attr!r}] = {converter_name}({source_expr})")
+    exec("\n".join(init_lines), init_globals)
+    __init__ = init_globals["__init__"]
 
     attributes = {attr: None for attr in attrs}
     attributes["__init__"] = __init__
@@ -229,11 +312,26 @@ def _class_factory(class_name, attrs):
 def efile_factory(data):
     new_cls_dict = _Base()
     for key, value in data.items():
-        Class_Def = _class_factory(key, value['header_list'])
-        list_info = []
-        for item in value["data"]:
-            list_info.append(Class_Def(item))
-        setattr(new_cls_dict, key, list_info)
+        header = value['header_list']
+        rows = value["data"]
+        converters = []
+        for attr in header:
+            converter = None
+            for item in rows:
+                sample = item.get(attr, "")
+                if sample == "":
+                    continue
+                kind = _numeric_cell_kind(sample)
+                if kind is float:
+                    converter = _safe_float_cell
+                elif kind is int:
+                    converter = _safe_int_cell
+                else:
+                    converter = _identity_cell
+                break
+            converters.append(_identity_cell if converter is None else converter)
+        Class_Def = _class_factory(key, header, converters)
+        setattr(new_cls_dict, key, [Class_Def(item) for item in rows])
 
     return new_cls_dict
 

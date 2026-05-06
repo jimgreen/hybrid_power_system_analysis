@@ -610,43 +610,43 @@ class ACPowerNetwork:
             if node_ref_count[node.idx] == 1:
                 warns.append(f"节点 {node.idx} {node.name} 单端悬空，请检查！")
 
+        # 电压基值一致性只与支路两端有关，不需要按岛重复扫描全部设备。
+        for dev in self.branches:
+            if dev.run_stat != 1:
+                continue
+            if dev.i_node_obj is None or dev.j_node_obj is None:
+                continue
+            if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
+                continue
+            if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
+                str_info = f" 支路 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
+                errors.append(str_info)
+
+        for dev in self.switches:
+            if dev.run_stat != 1:
+                continue
+            if dev.i_node_obj is None or dev.j_node_obj is None:
+                continue
+            if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
+                continue
+            if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
+                str_info = f" 开关 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
+                errors.append(str_info)
+
+        for dev in self.zero_branches:
+            if dev.run_stat != 1:
+                continue
+            if dev.i_node_obj is None or dev.j_node_obj is None:
+                continue
+            if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
+                continue
+            if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
+                str_info = f" 零阻抗支路 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
+                errors.append(str_info)
+
         # 检查每个岛屿
         for isl in self.islands:
-            # 1. 电压基值一致性
-            for dev in self.branches:
-                if dev.run_stat != 1:
-                    continue
-                if dev.i_node_obj is None or dev.j_node_obj is None:
-                    continue
-                if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
-                    continue
-                if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
-                    str_info = f" 支路 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
-                    errors.append(str_info)
-
-            for dev in self.switches:
-                if dev.run_stat != 1:
-                    continue
-                if dev.i_node_obj is None or dev.j_node_obj is None:
-                    continue
-                if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
-                    continue
-                if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
-                    str_info = f" 开关 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
-                    errors.append(str_info)
-
-            for dev in self.zero_branches:
-                if dev.run_stat != 1:
-                    continue
-                if dev.i_node_obj is None or dev.j_node_obj is None:
-                    continue
-                if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
-                    continue
-                if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
-                    str_info = f" 零阻抗支路 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
-                    errors.append(str_info)
-
-            # 2. 电压控制源唯一性（松弛节点或定V发电机）
+            # 电压控制源唯一性（松弛节点或定V发电机）
             if len(isl.slack_nodes) > 1:
                 if self._multi_slack_nodes_are_zero_tied(isl.slack_nodes):
                     str_info = f"岛屿 {isl.idx} 存在多个零阻抗等值相连的平衡节点:"
@@ -663,11 +663,12 @@ class ACPowerNetwork:
                 warns.append(f"岛屿 {isl.idx} , 无平衡节点，跳过潮流计算")
 
         # 检查平衡节点与定V发电机的一致性
+        slack_node_set = {slack_node for isl in self.islands for slack_node in isl.slack_nodes}
         for node in self.nodes:
             if node.run_stat != 1:
                 continue
-            slack_gens = [gen for gen in getattr(node, 'v_gens', []) if gen.control_type in ['V', 'SLACK', 'PH']]
-            if node in [slack_node for isl in self.islands for slack_node in isl.slack_nodes] and len(slack_gens) == 0:
+            has_slack_gen = any(gen.control_type in ['V', 'SLACK', 'PH'] for gen in getattr(node, 'v_gens', []))
+            if node in slack_node_set and not has_slack_gen:
                 errors.append(f"平衡节点 {node.idx} {node.name} 未关联任何平衡发电机设备")
 
         return warns, errors
