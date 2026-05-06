@@ -138,7 +138,14 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
                     row = raw_line.split()
                     if len(row) < header_len + 1:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
-                    idx_text, name, device_type, device_name, meas_type, weight_text, valid_text, value_text = row[1:9]
+                    idx_text = row[1]
+                    name = row[2]
+                    device_type = row[3]
+                    device_name = row[4]
+                    meas_type = row[5]
+                    weight_text = row[6]
+                    valid_text = row[7]
+                    value_text = row[8]
                     if meas_type and "a" <= meas_type[0] <= "z":
                         meas_type = meas_type.upper()
                     idx = int_cell(idx_text)
