@@ -81,6 +81,7 @@ _MEASUREMENT_ROW_CACHE = {}
 _MEASUREMENT_BUILDER_CACHE = {}
 _MEASUREMENT_TEMPLATE_CACHE = {}
 _ACTIVE_PLAN_TEMPLATE_CACHE = {}
+_ACTIVE_INDEX_TEMPLATE_CACHE = {}
 _OBSERVABILITY_RESULT_CACHE = {}
 _ZERO_TIE_LAYOUT_CACHE = {}
 _Y_ROW_CACHE = {}
@@ -632,6 +633,43 @@ class ACStateEstimator:
     def _default_observability_cache_key(self) -> Tuple[object, ...]:
         return self._active_plan_template_key(len(self.active_measurements), int(self._max_measurement_idx))
 
+    def _active_index_template_key(self) -> Tuple[object, ...]:
+        return (
+            _file_cache_key(self.e_file),
+            _file_cache_key(self.meas_file),
+            bool(self.flat_start),
+            int(self.targeted_pseudo_measurement_max),
+            int(len(self.measurements)),
+            int(getattr(self, "_max_measurement_idx", 0)),
+            int(self.n_state),
+        )
+
+    def _load_active_index_template(self):
+        cached = _ACTIVE_INDEX_TEMPLATE_CACHE.get(self._active_index_template_key())
+        if cached is None:
+            return None
+        return cached
+
+    def _store_active_index_template(
+        self,
+        active_indices: Tuple[int, ...],
+        active_angle_mask: np.ndarray,
+        active_device_type_codes: np.ndarray,
+        active_rows_by_device_type_code: Dict[int, Tuple[int, ...]],
+        first_active_weight: Optional[float],
+        active_weights_are_uniform: bool,
+    ) -> None:
+        if len(_ACTIVE_INDEX_TEMPLATE_CACHE) > 32:
+            _ACTIVE_INDEX_TEMPLATE_CACHE.clear()
+        _ACTIVE_INDEX_TEMPLATE_CACHE[self._active_index_template_key()] = (
+            active_indices,
+            active_angle_mask,
+            active_device_type_codes,
+            active_rows_by_device_type_code,
+            first_active_weight,
+            active_weights_are_uniform,
+        )
+
     def _install_active_plan_cache_entries(self) -> None:
         active_id = id(self.active_measurements)
         self._branch_transformer_vector_plan_cache[active_id] = (
@@ -685,21 +723,63 @@ class ACStateEstimator:
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and vectorized measurement plans."""
         self._initial_observability_cache = None
+        index_template = self._load_active_index_template()
+        if index_template is not None:
+            (
+                active_indices,
+                self.active_angle_residual_mask,
+                self.active_device_type_codes,
+                self._active_rows_by_device_type_code,
+                first_active_weight,
+                active_weights_are_uniform,
+            ) = index_template
+            measurements = self.measurements
+            self.active_measurements = [measurements[idx] for idx in active_indices]
+            self.active_z = np.asarray([measurements[idx].value for idx in active_indices], dtype=np.float64)
+            self.active_weight = np.asarray([measurements[idx].weight for idx in active_indices], dtype=np.float64)
+            self.active_has_angle_residuals = bool(self.active_angle_residual_mask.any())
+            self.active_weights_are_uniform = bool(active_indices) and bool(active_weights_are_uniform)
+            self.active_uniform_weight = first_active_weight if self.active_weights_are_uniform else None
+            self._branch_transformer_vector_plan_cache = {}
+            self._simple_jacobian_plan_cache = {}
+            self._zero_current_vector_plan_cache = {}
+            self._generator_measurement_plan_cache = {}
+            self._balance_measurement_plan_cache = {}
+            if not self._load_active_plan_template(len(self.active_measurements), int(self._max_measurement_idx)):
+                self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
+                self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
+                self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
+                self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
+                self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
+                self.active_measurements_are_vectorized = bool(
+                    np.all(
+                        self._active_branch_transformer_vector_plan["handled_mask"]
+                        | self._active_simple_jacobian_plan["handled_mask"]
+                        | self._active_zero_current_vector_plan["handled_mask"]
+                        | self._active_generator_measurement_plan["handled_mask"]
+                        | self._active_balance_measurement_plan["handled_mask"]
+                    )
+                )
+                self._store_active_plan_template(len(self.active_measurements), int(self._max_measurement_idx))
+            self._install_active_plan_cache_entries()
+            return
         active_measurements = []
         active_z = []
         active_weight = []
         active_angle_mask = []
         active_device_type_codes = []
         active_rows_by_device_type_code = {}
+        active_indices = []
         max_idx = 0
         first_active_weight = None
         active_weights_are_uniform = True
-        for meas in self.measurements:
+        for measurement_index, meas in enumerate(self.measurements):
             if meas.idx > max_idx:
                 max_idx = int(meas.idx)
             if not meas.valid or meas.weight <= 0.0:
                 continue
             active_row = len(active_measurements)
+            active_indices.append(measurement_index)
             active_measurements.append(meas)
             active_z.append(meas.value)
             active_weight.append(meas.weight)
@@ -720,7 +800,18 @@ class ACStateEstimator:
         self.active_has_angle_residuals = any(active_angle_mask)
         self.active_weights_are_uniform = bool(active_weight) and active_weights_are_uniform
         self.active_uniform_weight = first_active_weight if self.active_weights_are_uniform else None
-        self._active_rows_by_device_type_code = active_rows_by_device_type_code
+        self._active_rows_by_device_type_code = {
+            int(device_type_code): tuple(rows)
+            for device_type_code, rows in active_rows_by_device_type_code.items()
+        }
+        self._store_active_index_template(
+            tuple(active_indices),
+            self.active_angle_residual_mask,
+            self.active_device_type_codes,
+            self._active_rows_by_device_type_code,
+            first_active_weight,
+            bool(active_weight) and active_weights_are_uniform,
+        )
         self._branch_transformer_vector_plan_cache = {}
         self._simple_jacobian_plan_cache = {}
         self._zero_current_vector_plan_cache = {}
@@ -4645,15 +4736,16 @@ class ACStateEstimator:
         final_diagnostics: bool = True,
     ) -> EstimateResult:
         """Run weighted least squares with simple damping to avoid voltage divergence."""
+        solve_profile_start = time.perf_counter() if self.profile_enabled else None
         measurements = self._normalize_measurements(measurements)
         if len(measurements) < self.n_state:
             raise RuntimeError(f"Not enough valid measurements: {len(measurements)} < {self.n_state}")
 
         x = self.initial_state() if x0 is None else x0.copy()
         if measurements is self.active_measurements and x0 is None:
-            observability = self.observability_analysis()
+            observability = self._profile_call("solve.observability", self.observability_analysis)
         else:
-            observability = self.observability_analysis(x, measurements)
+            observability = self._profile_call("solve.observability", self.observability_analysis, x, measurements)
         z, weight = self._measurement_vectors(measurements)
         uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
         weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
@@ -4679,19 +4771,24 @@ class ACStateEstimator:
 
         for iteration in range(1, iteration_limit + 1):
             if cached_z_est is None:
-                z_est = self.evaluate(x, measurements)
+                z_est = self._profile_call("solve.evaluate", self.evaluate, x, measurements)
+                start = time.perf_counter() if self.profile_enabled else None
                 residual = self._measurement_residual(z, z_est, measurements)
                 objective = self._weighted_objective(weight, residual)
+                if start is not None:
+                    self._record_profile_time("solve.residual_objective", time.perf_counter() - start)
             else:
                 z_est = cached_z_est
                 residual = cached_residual
                 objective = cached_objective
                 cached_z_est = cached_residual = cached_objective = None
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            H = self.jacobian_sparse(x, measurements)
+            H = self._profile_call("solve.jacobian", self.jacobian_sparse, x, measurements)
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
-            gain, rhs = build_normal_equations(
+            gain, rhs = self._profile_call(
+                "solve.normal_equations",
+                build_normal_equations,
                 H,
                 residual,
                 weight,
@@ -4699,7 +4796,9 @@ class ACStateEstimator:
                 weights_are_uniform=weights_are_uniform,
                 weighted_residual=weighted_residual,
             )
-            dx, normal_factor_diag = normal_solver.solve(
+            dx, normal_factor_diag = self._profile_call(
+                "solve.factor_solve",
+                normal_solver.solve,
                 gain,
                 rhs,
                 return_factor_diag=False,
@@ -4725,9 +4824,12 @@ class ACStateEstimator:
                     candidate[self.n_angle : self.base_switch_re],
                     self.voltage_floor,
                 )
-                candidate_z_est = self.evaluate(candidate, measurements)
+                candidate_z_est = self._profile_call("solve.line_search_evaluate", self.evaluate, candidate, measurements)
+                start = time.perf_counter() if self.profile_enabled else None
                 candidate_residual = self._measurement_residual(z, candidate_z_est, measurements)
                 candidate_objective = self._weighted_objective(weight, candidate_residual)
+                if start is not None:
+                    self._record_profile_time("solve.line_search_residual_objective", time.perf_counter() - start)
                 finite_candidate = np.isfinite(candidate_objective)
                 if not finite_candidate:
                     nonfinite_candidates += 1
@@ -4760,7 +4862,7 @@ class ACStateEstimator:
 
             if verbose:
                 if cached_residual is None:
-                    cached_z_est = self.evaluate(x, measurements)
+                    cached_z_est = self._profile_call("solve.verbose_evaluate", self.evaluate, x, measurements)
                     cached_residual = self._measurement_residual(z, cached_z_est, measurements)
                     cached_objective = self._weighted_objective(weight, cached_residual)
                 updated_residual = cached_residual
@@ -4790,18 +4892,23 @@ class ACStateEstimator:
 
         if not final_quantities_current:
             if cached_z_est is None:
-                z_est = self.evaluate(x, measurements)
+                z_est = self._profile_call("solve.final_evaluate", self.evaluate, x, measurements)
+                start = time.perf_counter() if self.profile_enabled else None
                 residual = self._measurement_residual(z, z_est, measurements)
                 objective = self._weighted_objective(weight, residual)
+                if start is not None:
+                    self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
             else:
                 z_est = cached_z_est
                 residual = cached_residual
                 objective = cached_objective
         if final_diagnostics and not final_quantities_current:
-            H = self.jacobian_sparse(x, measurements)
+            H = self._profile_call("solve.final_jacobian", self.jacobian_sparse, x, measurements)
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
-            gain, _ = build_normal_equations(
+            gain, _ = self._profile_call(
+                "solve.final_normal_equations",
+                build_normal_equations,
                 H,
                 residual,
                 weight,
@@ -4813,6 +4920,8 @@ class ACStateEstimator:
             H = None
             gain = None
         self.apply_state(x)
+        if solve_profile_start is not None:
+            self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         return EstimateResult(
             converged=converged,
             iterations=iteration,
