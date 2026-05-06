@@ -177,6 +177,64 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(len(estimator.active_measurements), z_est.size)
         self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
 
+    def test_active_measurement_rows_use_cached_table_rows(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+
+        class FailingList(list):
+            def __getitem__(self, _index):
+                raise AssertionError("active row lookup should use cached table rows")
+
+        estimator.active_measurements = FailingList(estimator.active_measurements)
+
+        rows = estimator._active_measurement_rows_for_types(("ACNode", "ACBranch"))
+
+        self.assertGreater(rows.size, 0)
+        self.assertTrue(np.issubdtype(rows.dtype, np.integer))
+
+    def test_active_fallback_rows_can_use_table_without_iterating_measurements(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+
+        class TableBackedList(list):
+            def __iter__(self):
+                raise AssertionError("fallback rows should use cached table arrays")
+
+        measurements = TableBackedList(estimator.active_measurements)
+        measurements.table = estimator.active_measurement_table
+
+        zero_mask = np.zeros(len(measurements), dtype=bool)
+
+        def no_vectorized_rows(*_args, **_kwargs):
+            return zero_mask
+
+        estimator._fill_branch_transformer_values_vectorized = no_vectorized_rows
+        estimator._fill_zero_current_values_vectorized = no_vectorized_rows
+        estimator._fill_simple_values_vectorized = no_vectorized_rows
+        estimator._fill_generator_values_vectorized = no_vectorized_rows
+        # Keep balance vectorization enabled because Jacobian fallback does not carry
+        # a scalar ACPowerBalance branch and normally relies on the vectorized plan.
+        estimator._fill_branch_transformer_jacobian_vectorized = no_vectorized_rows
+        estimator._fill_zero_current_jacobian_vectorized = no_vectorized_rows
+        estimator._fill_simple_jacobian_vectorized = no_vectorized_rows
+        estimator._fill_generator_jacobian_sparse = no_vectorized_rows
+
+        x = estimator.initial_state()
+        z_est = estimator.evaluate(x, measurements)
+        H = estimator.jacobian_sparse(x, measurements)
+
+        self.assertEqual(len(measurements), z_est.size)
+        self.assertEqual((len(measurements), estimator.n_state), H.shape)
+
     def test_measurement_residual_skips_angle_mask_scan_when_flag_false(self):
         import secore.se_math as se_math
 
@@ -352,6 +410,77 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(1, len(measurements))
         self.assertEqual("V", measurements[0].meas_type)
+
+    def test_measurement_read_from_file_builds_column_table(self):
+        from secore.ac_se import Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345.6",
+                        "# 8 p_branch ACBranch br_1 p_from 3.5 0 12.0",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            measurements = Measurement.read_from_file(meas_file)
+
+        table = measurements.table
+        self.assertEqual(2, len(measurements))
+        np.testing.assert_array_equal(table.idx, np.array([7, 8], dtype=np.int64))
+        np.testing.assert_array_equal(table.device_type, np.array(["ACNode", "ACBranch"], dtype=object))
+        np.testing.assert_array_equal(table.meas_type, np.array(["V", "P_FROM"], dtype=object))
+        np.testing.assert_allclose(table.weight, np.array([2.5, 3.5]))
+        np.testing.assert_array_equal(table.valid, np.array([True, False]))
+        np.testing.assert_allclose(table.value, np.array([345.6, 12.0]))
+
+    def test_measurement_read_from_file_can_normalize_in_parse(self):
+        from types import SimpleNamespace
+        from secore.ac_se import Measurement
+
+        context = SimpleNamespace(
+            flat_start=False,
+            p_base=100000.0,
+            p_base_kW=100000.0,
+            u_scale=1000.0,
+            i_scale=1.0,
+            network=SimpleNamespace(node_dict={1: SimpleNamespace(vbase=345.0)}),
+            node_by_name={"bus_1": SimpleNamespace(idx=1)},
+            branch_by_name={},
+            transformer_by_name={},
+            zero_branch_by_name={},
+            switch_by_name={},
+            generator_by_name={},
+            load_by_name={},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345000.0",
+                        "# 8 theta_bus_1 ACNode bus_1 angle 1.0 1 90.0",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            measurements = Measurement.read_from_file(meas_file, scale_context=context)
+
+        self.assertTrue(getattr(measurements, "normalized", False))
+        self.assertAlmostEqual(1.0, measurements[0].value)
+        self.assertAlmostEqual(np.pi / 2, measurements[1].value)
+        np.testing.assert_allclose(measurements.table.value, np.array([1.0, np.pi / 2]))
 
     def test_measurement_read_from_file_does_not_share_warm_template_cache(self):
         from secore.ac_se import Measurement
@@ -628,30 +757,33 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsInstance(direct.ACBranch[0], ac_model.ACBranch)
         self.assertTrue(hasattr(direct.ACBranch[0], "i_node_obj"))
 
-    def test_ac_network_load_uses_direct_ac_constructor_by_default(self):
+    def test_ac_network_load_uses_array_model_by_default(self):
         import secore.ac_se
-        import ac_model
+        import ac_array_model
         from secore.ac_se import ACStateEstimator
 
-        original = ac_model._build_ac_model_direct
+        original = ac_array_model.build_ac_ppc_from_e_file
         calls = 0
 
-        def counted_factory(path):
+        def counted_factory(path, *args, **kwargs):
             nonlocal calls
             calls += 1
-            return original(path)
+            return original(path, *args, **kwargs)
 
-        ac_model._build_ac_model_direct = counted_factory
+        ac_array_model.build_ac_ppc_from_e_file = counted_factory
+        secore.ac_se.build_ac_ppc_from_e_file = counted_factory
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
                 meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
             )
         finally:
-            ac_model._build_ac_model_direct = original
+            ac_array_model.build_ac_ppc_from_e_file = original
+            secore.ac_se.build_ac_ppc_from_e_file = original
 
         self.assertEqual(1, calls)
         self.assertTrue(estimator.nodes)
+        self.assertTrue(hasattr(estimator.network, "_array_model"))
 
     def test_normalize_model_named_units_reuses_current_base_per_node(self):
         import unit_system
