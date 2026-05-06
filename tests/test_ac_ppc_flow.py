@@ -83,6 +83,32 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["voltage"]], object_voltage, atol=1e-10)
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["angle"]], object_angle, atol=1e-10)
 
+    def test_ppc_standard_jacobian_avoids_sparse_block_stack(self):
+        import ac_lf
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_flow import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+        self.assertEqual(0, calc.N_phi)
+
+        original_hstack = ac_lf.hstack
+        original_vstack = ac_lf.vstack
+
+        def reject_stack(*_args, **_kwargs):
+            raise AssertionError("standard PPC Jacobian should be assembled directly")
+
+        ac_lf.hstack = reject_stack
+        ac_lf.vstack = reject_stack
+        try:
+            calc.get_jacobi(calc.x)
+        finally:
+            ac_lf.hstack = original_hstack
+            ac_lf.vstack = original_vstack
+
     def test_efile_dict_cache_reuses_unchanged_parse(self):
         from efile_read import clear_efile_cache, read_efile_dict_cached
 

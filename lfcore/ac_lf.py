@@ -301,8 +301,16 @@ class ACPowerFlowCalc:
         self.pq_theta_rows = np.array([], dtype=np.int32)
         self.pq_v_cols = np.array([], dtype=np.int32)
         self.Y_diag = np.array([], dtype=np.complex128)
+        self.Y_jac_rows = np.array([], dtype=np.int32)
+        self.Y_jac_cols = np.array([], dtype=np.int32)
+        self.Y_jac_data = np.array([], dtype=np.complex128)
+        self.Y_jac_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices: List[np.ndarray] = []
         self.Y_offdiag_data: List[np.ndarray] = []
+        self.theta_col_by_node = np.array([], dtype=np.int32)
+        self.v_col_by_node = np.array([], dtype=np.int32)
+        self.p_row_by_node = np.array([], dtype=np.int32)
+        self.q_row_by_node = np.array([], dtype=np.int32)
         self.live_gens: List = []
         self.live_loads: List = []
         self.live_shunts: List = []
@@ -695,6 +703,14 @@ class ACPowerFlowCalc:
             "zero_phi_b": self.zero_phi_b,
             "pq_theta_rows": self.pq_theta_rows,
             "pq_v_cols": self.pq_v_cols,
+            "theta_col_by_node": self.theta_col_by_node,
+            "v_col_by_node": self.v_col_by_node,
+            "p_row_by_node": self.p_row_by_node,
+            "q_row_by_node": self.q_row_by_node,
+            "Y_jac_rows": self.Y_jac_rows,
+            "Y_jac_cols": self.Y_jac_cols,
+            "Y_jac_data": self.Y_jac_data,
+            "Y_jac_diag": self.Y_jac_diag,
             "branch_i": self.branch_i,
             "branch_j": self.branch_j,
             "branch_yff": self.branch_yff,
@@ -742,6 +758,8 @@ class ACPowerFlowCalc:
             "total_vars", "total_eq", "load_pos", "load_pv0", "load_pv1", "load_pv2",
             "load_qv0", "load_qv1", "load_qv2", "zero_idx", "zero_type", "zero_a",
             "zero_b", "zero_phi_a", "zero_phi_b", "pq_theta_rows", "pq_v_cols",
+            "theta_col_by_node", "v_col_by_node", "p_row_by_node", "q_row_by_node",
+            "Y_jac_rows", "Y_jac_cols", "Y_jac_data", "Y_jac_diag",
             "branch_i", "branch_j", "branch_yff", "branch_yft", "branch_ytf",
             "branch_ytt", "transformer_i", "transformer_j", "transformer_yff",
             "transformer_yft", "transformer_ytf", "transformer_ytt", "ppc_gen_rows",
@@ -818,7 +836,7 @@ class ACPowerFlowCalc:
                     load[self.ppc_load_rows, LOAD_COLS["qv1"]],
                     load[self.ppc_load_rows, LOAD_COLS["qv2"]],
                 )
-            ).tolist()
+            )
 
         if self.slack_node == -1:
             pv_indices = np.where(self.node_type == 'PV')[0]
@@ -830,7 +848,7 @@ class ACPowerFlowCalc:
             raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
 
     def _prepare_ppc_y_matrix(self, branch, transformer, shunt):
-        rows, cols, data = [], [], []
+        row_parts, col_parts, data_parts = [], [], []
         if branch.size:
             i_rows = self._ppc_node_rows(branch[:, BRANCH_COLS["i_node"]])
             j_rows = self._ppc_node_rows(branch[:, BRANCH_COLS["j_node"]])
@@ -848,11 +866,9 @@ class ACPowerFlowCalc:
                 branch[self.ppc_branch_rows, BRANCH_COLS["x"]],
                 branch[self.ppc_branch_rows, BRANCH_COLS["b"]],
             )
-            rows.extend(np.column_stack((self.branch_i, self.branch_i, self.branch_j, self.branch_j)).ravel())
-            cols.extend(np.column_stack((self.branch_i, self.branch_j, self.branch_i, self.branch_j)).ravel())
-            data.extend(
-                np.column_stack((self.branch_yff, self.branch_yft, self.branch_ytf, self.branch_ytt)).ravel()
-            )
+            row_parts.append(np.column_stack((self.branch_i, self.branch_i, self.branch_j, self.branch_j)).ravel())
+            col_parts.append(np.column_stack((self.branch_i, self.branch_j, self.branch_i, self.branch_j)).ravel())
+            data_parts.append(np.column_stack((self.branch_yff, self.branch_yft, self.branch_ytf, self.branch_ytt)).ravel())
 
         if transformer.size:
             i_rows = self._ppc_node_rows(transformer[:, TRANSFORMER_COLS["i_node"]])
@@ -878,29 +894,35 @@ class ACPowerFlowCalc:
                 transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["tap"]],
                 transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["shift"]],
             )
-            rows.extend(
+            row_parts.append(
                 np.column_stack((self.transformer_i, self.transformer_i, self.transformer_j, self.transformer_j)).ravel()
             )
-            cols.extend(
+            col_parts.append(
                 np.column_stack((self.transformer_i, self.transformer_j, self.transformer_i, self.transformer_j)).ravel()
             )
-            data.extend(
-                np.column_stack(
-                    (self.transformer_yff, self.transformer_yft, self.transformer_ytf, self.transformer_ytt)
-                ).ravel()
+            data_parts.append(
+                np.column_stack((self.transformer_yff, self.transformer_yft, self.transformer_ytf, self.transformer_ytt)).ravel()
             )
 
         if shunt.size and self.ppc_shunt_rows.size:
-            for shunt_row, pos in zip(self.ppc_shunt_rows, self.ppc_shunt_pos):
-                control = int(shunt[shunt_row, SHUNT_COLS["control_type"]])
-                if control in (SHUNT_B, SHUNT_Z) or shunt[shunt_row, SHUNT_COLS["g_set"]] != 0.0:
-                    y_sh = shunt[shunt_row, SHUNT_COLS["g_set"]] + 1j * shunt[shunt_row, SHUNT_COLS["b_set"]]
-                    if y_sh != 0:
-                        rows.append(int(pos))
-                        cols.append(int(pos))
-                        data.append(y_sh)
+            shunt_live = shunt[self.ppc_shunt_rows]
+            control = shunt_live[:, SHUNT_COLS["control_type"]].astype(np.int32)
+            y_sh = shunt_live[:, SHUNT_COLS["g_set"]] + 1j * shunt_live[:, SHUNT_COLS["b_set"]]
+            mask = ((control == SHUNT_B) | (control == SHUNT_Z) | (shunt_live[:, SHUNT_COLS["g_set"]] != 0.0)) & (y_sh != 0.0)
+            if np.any(mask):
+                shunt_pos = self.ppc_shunt_pos[mask]
+                row_parts.append(shunt_pos)
+                col_parts.append(shunt_pos)
+                data_parts.append(y_sh[mask])
 
-        self.Y = csr_matrix((np.asarray(data), (np.asarray(rows), np.asarray(cols))), shape=(self.N, self.N))
+        if row_parts:
+            rows = np.concatenate(row_parts).astype(np.int32, copy=False)
+            cols = np.concatenate(col_parts).astype(np.int32, copy=False)
+            data = np.concatenate(data_parts).astype(np.complex128, copy=False)
+        else:
+            rows = cols = np.array([], dtype=np.int32)
+            data = np.array([], dtype=np.complex128)
+        self.Y = csr_matrix((data, (rows, cols)), shape=(self.N, self.N))
         self.Y.sum_duplicates()
 
     def _prepare_ppc_zero_edges(self, zero_branch, switch, active_bus):
@@ -979,6 +1001,23 @@ class ACPowerFlowCalc:
             count=self.V_unknown.size,
         )
         self.pq_v_cols = np.arange(self.V_unknown.size, dtype=np.int32)
+        self.theta_col_by_node = np.full(self.N, -1, dtype=np.int32)
+        self.v_col_by_node = np.full(self.N, -1, dtype=np.int32)
+        self.p_row_by_node = np.full(self.N, -1, dtype=np.int32)
+        self.q_row_by_node = np.full(self.N, -1, dtype=np.int32)
+        self.theta_col_by_node[self.theta_unknown] = np.arange(self.n_theta, dtype=np.int32)
+        self.p_row_by_node[self.theta_unknown] = self.theta_col_by_node[self.theta_unknown]
+        self.v_col_by_node[self.V_unknown] = self.n_theta + np.arange(self.n_V, dtype=np.int32)
+        self.q_row_by_node[self.V_unknown] = self.n_theta + np.arange(self.n_V, dtype=np.int32)
+        if SCIPY_AVAILABLE:
+            y_csr = self.Y.tocsr()
+            self.Y_jac_rows = np.repeat(np.arange(self.N, dtype=np.int32), np.diff(y_csr.indptr))
+            self.Y_jac_cols = y_csr.indices.astype(np.int32, copy=True)
+            self.Y_jac_data = y_csr.data.astype(np.complex128, copy=True)
+            self.Y_jac_diag = y_csr.diagonal().astype(np.complex128, copy=False)
+        else:
+            self.Y_jac_rows = self.Y_jac_cols = np.array([], dtype=np.int32)
+            self.Y_jac_data = self.Y_jac_diag = np.array([], dtype=np.complex128)
         self.Y_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices = []
         self.Y_offdiag_data = []
@@ -1614,6 +1653,9 @@ class ACPowerFlowCalc:
 
     def _get_standard_jacobi_sparse(self, V: np.ndarray):
         """标准P/Q方程对theta/V变量的稀疏雅可比，采用MATPOWER矩阵化公式。"""
+        if self.Y_jac_rows.size:
+            return self._get_standard_jacobi_direct(V)
+
         Vc = self._cache['Vc']
         Ibus = self.Y.dot(Vc)
         Vnorm = np.divide(Vc, V, out=np.zeros_like(Vc), where=V != 0)
@@ -1640,6 +1682,106 @@ class ACPowerFlowCalc:
             J22 = J22 + diags(dQload_dV[pq], 0, shape=(pq.size, pq.size), format='csr')
 
         return vstack((hstack((J11, J12), format='csr'), hstack((J21, J22), format='csr')), format='csr')
+
+    def _get_standard_jacobi_direct(self, V: np.ndarray):
+        """Build the standard P/Q Jacobian directly from Y nonzeros."""
+        theta = self._cache['theta']
+        Vc = self._cache['Vc']
+        Ibus = self.Y.dot(Vc)
+        Sbus = Vc * np.conj(Ibus)
+        P = Sbus.real
+        Q = Sbus.imag
+
+        i = self.Y_jac_rows
+        j = self.Y_jac_cols
+        y = self.Y_jac_data
+        G = y.real
+        B = y.imag
+        Vi = V[i]
+        Vj = V[j]
+        delta = theta[i] - theta[j]
+        cos_delta = np.cos(delta)
+        sin_delta = np.sin(delta)
+
+        p_theta = Vi * Vj * (G * sin_delta - B * cos_delta)
+        q_theta = -Vi * Vj * (G * cos_delta + B * sin_delta)
+        p_vm = Vi * (G * cos_delta + B * sin_delta)
+        q_vm = Vi * (G * sin_delta - B * cos_delta)
+
+        diag_mask = i == j
+        if np.any(diag_mask):
+            diag_nodes = i[diag_mask]
+            diag_y = self.Y_jac_diag[diag_nodes]
+            Gii = diag_y.real
+            Bii = diag_y.imag
+            Vdiag = V[diag_nodes]
+            p_theta[diag_mask] = -Q[diag_nodes] - Bii * Vdiag * Vdiag
+            q_theta[diag_mask] = P[diag_nodes] - Gii * Vdiag * Vdiag
+            p_vm[diag_mask] = np.divide(
+                P[diag_nodes],
+                Vdiag,
+                out=np.zeros_like(Vdiag),
+                where=np.abs(Vdiag) > 1e-12,
+            ) + Gii * Vdiag
+            q_vm[diag_mask] = np.divide(
+                Q[diag_nodes],
+                Vdiag,
+                out=np.zeros_like(Vdiag),
+                where=np.abs(Vdiag) > 1e-12,
+            ) - Bii * Vdiag
+
+        p_rows = self.p_row_by_node[i]
+        q_rows = self.q_row_by_node[i]
+        theta_cols = self.theta_col_by_node[j]
+        v_cols = self.v_col_by_node[j]
+
+        rows_parts = []
+        cols_parts = []
+        data_parts = []
+
+        mask = (p_rows >= 0) & (theta_cols >= 0)
+        if np.any(mask):
+            rows_parts.append(p_rows[mask])
+            cols_parts.append(theta_cols[mask])
+            data_parts.append(p_theta[mask])
+
+        mask = (p_rows >= 0) & (v_cols >= 0)
+        if np.any(mask):
+            rows_parts.append(p_rows[mask])
+            cols_parts.append(v_cols[mask])
+            data_parts.append(p_vm[mask])
+
+        mask = (q_rows >= 0) & (theta_cols >= 0)
+        if np.any(mask):
+            rows_parts.append(q_rows[mask])
+            cols_parts.append(theta_cols[mask])
+            data_parts.append(q_theta[mask])
+
+        mask = (q_rows >= 0) & (v_cols >= 0)
+        if np.any(mask):
+            rows_parts.append(q_rows[mask])
+            cols_parts.append(v_cols[mask])
+            data_parts.append(q_vm[mask])
+
+        if self.V_unknown.size:
+            dPload_dV, dQload_dV = self._calc_load_power_derivatives(V)
+            p_load_rows = self.p_row_by_node[self.V_unknown]
+            v_load_cols = self.v_col_by_node[self.V_unknown]
+            q_load_rows = self.q_row_by_node[self.V_unknown]
+            rows_parts.extend((p_load_rows, q_load_rows))
+            cols_parts.extend((v_load_cols, v_load_cols))
+            data_parts.extend((dPload_dV[self.V_unknown], dQload_dV[self.V_unknown]))
+
+        if rows_parts:
+            rows = np.concatenate(rows_parts).astype(np.int32, copy=False)
+            cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
+            data = np.concatenate(data_parts).astype(np.float64, copy=False)
+        else:
+            rows = cols = np.array([], dtype=np.int32)
+            data = np.array([], dtype=np.float64)
+        J = coo_matrix((data, (rows, cols)), shape=(self.n_theta + self.n_V, self.n_theta + self.n_V)).tocsr()
+        J.sum_duplicates()
+        return J
 
     def get_jacobi(self, x: np.ndarray) -> csr_matrix:
         """计算雅可比矩阵。标准AC部分使用稀疏矩阵批量公式，零阻抗扩展按块追加。"""
