@@ -206,7 +206,9 @@ def clear_ac_ppc_cache(file_path=None) -> None:
         if file_path is None:
             _AC_PPC_CACHE.clear()
         else:
-            _AC_PPC_CACHE.pop(Path(file_path).resolve(), None)
+            path = Path(file_path).resolve()
+            _AC_PPC_CACHE.pop((path, True), None)
+            _AC_PPC_CACHE.pop((path, False), None)
 
 
 def _node_row_maps(bus: np.ndarray) -> Tuple[Dict[int, int], np.ndarray]:
@@ -222,7 +224,12 @@ def _empty(width: int) -> np.ndarray:
     return np.zeros((0, width), dtype=np.float64)
 
 
-def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: bool = False) -> Dict:
+def build_ac_ppc_from_e_file(
+    file_path,
+    use_cache: bool = True,
+    copy_arrays: bool = False,
+    include_device_names: bool = True,
+) -> Dict:
     """Build a MATPOWER-like NumPy dictionary for AC power-flow fast paths.
 
     The returned arrays are in pu/radians and should be treated as read-only by
@@ -231,7 +238,7 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     file_key = _file_cache_key(file_path)
     if use_cache:
         with _AC_PPC_CACHE_LOCK:
-            cached = _AC_PPC_CACHE.get(file_key[0])
+            cached = _AC_PPC_CACHE.get((file_key[0], include_device_names))
             if cached is not None and cached[0] == file_key:
                 return _copy_ppc(cached[1]) if copy_arrays else cached[1]
 
@@ -318,12 +325,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         branch[:, BRANCH_COLS["x"]] = branch_numeric[:, 4]
         branch[:, BRANCH_COLS["b"]] = branch_numeric[:, 5]
         branch[:, BRANCH_COLS["run_stat"]] = branch_numeric[:, 6]
-    branch_names = np.asarray(
-        [
-            row[branch_name_col] if branch_name_col is not None and row[branch_name_col] else f"branch_{pos}"
-            for pos, row in enumerate(branch_rows)
-        ],
-        dtype=object,
+    branch_names = (
+        np.asarray(
+            [
+                row[branch_name_col] if branch_name_col is not None and row[branch_name_col] else f"branch_{pos}"
+                for pos, row in enumerate(branch_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     transformer_rows = _rows(raw, "ACTransformer")
@@ -365,12 +376,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         transformer[:, TRANSFORMER_COLS["tap"]] = transformer_numeric[:, 6]
         transformer[:, TRANSFORMER_COLS["shift"]] = transformer_numeric[:, 7]
         transformer[:, TRANSFORMER_COLS["run_stat"]] = transformer_numeric[:, 8]
-    transformer_names = np.asarray(
-        [
-            row[transformer_name_col] if transformer_name_col is not None and row[transformer_name_col] else f"transformer_{pos}"
-            for pos, row in enumerate(transformer_rows)
-        ],
-        dtype=object,
+    transformer_names = (
+        np.asarray(
+            [
+                row[transformer_name_col] if transformer_name_col is not None and row[transformer_name_col] else f"transformer_{pos}"
+                for pos, row in enumerate(transformer_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     gen_rows = _rows(raw, "ACGenerator")
@@ -419,12 +434,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
             np.float64,
             copy=False,
         )
-    gen_names = np.asarray(
-        [
-            row[gen_name_col] if gen_name_col is not None and row[gen_name_col] else f"gen_{pos}"
-            for pos, row in enumerate(gen_rows)
-        ],
-        dtype=object,
+    gen_names = (
+        np.asarray(
+            [
+                row[gen_name_col] if gen_name_col is not None and row[gen_name_col] else f"gen_{pos}"
+                for pos, row in enumerate(gen_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     load_rows = _rows(raw, "ACLoad")
@@ -449,12 +468,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         for offset, target_col in enumerate(load_target_cols, start=2):
             load[:, target_col] = load_numeric[:, offset] * inv_p_base
         load[:, LOAD_COLS["run_stat"]] = load_numeric[:, 8]
-    load_names = np.asarray(
-        [
-            row[load_name_col] if load_name_col is not None and row[load_name_col] else f"load_{pos}"
-            for pos, row in enumerate(load_rows)
-        ],
-        dtype=object,
+    load_names = (
+        np.asarray(
+            [
+                row[load_name_col] if load_name_col is not None and row[load_name_col] else f"load_{pos}"
+                for pos, row in enumerate(load_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     shunt_rows = _rows(raw, "ACShuntCompensator")
@@ -496,12 +519,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
             np.float64,
             copy=False,
         )
-    shunt_names = np.asarray(
-        [
-            row[shunt_name_col] if shunt_name_col is not None and row[shunt_name_col] else f"shunt_{pos}"
-            for pos, row in enumerate(shunt_rows)
-        ],
-        dtype=object,
+    shunt_names = (
+        np.asarray(
+            [
+                row[shunt_name_col] if shunt_name_col is not None and row[shunt_name_col] else f"shunt_{pos}"
+                for pos, row in enumerate(shunt_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     zero_rows = _rows(raw, "ACZeroBranch")
@@ -523,12 +550,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         zero_branch[:, ZERO_BRANCH_COLS["i_node"]] = zero_numeric[:, 1]
         zero_branch[:, ZERO_BRANCH_COLS["j_node"]] = zero_numeric[:, 2]
         zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] = zero_numeric[:, 3]
-    zero_branch_names = np.asarray(
-        [
-            row[zero_name_col] if zero_name_col is not None and row[zero_name_col] else f"zero_branch_{pos}"
-            for pos, row in enumerate(zero_rows)
-        ],
-        dtype=object,
+    zero_branch_names = (
+        np.asarray(
+            [
+                row[zero_name_col] if zero_name_col is not None and row[zero_name_col] else f"zero_branch_{pos}"
+                for pos, row in enumerate(zero_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     switch_rows = _rows(raw, "ACSwitch")
@@ -552,12 +583,16 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         switch[:, SWITCH_COLS["j_node"]] = switch_numeric[:, 2]
         switch[:, SWITCH_COLS["status"]] = switch_numeric[:, 3]
         switch[:, SWITCH_COLS["run_stat"]] = switch_numeric[:, 4]
-    switch_names = np.asarray(
-        [
-            row[switch_name_col] if switch_name_col is not None and row[switch_name_col] else f"switch_{pos}"
-            for pos, row in enumerate(switch_rows)
-        ],
-        dtype=object,
+    switch_names = (
+        np.asarray(
+            [
+                row[switch_name_col] if switch_name_col is not None and row[switch_name_col] else f"switch_{pos}"
+                for pos, row in enumerate(switch_rows)
+            ],
+            dtype=object,
+        )
+        if include_device_names
+        else None
     )
 
     ppc = {
@@ -573,13 +608,6 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         "zero_branch": zero_branch,
         "switch": switch,
         "bus_name": bus_names,
-        "branch_name": branch_names,
-        "transformer_name": transformer_names,
-        "gen_name": gen_names,
-        "load_name": load_names,
-        "shunt_name": shunt_names,
-        "zero_branch_name": zero_branch_names,
-        "switch_name": switch_names,
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
         "transformer_cols": TRANSFORMER_COLS,
@@ -591,9 +619,21 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
         "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
     }
+    if include_device_names:
+        ppc.update(
+            {
+                "branch_name": branch_names,
+                "transformer_name": transformer_names,
+                "gen_name": gen_names,
+                "load_name": load_names,
+                "shunt_name": shunt_names,
+                "zero_branch_name": zero_branch_names,
+                "switch_name": switch_names,
+            }
+        )
     if use_cache:
         with _AC_PPC_CACHE_LOCK:
-            _AC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+            _AC_PPC_CACHE[(file_key[0], include_device_names)] = (file_key, ppc)
     return _copy_ppc(ppc) if copy_arrays else ppc
 
 

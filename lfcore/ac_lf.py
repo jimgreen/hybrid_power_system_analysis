@@ -107,6 +107,7 @@ from collections import deque
 from typing import List, Tuple, Dict, Optional
 import warnings
 import sys
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -136,6 +137,49 @@ from ac_array_model import (
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
 )
+
+_SPARSE_SOLVER = None
+_SPARSE_SOLVER_NAME = None
+
+
+def _load_suitesparse_solver():
+    """Return an optional SuiteSparse-compatible sparse solver when installed."""
+    candidates = (
+        ("scikits.umfpack", "spsolve", "umfpack"),
+        ("sksparse.klu", "spsolve", "klu"),
+        ("klu", "solve", "klu"),
+    )
+    for module_name, func_name, solver_name in candidates:
+        try:
+            if importlib.util.find_spec(module_name) is None:
+                continue
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+        try:
+            module = importlib.import_module(module_name)
+            solver = getattr(module, func_name, None)
+        except Exception:
+            continue
+        if solver is not None:
+            return solver_name, solver
+    return None, None
+
+
+def solve_sparse_system(matrix, rhs):
+    """Solve a sparse linear system, preferring SuiteSparse/KLU bindings when available."""
+    global _SPARSE_SOLVER, _SPARSE_SOLVER_NAME
+    if SCIPY_AVAILABLE:
+        if _SPARSE_SOLVER is None and _SPARSE_SOLVER_NAME is None:
+            _SPARSE_SOLVER_NAME, _SPARSE_SOLVER = _load_suitesparse_solver()
+            if _SPARSE_SOLVER is None:
+                _SPARSE_SOLVER_NAME = "scipy"
+        if _SPARSE_SOLVER is not None:
+            try:
+                return _SPARSE_SOLVER(matrix, rhs)
+            except Exception:
+                _SPARSE_SOLVER = None
+                _SPARSE_SOLVER_NAME = "scipy"
+    return spsolve(matrix, rhs)
 
 
 class _PPCNode:
@@ -254,6 +298,7 @@ class ACPowerFlowCalc:
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
         algorithm: str = "nr",
+        keep_node_objects: bool = True,
     ):
         # 基础配置
         algorithm = str(algorithm).strip().lower()
@@ -266,6 +311,7 @@ class ACPowerFlowCalc:
         )
         self.ppc = network if isinstance(network, dict) and network.get("format") == "ac_ppc_v1" else None
         self.array_mode = self.ppc is not None
+        self.keep_node_objects = bool(keep_node_objects)
         self.net = None if self.array_mode else network
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
@@ -285,6 +331,11 @@ class ACPowerFlowCalc:
         self.N: int = 0
         self.node_list: List = []
         self.node_pos: Dict[int, int] = {}
+        self.ppc_node_idx = np.array([], dtype=np.int64)
+        self.ppc_node_name = np.array([], dtype=object)
+        self.ppc_node_vbase = np.array([], dtype=np.float64)
+        self.ppc_node_voltage = np.array([], dtype=np.float64)
+        self.ppc_node_angle = np.array([], dtype=np.float64)
         self.isl = None
         self.Y: Optional[csr_matrix] = None
 
@@ -362,6 +413,13 @@ class ACPowerFlowCalc:
         self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_p_pos = np.array([], dtype=np.intp)
         self.std_jac_load_q_pos = np.array([], dtype=np.intp)
+        self._jac_delta = np.array([], dtype=np.float64)
+        self._jac_cos_delta = np.array([], dtype=np.float64)
+        self._jac_sin_delta = np.array([], dtype=np.float64)
+        self._jac_vivj = np.array([], dtype=np.float64)
+        self._jac_common_p = np.array([], dtype=np.float64)
+        self._jac_common_q = np.array([], dtype=np.float64)
+        self._jac_tmp = np.array([], dtype=np.float64)
         self.live_gens: List = []
         self.live_loads: List = []
         self.live_shunts: List = []
@@ -402,7 +460,20 @@ class ACPowerFlowCalc:
         self.pq_Bpp_factor = None
         self._state_theta = np.array([], dtype=np.float64)
         self._state_voltage = np.array([], dtype=np.float64)
+        self._state_vc = np.array([], dtype=np.complex128)
         self._empty_phi = np.array([], dtype=np.float64)
+        self._state_x_obj = None
+        self._power_x_obj = None
+        self._last_Ibus = None
+        self._last_Sbus = None
+        self._load_p_work = np.array([], dtype=np.float64)
+        self._load_q_work = np.array([], dtype=np.float64)
+        self._load_dp_work = np.array([], dtype=np.float64)
+        self._load_dq_work = np.array([], dtype=np.float64)
+        self._load_vm_work = np.array([], dtype=np.float64)
+        self._load_value_work = np.array([], dtype=np.float64)
+        self._load_aux_work = np.array([], dtype=np.float64)
+        self._residual_work = np.array([], dtype=np.float64)
         self.result: Dict = {}
 
     @classmethod
@@ -436,6 +507,9 @@ class ACPowerFlowCalc:
             self.load_pos = np.array([], dtype=np.int32)
             self.load_pv0 = self.load_pv1 = self.load_pv2 = np.array([], dtype=np.float64)
             self.load_qv0 = self.load_qv1 = self.load_qv2 = np.array([], dtype=np.float64)
+        self._load_vm_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
 
         if self.N_phi > 0 and len(self.zero_branch_info) > 0:
             self.zero_idx = self.zero_branch_info[:, 0].astype(np.int32)
@@ -528,13 +602,22 @@ class ACPowerFlowCalc:
 
         # 更新缓存
         if update_cache:
+            cos_theta = np.cos(theta)
+            sin_theta = np.sin(theta)
+            Vc = self._state_vc
+            np.multiply(V, cos_theta, out=Vc.real)
+            np.multiply(V, sin_theta, out=Vc.imag)
             self._cache.update({
                 'theta': theta,
                 'V': V,
-                'cos_theta': np.cos(theta),
-                'sin_theta': np.sin(theta),
-                'Vc': V * np.exp(1j * theta)
+                'cos_theta': cos_theta,
+                'sin_theta': sin_theta,
+                'Vc': Vc
             })
+            self._state_x_obj = x
+            self._power_x_obj = None
+            self._last_Ibus = None
+            self._last_Sbus = None
 
         return theta, V, phi_re, phi_im
 
@@ -548,6 +631,9 @@ class ACPowerFlowCalc:
         # 导纳注入功率
         I_y = self.Y.dot(Vc)
         S_y = Vc * np.conj(I_y)
+        self._power_x_obj = self._state_x_obj
+        self._last_Ibus = I_y
+        self._last_Sbus = S_y
 
         # 负荷功率（首次计算时缓存）
         P_load, Q_load = self._calc_load_power(V)
@@ -564,19 +650,33 @@ class ACPowerFlowCalc:
 
     def _calc_load_power(self, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """提取负荷功率计算逻辑（精简独立函数）"""
-        P_load = np.zeros(self.N, dtype=np.float64)
-        Q_load = np.zeros(self.N, dtype=np.float64)
+        P_load = self._load_p_work
+        Q_load = self._load_q_work
+        P_load.fill(0.0)
+        Q_load.fill(0.0)
 
         if self.load_pos.size:
-            vm_vals = V[self.load_pos]
+            vm_vals = self._load_vm_work
+            values = self._load_value_work
+            aux = self._load_aux_work
+            np.take(V, self.load_pos, out=vm_vals)
 
             # 向量化计算负荷功率
-            p_vals = self.load_pv0 + self.load_pv1 * vm_vals + self.load_pv2 * vm_vals ** 2
-            q_vals = self.load_qv0 + self.load_qv1 * vm_vals + self.load_qv2 * vm_vals ** 2
+            np.multiply(vm_vals, vm_vals, out=values)
+            values *= self.load_pv2
+            np.multiply(self.load_pv1, vm_vals, out=aux)
+            values += aux
+            values += self.load_pv0
 
             # 累加至对应节点
-            np.add.at(P_load, self.load_pos, p_vals)
-            np.add.at(Q_load, self.load_pos, q_vals)
+            np.add.at(P_load, self.load_pos, values)
+
+            np.multiply(vm_vals, vm_vals, out=values)
+            values *= self.load_qv2
+            np.multiply(self.load_qv1, vm_vals, out=aux)
+            values += aux
+            values += self.load_qv0
+            np.add.at(Q_load, self.load_pos, values)
 
         return P_load, Q_load
 
@@ -683,18 +783,35 @@ class ACPowerFlowCalc:
         self.row_to_pos[self.active_bus_rows] = np.arange(self.active_bus_rows.size, dtype=np.int32)
         self.N = int(self.active_bus_rows.size)
 
-        bus_names = ppc.get("bus_name", np.asarray([f"bus_{int(idx)}" for idx in bus_ids], dtype=object))
-        self.node_list = [
-            _PPCNode(
-                idx=int(bus[row, BUS_COLS["idx"]]),
-                name=str(bus_names[row]),
-                vbase=float(bus[row, BUS_COLS["vbase"]]),
-                voltage=float(bus[row, BUS_COLS["voltage"]]),
-                angle=float(bus[row, BUS_COLS["angle"]]),
-            )
-            for row in self.active_bus_rows
-        ]
-        self.node_pos = {node.idx: pos for pos, node in enumerate(self.node_list)}
+        active_rows = self.active_bus_rows
+        self.ppc_node_idx = bus[active_rows, BUS_COLS["idx"]].astype(np.int64, copy=True)
+        self.ppc_node_vbase = bus[active_rows, BUS_COLS["vbase"]].astype(np.float64, copy=True)
+        self.ppc_node_voltage = bus[active_rows, BUS_COLS["voltage"]].astype(np.float64, copy=True)
+        self.ppc_node_angle = bus[active_rows, BUS_COLS["angle"]].astype(np.float64, copy=True)
+        if self.keep_node_objects:
+            bus_names = ppc.get("bus_name", np.asarray([f"bus_{int(idx)}" for idx in bus_ids], dtype=object))
+            self.ppc_node_name = np.asarray(bus_names[active_rows], dtype=object)
+            self.node_list = [
+                _PPCNode(
+                    idx=int(idx),
+                    name=str(name),
+                    vbase=float(vbase),
+                    voltage=float(voltage),
+                    angle=float(angle),
+                )
+                for idx, name, vbase, voltage, angle in zip(
+                    self.ppc_node_idx,
+                    self.ppc_node_name,
+                    self.ppc_node_vbase,
+                    self.ppc_node_voltage,
+                    self.ppc_node_angle,
+                )
+            ]
+            self.node_pos = {node.idx: pos for pos, node in enumerate(self.node_list)}
+        else:
+            self.ppc_node_name = np.empty(self.N, dtype=object)
+            self.node_list = []
+            self.node_pos = {}
 
         self.node_type = np.full(self.N, 'PQ', dtype='U5')
         self.V_spec = np.full(self.N, np.nan, dtype=np.float64)
@@ -716,11 +833,11 @@ class ACPowerFlowCalc:
             "N": self.N,
             "active_bus_rows": self.active_bus_rows,
             "row_to_pos": self.row_to_pos,
-            "node_idx": np.asarray([node.idx for node in self.node_list], dtype=np.int64),
-            "node_name": np.asarray([node.name for node in self.node_list], dtype=object),
-            "node_vbase": np.asarray([node.vbase for node in self.node_list], dtype=np.float64),
-            "node_voltage": np.asarray([node.voltage for node in self.node_list], dtype=np.float64),
-            "node_angle": np.asarray([node.angle for node in self.node_list], dtype=np.float64),
+            "node_idx": self.ppc_node_idx,
+            "node_name": self.ppc_node_name,
+            "node_vbase": self.ppc_node_vbase,
+            "node_voltage": self.ppc_node_voltage,
+            "node_angle": self.ppc_node_angle,
             "node_pos": self.node_pos,
             "node_type": self.node_type,
             "V_spec": self.V_spec,
@@ -799,12 +916,28 @@ class ACPowerFlowCalc:
             "std_jac_load_extra_nodes": self.std_jac_load_extra_nodes,
             "std_jac_load_p_pos": self.std_jac_load_p_pos,
             "std_jac_load_q_pos": self.std_jac_load_q_pos,
+            "_jac_delta": self._jac_delta,
+            "_jac_cos_delta": self._jac_cos_delta,
+            "_jac_sin_delta": self._jac_sin_delta,
+            "_jac_vivj": self._jac_vivj,
+            "_jac_common_p": self._jac_common_p,
+            "_jac_common_q": self._jac_common_q,
+            "_jac_tmp": self._jac_tmp,
+            "_load_p_work": self._load_p_work,
+            "_load_q_work": self._load_q_work,
+            "_load_dp_work": self._load_dp_work,
+            "_load_dq_work": self._load_dq_work,
+            "_load_vm_work": self._load_vm_work,
+            "_load_value_work": self._load_value_work,
+            "_load_aux_work": self._load_aux_work,
+            "_residual_work": self._residual_work,
             "pq_Bp": self.pq_Bp,
             "pq_Bpp": self.pq_Bpp,
             "pq_Bp_factor": self.pq_Bp_factor,
             "pq_Bpp_factor": self.pq_Bpp_factor,
             "_state_theta": self._state_theta,
             "_state_voltage": self._state_voltage,
+            "_state_vc": self._state_vc,
             "_empty_phi": self._empty_phi,
             "branch_i": self.branch_i,
             "branch_j": self.branch_j,
@@ -834,17 +967,32 @@ class ACPowerFlowCalc:
         self.N = static["N"]
         self.active_bus_rows = static["active_bus_rows"]
         self.row_to_pos = static["row_to_pos"]
-        self.node_list = [
-            _PPCNode(int(idx), str(name), float(vbase), float(voltage), float(angle))
-            for idx, name, vbase, voltage, angle in zip(
-                static["node_idx"],
-                static["node_name"],
-                static["node_vbase"],
-                static["node_voltage"],
-                static["node_angle"],
-            )
-        ]
+        self.ppc_node_idx = static["node_idx"]
+        self.ppc_node_name = static["node_name"]
+        self.ppc_node_vbase = static["node_vbase"]
+        self.ppc_node_voltage = static["node_voltage"]
+        self.ppc_node_angle = static["node_angle"]
+        if self.keep_node_objects:
+            if self.ppc_node_name.size != self.N:
+                bus = self.ppc["bus"]
+                bus_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
+                bus_names = self.ppc.get("bus_name", np.asarray([f"bus_{int(idx)}" for idx in bus_ids], dtype=object))
+                self.ppc_node_name = np.asarray(bus_names[self.active_bus_rows], dtype=object)
+            self.node_list = [
+                _PPCNode(int(idx), str(name), float(vbase), float(voltage), float(angle))
+                for idx, name, vbase, voltage, angle in zip(
+                    self.ppc_node_idx,
+                    self.ppc_node_name,
+                    self.ppc_node_vbase,
+                    self.ppc_node_voltage,
+                    self.ppc_node_angle,
+                )
+            ]
+        else:
+            self.node_list = []
         self.node_pos = static["node_pos"]
+        if self.keep_node_objects and not self.node_pos:
+            self.node_pos = {int(idx): pos for pos, idx in enumerate(self.ppc_node_idx)}
         for name in (
             "node_type", "V_spec", "theta_spec", "P_spec", "Q_spec", "Y",
             "_slack_mask", "_fixed_voltage_mask", "zero_edges", "comp_nodes", "comp_tree_edges", "phi_node", "phi_comp",
@@ -863,7 +1011,10 @@ class ACPowerFlowCalc:
             "std_jac_load_q_slice", "standard_jac_csr_indices", "standard_jac_csr_indptr",
             "standard_jac_csr_order", "standard_jac_csr_data", "std_jac_load_nodes",
             "std_jac_load_extra_nodes", "std_jac_load_p_pos", "std_jac_load_q_pos", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
-            "_state_theta", "_state_voltage", "_empty_phi",
+            "_jac_delta", "_jac_cos_delta", "_jac_sin_delta", "_jac_vivj", "_jac_common_p", "_jac_common_q", "_jac_tmp",
+            "_load_p_work", "_load_q_work", "_load_dp_work", "_load_dq_work",
+            "_load_vm_work", "_load_value_work", "_load_aux_work", "_residual_work",
+            "_state_theta", "_state_voltage", "_state_vc", "_empty_phi",
             "branch_i", "branch_j", "branch_yff", "branch_yft", "branch_ytf",
             "branch_ytt", "transformer_i", "transformer_j", "transformer_yff",
             "transformer_yft", "transformer_ytf", "transformer_ytt", "ppc_gen_rows",
@@ -873,6 +1024,10 @@ class ACPowerFlowCalc:
             setattr(self, name, static[name])
         self.x = static["x0"].copy()
         self.standard_jac_data = static["standard_jac_data"].copy()
+        self._state_x_obj = None
+        self._power_x_obj = None
+        self._last_Ibus = None
+        self._last_Sbus = None
 
     def _prepare_ppc_devices(self, branch, transformer, gen, load, shunt, zero_branch, switch, active_bus):
         """Convert live ppc device rows into compact node positions and specification arrays."""
@@ -1086,7 +1241,16 @@ class ACPowerFlowCalc:
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
         self._state_theta = np.empty(self.N, dtype=np.float64)
         self._state_voltage = np.empty(self.N, dtype=np.float64)
+        self._state_vc = np.empty(self.N, dtype=np.complex128)
         self._empty_phi = np.array([], dtype=np.float64)
+        self._load_p_work = np.zeros(self.N, dtype=np.float64)
+        self._load_q_work = np.zeros(self.N, dtype=np.float64)
+        self._load_dp_work = np.zeros(self.N, dtype=np.float64)
+        self._load_dq_work = np.zeros(self.N, dtype=np.float64)
+        self._load_vm_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._residual_work = np.zeros(self.total_eq, dtype=np.float64)
         self._cache_static_numeric_arrays()
         self._cache_pq_decoupled_matrices()
         if self.total_vars != self.total_eq:
@@ -1108,6 +1272,9 @@ class ACPowerFlowCalc:
             self.load_pos = np.array([], dtype=np.int32)
             self.load_pv0 = self.load_pv1 = self.load_pv2 = np.array([], dtype=np.float64)
             self.load_qv0 = self.load_qv1 = self.load_qv2 = np.array([], dtype=np.float64)
+        self._load_vm_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
         if self.N_phi > 0 and len(self.zero_branch_info) > 0:
             self.zero_idx = self.zero_branch_info[:, 0].astype(np.int32)
             self.zero_type = self.zero_branch_info[:, 1].astype(np.int32)
@@ -1247,6 +1414,14 @@ class ACPowerFlowCalc:
             self.standard_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
             self.standard_jac_csr_order = pattern.data.astype(np.intp, copy=True)
             self.standard_jac_csr_data = np.empty_like(self.standard_jac_data)
+            y_nnz = self.Y_jac_rows.size
+            self._jac_delta = np.empty(y_nnz, dtype=np.float64)
+            self._jac_cos_delta = np.empty(y_nnz, dtype=np.float64)
+            self._jac_sin_delta = np.empty(y_nnz, dtype=np.float64)
+            self._jac_vivj = np.empty(y_nnz, dtype=np.float64)
+            self._jac_common_p = np.empty(y_nnz, dtype=np.float64)
+            self._jac_common_q = np.empty(y_nnz, dtype=np.float64)
+            self._jac_tmp = np.empty(y_nnz, dtype=np.float64)
 
     def _cache_pq_decoupled_matrices(self):
         """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
@@ -1409,7 +1584,16 @@ class ACPowerFlowCalc:
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
         self._state_theta = np.empty(self.N, dtype=np.float64)
         self._state_voltage = np.empty(self.N, dtype=np.float64)
+        self._state_vc = np.empty(self.N, dtype=np.complex128)
         self._empty_phi = np.array([], dtype=np.float64)
+        self._load_p_work = np.zeros(self.N, dtype=np.float64)
+        self._load_q_work = np.zeros(self.N, dtype=np.float64)
+        self._load_dp_work = np.zeros(self.N, dtype=np.float64)
+        self._load_dq_work = np.zeros(self.N, dtype=np.float64)
+        self._load_vm_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
+        self._residual_work = np.zeros(self.total_eq, dtype=np.float64)
         self._cache_static_arrays()
         self._cache_pq_decoupled_matrices()
 
@@ -1675,9 +1859,12 @@ class ACPowerFlowCalc:
         """计算残差向量 F"""
         theta, V, phi_re, phi_im = self._extract_state_vars(x)
         dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
+        return self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
 
-        # 预分配残差向量
-        F = np.zeros(self.total_eq, dtype=np.float64)
+    def _fill_residual(self, theta, V, phi_re, phi_im, dP, dQ) -> np.ndarray:
+        """Fill the preallocated Newton residual using already computed balances."""
+        F = self._residual_work
+        F.fill(0.0)
         eq_idx = 0
         # 方程顺序必须与 get_jacobi() 保持一致：P、Q、零阻抗电压约束、phi参考。
 
@@ -1960,18 +2147,29 @@ class ACPowerFlowCalc:
         return build_jacobian_matrix(rows, cols, data, (self.total_eq, self.total_vars))
 
     def _calc_load_power_derivatives(self, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        dP = np.zeros(self.N, dtype=np.float64)
-        dQ = np.zeros(self.N, dtype=np.float64)
+        dP = self._load_dp_work
+        dQ = self._load_dq_work
+        dP.fill(0.0)
+        dQ.fill(0.0)
         if self.load_pos.size:
-            vm = V[self.load_pos]
-            np.add.at(dP, self.load_pos, self.load_pv1 + 2.0 * vm * self.load_pv2)
-            np.add.at(dQ, self.load_pos, self.load_qv1 + 2.0 * vm * self.load_qv2)
+            vm = self._load_vm_work
+            values = self._load_value_work
+            np.take(V, self.load_pos, out=vm)
+            np.multiply(vm, self.load_pv2, out=values)
+            values *= 2.0
+            values += self.load_pv1
+            np.add.at(dP, self.load_pos, values)
+
+            np.multiply(vm, self.load_qv2, out=values)
+            values *= 2.0
+            values += self.load_qv1
+            np.add.at(dQ, self.load_pos, values)
         return dP, dQ
 
-    def _get_standard_jacobi_sparse(self, V: np.ndarray):
+    def _get_standard_jacobi_sparse(self, V: np.ndarray, Sbus=None):
         """标准P/Q方程对theta/V变量的稀疏雅可比，采用MATPOWER矩阵化公式。"""
         if self.Y_jac_rows.size:
-            return self._get_standard_jacobi_direct(V)
+            return self._get_standard_jacobi_direct(V, Sbus=Sbus)
 
         Vc = self._cache['Vc']
         Ibus = self.Y.dot(Vc)
@@ -2000,12 +2198,20 @@ class ACPowerFlowCalc:
 
         return vstack((hstack((J11, J12), format='csr'), hstack((J21, J22), format='csr')), format='csr')
 
-    def _get_standard_jacobi_direct(self, V: np.ndarray):
+    def _get_standard_jacobi_direct(self, V: np.ndarray, Sbus=None):
         """Build the standard P/Q Jacobian directly from Y nonzeros."""
         theta = self._cache['theta']
         Vc = self._cache['Vc']
-        Ibus = self.Y.dot(Vc)
-        Sbus = Vc * np.conj(Ibus)
+        if Sbus is not None:
+            pass
+        elif self._power_x_obj is self._state_x_obj and self._last_Sbus is not None:
+            Sbus = self._last_Sbus
+        else:
+            Ibus = self.Y.dot(Vc)
+            Sbus = Vc * np.conj(Ibus)
+            self._power_x_obj = self._state_x_obj
+            self._last_Ibus = Ibus
+            self._last_Sbus = Sbus
         P = Sbus.real
         Q = Sbus.imag
 
@@ -2015,14 +2221,23 @@ class ACPowerFlowCalc:
         B = self.Y_jac_b
         Vi = V[i]
         Vj = V[j]
-        delta = theta[i] - theta[j]
-        cos_delta = np.cos(delta)
-        sin_delta = np.sin(delta)
+        delta = self._jac_delta
+        cos_delta = self._jac_cos_delta
+        sin_delta = self._jac_sin_delta
+        vivj = self._jac_vivj
+        common_p = self._jac_common_p
+        common_q = self._jac_common_q
+        tmp = self._jac_tmp
 
-        p_theta = Vi * Vj * (G * sin_delta - B * cos_delta)
-        q_theta = -Vi * Vj * (G * cos_delta + B * sin_delta)
-        p_vm = Vi * (G * cos_delta + B * sin_delta)
-        q_vm = Vi * (G * sin_delta - B * cos_delta)
+        np.subtract(theta[i], theta[j], out=delta)
+        np.cos(delta, out=cos_delta)
+        np.sin(delta, out=sin_delta)
+        np.multiply(Vi, Vj, out=vivj)
+
+        np.multiply(G, sin_delta, out=common_q)
+        common_q -= B * cos_delta
+        np.multiply(G, cos_delta, out=common_p)
+        common_p += B * sin_delta
 
         diag_idx = self.Y_jac_diag_idx
         if diag_idx.size:
@@ -2030,26 +2245,38 @@ class ACPowerFlowCalc:
             Gii = self.Y_jac_diag_g
             Bii = self.Y_jac_diag_b
             Vdiag = V[diag_nodes]
-            p_theta[diag_idx] = -Q[diag_nodes] - Bii * Vdiag * Vdiag
-            q_theta[diag_idx] = P[diag_nodes] - Gii * Vdiag * Vdiag
-            p_vm[diag_idx] = np.divide(
+
+        data = self.standard_jac_data
+        np.multiply(vivj, common_q, out=tmp)
+        if diag_idx.size:
+            tmp[diag_idx] = -Q[diag_nodes] - Bii * Vdiag * Vdiag
+        data[self.std_jac_p_theta_slice] = tmp[self.std_jac_p_theta_idx]
+
+        np.multiply(vivj, common_p, out=tmp)
+        tmp *= -1.0
+        if diag_idx.size:
+            tmp[diag_idx] = P[diag_nodes] - Gii * Vdiag * Vdiag
+        data[self.std_jac_q_theta_slice] = tmp[self.std_jac_q_theta_idx]
+
+        np.multiply(Vi, common_p, out=tmp)
+        if diag_idx.size:
+            tmp[diag_idx] = np.divide(
                 P[diag_nodes],
                 Vdiag,
                 out=np.zeros_like(Vdiag),
                 where=np.abs(Vdiag) > 1e-12,
             ) + Gii * Vdiag
-            q_vm[diag_idx] = np.divide(
+        data[self.std_jac_p_vm_slice] = tmp[self.std_jac_p_vm_idx]
+
+        np.multiply(Vi, common_q, out=tmp)
+        if diag_idx.size:
+            tmp[diag_idx] = np.divide(
                 Q[diag_nodes],
                 Vdiag,
                 out=np.zeros_like(Vdiag),
                 where=np.abs(Vdiag) > 1e-12,
             ) - Bii * Vdiag
-
-        data = self.standard_jac_data
-        data[self.std_jac_p_theta_slice] = p_theta[self.std_jac_p_theta_idx]
-        data[self.std_jac_p_vm_slice] = p_vm[self.std_jac_p_vm_idx]
-        data[self.std_jac_q_theta_slice] = q_theta[self.std_jac_q_theta_idx]
-        data[self.std_jac_q_vm_slice] = q_vm[self.std_jac_q_vm_idx]
+        data[self.std_jac_q_vm_slice] = tmp[self.std_jac_q_vm_idx]
 
         if self.V_unknown.size:
             dPload_dV, dQload_dV = self._calc_load_power_derivatives(V)
@@ -2077,10 +2304,20 @@ class ACPowerFlowCalc:
         if not SCIPY_AVAILABLE:
             return self._get_jacobi_loop(x)
 
-        theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+        if self._state_x_obj is x:
+            theta = self._cache['theta']
+            V = self._cache['V']
+            phi_re = x[self.base_phi_re:self.base_phi_re + self.N_phi] if self.N_phi > 0 else self._empty_phi
+            phi_im = x[self.base_phi_im:self.base_phi_im + self.N_phi] if self.N_phi > 0 else self._empty_phi
+        else:
+            theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+        return self._get_jacobi_from_cached_state(theta, V, phi_re, phi_im)
+
+    def _get_jacobi_from_cached_state(self, theta, V, phi_re, phi_im, Sbus=None) -> csr_matrix:
+        """Build Jacobian using state arrays already extracted for the current Newton step."""
         cos_theta, sin_theta = self._cache['cos_theta'], self._cache['sin_theta']
 
-        J_standard = self._get_standard_jacobi_sparse(V)
+        J_standard = self._get_standard_jacobi_sparse(V, Sbus=Sbus)
         if self.N_phi == 0:
             return J_standard
 
@@ -2241,6 +2478,18 @@ class ACPowerFlowCalc:
             format='csr',
         )
 
+    def _build_newton_system(self, x: np.ndarray):
+        """Compute residual and Jacobian together for one Newton iteration."""
+        if not SCIPY_AVAILABLE:
+            F = self.get_f(x)
+            return F, self._get_jacobi_loop(x)
+
+        theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+        dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
+        F = self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
+        J = self._get_jacobi_from_cached_state(theta, V, phi_re, phi_im, Sbus=self._last_Sbus)
+        return F, J
+
     # --------------------------------------------------------------------------
     # 迭代求解
     # --------------------------------------------------------------------------
@@ -2263,8 +2512,8 @@ class ACPowerFlowCalc:
         for it in range(self.max_iter):
             self.iterations += 1
 
-            # 计算残差
-            F = self.get_f(x)
+            # 单轮内合并残差和 Jacobian 数值块计算，复用 YV/Sbus 等中间量。
+            F, J = self._build_newton_system(x)
             self.normF = np.linalg.norm(F, np.inf)
             print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
 
@@ -2276,10 +2525,7 @@ class ACPowerFlowCalc:
                 self._write_back()
                 return 0
 
-            # 求解修正量
-            J = self.get_jacobi(x)
-
-            delta = spsolve(J, F)
+            delta = solve_sparse_system(J, F)
             # 方程定义为 F(x)=0，这里使用 x_new = x - J^{-1}F。
             x -= delta
 

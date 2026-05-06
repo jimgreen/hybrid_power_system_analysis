@@ -44,11 +44,17 @@ def run_case(case_name: str, repeats: int, profile: bool = False, algorithm: str
     for _ in range(repeats):
         start = time.perf_counter()
         stage_start = start
-        ppc = build_ac_ppc_from_e_file(e_file, use_cache=True, copy_arrays=False)
+        ppc = build_ac_ppc_from_e_file(e_file, use_cache=True, copy_arrays=False, include_device_names=False)
         load_s = time.perf_counter() - stage_start
 
         stage_start = time.perf_counter()
-        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=300 if algorithm == "pq" else 50, algorithm=algorithm)
+        calc = ACPowerFlowCalc.from_ppc(
+            ppc,
+            tol=1e-8,
+            max_iter=300 if algorithm == "pq" else 50,
+            algorithm=algorithm,
+            keep_node_objects=False,
+        )
         calc_init_s = time.perf_counter() - stage_start
 
         stage_start = time.perf_counter()
