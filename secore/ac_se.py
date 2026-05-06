@@ -92,6 +92,7 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
     header = None
     column_index = None
     header_len = 0
+    standard_header = False
     idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
     measurements = []
     append_measurement = measurements.append
@@ -110,19 +111,25 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
                 continue
             if first == "@":
                 header = raw_line[1:].split()
-                column_index = {name: idx for idx, name in enumerate(header)}
-                missing = [name for name in required_columns if name not in column_index]
-                if missing:
-                    raise RuntimeError(f"{file_name} Measurement header is missing columns: {missing}")
+                standard_header = tuple(header) == required_columns
                 header_len = len(header)
-                idx_col = column_index["idx"]
-                name_col = column_index["name"]
-                dev_type_col = column_index["dev_type"]
-                dev_name_col = column_index["dev_name"]
-                meas_type_col = column_index["meas_type"]
-                weight_col = column_index["weight"]
-                valid_col = column_index["valid"]
-                value_col = column_index["value"]
+                if standard_header:
+                    column_index = {}
+                    idx_col, name_col, dev_type_col, dev_name_col = 0, 1, 2, 3
+                    meas_type_col, weight_col, valid_col, value_col = 4, 5, 6, 7
+                else:
+                    column_index = {name: idx for idx, name in enumerate(header)}
+                    missing = [name for name in required_columns if name not in column_index]
+                    if missing:
+                        raise RuntimeError(f"{file_name} Measurement header is missing columns: {missing}")
+                    idx_col = column_index["idx"]
+                    name_col = column_index["name"]
+                    dev_type_col = column_index["dev_type"]
+                    dev_name_col = column_index["dev_name"]
+                    meas_type_col = column_index["meas_type"]
+                    weight_col = column_index["weight"]
+                    valid_col = column_index["valid"]
+                    value_col = column_index["value"]
                 continue
             if first == "#":
                 if header is None or column_index is None:
@@ -130,22 +137,31 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
                 row = raw_line[1:].split()
                 if len(row) < header_len:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
-                raw_device_type = row[dev_type_col]
-                device_type = device_type_cache.get(raw_device_type)
-                if device_type is None:
-                    device_type = raw_device_type
-                    device_type_cache[raw_device_type] = device_type
-                raw_meas_type = row[meas_type_col]
-                meas_type = measurement_type_cache.get(raw_meas_type)
-                if meas_type is None:
-                    meas_type = raw_meas_type.upper()
-                    measurement_type_cache[raw_meas_type] = meas_type
-                idx = int_cell(row[idx_col])
-                name = row[name_col]
-                device_name = row[dev_name_col]
-                weight = float_cell(row[weight_col])
-                valid = row[valid_col] == "1"
-                value = float_cell(row[value_col])
+                if standard_header:
+                    idx_text, name, device_type, device_name, meas_type, weight_text, valid_text, value_text = row[:8]
+                    if meas_type and "a" <= meas_type[0] <= "z":
+                        meas_type = meas_type.upper()
+                    idx = int_cell(idx_text)
+                    weight = float_cell(weight_text)
+                    valid = valid_text == "1"
+                    value = float_cell(value_text)
+                else:
+                    raw_device_type = row[dev_type_col]
+                    device_type = device_type_cache.get(raw_device_type)
+                    if device_type is None:
+                        device_type = raw_device_type
+                        device_type_cache[raw_device_type] = device_type
+                    raw_meas_type = row[meas_type_col]
+                    meas_type = measurement_type_cache.get(raw_meas_type)
+                    if meas_type is None:
+                        meas_type = raw_meas_type.upper()
+                        measurement_type_cache[raw_meas_type] = meas_type
+                    idx = int_cell(row[idx_col])
+                    name = row[name_col]
+                    device_name = row[dev_name_col]
+                    weight = float_cell(row[weight_col])
+                    valid = row[valid_col] == "1"
+                    value = float_cell(row[value_col])
                 meas = new_measurement(measurement_cls)
                 meas.idx = idx
                 meas.name = name
@@ -500,29 +516,6 @@ class ACStateEstimator:
             int(self.n_state),
         )
 
-    def _install_active_plan_cache_entries(self) -> None:
-        active_id = id(self.active_measurements)
-        self._branch_transformer_vector_plan_cache[active_id] = (
-            self.active_measurements,
-            self._active_branch_transformer_vector_plan,
-        )
-        self._simple_jacobian_plan_cache[active_id] = (
-            self.active_measurements,
-            self._active_simple_jacobian_plan,
-        )
-        self._zero_current_vector_plan_cache[active_id] = (
-            self.active_measurements,
-            self._active_zero_current_vector_plan,
-        )
-        self._generator_measurement_plan_cache[active_id] = (
-            self.active_measurements,
-            self._active_generator_measurement_plan,
-        )
-        self._balance_measurement_plan_cache[active_id] = (
-            self.active_measurements,
-            self._active_balance_measurement_plan,
-        )
-
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and vectorized measurement plans."""
         self._initial_observability_cache = None
@@ -530,13 +523,11 @@ class ACStateEstimator:
         active_z = []
         active_weight = []
         active_angle_mask = []
-        active_device_type_codes = []
         active_rows_by_device_type_code = {}
         append_active_measurement = active_measurements.append
         append_active_z = active_z.append
         append_active_weight = active_weight.append
         append_active_angle_mask = active_angle_mask.append
-        append_active_device_type_code = active_device_type_codes.append
         device_type_code_get = _DEVICE_TYPE_CODES.get
         rows_by_type_setdefault = active_rows_by_device_type_code.setdefault
         angle_types = ANGLE_MEASUREMENT_TYPES
@@ -554,7 +545,6 @@ class ACStateEstimator:
             append_active_weight(meas.weight)
             append_active_angle_mask(meas.meas_type in angle_types)
             device_type_code = device_type_code_get(meas.device_type, 0)
-            append_active_device_type_code(device_type_code)
             if first_active_weight is None:
                 first_active_weight = float(meas.weight)
             elif active_weights_are_uniform and float(meas.weight) != first_active_weight:
@@ -565,14 +555,10 @@ class ACStateEstimator:
         self.active_z = np.asarray(active_z, dtype=np.float64)
         self.active_weight = np.asarray(active_weight, dtype=np.float64)
         self.active_angle_residual_mask = np.asarray(active_angle_mask, dtype=bool)
-        self.active_device_type_codes = np.asarray(active_device_type_codes, dtype=np.int16)
         self.active_has_angle_residuals = any(active_angle_mask)
         self.active_weights_are_uniform = bool(active_weight) and active_weights_are_uniform
         self.active_uniform_weight = first_active_weight if self.active_weights_are_uniform else None
-        self._active_rows_by_device_type_code = {
-            int(device_type_code): tuple(rows)
-            for device_type_code, rows in active_rows_by_device_type_code.items()
-        }
+        self._active_rows_by_device_type_code = active_rows_by_device_type_code
         self._branch_transformer_vector_plan_cache = {}
         self._simple_jacobian_plan_cache = {}
         self._zero_current_vector_plan_cache = {}
@@ -597,7 +583,6 @@ class ACStateEstimator:
                 | self._active_balance_measurement_plan["handled_mask"]
             )
         )
-        self._install_active_plan_cache_entries()
 
     def _measurement_rows_for_types(
         self,
@@ -2900,14 +2885,14 @@ class ACStateEstimator:
         values: np.ndarray,
         mask: Optional[np.ndarray] = None,
     ) -> None:
-        rows = np.asarray(rows, dtype=np.int64)
-        cols = np.asarray(cols, dtype=np.int64)
-        values = np.asarray(values, dtype=np.float64)
         if hasattr(H, "add_many"):
             row_col_mask = (rows >= 0) & (cols >= 0)
             mask = row_col_mask if mask is None else (np.asarray(mask, dtype=bool) & row_col_mask)
             H.add_many(rows, cols, values, mask)
             return
+        rows = np.asarray(rows, dtype=np.int64)
+        cols = np.asarray(cols, dtype=np.int64)
+        values = np.asarray(values, dtype=np.float64)
         if mask is None:
             mask = (rows >= 0) & (cols >= 0)
         else:
@@ -2930,6 +2915,10 @@ class ACStateEstimator:
             col_parts.append(np.asarray(cols))
             value_parts.append(np.asarray(values))
         if not row_parts:
+            return
+        if hasattr(H, "add_many"):
+            for rows, cols, values in zip(row_parts, col_parts, value_parts):
+                H.add_many(rows, cols, values)
             return
         if len(row_parts) == 1:
             self._add_indexed_values(H, row_parts[0], col_parts[0], value_parts[0])
@@ -3002,11 +2991,10 @@ class ACStateEstimator:
                 np.where(is_p, dvoltage_other.real, dvoltage_other.imag),
             )
             if hasattr(H, "add_many"):
-                H.add_many(
-                    np.concatenate((rows, rows, rows, rows)),
-                    np.concatenate((own_angle_cols, other_angle_cols, own_voltage_cols, other_voltage_cols)),
-                    np.concatenate(values),
-                )
+                H.add_many(rows, own_angle_cols, values[0])
+                H.add_many(rows, other_angle_cols, values[1])
+                H.add_many(rows, own_voltage_cols, values[2])
+                H.add_many(rows, other_voltage_cols, values[3])
             else:
                 self._add_indexed_values(H, rows, own_angle_cols, values[0])
                 self._add_indexed_values(H, rows, other_angle_cols, values[1])
@@ -3048,11 +3036,10 @@ class ACStateEstimator:
                 project(dvoltage_other),
             )
             if hasattr(H, "add_many"):
-                H.add_many(
-                    np.concatenate((rows, rows, rows, rows)),
-                    np.concatenate((own_angle_cols, other_angle_cols, own_voltage_cols, other_voltage_cols)),
-                    np.concatenate(values),
-                )
+                H.add_many(rows, own_angle_cols, values[0])
+                H.add_many(rows, other_angle_cols, values[1])
+                H.add_many(rows, own_voltage_cols, values[2])
+                H.add_many(rows, other_voltage_cols, values[3])
             else:
                 self._add_indexed_values(H, rows, own_angle_cols, values[0])
                 self._add_indexed_values(H, rows, other_angle_cols, values[1])
