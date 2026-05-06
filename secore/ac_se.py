@@ -543,7 +543,7 @@ class ACStateEstimator:
         max_idx = 0
         first_active_weight = None
         active_weights_are_uniform = True
-        for measurement_index, meas in enumerate(self.measurements):
+        for meas in self.measurements:
             if meas.idx > max_idx:
                 max_idx = int(meas.idx)
             if not meas.valid or meas.weight <= 0.0:

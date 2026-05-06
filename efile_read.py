@@ -51,10 +51,9 @@ def _identity_cell(value):
 
 def _split_data_row(text):
     """Split one E-file data row, using the regex path only when quotes exist."""
-    text = text.lstrip()
     if "'" not in text:
         return text.split()
-    return _QUOTED_SPLIT_RE.split(text)
+    return _QUOTED_SPLIT_RE.split(text.lstrip())
 
 
 def _convert_cell(value):
@@ -265,8 +264,14 @@ def _read_efile_rows(file_path):
         }
 
     with open(file_path, mode="rt", encoding="utf8") as fp:
-        for idx, line in enumerate(fp):
-            line = line.strip()
+        for idx, raw_line in enumerate(fp):
+            first = raw_line[0] if raw_line else ""
+            if first == "#":
+                if block_name is None:
+                    raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
+                rows.append(split_data_row(raw_line[1:]))
+                continue
+            line = raw_line.strip()
             if not line:
                 continue
             first = line[0]

@@ -1,3 +1,4 @@
+import keyword
 from types import SimpleNamespace
 
 
@@ -410,19 +411,22 @@ _AC_DIRECT_FLOAT_ATTRS = frozenset(
 def _direct_cell_assignment(attr, idx):
     value_expr = f"row[{idx}]"
     if attr in _AC_DIRECT_INT_ATTRS:
-        return f"        values[{attr!r}] = {value_expr} if {value_expr} == '' else int({value_expr})"
-    if attr in _AC_DIRECT_FLOAT_ATTRS:
-        return f"        values[{attr!r}] = {value_expr} if {value_expr} == '' else float({value_expr})"
-    return f"        values[{attr!r}] = {value_expr}"
+        parsed_expr = f"{value_expr} if {value_expr} == '' else int({value_expr})"
+    elif attr in _AC_DIRECT_FLOAT_ATTRS:
+        parsed_expr = f"{value_expr} if {value_expr} == '' else float({value_expr})"
+    else:
+        parsed_expr = value_expr
+    if attr.isidentifier() and not keyword.iskeyword(attr):
+        return f"        obj.{attr} = {parsed_expr}"
+    return f"        setattr(obj, {attr!r}, {parsed_expr})"
 
 
 def _generated_direct_row_lines(table_name, header):
     if table_name == "PowerBase":
-        lines = ["        obj = SimpleNamespace()", "        values = obj.__dict__"]
+        lines = ["        obj = SimpleNamespace()"]
     else:
         lines = [
             "        obj = new_row(row_cls)",
-            "        values = obj.__dict__",
         ]
     assigned = set()
     for idx, attr in enumerate(header):
@@ -430,7 +434,10 @@ def _generated_direct_row_lines(table_name, header):
         lines.append(_direct_cell_assignment(attr, idx))
     for attr, default in _AC_DIRECT_DEFAULT_ATTRS.get(table_name, {}).items():
         if attr not in assigned:
-            lines.append(f"        values[{attr!r}] = {default!r}")
+            if attr.isidentifier() and not keyword.iskeyword(attr):
+                lines.append(f"        obj.{attr} = {default!r}")
+            else:
+                lines.append(f"        setattr(obj, {attr!r}, {default!r})")
     return lines
 
 
