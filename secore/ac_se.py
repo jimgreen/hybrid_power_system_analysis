@@ -92,6 +92,7 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
     header = None
     column_index = None
     header_len = 0
+    idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
     measurements = []
     append_measurement = measurements.append
     new_measurement = measurement_cls.__new__
@@ -102,57 +103,67 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
     in_measurement = False
     with open(file_name, mode="rt", encoding="utf8") as fp:
         for line_no, raw_line in enumerate(fp, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
+            first = raw_line[0] if raw_line else ""
             if not in_measurement:
-                if line == "<Measurement>":
+                if first == "<" and raw_line.strip() == "<Measurement>":
                     in_measurement = True
                 continue
-            if line == "</Measurement>":
-                break
-            first = line[0]
             if first == "@":
-                header = line[1:].split()
+                header = raw_line[1:].split()
                 column_index = {name: idx for idx, name in enumerate(header)}
                 missing = [name for name in required_columns if name not in column_index]
                 if missing:
                     raise RuntimeError(f"{file_name} Measurement header is missing columns: {missing}")
                 header_len = len(header)
+                idx_col = column_index["idx"]
+                name_col = column_index["name"]
+                dev_type_col = column_index["dev_type"]
+                dev_name_col = column_index["dev_name"]
+                meas_type_col = column_index["meas_type"]
+                weight_col = column_index["weight"]
+                valid_col = column_index["valid"]
+                value_col = column_index["value"]
                 continue
+            if first == "#":
+                if header is None or column_index is None:
+                    raise RuntimeError(f"{file_name} Measurement data appears before the header")
+                row = raw_line[1:].split()
+                if len(row) < header_len:
+                    raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
+                raw_device_type = row[dev_type_col]
+                device_type = device_type_cache.get(raw_device_type)
+                if device_type is None:
+                    device_type = raw_device_type
+                    device_type_cache[raw_device_type] = device_type
+                raw_meas_type = row[meas_type_col]
+                meas_type = measurement_type_cache.get(raw_meas_type)
+                if meas_type is None:
+                    meas_type = raw_meas_type.upper()
+                    measurement_type_cache[raw_meas_type] = meas_type
+                idx = int_cell(row[idx_col])
+                name = row[name_col]
+                device_name = row[dev_name_col]
+                weight = float_cell(row[weight_col])
+                valid = row[valid_col] == "1"
+                value = float_cell(row[value_col])
+                meas = new_measurement(measurement_cls)
+                meas.idx = idx
+                meas.name = name
+                meas.device_type = device_type
+                meas.device_name = device_name
+                meas.meas_type = meas_type
+                meas.weight = weight
+                meas.valid = valid
+                meas.value = value
+                append_measurement(meas)
+                continue
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "</Measurement>":
+                break
             if first != "#":
                 raise SyntaxError(f"Invalid Measurement row at line {line_no} in {file_name}")
-            if header is None or column_index is None:
-                raise RuntimeError(f"{file_name} Measurement data appears before the header")
-            row = line[1:].split()
-            if len(row) < header_len:
-                raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
-            raw_device_type = row[column_index["dev_type"]]
-            device_type = device_type_cache.get(raw_device_type)
-            if device_type is None:
-                device_type = raw_device_type
-                device_type_cache[raw_device_type] = device_type
-            raw_meas_type = row[column_index["meas_type"]]
-            meas_type = measurement_type_cache.get(raw_meas_type)
-            if meas_type is None:
-                meas_type = raw_meas_type.upper()
-                measurement_type_cache[raw_meas_type] = meas_type
-            idx = int_cell(row[column_index["idx"]])
-            name = row[column_index["name"]]
-            device_name = row[column_index["dev_name"]]
-            weight = float_cell(row[column_index["weight"]])
-            valid = row[column_index["valid"]] == "1"
-            value = float_cell(row[column_index["value"]])
-            meas = new_measurement(measurement_cls)
-            meas.idx = idx
-            meas.name = name
-            meas.device_type = device_type
-            meas.device_name = device_name
-            meas.meas_type = meas_type
-            meas.weight = weight
-            meas.valid = valid
-            meas.value = value
-            append_measurement(meas)
     if not in_measurement:
         raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
     if header is None:
@@ -521,6 +532,14 @@ class ACStateEstimator:
         active_angle_mask = []
         active_device_type_codes = []
         active_rows_by_device_type_code = {}
+        append_active_measurement = active_measurements.append
+        append_active_z = active_z.append
+        append_active_weight = active_weight.append
+        append_active_angle_mask = active_angle_mask.append
+        append_active_device_type_code = active_device_type_codes.append
+        device_type_code_get = _DEVICE_TYPE_CODES.get
+        rows_by_type_setdefault = active_rows_by_device_type_code.setdefault
+        angle_types = ANGLE_MEASUREMENT_TYPES
         max_idx = 0
         first_active_weight = None
         active_weights_are_uniform = True
@@ -530,17 +549,17 @@ class ACStateEstimator:
             if not meas.valid or meas.weight <= 0.0:
                 continue
             active_row = len(active_measurements)
-            active_measurements.append(meas)
-            active_z.append(meas.value)
-            active_weight.append(meas.weight)
-            active_angle_mask.append(meas.meas_type in ANGLE_MEASUREMENT_TYPES)
-            device_type_code = _DEVICE_TYPE_CODES.get(meas.device_type, 0)
-            active_device_type_codes.append(device_type_code)
+            append_active_measurement(meas)
+            append_active_z(meas.value)
+            append_active_weight(meas.weight)
+            append_active_angle_mask(meas.meas_type in angle_types)
+            device_type_code = device_type_code_get(meas.device_type, 0)
+            append_active_device_type_code(device_type_code)
             if first_active_weight is None:
                 first_active_weight = float(meas.weight)
             elif active_weights_are_uniform and float(meas.weight) != first_active_weight:
                 active_weights_are_uniform = False
-            active_rows_by_device_type_code.setdefault(device_type_code, []).append(active_row)
+            rows_by_type_setdefault(device_type_code, []).append(active_row)
         self._max_measurement_idx = max_idx
         self.active_measurements = active_measurements
         self.active_z = np.asarray(active_z, dtype=np.float64)
