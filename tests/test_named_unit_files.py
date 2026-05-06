@@ -18,7 +18,7 @@ MEAS_FILES = sorted((ROOT_DIR / "data").glob("**/*.meas"))
 class NamedUnitFileTest(unittest.TestCase):
     def test_qinling_e_file_uses_named_values_but_network_uses_pu(self):
         from efile_read import EBook
-        from hybrid_flow import HybridPowerNetwork
+        from hybrid_lf import HybridPowerNetwork
 
         case_path = ROOT_DIR / "data" / "hybrid" / "qinling.e"
         raw = EBook(case_path).to_dict()

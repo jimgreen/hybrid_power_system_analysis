@@ -140,7 +140,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(1, call_count)
 
     def test_converter_initial_values_and_writeback_use_cached_arrays(self):
-        from lfcore.hybrid_flow import HybridPowerFlowCalc, HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 
         class NonIterableConverters:
             def __iter__(self):

@@ -6,7 +6,7 @@ from typing import Iterable, List, Sequence
 
 import numpy as np
 
-from lfcore.dc_flow import DCPowerFlowCalc
+from lfcore.dc_lf import DCPowerFlowCalc
 from model.dc_model import DCPowerNetwork
 from unit_system import dc_current_base_ka
 

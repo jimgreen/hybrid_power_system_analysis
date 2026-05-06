@@ -76,9 +76,6 @@ def _run_ac_flow(e_file):
     net = ACPowerNetwork()
     net.read_from_file(e_file)
     net.topo()
-    warnings, errors = net.check_topo()
-    if errors:
-        raise RuntimeError(f"{e_file} topology errors: {errors}")
     calc = ACPowerFlowCalc(net, tol=1e-8, max_iter=50)
     _quiet_call(calc.prepare)
     rc = _quiet_call(calc.run)

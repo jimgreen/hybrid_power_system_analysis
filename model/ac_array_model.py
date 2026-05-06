@@ -171,6 +171,14 @@ def _float_cell(row: List[str], cols: Dict[str, int], key: str, default: float =
     return default if value in (None, "") else float(value)
 
 
+def _float_column(rows: List[List[str]], col: int, default: float = 0.0) -> np.ndarray:
+    return np.fromiter(
+        (float(row[col]) if row[col] else default for row in rows),
+        dtype=np.float64,
+        count=len(rows),
+    )
+
+
 def _int_cell(row: List[str], cols: Dict[str, int], key: str, default: int = 0) -> int:
     value = _cell(row, cols, key, default)
     return default if value in (None, "") else int(float(value))
@@ -234,22 +242,38 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     node_isl_col = node_cols.get("isl")
     node_run_col = node_cols["run_stat"]
     bus = np.zeros((len(node_rows), len(BUS_COLS)), dtype=np.float64)
-    bus_names = np.empty(len(node_rows), dtype=object)
-    raw_vbase_by_idx: Dict[int, float] = {}
-    for pos, row in enumerate(node_rows):
-        idx = int(row[node_idx_col])
-        raw_vbase = float(row[node_vbase_col])
-        raw_vbase_by_idx[idx] = raw_vbase
-        bus[pos, BUS_COLS["idx"]] = idx
-        bus[pos, BUS_COLS["vbase"]] = raw_vbase / u_scale
-        voltage = row[node_voltage_col]
-        bus[pos, BUS_COLS["voltage"]] = (float(voltage) if voltage else raw_vbase) / raw_vbase
-        angle = row[node_angle_col]
-        bus[pos, BUS_COLS["angle"]] = math.radians(float(angle) if angle else 0.0)
-        bus[pos, BUS_COLS["isl"]] = float(row[node_isl_col]) if node_isl_col is not None and row[node_isl_col] else 0.0
-        run_stat = row[node_run_col]
-        bus[pos, BUS_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        bus_names[pos] = row[node_name_col] if node_name_col is not None and row[node_name_col] else f"bus_{idx}"
+    if node_rows:
+        node_idx_values = _float_column(node_rows, node_idx_col)
+        raw_vbase_values = _float_column(node_rows, node_vbase_col)
+        voltage_values = np.fromiter(
+            (
+                float(row[node_voltage_col]) if row[node_voltage_col] else raw_vbase_values[pos]
+                for pos, row in enumerate(node_rows)
+            ),
+            dtype=np.float64,
+            count=len(node_rows),
+        )
+        angle_values = _float_column(node_rows, node_angle_col, 0.0)
+        bus[:, BUS_COLS["idx"]] = node_idx_values
+        bus[:, BUS_COLS["vbase"]] = raw_vbase_values / u_scale
+        bus[:, BUS_COLS["voltage"]] = voltage_values / raw_vbase_values
+        bus[:, BUS_COLS["angle"]] = np.deg2rad(angle_values)
+        if node_isl_col is not None:
+            bus[:, BUS_COLS["isl"]] = _float_column(node_rows, node_isl_col, 0.0)
+        bus[:, BUS_COLS["run_stat"]] = _float_column(node_rows, node_run_col, 1.0)
+        raw_vbase_by_idx: Dict[int, float] = {
+            int(idx): float(vbase) for idx, vbase in zip(node_idx_values, raw_vbase_values)
+        }
+    else:
+        node_idx_values = np.array([], dtype=np.float64)
+        raw_vbase_by_idx = {}
+    bus_names = np.asarray(
+        [
+            row[node_name_col] if node_name_col is not None and row[node_name_col] else f"bus_{int(node_idx_values[pos])}"
+            for pos, row in enumerate(node_rows)
+        ],
+        dtype=object,
+    )
 
     branch_rows = _rows(raw, "ACBranch")
     branch_cols = _columns(raw, "ACBranch")
@@ -262,17 +286,21 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     branch_b_col = branch_cols["b"]
     branch_run_col = branch_cols["run_stat"]
     branch = np.zeros((len(branch_rows), len(BRANCH_COLS)), dtype=np.float64)
-    branch_names = np.empty(len(branch_rows), dtype=object)
-    for pos, row in enumerate(branch_rows):
-        branch[pos, BRANCH_COLS["idx"]] = int(row[branch_idx_col])
-        branch[pos, BRANCH_COLS["i_node"]] = int(row[branch_i_col])
-        branch[pos, BRANCH_COLS["j_node"]] = int(row[branch_j_col])
-        branch[pos, BRANCH_COLS["r"]] = float(row[branch_r_col])
-        branch[pos, BRANCH_COLS["x"]] = float(row[branch_x_col])
-        branch[pos, BRANCH_COLS["b"]] = float(row[branch_b_col])
-        run_stat = row[branch_run_col]
-        branch[pos, BRANCH_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        branch_names[pos] = row[branch_name_col] if branch_name_col is not None and row[branch_name_col] else f"branch_{pos}"
+    if branch_rows:
+        branch[:, BRANCH_COLS["idx"]] = _float_column(branch_rows, branch_idx_col)
+        branch[:, BRANCH_COLS["i_node"]] = _float_column(branch_rows, branch_i_col)
+        branch[:, BRANCH_COLS["j_node"]] = _float_column(branch_rows, branch_j_col)
+        branch[:, BRANCH_COLS["r"]] = _float_column(branch_rows, branch_r_col)
+        branch[:, BRANCH_COLS["x"]] = _float_column(branch_rows, branch_x_col)
+        branch[:, BRANCH_COLS["b"]] = _float_column(branch_rows, branch_b_col)
+        branch[:, BRANCH_COLS["run_stat"]] = _float_column(branch_rows, branch_run_col, 1.0)
+    branch_names = np.asarray(
+        [
+            row[branch_name_col] if branch_name_col is not None and row[branch_name_col] else f"branch_{pos}"
+            for pos, row in enumerate(branch_rows)
+        ],
+        dtype=object,
+    )
 
     transformer_rows = _rows(raw, "ACTransformer")
     transformer_cols = _columns(raw, "ACTransformer")
@@ -287,21 +315,23 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     transformer_shift_col = transformer_cols["shift"]
     transformer_run_col = transformer_cols["run_stat"]
     transformer = np.zeros((len(transformer_rows), len(TRANSFORMER_COLS)), dtype=np.float64)
-    transformer_names = np.empty(len(transformer_rows), dtype=object)
-    for pos, row in enumerate(transformer_rows):
-        transformer[pos, TRANSFORMER_COLS["idx"]] = int(row[transformer_idx_col])
-        transformer[pos, TRANSFORMER_COLS["i_node"]] = int(row[transformer_i_col])
-        transformer[pos, TRANSFORMER_COLS["j_node"]] = int(row[transformer_j_col])
-        transformer[pos, TRANSFORMER_COLS["r"]] = float(row[transformer_r_col])
-        transformer[pos, TRANSFORMER_COLS["x"]] = float(row[transformer_x_col])
-        transformer[pos, TRANSFORMER_COLS["b"]] = float(row[transformer_b_col])
-        tap = row[transformer_tap_col]
-        transformer[pos, TRANSFORMER_COLS["tap"]] = float(tap) if tap else 1.0
-        shift = row[transformer_shift_col]
-        transformer[pos, TRANSFORMER_COLS["shift"]] = float(shift) if shift else 0.0
-        run_stat = row[transformer_run_col]
-        transformer[pos, TRANSFORMER_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        transformer_names[pos] = row[transformer_name_col] if transformer_name_col is not None and row[transformer_name_col] else f"transformer_{pos}"
+    if transformer_rows:
+        transformer[:, TRANSFORMER_COLS["idx"]] = _float_column(transformer_rows, transformer_idx_col)
+        transformer[:, TRANSFORMER_COLS["i_node"]] = _float_column(transformer_rows, transformer_i_col)
+        transformer[:, TRANSFORMER_COLS["j_node"]] = _float_column(transformer_rows, transformer_j_col)
+        transformer[:, TRANSFORMER_COLS["r"]] = _float_column(transformer_rows, transformer_r_col)
+        transformer[:, TRANSFORMER_COLS["x"]] = _float_column(transformer_rows, transformer_x_col)
+        transformer[:, TRANSFORMER_COLS["b"]] = _float_column(transformer_rows, transformer_b_col)
+        transformer[:, TRANSFORMER_COLS["tap"]] = _float_column(transformer_rows, transformer_tap_col, 1.0)
+        transformer[:, TRANSFORMER_COLS["shift"]] = _float_column(transformer_rows, transformer_shift_col, 0.0)
+        transformer[:, TRANSFORMER_COLS["run_stat"]] = _float_column(transformer_rows, transformer_run_col, 1.0)
+    transformer_names = np.asarray(
+        [
+            row[transformer_name_col] if transformer_name_col is not None and row[transformer_name_col] else f"transformer_{pos}"
+            for pos, row in enumerate(transformer_rows)
+        ],
+        dtype=object,
+    )
 
     gen_rows = _rows(raw, "ACGenerator")
     gen_cols = _columns(raw, "ACGenerator")
@@ -315,20 +345,44 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     gen_alpha_col = gen_cols.get("alpha")
     gen_run_col = gen_cols["run_stat"]
     gen = np.zeros((len(gen_rows), len(GEN_COLS)), dtype=np.float64)
-    gen_names = np.empty(len(gen_rows), dtype=object)
-    for pos, row in enumerate(gen_rows):
-        gen[pos, GEN_COLS["idx"]] = int(row[gen_idx_col])
-        gen[pos, GEN_COLS["node"]] = int(row[gen_node_col])
-        gen[pos, GEN_COLS["control_type"]] = CTRL_CODE.get(row[gen_control_col].upper() if row[gen_control_col] else "PQ", CTRL_PQ)
-        gen[pos, GEN_COLS["p_set"]] = float(row[gen_p_col]) / p_base
-        gen[pos, GEN_COLS["q_set"]] = float(row[gen_q_col]) / p_base
-        raw_vbase = _node_voltage_base(raw_vbase_by_idx, int(row[gen_node_col]))
-        v_set = row[gen_v_col]
-        gen[pos, GEN_COLS["v_set"]] = (float(v_set) if v_set else raw_vbase) / raw_vbase
-        gen[pos, GEN_COLS["alpha"]] = float(row[gen_alpha_col]) if gen_alpha_col is not None and row[gen_alpha_col] else 1.0
-        run_stat = row[gen_run_col]
-        gen[pos, GEN_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        gen_names[pos] = row[gen_name_col] if gen_name_col is not None and row[gen_name_col] else f"gen_{pos}"
+    if gen_rows:
+        gen_nodes = _float_column(gen_rows, gen_node_col)
+        gen_raw_vbase = np.fromiter(
+            (_node_voltage_base(raw_vbase_by_idx, int(node)) for node in gen_nodes),
+            dtype=np.float64,
+            count=len(gen_rows),
+        )
+        gen_v_set_raw = np.fromiter(
+            (
+                float(row[gen_v_col]) if row[gen_v_col] else gen_raw_vbase[pos]
+                for pos, row in enumerate(gen_rows)
+            ),
+            dtype=np.float64,
+            count=len(gen_rows),
+        )
+        inv_p_base = 1.0 / p_base
+        gen[:, GEN_COLS["idx"]] = _float_column(gen_rows, gen_idx_col)
+        gen[:, GEN_COLS["node"]] = gen_nodes
+        gen[:, GEN_COLS["control_type"]] = np.fromiter(
+            (CTRL_CODE.get(row[gen_control_col].upper() if row[gen_control_col] else "PQ", CTRL_PQ) for row in gen_rows),
+            dtype=np.float64,
+            count=len(gen_rows),
+        )
+        gen[:, GEN_COLS["p_set"]] = _float_column(gen_rows, gen_p_col) * inv_p_base
+        gen[:, GEN_COLS["q_set"]] = _float_column(gen_rows, gen_q_col) * inv_p_base
+        gen[:, GEN_COLS["v_set"]] = gen_v_set_raw / gen_raw_vbase
+        if gen_alpha_col is not None:
+            gen[:, GEN_COLS["alpha"]] = _float_column(gen_rows, gen_alpha_col, 1.0)
+        else:
+            gen[:, GEN_COLS["alpha"]] = 1.0
+        gen[:, GEN_COLS["run_stat"]] = _float_column(gen_rows, gen_run_col, 1.0)
+    gen_names = np.asarray(
+        [
+            row[gen_name_col] if gen_name_col is not None and row[gen_name_col] else f"gen_{pos}"
+            for pos, row in enumerate(gen_rows)
+        ],
+        dtype=object,
+    )
 
     load_rows = _rows(raw, "ACLoad")
     load_cols = _columns(raw, "ACLoad")
@@ -339,15 +393,20 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     load_value_cols = tuple(load_cols[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
     load_target_cols = tuple(LOAD_COLS[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
     load = np.zeros((len(load_rows), len(LOAD_COLS)), dtype=np.float64)
-    load_names = np.empty(len(load_rows), dtype=object)
-    for pos, row in enumerate(load_rows):
-        load[pos, LOAD_COLS["idx"]] = int(row[load_idx_col])
-        load[pos, LOAD_COLS["node"]] = int(row[load_node_col])
+    if load_rows:
+        load[:, LOAD_COLS["idx"]] = _float_column(load_rows, load_idx_col)
+        load[:, LOAD_COLS["node"]] = _float_column(load_rows, load_node_col)
+        inv_p_base = 1.0 / p_base
         for source_col, target_col in zip(load_value_cols, load_target_cols):
-            load[pos, target_col] = float(row[source_col]) / p_base
-        run_stat = row[load_run_col]
-        load[pos, LOAD_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        load_names[pos] = row[load_name_col] if load_name_col is not None and row[load_name_col] else f"load_{pos}"
+            load[:, target_col] = _float_column(load_rows, source_col) * inv_p_base
+        load[:, LOAD_COLS["run_stat"]] = _float_column(load_rows, load_run_col, 1.0)
+    load_names = np.asarray(
+        [
+            row[load_name_col] if load_name_col is not None and row[load_name_col] else f"load_{pos}"
+            for pos, row in enumerate(load_rows)
+        ],
+        dtype=object,
+    )
 
     shunt_rows = _rows(raw, "ACShuntCompensator")
     shunt_cols = _columns(raw, "ACShuntCompensator")
@@ -361,20 +420,40 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     shunt_v_col = shunt_cols["v_set"]
     shunt_run_col = shunt_cols["run_stat"]
     shunt = np.zeros((len(shunt_rows), len(SHUNT_COLS)), dtype=np.float64)
-    shunt_names = np.empty(len(shunt_rows), dtype=object)
-    for pos, row in enumerate(shunt_rows):
-        shunt[pos, SHUNT_COLS["idx"]] = int(row[shunt_idx_col])
-        shunt[pos, SHUNT_COLS["node"]] = int(row[shunt_node_col])
-        shunt[pos, SHUNT_COLS["control_type"]] = SHUNT_CODE.get(row[shunt_control_col].upper() if row[shunt_control_col] else "Q", SHUNT_Q)
-        shunt[pos, SHUNT_COLS["q_set"]] = float(row[shunt_q_col]) / p_base
-        shunt[pos, SHUNT_COLS["g_set"]] = float(row[shunt_g_col])
-        shunt[pos, SHUNT_COLS["b_set"]] = float(row[shunt_b_col])
-        raw_vbase = _node_voltage_base(raw_vbase_by_idx, int(row[shunt_node_col]))
-        v_set = row[shunt_v_col]
-        shunt[pos, SHUNT_COLS["v_set"]] = (float(v_set) if v_set else raw_vbase) / raw_vbase
-        run_stat = row[shunt_run_col]
-        shunt[pos, SHUNT_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        shunt_names[pos] = row[shunt_name_col] if shunt_name_col is not None and row[shunt_name_col] else f"shunt_{pos}"
+    if shunt_rows:
+        shunt_nodes = _float_column(shunt_rows, shunt_node_col)
+        shunt_raw_vbase = np.fromiter(
+            (_node_voltage_base(raw_vbase_by_idx, int(node)) for node in shunt_nodes),
+            dtype=np.float64,
+            count=len(shunt_rows),
+        )
+        shunt_v_set_raw = np.fromiter(
+            (
+                float(row[shunt_v_col]) if row[shunt_v_col] else shunt_raw_vbase[pos]
+                for pos, row in enumerate(shunt_rows)
+            ),
+            dtype=np.float64,
+            count=len(shunt_rows),
+        )
+        shunt[:, SHUNT_COLS["idx"]] = _float_column(shunt_rows, shunt_idx_col)
+        shunt[:, SHUNT_COLS["node"]] = shunt_nodes
+        shunt[:, SHUNT_COLS["control_type"]] = np.fromiter(
+            (SHUNT_CODE.get(row[shunt_control_col].upper() if row[shunt_control_col] else "Q", SHUNT_Q) for row in shunt_rows),
+            dtype=np.float64,
+            count=len(shunt_rows),
+        )
+        shunt[:, SHUNT_COLS["q_set"]] = _float_column(shunt_rows, shunt_q_col) / p_base
+        shunt[:, SHUNT_COLS["g_set"]] = _float_column(shunt_rows, shunt_g_col)
+        shunt[:, SHUNT_COLS["b_set"]] = _float_column(shunt_rows, shunt_b_col)
+        shunt[:, SHUNT_COLS["v_set"]] = shunt_v_set_raw / shunt_raw_vbase
+        shunt[:, SHUNT_COLS["run_stat"]] = _float_column(shunt_rows, shunt_run_col, 1.0)
+    shunt_names = np.asarray(
+        [
+            row[shunt_name_col] if shunt_name_col is not None and row[shunt_name_col] else f"shunt_{pos}"
+            for pos, row in enumerate(shunt_rows)
+        ],
+        dtype=object,
+    )
 
     zero_rows = _rows(raw, "ACZeroBranch")
     zero_cols = _columns(raw, "ACZeroBranch")
@@ -384,14 +463,18 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     zero_j_col = zero_cols["j_node"]
     zero_run_col = zero_cols["run_stat"]
     zero_branch = np.zeros((len(zero_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64)
-    zero_branch_names = np.empty(len(zero_rows), dtype=object)
-    for pos, row in enumerate(zero_rows):
-        zero_branch[pos, ZERO_BRANCH_COLS["idx"]] = int(row[zero_idx_col])
-        zero_branch[pos, ZERO_BRANCH_COLS["i_node"]] = int(row[zero_i_col])
-        zero_branch[pos, ZERO_BRANCH_COLS["j_node"]] = int(row[zero_j_col])
-        run_stat = row[zero_run_col]
-        zero_branch[pos, ZERO_BRANCH_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        zero_branch_names[pos] = row[zero_name_col] if zero_name_col is not None and row[zero_name_col] else f"zero_branch_{pos}"
+    if zero_rows:
+        zero_branch[:, ZERO_BRANCH_COLS["idx"]] = _float_column(zero_rows, zero_idx_col)
+        zero_branch[:, ZERO_BRANCH_COLS["i_node"]] = _float_column(zero_rows, zero_i_col)
+        zero_branch[:, ZERO_BRANCH_COLS["j_node"]] = _float_column(zero_rows, zero_j_col)
+        zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] = _float_column(zero_rows, zero_run_col, 1.0)
+    zero_branch_names = np.asarray(
+        [
+            row[zero_name_col] if zero_name_col is not None and row[zero_name_col] else f"zero_branch_{pos}"
+            for pos, row in enumerate(zero_rows)
+        ],
+        dtype=object,
+    )
 
     switch_rows = _rows(raw, "ACSwitch")
     switch_cols = _columns(raw, "ACSwitch")
@@ -402,16 +485,19 @@ def build_ac_ppc_from_e_file(file_path, use_cache: bool = True, copy_arrays: boo
     switch_status_col = switch_cols["status"]
     switch_run_col = switch_cols["run_stat"]
     switch = np.zeros((len(switch_rows), len(SWITCH_COLS)), dtype=np.float64)
-    switch_names = np.empty(len(switch_rows), dtype=object)
-    for pos, row in enumerate(switch_rows):
-        switch[pos, SWITCH_COLS["idx"]] = int(row[switch_idx_col])
-        switch[pos, SWITCH_COLS["i_node"]] = int(row[switch_i_col])
-        switch[pos, SWITCH_COLS["j_node"]] = int(row[switch_j_col])
-        status = row[switch_status_col]
-        switch[pos, SWITCH_COLS["status"]] = float(status) if status else 1.0
-        run_stat = row[switch_run_col]
-        switch[pos, SWITCH_COLS["run_stat"]] = float(run_stat) if run_stat else 1.0
-        switch_names[pos] = row[switch_name_col] if switch_name_col is not None and row[switch_name_col] else f"switch_{pos}"
+    if switch_rows:
+        switch[:, SWITCH_COLS["idx"]] = _float_column(switch_rows, switch_idx_col)
+        switch[:, SWITCH_COLS["i_node"]] = _float_column(switch_rows, switch_i_col)
+        switch[:, SWITCH_COLS["j_node"]] = _float_column(switch_rows, switch_j_col)
+        switch[:, SWITCH_COLS["status"]] = _float_column(switch_rows, switch_status_col, 1.0)
+        switch[:, SWITCH_COLS["run_stat"]] = _float_column(switch_rows, switch_run_col, 1.0)
+    switch_names = np.asarray(
+        [
+            row[switch_name_col] if switch_name_col is not None and row[switch_name_col] else f"switch_{pos}"
+            for pos, row in enumerate(switch_rows)
+        ],
+        dtype=object,
+    )
 
     ppc = {
         "format": "ac_ppc_v1",

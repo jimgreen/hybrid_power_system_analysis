@@ -8,7 +8,7 @@ from pathlib import Path
 class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np
-        from lfcore.dc_flow import DCPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_model import DCPowerNetwork
 
         class NonIterableControls:
@@ -30,7 +30,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         np.testing.assert_allclose(calc.get_jacobi(G, x).toarray(), expected_j, atol=1e-12)
 
     def test_update_lf_info_uses_cached_branch_arrays(self):
-        from lfcore.dc_flow import DCPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_model import DCPowerNetwork
 
         class NonIterableBranches:
@@ -52,7 +52,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_generates_solvable_dc_case_and_measurements(self):
         from generate_dc_large_cases import generate_dc_case_files
-        from lfcore.dc_flow import DCPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_model import DCPowerNetwork
         from secore.dc_se import DCStateEstimator
 

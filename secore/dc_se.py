@@ -14,7 +14,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from dc_flow import DCPowerFlowCalc
+from dc_lf import DCPowerFlowCalc
 from dc_model import DCPowerNetwork
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook

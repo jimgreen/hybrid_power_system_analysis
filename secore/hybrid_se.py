@@ -16,7 +16,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
         sys.path.insert(0, str(path))
 
 from efile_read import EBook
-from ac_flow import matpower_branch_stamp, matpower_branch_stamp_vectorized
+from ac_lf import matpower_branch_stamp, matpower_branch_stamp_vectorized
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 from secore.se_math import (

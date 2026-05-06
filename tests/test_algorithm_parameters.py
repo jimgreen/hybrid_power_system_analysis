@@ -59,9 +59,9 @@ def _write_se_para(
 class AlgorithmParameterFileTest(unittest.TestCase):
     def test_power_flow_classes_read_algorithm_parameters_from_lf_para(self):
         from algorithm_parameters import load_lf_parameters
-        from lfcore.ac_flow import ACPowerFlowCalc
-        from lfcore.dc_flow import DCPowerFlowCalc
-        from lfcore.hybrid_flow import HybridPowerFlowCalc, HybridPowerNetwork
+        from lfcore.ac_lf import ACPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             para_file = Path(tmp_dir) / "lf.para"

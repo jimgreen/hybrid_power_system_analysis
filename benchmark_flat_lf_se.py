@@ -82,9 +82,6 @@ def _bench_dc_lf(e_file: Path):
         network = DCPowerNetwork()
         network.read_from_file(e_file)
         network.topo()
-        warnings, errors = network.check_topo()
-        if errors:
-            raise RuntimeError(f"{e_file} topology errors: {errors}")
         return network
 
     network, init_s = _time_call(init)

@@ -779,15 +779,6 @@ if __name__ == "__main__":
 
     net.print_isl_info()
 
-    warns, errors = net.check_topo()
-
-    for warn in warns:
-        print("  警告:", warn)
-
-    for error in errors:
-        print("  错误:", error)
-
-
     # 8. 运行潮流计算
     print("=== 开始直流电网潮流计算===")
     calc = DCPowerFlowCalc(net)

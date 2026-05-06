@@ -1081,11 +1081,3 @@ if __name__ == "__main__":
 
     net.print_isl_info()
 
-    warns, errors = net.check_topo()
-
-    for warn in warns:
-        print("  警告:", warn)
-
-    for error in errors:
-        print("  错误:", error)
-

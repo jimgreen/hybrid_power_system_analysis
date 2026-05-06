@@ -343,6 +343,8 @@ class ACPowerFlowCalc:
         self.Y_jac_rows = np.array([], dtype=np.int32)
         self.Y_jac_cols = np.array([], dtype=np.int32)
         self.Y_jac_data = np.array([], dtype=np.complex128)
+        self.Y_jac_g = np.array([], dtype=np.float64)
+        self.Y_jac_b = np.array([], dtype=np.float64)
         self.Y_jac_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices: List[np.ndarray] = []
         self.Y_offdiag_data: List[np.ndarray] = []
@@ -388,6 +390,9 @@ class ACPowerFlowCalc:
         self.pq_Bpp = None
         self.pq_Bp_factor = None
         self.pq_Bpp_factor = None
+        self._state_theta = np.array([], dtype=np.float64)
+        self._state_voltage = np.array([], dtype=np.float64)
+        self._empty_phi = np.array([], dtype=np.float64)
         self.result: Dict = {}
 
     @classmethod
@@ -488,9 +493,10 @@ class ACPowerFlowCalc:
     def _extract_state_vars(self, x: np.ndarray, update_cache: bool = True) -> Tuple[
         np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """将扁平 Newton 向量还原为 theta、V 和零阻抗支路的 phi 变量。"""
-        # 基础初始化
-        theta = np.zeros(self.N, dtype=np.float64)
-        V = np.ones(self.N, dtype=np.float64)
+        theta = self._state_theta
+        V = self._state_voltage
+        theta.fill(0.0)
+        V.fill(1.0)
 
         # 填充未知变量
         theta[self.theta_unknown] = x[:self.n_theta]
@@ -505,8 +511,8 @@ class ACPowerFlowCalc:
 
         # 提取phi变量（精简条件判断）
         phi_slice = slice(self.base_phi_re, self.base_phi_re + self.N_phi)
-        phi_re = x[phi_slice] if self.N_phi > 0 else np.array([], dtype=np.float64)
-        phi_im = x[self.base_phi_im:self.base_phi_im + self.N_phi] if self.N_phi > 0 else np.array([], dtype=np.float64)
+        phi_re = x[phi_slice] if self.N_phi > 0 else self._empty_phi
+        phi_im = x[self.base_phi_im:self.base_phi_im + self.N_phi] if self.N_phi > 0 else self._empty_phi
 
         # 更新缓存
         if update_cache:
@@ -751,6 +757,8 @@ class ACPowerFlowCalc:
             "Y_jac_rows": self.Y_jac_rows,
             "Y_jac_cols": self.Y_jac_cols,
             "Y_jac_data": self.Y_jac_data,
+            "Y_jac_g": self.Y_jac_g,
+            "Y_jac_b": self.Y_jac_b,
             "Y_jac_diag": self.Y_jac_diag,
             "Y_jac_diag_idx": self.Y_jac_diag_idx,
             "Y_jac_diag_nodes": self.Y_jac_diag_nodes,
@@ -773,6 +781,9 @@ class ACPowerFlowCalc:
             "pq_Bpp": self.pq_Bpp,
             "pq_Bp_factor": self.pq_Bp_factor,
             "pq_Bpp_factor": self.pq_Bpp_factor,
+            "_state_theta": self._state_theta,
+            "_state_voltage": self._state_voltage,
+            "_empty_phi": self._empty_phi,
             "branch_i": self.branch_i,
             "branch_j": self.branch_j,
             "branch_yff": self.branch_yff,
@@ -821,13 +832,14 @@ class ACPowerFlowCalc:
             "load_qv0", "load_qv1", "load_qv2", "zero_idx", "zero_type", "zero_a",
             "zero_b", "zero_phi_a", "zero_phi_b", "pq_theta_rows", "pq_v_cols",
             "theta_col_by_node", "v_col_by_node", "p_row_by_node", "q_row_by_node",
-            "Y_jac_rows", "Y_jac_cols", "Y_jac_data", "Y_jac_diag",
+            "Y_jac_rows", "Y_jac_cols", "Y_jac_data", "Y_jac_g", "Y_jac_b", "Y_jac_diag",
             "Y_jac_diag_idx", "Y_jac_diag_nodes", "Y_jac_diag_g", "Y_jac_diag_b",
             "standard_jac_rows", "standard_jac_cols", "standard_jac_data",
             "std_jac_p_theta_idx", "std_jac_p_vm_idx", "std_jac_q_theta_idx",
             "std_jac_q_vm_idx", "std_jac_p_theta_slice", "std_jac_p_vm_slice",
             "std_jac_q_theta_slice", "std_jac_q_vm_slice", "std_jac_load_p_slice",
             "std_jac_load_q_slice", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
+            "_state_theta", "_state_voltage", "_empty_phi",
             "branch_i", "branch_j", "branch_yff", "branch_yft", "branch_ytf",
             "branch_ytt", "transformer_i", "transformer_j", "transformer_yff",
             "transformer_yft", "transformer_ytf", "transformer_ytt", "ppc_gen_rows",
@@ -1035,6 +1047,9 @@ class ACPowerFlowCalc:
         self.total_eq = self.n_theta + self.n_V + 2 * n_tree + n_phi_fix
         self.x = np.zeros(self.total_vars, dtype=np.float64)
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
+        self._state_theta = np.empty(self.N, dtype=np.float64)
+        self._state_voltage = np.empty(self.N, dtype=np.float64)
+        self._empty_phi = np.array([], dtype=np.float64)
         self._cache_static_numeric_arrays()
         self._cache_pq_decoupled_matrices()
         if self.total_vars != self.total_eq:
@@ -1084,6 +1099,8 @@ class ACPowerFlowCalc:
             self.Y_jac_rows = np.repeat(np.arange(self.N, dtype=np.int32), np.diff(y_csr.indptr))
             self.Y_jac_cols = y_csr.indices.astype(np.int32, copy=True)
             self.Y_jac_data = y_csr.data.astype(np.complex128, copy=True)
+            self.Y_jac_g = self.Y_jac_data.real
+            self.Y_jac_b = self.Y_jac_data.imag
             self.Y_jac_diag = y_csr.diagonal().astype(np.complex128, copy=False)
             self.Y_jac_diag_idx = np.flatnonzero(self.Y_jac_rows == self.Y_jac_cols)
             self.Y_jac_diag_nodes = self.Y_jac_rows[self.Y_jac_diag_idx]
@@ -1092,6 +1109,7 @@ class ACPowerFlowCalc:
         else:
             self.Y_jac_rows = self.Y_jac_cols = np.array([], dtype=np.int32)
             self.Y_jac_data = self.Y_jac_diag = np.array([], dtype=np.complex128)
+            self.Y_jac_g = self.Y_jac_b = np.array([], dtype=np.float64)
             self.Y_jac_diag_idx = self.Y_jac_diag_nodes = np.array([], dtype=np.int32)
             self.Y_jac_diag_g = self.Y_jac_diag_b = np.array([], dtype=np.float64)
         self._cache_standard_jacobian_pattern()
@@ -1317,6 +1335,9 @@ class ACPowerFlowCalc:
         # 4. 初始化状态向量
         self.x = np.zeros(self.total_vars, dtype=np.float64)
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
+        self._state_theta = np.empty(self.N, dtype=np.float64)
+        self._state_voltage = np.empty(self.N, dtype=np.float64)
+        self._empty_phi = np.array([], dtype=np.float64)
         self._cache_static_arrays()
         self._cache_pq_decoupled_matrices()
 
@@ -1918,9 +1939,8 @@ class ACPowerFlowCalc:
 
         i = self.Y_jac_rows
         j = self.Y_jac_cols
-        y = self.Y_jac_data
-        G = y.real
-        B = y.imag
+        G = self.Y_jac_g
+        B = self.Y_jac_b
         Vi = V[i]
         Vj = V[j]
         delta = theta[i] - theta[j]
@@ -2515,15 +2535,9 @@ if __name__ == "__main__":
     file_name = sys.argv[1] if len(sys.argv) > 1 else "../../data/ac/ieee300.e"
     net.read_from_file(file_name)
 
-    # 拓扑分析和校验
+    # 拓扑分析
     net.topo()
     net.print_isl_info()
-
-    warns, errors = net.check_topo()
-    for warn in warns:
-        print(f"  警告: {warn}")
-    for error in errors:
-        print(f"  错误: {error}")
 
     # 潮流计算
     calc = ACPowerFlowCalc(net)

@@ -364,10 +364,6 @@ def solve_ac(e_file: Path) -> Tuple[Snapshot, str]:
     network = ACPowerNetwork()
     network.read_from_file(e_file)
     network.topo()
-    with contextlib.redirect_stdout(io.StringIO()):
-        warnings, errors = network.check_topo()
-    if errors:
-        raise RuntimeError(f"AC topology check failed for {e_file}: {errors}")
     calc = ACPowerFlowCalc(network)
     with contextlib.redirect_stdout(io.StringIO()):
         calc.prepare()
@@ -381,10 +377,6 @@ def solve_dc(e_file: Path) -> Tuple[Snapshot, str]:
     network = DCPowerNetwork()
     network.read_from_file(e_file)
     network.topo()
-    with contextlib.redirect_stdout(io.StringIO()):
-        warnings, errors = network.check_topo()
-    if errors:
-        raise RuntimeError(f"DC topology check failed for {e_file}: {errors}")
     calc = DCPowerFlowCalc(network)
     with contextlib.redirect_stdout(io.StringIO()):
         rc = calc.run()

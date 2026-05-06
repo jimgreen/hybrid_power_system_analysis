@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT_DIR / "lfcore"))
 class ACPPCFlowTest(unittest.TestCase):
     def test_object_y_matrix_uses_vectorized_branch_stamps(self):
         import ac_lf
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
@@ -52,7 +52,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
     def test_ppc_flow_matches_object_flow_for_ieee300(self):
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
@@ -85,7 +85,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
     def test_ppc_flow_supports_pq_decoupled_algorithm(self):
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
@@ -120,7 +120,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
     def test_invalid_power_flow_algorithm_is_rejected(self):
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
@@ -141,7 +141,7 @@ class ACPPCFlowTest(unittest.TestCase):
     def test_pq_algorithm_reuses_fixed_b_matrix_factorization(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
@@ -175,10 +175,28 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual("pq", calc.used_algorithm)
         self.assertEqual([calc.pq_Bp.shape, calc.pq_Bpp.shape], factor_shapes)
 
+    def test_state_extraction_reuses_iteration_work_arrays(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        theta1, voltage1, _, _ = calc._extract_state_vars(calc.x, update_cache=True)
+        theta2, voltage2, _, _ = calc._extract_state_vars(calc.x, update_cache=True)
+
+        self.assertIs(theta1, theta2)
+        self.assertIs(voltage1, voltage2)
+        self.assertIs(theta2, calc._cache["theta"])
+        self.assertIs(voltage2, calc._cache["V"])
+
     def test_ppc_standard_jacobian_avoids_sparse_block_stack(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
@@ -203,7 +221,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
     def test_ppc_standard_jacobian_caches_coordinate_pattern(self):
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
@@ -231,7 +249,7 @@ class ACPPCFlowTest(unittest.TestCase):
     def test_ppc_prepare_uses_sparse_connected_components(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file
-        from ac_flow import ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
