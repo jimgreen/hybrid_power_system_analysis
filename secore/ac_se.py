@@ -1879,28 +1879,25 @@ class ACStateEstimator:
         n = len(self.nodes)
         self._y_row_nodes = []
         self._y_row_y_conj = []
-        self._y_row_off_mask = []
-        self._y_row_off_nodes = []
-        self._y_row_diag_conj = np.zeros(n, dtype=np.complex128)
+        self._y_row_off_mask = [None] * n
+        self._y_row_off_nodes = [None] * n
+        self._y_row_diag_conj = np.conj(self.Y.diagonal()).astype(np.complex128, copy=False)
+        y_indices = self.Y.indices if issparse(self.Y) else None
+        y_data_conj = np.conj(self.Y.data) if issparse(self.Y) else None
 
         for pos in range(n):
             if issparse(self.Y):
                 start, end = self.Y.indptr[pos], self.Y.indptr[pos + 1]
-                nodes = self.Y.indices[start:end].astype(np.int32, copy=True)
-                y_values = self.Y.data[start:end].astype(np.complex128, copy=True)
+                nodes = y_indices[start:end]
+                y_conj = y_data_conj[start:end]
             else:
                 row = self.Y[pos, :]
                 nodes = np.nonzero(row)[0].astype(np.int32)
                 y_values = np.asarray(row[nodes], dtype=np.complex128)
+                y_conj = np.conj(y_values)
 
-            y_conj = np.conj(y_values)
-            off_mask = nodes != pos
-            diag_values = y_values[nodes == pos]
             self._y_row_nodes.append(nodes)
             self._y_row_y_conj.append(y_conj)
-            self._y_row_off_mask.append(off_mask)
-            self._y_row_off_nodes.append(nodes[off_mask])
-            self._y_row_diag_conj[pos] = np.conj(diag_values[0]) if diag_values.size else 0.0
 
     def _group_loads(self) -> Dict[int, List]:
         grouped: Dict[int, List] = {}
@@ -3742,6 +3739,11 @@ class ACStateEstimator:
         y_conj = self._y_row_y_conj[pos]
         off_mask = self._y_row_off_mask[pos]
         off_nodes = self._y_row_off_nodes[pos]
+        if off_mask is None:
+            off_mask = node_cols != pos
+            off_nodes = node_cols[off_mask]
+            self._y_row_off_mask[pos] = off_mask
+            self._y_row_off_nodes[pos] = off_nodes
         exp_delta = np.exp(1j * (theta[pos] - theta[node_cols]))
         term = y_conj * voltage[pos] * voltage[node_cols] * exp_delta
         off_term = term[off_mask]
