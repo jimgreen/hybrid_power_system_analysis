@@ -354,6 +354,14 @@ class ACPowerFlowCalc:
         self.v_col_by_node = np.array([], dtype=np.int32)
         self.p_row_by_node = np.array([], dtype=np.int32)
         self.q_row_by_node = np.array([], dtype=np.int32)
+        self.standard_jac_csr_indices = np.array([], dtype=np.int32)
+        self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
+        self.standard_jac_csr_order = np.array([], dtype=np.intp)
+        self.standard_jac_csr_data = np.array([], dtype=np.float64)
+        self.std_jac_load_nodes = np.array([], dtype=np.int32)
+        self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
+        self.std_jac_load_p_pos = np.array([], dtype=np.intp)
+        self.std_jac_load_q_pos = np.array([], dtype=np.intp)
         self.live_gens: List = []
         self.live_loads: List = []
         self.live_shunts: List = []
@@ -783,6 +791,14 @@ class ACPowerFlowCalc:
             "std_jac_q_vm_slice": self.std_jac_q_vm_slice,
             "std_jac_load_p_slice": self.std_jac_load_p_slice,
             "std_jac_load_q_slice": self.std_jac_load_q_slice,
+            "standard_jac_csr_indices": self.standard_jac_csr_indices,
+            "standard_jac_csr_indptr": self.standard_jac_csr_indptr,
+            "standard_jac_csr_order": self.standard_jac_csr_order,
+            "standard_jac_csr_data": self.standard_jac_csr_data,
+            "std_jac_load_nodes": self.std_jac_load_nodes,
+            "std_jac_load_extra_nodes": self.std_jac_load_extra_nodes,
+            "std_jac_load_p_pos": self.std_jac_load_p_pos,
+            "std_jac_load_q_pos": self.std_jac_load_q_pos,
             "pq_Bp": self.pq_Bp,
             "pq_Bpp": self.pq_Bpp,
             "pq_Bp_factor": self.pq_Bp_factor,
@@ -844,7 +860,9 @@ class ACPowerFlowCalc:
             "std_jac_p_theta_idx", "std_jac_p_vm_idx", "std_jac_q_theta_idx",
             "std_jac_q_vm_idx", "std_jac_p_theta_slice", "std_jac_p_vm_slice",
             "std_jac_q_theta_slice", "std_jac_q_vm_slice", "std_jac_load_p_slice",
-            "std_jac_load_q_slice", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
+            "std_jac_load_q_slice", "standard_jac_csr_indices", "standard_jac_csr_indptr",
+            "standard_jac_csr_order", "standard_jac_csr_data", "std_jac_load_nodes",
+            "std_jac_load_extra_nodes", "std_jac_load_p_pos", "std_jac_load_q_pos", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
             "_state_theta", "_state_voltage", "_empty_phi",
             "branch_i", "branch_j", "branch_yff", "branch_yft", "branch_ytf",
             "branch_ytt", "transformer_i", "transformer_j", "transformer_yff",
@@ -1147,6 +1165,14 @@ class ACPowerFlowCalc:
         self.std_jac_p_theta_slice = self.std_jac_p_vm_slice = slice(0, 0)
         self.std_jac_q_theta_slice = self.std_jac_q_vm_slice = slice(0, 0)
         self.std_jac_load_p_slice = self.std_jac_load_q_slice = slice(0, 0)
+        self.standard_jac_csr_indices = np.array([], dtype=np.int32)
+        self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
+        self.standard_jac_csr_order = np.array([], dtype=np.intp)
+        self.standard_jac_csr_data = np.array([], dtype=np.float64)
+        self.std_jac_load_nodes = np.array([], dtype=np.int32)
+        self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
+        self.std_jac_load_p_pos = np.array([], dtype=np.intp)
+        self.std_jac_load_q_pos = np.array([], dtype=np.intp)
 
         if not self.Y_jac_rows.size:
             return
@@ -1184,17 +1210,43 @@ class ACPowerFlowCalc:
         cursor = self.std_jac_q_vm_slice.stop
 
         if self.V_unknown.size:
-            v_load_cols = self.v_col_by_node[self.V_unknown]
-            rows_parts.extend((self.p_row_by_node[self.V_unknown], self.q_row_by_node[self.V_unknown]))
-            cols_parts.extend((v_load_cols, v_load_cols))
-            self.std_jac_load_p_slice = slice(cursor, cursor + self.V_unknown.size)
-            cursor = self.std_jac_load_p_slice.stop
-            self.std_jac_load_q_slice = slice(cursor, cursor + self.V_unknown.size)
-            cursor = self.std_jac_load_q_slice.stop
+            diag_idx_by_node = np.full(self.N, -1, dtype=np.intp)
+            diag_idx_by_node[self.Y_jac_diag_nodes] = self.Y_jac_diag_idx
+            load_diag_idx = diag_idx_by_node[self.V_unknown]
+            yidx_to_p_vm_pos = np.full(self.Y_jac_rows.size, -1, dtype=np.intp)
+            yidx_to_q_vm_pos = np.full(self.Y_jac_rows.size, -1, dtype=np.intp)
+            yidx_to_p_vm_pos[self.std_jac_p_vm_idx] = np.arange(self.std_jac_p_vm_idx.size, dtype=np.intp)
+            yidx_to_q_vm_pos[self.std_jac_q_vm_idx] = np.arange(self.std_jac_q_vm_idx.size, dtype=np.intp)
+            p_local_pos = np.where(load_diag_idx >= 0, yidx_to_p_vm_pos[load_diag_idx], -1)
+            q_local_pos = np.where(load_diag_idx >= 0, yidx_to_q_vm_pos[load_diag_idx], -1)
+            direct_mask = (p_local_pos >= 0) & (q_local_pos >= 0)
+            self.std_jac_load_nodes = self.V_unknown[direct_mask]
+            self.std_jac_load_p_pos = self.std_jac_p_vm_slice.start + p_local_pos[direct_mask]
+            self.std_jac_load_q_pos = self.std_jac_q_vm_slice.start + q_local_pos[direct_mask]
+
+            self.std_jac_load_extra_nodes = self.V_unknown[~direct_mask]
+            if self.std_jac_load_extra_nodes.size:
+                v_load_cols = self.v_col_by_node[self.std_jac_load_extra_nodes]
+                rows_parts.extend((self.p_row_by_node[self.std_jac_load_extra_nodes], self.q_row_by_node[self.std_jac_load_extra_nodes]))
+                cols_parts.extend((v_load_cols, v_load_cols))
+                self.std_jac_load_p_slice = slice(cursor, cursor + self.std_jac_load_extra_nodes.size)
+                cursor = self.std_jac_load_p_slice.stop
+                self.std_jac_load_q_slice = slice(cursor, cursor + self.std_jac_load_extra_nodes.size)
+                cursor = self.std_jac_load_q_slice.stop
 
         self.standard_jac_rows = np.concatenate(rows_parts).astype(np.int32, copy=False)
         self.standard_jac_cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
         self.standard_jac_data = np.empty(cursor, dtype=np.float64)
+        if SCIPY_AVAILABLE and cursor:
+            marker = np.arange(cursor, dtype=np.float64)
+            pattern = coo_matrix(
+                (marker, (self.standard_jac_rows, self.standard_jac_cols)),
+                shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
+            ).tocsr()
+            self.standard_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
+            self.standard_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
+            self.standard_jac_csr_order = pattern.data.astype(np.intp, copy=True)
+            self.standard_jac_csr_data = np.empty_like(self.standard_jac_data)
 
     def _cache_pq_decoupled_matrices(self):
         """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
@@ -2001,15 +2053,24 @@ class ACPowerFlowCalc:
 
         if self.V_unknown.size:
             dPload_dV, dQload_dV = self._calc_load_power_derivatives(V)
-            data[self.std_jac_load_p_slice] = dPload_dV[self.V_unknown]
-            data[self.std_jac_load_q_slice] = dQload_dV[self.V_unknown]
+            if self.std_jac_load_nodes.size:
+                data[self.std_jac_load_p_pos] += dPload_dV[self.std_jac_load_nodes]
+                data[self.std_jac_load_q_pos] += dQload_dV[self.std_jac_load_nodes]
+            if self.std_jac_load_p_slice.stop > self.std_jac_load_p_slice.start:
+                data[self.std_jac_load_p_slice] = dPload_dV[self.std_jac_load_extra_nodes]
+                data[self.std_jac_load_q_slice] = dQload_dV[self.std_jac_load_extra_nodes]
 
-        J = coo_matrix(
+        if self.standard_jac_csr_order.size:
+            self.standard_jac_csr_data[:] = data[self.standard_jac_csr_order]
+            return csr_matrix(
+                (self.standard_jac_csr_data, self.standard_jac_csr_indices, self.standard_jac_csr_indptr),
+                shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
+                copy=False,
+            )
+        return coo_matrix(
             (data, (self.standard_jac_rows, self.standard_jac_cols)),
             shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
         ).tocsr()
-        J.sum_duplicates()
-        return J
 
     def get_jacobi(self, x: np.ndarray) -> csr_matrix:
         """计算雅可比矩阵。标准AC部分使用稀疏矩阵批量公式，零阻抗扩展按块追加。"""
