@@ -44,6 +44,39 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(rhs, H_dense.T @ (weight * residual))
         self.assertIsInstance(gain, np.ndarray)
 
+    def test_sparse_jacobian_builder_retains_explicit_zero_entries(self):
+        from secore.se_math import SparseJacobianBuilder
+
+        builder = SparseJacobianBuilder((2, 3))
+        builder.add(0, 0, 0.0)
+        builder.add_many(
+            np.array([0, 1, 1]),
+            np.array([1, 1, 2]),
+            np.array([0.0, 2.0, 0.0]),
+        )
+        H = builder.to_csr()
+
+        self.assertEqual(4, H.nnz)
+        self.assertIn(0.0, H.data)
+        np.testing.assert_allclose(H.toarray(), np.array([[0.0, 0.0, 0.0], [0.0, 2.0, 0.0]]))
+
+    def test_sparse_normal_equations_keep_structural_zero_pattern(self):
+        from secore.se_math import SparseJacobianBuilder, build_normal_equations
+
+        builder = SparseJacobianBuilder((1, 2))
+        builder.add_many(np.array([0, 0]), np.array([0, 1]), np.array([1.0, 0.0]))
+        H = builder.to_csr()
+        gain, rhs = build_normal_equations(
+            H,
+            np.array([3.0]),
+            np.array([1.0]),
+            dense_gain_limit=0,
+        )
+
+        self.assertEqual(4, gain.nnz)
+        np.testing.assert_allclose(gain.toarray(), np.array([[1.0, 0.0], [0.0, 0.0]]))
+        np.testing.assert_allclose(rhs, np.array([3.0, 0.0]))
+
     def test_build_normal_equations_uses_precomputed_uniform_weight_flag(self):
         from scipy.sparse import csr_matrix
         import secore.se_math as se_math

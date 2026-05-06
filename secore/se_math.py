@@ -1,12 +1,15 @@
+import hashlib
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
 try:
     from scipy.sparse import coo_matrix as SP_COO_MATRIX
+    from scipy.sparse import csc_matrix as SP_CSC_MATRIX
     from scipy.sparse import issparse as SP_ISSPARSE
 except Exception:
     SP_COO_MATRIX = None
+    SP_CSC_MATRIX = None
     SP_ISSPARSE = None
 
 try:
@@ -44,6 +47,8 @@ except Exception:
 
 
 ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
+_NORMAL_EQUATION_PATTERN_CACHE = {}
+_SPARSE_PATTERN_EXPANSION_CACHE = {}
 
 
 def angle_residual_mask(measurements: Sequence[object]) -> np.ndarray:
@@ -101,7 +106,7 @@ class SparseJacobianBuilder:
         rows = np.asarray(rows, dtype=np.int32)
         cols = np.asarray(cols, dtype=np.int32)
         values = np.asarray(values, dtype=np.float64)
-        mask = (cols >= 0) & (values != 0.0)
+        mask = cols >= 0
         if not np.any(mask):
             return
         self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
@@ -167,12 +172,12 @@ class SparseJacobianBuilder:
         flat_rows = broadcast_rows.ravel().astype(np.int32)
         flat_cols = broadcast_cols.ravel().astype(np.int32)
         flat_values = broadcast_values.ravel().astype(np.float64)
-        mask = (flat_cols >= 0) & (flat_values != 0.0)
+        mask = flat_cols >= 0
         if np.any(mask):
             self._append_arrays(flat_rows[mask], flat_cols[mask], flat_values[mask])
 
     def add(self, row: int, col: int, value: float) -> None:
-        if col >= 0 and value != 0.0:
+        if col >= 0:
             self.rows.append(int(row))
             self.cols.append(int(col))
             self.data.append(float(value))
@@ -185,7 +190,6 @@ class SparseJacobianBuilder:
             mask = cols >= 0
         else:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
-        mask = mask & (values != 0.0)
         if np.any(mask):
             self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
             self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
@@ -214,6 +218,78 @@ def sparse_structural_rank(matrix) -> Optional[int]:
 
 def matrix_is_empty(matrix) -> bool:
     return matrix.shape[0] == 0 or matrix.shape[1] == 0
+
+
+def _normal_equation_structural_pattern(H):
+    """Return the structural pattern implied by H.T @ H, retaining zero entries."""
+    if SP_COO_MATRIX is None or not is_sparse_matrix(H):
+        return None
+    H_csc = H if getattr(H, "format", None) == "csc" else H.tocsc()
+    digest = hashlib.blake2b(
+        H_csc.indptr.tobytes() + H_csc.indices.tobytes(),
+        digest_size=16,
+    ).digest()
+    key = (H_csc.shape, int(H_csc.nnz), digest)
+    cached = _NORMAL_EQUATION_PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    H_pattern = H_csc.copy()
+    H_pattern.data = np.ones(int(H_pattern.nnz), dtype=np.float64)
+    pattern = (H_pattern.T @ H_pattern).tocsc()
+    pattern.data = np.zeros(int(pattern.nnz), dtype=np.float64)
+    if len(_NORMAL_EQUATION_PATTERN_CACHE) > 16:
+        _NORMAL_EQUATION_PATTERN_CACHE.clear()
+    _NORMAL_EQUATION_PATTERN_CACHE[key] = pattern
+    return pattern
+
+
+def _expand_sparse_matrix_to_pattern(matrix, pattern):
+    """Return matrix on the union pattern, keeping explicit structural zeros."""
+    if pattern is None or SP_COO_MATRIX is None or SP_CSC_MATRIX is None:
+        return matrix
+    matrix_csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+    pattern_csc = pattern if getattr(pattern, "format", None) == "csc" else pattern.tocsc()
+    if (
+        matrix_csc.shape == pattern_csc.shape
+        and int(matrix_csc.nnz) == int(pattern_csc.nnz)
+        and np.array_equal(matrix_csc.indptr, pattern_csc.indptr)
+        and np.array_equal(matrix_csc.indices, pattern_csc.indices)
+    ):
+        return matrix_csc
+
+    matrix_digest = hashlib.blake2b(
+        matrix_csc.indptr.tobytes() + matrix_csc.indices.tobytes(),
+        digest_size=16,
+    ).digest()
+    key = (
+        id(pattern_csc),
+        int(matrix_csc.nnz),
+        matrix_digest,
+    )
+    target_positions = _SPARSE_PATTERN_EXPANSION_CACHE.get(key)
+    if target_positions is None:
+        positions = np.empty(int(matrix_csc.nnz), dtype=np.int64)
+        write_pos = 0
+        for col in range(int(matrix_csc.shape[1])):
+            matrix_start = int(matrix_csc.indptr[col])
+            matrix_end = int(matrix_csc.indptr[col + 1])
+            if matrix_start == matrix_end:
+                continue
+            pattern_start = int(pattern_csc.indptr[col])
+            pattern_end = int(pattern_csc.indptr[col + 1])
+            pattern_indices = pattern_csc.indices[pattern_start:pattern_end]
+            matrix_indices = matrix_csc.indices[matrix_start:matrix_end]
+            local_positions = np.searchsorted(pattern_indices, matrix_indices)
+            positions[write_pos : write_pos + matrix_indices.size] = pattern_start + local_positions
+            write_pos += matrix_indices.size
+        target_positions = positions
+        if len(_SPARSE_PATTERN_EXPANSION_CACHE) > 32:
+            _SPARSE_PATTERN_EXPANSION_CACHE.clear()
+        _SPARSE_PATTERN_EXPANSION_CACHE[key] = target_positions
+
+    data = np.zeros(int(pattern_csc.nnz), dtype=np.float64)
+    data[target_positions] = matrix_csc.data
+    return SP_CSC_MATRIX((data, pattern_csc.indices, pattern_csc.indptr), shape=pattern_csc.shape, copy=False)
 
 
 def measurement_leverage(H, gain_inv: np.ndarray) -> np.ndarray:
@@ -604,6 +680,7 @@ def build_normal_equations(
                 gain = H.T @ weighted_H
                 rhs = H.T @ weighted_residual
         if is_sparse_matrix(gain):
+            gain = _expand_sparse_matrix_to_pattern(gain, _normal_equation_structural_pattern(H))
             gain = gain.toarray() if gain.shape[0] <= dense_gain_limit else gain.tocsc()
         return gain, np.asarray(rhs, dtype=np.float64).ravel()
 

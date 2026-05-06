@@ -3120,8 +3120,8 @@ class ACStateEstimator:
             dcurrent_re[valid_current] = current.real[valid_current] / current_abs[valid_current]
             dcurrent_im[valid_current] = current.imag[valid_current] / current_abs[valid_current]
             current_idx = plan["current_idx"]
-            self._add_indexed_values(H, rows, self.base_switch_re + current_idx, dcurrent_re, valid_current)
-            self._add_indexed_values(H, rows, self.base_switch_im + current_idx, dcurrent_im, valid_current)
+            self._add_indexed_values(H, rows, self.base_switch_re + current_idx, dcurrent_re)
+            self._add_indexed_values(H, rows, self.base_switch_im + current_idx, dcurrent_im)
 
         return plan["handled_mask"]
 
@@ -3382,13 +3382,12 @@ class ACStateEstimator:
                     np.concatenate((rows, rows, rows, rows)),
                     np.concatenate((own_angle_cols, other_angle_cols, own_voltage_cols, other_voltage_cols)),
                     np.concatenate(values),
-                    np.tile(valid, 4),
                 )
             else:
-                self._add_indexed_values(H, rows, own_angle_cols, values[0], valid)
-                self._add_indexed_values(H, rows, other_angle_cols, values[1], valid)
-                self._add_indexed_values(H, rows, own_voltage_cols, values[2], valid)
-                self._add_indexed_values(H, rows, other_voltage_cols, values[3], valid)
+                self._add_indexed_values(H, rows, own_angle_cols, values[0])
+                self._add_indexed_values(H, rows, other_angle_cols, values[1])
+                self._add_indexed_values(H, rows, own_voltage_cols, values[2])
+                self._add_indexed_values(H, rows, other_voltage_cols, values[3])
 
         return plan["handled_mask"]
 
