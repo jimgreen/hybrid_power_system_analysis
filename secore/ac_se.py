@@ -43,6 +43,7 @@ from secore.se_math import (
     measurement_leverage,
     measurement_residual as build_measurement_residual,
     NormalEquationSolver,
+    _normal_equation_structural_pattern,
     observability_rank_details,
     solve_normal_equations_with_factor,
     sparse_structural_rank,
@@ -77,154 +78,13 @@ _PSEUDO_MEASUREMENT_SUMMARY_TYPES = {
     "ACSwitch": frozenset(("P_FROM", "Q_FROM", "V_FROM", "I_FROM")),
 }
 
-_MEASUREMENT_ROW_CACHE = {}
-_MEASUREMENT_BUILDER_CACHE = {}
-_MEASUREMENT_TEMPLATE_CACHE = {}
-_ACTIVE_PLAN_TEMPLATE_CACHE = {}
-_ACTIVE_INDEX_TEMPLATE_CACHE = {}
 _OBSERVABILITY_RESULT_CACHE = {}
-_ZERO_TIE_LAYOUT_CACHE = {}
-_Y_ROW_CACHE = {}
 
 
 def _file_cache_key(file_name: Path) -> Tuple[Path, int, int]:
     path = Path(file_name).resolve()
     stat = path.stat()
     return path, int(stat.st_mtime_ns), int(stat.st_size)
-
-
-def _read_measurement_rows_cached(file_name: Path) -> Tuple[List[str], List[List[str]]]:
-    key = _file_cache_key(file_name)
-    cached = _MEASUREMENT_ROW_CACHE.get(key[0])
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    parsed = _read_measurement_rows(file_name)
-    _MEASUREMENT_ROW_CACHE[key[0]] = (key, parsed)
-    return parsed
-
-
-def _read_measurement_rows(file_name: Path) -> Tuple[List[str], List[List[str]]]:
-    header = None
-    rows = []
-    in_measurement = False
-    with open(file_name, mode="rt", encoding="utf8") as fp:
-        for line_no, raw_line in enumerate(fp, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            if not in_measurement:
-                if line == "<Measurement>":
-                    in_measurement = True
-                continue
-            if line == "</Measurement>":
-                break
-            first = line[0]
-            if first == "@":
-                header = line[1:].split()
-                continue
-            if first != "#":
-                raise SyntaxError(f"Invalid Measurement row at line {line_no} in {file_name}")
-            if header is None:
-                raise RuntimeError(f"{file_name} Measurement data appears before the header")
-            rows.append(line[1:].split())
-    if not in_measurement:
-        raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
-    if header is None:
-        raise RuntimeError(f"{file_name} Measurement block does not contain a header")
-    return header, rows
-
-
-def _measurement_row_builder(header: Sequence[str]):
-    key = tuple(header)
-    cached = _MEASUREMENT_BUILDER_CACHE.get(key)
-    if cached is not None:
-        return cached
-    required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
-    column_index = {name: idx for idx, name in enumerate(header)}
-    missing = [name for name in required_columns if name not in column_index]
-    if missing:
-        raise RuntimeError(f"Measurement header is missing columns: {missing}")
-    header_len = len(header)
-    code = f"""
-def build_measurements(rows, measurement_cls, file_name):
-    measurements = []
-    append_measurement = measurements.append
-    new_measurement = measurement_cls.__new__
-    int_cell = int
-    float_cell = float
-    device_type_cache = {{}}
-    measurement_type_cache = {{}}
-    for row_no, row in enumerate(rows, start=1):
-        if len(row) < {header_len}:
-            raise RuntimeError(f"Malformed Measurement row at line {{row_no}} in {{file_name}}")
-        raw_device_type = row[{column_index['dev_type']}]
-        device_type = device_type_cache.get(raw_device_type)
-        if device_type is None:
-            device_type = raw_device_type
-            device_type_cache[raw_device_type] = device_type
-        raw_meas_type = row[{column_index['meas_type']}]
-        meas_type = measurement_type_cache.get(raw_meas_type)
-        if meas_type is None:
-            meas_type = raw_meas_type.upper()
-            measurement_type_cache[raw_meas_type] = meas_type
-        meas = new_measurement(measurement_cls)
-        meas.idx = int_cell(row[{column_index['idx']}])
-        meas.name = row[{column_index['name']}]
-        meas.device_type = device_type
-        meas.device_name = row[{column_index['dev_name']}]
-        meas.meas_type = meas_type
-        meas.weight = float_cell(row[{column_index['weight']}])
-        meas.valid = row[{column_index['valid']}] == "1"
-        meas.value = float_cell(row[{column_index['value']}])
-        append_measurement(meas)
-    return measurements
-"""
-    namespace = {}
-    exec(code, namespace)
-    builder = namespace["build_measurements"]
-    _MEASUREMENT_BUILDER_CACHE[key] = builder
-    return builder
-
-
-def _measurement_template_from_objects(measurements: Sequence["Measurement"]):
-    return (
-        tuple(meas.idx for meas in measurements),
-        tuple(meas.name for meas in measurements),
-        tuple(meas.device_type for meas in measurements),
-        tuple(meas.device_name for meas in measurements),
-        tuple(meas.meas_type for meas in measurements),
-        tuple(meas.weight for meas in measurements),
-        tuple(meas.valid for meas in measurements),
-        tuple(meas.value for meas in measurements),
-    )
-
-
-def _clone_measurement_template(template, measurement_cls):
-    idxs, names, device_types, device_names, meas_types, weights, valids, values = template
-    measurements = []
-    append_measurement = measurements.append
-    new_measurement = measurement_cls.__new__
-    for idx, name, device_type, device_name, meas_type, weight, valid, value in zip(
-        idxs,
-        names,
-        device_types,
-        device_names,
-        meas_types,
-        weights,
-        valids,
-        values,
-    ):
-        meas = new_measurement(measurement_cls)
-        meas.idx = idx
-        meas.name = name
-        meas.device_type = device_type
-        meas.device_name = device_name
-        meas.meas_type = meas_type
-        meas.weight = weight
-        meas.valid = valid
-        meas.value = value
-        append_measurement(meas)
-    return measurements
 
 
 def _read_measurements_direct(file_name: Path, measurement_cls):
@@ -277,15 +137,21 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
             if meas_type is None:
                 meas_type = raw_meas_type.upper()
                 measurement_type_cache[raw_meas_type] = meas_type
+            idx = int_cell(row[column_index["idx"]])
+            name = row[column_index["name"]]
+            device_name = row[column_index["dev_name"]]
+            weight = float_cell(row[column_index["weight"]])
+            valid = row[column_index["valid"]] == "1"
+            value = float_cell(row[column_index["value"]])
             meas = new_measurement(measurement_cls)
-            meas.idx = int_cell(row[column_index["idx"]])
-            meas.name = row[column_index["name"]]
+            meas.idx = idx
+            meas.name = name
             meas.device_type = device_type
-            meas.device_name = row[column_index["dev_name"]]
+            meas.device_name = device_name
             meas.meas_type = meas_type
-            meas.weight = float_cell(row[column_index["weight"]])
-            meas.valid = row[column_index["valid"]] == "1"
-            meas.value = float_cell(row[column_index["value"]])
+            meas.weight = weight
+            meas.valid = valid
+            meas.value = value
             append_measurement(meas)
     if not in_measurement:
         raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
@@ -331,13 +197,7 @@ class Measurement:
 
     @classmethod
     def read_from_file(cls, file_name: Path) -> List["Measurement"]:
-        file_key = _file_cache_key(file_name)
-        cached_template = _MEASUREMENT_TEMPLATE_CACHE.get(file_key[0])
-        if cached_template is not None and cached_template[0] == file_key:
-            return _clone_measurement_template(cached_template[1], cls)
-        measurements = _read_measurements_direct(file_name, cls)
-        _MEASUREMENT_TEMPLATE_CACHE[file_key[0]] = (file_key, _measurement_template_from_objects(measurements))
-        return measurements
+        return _read_measurements_direct(file_name, cls)
 
 @dataclass
 class ObservabilityResult:
@@ -415,7 +275,6 @@ class ACStateEstimator:
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
-        self.active_plan_template_hit = False
         self.params = (parameters or load_se_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -619,55 +478,15 @@ class ACStateEstimator:
         finally:
             self._record_profile_time(name, time.perf_counter() - start)
 
-    def _active_plan_template_key(self, active_count: int, max_idx: int) -> Tuple[object, ...]:
-        return (
-            _file_cache_key(self.e_file),
-            _file_cache_key(self.meas_file),
-            bool(self.flat_start),
-            int(self.targeted_pseudo_measurement_max),
-            int(active_count),
-            int(max_idx),
-            int(self.n_state),
-        )
-
     def _default_observability_cache_key(self) -> Tuple[object, ...]:
-        return self._active_plan_template_key(len(self.active_measurements), int(self._max_measurement_idx))
-
-    def _active_index_template_key(self) -> Tuple[object, ...]:
         return (
             _file_cache_key(self.e_file),
             _file_cache_key(self.meas_file),
             bool(self.flat_start),
             int(self.targeted_pseudo_measurement_max),
-            int(len(self.measurements)),
-            int(getattr(self, "_max_measurement_idx", 0)),
+            int(len(self.active_measurements)),
+            int(self._max_measurement_idx),
             int(self.n_state),
-        )
-
-    def _load_active_index_template(self):
-        cached = _ACTIVE_INDEX_TEMPLATE_CACHE.get(self._active_index_template_key())
-        if cached is None:
-            return None
-        return cached
-
-    def _store_active_index_template(
-        self,
-        active_indices: Tuple[int, ...],
-        active_angle_mask: np.ndarray,
-        active_device_type_codes: np.ndarray,
-        active_rows_by_device_type_code: Dict[int, Tuple[int, ...]],
-        first_active_weight: Optional[float],
-        active_weights_are_uniform: bool,
-    ) -> None:
-        if len(_ACTIVE_INDEX_TEMPLATE_CACHE) > 32:
-            _ACTIVE_INDEX_TEMPLATE_CACHE.clear()
-        _ACTIVE_INDEX_TEMPLATE_CACHE[self._active_index_template_key()] = (
-            active_indices,
-            active_angle_mask,
-            active_device_type_codes,
-            active_rows_by_device_type_code,
-            first_active_weight,
-            active_weights_are_uniform,
         )
 
     def _install_active_plan_cache_entries(self) -> None:
@@ -693,83 +512,15 @@ class ACStateEstimator:
             self._active_balance_measurement_plan,
         )
 
-    def _load_active_plan_template(self, active_count: int, max_idx: int) -> bool:
-        cached = _ACTIVE_PLAN_TEMPLATE_CACHE.get(self._active_plan_template_key(active_count, max_idx))
-        if cached is None:
-            return False
-        (
-            self._active_branch_transformer_vector_plan,
-            self._active_simple_jacobian_plan,
-            self._active_zero_current_vector_plan,
-            self._active_generator_measurement_plan,
-            self._active_balance_measurement_plan,
-            self.active_measurements_are_vectorized,
-        ) = cached
-        self.active_plan_template_hit = True
-        return True
-
-    def _store_active_plan_template(self, active_count: int, max_idx: int) -> None:
-        if len(_ACTIVE_PLAN_TEMPLATE_CACHE) > 32:
-            _ACTIVE_PLAN_TEMPLATE_CACHE.clear()
-        _ACTIVE_PLAN_TEMPLATE_CACHE[self._active_plan_template_key(active_count, max_idx)] = (
-            self._active_branch_transformer_vector_plan,
-            self._active_simple_jacobian_plan,
-            self._active_zero_current_vector_plan,
-            self._active_generator_measurement_plan,
-            self._active_balance_measurement_plan,
-            self.active_measurements_are_vectorized,
-        )
-
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and vectorized measurement plans."""
         self._initial_observability_cache = None
-        index_template = self._load_active_index_template()
-        if index_template is not None:
-            (
-                active_indices,
-                self.active_angle_residual_mask,
-                self.active_device_type_codes,
-                self._active_rows_by_device_type_code,
-                first_active_weight,
-                active_weights_are_uniform,
-            ) = index_template
-            measurements = self.measurements
-            self.active_measurements = [measurements[idx] for idx in active_indices]
-            self.active_z = np.asarray([measurements[idx].value for idx in active_indices], dtype=np.float64)
-            self.active_weight = np.asarray([measurements[idx].weight for idx in active_indices], dtype=np.float64)
-            self.active_has_angle_residuals = bool(self.active_angle_residual_mask.any())
-            self.active_weights_are_uniform = bool(active_indices) and bool(active_weights_are_uniform)
-            self.active_uniform_weight = first_active_weight if self.active_weights_are_uniform else None
-            self._branch_transformer_vector_plan_cache = {}
-            self._simple_jacobian_plan_cache = {}
-            self._zero_current_vector_plan_cache = {}
-            self._generator_measurement_plan_cache = {}
-            self._balance_measurement_plan_cache = {}
-            if not self._load_active_plan_template(len(self.active_measurements), int(self._max_measurement_idx)):
-                self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
-                self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
-                self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
-                self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
-                self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
-                self.active_measurements_are_vectorized = bool(
-                    np.all(
-                        self._active_branch_transformer_vector_plan["handled_mask"]
-                        | self._active_simple_jacobian_plan["handled_mask"]
-                        | self._active_zero_current_vector_plan["handled_mask"]
-                        | self._active_generator_measurement_plan["handled_mask"]
-                        | self._active_balance_measurement_plan["handled_mask"]
-                    )
-                )
-                self._store_active_plan_template(len(self.active_measurements), int(self._max_measurement_idx))
-            self._install_active_plan_cache_entries()
-            return
         active_measurements = []
         active_z = []
         active_weight = []
         active_angle_mask = []
         active_device_type_codes = []
         active_rows_by_device_type_code = {}
-        active_indices = []
         max_idx = 0
         first_active_weight = None
         active_weights_are_uniform = True
@@ -779,7 +530,6 @@ class ACStateEstimator:
             if not meas.valid or meas.weight <= 0.0:
                 continue
             active_row = len(active_measurements)
-            active_indices.append(measurement_index)
             active_measurements.append(meas)
             active_z.append(meas.value)
             active_weight.append(meas.weight)
@@ -804,40 +554,30 @@ class ACStateEstimator:
             int(device_type_code): tuple(rows)
             for device_type_code, rows in active_rows_by_device_type_code.items()
         }
-        self._store_active_index_template(
-            tuple(active_indices),
-            self.active_angle_residual_mask,
-            self.active_device_type_codes,
-            self._active_rows_by_device_type_code,
-            first_active_weight,
-            bool(active_weight) and active_weights_are_uniform,
-        )
         self._branch_transformer_vector_plan_cache = {}
         self._simple_jacobian_plan_cache = {}
         self._zero_current_vector_plan_cache = {}
         self._generator_measurement_plan_cache = {}
         self._balance_measurement_plan_cache = {}
-        if not self._load_active_plan_template(len(active_measurements), max_idx):
-            self._active_branch_transformer_vector_plan = None
-            self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
-            self._active_simple_jacobian_plan = None
-            self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
-            self._active_zero_current_vector_plan = None
-            self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
-            self._active_generator_measurement_plan = None
-            self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
-            self._active_balance_measurement_plan = None
-            self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
-            self.active_measurements_are_vectorized = bool(
-                np.all(
-                    self._active_branch_transformer_vector_plan["handled_mask"]
-                    | self._active_simple_jacobian_plan["handled_mask"]
-                    | self._active_zero_current_vector_plan["handled_mask"]
-                    | self._active_generator_measurement_plan["handled_mask"]
-                    | self._active_balance_measurement_plan["handled_mask"]
-                )
+        self._active_branch_transformer_vector_plan = None
+        self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
+        self._active_simple_jacobian_plan = None
+        self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
+        self._active_zero_current_vector_plan = None
+        self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
+        self._active_generator_measurement_plan = None
+        self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
+        self._active_balance_measurement_plan = None
+        self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
+        self.active_measurements_are_vectorized = bool(
+            np.all(
+                self._active_branch_transformer_vector_plan["handled_mask"]
+                | self._active_simple_jacobian_plan["handled_mask"]
+                | self._active_zero_current_vector_plan["handled_mask"]
+                | self._active_generator_measurement_plan["handled_mask"]
+                | self._active_balance_measurement_plan["handled_mask"]
             )
-            self._store_active_plan_template(len(active_measurements), max_idx)
+        )
         self._install_active_plan_cache_entries()
 
     def _measurement_rows_for_types(
@@ -1943,68 +1683,8 @@ class ACStateEstimator:
                 node = self.node_by_name[meas.device_name]
                 meas.value -= self._angle_reference_for_node(node.idx)
 
-    def _zero_tie_layout_cache_key(self) -> Tuple[object, ...]:
-        reference_voltages = tuple(sorted((int(pos), float(value)) for pos, value in self.reference_voltage_by_pos.items()))
-        return (
-            _file_cache_key(self.e_file),
-            tuple(sorted(int(pos) for pos in self.ref_idx)),
-            reference_voltages,
-            len(self.nodes),
-        )
-
-    def _install_zero_tie_layout(self, layout) -> None:
-        (
-            self.zero_tie_components,
-            self.angle_col,
-            self.voltage_col,
-            self.angle_state_pos,
-            self.angle_state_nodes,
-            self.voltage_state_pos,
-            self.voltage_state_nodes,
-            self.ref_angles,
-            self.ref_voltages,
-            self.n_angle,
-            self.n_voltage,
-            self._angle_ref_nodes,
-            self._angle_ref_values,
-            self._voltage_ref_nodes,
-            self._voltage_ref_values,
-            self._angle_unpack_nodes,
-            self._angle_unpack_cols,
-            self._voltage_unpack_nodes,
-            self._voltage_unpack_cols,
-        ) = layout
-
-    def _current_zero_tie_layout(self):
-        return (
-            self.zero_tie_components,
-            self.angle_col,
-            self.voltage_col,
-            self.angle_state_pos,
-            self.angle_state_nodes,
-            self.voltage_state_pos,
-            self.voltage_state_nodes,
-            self.ref_angles,
-            self.ref_voltages,
-            self.n_angle,
-            self.n_voltage,
-            self._angle_ref_nodes,
-            self._angle_ref_values,
-            self._voltage_ref_nodes,
-            self._voltage_ref_values,
-            self._angle_unpack_nodes,
-            self._angle_unpack_cols,
-            self._voltage_unpack_nodes,
-            self._voltage_unpack_cols,
-        )
-
     def _build_zero_tie_state_layout(self) -> None:
         """Compress AC voltage/angle states across ideal switches and zero branches."""
-        cache_key = self._zero_tie_layout_cache_key()
-        cached = _ZERO_TIE_LAYOUT_CACHE.get(cache_key)
-        if cached is not None:
-            self._install_zero_tie_layout(cached)
-            return
         n = len(self.nodes)
         parent = np.arange(n, dtype=np.int32)
 
@@ -2105,9 +1785,6 @@ class ACStateEstimator:
             self._voltage_unpack_cols = np.array([], dtype=np.int32)
         voltage_mask = self.voltage_col >= 0
         self.voltage_col[voltage_mask] = self.n_angle + self.voltage_col[voltage_mask]
-        if len(_ZERO_TIE_LAYOUT_CACHE) > 16:
-            _ZERO_TIE_LAYOUT_CACHE.clear()
-        _ZERO_TIE_LAYOUT_CACHE[cache_key] = self._current_zero_tie_layout()
 
     def _build_y_matrix(self) -> np.ndarray:
         """Build the estimator admittance matrix with the same stamps as load flow."""
@@ -2180,20 +1857,6 @@ class ACStateEstimator:
 
     def _prepare_y_row_cache(self) -> None:
         """Cache sparse Y-row topology used repeatedly by generator Jacobian rows."""
-        if issparse(self.Y):
-            cache_key = (_file_cache_key(self.e_file), int(self.Y.shape[0]), int(self.Y.nnz))
-        else:
-            cache_key = (_file_cache_key(self.e_file), int(self.Y.shape[0]), int(np.count_nonzero(self.Y)))
-        cached = _Y_ROW_CACHE.get(cache_key)
-        if cached is not None:
-            (
-                self._y_row_nodes,
-                self._y_row_y_conj,
-                self._y_row_off_mask,
-                self._y_row_off_nodes,
-                self._y_row_diag_conj,
-            ) = cached
-            return
         n = len(self.nodes)
         self._y_row_nodes = []
         self._y_row_y_conj = []
@@ -2219,15 +1882,6 @@ class ACStateEstimator:
             self._y_row_off_mask.append(off_mask)
             self._y_row_off_nodes.append(nodes[off_mask])
             self._y_row_diag_conj[pos] = np.conj(diag_values[0]) if diag_values.size else 0.0
-        if len(_Y_ROW_CACHE) > 16:
-            _Y_ROW_CACHE.clear()
-        _Y_ROW_CACHE[cache_key] = (
-            self._y_row_nodes,
-            self._y_row_y_conj,
-            self._y_row_off_mask,
-            self._y_row_off_nodes,
-            self._y_row_diag_conj,
-        )
 
     def _group_loads(self) -> Dict[int, List]:
         grouped: Dict[int, List] = {}
@@ -4761,6 +4415,7 @@ class ACStateEstimator:
         cached_residual = None
         cached_objective = None
         normal_solver = NormalEquationSolver()
+        normal_pattern = None
 
         if verbose:
             _print_iteration_header()
@@ -4783,6 +4438,8 @@ class ACStateEstimator:
                 cached_z_est = cached_residual = cached_objective = None
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             H = self._profile_call("solve.jacobian", self.jacobian_sparse, x, measurements)
+            if normal_pattern is None and issparse(H):
+                normal_pattern = _normal_equation_structural_pattern(H)
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
             gain, rhs = self._profile_call(
@@ -4794,6 +4451,7 @@ class ACStateEstimator:
                 uniform_weight=uniform_weight,
                 weights_are_uniform=weights_are_uniform,
                 weighted_residual=weighted_residual,
+                normal_pattern=normal_pattern,
             )
             dx, normal_factor_diag = self._profile_call(
                 "solve.factor_solve",
@@ -4914,6 +4572,7 @@ class ACStateEstimator:
                 uniform_weight=uniform_weight,
                 weights_are_uniform=weights_are_uniform,
                 weighted_residual=weighted_residual,
+                normal_pattern=normal_pattern,
             )
         elif not final_diagnostics:
             H = None
@@ -5107,7 +4766,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Profile:")
         for name, value in sorted(estimator.profile_times.items()):
             print(f"  {name}={value:.6f}s")
-        print(f"  init.active_plan_template_hit={estimator.active_plan_template_hit}")
 
     return 0 if result.converged and result.observability.observable else 1
 

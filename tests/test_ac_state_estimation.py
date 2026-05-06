@@ -263,7 +263,6 @@ class ACStateEstimationTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
             original_read_direct = ac_se._read_measurements_direct
             calls = []
 
@@ -277,9 +276,8 @@ class ACStateEstimationTest(unittest.TestCase):
                 loaded_by_estimator = ACStateEstimator._load_measurements(meas_file)
             finally:
                 ac_se._read_measurements_direct = original_read_direct
-                ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
 
-        self.assertEqual([meas_file], calls)
+        self.assertEqual([meas_file, meas_file], calls)
         self.assertEqual(1, len(measurements))
         self.assertEqual("V", measurements[0].meas_type)
         self.assertEqual(1, len(loaded_by_estimator))
@@ -341,7 +339,6 @@ class ACStateEstimationTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            ac_se._MEASUREMENT_ROW_CACHE.clear()
             original_read_rows = efile_read.read_efile_rows_cached
 
             def reject_read_rows(_file_name):
@@ -352,13 +349,11 @@ class ACStateEstimationTest(unittest.TestCase):
                 measurements = Measurement.read_from_file(meas_file)
             finally:
                 efile_read.read_efile_rows_cached = original_read_rows
-                ac_se._MEASUREMENT_ROW_CACHE.clear()
 
         self.assertEqual(1, len(measurements))
         self.assertEqual("V", measurements[0].meas_type)
 
-    def test_measurement_read_from_file_uses_template_cache_after_direct_parse(self):
-        import secore.ac_se as ac_se
+    def test_measurement_read_from_file_does_not_share_warm_template_cache(self):
         from secore.ac_se import Measurement
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -375,20 +370,14 @@ class ACStateEstimationTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            ac_se._MEASUREMENT_BUILDER_CACHE.clear()
-            ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
-
             measurements = Measurement.read_from_file(meas_file)
-            cached_measurements = Measurement.read_from_file(meas_file)
+            repeated_measurements = Measurement.read_from_file(meas_file)
 
         self.assertEqual(1, len(measurements))
-        self.assertEqual(1, len(cached_measurements))
-        self.assertEqual(0, len(ac_se._MEASUREMENT_BUILDER_CACHE))
-        self.assertEqual(1, len(ac_se._MEASUREMENT_TEMPLATE_CACHE))
-        self.assertIsNot(measurements[0], cached_measurements[0])
-        cached_measurements[0].value = 1.0
+        self.assertEqual(1, len(repeated_measurements))
+        self.assertIsNot(measurements[0], repeated_measurements[0])
+        repeated_measurements[0].value = 1.0
         self.assertEqual(345.6, measurements[0].value)
-        ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
 
     def test_measurement_objects_use_slots_and_support_dataclass_replace(self):
         from dataclasses import replace
@@ -1685,11 +1674,9 @@ class ACStateEstimationTest(unittest.TestCase):
 
             self.assertIs(expected_plan, plan)
 
-    def test_active_measurement_plan_template_reused_across_estimators(self):
-        import secore.ac_se as ac_se
+    def test_active_measurement_plans_are_estimator_local(self):
         from secore.ac_se import ACStateEstimator
 
-        ac_se._ACTIVE_PLAN_TEMPLATE_CACHE.clear()
         first = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
@@ -1699,9 +1686,7 @@ class ACStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
         )
 
-        self.assertFalse(first.active_plan_template_hit)
-        self.assertTrue(second.active_plan_template_hit)
-        self.assertIs(
+        self.assertIsNot(
             first._active_branch_transformer_vector_plan,
             second._active_branch_transformer_vector_plan,
         )
@@ -2549,6 +2534,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
         calls = []
         original_splu = se_math.SP_SPLU
+        original_cholmod = se_math.CHOLMOD_CHOLESKY
 
         class FakeLU:
             def __init__(self):
@@ -2559,6 +2545,7 @@ class ACStateEstimationTest(unittest.TestCase):
             return FakeLU()
 
         se_math.SP_SPLU = fake_splu
+        se_math.CHOLMOD_CHOLESKY = None
         try:
             rank, deficiency, _singular_values, _weak_states = se_math.observability_rank_details(
                 eye(2, format="csr"),
@@ -2566,6 +2553,7 @@ class ACStateEstimationTest(unittest.TestCase):
             )
         finally:
             se_math.SP_SPLU = original_splu
+            se_math.CHOLMOD_CHOLESKY = original_cholmod
 
         self.assertEqual(2, rank)
         self.assertEqual(0, deficiency)

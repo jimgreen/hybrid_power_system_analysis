@@ -1,5 +1,8 @@
 import argparse
+import json
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -78,6 +81,70 @@ def run_cases(cases: Iterable[str], repeats: int, parameter_file: Path, flat_sta
     return [run_case(case, repeats, parameter_file, flat_start, skip_bad_data, profile) for case in cases]
 
 
+def run_case_cold_process(
+    case_name: str,
+    repeats: int,
+    parameter_file: Path,
+    flat_start: bool = True,
+    skip_bad_data: bool = True,
+    profile: bool = False,
+):
+    runs = []
+    profile_totals = {}
+    last = None
+    for _ in range(repeats):
+        cmd = [
+            sys.executable,
+            "-m",
+            "secore.ac_se_benchmark",
+            case_name,
+            "--repeats",
+            "1",
+            "--para",
+            str(parameter_file),
+            "--json",
+        ]
+        if not flat_start:
+            cmd.append("--file-start")
+        if not skip_bad_data:
+            cmd.append("--with-bad-data")
+        if profile:
+            cmd.append("--profile")
+        completed = subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        child_result = json.loads(completed.stdout)
+        runs.extend(float(item) for item in child_result["times"])
+        if profile:
+            for name, value in child_result.get("profile", {}).items():
+                profile_totals[name] = profile_totals.get(name, 0.0) + float(value)
+        last = child_result
+    last["times"] = runs
+    last["avg"] = sum(runs) / len(runs)
+    last["min"] = min(runs)
+    if profile:
+        last["profile"] = {name: value / len(runs) for name, value in sorted(profile_totals.items())}
+    return last
+
+
+def run_cases_cold_process(
+    cases: Iterable[str],
+    repeats: int,
+    parameter_file: Path,
+    flat_start: bool,
+    skip_bad_data: bool,
+    profile: bool,
+):
+    return [
+        run_case_cold_process(case, repeats, parameter_file, flat_start, skip_bad_data, profile)
+        for case in cases
+    ]
+
+
 def _print_result(result) -> None:
     times = " ".join(f"{item:.3f}" for item in result["times"])
     print(
@@ -106,9 +173,12 @@ def main(argv: Sequence[str] = None) -> int:
     parser.add_argument("--file-start", action="store_true", help="Use E-file voltage/angle start instead of flat start.")
     parser.add_argument("--with-bad-data", action="store_true", help="Include post-estimation bad-data analysis.")
     parser.add_argument("--profile", action="store_true", help="Print averaged initialization profile timings.")
+    parser.add_argument("--cold-process", action="store_true", help="Run each repeat in a fresh Python process.")
+    parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    results = run_cases(
+    runner = run_cases_cold_process if args.cold_process else run_cases
+    results = runner(
         args.cases,
         max(1, args.repeats),
         Path(args.para),
@@ -116,6 +186,9 @@ def main(argv: Sequence[str] = None) -> int:
         skip_bad_data=not args.with_bad_data,
         profile=args.profile,
     )
+    if args.json:
+        print(json.dumps(results[0] if len(results) == 1 else results, sort_keys=True))
+        return 0 if all(item["converged"] and item["observable"] for item in results) else 1
     for result in results:
         _print_result(result)
     return 0 if all(item["converged"] and item["observable"] for item in results) else 1

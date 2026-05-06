@@ -49,6 +49,7 @@ except Exception:
 ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
 _NORMAL_EQUATION_PATTERN_CACHE = {}
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
+_SPARSE_PATTERN_LINEAR_INDEX_CACHE = {}
 
 
 def angle_residual_mask(measurements: Sequence[object]) -> np.ndarray:
@@ -249,6 +250,10 @@ def _expand_sparse_matrix_to_pattern(matrix, pattern):
         return matrix
     matrix_csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
     pattern_csc = pattern if getattr(pattern, "format", None) == "csc" else pattern.tocsc()
+    if not matrix_csc.has_sorted_indices:
+        matrix_csc.sort_indices()
+    if not pattern_csc.has_sorted_indices:
+        pattern_csc.sort_indices()
     if (
         matrix_csc.shape == pattern_csc.shape
         and int(matrix_csc.nnz) == int(pattern_csc.nnz)
@@ -268,21 +273,23 @@ def _expand_sparse_matrix_to_pattern(matrix, pattern):
     )
     target_positions = _SPARSE_PATTERN_EXPANSION_CACHE.get(key)
     if target_positions is None:
-        positions = np.empty(int(matrix_csc.nnz), dtype=np.int64)
-        write_pos = 0
-        for col in range(int(matrix_csc.shape[1])):
-            matrix_start = int(matrix_csc.indptr[col])
-            matrix_end = int(matrix_csc.indptr[col + 1])
-            if matrix_start == matrix_end:
-                continue
-            pattern_start = int(pattern_csc.indptr[col])
-            pattern_end = int(pattern_csc.indptr[col + 1])
-            pattern_indices = pattern_csc.indices[pattern_start:pattern_end]
-            matrix_indices = matrix_csc.indices[matrix_start:matrix_end]
-            local_positions = np.searchsorted(pattern_indices, matrix_indices)
-            positions[write_pos : write_pos + matrix_indices.size] = pattern_start + local_positions
-            write_pos += matrix_indices.size
-        target_positions = positions
+        n_rows = int(pattern_csc.shape[0])
+        pattern_key = (id(pattern_csc), pattern_csc.shape, int(pattern_csc.nnz))
+        pattern_linear = _SPARSE_PATTERN_LINEAR_INDEX_CACHE.get(pattern_key)
+        if pattern_linear is None:
+            pattern_counts = np.diff(pattern_csc.indptr).astype(np.int64, copy=False)
+            pattern_cols = np.repeat(np.arange(int(pattern_csc.shape[1]), dtype=np.int64), pattern_counts)
+            pattern_linear = pattern_cols * n_rows + pattern_csc.indices.astype(np.int64, copy=False)
+            if len(_SPARSE_PATTERN_LINEAR_INDEX_CACHE) > 16:
+                _SPARSE_PATTERN_LINEAR_INDEX_CACHE.clear()
+            _SPARSE_PATTERN_LINEAR_INDEX_CACHE[pattern_key] = pattern_linear
+        matrix_counts = np.diff(matrix_csc.indptr).astype(np.int64, copy=False)
+        matrix_cols = np.repeat(np.arange(int(matrix_csc.shape[1]), dtype=np.int64), matrix_counts)
+        matrix_linear = matrix_cols * n_rows + matrix_csc.indices.astype(np.int64, copy=False)
+        target_positions = np.nonzero(np.isin(pattern_linear, matrix_linear, assume_unique=True))[0].astype(
+            np.int64,
+            copy=False,
+        )
         if len(_SPARSE_PATTERN_EXPANSION_CACHE) > 32:
             _SPARSE_PATTERN_EXPANSION_CACHE.clear()
         _SPARSE_PATTERN_EXPANSION_CACHE[key] = target_positions
@@ -356,7 +363,13 @@ def observability_rank_details(
         diag = np.asarray(normal_factor_diag, dtype=np.float64)
         if diag.size == state_count and float(np.min(diag)) > tol:
             return state_count, 0, np.array([], dtype=np.float64), weak_states
-    elif is_sparse_matrix(gram) and SP_SPLU is not None:
+    elif is_sparse_matrix(gram) and CHOLMOD_CHOLESKY is not None:
+        try:
+            CHOLMOD_CHOLESKY(gram.tocsc())
+            return state_count, 0, np.array([], dtype=np.float64), weak_states
+        except Exception:
+            pass
+    if normal_factor_diag is None and is_sparse_matrix(gram) and SP_SPLU is not None:
         gram_csc = gram.tocsc()
         try:
             lu = SP_SPLU(gram_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
@@ -372,13 +385,13 @@ def observability_rank_details(
                 return state_count, 0, np.array([], dtype=np.float64), weak_states
         except Exception:
             pass
-    elif DPOTRF is not None:
+    elif normal_factor_diag is None and DPOTRF is not None:
         chol, info = DPOTRF(gram, lower=True, clean=False, overwrite_a=False)
         if info == 0:
             diag = np.diag(chol)
             if diag.size == state_count and float(np.min(diag)) > tol:
                 return state_count, 0, np.array([], dtype=np.float64), weak_states
-    else:
+    elif normal_factor_diag is None:
         try:
             chol = np.linalg.cholesky(gram)
             diag = np.diag(chol)
@@ -647,6 +660,7 @@ def build_normal_equations(
     uniform_weight: Optional[float] = None,
     weights_are_uniform: Optional[bool] = None,
     weighted_residual: Optional[np.ndarray] = None,
+    normal_pattern=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build WLS normal equations while avoiding WH allocation for uniform weights."""
     if is_sparse_matrix(H):
@@ -680,7 +694,9 @@ def build_normal_equations(
                 gain = H.T @ weighted_H
                 rhs = H.T @ weighted_residual
         if is_sparse_matrix(gain):
-            gain = _expand_sparse_matrix_to_pattern(gain, _normal_equation_structural_pattern(H))
+            if normal_pattern is None:
+                normal_pattern = _normal_equation_structural_pattern(H)
+            gain = _expand_sparse_matrix_to_pattern(gain, normal_pattern)
             gain = gain.toarray() if gain.shape[0] <= dense_gain_limit else gain.tocsc()
         return gain, np.asarray(rhs, dtype=np.float64).ravel()
 

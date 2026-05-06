@@ -1,14 +1,4 @@
-from pathlib import Path
 from types import SimpleNamespace
-
-
-_TOPO_TEMPLATE_CACHE = {}
-
-
-def _file_cache_key(file_name):
-    path = Path(file_name).resolve()
-    stat = path.stat()
-    return path, int(stat.st_mtime_ns), int(stat.st_size)
 
 
 class ACIsl:
@@ -476,7 +466,7 @@ def _generated_ac_table_builder(table_name, header):
 
 
 def _build_ac_model_direct(file_name):
-    data = read_efile_rows_cached(file_name)
+    data = read_efile_rows_cached(file_name, use_cache=False)
     fallback_tables = {key: value for key, value in data.items() if key not in _AC_DIRECT_TABLES}
     fallback = efile_factory_from_rows(fallback_tables) if fallback_tables else SimpleNamespace()
     model = fallback
@@ -547,7 +537,6 @@ class ACPowerNetwork:
         return trfm
 
     def read_from_file(self, file_name):
-        self._topo_cache_key = _file_cache_key(file_name)
         self.model = _build_ac_model_direct(file_name)
         self.p_base = normalize_model_named_units(self.model)
         self.p_base_kW = float(self.model.p_base_kW)
@@ -649,13 +638,6 @@ class ACPowerNetwork:
         if len(self.node_dict) == 0:
             self.format_assoc()
 
-        cache_key = getattr(self, "_topo_cache_key", None)
-        if cache_key is not None:
-            cached = _TOPO_TEMPLATE_CACHE.get(cache_key[0])
-            if cached is not None and cached[0] == cache_key:
-                self._install_topo_template(cached[1])
-                return
-
         # 重置所有节点的拓扑岛号为0
         for node in self.nodes:
             node.isl = 0
@@ -723,118 +705,8 @@ class ACPowerNetwork:
             node.isl_obj = island
 
         self.det_isl_alive_stat()
-        if cache_key is not None:
-            if len(_TOPO_TEMPLATE_CACHE) > 16:
-                _TOPO_TEMPLATE_CACHE.clear()
-            _TOPO_TEMPLATE_CACHE[cache_key[0]] = (cache_key, self._topo_template())
-
-    def _topo_template(self):
-        island_by_obj = {id(isl): pos for pos, isl in enumerate(self.islands)}
-        generator_index_by_obj = {id(gen): pos for pos, gen in enumerate(self.generators)}
-        node_island_pos = []
-        node_v_gens = []
-        for node in self.nodes:
-            node_island_pos.append(island_by_obj.get(id(node.isl_obj), -1))
-            node_v_gens.append(tuple(generator_index_by_obj[id(gen)] for gen in getattr(node, "v_gens", ())))
-
-        def positions(items, source):
-            index_by_obj = {id(item): pos for pos, item in enumerate(source)}
-            return tuple(index_by_obj[id(item)] for item in items)
-
-        islands = []
-        for isl in self.islands:
-            islands.append(
-                (
-                    int(isl.idx),
-                    bool(isl.is_alive),
-                    positions(isl.nodes, self.nodes),
-                    positions(isl.gens, self.generators),
-                    positions(isl.loads, self.loads),
-                    positions(isl.branches, self.branches),
-                    positions(isl.zero_branches, self.zero_branches),
-                    positions(isl.switches, self.switches),
-                    positions(isl.transformers, self.transformers),
-                    positions(isl.shunt_compensators, self.shunt_compensators),
-                    positions(isl.slack_nodes, self.nodes),
-                    positions(isl.v_gens, self.generators),
-                )
-            )
-
-        return (
-            tuple(islands),
-            tuple(node_island_pos),
-            tuple(bool(getattr(node, "is_alive", False)) for node in self.nodes),
-            tuple(tuple(items) for items in node_v_gens),
-            tuple(bool(getattr(load, "is_alive", False)) for load in self.loads),
-            tuple(bool(getattr(gen, "is_alive", False)) for gen in self.generators),
-            tuple(bool(getattr(scp, "is_alive", False)) for scp in self.shunt_compensators),
-            tuple(bool(getattr(br, "is_alive", False)) for br in self.branches),
-            tuple(bool(getattr(trfm, "is_alive", False)) for trfm in self.transformers),
-            tuple(bool(getattr(zbr, "is_alive", False)) for zbr in self.zero_branches),
-            tuple(bool(getattr(sw, "is_alive", False)) for sw in self.switches),
-        )
-
-    def _install_topo_template(self, template):
-        (
-            island_templates,
-            node_island_pos,
-            node_alive,
-            node_v_gens,
-            load_alive,
-            gen_alive,
-            shunt_alive,
-            branch_alive,
-            transformer_alive,
-            zero_branch_alive,
-            switch_alive,
-        ) = template
-
-        self.islands = [ACIsl(idx, is_alive) for idx, is_alive, *_rest in island_templates]
-        for island, island_template in zip(self.islands, island_templates):
-            (
-                _idx,
-                is_alive,
-                node_positions,
-                gen_positions,
-                load_positions,
-                branch_positions,
-                zero_branch_positions,
-                switch_positions,
-                transformer_positions,
-                shunt_positions,
-                slack_positions,
-                v_gen_positions,
-            ) = island_template
-            island.is_alive = is_alive
-            island.nodes = [self.nodes[pos] for pos in node_positions]
-            island.gens = [self.generators[pos] for pos in gen_positions]
-            island.loads = [self.loads[pos] for pos in load_positions]
-            island.branches = [self.branches[pos] for pos in branch_positions]
-            island.zero_branches = [self.zero_branches[pos] for pos in zero_branch_positions]
-            island.switches = [self.switches[pos] for pos in switch_positions]
-            island.transformers = [self.transformers[pos] for pos in transformer_positions]
-            island.shunt_compensators = [self.shunt_compensators[pos] for pos in shunt_positions]
-            island.slack_nodes = [self.nodes[pos] for pos in slack_positions]
-            island.v_gens = [self.generators[pos] for pos in v_gen_positions]
-
-        for pos, node in enumerate(self.nodes):
-            island_pos = node_island_pos[pos]
-            node.isl_obj = self.islands[island_pos] if island_pos >= 0 else None
-            node.isl = node.isl_obj.idx if node.isl_obj is not None else 0
-            node.is_alive = node_alive[pos]
-            node.v_gens = [self.generators[gen_pos] for gen_pos in node_v_gens[pos]]
-
-        for items, alive_flags in (
-            (self.loads, load_alive),
-            (self.generators, gen_alive),
-            (self.shunt_compensators, shunt_alive),
-            (self.branches, branch_alive),
-            (self.transformers, transformer_alive),
-            (self.zero_branches, zero_branch_alive),
-            (self.switches, switch_alive),
-        ):
-            for item, is_alive in zip(items, alive_flags):
-                item.is_alive = is_alive
+        # Cold-start state estimation does not reuse module-level topology templates.
+        # Avoid the extra full-model scan needed to build the warm-cache template.
 
     def det_isl_alive_stat(self):
 
