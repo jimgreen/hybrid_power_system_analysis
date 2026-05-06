@@ -1301,6 +1301,36 @@ class ACStateEstimator:
         self.voltage_state_pos = np.asarray(self.voltage_state_pos, dtype=np.int32)
         self.n_angle = int(self.angle_state_pos.size)
         self.n_voltage = int(self.voltage_state_pos.size)
+        self._angle_ref_nodes = np.fromiter(self.ref_angles.keys(), dtype=np.int32, count=len(self.ref_angles))
+        self._angle_ref_values = np.fromiter(self.ref_angles.values(), dtype=np.float64, count=len(self.ref_angles))
+        self._voltage_ref_nodes = np.fromiter(self.ref_voltages.keys(), dtype=np.int32, count=len(self.ref_voltages))
+        self._voltage_ref_values = np.fromiter(
+            self.ref_voltages.values(),
+            dtype=np.float64,
+            count=len(self.ref_voltages),
+        )
+        if self.angle_state_nodes:
+            self._angle_unpack_nodes = np.concatenate(self.angle_state_nodes).astype(np.int32, copy=False)
+            self._angle_unpack_cols = np.concatenate(
+                [
+                    np.full(nodes.size, col, dtype=np.int32)
+                    for col, nodes in enumerate(self.angle_state_nodes)
+                ]
+            )
+        else:
+            self._angle_unpack_nodes = np.array([], dtype=np.int32)
+            self._angle_unpack_cols = np.array([], dtype=np.int32)
+        if self.voltage_state_nodes:
+            self._voltage_unpack_nodes = np.concatenate(self.voltage_state_nodes).astype(np.int32, copy=False)
+            self._voltage_unpack_cols = np.concatenate(
+                [
+                    np.full(nodes.size, col, dtype=np.int32)
+                    for col, nodes in enumerate(self.voltage_state_nodes)
+                ]
+            )
+        else:
+            self._voltage_unpack_nodes = np.array([], dtype=np.int32)
+            self._voltage_unpack_cols = np.array([], dtype=np.int32)
         voltage_mask = self.voltage_col >= 0
         self.voltage_col[voltage_mask] = self.n_angle + self.voltage_col[voltage_mask]
 
@@ -1485,18 +1515,18 @@ class ACStateEstimator:
         """Restore full theta/V arrays from the compact WLS state vector."""
         n = len(self.nodes)
         theta = np.zeros(n, dtype=np.float64)
-        for pos, angle in self.ref_angles.items():
-            theta[pos] = angle
-        for col, node_positions in enumerate(self.angle_state_nodes):
-            theta[node_positions] = x[col]
+        if self._angle_ref_nodes.size:
+            theta[self._angle_ref_nodes] = self._angle_ref_values
+        if self._angle_unpack_nodes.size:
+            theta[self._angle_unpack_nodes] = x[self._angle_unpack_cols]
 
         state_voltage = np.asarray(x[self.n_angle : self.base_switch_re], dtype=np.float64).copy()
         state_voltage[state_voltage < self.voltage_floor] = self.voltage_floor
         voltage = np.ones(n, dtype=np.float64)
-        for pos, value in self.ref_voltages.items():
-            voltage[pos] = value
-        for col, node_positions in enumerate(self.voltage_state_nodes):
-            voltage[node_positions] = state_voltage[col]
+        if self._voltage_ref_nodes.size:
+            voltage[self._voltage_ref_nodes] = self._voltage_ref_values
+        if self._voltage_unpack_nodes.size:
+            voltage[self._voltage_unpack_nodes] = state_voltage[self._voltage_unpack_cols]
         voltage[voltage < self.voltage_floor] = self.voltage_floor
         return theta, voltage
 

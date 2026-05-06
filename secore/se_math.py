@@ -423,6 +423,11 @@ def solve_normal_equations_with_factor(
         gain_csc = gain.tocsc()
         if SP_SPLU is not None:
             try:
+                lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0)
+                return lu.solve(rhs), np.abs(lu.U.diagonal())
+            except Exception:
+                pass
+            try:
                 lu = SP_SPLU(gain_csc)
                 return lu.solve(rhs), np.abs(lu.U.diagonal())
             except Exception:

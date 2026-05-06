@@ -1405,6 +1405,55 @@ class ACStateEstimationTest(unittest.TestCase):
             self.assertEqual(estimator.voltage_col[i], estimator.voltage_col[j])
             self.assertEqual(estimator.angle_col[i], estimator.angle_col[j])
 
+    def test_compact_state_unpack_uses_precomputed_bulk_indexes(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            flat_start=True,
+        )
+
+        self.assertEqual(
+            int(np.sum(estimator.angle_col >= 0)),
+            int(estimator._angle_unpack_nodes.size),
+        )
+        self.assertEqual(
+            int(np.sum(estimator.voltage_col >= 0)),
+            int(estimator._voltage_unpack_nodes.size),
+        )
+        self.assertEqual(estimator._angle_unpack_nodes.size, estimator._angle_unpack_cols.size)
+        self.assertEqual(estimator._voltage_unpack_nodes.size, estimator._voltage_unpack_cols.size)
+
+    def test_sparse_normal_solver_disables_dynamic_pivoting_for_speed(self):
+        from scipy.sparse import csc_matrix
+        import secore.se_math as se_math
+
+        calls = []
+        original_splu = se_math.SP_SPLU
+
+        class FakeLU:
+            def __init__(self):
+                self.U = csc_matrix(np.eye(2))
+
+            def solve(self, rhs):
+                return np.asarray(rhs, dtype=np.float64)
+
+        def fake_splu(matrix, **kwargs):
+            calls.append(kwargs)
+            return FakeLU()
+
+        se_math.SP_SPLU = fake_splu
+        try:
+            dx, diag = se_math.solve_normal_equations_with_factor(csc_matrix(np.eye(2)), np.ones(2))
+        finally:
+            se_math.SP_SPLU = original_splu
+
+        self.assertTrue(calls)
+        self.assertEqual(0.0, calls[0]["diag_pivot_thresh"])
+        np.testing.assert_allclose(dx, np.ones(2))
+        np.testing.assert_allclose(diag, np.ones(2))
+
     def test_ac_net_30_analytic_jacobian_matches_finite_difference(self):
         from secore.ac_se import ACStateEstimator
 
