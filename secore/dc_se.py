@@ -15,7 +15,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
         sys.path.insert(0, str(path))
 
 from dc_lf import DCPowerFlowCalc
-from dc_model import DCPowerNetwork
+from dc_array_model import DCPowerNetwork
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook
 from secore.se_math import (

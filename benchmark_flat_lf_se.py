@@ -16,7 +16,7 @@ from ac_array_model import build_ac_ppc_from_e_file  # noqa: E402
 from ac_lf import ACPowerFlowCalc  # noqa: E402
 from ac_se import ACStateEstimator  # noqa: E402
 from dc_lf import DCPowerFlowCalc  # noqa: E402
-from dc_model import DCPowerNetwork  # noqa: E402
+from dc_array_model import DCPowerNetwork  # noqa: E402
 from dc_se import DCStateEstimator  # noqa: E402
 from hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork  # noqa: E402
 from hybrid_se import HybridStateEstimator  # noqa: E402

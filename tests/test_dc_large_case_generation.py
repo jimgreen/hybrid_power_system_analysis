@@ -6,9 +6,40 @@ from pathlib import Path
 
 
 class DCLargeCaseGenerationTest(unittest.TestCase):
+    def test_dc_array_network_replaces_object_model_loader(self):
+        from model.dc_array_model import DCPowerNetwork
+
+        network = DCPowerNetwork()
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.topo()
+
+        self.assertEqual("dc_ppc_v1", network.ppc["format"])
+        self.assertEqual(30, len(network.nodes))
+        self.assertEqual(37, len(network.branches))
+        self.assertEqual("nd_1", network.nodes[0].name)
+        self.assertEqual(1.0, network.nodes[0].voltage)
+        self.assertEqual(1, network.nodes[0].run_stat)
+        self.assertIs(network.branches[0].i_node_obj, network.nodes[0])
+        self.assertTrue(any(isl.is_alive for isl in network.islands))
+
+    def test_dc_programs_import_array_model_network(self):
+        root = Path(__file__).resolve().parents[1]
+        checked_files = [
+            root / "benchmark_flat_lf_se.py",
+            root / "generate_dc_large_cases.py",
+            root / "update_meas_from_lf.py",
+            root / "secore" / "dc_se.py",
+            root / "lfcore" / "dc_lf.py",
+        ]
+
+        for file_path in checked_files:
+            source = file_path.read_text(encoding="utf-8")
+            self.assertNotIn("dc_model import DCPowerNetwork", source, str(file_path))
+            self.assertNotIn("import dc_model", source, str(file_path))
+
     def test_dc_solver_accepts_optional_solver_name_and_falls_back(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_model import DCPowerNetwork
+        from model.dc_array_model import DCPowerNetwork
 
         network = DCPowerNetwork()
         network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
@@ -24,7 +55,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_run_reuses_combined_dc_newton_system_builder(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_model import DCPowerNetwork
+        from model.dc_array_model import DCPowerNetwork
 
         class CountingDCPowerFlowCalc(DCPowerFlowCalc):
             def __init__(self, *args, **kwargs):
@@ -90,7 +121,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_model import DCPowerNetwork
+        from model.dc_array_model import DCPowerNetwork
 
         class NonIterableControls:
             def __iter__(self):
@@ -112,7 +143,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_update_lf_info_uses_cached_branch_arrays(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_model import DCPowerNetwork
+        from model.dc_array_model import DCPowerNetwork
 
         class NonIterableBranches:
             def __iter__(self):
@@ -134,7 +165,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_generates_solvable_dc_case_and_measurements(self):
         from generate_dc_large_cases import generate_dc_case_files
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_model import DCPowerNetwork
+        from model.dc_array_model import DCPowerNetwork
         from secore.dc_se import DCStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:

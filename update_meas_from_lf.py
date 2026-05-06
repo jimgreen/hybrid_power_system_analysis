@@ -25,7 +25,7 @@ for path in (ROOT_DIR, MODEL_DIR, LFCORE_DIR):
 from ac_lf import ACPowerFlowCalc
 from ac_model import ACPowerNetwork
 from dc_lf import DCPowerFlowCalc
-from dc_model import DCPowerNetwork
+from dc_array_model import DCPowerNetwork
 from hybrid_lf import run_hybrid_power_flow
 from unit_system import ac_current_base_ka, dc_current_base_ka
 

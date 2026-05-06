@@ -1,5 +1,6 @@
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -148,6 +149,20 @@ def _copy_ppc(ppc: Dict) -> Dict:
     for key, value in ppc.items():
         copied[key] = value.copy() if isinstance(value, np.ndarray) else value
     return copied
+
+
+class _ArrayDevice(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
+def _device(
+    idx,
+    name,
+    **values,
+):
+    obj = _ArrayDevice(idx=int(idx), name=str(name), **values)
+    obj.is_alive = False
+    return obj
 
 
 def _node_maps(bus: np.ndarray):
@@ -355,3 +370,635 @@ def build_dc_ppc_from_e_file(
         with _DC_PPC_CACHE_LOCK:
             _DC_PPC_CACHE[(file_key[0], include_device_names)] = (file_key, ppc)
     return _copy_ppc(ppc) if copy_arrays else ppc
+
+
+class DCIsl:
+    def __init__(self, idx, is_alive):
+        self.idx = idx
+        self.is_alive = is_alive
+        self.nodes = []
+        self.gens = []
+        self.loads = []
+        self.branches = []
+        self.zero_branches = []
+        self.switches = []
+        self.dcdc_converters = []
+        self.slack_nodes = []
+        self.v_gens = []
+        self.v_dcdcs = []
+
+
+class DCPowerNetwork:
+    """Object-compatible DC network facade backed by dc_ppc_v1 arrays."""
+
+    def __init__(self):
+        self.ppc = None
+        self.nodes = []
+        self.branches = []
+        self.loads = []
+        self.generators = []
+        self.zero_branches = []
+        self.switches = []
+        self.dcdc_converters = []
+        self.islands = []
+        self.node_dict = {}
+        self.switch_dict = {}
+        self.load_dict = {}
+        self.generator_dict = {}
+        self.zero_branche_dict = {}
+        self.branche_dict = {}
+        self.dcdc_converter_dict = {}
+
+    def add_node(self, idx, vbase, voltage=1.0, run_stat=1):
+        node = _device(idx, f"nd_{idx}", vbase=float(vbase), voltage=float(voltage), run_stat=int(run_stat))
+        node.isl = None
+        node.isl_obj = None
+        node.v_set = 1.0
+        node.v_gens = []
+        node.v_dcdcs = []
+        node.is_slack = False
+        self.nodes.append(node)
+        return node
+
+    def add_branch(self, idx, i_node, j_node, r, run_stat=1):
+        br = _device(
+            idx,
+            f"br_{idx}",
+            i_node=int(i_node),
+            j_node=int(j_node),
+            r=float(r),
+            run_stat=int(run_stat),
+            current=None,
+            i_p=None,
+            j_p=None,
+            i_node_obj=None,
+            j_node_obj=None,
+        )
+        self.branches.append(br)
+        return br
+
+    def add_load(self, idx, node, pv0, pv1, pv2, run_stat=1):
+        ld = _device(
+            idx,
+            f"load_{idx}",
+            node=int(node),
+            pv0=float(pv0),
+            pv1=float(pv1),
+            pv2=float(pv2),
+            run_stat=int(run_stat),
+            p=None,
+            current=None,
+            node_obj=None,
+        )
+        self.loads.append(ld)
+        return ld
+
+    def add_generator(self, idx, node, control_type, p_set, v_set, i_set, run_stat=1):
+        gen = _device(
+            idx,
+            f"gen_{idx}",
+            node=int(node),
+            control_type=str(control_type),
+            p_set=float(p_set),
+            v_set=float(v_set),
+            i_set=float(i_set),
+            run_stat=int(run_stat),
+            p=None,
+            current=None,
+            node_obj=None,
+        )
+        self.generators.append(gen)
+        return gen
+
+    def add_zero_branch(self, idx, i_node, j_node, run_stat=1):
+        zbr = _device(
+            idx,
+            f"zbr_{idx}",
+            i_node=int(i_node),
+            j_node=int(j_node),
+            run_stat=int(run_stat),
+            current=None,
+            p=None,
+            i_node_obj=None,
+            j_node_obj=None,
+        )
+        self.zero_branches.append(zbr)
+        return zbr
+
+    def add_switch(self, idx, i_node, j_node, status, run_stat=1):
+        sw = _device(
+            idx,
+            f"sw_{idx}",
+            i_node=int(i_node),
+            j_node=int(j_node),
+            status=int(status),
+            run_stat=int(run_stat),
+            current=None,
+            p=None,
+            i_node_obj=None,
+            j_node_obj=None,
+        )
+        self.switches.append(sw)
+        return sw
+
+    def add_dcdc_converter(self, idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat=1):
+        conv = _device(
+            idx,
+            f"dcdc_{idx}",
+            i_node=int(i_node),
+            j_node=int(j_node),
+            r1=float(r1),
+            r2=float(r2),
+            control_type=str(control_type),
+            p_set=float(p_set),
+            i_set=float(i_set),
+            v_set=float(v_set),
+            run_stat=int(run_stat),
+            i_p=None,
+            j_p=None,
+            i_c=None,
+            j_c=None,
+            i_node_obj=None,
+            j_node_obj=None,
+        )
+        self.dcdc_converters.append(conv)
+        return conv
+
+    def read_from_file(self, file_name):
+        self.ppc = build_dc_ppc_from_e_file(file_name, use_cache=True, copy_arrays=True)
+        base = self.ppc["base"]
+        self.p_base = float(base["p_base"])
+        self.p_base_kW = float(base["p_base_kW"])
+        self.u_scale = float(base["u_scale"])
+        self.p_scale = float(base["p_scale"])
+        self.i_scale = float(base["i_scale"])
+        self._load_objects_from_ppc(self.ppc)
+
+    def _load_objects_from_ppc(self, ppc):
+        ctrl_label = {CTRL_P: "P", CTRL_V: "V", CTRL_I: "I"}
+        self.nodes = []
+        for row, name in zip(ppc["bus"], ppc.get("bus_name", [])):
+            node = _device(
+                row[BUS_COLS["idx"]],
+                name,
+                vbase=float(row[BUS_COLS["vbase"]]),
+                voltage=float(row[BUS_COLS["voltage"]]),
+                run_stat=int(row[BUS_COLS["run_stat"]]),
+            )
+            node.isl = None
+            node.isl_obj = None
+            node.v_set = 1.0
+            node.v_gens = []
+            node.v_dcdcs = []
+            node.is_slack = False
+            self.nodes.append(node)
+
+        self.branches = []
+        for row, name in zip(ppc["branch"], ppc.get("branch_name", [])):
+            self.branches.append(
+                _device(
+                    row[BRANCH_COLS["idx"]],
+                    name,
+                    i_node=int(row[BRANCH_COLS["i_node"]]),
+                    j_node=int(row[BRANCH_COLS["j_node"]]),
+                    r=float(row[BRANCH_COLS["r"]]),
+                    run_stat=int(row[BRANCH_COLS["run_stat"]]),
+                    i_p=float(row[BRANCH_COLS["i_p"]]),
+                    j_p=float(row[BRANCH_COLS["j_p"]]),
+                    current=float(row[BRANCH_COLS["current"]]),
+                    i_node_obj=None,
+                    j_node_obj=None,
+                )
+            )
+
+        self.loads = []
+        for row, name in zip(ppc["load"], ppc.get("load_name", [])):
+            self.loads.append(
+                _device(
+                    row[LOAD_COLS["idx"]],
+                    name,
+                    node=int(row[LOAD_COLS["node"]]),
+                    pv0=float(row[LOAD_COLS["pv0"]]),
+                    pv1=float(row[LOAD_COLS["pv1"]]),
+                    pv2=float(row[LOAD_COLS["pv2"]]),
+                    run_stat=int(row[LOAD_COLS["run_stat"]]),
+                    p=float(row[LOAD_COLS["p"]]),
+                    current=float(row[LOAD_COLS["current"]]),
+                    node_obj=None,
+                )
+            )
+
+        self.generators = []
+        for row, name in zip(ppc["gen"], ppc.get("gen_name", [])):
+            self.generators.append(
+                _device(
+                    row[GEN_COLS["idx"]],
+                    name,
+                    node=int(row[GEN_COLS["node"]]),
+                    control_type=ctrl_label[int(row[GEN_COLS["control_type"]])],
+                    p_set=float(row[GEN_COLS["p_set"]]),
+                    v_set=float(row[GEN_COLS["v_set"]]),
+                    i_set=float(row[GEN_COLS["i_set"]]),
+                    run_stat=int(row[GEN_COLS["run_stat"]]),
+                    p=float(row[GEN_COLS["p"]]),
+                    current=float(row[GEN_COLS["current"]]),
+                    node_obj=None,
+                )
+            )
+
+        self.zero_branches = []
+        for row, name in zip(ppc["zero_branch"], ppc.get("zero_branch_name", [])):
+            self.zero_branches.append(
+                _device(
+                    row[ZERO_BRANCH_COLS["idx"]],
+                    name,
+                    i_node=int(row[ZERO_BRANCH_COLS["i_node"]]),
+                    j_node=int(row[ZERO_BRANCH_COLS["j_node"]]),
+                    run_stat=int(row[ZERO_BRANCH_COLS["run_stat"]]),
+                    p=float(row[ZERO_BRANCH_COLS["p"]]),
+                    current=float(row[ZERO_BRANCH_COLS["current"]]),
+                    i_node_obj=None,
+                    j_node_obj=None,
+                )
+            )
+
+        self.switches = []
+        for row, name in zip(ppc["switch"], ppc.get("switch_name", [])):
+            self.switches.append(
+                _device(
+                    row[SWITCH_COLS["idx"]],
+                    name,
+                    i_node=int(row[SWITCH_COLS["i_node"]]),
+                    j_node=int(row[SWITCH_COLS["j_node"]]),
+                    status=int(row[SWITCH_COLS["status"]]),
+                    run_stat=int(row[SWITCH_COLS["run_stat"]]),
+                    p=float(row[SWITCH_COLS["p"]]),
+                    current=float(row[SWITCH_COLS["current"]]),
+                    i_node_obj=None,
+                    j_node_obj=None,
+                )
+            )
+
+        self.dcdc_converters = []
+        for row, name in zip(ppc["dcdc"], ppc.get("dcdc_name", [])):
+            self.dcdc_converters.append(
+                _device(
+                    row[DCDC_COLS["idx"]],
+                    name,
+                    i_node=int(row[DCDC_COLS["i_node"]]),
+                    j_node=int(row[DCDC_COLS["j_node"]]),
+                    r1=float(row[DCDC_COLS["r1"]]),
+                    r2=float(row[DCDC_COLS["r2"]]),
+                    control_type=ctrl_label[int(row[DCDC_COLS["control_type"]])],
+                    p_set=float(row[DCDC_COLS["p_set"]]),
+                    i_set=float(row[DCDC_COLS["i_set"]]),
+                    v_set=float(row[DCDC_COLS["v_set"]]),
+                    run_stat=int(row[DCDC_COLS["run_stat"]]),
+                    i_p=float(row[DCDC_COLS["i_p"]]),
+                    j_p=float(row[DCDC_COLS["j_p"]]),
+                    i_c=float(row[DCDC_COLS["i_c"]]),
+                    j_c=float(row[DCDC_COLS["j_c"]]),
+                    i_node_obj=None,
+                    j_node_obj=None,
+                )
+            )
+
+    def format_assoc(self):
+        self.node_dict = {node.idx: node for node in self.nodes}
+        self.switch_dict = {sw.idx: sw for sw in self.switches}
+        self.load_dict = {ld.idx: ld for ld in self.loads}
+        self.generator_dict = {gen.idx: gen for gen in self.generators}
+        self.zero_branche_dict = {zbr.idx: zbr for zbr in self.zero_branches}
+        self.branche_dict = {br.idx: br for br in self.branches}
+        self.dcdc_converter_dict = {conv.idx: conv for conv in self.dcdc_converters}
+
+        for node in self.nodes:
+            node.generators = []
+            node.loads = []
+            node.branches = []
+            node.switches = []
+            node.dcdc_converters = []
+            node.zero_branches = []
+            node.is_alive = False
+
+        for gen in self.generators:
+            gen.node_obj = self.node_dict.get(gen.node, None)
+            if gen.node_obj:
+                gen.node_obj.generators.append(gen)
+        for ld in self.loads:
+            ld.node_obj = self.node_dict.get(ld.node, None)
+            if ld.node_obj:
+                ld.node_obj.loads.append(ld)
+        for br in self.branches:
+            br.i_node_obj = self.node_dict.get(br.i_node, None)
+            br.j_node_obj = self.node_dict.get(br.j_node, None)
+            if br.i_node_obj:
+                br.i_node_obj.branches.append(br)
+            if br.j_node_obj:
+                br.j_node_obj.branches.append(br)
+        for sw in self.switches:
+            sw.i_node_obj = self.node_dict.get(sw.i_node, None)
+            sw.j_node_obj = self.node_dict.get(sw.j_node, None)
+            if sw.i_node_obj:
+                sw.i_node_obj.switches.append(sw)
+            if sw.j_node_obj:
+                sw.j_node_obj.switches.append(sw)
+        for conv in self.dcdc_converters:
+            conv.i_node_obj = self.node_dict.get(conv.i_node, None)
+            conv.j_node_obj = self.node_dict.get(conv.j_node, None)
+            if conv.i_node_obj:
+                conv.i_node_obj.dcdc_converters.append(conv)
+            if conv.j_node_obj:
+                conv.j_node_obj.dcdc_converters.append(conv)
+        for zbr in self.zero_branches:
+            zbr.i_node_obj = self.node_dict.get(zbr.i_node, None)
+            zbr.j_node_obj = self.node_dict.get(zbr.j_node, None)
+            if zbr.i_node_obj:
+                zbr.i_node_obj.zero_branches.append(zbr)
+            if zbr.j_node_obj:
+                zbr.j_node_obj.zero_branches.append(zbr)
+
+    def topo(self):
+        if len(self.node_dict) == 0:
+            self.format_assoc()
+        for node in self.nodes:
+            node.isl = 0
+            node.isl_obj = None
+
+        running_nodes = [node for node in self.nodes if node.run_stat == 1]
+        adj = {node: set() for node in running_nodes}
+
+        def add_edge(dev):
+            if (
+                dev.run_stat == 1
+                and dev.i_node_obj in adj
+                and dev.j_node_obj in adj
+                and dev.i_node_obj != dev.j_node_obj
+            ):
+                adj[dev.i_node_obj].add(dev.j_node_obj)
+                adj[dev.j_node_obj].add(dev.i_node_obj)
+
+        for dev in self.branches:
+            add_edge(dev)
+        for dev in self.zero_branches:
+            add_edge(dev)
+        for dev in self.switches:
+            if dev.status == 1:
+                add_edge(dev)
+
+        self.islands = []
+        island_idx = 0
+        for node in running_nodes:
+            if node.isl == 0:
+                island_idx += 1
+                island = DCIsl(island_idx, True)
+                self.islands.append(island)
+                stack = [node]
+                node.isl = island_idx
+                node.isl_obj = island
+                while stack:
+                    cur_node = stack.pop()
+                    for next_node in adj[cur_node]:
+                        if next_node.isl == 0:
+                            next_node.isl = island_idx
+                            next_node.isl_obj = island
+                            stack.append(next_node)
+
+        self.det_isl_alive_stat()
+
+    def det_isl_alive_stat(self):
+        for isl in self.islands:
+            isl.is_alive = False
+            isl.slack_nodes = []
+            isl.v_gens = []
+            isl.v_dcdcs = []
+            isl.nodes = []
+            isl.gens = []
+            isl.loads = []
+            isl.branches = []
+            isl.dcdc_converters = []
+            isl.zero_branches = []
+            isl.switches = []
+
+        for node in self.nodes:
+            node.v_gens = []
+            node.v_dcdcs = []
+            node.v_set = 0.0
+            node.is_slack = False
+
+        for gen in self.generators:
+            if gen.run_stat == 0:
+                continue
+            node = gen.node_obj
+            if node is None or node.isl_obj is None:
+                continue
+            node.isl_obj.gens.append(gen)
+            if gen.control_type == "V":
+                node.v_gens.append(gen)
+                node.isl_obj.v_gens.append(gen)
+
+        for dcdc in self.dcdc_converters:
+            if dcdc.run_stat == 0:
+                continue
+            if dcdc.i_node_obj is None or dcdc.j_node_obj is None:
+                continue
+            if dcdc.i_node_obj.isl_obj is None or dcdc.j_node_obj.isl_obj is None:
+                continue
+            node = dcdc.i_node_obj
+            dcdc.i_node_obj.isl_obj.dcdc_converters.append(dcdc)
+            dcdc.j_node_obj.isl_obj.dcdc_converters.append(dcdc)
+            if dcdc.control_type == "V":
+                node.v_dcdcs.append(dcdc)
+                node.isl_obj.v_dcdcs.append(dcdc)
+
+        for load in self.loads:
+            if load.run_stat == 0:
+                continue
+            if load.node_obj is None or load.node_obj.isl_obj is None:
+                continue
+            load.node_obj.isl_obj.loads.append(load)
+        for switch in self.switches:
+            if switch.i_node_obj is None or switch.j_node_obj is None:
+                continue
+            if switch.run_stat == 0 or switch.status == 0:
+                continue
+            if switch.i_node_obj.isl_obj and switch.j_node_obj.isl_obj and switch.i_node_obj.isl_obj == switch.j_node_obj.isl_obj:
+                switch.i_node_obj.isl_obj.switches.append(switch)
+        for br in self.branches:
+            if br.run_stat == 0:
+                continue
+            if br.i_node_obj is None or br.j_node_obj is None:
+                continue
+            if br.i_node_obj.isl_obj and br.j_node_obj.isl_obj and br.i_node_obj.isl_obj == br.j_node_obj.isl_obj:
+                br.i_node_obj.isl_obj.branches.append(br)
+        for zbr in self.zero_branches:
+            if zbr.run_stat == 0:
+                continue
+            if zbr.i_node_obj is None or zbr.j_node_obj is None:
+                continue
+            if zbr.i_node_obj.isl_obj and zbr.j_node_obj.isl_obj and zbr.i_node_obj.isl_obj == zbr.j_node_obj.isl_obj:
+                zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
+
+        for node in self.nodes:
+            if node.isl_obj is None:
+                continue
+            node.isl_obj.nodes.append(node)
+            if len(node.v_gens) + len(node.v_dcdcs) > 0:
+                node.isl_obj.slack_nodes.append(node)
+
+        for isl in self.islands:
+            if len(isl.slack_nodes) + len(isl.v_dcdcs) >= 1:
+                isl.is_alive = True
+
+        for node in self.nodes:
+            node.is_alive = node.run_stat == 1 and node.isl_obj is not None and node.isl_obj.is_alive
+        for load in self.loads:
+            node = load.node_obj
+            load.is_alive = node is not None and node.isl_obj is not None and load.run_stat == 1 and node.isl_obj.is_alive
+        for gen in self.generators:
+            node = gen.node_obj
+            gen.is_alive = node is not None and node.isl_obj is not None and gen.run_stat == 1 and node.isl_obj.is_alive
+        for br in self.branches:
+            br.is_alive = (
+                br.i_node_obj is not None
+                and br.j_node_obj is not None
+                and br.run_stat == 1
+                and br.i_node_obj.is_alive
+                and br.j_node_obj.is_alive
+            )
+        for zbr in self.zero_branches:
+            zbr.is_alive = (
+                zbr.i_node_obj is not None
+                and zbr.j_node_obj is not None
+                and zbr.run_stat == 1
+                and zbr.i_node_obj.is_alive
+                and zbr.j_node_obj.is_alive
+            )
+        for sw in self.switches:
+            sw.is_alive = (
+                sw.i_node_obj is not None
+                and sw.j_node_obj is not None
+                and sw.status == 1
+                and sw.run_stat == 1
+                and sw.i_node_obj.is_alive
+                and sw.j_node_obj.is_alive
+            )
+        for conv in self.dcdc_converters:
+            conv.is_alive = (
+                conv.i_node_obj is not None
+                and conv.j_node_obj is not None
+                and conv.run_stat == 1
+                and conv.i_node_obj.is_alive
+                and conv.j_node_obj.is_alive
+            )
+
+    def print_isl_info(self):
+        for isl in self.islands:
+            print(f"isl {isl.idx} is_alive = {isl.is_alive}")
+            print(f"    node = {len(isl.nodes)}:")
+            for node in isl.nodes:
+                print(f"        {node.idx} {node.name} vbase: {node.vbase}")
+            print(f"    gens = {len(isl.gens)}:")
+            for gen in isl.gens:
+                print(f"        {gen.idx} {gen.name} node = {gen.node} control_type = {gen.control_type}")
+            print(f"    loads = {len(isl.loads)}:")
+            for load in isl.loads:
+                print(f"        {load.idx} {load.name} node = {load.node}")
+            print(f"    branches = {len(isl.branches)}:")
+            for br in isl.branches:
+                print(f"        {br.idx} {br.name} i_node = {br.i_node} j_node = {br.j_node} r = {br.r}")
+            print(f"    switches = {len(isl.switches)}:")
+            for sw in isl.switches:
+                print(f"        {sw.idx} {sw.name} i_node = {sw.i_node} j_node = {sw.j_node} status = {sw.status}")
+            print(f"    zero_branches = {len(isl.zero_branches)}:")
+            for zbr in isl.zero_branches:
+                print(f"        {zbr.idx} {zbr.name} i_node = {zbr.i_node} j_node = {zbr.j_node}")
+            print(f"    dcdc_converters = {len(isl.dcdc_converters)}:")
+            for dcc in isl.dcdc_converters:
+                print(f"        {dcc.idx} {dcc.name} i_node = {dcc.i_node} j_node = {dcc.j_node} r1 = {dcc.r1} r2 = {dcc.r2} control_type = {dcc.control_type}")
+
+    def check_topo(self):
+        errors = []
+        warns = []
+        if len(self.islands) == 0:
+            self.topo()
+
+        node_ref_count = {node.idx: 0 for node in self.nodes}
+
+        def check_node(node_idx, dev_type, dev):
+            if node_idx not in self.node_dict:
+                errors.append(f"设备 {dev_type}[{dev.idx}] {dev.name} 引用的节点 {node_idx} 不存在")
+            elif self.node_dict[node_idx].run_stat == 1:
+                node_ref_count[node_idx] += 1
+
+        for br in self.branches:
+            if br.run_stat:
+                check_node(br.i_node, "Branch", br)
+                check_node(br.j_node, "Branch", br)
+        for zbr in self.zero_branches:
+            if zbr.run_stat:
+                check_node(zbr.i_node, "ZeroBranch", zbr)
+                check_node(zbr.j_node, "ZeroBranch", zbr)
+        for sw in self.switches:
+            if sw.run_stat:
+                check_node(sw.i_node, "Switch", sw)
+                check_node(sw.j_node, "Switch", sw)
+        for ld in self.loads:
+            if ld.run_stat:
+                check_node(ld.node, "Load", ld)
+        for gen in self.generators:
+            if gen.run_stat:
+                check_node(gen.node, "Generator", gen)
+        for dcdc in self.dcdc_converters:
+            if dcdc.run_stat:
+                check_node(dcdc.i_node, "DCDCConverter", dcdc)
+                check_node(dcdc.j_node, "DCDCConverter", dcdc)
+
+        for node in self.nodes:
+            if node.run_stat != 1:
+                continue
+            if node_ref_count[node.idx] == 0:
+                errors.append(f"节点 {node.idx} {node.name} 未关联任何设备")
+            if node_ref_count[node.idx] == 1:
+                warns.append(f"节点 {node.idx} {node.name} 单端悬空，请检查！")
+
+        for isl in self.islands:
+            vbase_set = {int(node.vbase * 1000) for node in isl.nodes}
+            if len(vbase_set) > 1:
+                str_info = f"岛屿 {isl.idx} 内节点电压基值不一致:"
+                for vbase in vbase_set:
+                    str_info += f" {vbase / 1000.0 :.2f}"
+                errors.append(str_info)
+            if len(isl.slack_nodes) > 1:
+                str_info = f"岛屿 {isl.idx} 存在多个定V节点:"
+                for node in isl.slack_nodes:
+                    str_info += f" {node.name}"
+                warns.append(str_info)
+            if len(isl.v_dcdcs) > 1:
+                str_info = f"岛屿 {isl.idx} 存在多个定V变流器:"
+                for dcdc in isl.v_dcdcs:
+                    str_info += f" {dcdc.name}"
+                warns.append(str_info)
+            if len(isl.slack_nodes) + len(isl.v_dcdcs) == 0:
+                errors.append(f"岛屿 {isl.idx} , 内无电压控制源（定V节点或定V变流器）")
+            if len(isl.slack_nodes) > 1:
+                str_info = f"岛屿 {isl.idx} , 内有多个电压控制源（定V节点或定V变流器）:"
+                for node in isl.slack_nodes:
+                    str_info += f" node-{node.name}"
+                errors.append(str_info)
+
+        for node in self.nodes:
+            if node.run_stat != 1:
+                continue
+            if len(node.v_gens) + len(node.v_dcdcs) <= 1:
+                continue
+            if len(node.v_gens) + len(node.v_dcdcs) >= 2:
+                errors.append(f"松弛节点 {node.idx} 上的定V发电机与定V变流器数量之和超过1，请检查拓扑！")
+            node.v_set = 0.0
+            if len(node.v_gens) >= 1:
+                node.v_set = node.v_gens[0].v_set
+            if len(node.v_dcdcs) > 1:
+                node.v_set = node.v_dcdcs[0].v_set
+            node.is_slack = True
+
+        return warns, errors
