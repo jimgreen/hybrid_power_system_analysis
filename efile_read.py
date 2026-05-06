@@ -1,0 +1,247 @@
+import re
+import threading
+import weakref
+from pathlib import Path
+
+
+_QUOTED_SPLIT_RE = re.compile(r"\s+(?=(?:[^']*'[^']*')*[^']*$)")
+_CLASS_CACHE = {}
+_EFILE_CACHE = {}
+_EFILE_CACHE_LOCK = threading.Lock()
+
+
+def _split_data_row(text):
+    """Split one E-file data row, using the regex path only when quotes exist."""
+    text = text.lstrip()
+    if "'" not in text:
+        return text.split()
+    return _QUOTED_SPLIT_RE.split(text)
+
+
+def _convert_cell(value):
+    """Convert E-file scalar text to int/float only when it is numeric-like."""
+    if not isinstance(value, str):
+        return value
+    if not value:
+        return value
+    first = value[0]
+    if first not in "+-.0123456789":
+        return value
+    if "." in value or "e" in value or "E" in value:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+class SingletonType(type):
+    _instance_lock = threading.Lock()
+    _instance_ref = weakref.WeakValueDictionary()
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instance_ref:
+            with SingletonType._instance_lock:
+                if cls not in cls._instance_ref:
+                    instance = super(SingletonType, cls).__call__(*args, **kwargs)
+                    cls._instance_ref[cls] = instance
+        return cls._instance_ref[cls]
+
+class EBlock(object):
+    """Represents a block."""
+    __slots__ = ("name", "header_list", "data")
+
+    def __init__(self, name):
+        """Constructor
+        :type name: str
+        """
+        self.name = name
+        self.header_list = []
+        self.data = []
+
+    def AddRow(self, attr_list):
+        """
+        :type attr_list: ['attr1','attr2',...]
+        """
+        header = self.header_list
+        if len(attr_list) != len(header):
+            raise TypeError(f'attr_list length {len(attr_list)} {attr_list} not equal to header_list {header} length {len(header)}')
+        self.data.append(dict(zip(header, attr_list)))
+    
+    def to_dict(self):
+        return {'table_name':self.name,'header_list':self.header_list,'data':self.data}
+
+cond_operators = {
+    'eq': lambda a,b: a == b,
+    'gt': lambda a,b: a > b,
+    'lt': lambda a,b: a < b,
+    'gte': lambda a,b: a >= b,
+    'lte': lambda a,b: a <= b,
+    'neq': lambda a,b: a != b
+}
+
+class EBook():
+    """Represents a book."""
+
+    # _write_lock = threading.Lock()
+    def __init__(self, input):
+        """Constructor
+        :type name: str
+        """
+        self.data = {}
+        if isinstance(input,str) or isinstance(input,Path):
+            self.file_path = input
+            self._read_file_(self.file_path)
+        else:
+            self._read_dict_(input)
+
+        
+    def _read_file_(self, file_path):
+        data = self.data
+        block_read = None
+        split_data_row = _split_data_row
+        # efile 解析：绝大多数文件没有带空格的引号字段，优先走 str.split 快路径。
+        with open(file_path, mode='rt', encoding='utf8') as fp:
+            for idx, line in enumerate(fp):
+                line = line.strip()
+                if not line:  # empty line
+                    continue
+                first = line[0]
+                if first == '<':
+                    if line.startswith('</'):  # block end
+                        data[block_read.name] = block_read
+                        continue
+                    block_read = EBlock(line[1:-1])
+                elif first == '@':  # header
+                    block_read.header_list = line[1:].split()
+                elif first == '#':
+                    block_read.AddRow(split_data_row(line[1:]))
+                else:
+                    raise SyntaxError(f"Invalid row at line {idx + 1} {line} in {file_path}")
+    
+    def _tab_name_check(self, tab_name):
+        if not self.data.get(tab_name, None):
+            raise ValueError(f"Not found table {tab_name}")
+        
+    def to_dict(self):
+        data_dict = {}
+        for key, block in self.data.items():
+            if ' lv ' in key:
+                key_list = key.split(' lv ')
+                data_dict[key_list[0]] = block.to_dict() | {'lv': int(key_list[1].strip().split('=')[1])}
+            else:
+                data_dict[key] = block.to_dict() | {'lv': 0}
+        return data_dict
+
+    def _read_dict_(self,data_dict):
+
+        for key,v in data_dict.items():
+            self.data[key] = EBlock(key)
+            self.data[key].header_list = list(v[0].keys()) if v else []
+            for d in v:
+                self.data[key].AddRow(d.values())
+
+
+    def apply_to_file(self,file_path=None):
+        
+        """将当前内容写入文件
+        """
+        if file_path:
+            write_file_path = file_path
+        else:
+            write_file_path = self.file_path
+        with open(write_file_path, mode='w', encoding='gb18030') as fp:
+            parts = []
+            for e in self.data.values():
+                parts.append('<' + e.name + '>\n')
+                parts.append('@ ' + '\t'.join(e.header_list) + '\n')
+                for row in e.data:
+                    parts.append('# ' + '\t'.join(str(item) for item in row.values()) + '\n')
+                parts.append('</' + e.name + '>\n')
+            fp.write(''.join(parts))
+
+
+def _efile_cache_key(file_path):
+    path = Path(file_path).resolve()
+    stat = path.stat()
+    return path, stat.st_mtime_ns, stat.st_size
+
+
+def read_efile_dict_cached(file_path, use_cache=True):
+    """Read an E file as raw table dictionaries and reuse the parse while unchanged."""
+    if not use_cache:
+        return EBook(file_path).to_dict()
+    key = _efile_cache_key(file_path)
+    path = key[0]
+    with _EFILE_CACHE_LOCK:
+        cached = _EFILE_CACHE.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+    data = EBook(path).to_dict()
+    with _EFILE_CACHE_LOCK:
+        _EFILE_CACHE[path] = (key, data)
+    return data
+
+
+def clear_efile_cache(file_path=None):
+    """Clear all cached E parses, or just one file when a path is supplied."""
+    with _EFILE_CACHE_LOCK:
+        if file_path is None:
+            _EFILE_CACHE.clear()
+        else:
+            _EFILE_CACHE.pop(Path(file_path).resolve(), None)
+
+
+class _Base:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, _convert_cell(value))
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.__dict__})"
+
+
+def _class_factory(class_name, attrs):
+    if not class_name:
+        raise ValueError("JSON data must contain a 'data' key")
+    key = (class_name, tuple(attrs))
+    cached = _CLASS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    attr_names = tuple(attrs)
+
+    def __init__(self, row=None, **kwargs):
+        source = kwargs if row is None else row
+        convert = _convert_cell
+        for attr in attr_names:
+            setattr(self, attr, convert(source[attr]))
+
+    attributes = {attr: None for attr in attrs}
+    attributes["__init__"] = __init__
+    cls = type(class_name, (_Base,), attributes)
+    _CLASS_CACHE[key] = cls
+    return cls
+
+
+def efile_factory(data):
+    new_cls_dict = _Base()
+    for key, value in data.items():
+        Class_Def = _class_factory(key, value['header_list'])
+        list_info = []
+        for item in value["data"]:
+            list_info.append(Class_Def(item))
+        setattr(new_cls_dict, key, list_info)
+
+    return new_cls_dict
+
+
+if __name__ == '__main__':
+    path = "C:/Users/80747/OneDrive - zju.edu.cn/Desktop/py_code/data_generation/simp_syst.e"
+    cls = EBook(path)
+    cls.apply_to_file()
+    # csv文件测试
+
+    pass

@@ -1,0 +1,121 @@
+<PowerBase>
+@ p_base u_scale p_scale i_scale
+# 100    1.0     1.0     1.0
+</PowerBase>
+
+<DCNode>
+@ idx name  vbase voltage isl run_stat
+# 0   nd_1  100.0 100     0   1
+# 1   nd_2  100.0 100     0   1
+# 2   nd_3  100.0 100     0   1
+# 3   nd_4  100.0 100     0   1
+# 4   nd_5  100.0 100     0   1
+# 5   nd_6  100.0 100     0   1
+# 6   nd_7  100.0 100     0   1
+# 7   nd_8  100.0 100     0   1
+# 8   nd_9  100.0 100     0   1
+# 9   nd_10 100.0 100     0   1
+# 10  nd_11 100.0 100     0   1
+# 11  nd_12 100.0 100     0   1
+# 12  nd_13 100.0 100     0   1
+# 13  nd_14 100.0 100     0   1
+# 14  nd_15 100.0 100     0   1
+# 15  nd_16 100.0 100     0   1
+# 16  nd_17 100.0 100     0   1
+# 17  nd_18 100.0 100     0   1
+# 18  nd_19 100.0 100     0   1
+# 19  nd_20 100.0 100     0   1
+</DCNode>
+
+<DCBranch>
+@ idx name       i_node j_node r    run_stat i_p j_p current
+# 0   line_0_1   0      1      0.01 1        0   0   0
+# 1   line_1_2   1      2      0.02 1        0   0   0
+# 2   line_2_3   2      3      0.03 1        0   0   0
+# 3   line_3_4   3      4      0.01 1        0   0   0
+# 4   line_4_0   4      0      0.02 1        0   0   0
+# 5   line_5_6   5      6      0.01 1        0   0   0
+# 6   line_6_7   6      7      0.02 1        0   0   0
+# 7   line_7_8   7      8      0.03 1        0   0   0
+# 8   line_8_9   8      9      0.01 1        0   0   0
+# 9   line_9_5   9      5      0.02 1        0   0   0
+# 10  line_10_11 10     11     0.01 1        0   0   0
+# 11  line_11_12 11     12     0.02 1        0   0   0
+# 12  line_12_13 12     13     0.03 1        0   0   0
+# 13  line_13_14 13     14     0.01 1        0   0   0
+# 14  line_14_10 14     10     0.02 1        0   0   0
+# 15  line_15_16 15     16     0.01 1        0   0   0
+# 16  line_16_17 16     17     0.02 1        0   0   0
+# 17  line_17_18 17     18     0.03 1        0   0   0
+# 18  line_18_19 18     19     0.01 1        0   0   0
+# 19  line_19_15 19     15     0.02 1        0   0   0
+# 20  line_4_5   4      5      0.04 1        0   0   0
+# 21  line_9_10  9      10     0.05 1        0   0   0
+# 22  line_14_15 14     15     0.03 1        0   0   0
+# 23  line_2_6   2      6      0.06 1        0   0   0
+# 24  line_8_12  8      12     0.07 1        0   0   0
+# 25  line_13_17 13     17     0.05 1        0   0   0
+# 26  line_0_19  0      19     0.08 1        0   0   0
+</DCBranch>
+
+<DCLoad>
+@ idx name    node pv0 pv1 pv2 run_stat p current
+# 0   load_1  0    200 0   0   1        0 0
+# 1   load_2  2    0   0   100 1        0 0
+# 2   load_3  4    0   150 0   1        0 0
+# 3   load_4  6    150 0   0   1        0 0
+# 4   load_5  8    10  10  90  1        0 0
+# 5   load_6  10   100 0   0   1        0 0
+# 6   load_7  12   0   120 0   1        0 0
+# 7   load_8  14   20  20  80  1        0 0
+# 8   load_9  16   250 0   0   1        0 0
+# 9   load_10 18   0   90  0   1        0 0
+# 10  load_11 19   120 0   0   1        0 0
+</DCLoad>
+
+<DCGenerator>
+@ idx name   node control_type v_set p_set i_set  run_stat p current
+# 0   gen_v1 3    V            150   0     0      1        0 0
+# 1   gen_v2 10   P            0     100   0      1        0 0
+# 2   gen_v3 17   P            0     150   0      1        0 0
+# 3   gen_p1 5    P            110   200   0      1        0 0
+# 4   gen_i1 7    I            110   0     0.0015 1        0 0
+# 5   gen_p2 11   P            110   180   0      1        0 0
+# 6   gen_i2 13   I            110   0     0.0012 1        0 0
+# 7   gen_p3 15   P            110   220   0      1        0 0
+# 8   gen_i3 19   I            110   0     0.001  1        0 0
+</DCGenerator>
+
+<DCZeroBranch>
+@ idx name      i_node j_node run_stat p current
+# 0   zbr_1_2   1      2      1        0 0
+# 1   zbr_3_4   3      4      1        0 0
+# 2   zbr_6_7   6      7      1        0 0
+# 3   zbr_9_10  9      10     1        0 0
+# 4   zbr_11_12 11     12     1        0 0
+# 5   zbr_14_15 14     15     1        0 0
+# 6   zbr_16_17 16     17     1        0 0
+</DCZeroBranch>
+
+<DCSwitch>
+@ idx name     i_node j_node status run_stat p current
+# 0   sw_0_1   0      1      1      1        0 0
+# 1   sw_2_3   2      3      1      1        0 0
+# 2   sw_4_5   4      5      1      1        0 0
+# 3   sw_6_8   6      8      1      1        0 0
+# 4   sw_9_11  9      11     1      1        0 0
+# 5   sw_10_12 10     12     1      1        0 0
+# 6   sw_13_14 13     14     1      1        0 0
+# 7   sw_15_17 15     17     1      1        0 0
+# 8   sw_18_19 18     19     1      1        0 0
+</DCSwitch>
+
+<DCDCConverter>
+@ idx name   i_node j_node r1    r2    control_type p_set i_set  v_set run_stat i_p j_p i_c j_c
+# 0   conv_1 4      5      0.05  0.05  P            200   0      0     1        0   0   0   0
+# 1   conv_2 8      9      0.1   0.1   P            100   0      0     1        0   0   0   0
+# 2   conv_3 12     13     0.075 0.075 I            0     0.0015 0     1        0   0   0   0
+# 3   conv_4 16     17     0.06  0.06  P            150   0      0     1        0   0   0   0
+# 4   conv_5 18     19     0.09  0.09  I            0     0.001  0     1        0   0   0   0
+# 5   conv_6 0      15     0.125 0.125 P            100   0      0     1        0   0   0   0
+</DCDCConverter>
