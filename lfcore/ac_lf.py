@@ -294,6 +294,8 @@ class ACPowerFlowCalc:
         self.theta_spec: np.ndarray = np.array([])
         self.P_spec: np.ndarray = np.array([])
         self.Q_spec: np.ndarray = np.array([])
+        self._slack_mask = np.array([], dtype=bool)
+        self._fixed_voltage_mask = np.array([], dtype=bool)
         self.load_info: List = []
         self.slack_node: int = -1
 
@@ -400,8 +402,13 @@ class ACPowerFlowCalc:
         """Create a solver directly from an AC NumPy ppc dictionary."""
         return cls(ppc, **kwargs)
 
+    def _cache_node_type_masks(self):
+        self._slack_mask = self.node_type == 'SLACK'
+        self._fixed_voltage_mask = self._slack_mask | (self.node_type == 'PV')
+
     def _cache_static_arrays(self):
         """Convert object lists and sparse Y rows into arrays reused by each Newton step."""
+        self._cache_node_type_masks()
         self.live_gens = [gen for gen in self.isl.gens if gen.is_alive]
         self.live_loads = [ld for ld in self.isl.loads if ld.is_alive]
         self.live_shunts = [sc for sc in self.isl.shunt_compensators if sc.is_alive]
@@ -503,11 +510,8 @@ class ACPowerFlowCalc:
         V[self.V_unknown] = x[self.n_theta:self.n_theta + self.n_V]
 
         # 填充已知变量（精简判断逻辑）
-        slack_mask = self.node_type == 'SLACK'
-        pv_mask = self.node_type == 'PV'
-
-        theta[slack_mask] = self.theta_spec[slack_mask]
-        V[slack_mask | pv_mask] = self.V_spec[slack_mask | pv_mask]
+        theta[self._slack_mask] = self.theta_spec[self._slack_mask]
+        V[self._fixed_voltage_mask] = self.V_spec[self._fixed_voltage_mask]
 
         # 提取phi变量（精简条件判断）
         phi_slice = slice(self.base_phi_re, self.base_phi_re + self.N_phi)
@@ -715,6 +719,8 @@ class ACPowerFlowCalc:
             "theta_spec": self.theta_spec,
             "P_spec": self.P_spec,
             "Q_spec": self.Q_spec,
+            "_slack_mask": self._slack_mask,
+            "_fixed_voltage_mask": self._fixed_voltage_mask,
             "Y": self.Y,
             "zero_edges": self.zero_edges,
             "comp_nodes": self.comp_nodes,
@@ -825,7 +831,7 @@ class ACPowerFlowCalc:
         self.node_pos = static["node_pos"]
         for name in (
             "node_type", "V_spec", "theta_spec", "P_spec", "Q_spec", "Y",
-            "zero_edges", "comp_nodes", "comp_tree_edges", "phi_node", "phi_comp",
+            "_slack_mask", "_fixed_voltage_mask", "zero_edges", "comp_nodes", "comp_tree_edges", "phi_node", "phi_comp",
             "ref_phi_idx", "zero_branch_info", "N_phi", "theta_unknown", "V_unknown",
             "theta_idx", "V_idx", "n_theta", "n_V", "base_phi_re", "base_phi_im",
             "total_vars", "total_eq", "load_pos", "load_pv0", "load_pv1", "load_pv2",
@@ -858,49 +864,62 @@ class ACPowerFlowCalc:
             self.ppc_gen_rows = np.where(gen_live)[0].astype(np.int32)
             self.ppc_gen_pos = self.row_to_pos[gen_rows[self.ppc_gen_rows]]
             self.ppc_gen_share = np.ones(self.ppc_gen_rows.size, dtype=np.float64)
-            for gen_row, pos in zip(self.ppc_gen_rows, self.ppc_gen_pos):
-                control = int(gen[gen_row, GEN_COLS["control_type"]])
-                if control == CTRL_SLACK:
-                    self.node_type[pos] = 'SLACK'
-                    self.slack_node = int(pos)
-                    self.V_spec[pos] = gen[gen_row, GEN_COLS["v_set"]]
-                    self.theta_spec[pos] = self.ppc["bus"][self.active_bus_rows[pos], BUS_COLS["angle"]]
-                elif control == CTRL_PV and self.node_type[pos] != 'SLACK':
-                    self.node_type[pos] = 'PV'
-                    v_set = gen[gen_row, GEN_COLS["v_set"]]
+            live_gen = gen[self.ppc_gen_rows]
+            controls = live_gen[:, GEN_COLS["control_type"]].astype(np.int32, copy=False)
+
+            slack_mask = controls == CTRL_SLACK
+            if np.any(slack_mask):
+                slack_pos = self.ppc_gen_pos[slack_mask]
+                self.node_type[slack_pos] = 'SLACK'
+                self.V_spec[slack_pos] = live_gen[slack_mask, GEN_COLS["v_set"]]
+                self.theta_spec[slack_pos] = self.ppc["bus"][self.active_bus_rows[slack_pos], BUS_COLS["angle"]]
+                self.slack_node = int(slack_pos[-1])
+
+            pv_mask = (controls == CTRL_PV) & (self.node_type[self.ppc_gen_pos] != 'SLACK')
+            if np.any(pv_mask):
+                pv_pos = self.ppc_gen_pos[pv_mask]
+                pv_v = live_gen[pv_mask, GEN_COLS["v_set"]]
+                for pos, v_set in zip(pv_pos, pv_v):
                     if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - v_set) > 1e-6:
                         raise ValueError(f"节点{pos}多个PV发电机电压设定冲突")
-                    self.V_spec[pos] = v_set
-                    self.P_spec[pos] += gen[gen_row, GEN_COLS["p_set"]]
-                elif control in (CTRL_PQ, CTRL_P):
-                    self.P_spec[pos] += gen[gen_row, GEN_COLS["p_set"]]
-                    self.Q_spec[pos] += gen[gen_row, GEN_COLS["q_set"]]
+                self.node_type[pv_pos] = 'PV'
+                self.V_spec[pv_pos] = pv_v
+                np.add.at(self.P_spec, pv_pos, live_gen[pv_mask, GEN_COLS["p_set"]])
 
-            groups: Dict[int, List[int]] = {}
-            for local_idx, pos in enumerate(self.ppc_gen_pos):
-                groups.setdefault(int(pos), []).append(local_idx)
-            for indices in groups.values():
-                total_alpha = float(np.sum(gen[self.ppc_gen_rows[indices], GEN_COLS["alpha"]]))
-                if total_alpha > 0.0:
-                    self.ppc_gen_share[indices] = gen[self.ppc_gen_rows[indices], GEN_COLS["alpha"]] / total_alpha
-                else:
-                    self.ppc_gen_share[indices] = 1.0 / len(indices)
+            pq_mask = (controls == CTRL_PQ) | (controls == CTRL_P)
+            if np.any(pq_mask):
+                pq_pos = self.ppc_gen_pos[pq_mask]
+                np.add.at(self.P_spec, pq_pos, live_gen[pq_mask, GEN_COLS["p_set"]])
+                np.add.at(self.Q_spec, pq_pos, live_gen[pq_mask, GEN_COLS["q_set"]])
+
+            alpha = live_gen[:, GEN_COLS["alpha"]]
+            alpha_sum = np.bincount(self.ppc_gen_pos, weights=alpha, minlength=self.N)
+            gen_count = np.bincount(self.ppc_gen_pos, minlength=self.N)
+            positive_alpha = alpha_sum[self.ppc_gen_pos] > 0.0
+            self.ppc_gen_share[positive_alpha] = alpha[positive_alpha] / alpha_sum[self.ppc_gen_pos[positive_alpha]]
+            no_alpha = ~positive_alpha
+            if np.any(no_alpha):
+                self.ppc_gen_share[no_alpha] = 1.0 / gen_count[self.ppc_gen_pos[no_alpha]]
 
         if shunt.size:
             shunt_rows = self._ppc_node_rows(shunt[:, SHUNT_COLS["node"]])
             shunt_live = (shunt[:, SHUNT_COLS["run_stat"]] == 1) & active_bus[shunt_rows]
             self.ppc_shunt_rows = np.where(shunt_live)[0].astype(np.int32)
             self.ppc_shunt_pos = self.row_to_pos[shunt_rows[self.ppc_shunt_rows]]
-            for shunt_row, pos in zip(self.ppc_shunt_rows, self.ppc_shunt_pos):
-                control = int(shunt[shunt_row, SHUNT_COLS["control_type"]])
-                if control == SHUNT_Q:
-                    self.Q_spec[pos] += shunt[shunt_row, SHUNT_COLS["q_set"]]
-                elif control == SHUNT_V and self.node_type[pos] != 'SLACK':
-                    self.node_type[pos] = 'PV'
-                    v_set = shunt[shunt_row, SHUNT_COLS["v_set"]]
+            live_shunt = shunt[self.ppc_shunt_rows]
+            controls = live_shunt[:, SHUNT_COLS["control_type"]].astype(np.int32, copy=False)
+            q_mask = controls == SHUNT_Q
+            if np.any(q_mask):
+                np.add.at(self.Q_spec, self.ppc_shunt_pos[q_mask], live_shunt[q_mask, SHUNT_COLS["q_set"]])
+            v_mask = (controls == SHUNT_V) & (self.node_type[self.ppc_shunt_pos] != 'SLACK')
+            if np.any(v_mask):
+                v_pos = self.ppc_shunt_pos[v_mask]
+                v_set_values = live_shunt[v_mask, SHUNT_COLS["v_set"]]
+                for pos, v_set in zip(v_pos, v_set_values):
                     if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - v_set) > 1e-6:
                         raise ValueError(f"节点{pos}电压设定冲突")
-                    self.V_spec[pos] = v_set
+                self.node_type[v_pos] = 'PV'
+                self.V_spec[v_pos] = v_set_values
 
         if load.size:
             load_rows = self._ppc_node_rows(load[:, LOAD_COLS["node"]])
@@ -1057,6 +1076,7 @@ class ACPowerFlowCalc:
 
     def _cache_static_numeric_arrays(self):
         """Cache numeric arrays used by Newton iterations without object-model access."""
+        self._cache_node_type_masks()
         if len(self.load_info):
             load_data = np.asarray(self.load_info, dtype=np.float64)
             self.load_pos = load_data[:, 0].astype(np.int32)
