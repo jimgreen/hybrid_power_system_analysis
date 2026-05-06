@@ -3,6 +3,7 @@ import contextlib
 import io
 import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -41,6 +42,7 @@ from secore.se_math import (
     matrix_is_empty,
     measurement_leverage,
     measurement_residual as build_measurement_residual,
+    NormalEquationSolver,
     observability_rank_details,
     solve_normal_equations_with_factor,
     sparse_structural_rank,
@@ -51,6 +53,244 @@ from unit_system import ac_current_base_ka
 
 DEFAULT_CASE = ROOT_DIR / "data" / "ac" / "ieee39.e"
 DEFAULT_MEAS = ROOT_DIR / "data" / "ac" / "ieee39.meas"
+
+
+_DEVICE_TYPE_CODES = {
+    "ACNode": 1,
+    "ACBranch": 2,
+    "ACTransformer": 3,
+    "ACLoad": 4,
+    "ACGenerator": 5,
+    "ACZeroBranch": 6,
+    "ACZeroBranchConstraint": 7,
+    "ACSwitchConstraint": 8,
+    "ACSwitch": 9,
+    "ACPowerBalance": 10,
+}
+
+_TERMINAL_POWER_MEASUREMENT_TYPES = frozenset(("P_FROM", "Q_FROM", "P_TO", "Q_TO"))
+_PSEUDO_DEVICE_SUMMARY_TYPES = frozenset(("ACGenerator", "ACLoad"))
+_PSEUDO_MEASUREMENT_SUMMARY_TYPES = {
+    "ACGenerator": frozenset(("P_GEN", "Q_GEN")),
+    "ACLoad": frozenset(("P_LOAD", "Q_LOAD")),
+    "ACZeroBranch": frozenset(("P_FROM", "Q_FROM", "V_FROM", "I_FROM")),
+    "ACSwitch": frozenset(("P_FROM", "Q_FROM", "V_FROM", "I_FROM")),
+}
+
+_MEASUREMENT_ROW_CACHE = {}
+_MEASUREMENT_BUILDER_CACHE = {}
+_MEASUREMENT_TEMPLATE_CACHE = {}
+_ACTIVE_PLAN_TEMPLATE_CACHE = {}
+_OBSERVABILITY_RESULT_CACHE = {}
+_ZERO_TIE_LAYOUT_CACHE = {}
+_Y_ROW_CACHE = {}
+
+
+def _file_cache_key(file_name: Path) -> Tuple[Path, int, int]:
+    path = Path(file_name).resolve()
+    stat = path.stat()
+    return path, int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _read_measurement_rows_cached(file_name: Path) -> Tuple[List[str], List[List[str]]]:
+    key = _file_cache_key(file_name)
+    cached = _MEASUREMENT_ROW_CACHE.get(key[0])
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    parsed = _read_measurement_rows(file_name)
+    _MEASUREMENT_ROW_CACHE[key[0]] = (key, parsed)
+    return parsed
+
+
+def _read_measurement_rows(file_name: Path) -> Tuple[List[str], List[List[str]]]:
+    header = None
+    rows = []
+    in_measurement = False
+    with open(file_name, mode="rt", encoding="utf8") as fp:
+        for line_no, raw_line in enumerate(fp, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not in_measurement:
+                if line == "<Measurement>":
+                    in_measurement = True
+                continue
+            if line == "</Measurement>":
+                break
+            first = line[0]
+            if first == "@":
+                header = line[1:].split()
+                continue
+            if first != "#":
+                raise SyntaxError(f"Invalid Measurement row at line {line_no} in {file_name}")
+            if header is None:
+                raise RuntimeError(f"{file_name} Measurement data appears before the header")
+            rows.append(line[1:].split())
+    if not in_measurement:
+        raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
+    if header is None:
+        raise RuntimeError(f"{file_name} Measurement block does not contain a header")
+    return header, rows
+
+
+def _measurement_row_builder(header: Sequence[str]):
+    key = tuple(header)
+    cached = _MEASUREMENT_BUILDER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
+    column_index = {name: idx for idx, name in enumerate(header)}
+    missing = [name for name in required_columns if name not in column_index]
+    if missing:
+        raise RuntimeError(f"Measurement header is missing columns: {missing}")
+    header_len = len(header)
+    code = f"""
+def build_measurements(rows, measurement_cls, file_name):
+    measurements = []
+    append_measurement = measurements.append
+    new_measurement = measurement_cls.__new__
+    int_cell = int
+    float_cell = float
+    device_type_cache = {{}}
+    measurement_type_cache = {{}}
+    for row_no, row in enumerate(rows, start=1):
+        if len(row) < {header_len}:
+            raise RuntimeError(f"Malformed Measurement row at line {{row_no}} in {{file_name}}")
+        raw_device_type = row[{column_index['dev_type']}]
+        device_type = device_type_cache.get(raw_device_type)
+        if device_type is None:
+            device_type = raw_device_type
+            device_type_cache[raw_device_type] = device_type
+        raw_meas_type = row[{column_index['meas_type']}]
+        meas_type = measurement_type_cache.get(raw_meas_type)
+        if meas_type is None:
+            meas_type = raw_meas_type.upper()
+            measurement_type_cache[raw_meas_type] = meas_type
+        meas = new_measurement(measurement_cls)
+        meas.idx = int_cell(row[{column_index['idx']}])
+        meas.name = row[{column_index['name']}]
+        meas.device_type = device_type
+        meas.device_name = row[{column_index['dev_name']}]
+        meas.meas_type = meas_type
+        meas.weight = float_cell(row[{column_index['weight']}])
+        meas.valid = row[{column_index['valid']}] == "1"
+        meas.value = float_cell(row[{column_index['value']}])
+        append_measurement(meas)
+    return measurements
+"""
+    namespace = {}
+    exec(code, namespace)
+    builder = namespace["build_measurements"]
+    _MEASUREMENT_BUILDER_CACHE[key] = builder
+    return builder
+
+
+def _measurement_template_from_objects(measurements: Sequence["Measurement"]):
+    return (
+        tuple(meas.idx for meas in measurements),
+        tuple(meas.name for meas in measurements),
+        tuple(meas.device_type for meas in measurements),
+        tuple(meas.device_name for meas in measurements),
+        tuple(meas.meas_type for meas in measurements),
+        tuple(meas.weight for meas in measurements),
+        tuple(meas.valid for meas in measurements),
+        tuple(meas.value for meas in measurements),
+    )
+
+
+def _clone_measurement_template(template, measurement_cls):
+    idxs, names, device_types, device_names, meas_types, weights, valids, values = template
+    measurements = []
+    append_measurement = measurements.append
+    new_measurement = measurement_cls.__new__
+    for idx, name, device_type, device_name, meas_type, weight, valid, value in zip(
+        idxs,
+        names,
+        device_types,
+        device_names,
+        meas_types,
+        weights,
+        valids,
+        values,
+    ):
+        meas = new_measurement(measurement_cls)
+        meas.idx = idx
+        meas.name = name
+        meas.device_type = device_type
+        meas.device_name = device_name
+        meas.meas_type = meas_type
+        meas.weight = weight
+        meas.valid = valid
+        meas.value = value
+        append_measurement(meas)
+    return measurements
+
+
+def _read_measurements_direct(file_name: Path, measurement_cls):
+    required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
+    header = None
+    column_index = None
+    header_len = 0
+    measurements = []
+    append_measurement = measurements.append
+    new_measurement = measurement_cls.__new__
+    int_cell = int
+    float_cell = float
+    device_type_cache = {}
+    measurement_type_cache = {}
+    in_measurement = False
+    with open(file_name, mode="rt", encoding="utf8") as fp:
+        for line_no, raw_line in enumerate(fp, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not in_measurement:
+                if line == "<Measurement>":
+                    in_measurement = True
+                continue
+            if line == "</Measurement>":
+                break
+            first = line[0]
+            if first == "@":
+                header = line[1:].split()
+                column_index = {name: idx for idx, name in enumerate(header)}
+                missing = [name for name in required_columns if name not in column_index]
+                if missing:
+                    raise RuntimeError(f"{file_name} Measurement header is missing columns: {missing}")
+                header_len = len(header)
+                continue
+            if first != "#":
+                raise SyntaxError(f"Invalid Measurement row at line {line_no} in {file_name}")
+            if header is None or column_index is None:
+                raise RuntimeError(f"{file_name} Measurement data appears before the header")
+            row = line[1:].split()
+            if len(row) < header_len:
+                raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
+            raw_device_type = row[column_index["dev_type"]]
+            device_type = device_type_cache.get(raw_device_type)
+            if device_type is None:
+                device_type = raw_device_type
+                device_type_cache[raw_device_type] = device_type
+            raw_meas_type = row[column_index["meas_type"]]
+            meas_type = measurement_type_cache.get(raw_meas_type)
+            if meas_type is None:
+                meas_type = raw_meas_type.upper()
+                measurement_type_cache[raw_meas_type] = meas_type
+            meas = new_measurement(measurement_cls)
+            meas.idx = int_cell(row[column_index["idx"]])
+            meas.name = row[column_index["name"]]
+            meas.device_type = device_type
+            meas.device_name = row[column_index["dev_name"]]
+            meas.meas_type = meas_type
+            meas.weight = float_cell(row[column_index["weight"]])
+            meas.valid = row[column_index["valid"]] == "1"
+            meas.value = float_cell(row[column_index["value"]])
+            append_measurement(meas)
+    if not in_measurement:
+        raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
+    if header is None:
+        raise RuntimeError(f"{file_name} Measurement block does not contain a header")
+    return measurements
 
 
 @dataclass(init=False, slots=True)
@@ -88,6 +328,15 @@ class Measurement:
     def device(self) -> str:
         return f"{self.device_type}:{self.device_name}"
 
+    @classmethod
+    def read_from_file(cls, file_name: Path) -> List["Measurement"]:
+        file_key = _file_cache_key(file_name)
+        cached_template = _MEASUREMENT_TEMPLATE_CACHE.get(file_key[0])
+        if cached_template is not None and cached_template[0] == file_key:
+            return _clone_measurement_template(cached_template[1], cls)
+        measurements = _read_measurements_direct(file_name, cls)
+        _MEASUREMENT_TEMPLATE_CACHE[file_key[0]] = (file_key, _measurement_template_from_objects(measurements))
+        return measurements
 
 @dataclass
 class ObservabilityResult:
@@ -110,8 +359,8 @@ class EstimateResult:
     x: np.ndarray
     z_est: np.ndarray
     residual: np.ndarray
-    H: np.ndarray
-    gain: np.ndarray
+    H: Optional[np.ndarray]
+    gain: Optional[np.ndarray]
     measurements: List[Measurement]
     observability: ObservabilityResult
 
@@ -161,7 +410,11 @@ class ACStateEstimator:
         flat_start: Optional[bool] = None,
         parameter_file: Path = DEFAULT_SE_PARAMETER_FILE,
         parameters: Optional[StateEstimationParameters] = None,
+        profile: bool = False,
     ):
+        self.profile_enabled = bool(profile)
+        self.profile_times: Dict[str, float] = {}
+        self.active_plan_template_hit = False
         self.params = (parameters or load_se_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -179,8 +432,9 @@ class ACStateEstimator:
         self.voltage_floor = self.params.voltage_floor
         self.min_current_voltage = self.params.min_current_voltage
 
-        self.network = self._load_network(self.e_file)
-        self.measurements = self._load_measurements(self.meas_file)
+        profile_start = time.perf_counter()
+        self.network = self._profile_call("init.load_network", self._load_network, self.e_file)
+        self.measurements = self._profile_call("init.load_measurements", self._load_measurements, self.meas_file)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
         self.u_scale = float(self.network.u_scale)
@@ -216,20 +470,19 @@ class ACStateEstimator:
         self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
         # Reference-bus voltage values must be known before the compact state layout
         # is built, so real file measurements are normalized before selecting them.
-        self._disable_angle_measurements()
-        self._convert_measurements_to_pu()
-        self.node_voltage_measurements = self._node_voltage_measurements()
-        self.node_degrees = self._node_incident_degrees()
-        self.references = self._select_reference_nodes()
+        self._profile_call("init.convert_measurements", self._convert_measurements_to_pu)
+        self.node_voltage_measurements = self._profile_call("init.node_voltage_measurements", self._node_voltage_measurements)
+        self.node_degrees = self._profile_call("init.node_degrees", self._node_incident_degrees)
+        self.references = self._profile_call("init.references", self._select_reference_nodes)
         self.ref_idx = {self.node_pos[node.idx] for node in self.references}
         self.reference_voltage_by_pos = {
             self.node_pos[node.idx]: self.node_voltage_measurements[node.idx]
             for node in self.references
             if node.idx in self.node_voltage_measurements and node.idx in self.node_pos
         }
-        self.reference_angle_by_pos = self._reference_angle_offsets()
-        self._rebase_angle_measurements()
-        self._build_zero_tie_state_layout()
+        self.reference_angle_by_pos = self._profile_call("init.reference_angles", self._reference_angle_offsets)
+        self._profile_call("init.rebase_angles", self._rebase_angle_measurements)
+        self._profile_call("init.zero_tie_layout", self._build_zero_tie_state_layout)
         self.zero_current_devices = [("Z", zbr) for zbr in self.zero_branches] + [("S", sw) for sw in self.switches]
         self.zero_current_pos = {(kind, dev.name): pos for pos, (kind, dev) in enumerate(self.zero_current_devices)}
         self.zero_branch_pos = {zbr.name: self.zero_current_pos[("Z", zbr.name)] for zbr in self.zero_branches}
@@ -258,6 +511,7 @@ class ACStateEstimator:
         self.load_qv0_array = np.asarray([load.qv0 for load in self.load_order], dtype=np.float64)
         self.load_qv1_array = np.asarray([load.qv1 for load in self.load_order], dtype=np.float64)
         self.load_qv2_array = np.asarray([load.qv2 for load in self.load_order], dtype=np.float64)
+        self.n_nodes = len(self.nodes)
         gen_seed = [self._generator_pseudo_power(gen) for gen in self.generator_order]
         load_seed = [self._load_pseudo_power(load) for load in self.load_order]
         self.initial_gen_p_array = np.asarray([p for p, _q in gen_seed], dtype=np.float64)
@@ -267,6 +521,24 @@ class ACStateEstimator:
         self.n_generator_power = len(self.generator_order)
         self.n_load_power = len(self.load_order)
         self.n_switch_current = len(self.zero_current_devices)
+        self.switch_current_idx_array = np.arange(self.n_switch_current, dtype=np.int32)
+        self.switch_balance_end_pos = np.concatenate((self.zero_current_i, self.zero_current_j)).astype(
+            np.int64,
+            copy=False,
+        )
+        self.switch_balance_end_current_idx = np.concatenate(
+            (self.switch_current_idx_array, self.switch_current_idx_array)
+        )
+        self.switch_balance_sign = np.concatenate(
+            (
+                np.ones(self.n_switch_current, dtype=np.float64),
+                -np.ones(self.n_switch_current, dtype=np.float64),
+            )
+        )
+        self.generator_power_idx_array = np.arange(self.n_generator_power, dtype=np.int32)
+        self.load_power_idx_array = np.arange(self.n_load_power, dtype=np.int32)
+        self.generator_balance_minus_ones = -np.ones(self.n_generator_power, dtype=np.float64)
+        self.load_balance_ones = np.ones(self.n_load_power, dtype=np.float64)
         self.base_switch_re = self.n_angle + self.n_voltage
         self.base_switch_im = self.base_switch_re + self.n_switch_current
         self.base_gen_p = self.base_switch_im + self.n_switch_current
@@ -302,22 +574,113 @@ class ACStateEstimator:
         self.state_labels.extend(f"P_LOAD:{load.name}" for load in self.load_order)
         self.state_labels.extend(f"Q_LOAD:{load.name}" for load in self.load_order)
 
-        self.branch_stamp_by_name = self._build_branch_stamp_map(list(self.branch_by_name.values()), False)
-        self.transformer_stamp_by_name = self._build_branch_stamp_map(list(self.transformer_by_name.values()), True)
+        self.branch_stamp_by_name = self._profile_call(
+            "init.branch_stamps",
+            self._build_branch_stamp_map,
+            list(self.branch_by_name.values()),
+            False,
+        )
+        self.transformer_stamp_by_name = self._profile_call(
+            "init.transformer_stamps",
+            self._build_branch_stamp_map,
+            list(self.transformer_by_name.values()),
+            True,
+        )
 
-        self.Y = self._build_y_matrix()
-        self._prepare_y_row_cache()
-        self.loads_at_pos = self._group_loads()
-        self.generators_at_pos = self._group_generators()
-        self.generator_share_by_name = self._generator_shares()
+        self.Y = self._profile_call("init.y_matrix", self._build_y_matrix)
+        self._profile_call("init.y_row_cache", self._prepare_y_row_cache)
+        self.loads_at_pos = self._profile_call("init.group_loads", self._group_loads)
+        self.generators_at_pos = self._profile_call("init.group_generators", self._group_generators)
+        self.generator_share_by_name = self._profile_call("init.generator_shares", self._generator_shares)
         self._initial_observability_cache = None
         # Add priors after unit conversion because model objects are already normalized.
-        self._add_pseudo_power_measurements()
-        self._seed_power_state_arrays_from_measurements()
-        self._add_power_balance_constraint_measurements()
+        self._profile_call("init.pseudo_measurements", self._add_pseudo_power_measurements)
+        self._profile_call("init.seed_power_state", self._seed_power_state_arrays_from_measurements)
+        self._profile_call("init.power_balance_constraints", self._add_power_balance_constraint_measurements)
         self.targeted_observability_pseudo_count = 0
-        self._refresh_active_measurement_indexes()
-        self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
+        self._profile_call("init.active_refresh", self._refresh_active_measurement_indexes)
+        self.targeted_observability_pseudo_count = self._profile_call(
+            "init.targeted_observability",
+            self._add_targeted_observability_pseudo_measurements,
+        )
+        self._record_profile_time("init.total", time.perf_counter() - profile_start)
+
+    def _record_profile_time(self, name: str, elapsed: float) -> None:
+        if self.profile_enabled:
+            self.profile_times[name] = self.profile_times.get(name, 0.0) + float(elapsed)
+
+    def _profile_call(self, name: str, func, *args, **kwargs):
+        if not self.profile_enabled:
+            return func(*args, **kwargs)
+        start = time.perf_counter()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            self._record_profile_time(name, time.perf_counter() - start)
+
+    def _active_plan_template_key(self, active_count: int, max_idx: int) -> Tuple[object, ...]:
+        return (
+            _file_cache_key(self.e_file),
+            _file_cache_key(self.meas_file),
+            bool(self.flat_start),
+            int(self.targeted_pseudo_measurement_max),
+            int(active_count),
+            int(max_idx),
+            int(self.n_state),
+        )
+
+    def _default_observability_cache_key(self) -> Tuple[object, ...]:
+        return self._active_plan_template_key(len(self.active_measurements), int(self._max_measurement_idx))
+
+    def _install_active_plan_cache_entries(self) -> None:
+        active_id = id(self.active_measurements)
+        self._branch_transformer_vector_plan_cache[active_id] = (
+            self.active_measurements,
+            self._active_branch_transformer_vector_plan,
+        )
+        self._simple_jacobian_plan_cache[active_id] = (
+            self.active_measurements,
+            self._active_simple_jacobian_plan,
+        )
+        self._zero_current_vector_plan_cache[active_id] = (
+            self.active_measurements,
+            self._active_zero_current_vector_plan,
+        )
+        self._generator_measurement_plan_cache[active_id] = (
+            self.active_measurements,
+            self._active_generator_measurement_plan,
+        )
+        self._balance_measurement_plan_cache[active_id] = (
+            self.active_measurements,
+            self._active_balance_measurement_plan,
+        )
+
+    def _load_active_plan_template(self, active_count: int, max_idx: int) -> bool:
+        cached = _ACTIVE_PLAN_TEMPLATE_CACHE.get(self._active_plan_template_key(active_count, max_idx))
+        if cached is None:
+            return False
+        (
+            self._active_branch_transformer_vector_plan,
+            self._active_simple_jacobian_plan,
+            self._active_zero_current_vector_plan,
+            self._active_generator_measurement_plan,
+            self._active_balance_measurement_plan,
+            self.active_measurements_are_vectorized,
+        ) = cached
+        self.active_plan_template_hit = True
+        return True
+
+    def _store_active_plan_template(self, active_count: int, max_idx: int) -> None:
+        if len(_ACTIVE_PLAN_TEMPLATE_CACHE) > 32:
+            _ACTIVE_PLAN_TEMPLATE_CACHE.clear()
+        _ACTIVE_PLAN_TEMPLATE_CACHE[self._active_plan_template_key(active_count, max_idx)] = (
+            self._active_branch_transformer_vector_plan,
+            self._active_simple_jacobian_plan,
+            self._active_zero_current_vector_plan,
+            self._active_generator_measurement_plan,
+            self._active_balance_measurement_plan,
+            self.active_measurements_are_vectorized,
+        )
 
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and vectorized measurement plans."""
@@ -325,10 +688,12 @@ class ACStateEstimator:
         active_measurements = []
         active_z = []
         active_weight = []
-        active_device_keys = set()
-        active_measurement_keys = set()
-        active_rows_by_device_type = {}
+        active_angle_mask = []
+        active_device_type_codes = []
+        active_rows_by_device_type_code = {}
         max_idx = 0
+        first_active_weight = None
+        active_weights_are_uniform = True
         for meas in self.measurements:
             if meas.idx > max_idx:
                 max_idx = int(meas.idx)
@@ -338,32 +703,51 @@ class ACStateEstimator:
             active_measurements.append(meas)
             active_z.append(meas.value)
             active_weight.append(meas.weight)
-            active_rows_by_device_type.setdefault(meas.device_type, []).append(active_row)
-            active_device_keys.add((meas.device_type, meas.device_name))
-            active_measurement_keys.add((meas.device_type, meas.device_name, meas.meas_type))
-        self._active_device_key_cache = active_device_keys
-        self._active_measurement_key_cache = active_measurement_keys
+            active_angle_mask.append(meas.meas_type in ANGLE_MEASUREMENT_TYPES)
+            device_type_code = _DEVICE_TYPE_CODES.get(meas.device_type, 0)
+            active_device_type_codes.append(device_type_code)
+            if first_active_weight is None:
+                first_active_weight = float(meas.weight)
+            elif active_weights_are_uniform and float(meas.weight) != first_active_weight:
+                active_weights_are_uniform = False
+            active_rows_by_device_type_code.setdefault(device_type_code, []).append(active_row)
         self._max_measurement_idx = max_idx
         self.active_measurements = active_measurements
         self.active_z = np.asarray(active_z, dtype=np.float64)
         self.active_weight = np.asarray(active_weight, dtype=np.float64)
-        self.active_angle_residual_mask = angle_residual_mask(self.active_measurements)
-        self._active_rows_by_device_type = active_rows_by_device_type
+        self.active_angle_residual_mask = np.asarray(active_angle_mask, dtype=bool)
+        self.active_device_type_codes = np.asarray(active_device_type_codes, dtype=np.int16)
+        self.active_has_angle_residuals = any(active_angle_mask)
+        self.active_weights_are_uniform = bool(active_weight) and active_weights_are_uniform
+        self.active_uniform_weight = first_active_weight if self.active_weights_are_uniform else None
+        self._active_rows_by_device_type_code = active_rows_by_device_type_code
         self._branch_transformer_vector_plan_cache = {}
-        self._active_branch_transformer_vector_plan = None
-        self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
         self._simple_jacobian_plan_cache = {}
-        self._active_simple_jacobian_plan = None
-        self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
         self._zero_current_vector_plan_cache = {}
-        self._active_zero_current_vector_plan = None
-        self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
         self._generator_measurement_plan_cache = {}
-        self._active_generator_measurement_plan = None
-        self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
         self._balance_measurement_plan_cache = {}
-        self._active_balance_measurement_plan = None
-        self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
+        if not self._load_active_plan_template(len(active_measurements), max_idx):
+            self._active_branch_transformer_vector_plan = None
+            self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
+            self._active_simple_jacobian_plan = None
+            self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
+            self._active_zero_current_vector_plan = None
+            self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
+            self._active_generator_measurement_plan = None
+            self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
+            self._active_balance_measurement_plan = None
+            self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
+            self.active_measurements_are_vectorized = bool(
+                np.all(
+                    self._active_branch_transformer_vector_plan["handled_mask"]
+                    | self._active_simple_jacobian_plan["handled_mask"]
+                    | self._active_zero_current_vector_plan["handled_mask"]
+                    | self._active_generator_measurement_plan["handled_mask"]
+                    | self._active_balance_measurement_plan["handled_mask"]
+                )
+            )
+            self._store_active_plan_template(len(active_measurements), max_idx)
+        self._install_active_plan_cache_entries()
 
     def _measurement_rows_for_types(
         self,
@@ -372,10 +756,10 @@ class ACStateEstimator:
     ):
         """Yield candidate measurement rows, using the active type index when available."""
         if measurements is self.active_measurements:
-            rows_by_device_type = getattr(self, "_active_rows_by_device_type", None)
-            if rows_by_device_type is not None:
+            rows_by_device_type_code = getattr(self, "_active_rows_by_device_type_code", None)
+            if rows_by_device_type_code is not None:
                 for device_type in device_types:
-                    for row in rows_by_device_type.get(device_type, ()):
+                    for row in rows_by_device_type_code.get(_DEVICE_TYPE_CODES.get(device_type, 0), ()):
                         yield row, measurements[row]
                 return
         device_type_set = set(device_types)
@@ -397,10 +781,22 @@ class ACStateEstimator:
         weight = np.asarray([meas.weight for meas in measurements], dtype=np.float64)
         return z, weight
 
+    @staticmethod
+    def _uniform_weight(weight: np.ndarray) -> Optional[float]:
+        if weight.size == 0:
+            return None
+        first_weight = float(weight[0])
+        return first_weight if bool(np.all(weight == first_weight)) else None
+
     def _angle_residual_mask(self, measurements: Sequence[Measurement]) -> np.ndarray:
         if measurements is self.active_measurements:
             return self.active_angle_residual_mask
         return angle_residual_mask(measurements)
+
+    def _has_angle_residuals(self, measurements: Sequence[Measurement], angle_mask: np.ndarray) -> bool:
+        if measurements is self.active_measurements:
+            return self.active_has_angle_residuals
+        return bool(np.any(angle_mask))
 
     def _measurement_residual(
         self,
@@ -408,7 +804,17 @@ class ACStateEstimator:
         z_est: np.ndarray,
         measurements: Sequence[Measurement],
     ) -> np.ndarray:
-        return build_measurement_residual(z, z_est, self._angle_residual_mask(measurements))
+        angle_mask = self._angle_residual_mask(measurements)
+        return build_measurement_residual(
+            z,
+            z_est,
+            angle_mask,
+            has_angle_residuals=self._has_angle_residuals(measurements, angle_mask),
+        )
+
+    @staticmethod
+    def _weighted_objective(weight: np.ndarray, residual: np.ndarray) -> float:
+        return 0.5 * float(np.einsum("i,i,i->", weight, residual, residual, optimize=False))
 
     def _disable_angle_measurements(self) -> None:
         """Keep all phase-angle measurement rows out of WLS; flat starts store them as zero."""
@@ -439,88 +845,16 @@ class ACStateEstimator:
             if devices is None or meas.device_name not in devices:
                 meas.valid = False
 
-    @staticmethod
-    def _load_network(e_file: Path) -> ACPowerNetwork:
+    def _load_network(self, e_file: Path) -> ACPowerNetwork:
         """Read the AC case and build topology references used by measurements."""
         network = ACPowerNetwork()
-        network.read_from_file(e_file)
-        network.topo()
+        self._profile_call("init.network_read_file", network.read_from_file, e_file)
+        self._profile_call("init.network_topo", network.topo)
         return network
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> List[Measurement]:
-        required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
-        header_found = False
-        measurements = []
-        measurement_cls = Measurement
-        append_measurement = measurements.append
-        device_type_cache = {}
-        measurement_type_cache = {}
-        with open(meas_file, mode="rt", encoding="utf8") as fp:
-            for line in fp:
-                line = line.strip()
-                if line == "<Measurement>":
-                    break
-            else:
-                raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
-
-            for line_no, line in enumerate(fp, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                first = line[0]
-                if first == "@":
-                    header = line[1:].split()
-                    column_index = {name: idx for idx, name in enumerate(header)}
-                    missing = [name for name in required_columns if name not in column_index]
-                    if missing:
-                        raise RuntimeError(f"{meas_file} Measurement header is missing columns: {missing}")
-                    idx_col = column_index["idx"]
-                    name_col = column_index["name"]
-                    dev_type_col = column_index["dev_type"]
-                    dev_name_col = column_index["dev_name"]
-                    meas_type_col = column_index["meas_type"]
-                    weight_col = column_index["weight"]
-                    valid_col = column_index["valid"]
-                    value_col = column_index["value"]
-                    header_found = True
-                    continue
-                if line == "</Measurement>":
-                    break
-                if first != "#":
-                    raise SyntaxError(f"Invalid Measurement row at line {line_no} in {meas_file}")
-                if not header_found:
-                    raise RuntimeError(f"{meas_file} Measurement data appears before the header")
-                raw = line[1:].split()
-                if len(raw) < len(header):
-                    raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
-                raw_device_type = raw[dev_type_col]
-                device_type = device_type_cache.get(raw_device_type)
-                if device_type is None:
-                    device_type = raw_device_type
-                    device_type_cache[raw_device_type] = device_type
-                raw_meas_type = raw[meas_type_col]
-                meas_type = measurement_type_cache.get(raw_meas_type)
-                if meas_type is None:
-                    meas_type = raw_meas_type.upper()
-                    measurement_type_cache[raw_meas_type] = meas_type
-                append_measurement(
-                    measurement_cls(
-                        int(raw[idx_col]),
-                        raw[name_col],
-                        device_type,
-                        raw[dev_name_col],
-                        meas_type,
-                        float(raw[weight_col]),
-                        raw[valid_col] == "1",
-                        float(raw[value_col]),
-                    )
-                )
-            if not header_found:
-                raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
-        if not header_found:
-            raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
-        return measurements
+        return Measurement.read_from_file(meas_file)
 
     def _node_current_base(self, node_idx: int) -> float:
         return self.i_scale * ac_current_base_ka(self.p_base_kW, self._voltage_base(node_idx))
@@ -596,109 +930,166 @@ class ACStateEstimator:
             node_idx: self.i_scale * ac_current_base_ka(self.p_base_kW, float(node.vbase))
             for node_idx, node in self.network.node_dict.items()
         }
-        node_by_name = self.node_by_name
-        branch_by_name = self.branch_by_name
-        transformer_by_name = self.transformer_by_name
-        zero_branch_by_name = self.zero_branch_by_name
-        switch_by_name = self.switch_by_name
-        generator_by_name = self.generator_by_name
-        load_by_name = self.load_by_name
+        node_voltage_scale_by_name = {
+            name: voltage_scale_by_node[node.idx]
+            for name, node in self.node_by_name.items()
+        }
+        branch_terminal_scale_by_name = {
+            name: (
+                voltage_scale_by_node[device.i_node],
+                current_scale_by_node[device.i_node],
+                voltage_scale_by_node[device.j_node],
+                current_scale_by_node[device.j_node],
+            )
+            for name, device in self.branch_by_name.items()
+        }
+        transformer_terminal_scale_by_name = {
+            name: (
+                voltage_scale_by_node[device.i_node],
+                current_scale_by_node[device.i_node],
+                voltage_scale_by_node[device.j_node],
+                current_scale_by_node[device.j_node],
+            )
+            for name, device in self.transformer_by_name.items()
+        }
+        zero_branch_terminal_scale_by_name = {
+            name: (
+                voltage_scale_by_node[device.i_node],
+                current_scale_by_node[device.i_node],
+                voltage_scale_by_node[device.j_node],
+                current_scale_by_node[device.j_node],
+            )
+            for name, device in self.zero_branch_by_name.items()
+        }
+        switch_terminal_scale_by_name = {
+            name: (
+                voltage_scale_by_node[device.i_node],
+                current_scale_by_node[device.i_node],
+                voltage_scale_by_node[device.j_node],
+                current_scale_by_node[device.j_node],
+            )
+            for name, device in self.switch_by_name.items()
+        }
+        generator_node_scale_by_name = {
+            name: (voltage_scale_by_node[gen.node], current_scale_by_node[gen.node])
+            for name, gen in self.generator_by_name.items()
+        }
+        load_node_scale_by_name = {
+            name: (voltage_scale_by_node[load.node], current_scale_by_node[load.node])
+            for name, load in self.load_by_name.items()
+        }
+        max_idx = 0
+        terminal_maps = {
+            "ACBranch": branch_terminal_scale_by_name,
+            "ACTransformer": transformer_terminal_scale_by_name,
+            "ACZeroBranch": zero_branch_terminal_scale_by_name,
+            "ACSwitch": switch_terminal_scale_by_name,
+        }
         active_device_keys = set()
         active_measurement_keys = set()
-        max_idx = 0
-
-        def scale_terminal(meas_type: str, device) -> float:
-            if meas_type.startswith(("P_", "Q_")):
-                return power_scale
-            if meas_type.endswith("_FROM"):
-                node_idx = device.i_node
-            elif meas_type.endswith("_TO"):
-                node_idx = device.j_node
-            else:
-                return 1.0
-            if meas_type.startswith("V_"):
-                return voltage_scale_by_node[node_idx]
-            if meas_type.startswith("I_"):
-                return current_scale_by_node[node_idx]
-            return 1.0
+        add_active_device_key = active_device_keys.add
+        add_active_measurement_key = active_measurement_keys.add
+        node_voltage_best: Dict[int, Tuple[float, float]] = {}
+        power_seed_best: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+        has_valid_angle_measurements = False
 
         for meas in self.measurements:
             if meas.idx > max_idx:
                 max_idx = int(meas.idx)
+            if meas.meas_type in ANGLE_MEASUREMENT_TYPES:
+                if self.flat_start:
+                    meas.value = 0.0
+                meas.valid = False
+                continue
             if not meas.valid or meas.weight <= 0.0:
                 continue
             scale = 1.0
             mtype = meas.meas_type
-            if meas.device_type == "ACNode":
-                if meas.device_name not in node_by_name:
+            device_type = meas.device_type
+            device_name = meas.device_name
+            if device_type == "ACNode":
+                node_scale = node_voltage_scale_by_name.get(device_name)
+                if node_scale is None:
                     meas.valid = False
                     continue
                 if mtype == "V":
-                    scale = voltage_scale_by_node[node_by_name[meas.device_name].idx]
+                    scale = node_scale
                 elif mtype in ("ANGLE", "THETA"):
+                    has_valid_angle_measurements = True
                     meas.value = math.radians(float(meas.value))
                     continue
-            elif meas.device_type == "ACBranch":
-                device = branch_by_name.get(meas.device_name)
-                if device is None:
+            elif device_type in terminal_maps:
+                terminal_scales = terminal_maps[device_type].get(device_name)
+                if terminal_scales is None:
                     meas.valid = False
                     continue
-                scale = scale_terminal(mtype, device)
-            elif meas.device_type == "ACTransformer":
-                device = transformer_by_name.get(meas.device_name)
-                if device is None:
-                    meas.valid = False
-                    continue
-                scale = scale_terminal(mtype, device)
-            elif meas.device_type == "ACZeroBranch":
-                device = zero_branch_by_name.get(meas.device_name)
-                if device is None:
-                    meas.valid = False
-                    continue
-                scale = scale_terminal(mtype, device)
-            elif meas.device_type == "ACSwitch":
-                device = switch_by_name.get(meas.device_name)
-                if device is None:
-                    meas.valid = False
-                    continue
-                scale = scale_terminal(mtype, device)
-            elif meas.device_type == "ACZeroBranchConstraint":
+                if mtype in _TERMINAL_POWER_MEASUREMENT_TYPES:
+                    scale = power_scale
+                elif mtype == "V_FROM":
+                    scale = terminal_scales[0]
+                elif mtype == "I_FROM":
+                    scale = terminal_scales[1]
+                elif mtype == "V_TO":
+                    scale = terminal_scales[2]
+                elif mtype == "I_TO":
+                    scale = terminal_scales[3]
+            elif device_type == "ACZeroBranchConstraint":
                 meas.valid = False
                 continue
-            elif meas.device_type == "ACSwitchConstraint":
+            elif device_type == "ACSwitchConstraint":
                 meas.valid = False
                 continue
-            elif meas.device_type == "ACGenerator":
-                gen = generator_by_name.get(meas.device_name)
-                if gen is None:
+            elif device_type == "ACGenerator":
+                node_scales = generator_node_scale_by_name.get(device_name)
+                if node_scales is None:
                     meas.valid = False
                     continue
                 if mtype in ("P_GEN", "Q_GEN"):
                     scale = power_scale
                 elif mtype == "V_GEN":
-                    scale = voltage_scale_by_node[gen.node]
+                    scale = node_scales[0]
                 elif mtype == "I_GEN":
-                    scale = current_scale_by_node[gen.node]
-            elif meas.device_type == "ACLoad":
-                load = load_by_name.get(meas.device_name)
-                if load is None:
+                    scale = node_scales[1]
+            elif device_type == "ACLoad":
+                node_scales = load_node_scale_by_name.get(device_name)
+                if node_scales is None:
                     meas.valid = False
                     continue
                 if mtype in ("P_LOAD", "Q_LOAD"):
                     scale = power_scale
                 elif mtype == "V_LOAD":
-                    scale = voltage_scale_by_node[load.node]
+                    scale = node_scales[0]
                 elif mtype == "I_LOAD":
-                    scale = current_scale_by_node[load.node]
+                    scale = node_scales[1]
             else:
                 meas.valid = False
                 continue
             meas.value = float(meas.value) / scale
-            active_device_keys.add((meas.device_type, meas.device_name))
-            active_measurement_keys.add((meas.device_type, meas.device_name, meas.meas_type))
+            if device_type == "ACNode" and mtype == "V" and not meas.name.startswith("pseudo_"):
+                node_idx = self.node_by_name[device_name].idx
+                current = node_voltage_best.get(node_idx)
+                if current is None or meas.weight > current[0]:
+                    node_voltage_best[node_idx] = (float(meas.weight), float(meas.value))
+            elif (
+                (device_type == "ACGenerator" and mtype in ("P_GEN", "Q_GEN"))
+                or (device_type == "ACLoad" and mtype in ("P_LOAD", "Q_LOAD"))
+            ):
+                key = (device_type, device_name, mtype)
+                current = power_seed_best.get(key)
+                if current is None or meas.weight > current[0]:
+                    power_seed_best[key] = (float(meas.weight), float(meas.value))
+            if device_type in _PSEUDO_DEVICE_SUMMARY_TYPES:
+                add_active_device_key((device_type, device_name))
+            if mtype in _PSEUDO_MEASUREMENT_SUMMARY_TYPES.get(device_type, ()):
+                add_active_measurement_key((device_type, device_name, mtype))
         self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
         self._max_measurement_idx = max_idx
+        self._node_voltage_measurement_cache = {
+            node_idx: value for node_idx, (_weight, value) in node_voltage_best.items()
+        }
+        self._real_power_measurement_seed_cache = power_seed_best
+        self._has_valid_angle_measurements = has_valid_angle_measurements
 
     def _active_device_keys(self) -> set:
         """Return devices that already have at least one usable measurement."""
@@ -749,19 +1140,23 @@ class ACStateEstimator:
         device_name: str,
         meas_type: str,
         value: float,
+        *,
+        record_summary: bool = True,
     ) -> int:
-        measurement = Measurement(
-            idx=next_idx,
-            name=name,
-            device_type=device_type,
-            device_name=device_name,
-            meas_type=meas_type,
-            weight=self.pseudo_measurement_weight,
-            valid=True,
-            value=float(value),
-        )
+        measurement = Measurement.__new__(Measurement)
+        measurement.idx = next_idx
+        measurement.name = name
+        measurement.device_type = device_type
+        measurement.device_name = device_name
+        measurement.meas_type = meas_type
+        measurement.weight = self.pseudo_measurement_weight
+        measurement.valid = True
+        measurement.value = float(value)
         self.measurements.append(measurement)
-        self._record_measurement_summary(measurement)
+        if record_summary:
+            self._record_measurement_summary(measurement)
+        elif next_idx > getattr(self, "_max_measurement_idx", 0):
+            self._max_measurement_idx = int(next_idx)
         return next_idx + 1
 
     @staticmethod
@@ -821,9 +1216,10 @@ class ACStateEstimator:
                     add(self.node_pos[dev.node])
         return counts
 
-    def _add_pseudo_topology_measurements(self, next_idx: int) -> int:
+    def _add_pseudo_topology_measurements(self, next_idx: int) -> Tuple[int, set]:
         """Add weak priors for topology devices that have no usable measurement row."""
-        measured_keys = self._active_measurement_keys()
+        measured_keys = self._active_measurement_key_cache
+        added_keys = set()
 
         for device_type, devices in (
             ("ACZeroBranch", self.zero_branches),
@@ -838,7 +1234,8 @@ class ACStateEstimator:
                     ("I_FROM", abs(getattr(dev, "current", 0.0) or 0.0)),
                 )
                 for meas_type, value in values:
-                    if (device_type, dev.name, meas_type) in measured_keys:
+                    key = (device_type, dev.name, meas_type)
+                    if key in measured_keys or key in added_keys:
                         continue
                     next_idx = self._append_pseudo_measurement(
                         next_idx,
@@ -847,20 +1244,27 @@ class ACStateEstimator:
                         dev.name,
                         meas_type,
                         value,
+                        record_summary=False,
                     )
-        return next_idx
+                    added_keys.add(key)
+        return next_idx, added_keys
 
     def _add_pseudo_power_measurements(self) -> None:
         """Add weak priors for devices whose file measurements are missing or invalid."""
-        measured_devices = self._active_device_keys()
-        measured_keys = self._active_measurement_keys()
+        if not hasattr(self, "_active_device_key_cache") or not hasattr(self, "_active_measurement_key_cache"):
+            self._refresh_measurement_summary_cache()
+        measured_devices = self._active_device_key_cache
+        measured_keys = self._active_measurement_key_cache
+        added_keys = set()
         next_idx = self._next_measurement_idx()
-        next_idx = self._add_pseudo_topology_measurements(next_idx)
+        next_idx, topology_added_keys = self._add_pseudo_topology_measurements(next_idx)
+        added_keys.update(topology_added_keys)
 
         for gen in sorted(self.generator_by_name.values(), key=lambda item: item.idx):
             p, q = self._generator_pseudo_power(gen)
             voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
-            if ("ACGenerator", gen.name, "P_GEN") not in measured_keys:
+            key = ("ACGenerator", gen.name, "P_GEN")
+            if key not in measured_keys and key not in added_keys:
                 next_idx = self._append_pseudo_measurement(
                     next_idx,
                     f"pseudo_p_{gen.name}",
@@ -868,8 +1272,11 @@ class ACStateEstimator:
                     gen.name,
                     "P_GEN",
                     p,
+                    record_summary=False,
                 )
-            if ("ACGenerator", gen.name, "Q_GEN") not in measured_keys:
+                added_keys.add(key)
+            key = ("ACGenerator", gen.name, "Q_GEN")
+            if key not in measured_keys and key not in added_keys:
                 next_idx = self._append_pseudo_measurement(
                     next_idx,
                     f"pseudo_q_{gen.name}",
@@ -877,8 +1284,11 @@ class ACStateEstimator:
                     gen.name,
                     "Q_GEN",
                     q,
+                    record_summary=False,
                 )
+                added_keys.add(key)
             if ("ACGenerator", gen.name) not in measured_devices:
+                key = ("ACGenerator", gen.name, "V_GEN")
                 next_idx = self._append_pseudo_measurement(
                     next_idx,
                     f"pseudo_v_{gen.name}",
@@ -886,12 +1296,15 @@ class ACStateEstimator:
                     gen.name,
                     "V_GEN",
                     voltage,
+                    record_summary=False,
                 )
+                added_keys.add(key)
 
         for load in sorted(self.load_by_name.values(), key=lambda item: item.idx):
             p, q = self._load_pseudo_power(load)
             voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
-            if ("ACLoad", load.name, "P_LOAD") not in measured_keys:
+            key = ("ACLoad", load.name, "P_LOAD")
+            if key not in measured_keys and key not in added_keys:
                 next_idx = self._append_pseudo_measurement(
                     next_idx,
                     f"pseudo_p_{load.name}",
@@ -899,8 +1312,11 @@ class ACStateEstimator:
                     load.name,
                     "P_LOAD",
                     p,
+                    record_summary=False,
                 )
-            if ("ACLoad", load.name, "Q_LOAD") not in measured_keys:
+                added_keys.add(key)
+            key = ("ACLoad", load.name, "Q_LOAD")
+            if key not in measured_keys and key not in added_keys:
                 next_idx = self._append_pseudo_measurement(
                     next_idx,
                     f"pseudo_q_{load.name}",
@@ -908,8 +1324,11 @@ class ACStateEstimator:
                     load.name,
                     "Q_LOAD",
                     q,
+                    record_summary=False,
                 )
+                added_keys.add(key)
             if ("ACLoad", load.name) not in measured_devices:
+                key = ("ACLoad", load.name, "V_LOAD")
                 next_idx = self._append_pseudo_measurement(
                     next_idx,
                     f"pseudo_v_{load.name}",
@@ -917,26 +1336,33 @@ class ACStateEstimator:
                     load.name,
                     "V_LOAD",
                     voltage,
+                    record_summary=False,
                 )
+                added_keys.add(key)
+        if added_keys:
+            measured_keys.update(added_keys)
+            measured_devices.update((device_type, device_name) for device_type, device_name, _meas_type in added_keys)
 
     def _seed_power_state_arrays_from_measurements(self) -> None:
         """Use the best available P/Q rows as initial values for explicit power states."""
-        best: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
-        for meas in self.measurements:
-            if not meas.valid or meas.weight <= 0.0:
-                continue
-            if meas.device_type == "ACGenerator" and meas.meas_type in ("P_GEN", "Q_GEN"):
-                if meas.device_name not in self.generator_state_index_by_name:
+        best = getattr(self, "_real_power_measurement_seed_cache", None)
+        if best is None:
+            best: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+            for meas in self.measurements:
+                if not meas.valid or meas.weight <= 0.0:
                     continue
-            elif meas.device_type == "ACLoad" and meas.meas_type in ("P_LOAD", "Q_LOAD"):
-                if meas.device_name not in self.load_state_index_by_name:
+                if meas.device_type == "ACGenerator" and meas.meas_type in ("P_GEN", "Q_GEN"):
+                    if meas.device_name not in self.generator_state_index_by_name:
+                        continue
+                elif meas.device_type == "ACLoad" and meas.meas_type in ("P_LOAD", "Q_LOAD"):
+                    if meas.device_name not in self.load_state_index_by_name:
+                        continue
+                else:
                     continue
-            else:
-                continue
-            key = (meas.device_type, meas.device_name, meas.meas_type)
-            current = best.get(key)
-            if current is None or meas.weight > current[0]:
-                best[key] = (float(meas.weight), float(meas.value))
+                key = (meas.device_type, meas.device_name, meas.meas_type)
+                current = best.get(key)
+                if current is None or meas.weight > current[0]:
+                    best[key] = (float(meas.weight), float(meas.value))
 
         for (_device_type, name, meas_type), (_weight, value) in best.items():
             if meas_type == "P_GEN":
@@ -1304,35 +1730,30 @@ class ACStateEstimator:
 
     def _add_power_balance_constraint_measurements(self) -> None:
         """Add nodal AC power-balance equations that tie P/Q states to the grid."""
-        existing = {
-            (meas.device_type, meas.device_name, meas.meas_type)
-            for meas in self.measurements
-            if meas.valid
-            and meas.weight > 0.0
-            and meas.device_type == "ACPowerBalance"
-        }
         next_idx = self._next_measurement_idx()
         weight = 10.0
+        new_measurement = Measurement.__new__
+        append = self.measurements.append
         for node in self.nodes:
             for meas_type in ("P_BALANCE", "Q_BALANCE"):
-                if ("ACPowerBalance", node.name, meas_type) in existing:
-                    continue
-                self.measurements.append(
-                    Measurement(
-                        idx=next_idx,
-                        name=f"constraint_{meas_type.lower()}_{node.name}",
-                        device_type="ACPowerBalance",
-                        device_name=node.name,
-                        meas_type=meas_type,
-                        weight=weight,
-                        valid=True,
-                        value=0.0,
-                    )
-                )
+                measurement = new_measurement(Measurement)
+                measurement.idx = next_idx
+                measurement.name = f"constraint_{meas_type.lower()}_{node.name}"
+                measurement.device_type = "ACPowerBalance"
+                measurement.device_name = node.name
+                measurement.meas_type = meas_type
+                measurement.weight = weight
+                measurement.valid = True
+                measurement.value = 0.0
+                append(measurement)
                 next_idx += 1
+        self._max_measurement_idx = next_idx - 1 if next_idx > 0 else self._max_measurement_idx
 
     def _node_voltage_measurements(self) -> Dict[int, float]:
         """Return valid real ACNode voltage measurements keyed by node index."""
+        cached = getattr(self, "_node_voltage_measurement_cache", None)
+        if cached is not None:
+            return dict(cached)
         best: Dict[int, Tuple[float, float]] = {}
         for meas in self.measurements:
             if (
@@ -1418,6 +1839,8 @@ class ACStateEstimator:
 
     def _rebase_angle_measurements(self) -> None:
         """Convert absolute node angle measurements to the estimator reference frame."""
+        if not getattr(self, "_has_valid_angle_measurements", True):
+            return
         for meas in self.measurements:
             if (
                 meas.valid
@@ -1429,8 +1852,68 @@ class ACStateEstimator:
                 node = self.node_by_name[meas.device_name]
                 meas.value -= self._angle_reference_for_node(node.idx)
 
+    def _zero_tie_layout_cache_key(self) -> Tuple[object, ...]:
+        reference_voltages = tuple(sorted((int(pos), float(value)) for pos, value in self.reference_voltage_by_pos.items()))
+        return (
+            _file_cache_key(self.e_file),
+            tuple(sorted(int(pos) for pos in self.ref_idx)),
+            reference_voltages,
+            len(self.nodes),
+        )
+
+    def _install_zero_tie_layout(self, layout) -> None:
+        (
+            self.zero_tie_components,
+            self.angle_col,
+            self.voltage_col,
+            self.angle_state_pos,
+            self.angle_state_nodes,
+            self.voltage_state_pos,
+            self.voltage_state_nodes,
+            self.ref_angles,
+            self.ref_voltages,
+            self.n_angle,
+            self.n_voltage,
+            self._angle_ref_nodes,
+            self._angle_ref_values,
+            self._voltage_ref_nodes,
+            self._voltage_ref_values,
+            self._angle_unpack_nodes,
+            self._angle_unpack_cols,
+            self._voltage_unpack_nodes,
+            self._voltage_unpack_cols,
+        ) = layout
+
+    def _current_zero_tie_layout(self):
+        return (
+            self.zero_tie_components,
+            self.angle_col,
+            self.voltage_col,
+            self.angle_state_pos,
+            self.angle_state_nodes,
+            self.voltage_state_pos,
+            self.voltage_state_nodes,
+            self.ref_angles,
+            self.ref_voltages,
+            self.n_angle,
+            self.n_voltage,
+            self._angle_ref_nodes,
+            self._angle_ref_values,
+            self._voltage_ref_nodes,
+            self._voltage_ref_values,
+            self._angle_unpack_nodes,
+            self._angle_unpack_cols,
+            self._voltage_unpack_nodes,
+            self._voltage_unpack_cols,
+        )
+
     def _build_zero_tie_state_layout(self) -> None:
         """Compress AC voltage/angle states across ideal switches and zero branches."""
+        cache_key = self._zero_tie_layout_cache_key()
+        cached = _ZERO_TIE_LAYOUT_CACHE.get(cache_key)
+        if cached is not None:
+            self._install_zero_tie_layout(cached)
+            return
         n = len(self.nodes)
         parent = np.arange(n, dtype=np.int32)
 
@@ -1531,6 +2014,9 @@ class ACStateEstimator:
             self._voltage_unpack_cols = np.array([], dtype=np.int32)
         voltage_mask = self.voltage_col >= 0
         self.voltage_col[voltage_mask] = self.n_angle + self.voltage_col[voltage_mask]
+        if len(_ZERO_TIE_LAYOUT_CACHE) > 16:
+            _ZERO_TIE_LAYOUT_CACHE.clear()
+        _ZERO_TIE_LAYOUT_CACHE[cache_key] = self._current_zero_tie_layout()
 
     def _build_y_matrix(self) -> np.ndarray:
         """Build the estimator admittance matrix with the same stamps as load flow."""
@@ -1603,6 +2089,20 @@ class ACStateEstimator:
 
     def _prepare_y_row_cache(self) -> None:
         """Cache sparse Y-row topology used repeatedly by generator Jacobian rows."""
+        if issparse(self.Y):
+            cache_key = (_file_cache_key(self.e_file), int(self.Y.shape[0]), int(self.Y.nnz))
+        else:
+            cache_key = (_file_cache_key(self.e_file), int(self.Y.shape[0]), int(np.count_nonzero(self.Y)))
+        cached = _Y_ROW_CACHE.get(cache_key)
+        if cached is not None:
+            (
+                self._y_row_nodes,
+                self._y_row_y_conj,
+                self._y_row_off_mask,
+                self._y_row_off_nodes,
+                self._y_row_diag_conj,
+            ) = cached
+            return
         n = len(self.nodes)
         self._y_row_nodes = []
         self._y_row_y_conj = []
@@ -1628,6 +2128,15 @@ class ACStateEstimator:
             self._y_row_off_mask.append(off_mask)
             self._y_row_off_nodes.append(nodes[off_mask])
             self._y_row_diag_conj[pos] = np.conj(diag_values[0]) if diag_values.size else 0.0
+        if len(_Y_ROW_CACHE) > 16:
+            _Y_ROW_CACHE.clear()
+        _Y_ROW_CACHE[cache_key] = (
+            self._y_row_nodes,
+            self._y_row_y_conj,
+            self._y_row_off_mask,
+            self._y_row_off_nodes,
+            self._y_row_diag_conj,
+        )
 
     def _group_loads(self) -> Dict[int, List]:
         grouped: Dict[int, List] = {}
@@ -1773,8 +2282,8 @@ class ACStateEstimator:
         p_load = np.zeros(len(self.nodes), dtype=np.float64)
         q_load = np.zeros(len(self.nodes), dtype=np.float64)
         if self.load_pos_array.size:
-            np.add.at(p_load, self.load_pos_array, p_values)
-            np.add.at(q_load, self.load_pos_array, q_values)
+            p_load = np.bincount(self.load_pos_array, weights=p_values, minlength=self.n_nodes)
+            q_load = np.bincount(self.load_pos_array, weights=q_values, minlength=self.n_nodes)
         load_power = {
             load.name: (float(p_values[idx]), float(q_values[idx]))
             for idx, load in enumerate(self.load_order)
@@ -1783,12 +2292,12 @@ class ACStateEstimator:
 
     def _load_power_totals_from_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Compute node-level load totals from explicit P_LOAD/Q_LOAD states."""
-        p_load = np.zeros(len(self.nodes), dtype=np.float64)
-        q_load = np.zeros(len(self.nodes), dtype=np.float64)
-        if self.load_pos_array.size:
-            np.add.at(p_load, self.load_pos_array, x[self.base_load_p : self.base_load_q])
-            np.add.at(q_load, self.load_pos_array, x[self.base_load_q : self.n_state])
-        return p_load, q_load
+        if not self.load_pos_array.size:
+            return np.zeros(self.n_nodes, dtype=np.float64), np.zeros(self.n_nodes, dtype=np.float64)
+        return (
+            np.bincount(self.load_pos_array, weights=x[self.base_load_p : self.base_load_q], minlength=self.n_nodes),
+            np.bincount(self.load_pos_array, weights=x[self.base_load_q : self.n_state], minlength=self.n_nodes),
+        )
 
     def _generator_power_from_state(self, x: np.ndarray) -> Tuple[Dict[str, Tuple[float, float]], np.ndarray, np.ndarray]:
         """Return generator P/Q states and node totals used by balance equations."""
@@ -1797,8 +2306,8 @@ class ACStateEstimator:
         p_gen = np.zeros(len(self.nodes), dtype=np.float64)
         q_gen = np.zeros(len(self.nodes), dtype=np.float64)
         if self.generator_pos_array.size:
-            np.add.at(p_gen, self.generator_pos_array, p_values)
-            np.add.at(q_gen, self.generator_pos_array, q_values)
+            p_gen = np.bincount(self.generator_pos_array, weights=p_values, minlength=self.n_nodes)
+            q_gen = np.bincount(self.generator_pos_array, weights=q_values, minlength=self.n_nodes)
         gen_power = {
             gen.name: (float(p_values[idx]), float(q_values[idx]))
             for idx, gen in enumerate(self.generator_order)
@@ -1807,12 +2316,12 @@ class ACStateEstimator:
 
     def _generator_power_totals_from_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Compute node-level generator totals from explicit P_GEN/Q_GEN states."""
-        p_gen = np.zeros(len(self.nodes), dtype=np.float64)
-        q_gen = np.zeros(len(self.nodes), dtype=np.float64)
-        if self.generator_pos_array.size:
-            np.add.at(p_gen, self.generator_pos_array, x[self.base_gen_p : self.base_gen_q])
-            np.add.at(q_gen, self.generator_pos_array, x[self.base_gen_q : self.base_load_p])
-        return p_gen, q_gen
+        if not self.generator_pos_array.size:
+            return np.zeros(self.n_nodes, dtype=np.float64), np.zeros(self.n_nodes, dtype=np.float64)
+        return (
+            np.bincount(self.generator_pos_array, weights=x[self.base_gen_p : self.base_gen_q], minlength=self.n_nodes),
+            np.bincount(self.generator_pos_array, weights=x[self.base_gen_q : self.base_load_p], minlength=self.n_nodes),
+        )
 
     def _switch_power_injections(
         self,
@@ -1820,17 +2329,15 @@ class ACStateEstimator:
         switch_current: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute node injections from explicit zero-branch/switch current states."""
-        p_switch = np.zeros(len(self.nodes), dtype=np.float64)
-        q_switch = np.zeros(len(self.nodes), dtype=np.float64)
         if self.n_switch_current == 0:
-            return p_switch, q_switch
-        s_from = voltage_complex[self.zero_current_i] * np.conj(switch_current)
-        s_to = voltage_complex[self.zero_current_j] * np.conj(-switch_current)
-        np.add.at(p_switch, self.zero_current_i, s_from.real)
-        np.add.at(q_switch, self.zero_current_i, s_from.imag)
-        np.add.at(p_switch, self.zero_current_j, s_to.real)
-        np.add.at(q_switch, self.zero_current_j, s_to.imag)
-        return p_switch, q_switch
+            return np.zeros(self.n_nodes, dtype=np.float64), np.zeros(self.n_nodes, dtype=np.float64)
+        end_pos = self.switch_balance_end_pos
+        current = switch_current[self.switch_balance_end_current_idx] * self.switch_balance_sign
+        s = voltage_complex[end_pos] * np.conj(current)
+        return (
+            np.bincount(end_pos, weights=s.real, minlength=self.n_nodes),
+            np.bincount(end_pos, weights=s.imag, minlength=self.n_nodes),
+        )
 
     def _power_balance_totals(
         self,
@@ -2152,7 +2659,7 @@ class ACStateEstimator:
             | vectorized_generator_rows
             | vectorized_balance_rows
         )
-        if np.all(vectorized_rows):
+        if (measurements is self.active_measurements and self.active_measurements_are_vectorized) or np.all(vectorized_rows):
             return values
 
         for row, meas in enumerate(measurements):
@@ -2647,6 +3154,41 @@ class ACStateEstimator:
         if np.any(mask):
             np.add.at(H, (rows[mask], cols[mask]), values[mask])
 
+    def _add_indexed_value_blocks(self, H: np.ndarray, blocks: Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
+        """Append several vectorized Jacobian write blocks with one sparse/dense scatter."""
+        if not blocks:
+            return
+        row_parts = []
+        col_parts = []
+        value_parts = []
+        for rows, cols, values in blocks:
+            rows = np.asarray(rows)
+            if rows.size == 0:
+                continue
+            row_parts.append(rows)
+            col_parts.append(np.asarray(cols))
+            value_parts.append(np.asarray(values))
+        if not row_parts:
+            return
+        if len(row_parts) == 1:
+            self._add_indexed_values(H, row_parts[0], col_parts[0], value_parts[0])
+            return
+        self._add_indexed_values(
+            H,
+            np.concatenate(row_parts),
+            np.concatenate(col_parts),
+            np.concatenate(value_parts),
+        )
+
+    @staticmethod
+    def _complex_bincount(index: np.ndarray, values: np.ndarray, size: int) -> np.ndarray:
+        if index.size == 0:
+            return np.zeros(size, dtype=np.complex128)
+        return (
+            np.bincount(index, weights=values.real, minlength=size)
+            + 1j * np.bincount(index, weights=values.imag, minlength=size)
+        )
+
     @staticmethod
     def _add_scalar_value(H, row: int, col: int, value: float) -> None:
         if col < 0:
@@ -3040,11 +3582,15 @@ class ACStateEstimator:
             "handled_mask": handled,
             "rows": self._int_array(rows),
             "pos": self._int_array(pos),
+            "pos_i64": np.asarray(pos, dtype=np.int64),
             "kind": self._int_array(kind),
             "p_row_by_pos": p_row_by_pos,
             "q_row_by_pos": q_row_by_pos,
             "y_balance": np.concatenate(y_balance) if y_balance else np.array([], dtype=np.int32),
             "y_nodes": np.concatenate(y_nodes) if y_nodes else np.array([], dtype=np.int32),
+            "y_nodes_i64": (
+                np.concatenate(y_nodes).astype(np.int64, copy=False) if y_nodes else np.array([], dtype=np.int64)
+            ),
             "y_conj": np.concatenate(y_conj) if y_conj else np.array([], dtype=np.complex128),
         }
         if len(self._balance_measurement_plan_cache) > 16:
@@ -3085,12 +3631,12 @@ class ACStateEstimator:
         if rows.size == 0:
             return plan["handled_mask"]
 
-        pos = plan["pos"].astype(np.int64, copy=False)
+        pos = plan["pos_i64"]
         kind = plan["kind"]
 
         y_balance = plan["y_balance"]
         if y_balance.size:
-            y_nodes = plan["y_nodes"].astype(np.int64, copy=False)
+            y_nodes = plan["y_nodes_i64"]
             y_conj = plan["y_conj"]
             y_pos = pos[y_balance]
             exp_delta = np.exp(1j * (theta[y_pos] - theta[y_nodes]))
@@ -3102,61 +3648,60 @@ class ACStateEstimator:
                 off_balance = y_balance[off_mask]
                 off_nodes = y_nodes[off_mask]
                 off_term = term[off_mask]
-                np.add.at(off_sum, off_balance, off_term)
+                off_sum = self._complex_bincount(off_balance, off_term, pos.size)
 
                 theta_values = -1j * off_term
                 theta_rows = rows[off_balance]
                 theta_cols = self.angle_col[off_nodes]
                 theta_kind = kind[off_balance]
-                self._add_indexed_values(
-                    H,
-                    theta_rows,
-                    theta_cols,
-                    np.where(theta_kind == 0, theta_values.real, theta_values.imag),
-                )
 
                 voltage_values = y_conj[off_mask] * voltage[y_pos[off_mask]] * exp_delta[off_mask]
                 voltage_cols = self.voltage_col[off_nodes]
-                self._add_indexed_values(
+                self._add_indexed_value_blocks(
                     H,
-                    rows[off_balance],
-                    voltage_cols,
-                    np.where(theta_kind == 0, voltage_values.real, voltage_values.imag),
+                    (
+                        (
+                            theta_rows,
+                            theta_cols,
+                            np.where(theta_kind == 0, theta_values.real, theta_values.imag),
+                        ),
+                        (
+                            theta_rows,
+                            voltage_cols,
+                            np.where(theta_kind == 0, voltage_values.real, voltage_values.imag),
+                        ),
+                    ),
                 )
 
-            sum_all = np.zeros(pos.size, dtype=np.complex128)
-            np.add.at(sum_all, y_balance, y_conj * voltage[y_nodes] * exp_delta)
+            sum_all = self._complex_bincount(y_balance, y_conj * voltage[y_nodes] * exp_delta, pos.size)
         else:
             off_sum = np.zeros(pos.size, dtype=np.complex128)
             sum_all = np.zeros(pos.size, dtype=np.complex128)
 
         own_theta_values = 1j * off_sum
-        self._add_indexed_values(
-            H,
-            rows,
-            self.angle_col[pos],
-            np.where(kind == 0, own_theta_values.real, own_theta_values.imag),
-        )
         own_voltage_values = self._y_row_diag_conj[pos] * voltage[pos] + sum_all
-        self._add_indexed_values(
+        self._add_indexed_value_blocks(
             H,
-            rows,
-            self.voltage_col[pos],
-            np.where(kind == 0, own_voltage_values.real, own_voltage_values.imag),
+            (
+                (
+                    rows,
+                    self.angle_col[pos],
+                    np.where(kind == 0, own_theta_values.real, own_theta_values.imag),
+                ),
+                (
+                    rows,
+                    self.voltage_col[pos],
+                    np.where(kind == 0, own_voltage_values.real, own_voltage_values.imag),
+                ),
+            ),
         )
 
         p_row_by_pos = plan["p_row_by_pos"]
         q_row_by_pos = plan["q_row_by_pos"]
         if self.n_switch_current:
-            current_idx = np.arange(self.n_switch_current, dtype=np.int32)
-            end_pos = np.concatenate((self.zero_current_i, self.zero_current_j)).astype(np.int64, copy=False)
-            end_current_idx = np.concatenate((current_idx, current_idx))
-            sign = np.concatenate(
-                (
-                    np.ones(self.n_switch_current, dtype=np.float64),
-                    -np.ones(self.n_switch_current, dtype=np.float64),
-                )
-            )
+            end_pos = self.switch_balance_end_pos
+            end_current_idx = self.switch_balance_end_current_idx
+            sign = self.switch_balance_sign
             current = switch_current[end_current_idx] * sign
             s = voltage_complex[end_pos] * np.conj(current)
             dS_dtheta = 1j * s
@@ -3166,47 +3711,42 @@ class ACStateEstimator:
             p_rows = p_row_by_pos[end_pos]
             q_rows = q_row_by_pos[end_pos]
 
-            self._add_indexed_values(H, p_rows, self.angle_col[end_pos], dS_dtheta.real)
-            self._add_indexed_values(H, q_rows, self.angle_col[end_pos], dS_dtheta.imag)
-            self._add_indexed_values(H, p_rows, self.voltage_col[end_pos], dS_dV.real)
-            self._add_indexed_values(H, q_rows, self.voltage_col[end_pos], dS_dV.imag)
-            self._add_indexed_values(H, p_rows, self.base_switch_re + end_current_idx, dS_dIr.real)
-            self._add_indexed_values(H, q_rows, self.base_switch_re + end_current_idx, dS_dIr.imag)
-            self._add_indexed_values(H, p_rows, self.base_switch_im + end_current_idx, dS_dIi.real)
-            self._add_indexed_values(H, q_rows, self.base_switch_im + end_current_idx, dS_dIi.imag)
+            self._add_indexed_value_blocks(
+                H,
+                (
+                    (p_rows, self.angle_col[end_pos], dS_dtheta.real),
+                    (q_rows, self.angle_col[end_pos], dS_dtheta.imag),
+                    (p_rows, self.voltage_col[end_pos], dS_dV.real),
+                    (q_rows, self.voltage_col[end_pos], dS_dV.imag),
+                    (p_rows, self.base_switch_re + end_current_idx, dS_dIr.real),
+                    (q_rows, self.base_switch_re + end_current_idx, dS_dIr.imag),
+                    (p_rows, self.base_switch_im + end_current_idx, dS_dIi.real),
+                    (q_rows, self.base_switch_im + end_current_idx, dS_dIi.imag),
+                ),
+            )
 
         if self.n_generator_power:
-            gen_idx = np.arange(self.n_generator_power, dtype=np.int32)
+            gen_idx = self.generator_power_idx_array
             gen_p_rows = p_row_by_pos[self.generator_pos_array]
             gen_q_rows = q_row_by_pos[self.generator_pos_array]
-            self._add_indexed_values(
+            self._add_indexed_value_blocks(
                 H,
-                gen_p_rows,
-                self.base_gen_p + gen_idx,
-                -np.ones(self.n_generator_power, dtype=np.float64),
-            )
-            self._add_indexed_values(
-                H,
-                gen_q_rows,
-                self.base_gen_q + gen_idx,
-                -np.ones(self.n_generator_power, dtype=np.float64),
+                (
+                    (gen_p_rows, self.base_gen_p + gen_idx, self.generator_balance_minus_ones),
+                    (gen_q_rows, self.base_gen_q + gen_idx, self.generator_balance_minus_ones),
+                ),
             )
 
         if self.n_load_power:
-            load_idx = np.arange(self.n_load_power, dtype=np.int32)
+            load_idx = self.load_power_idx_array
             load_p_rows = p_row_by_pos[self.load_pos_array]
             load_q_rows = q_row_by_pos[self.load_pos_array]
-            self._add_indexed_values(
+            self._add_indexed_value_blocks(
                 H,
-                load_p_rows,
-                self.base_load_p + load_idx,
-                np.ones(self.n_load_power, dtype=np.float64),
-            )
-            self._add_indexed_values(
-                H,
-                load_q_rows,
-                self.base_load_q + load_idx,
-                np.ones(self.n_load_power, dtype=np.float64),
+                (
+                    (load_p_rows, self.base_load_p + load_idx, self.load_balance_ones),
+                    (load_q_rows, self.base_load_q + load_idx, self.load_balance_ones),
+                ),
             )
 
         return plan["handled_mask"]
@@ -3790,7 +4330,10 @@ class ACStateEstimator:
             | vectorized_generator_rows
             | vectorized_balance_rows
         )
-        if sparse and np.all(vectorized_rows):
+        if sparse and (
+            (measurements is self.active_measurements and self.active_measurements_are_vectorized)
+            or np.all(vectorized_rows)
+        ):
             return H.to_csr()
 
         for row, meas in enumerate(measurements):
@@ -4043,6 +4586,18 @@ class ACStateEstimator:
             and self._initial_observability_cache is not None
         ):
             return self._initial_observability_cache
+        use_default_cache = (
+            x is None
+            and measurements is None
+            and H is None
+            and normal_matrix is None
+            and normal_factor_diag is None
+        )
+        if use_default_cache:
+            cached = _OBSERVABILITY_RESULT_CACHE.get(self._default_observability_cache_key())
+            if cached is not None:
+                self._initial_observability_cache = cached
+                return cached
         x = self.initial_state() if x is None else x
         measurements = self._normalize_measurements(measurements)
         H = self.jacobian_sparse(x, measurements) if H is None else H
@@ -4059,7 +4614,7 @@ class ACStateEstimator:
             rank = self.n_state
             deficiency = 0
             weak_states = []
-        return ObservabilityResult(
+        result = ObservabilityResult(
             observable=rank == self.n_state,
             rank=rank,
             state_count=self.n_state,
@@ -4068,6 +4623,12 @@ class ACStateEstimator:
             singular_values=s,
             weak_states=weak_states,
         )
+        if use_default_cache:
+            if len(_OBSERVABILITY_RESULT_CACHE) > 32:
+                _OBSERVABILITY_RESULT_CACHE.clear()
+            _OBSERVABILITY_RESULT_CACHE[self._default_observability_cache_key()] = result
+            self._initial_observability_cache = result
+        return result
 
     def _has_structural_observability_certificate(self, H) -> bool:
         """Certify large sparse AC cases when numeric LU is conservative but structure is anchored."""
@@ -4081,6 +4642,7 @@ class ACStateEstimator:
         measurements: Optional[Sequence[Measurement]] = None,
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
+        final_diagnostics: bool = True,
     ) -> EstimateResult:
         """Run weighted least squares with simple damping to avoid voltage divergence."""
         measurements = self._normalize_measurements(measurements)
@@ -4093,6 +4655,9 @@ class ACStateEstimator:
         else:
             observability = self.observability_analysis(x, measurements)
         z, weight = self._measurement_vectors(measurements)
+        uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
+        weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
+        weighted_residual = None if weights_are_uniform else np.empty_like(weight)
         converged = False
         max_correction = np.inf
         objective = np.inf
@@ -4104,6 +4669,7 @@ class ACStateEstimator:
         cached_z_est = None
         cached_residual = None
         cached_objective = None
+        normal_solver = NormalEquationSolver()
 
         if verbose:
             _print_iteration_header()
@@ -4115,7 +4681,7 @@ class ACStateEstimator:
             if cached_z_est is None:
                 z_est = self.evaluate(x, measurements)
                 residual = self._measurement_residual(z, z_est, measurements)
-                objective = 0.5 * float(np.dot(weight * residual, residual))
+                objective = self._weighted_objective(weight, residual)
             else:
                 z_est = cached_z_est
                 residual = cached_residual
@@ -4123,10 +4689,20 @@ class ACStateEstimator:
                 cached_z_est = cached_residual = cached_objective = None
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             H = self.jacobian_sparse(x, measurements)
-            gain, rhs = build_normal_equations(H, residual, weight)
-            dx, normal_factor_diag = solve_normal_equations_with_factor(
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            gain, rhs = build_normal_equations(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+            )
+            dx, normal_factor_diag = normal_solver.solve(
                 gain,
                 rhs,
+                return_factor_diag=False,
             )
 
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
@@ -4151,8 +4727,8 @@ class ACStateEstimator:
                 )
                 candidate_z_est = self.evaluate(candidate, measurements)
                 candidate_residual = self._measurement_residual(z, candidate_z_est, measurements)
-                candidate_objective = 0.5 * float(np.dot(weight * candidate_residual, candidate_residual))
-                finite_candidate = np.isfinite(candidate_objective) and np.all(np.isfinite(candidate_residual))
+                candidate_objective = self._weighted_objective(weight, candidate_residual)
+                finite_candidate = np.isfinite(candidate_objective)
                 if not finite_candidate:
                     nonfinite_candidates += 1
                     if nonfinite_candidates >= 8:
@@ -4186,7 +4762,7 @@ class ACStateEstimator:
                 if cached_residual is None:
                     cached_z_est = self.evaluate(x, measurements)
                     cached_residual = self._measurement_residual(z, cached_z_est, measurements)
-                    cached_objective = 0.5 * float(np.dot(weight * cached_residual, cached_residual))
+                    cached_objective = self._weighted_objective(weight, cached_residual)
                 updated_residual = cached_residual
                 updated_residual_inf = float(np.linalg.norm(updated_residual, np.inf)) if updated_residual.size else 0.0
                 _print_iteration(
@@ -4203,7 +4779,12 @@ class ACStateEstimator:
                 break
 
         if not converged and flat_restart_enabled:
-            restart_result = self.estimate(measurements, x0=self._file_state(), verbose=verbose)
+            restart_result = self.estimate(
+                measurements,
+                x0=self._file_state(),
+                verbose=verbose,
+                final_diagnostics=final_diagnostics,
+            )
             restart_result.iterations += iteration
             return restart_result
 
@@ -4211,13 +4792,26 @@ class ACStateEstimator:
             if cached_z_est is None:
                 z_est = self.evaluate(x, measurements)
                 residual = self._measurement_residual(z, z_est, measurements)
-                objective = 0.5 * float(np.dot(weight * residual, residual))
+                objective = self._weighted_objective(weight, residual)
             else:
                 z_est = cached_z_est
                 residual = cached_residual
                 objective = cached_objective
+        if final_diagnostics and not final_quantities_current:
             H = self.jacobian_sparse(x, measurements)
-            gain, _ = build_normal_equations(H, residual, weight)
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            gain, _ = build_normal_equations(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+            )
+        elif not final_diagnostics:
+            H = None
+            gain = None
         self.apply_state(x)
         return EstimateResult(
             converged=converged,
@@ -4236,6 +4830,13 @@ class ACStateEstimator:
 
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
         """Return measurements whose normalized residual exceeds the bad-data threshold."""
+        if result.H is None or result.gain is None:
+            result.H = self.jacobian_sparse(result.x, result.measurements)
+            result.gain, _ = build_normal_equations(
+                result.H,
+                result.residual,
+                np.asarray([meas.weight for meas in result.measurements], dtype=np.float64),
+            )
         threshold = self.params.bad_threshold if threshold is None else threshold
         weights = np.asarray([meas.weight for meas in result.measurements], dtype=np.float64)
         R_diag = 1.0 / weights
@@ -4345,8 +4946,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-remove", type=int, default=None, help="Override maximum removed bad data count.")
     parser.add_argument("--flat-start", action="store_true", default=None, help="Use flat voltage start instead of E-file voltage/angle.")
     parser.add_argument("--remove-bad-data", action="store_true", help="Iteratively remove the largest bad datum.")
+    parser.add_argument("--skip-bad-data", action="store_true", help="Skip post-estimation bad-data analysis.")
     parser.add_argument("--print-state", action="store_true", help="Print estimated node states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
+    parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
     args = parser.parse_args(argv)
 
     estimator = ACStateEstimator(
@@ -4357,6 +4960,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         diff_step=args.diff_step,
         parameter_file=Path(args.para),
         flat_start=args.flat_start,
+        profile=args.profile,
     )
 
     initial_observability = estimator.observability_analysis()
@@ -4373,10 +4977,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for item in removed:
                 print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
     else:
-        result = estimator.estimate(verbose=not args.quiet)
+        result = estimator.estimate(verbose=not args.quiet, final_diagnostics=not args.skip_bad_data)
 
-    bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
-    bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
     print(
         "State estimation: "
         f"converged={result.converged}, "
@@ -4386,10 +4988,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"norm_res={result.residual_inf:.3e}"
     )
     _print_observability(result.observability)
-    _print_bad_data(bad_items, normalized, bad_threshold)
+    if not args.skip_bad_data:
+        bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
+        bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
+        _print_bad_data(bad_items, normalized, bad_threshold)
 
     if args.print_state:
         estimator.print_state(result.x)
+    if args.profile:
+        print("Profile:")
+        for name, value in sorted(estimator.profile_times.items()):
+            print(f"  {name}={value:.6f}s")
+        print(f"  init.active_plan_template_hit={estimator.active_plan_template_hit}")
 
     return 0 if result.converged and result.observability.observable else 1
 

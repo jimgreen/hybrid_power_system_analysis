@@ -44,6 +44,127 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(rhs, H_dense.T @ (weight * residual))
         self.assertIsInstance(gain, np.ndarray)
 
+    def test_build_normal_equations_uses_precomputed_uniform_weight_flag(self):
+        from scipy.sparse import csr_matrix
+        import secore.se_math as se_math
+
+        H_dense = np.array([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]])
+        residual = np.array([0.5, -1.0, 2.0])
+        weight = np.array([2.0, 2.0, 2.0])
+
+        original_all = se_math.np.all
+
+        def fail_all(*_args, **_kwargs):
+            raise AssertionError("uniform weight fast path should not scan the weight vector")
+
+        se_math.np.all = fail_all
+        try:
+            gain, rhs = se_math.build_normal_equations(
+                csr_matrix(H_dense),
+                residual,
+                weight,
+                uniform_weight=2.0,
+            )
+        finally:
+            se_math.np.all = original_all
+
+        np.testing.assert_allclose(gain.toarray() if hasattr(gain, "toarray") else gain, 2.0 * (H_dense.T @ H_dense))
+        np.testing.assert_allclose(rhs, 2.0 * (H_dense.T @ residual))
+
+    def test_build_normal_equations_uses_precomputed_nonuniform_weight_flag(self):
+        from scipy.sparse import csr_matrix
+        import secore.se_math as se_math
+
+        H_dense = np.array([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]])
+        residual = np.array([0.5, -1.0, 2.0])
+        weight = np.array([1.0, 2.0, 3.0])
+
+        original_all = se_math.np.all
+
+        def fail_all(*_args, **_kwargs):
+            raise AssertionError("known nonuniform weight path should not scan the weight vector")
+
+        se_math.np.all = fail_all
+        try:
+            gain, rhs = se_math.build_normal_equations(
+                csr_matrix(H_dense),
+                residual,
+                weight,
+                weights_are_uniform=False,
+            )
+        finally:
+            se_math.np.all = original_all
+
+        np.testing.assert_allclose(gain.toarray() if hasattr(gain, "toarray") else gain, H_dense.T @ (weight[:, None] * H_dense))
+        np.testing.assert_allclose(rhs, H_dense.T @ (weight * residual))
+
+    def test_build_normal_equations_uses_supplied_weighted_residual(self):
+        from scipy.sparse import csr_matrix
+        from secore.se_math import build_normal_equations
+
+        H_dense = np.array([[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]])
+        residual = np.array([100.0, 100.0, 100.0])
+        weight = np.array([1.0, 2.0, 3.0])
+        weighted_residual = np.array([0.5, -2.0, 6.0])
+
+        gain, rhs = build_normal_equations(
+            csr_matrix(H_dense),
+            residual,
+            weight,
+            weights_are_uniform=False,
+            weighted_residual=weighted_residual,
+        )
+
+        np.testing.assert_allclose(gain.toarray() if hasattr(gain, "toarray") else gain, H_dense.T @ (weight[:, None] * H_dense))
+        np.testing.assert_allclose(rhs, H_dense.T @ weighted_residual)
+
+    def test_active_vectorized_evaluate_and_jacobian_skip_full_mask_scan(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+        x = estimator.initial_state()
+        self.assertTrue(estimator.active_measurements_are_vectorized)
+
+        original_all = ac_se.np.all
+
+        def fail_all(*_args, **_kwargs):
+            raise AssertionError("active vectorized path should not scan the handled mask")
+
+        ac_se.np.all = fail_all
+        try:
+            z_est = estimator.evaluate(x)
+            H = estimator.jacobian_sparse(x)
+        finally:
+            ac_se.np.all = original_all
+
+        self.assertEqual(len(estimator.active_measurements), z_est.size)
+        self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
+
+    def test_measurement_residual_skips_angle_mask_scan_when_flag_false(self):
+        import secore.se_math as se_math
+
+        original_any = se_math.np.any
+
+        def fail_any(*_args, **_kwargs):
+            raise AssertionError("no-angle residual fast path should not scan the angle mask")
+
+        se_math.np.any = fail_any
+        try:
+            residual = se_math.measurement_residual(
+                np.array([3.0, 5.0]),
+                np.array([1.0, 2.0]),
+                np.array([False, False]),
+                has_angle_residuals=False,
+            )
+        finally:
+            se_math.np.any = original_any
+
+        np.testing.assert_allclose(residual, np.array([2.0, 3.0]))
+
     def test_load_measurements_uses_direct_measurement_parser(self):
         import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
@@ -89,6 +210,152 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(2.5, measurement.weight)
         self.assertTrue(measurement.valid)
         self.assertEqual(345.6, measurement.value)
+
+    def test_measurement_read_from_file_uses_direct_measurement_parser(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator, Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345.6",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
+            original_read_direct = ac_se._read_measurements_direct
+            calls = []
+
+            def counted_read_direct(file_name, measurement_cls):
+                calls.append(Path(file_name))
+                return original_read_direct(file_name, measurement_cls)
+
+            ac_se._read_measurements_direct = counted_read_direct
+            try:
+                measurements = Measurement.read_from_file(meas_file)
+                loaded_by_estimator = ACStateEstimator._load_measurements(meas_file)
+            finally:
+                ac_se._read_measurements_direct = original_read_direct
+                ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
+
+        self.assertEqual([meas_file], calls)
+        self.assertEqual(1, len(measurements))
+        self.assertEqual("V", measurements[0].meas_type)
+        self.assertEqual(1, len(loaded_by_estimator))
+        self.assertEqual("V", loaded_by_estimator[0].meas_type)
+
+    def test_measurement_read_from_file_bypasses_intermediate_row_objects(self):
+        import efile_read
+        from secore.ac_se import Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345.6",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_factory = efile_read.efile_factory_from_file_cached
+
+            def reject_factory(_file_name):
+                raise AssertionError("measurement loading should use raw rows, not row objects")
+
+            efile_read.efile_factory_from_file_cached = reject_factory
+            try:
+                measurements = Measurement.read_from_file(meas_file)
+            finally:
+                efile_read.efile_factory_from_file_cached = original_factory
+
+        self.assertEqual(1, len(measurements))
+        self.assertEqual("V", measurements[0].meas_type)
+
+    def test_measurement_read_from_file_bypasses_generic_raw_efile_parser(self):
+        import secore.ac_se as ac_se
+        import efile_read
+        from secore.ac_se import Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Other>",
+                        "@ idx name",
+                        "# 1 ignored",
+                        "</Other>",
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345.6",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ac_se._MEASUREMENT_ROW_CACHE.clear()
+            original_read_rows = efile_read.read_efile_rows_cached
+
+            def reject_read_rows(_file_name):
+                raise AssertionError("measurement loading should use the dedicated Measurement parser")
+
+            efile_read.read_efile_rows_cached = reject_read_rows
+            try:
+                measurements = Measurement.read_from_file(meas_file)
+            finally:
+                efile_read.read_efile_rows_cached = original_read_rows
+                ac_se._MEASUREMENT_ROW_CACHE.clear()
+
+        self.assertEqual(1, len(measurements))
+        self.assertEqual("V", measurements[0].meas_type)
+
+    def test_measurement_read_from_file_uses_template_cache_after_direct_parse(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "minimal.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 7 vm_bus_1 ACNode bus_1 v 2.5 1 345.6",
+                        "</Measurement>",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ac_se._MEASUREMENT_BUILDER_CACHE.clear()
+            ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
+
+            measurements = Measurement.read_from_file(meas_file)
+            cached_measurements = Measurement.read_from_file(meas_file)
+
+        self.assertEqual(1, len(measurements))
+        self.assertEqual(1, len(cached_measurements))
+        self.assertEqual(0, len(ac_se._MEASUREMENT_BUILDER_CACHE))
+        self.assertEqual(1, len(ac_se._MEASUREMENT_TEMPLATE_CACHE))
+        self.assertIsNot(measurements[0], cached_measurements[0])
+        cached_measurements[0].value = 1.0
+        self.assertEqual(345.6, measurements[0].value)
+        ac_se._MEASUREMENT_TEMPLATE_CACHE.clear()
 
     def test_measurement_objects_use_slots_and_support_dataclass_replace(self):
         from dataclasses import replace
@@ -250,6 +517,120 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(7.25, mixed.idx)
         self.assertEqual("text", mixed.value)
 
+    def test_efile_row_factory_builds_equivalent_objects_without_row_dicts(self):
+        import efile_read
+
+        data = {
+            "FastEfileRows": {
+                "table_name": "FastEfileRows",
+                "header_list": ["idx", "name", "value"],
+                "rows": [["7", "load_1", "3.5"], ["8", "load_2", ""]],
+                "lv": 0,
+            }
+        }
+
+        model = efile_read.efile_factory_from_rows(data)
+        rows = model.FastEfileRows
+
+        self.assertEqual(7, rows[0].idx)
+        self.assertEqual("load_1", rows[0].name)
+        self.assertEqual(3.5, rows[0].value)
+        self.assertEqual(8, rows[1].idx)
+        self.assertEqual("", rows[1].value)
+
+    def test_ac_direct_model_constructor_matches_generic_counts(self):
+        import secore.ac_se
+        import ac_model
+
+        path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        direct = ac_model._build_ac_model_direct(path)
+        generic = ac_model.efile_factory_from_file_cached(path)
+
+        for attr in (
+            "ACNode",
+            "ACBranch",
+            "ACLoad",
+            "ACGenerator",
+            "ACTransformer",
+            "ACZeroBranch",
+            "ACSwitch",
+            "ACShuntCompensator",
+        ):
+            self.assertEqual(len(getattr(generic, attr, [])), len(getattr(direct, attr, [])))
+
+    def test_ac_direct_model_constructor_bypasses_row_dicts(self):
+        import secore.ac_se
+        import ac_model
+
+        original = ac_model._row_dict
+
+        def reject_row_dict(*_args, **_kwargs):
+            raise AssertionError("generated AC direct constructor should not build per-row dictionaries")
+
+        ac_model._row_dict = reject_row_dict
+        try:
+            direct = ac_model._build_ac_model_direct(ROOT_DIR / "data" / "ac" / "ieee39.e")
+        finally:
+            ac_model._row_dict = original
+
+        self.assertTrue(getattr(direct, "ACNode", []))
+
+    def test_ac_direct_model_constructor_bypasses_ac_class_initializers(self):
+        import secore.ac_se
+        import ac_model
+
+        patched_classes = (
+            ac_model.ACNode,
+            ac_model.ACBranch,
+            ac_model.ACLoad,
+            ac_model.ACGenerator,
+            ac_model.ACShuntCompensator,
+            ac_model.ACZeroBranch,
+            ac_model.ACSwitch,
+            ac_model.ACTransformer,
+        )
+        originals = {cls: cls.__init__ for cls in patched_classes}
+
+        def reject_init(self, *_args, **_kwargs):
+            raise AssertionError("direct AC constructor should bypass AC class __init__")
+
+        for cls in patched_classes:
+            cls.__init__ = reject_init
+        try:
+            direct = ac_model._build_ac_model_direct(ROOT_DIR / "data" / "ac" / "ieee39.e")
+        finally:
+            for cls, original in originals.items():
+                cls.__init__ = original
+
+        self.assertIsInstance(direct.ACNode[0], ac_model.ACNode)
+        self.assertIsInstance(direct.ACBranch[0], ac_model.ACBranch)
+        self.assertTrue(hasattr(direct.ACBranch[0], "i_node_obj"))
+
+    def test_ac_network_load_uses_direct_ac_constructor_by_default(self):
+        import secore.ac_se
+        import ac_model
+        from secore.ac_se import ACStateEstimator
+
+        original = ac_model._build_ac_model_direct
+        calls = 0
+
+        def counted_factory(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        ac_model._build_ac_model_direct = counted_factory
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            )
+        finally:
+            ac_model._build_ac_model_direct = original
+
+        self.assertEqual(1, calls)
+        self.assertTrue(estimator.nodes)
+
     def test_normalize_model_named_units_reuses_current_base_per_node(self):
         import unit_system
         from efile_read import efile_factory
@@ -390,6 +771,25 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertAlmostEqual(1.0, estimator.measurements[0].value)
 
+    def test_measurement_unit_conversion_bypasses_per_measurement_terminal_dispatch(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+        estimator.measurements = estimator._load_measurements(ROOT_DIR / "data" / "ac" / "ieee39.meas")
+        estimator._disable_angle_measurements()
+        estimator._disable_unavailable_measurements()
+
+        def reject_terminal_scale(*_args, **_kwargs):
+            raise AssertionError("unit conversion should use precomputed terminal scale maps")
+
+        estimator._terminal_measurement_scale = reject_terminal_scale
+        estimator._convert_measurements_to_pu()
+
+        self.assertTrue(estimator._active_measurement_key_cache)
+
     def test_estimator_skips_separate_unavailable_measurement_scan(self):
         import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
@@ -429,6 +829,33 @@ class ACStateEstimationTest(unittest.TestCase):
             )
         finally:
             ac_se.ACStateEstimator._refresh_measurement_summary_cache = original
+
+        self.assertTrue(estimator.active_measurements)
+
+    def test_pseudo_initialization_reads_summary_cache_without_key_copies(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original_active_devices = ac_se.ACStateEstimator._active_device_keys
+        original_active_measurements = ac_se.ACStateEstimator._active_measurement_keys
+
+        def reject_active_devices(self):
+            raise AssertionError("pseudo initialization should read the cached key set directly")
+
+        def reject_active_measurements(self):
+            raise AssertionError("pseudo initialization should read the cached key set directly")
+
+        ac_se.ACStateEstimator._active_device_keys = reject_active_devices
+        ac_se.ACStateEstimator._active_measurement_keys = reject_active_measurements
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+        finally:
+            ac_se.ACStateEstimator._active_device_keys = original_active_devices
+            ac_se.ACStateEstimator._active_measurement_keys = original_active_measurements
 
         self.assertTrue(estimator.active_measurements)
 
@@ -1225,6 +1652,28 @@ class ACStateEstimationTest(unittest.TestCase):
 
             self.assertIs(expected_plan, plan)
 
+    def test_active_measurement_plan_template_reused_across_estimators(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        ac_se._ACTIVE_PLAN_TEMPLATE_CACHE.clear()
+        first = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+        second = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+
+        self.assertFalse(first.active_plan_template_hit)
+        self.assertTrue(second.active_plan_template_hit)
+        self.assertIs(
+            first._active_branch_transformer_vector_plan,
+            second._active_branch_transformer_vector_plan,
+        )
+        np.testing.assert_allclose(first.evaluate(first.initial_state()), second.evaluate(second.initial_state()))
+
     def test_active_measurement_summary_reuses_initialization_cache(self):
         from secore.ac_se import ACStateEstimator
 
@@ -1359,10 +1808,10 @@ class ACStateEstimationTest(unittest.TestCase):
         original = ac_se.build_normal_equations
         non_unit_weight_seen = False
 
-        def counted_builder(H, residual, weight):
+        def counted_builder(H, residual, weight, **kwargs):
             nonlocal non_unit_weight_seen
             non_unit_weight_seen = bool(np.any(weight != 1.0))
-            return original(H, residual, weight)
+            return original(H, residual, weight, **kwargs)
 
         ac_se.build_normal_equations = counted_builder
         try:
@@ -1372,6 +1821,58 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(result.converged)
         self.assertTrue(non_unit_weight_seen)
+
+    def test_main_skip_bad_data_skips_post_estimation_bad_data_analysis(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original_identify = ACStateEstimator.identify_bad_data
+
+        def reject_identify(*_args, **_kwargs):
+            raise AssertionError("--skip-bad-data should bypass identify_bad_data")
+
+        ACStateEstimator.identify_bad_data = reject_identify
+        try:
+            rc = ac_se.main(
+                [
+                    "--case",
+                    str(ROOT_DIR / "data" / "ac" / "ieee39.e"),
+                    "--meas",
+                    str(ROOT_DIR / "data" / "ac" / "ieee39.meas"),
+                    "--para",
+                    str(ROOT_DIR / "se.para"),
+                    "--flat-start",
+                    "--quiet",
+                    "--skip-bad-data",
+                ]
+            )
+        finally:
+            ACStateEstimator.identify_bad_data = original_identify
+
+        self.assertEqual(0, rc)
+
+    def test_estimate_can_skip_final_diagnostic_jacobian_and_gain(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+        )
+        original_jacobian = estimator.jacobian_sparse
+        calls = 0
+
+        def counted_jacobian(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_jacobian(*args, **kwargs)
+
+        estimator.jacobian_sparse = counted_jacobian
+        result = estimator.estimate(final_diagnostics=False)
+
+        self.assertTrue(result.converged)
+        self.assertEqual(result.iterations, calls)
+        self.assertIsNone(result.H)
+        self.assertIsNone(result.gain)
 
     def test_estimate_uses_cholesky_solver_when_available(self):
         import secore.se_math as se_math
@@ -1866,6 +2367,8 @@ class ACStateEstimationTest(unittest.TestCase):
 
         calls = []
         original_splu = se_math.SP_SPLU
+        original_cholmod_analyze = se_math.CHOLMOD_ANALYZE
+        original_cholmod_cholesky = se_math.CHOLMOD_CHOLESKY
 
         class FakeLU:
             def __init__(self):
@@ -1879,16 +2382,89 @@ class ACStateEstimationTest(unittest.TestCase):
             return FakeLU()
 
         se_math.SP_SPLU = fake_splu
+        se_math.CHOLMOD_ANALYZE = None
+        se_math.CHOLMOD_CHOLESKY = None
         try:
             dx, diag = se_math.solve_normal_equations_with_factor(csc_matrix(np.eye(2)), np.ones(2))
         finally:
             se_math.SP_SPLU = original_splu
+            se_math.CHOLMOD_ANALYZE = original_cholmod_analyze
+            se_math.CHOLMOD_CHOLESKY = original_cholmod_cholesky
 
         self.assertTrue(calls)
         self.assertEqual(0.0, calls[0]["diag_pivot_thresh"])
         self.assertEqual("MMD_AT_PLUS_A", calls[0]["permc_spec"])
         np.testing.assert_allclose(dx, np.ones(2))
         np.testing.assert_allclose(diag, np.ones(2))
+
+    def test_cholmod_solver_reuses_symbolic_analysis_for_same_sparse_pattern(self):
+        from scipy.sparse import csc_matrix
+        import secore.se_math as se_math
+
+        analyze_calls = []
+        numeric_calls = []
+        original_cholmod_analyze = se_math.CHOLMOD_ANALYZE
+        original_cholmod_cholesky = se_math.CHOLMOD_CHOLESKY
+
+        class FakeCholmodFactor:
+            def __init__(self, matrix):
+                self.matrix = matrix
+
+            def cholesky_inplace(self, matrix):
+                numeric_calls.append(matrix.copy())
+                self.matrix = matrix
+
+            def __call__(self, rhs):
+                return np.linalg.solve(self.matrix.toarray(), rhs)
+
+        def fake_analyze(matrix):
+            analyze_calls.append(matrix.copy())
+            return FakeCholmodFactor(matrix)
+
+        se_math.CHOLMOD_ANALYZE = fake_analyze
+        se_math.CHOLMOD_CHOLESKY = None
+        try:
+            solver = se_math.NormalEquationSolver()
+            gain_1 = csc_matrix([[4.0, 1.0], [1.0, 3.0]])
+            gain_2 = csc_matrix([[5.0, 2.0], [2.0, 6.0]])
+            dx_1, _ = solver.solve(gain_1, np.array([1.0, 2.0]))
+            dx_2, _ = solver.solve(gain_2, np.array([3.0, 4.0]))
+        finally:
+            se_math.CHOLMOD_ANALYZE = original_cholmod_analyze
+            se_math.CHOLMOD_CHOLESKY = original_cholmod_cholesky
+
+        self.assertEqual(1, len(analyze_calls))
+        self.assertEqual(2, len(numeric_calls))
+        np.testing.assert_allclose(dx_1, np.linalg.solve(gain_1.toarray(), np.array([1.0, 2.0])))
+        np.testing.assert_allclose(dx_2, np.linalg.solve(gain_2.toarray(), np.array([3.0, 4.0])))
+
+    def test_normal_equation_solver_disables_repeated_failed_cholmod_attempts(self):
+        from scipy.sparse import csc_matrix
+        import secore.se_math as se_math
+
+        original_cholmod_analyze = se_math.CHOLMOD_ANALYZE
+        original_cholmod_cholesky = se_math.CHOLMOD_CHOLESKY
+        calls = 0
+
+        def failing_analyze(_matrix):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("cholmod unavailable for this matrix")
+
+        se_math.CHOLMOD_ANALYZE = failing_analyze
+        se_math.CHOLMOD_CHOLESKY = None
+        try:
+            solver = se_math.NormalEquationSolver()
+            gain = csc_matrix([[4.0, 1.0], [1.0, 3.0]])
+            dx_1, _ = solver.solve(gain, np.array([1.0, 2.0]))
+            dx_2, _ = solver.solve(gain, np.array([3.0, 4.0]))
+        finally:
+            se_math.CHOLMOD_ANALYZE = original_cholmod_analyze
+            se_math.CHOLMOD_CHOLESKY = original_cholmod_cholesky
+
+        self.assertEqual(1, calls)
+        np.testing.assert_allclose(dx_1, np.linalg.solve(gain.toarray(), np.array([1.0, 2.0])))
+        np.testing.assert_allclose(dx_2, np.linalg.solve(gain.toarray(), np.array([3.0, 4.0])))
 
     def test_targeted_pseudo_reuses_observable_rank_result(self):
         from secore.ac_se import ACStateEstimator, ObservabilityResult

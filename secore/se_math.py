@@ -22,6 +22,13 @@ except Exception:
     SP_SPSOLVE = None
 
 try:
+    from sksparse.cholmod import cholesky as CHOLMOD_CHOLESKY
+    from sksparse.cholmod import analyze as CHOLMOD_ANALYZE
+except Exception:
+    CHOLMOD_CHOLESKY = None
+    CHOLMOD_ANALYZE = None
+
+try:
     from scipy.linalg.lapack import dposv as DPOSV
     from scipy.linalg.lapack import dpotrf as DPOTRF
 except Exception:
@@ -53,10 +60,17 @@ def wrap_angle_residual(residual: np.ndarray) -> np.ndarray:
     return (residual + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def measurement_residual(z: np.ndarray, z_est: np.ndarray, angle_mask: np.ndarray = None) -> np.ndarray:
+def measurement_residual(
+    z: np.ndarray,
+    z_est: np.ndarray,
+    angle_mask: np.ndarray = None,
+    has_angle_residuals: Optional[bool] = None,
+) -> np.ndarray:
     """Return z - h(x), wrapping only rows that represent angle measurements."""
     residual = np.asarray(z, dtype=np.float64) - np.asarray(z_est, dtype=np.float64)
-    if angle_mask is not None and np.any(angle_mask):
+    if has_angle_residuals is None:
+        has_angle_residuals = bool(angle_mask is not None and np.any(angle_mask))
+    if has_angle_residuals:
         residual = residual.copy()
         residual[angle_mask] = wrap_angle_residual(residual[angle_mask])
     return residual
@@ -173,7 +187,9 @@ class SparseJacobianBuilder:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
         mask = mask & (values != 0.0)
         if np.any(mask):
-            self._append_arrays(rows[mask], cols[mask], values[mask])
+            self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
+            self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
+            self._data_chunks.append(values[mask].astype(np.float64, copy=False))
 
     def to_csr(self):
         rows, cols, data = self._coo_arrays()
@@ -422,43 +438,114 @@ def solve_normal_equations(gain: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return dx
 
 
-def solve_normal_equations_with_factor(
+class NormalEquationSolver:
+    """Solve repeated normal equations, reusing CHOLMOD symbolic analysis when available."""
+
+    def __init__(self):
+        self._cholmod_factor = None
+        self._cholmod_pattern = None
+        self._cholmod_disabled = False
+
+    @staticmethod
+    def _sparse_pattern(matrix) -> Tuple[Tuple[int, int], int, np.ndarray, np.ndarray]:
+        return (
+            matrix.shape,
+            int(matrix.nnz),
+            matrix.indptr.astype(np.int64, copy=True),
+            matrix.indices.astype(np.int64, copy=True),
+        )
+
+    @staticmethod
+    def _same_sparse_pattern(pattern, matrix) -> bool:
+        if pattern is None:
+            return False
+        shape, nnz, indptr, indices = pattern
+        return (
+            shape == matrix.shape
+            and nnz == int(matrix.nnz)
+            and indptr.shape == matrix.indptr.shape
+            and indices.shape == matrix.indices.shape
+            and np.array_equal(indptr, matrix.indptr)
+            and np.array_equal(indices, matrix.indices)
+        )
+
+    def _solve_sparse_cholmod(self, gain_csc, rhs: np.ndarray):
+        if CHOLMOD_ANALYZE is not None:
+            if not self._same_sparse_pattern(self._cholmod_pattern, gain_csc):
+                self._cholmod_factor = CHOLMOD_ANALYZE(gain_csc)
+                self._cholmod_pattern = self._sparse_pattern(gain_csc)
+            self._cholmod_factor.cholesky_inplace(gain_csc)
+            return self._cholmod_factor(rhs), None
+        if CHOLMOD_CHOLESKY is not None:
+            factor = CHOLMOD_CHOLESKY(gain_csc)
+            return factor(rhs), None
+        raise RuntimeError("CHOLMOD is not available")
+
+    def solve(
+        self,
+        gain: np.ndarray,
+        rhs: np.ndarray,
+        return_factor_diag: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Solve normal equations, preferring sparse SPD Cholesky when available."""
+        if is_sparse_matrix(gain):
+            gain_csc = gain if getattr(gain, "format", None) == "csc" else gain.tocsc()
+            if not self._cholmod_disabled and (CHOLMOD_ANALYZE is not None or CHOLMOD_CHOLESKY is not None):
+                try:
+                    return self._solve_sparse_cholmod(gain_csc, rhs)
+                except Exception:
+                    self._cholmod_factor = None
+                    self._cholmod_pattern = None
+                    self._cholmod_disabled = True
+            return _solve_normal_equations_no_cholmod(gain_csc, rhs, return_factor_diag)
+        return _solve_dense_normal_equations(gain, rhs, return_factor_diag)
+
+
+def _solve_normal_equations_no_cholmod(
+    gain_csc,
+    rhs: np.ndarray,
+    return_factor_diag: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if SP_SPLU is not None:
+        try:
+            lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
+            factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
+            return lu.solve(rhs), factor_diag
+        except Exception:
+            pass
+        try:
+            lu = SP_SPLU(gain_csc)
+            factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
+            return lu.solve(rhs), factor_diag
+        except Exception:
+            pass
+    if SP_SPSOLVE is not None:
+        try:
+            return SP_SPSOLVE(gain_csc, rhs), None
+        except Exception:
+            pass
+    return _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
+
+
+def _solve_dense_normal_equations(
     gain: np.ndarray,
     rhs: np.ndarray,
+    return_factor_diag: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Solve normal equations and return the Cholesky diagonal when available."""
-    if is_sparse_matrix(gain):
-        gain_csc = gain.tocsc()
-        if SP_SPLU is not None:
-            try:
-                lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
-                return lu.solve(rhs), np.abs(lu.U.diagonal())
-            except Exception:
-                pass
-            try:
-                lu = SP_SPLU(gain_csc)
-                return lu.solve(rhs), np.abs(lu.U.diagonal())
-            except Exception:
-                pass
-        if SP_SPSOLVE is not None:
-            try:
-                return SP_SPSOLVE(gain_csc, rhs), None
-            except Exception:
-                pass
-        gain = gain_csc.toarray()
-
     if DPOSV is not None:
         try:
             factor, dx, info = DPOSV(gain, rhs.copy(), lower=True, overwrite_a=False, overwrite_b=True)
             if info == 0:
-                return dx, np.diag(factor).copy()
+                factor_diag = np.diag(factor).copy() if return_factor_diag else None
+                return dx, factor_diag
         except Exception:
             pass
     if CHO_FACTOR is not None and CHO_SOLVE is not None:
         try:
             factor = CHO_FACTOR(gain, lower=True, check_finite=False)
             dx = CHO_SOLVE(factor, rhs, check_finite=False)
-            return dx, np.diag(factor[0]).copy()
+            factor_diag = np.diag(factor[0]).copy() if return_factor_diag else None
+            return dx, factor_diag
         except Exception:
             pass
     try:
@@ -467,17 +554,42 @@ def solve_normal_equations_with_factor(
         return np.linalg.pinv(gain) @ rhs, None
 
 
+def solve_normal_equations_with_factor(
+    gain: np.ndarray,
+    rhs: np.ndarray,
+    return_factor_diag: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Solve normal equations and return the Cholesky diagonal when available."""
+    return NormalEquationSolver().solve(gain, rhs, return_factor_diag=return_factor_diag)
+
+
 def build_normal_equations(
     H: np.ndarray,
     residual: np.ndarray,
     weight: np.ndarray,
     dense_gain_limit: int = 1000,
+    uniform_weight: Optional[float] = None,
+    weights_are_uniform: Optional[bool] = None,
+    weighted_residual: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build WLS normal equations while avoiding WH allocation for uniform weights."""
     if is_sparse_matrix(H):
         if weight.size == 0:
             gain = H.T @ H
             rhs = H.T @ residual
+        elif weights_are_uniform is True or uniform_weight is not None:
+            if uniform_weight is None:
+                uniform_weight = float(weight[0])
+            gain = H.T @ H
+            rhs = H.T @ residual
+            if uniform_weight != 1.0:
+                gain = uniform_weight * gain
+                rhs = uniform_weight * rhs
+        elif weights_are_uniform is False:
+            weighted_residual = weight * residual if weighted_residual is None else weighted_residual
+            weighted_H = H.multiply(weight[:, None])
+            gain = H.T @ weighted_H
+            rhs = H.T @ weighted_residual
         else:
             first_weight = float(weight[0])
             if np.all(weight == first_weight):
@@ -487,9 +599,10 @@ def build_normal_equations(
                     gain = first_weight * gain
                     rhs = first_weight * rhs
             else:
+                weighted_residual = weight * residual if weighted_residual is None else weighted_residual
                 weighted_H = H.multiply(weight[:, None])
                 gain = H.T @ weighted_H
-                rhs = H.T @ (weight * residual)
+                rhs = H.T @ weighted_residual
         if is_sparse_matrix(gain):
             gain = gain.toarray() if gain.shape[0] <= dense_gain_limit else gain.tocsc()
         return gain, np.asarray(rhs, dtype=np.float64).ravel()
@@ -497,6 +610,23 @@ def build_normal_equations(
     if weight.size == 0:
         gain = H.T @ H
         rhs = H.T @ residual
+        return gain, rhs
+
+    if weights_are_uniform is True or uniform_weight is not None:
+        if uniform_weight is None:
+            uniform_weight = float(weight[0])
+        gain = H.T @ H
+        rhs = H.T @ residual
+        if uniform_weight != 1.0:
+            gain = uniform_weight * gain
+            rhs = uniform_weight * rhs
+        return gain, rhs
+
+    if weights_are_uniform is False:
+        weighted_residual = weight * residual if weighted_residual is None else weighted_residual
+        WH = weight[:, None] * H
+        gain = H.T @ WH
+        rhs = H.T @ weighted_residual
         return gain, rhs
 
     first_weight = float(weight[0])
@@ -510,5 +640,6 @@ def build_normal_equations(
 
     WH = weight[:, None] * H
     gain = H.T @ WH
-    rhs = H.T @ (weight * residual)
+    weighted_residual = weight * residual if weighted_residual is None else weighted_residual
+    rhs = H.T @ weighted_residual
     return gain, rhs

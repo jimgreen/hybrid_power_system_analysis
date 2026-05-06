@@ -6,7 +6,9 @@ from pathlib import Path
 
 _QUOTED_SPLIT_RE = re.compile(r"\s+(?=(?:[^']*'[^']*')*[^']*$)")
 _CLASS_CACHE = {}
+_ROW_CLASS_CACHE = {}
 _EFILE_CACHE = {}
+_EFILE_ROW_CACHE = {}
 _EFILE_CACHE_LOCK = threading.Lock()
 
 
@@ -223,13 +225,82 @@ def read_efile_dict_cached(file_path, use_cache=True):
     return data
 
 
+def read_efile_rows_cached(file_path, use_cache=True):
+    """Read an E file as raw header/row token lists and reuse the parse while unchanged."""
+    if not use_cache:
+        return _read_efile_rows(file_path)
+    key = _efile_cache_key(file_path)
+    path = key[0]
+    with _EFILE_CACHE_LOCK:
+        cached = _EFILE_ROW_CACHE.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+    data = _read_efile_rows(path)
+    with _EFILE_CACHE_LOCK:
+        _EFILE_ROW_CACHE[path] = (key, data)
+    return data
+
+
+def _read_efile_rows(file_path):
+    data = {}
+    block_name = None
+    header = None
+    rows = None
+    split_data_row = _split_data_row
+
+    def finish_block():
+        if block_name is None:
+            return
+        table_name = block_name
+        lv = 0
+        if " lv " in block_name:
+            key_list = block_name.split(" lv ")
+            table_name = key_list[0]
+            lv = int(key_list[1].strip().split("=")[1])
+        data[table_name] = {
+            "table_name": table_name,
+            "header_list": header or [],
+            "rows": rows or [],
+            "lv": lv,
+        }
+
+    with open(file_path, mode="rt", encoding="utf8") as fp:
+        for idx, line in enumerate(fp):
+            line = line.strip()
+            if not line:
+                continue
+            first = line[0]
+            if first == "<":
+                if line.startswith("</"):
+                    finish_block()
+                    block_name = header = rows = None
+                    continue
+                block_name = line[1:-1]
+                header = []
+                rows = []
+            elif first == "@":
+                if block_name is None:
+                    raise SyntaxError(f"Header outside block at line {idx + 1} in {file_path}")
+                header = line[1:].split()
+            elif first == "#":
+                if block_name is None:
+                    raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
+                rows.append(split_data_row(line[1:]))
+            else:
+                raise SyntaxError(f"Invalid row at line {idx + 1} {line} in {file_path}")
+    return data
+
+
 def clear_efile_cache(file_path=None):
     """Clear all cached E parses, or just one file when a path is supplied."""
     with _EFILE_CACHE_LOCK:
         if file_path is None:
             _EFILE_CACHE.clear()
+            _EFILE_ROW_CACHE.clear()
         else:
-            _EFILE_CACHE.pop(Path(file_path).resolve(), None)
+            path = Path(file_path).resolve()
+            _EFILE_CACHE.pop(path, None)
+            _EFILE_ROW_CACHE.pop(path, None)
 
 
 class _Base:
@@ -309,27 +380,135 @@ def _class_factory(class_name, attrs, converters=None):
     return cls
 
 
+def _row_class_factory(class_name, attrs, converters=None):
+    if not class_name:
+        raise ValueError("Row data must contain a table name")
+    if converters is None:
+        converters = tuple(_convert_cell for _ in attrs)
+    else:
+        converters = tuple(converters)
+    key = (class_name, tuple(attrs), tuple(id(converter) for converter in converters))
+    cached = _ROW_CLASS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    init_globals = {}
+    init_lines = [
+        "def __init__(self, row):",
+        "    values = self.__dict__",
+    ]
+    for idx, (attr, convert) in enumerate(zip(attrs, converters)):
+        source_expr = f"row[{idx}]"
+        if convert is _identity_cell:
+            init_lines.append(f"    values[{attr!r}] = {source_expr}")
+        elif convert is _safe_int_cell:
+            value_name = f"_value_{idx}"
+            init_lines.extend(
+                [
+                    f"    {value_name} = {source_expr}",
+                    f"    if isinstance({value_name}, str):",
+                    "        try:",
+                    f"            values[{attr!r}] = int({value_name})",
+                    "        except ValueError:",
+                    "            try:",
+                    f"                values[{attr!r}] = float({value_name})",
+                    "            except ValueError:",
+                    f"                values[{attr!r}] = {value_name}",
+                    "    else:",
+                    f"        values[{attr!r}] = {value_name}",
+                ]
+            )
+        elif convert is _safe_float_cell:
+            value_name = f"_value_{idx}"
+            init_lines.extend(
+                [
+                    f"    {value_name} = {source_expr}",
+                    f"    if isinstance({value_name}, str):",
+                    "        try:",
+                    f"            values[{attr!r}] = float({value_name})",
+                    "        except ValueError:",
+                    f"            values[{attr!r}] = {value_name}",
+                    "    else:",
+                    f"        values[{attr!r}] = {value_name}",
+                ]
+            )
+        else:
+            converter_name = f"_converter_{idx}"
+            init_globals[converter_name] = convert
+            init_lines.append(f"    values[{attr!r}] = {converter_name}({source_expr})")
+    exec("\n".join(init_lines), init_globals)
+    attributes = {attr: None for attr in attrs}
+    attributes["__init__"] = init_globals["__init__"]
+    cls = type(class_name, (_Base,), attributes)
+    _ROW_CLASS_CACHE[key] = cls
+    return cls
+
+
+def _infer_row_converters(header, rows):
+    converters = [None] * len(header)
+    unresolved = len(header)
+    if unresolved:
+        for row in rows:
+            for idx, sample in enumerate(row[: len(header)]):
+                if converters[idx] is not None or sample == "":
+                    continue
+                kind = _numeric_cell_kind(sample)
+                if kind is float:
+                    converters[idx] = _safe_float_cell
+                elif kind is int:
+                    converters[idx] = _safe_int_cell
+                else:
+                    converters[idx] = _identity_cell
+                unresolved -= 1
+            if unresolved == 0:
+                break
+    return [_identity_cell if converter is None else converter for converter in converters]
+
+
+def efile_factory_from_rows(data):
+    """Build model objects from raw row tokens, bypassing EBook row dictionaries."""
+    new_cls_dict = _Base()
+    for key, value in data.items():
+        header = value["header_list"]
+        rows = value["rows"]
+        converters = _infer_row_converters(header, rows)
+        Class_Def = _row_class_factory(key, header, converters)
+        setattr(new_cls_dict, key, [Class_Def(item) for item in rows])
+        if "lv" in value:
+            setattr(new_cls_dict, f"{key}_lv", value["lv"])
+    return new_cls_dict
+
+
+def efile_factory_from_file_cached(file_path, use_cache=True):
+    return efile_factory_from_rows(read_efile_rows_cached(file_path, use_cache=use_cache))
+
+
 def efile_factory(data):
     new_cls_dict = _Base()
     for key, value in data.items():
         header = value['header_list']
         rows = value["data"]
-        converters = []
-        for attr in header:
-            converter = None
+        converters = [None] * len(header)
+        unresolved = len(header)
+        if unresolved:
             for item in rows:
-                sample = item.get(attr, "")
-                if sample == "":
-                    continue
-                kind = _numeric_cell_kind(sample)
-                if kind is float:
-                    converter = _safe_float_cell
-                elif kind is int:
-                    converter = _safe_int_cell
-                else:
-                    converter = _identity_cell
-                break
-            converters.append(_identity_cell if converter is None else converter)
+                for idx, attr in enumerate(header):
+                    if converters[idx] is not None:
+                        continue
+                    sample = item.get(attr, "")
+                    if sample == "":
+                        continue
+                    kind = _numeric_cell_kind(sample)
+                    if kind is float:
+                        converters[idx] = _safe_float_cell
+                    elif kind is int:
+                        converters[idx] = _safe_int_cell
+                    else:
+                        converters[idx] = _identity_cell
+                    unresolved -= 1
+                if unresolved == 0:
+                    break
+        converters = [_identity_cell if converter is None else converter for converter in converters]
         Class_Def = _class_factory(key, header, converters)
         setattr(new_cls_dict, key, [Class_Def(item) for item in rows])
 

@@ -1,3 +1,16 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+
+_TOPO_TEMPLATE_CACHE = {}
+
+
+def _file_cache_key(file_name):
+    path = Path(file_name).resolve()
+    stat = path.stat()
+    return path, int(stat.st_mtime_ns), int(stat.st_size)
+
+
 class ACIsl:
     def __init__(self, idx, is_alive):
         self.idx = idx
@@ -136,8 +149,346 @@ class ACTransformer:
         self.j_q = None
         self.j_c = None
 
-from efile_read import efile_factory, read_efile_dict_cached
+from efile_read import efile_factory_from_file_cached, efile_factory_from_rows, read_efile_rows_cached
 from unit_system import normalize_model_named_units
+
+
+_AC_DIRECT_TABLES = {
+    "PowerBase",
+    "ACNode",
+    "ACBranch",
+    "ACLoad",
+    "ACGenerator",
+    "ACShuntCompensator",
+    "ACZeroBranch",
+    "ACSwitch",
+    "ACTransformer",
+}
+
+
+def _to_int(value, default=0):
+    return default if value == "" else int(value)
+
+
+def _to_float(value, default=0.0):
+    return default if value == "" else float(value)
+
+
+def _row_dict(header, row):
+    return {name: row[idx] if idx < len(row) else "" for idx, name in enumerate(header)}
+
+
+def _set_present_attrs(obj, values):
+    for key, value in values.items():
+        if value == "":
+            setattr(obj, key, value)
+            continue
+        try:
+            parsed = int(value)
+        except ValueError:
+            try:
+                parsed = float(value)
+            except ValueError:
+                parsed = value
+        setattr(obj, key, parsed)
+    return obj
+
+
+def _parse_direct_cell(value):
+    if value == "":
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def _header_index(header, name):
+    try:
+        return header.index(name)
+    except ValueError:
+        return None
+
+
+def _int_arg(header, name, default=0):
+    idx = _header_index(header, name)
+    return repr(default) if idx is None else f"_to_int(row[{idx}], {default!r})"
+
+
+def _float_arg(header, name, default=0.0):
+    idx = _header_index(header, name)
+    return repr(default) if idx is None else f"_to_float(row[{idx}], {default!r})"
+
+
+def _str_arg(header, name, default=""):
+    idx = _header_index(header, name)
+    return repr(default) if idx is None else f"row[{idx}]"
+
+
+def _header_attr_lines(header):
+    lines = ["        values = obj.__dict__"]
+    for idx, attr in enumerate(header):
+        lines.append(f"        values[{attr!r}] = _parse_direct_cell(row[{idx}])")
+    return lines
+
+
+_AC_DIRECT_BUILDER_CACHE = {}
+
+
+_AC_DIRECT_CLASS_BY_TABLE = {
+    "ACNode": ACNode,
+    "ACBranch": ACBranch,
+    "ACLoad": ACLoad,
+    "ACGenerator": ACGenerator,
+    "ACShuntCompensator": ACShuntCompensator,
+    "ACZeroBranch": ACZeroBranch,
+    "ACSwitch": ACSwitch,
+    "ACTransformer": ACTransformer,
+}
+
+
+_AC_DIRECT_DEFAULT_ATTRS = {
+    "ACNode": {
+        "idx": 0,
+        "name": "",
+        "vbase": 0.0,
+        "voltage": 1.0,
+        "angle": 0.0,
+        "isl": 0,
+        "run_stat": 1,
+        "isl_obj": None,
+    },
+    "ACBranch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "r": 0.0,
+        "x": 0.0,
+        "b": 0.0,
+        "run_stat": 1,
+        "i_p": None,
+        "i_q": None,
+        "i_c": None,
+        "j_p": None,
+        "j_q": None,
+        "j_c": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "ACLoad": {
+        "idx": 0,
+        "name": "",
+        "node": 0,
+        "pv0": 0.0,
+        "pv1": 0.0,
+        "pv2": 0.0,
+        "qv0": 0.0,
+        "qv1": 0.0,
+        "qv2": 0.0,
+        "run_stat": 1,
+        "p": None,
+        "q": None,
+        "current": None,
+        "node_obj": None,
+    },
+    "ACGenerator": {
+        "idx": 0,
+        "name": "",
+        "node": 0,
+        "control_type": "",
+        "p_set": 0.0,
+        "q_set": 0.0,
+        "v_set": 1.0,
+        "alpha": None,
+        "run_stat": 1,
+        "p": None,
+        "q": None,
+        "current": None,
+        "node_obj": None,
+    },
+    "ACShuntCompensator": {
+        "idx": 0,
+        "name": "",
+        "node": 0,
+        "control_type": "Q",
+        "q_set": 0.0,
+        "g_set": 0.0,
+        "b_set": 0.0,
+        "v_set": 1.0,
+        "run_stat": 1,
+        "p": None,
+        "q": None,
+        "current": None,
+        "is_alive": False,
+        "node_obj": None,
+    },
+    "ACZeroBranch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "run_stat": 1,
+        "p": None,
+        "q": None,
+        "current": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "ACSwitch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "status": 1,
+        "run_stat": 1,
+        "p": None,
+        "q": None,
+        "current": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "ACTransformer": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "r": 0.0,
+        "x": 0.0,
+        "b": 0.0,
+        "tap": 1.0,
+        "shift": 0.0,
+        "run_stat": 1,
+        "is_alive": True,
+        "current": None,
+        "i_p": None,
+        "i_q": None,
+        "i_c": None,
+        "j_p": None,
+        "j_q": None,
+        "j_c": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+}
+
+
+_AC_DIRECT_INT_ATTRS = frozenset(("idx", "i_node", "j_node", "node", "isl", "run_stat", "status"))
+_AC_DIRECT_FLOAT_ATTRS = frozenset(
+    (
+        "vbase",
+        "voltage",
+        "angle",
+        "r",
+        "x",
+        "b",
+        "tap",
+        "shift",
+        "pv0",
+        "pv1",
+        "pv2",
+        "qv0",
+        "qv1",
+        "qv2",
+        "p",
+        "q",
+        "current",
+        "i_p",
+        "i_q",
+        "i_c",
+        "j_p",
+        "j_q",
+        "j_c",
+        "p_set",
+        "q_set",
+        "v_set",
+        "alpha",
+        "q_set",
+        "g_set",
+        "b_set",
+        "p_base",
+        "u_scale",
+        "p_scale",
+        "i_scale",
+    )
+)
+
+
+def _direct_cell_assignment(attr, idx):
+    value_expr = f"row[{idx}]"
+    if attr in _AC_DIRECT_INT_ATTRS:
+        return f"        values[{attr!r}] = {value_expr} if {value_expr} == '' else int({value_expr})"
+    if attr in _AC_DIRECT_FLOAT_ATTRS:
+        return f"        values[{attr!r}] = {value_expr} if {value_expr} == '' else float({value_expr})"
+    return f"        values[{attr!r}] = {value_expr}"
+
+
+def _generated_direct_row_lines(table_name, header):
+    if table_name == "PowerBase":
+        lines = ["        obj = SimpleNamespace()", "        values = obj.__dict__"]
+    else:
+        lines = [
+            "        obj = new_row(row_cls)",
+            "        values = obj.__dict__",
+        ]
+    assigned = set()
+    for idx, attr in enumerate(header):
+        assigned.add(attr)
+        lines.append(_direct_cell_assignment(attr, idx))
+    for attr, default in _AC_DIRECT_DEFAULT_ATTRS.get(table_name, {}).items():
+        if attr not in assigned:
+            lines.append(f"        values[{attr!r}] = {default!r}")
+    return lines
+
+
+def _generated_ac_table_builder(table_name, header):
+    key = (table_name, tuple(header))
+    cached = _AC_DIRECT_BUILDER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if table_name != "PowerBase" and table_name not in _AC_DIRECT_CLASS_BY_TABLE:
+        raise ValueError(f"Unsupported direct AC table: {table_name}")
+
+    lines = [
+        "def build(rows, row_cls=None):",
+        "    output = []",
+        "    append = output.append",
+        "    new_row = None if row_cls is None else row_cls.__new__",
+        "    for row in rows:",
+        *_generated_direct_row_lines(table_name, header),
+        "        append(obj)",
+        "    return output",
+    ]
+    namespace = globals().copy()
+    exec("\n".join(lines), namespace)
+    generated = namespace["build"]
+    row_cls = _AC_DIRECT_CLASS_BY_TABLE.get(table_name)
+
+    def builder(rows):
+        return generated(rows, row_cls)
+
+    _AC_DIRECT_BUILDER_CACHE[key] = builder
+    return builder
+
+
+def _build_ac_model_direct(file_name):
+    data = read_efile_rows_cached(file_name)
+    fallback_tables = {key: value for key, value in data.items() if key not in _AC_DIRECT_TABLES}
+    fallback = efile_factory_from_rows(fallback_tables) if fallback_tables else SimpleNamespace()
+    model = fallback
+
+    for table_name in _AC_DIRECT_TABLES:
+        table = data.get(table_name, {})
+        header = table.get("header_list", [])
+        rows = table.get("rows", [])
+        builder = _generated_ac_table_builder(table_name, header)
+        setattr(model, table_name, builder(rows))
+
+    return model
 
 class ACPowerNetwork:
     def __init__(self):
@@ -196,7 +547,8 @@ class ACPowerNetwork:
         return trfm
 
     def read_from_file(self, file_name):
-        self.model = efile_factory(read_efile_dict_cached(file_name))
+        self._topo_cache_key = _file_cache_key(file_name)
+        self.model = _build_ac_model_direct(file_name)
         self.p_base = normalize_model_named_units(self.model)
         self.p_base_kW = float(self.model.p_base_kW)
         self.u_scale = float(self.model.u_scale)
@@ -297,15 +649,37 @@ class ACPowerNetwork:
         if len(self.node_dict) == 0:
             self.format_assoc()
 
+        cache_key = getattr(self, "_topo_cache_key", None)
+        if cache_key is not None:
+            cached = _TOPO_TEMPLATE_CACHE.get(cache_key[0])
+            if cached is not None and cached[0] == cache_key:
+                self._install_topo_template(cached[1])
+                return
+
         # 重置所有节点的拓扑岛号为0
         for node in self.nodes:
             node.isl = 0
             node.isl_obj = None
 
-        # 构建邻接表，停运节点不生成拓扑岛；用节点 idx 做键比对象 set 更轻量。
         running_nodes = [node for node in self.nodes if node.run_stat == 1]
         running_node_ids = {node.idx for node in running_nodes}
-        adj = {node.idx: [] for node in running_nodes}
+        parent = {node.idx: node.idx for node in running_nodes}
+
+        def find(node_idx):
+            root = node_idx
+            while parent[root] != root:
+                root = parent[root]
+            while parent[node_idx] != node_idx:
+                next_idx = parent[node_idx]
+                parent[node_idx] = root
+                node_idx = next_idx
+            return root
+
+        def union(left, right):
+            root_l = find(left)
+            root_r = find(right)
+            if root_l != root_r:
+                parent[root_r] = root_l
 
         def add_edge(dev):
             if (
@@ -314,8 +688,7 @@ class ACPowerNetwork:
                 and dev.j_node in running_node_ids
                 and dev.i_node != dev.j_node
             ):
-                adj[dev.i_node].append(dev.j_node)
-                adj[dev.j_node].append(dev.i_node)
+                union(dev.i_node, dev.j_node)
 
         # 添加普通支路（branches）
         for dev in self.branches:
@@ -337,28 +710,131 @@ class ACPowerNetwork:
         self.islands = []
 
         island_idx = 0
-        # 深度优先遍历所有节点
+        root_to_island = {}
         for node in running_nodes:
-            if node.isl == 0:  # 未访问节点，开始新岛
+            root = find(node.idx)
+            island = root_to_island.get(root)
+            if island is None:
                 island_idx += 1
-                # 创建新的拓扑岛对象，默认is_alive为True（后续可根据岛内设备修正）
                 island = ACIsl(island_idx, True)
+                root_to_island[root] = island
                 self.islands.append(island)
-
-                # 使用栈进行DFS
-                stack = [node.idx]
-                node.isl = island_idx
-                node.isl_obj = island
-                while stack:
-                    cur_node_idx = stack.pop()
-                    for next_node_idx in adj[cur_node_idx]:
-                        next_node = self.node_dict[next_node_idx]
-                        if next_node.isl == 0:
-                            next_node.isl = island_idx
-                            next_node.isl_obj = island
-                            stack.append(next_node_idx)
+            node.isl = island.idx
+            node.isl_obj = island
 
         self.det_isl_alive_stat()
+        if cache_key is not None:
+            if len(_TOPO_TEMPLATE_CACHE) > 16:
+                _TOPO_TEMPLATE_CACHE.clear()
+            _TOPO_TEMPLATE_CACHE[cache_key[0]] = (cache_key, self._topo_template())
+
+    def _topo_template(self):
+        island_by_obj = {id(isl): pos for pos, isl in enumerate(self.islands)}
+        generator_index_by_obj = {id(gen): pos for pos, gen in enumerate(self.generators)}
+        node_island_pos = []
+        node_v_gens = []
+        for node in self.nodes:
+            node_island_pos.append(island_by_obj.get(id(node.isl_obj), -1))
+            node_v_gens.append(tuple(generator_index_by_obj[id(gen)] for gen in getattr(node, "v_gens", ())))
+
+        def positions(items, source):
+            index_by_obj = {id(item): pos for pos, item in enumerate(source)}
+            return tuple(index_by_obj[id(item)] for item in items)
+
+        islands = []
+        for isl in self.islands:
+            islands.append(
+                (
+                    int(isl.idx),
+                    bool(isl.is_alive),
+                    positions(isl.nodes, self.nodes),
+                    positions(isl.gens, self.generators),
+                    positions(isl.loads, self.loads),
+                    positions(isl.branches, self.branches),
+                    positions(isl.zero_branches, self.zero_branches),
+                    positions(isl.switches, self.switches),
+                    positions(isl.transformers, self.transformers),
+                    positions(isl.shunt_compensators, self.shunt_compensators),
+                    positions(isl.slack_nodes, self.nodes),
+                    positions(isl.v_gens, self.generators),
+                )
+            )
+
+        return (
+            tuple(islands),
+            tuple(node_island_pos),
+            tuple(bool(getattr(node, "is_alive", False)) for node in self.nodes),
+            tuple(tuple(items) for items in node_v_gens),
+            tuple(bool(getattr(load, "is_alive", False)) for load in self.loads),
+            tuple(bool(getattr(gen, "is_alive", False)) for gen in self.generators),
+            tuple(bool(getattr(scp, "is_alive", False)) for scp in self.shunt_compensators),
+            tuple(bool(getattr(br, "is_alive", False)) for br in self.branches),
+            tuple(bool(getattr(trfm, "is_alive", False)) for trfm in self.transformers),
+            tuple(bool(getattr(zbr, "is_alive", False)) for zbr in self.zero_branches),
+            tuple(bool(getattr(sw, "is_alive", False)) for sw in self.switches),
+        )
+
+    def _install_topo_template(self, template):
+        (
+            island_templates,
+            node_island_pos,
+            node_alive,
+            node_v_gens,
+            load_alive,
+            gen_alive,
+            shunt_alive,
+            branch_alive,
+            transformer_alive,
+            zero_branch_alive,
+            switch_alive,
+        ) = template
+
+        self.islands = [ACIsl(idx, is_alive) for idx, is_alive, *_rest in island_templates]
+        for island, island_template in zip(self.islands, island_templates):
+            (
+                _idx,
+                is_alive,
+                node_positions,
+                gen_positions,
+                load_positions,
+                branch_positions,
+                zero_branch_positions,
+                switch_positions,
+                transformer_positions,
+                shunt_positions,
+                slack_positions,
+                v_gen_positions,
+            ) = island_template
+            island.is_alive = is_alive
+            island.nodes = [self.nodes[pos] for pos in node_positions]
+            island.gens = [self.generators[pos] for pos in gen_positions]
+            island.loads = [self.loads[pos] for pos in load_positions]
+            island.branches = [self.branches[pos] for pos in branch_positions]
+            island.zero_branches = [self.zero_branches[pos] for pos in zero_branch_positions]
+            island.switches = [self.switches[pos] for pos in switch_positions]
+            island.transformers = [self.transformers[pos] for pos in transformer_positions]
+            island.shunt_compensators = [self.shunt_compensators[pos] for pos in shunt_positions]
+            island.slack_nodes = [self.nodes[pos] for pos in slack_positions]
+            island.v_gens = [self.generators[pos] for pos in v_gen_positions]
+
+        for pos, node in enumerate(self.nodes):
+            island_pos = node_island_pos[pos]
+            node.isl_obj = self.islands[island_pos] if island_pos >= 0 else None
+            node.isl = node.isl_obj.idx if node.isl_obj is not None else 0
+            node.is_alive = node_alive[pos]
+            node.v_gens = [self.generators[gen_pos] for gen_pos in node_v_gens[pos]]
+
+        for items, alive_flags in (
+            (self.loads, load_alive),
+            (self.generators, gen_alive),
+            (self.shunt_compensators, shunt_alive),
+            (self.branches, branch_alive),
+            (self.transformers, transformer_alive),
+            (self.zero_branches, zero_branch_alive),
+            (self.switches, switch_alive),
+        ):
+            for item, is_alive in zip(items, alive_flags):
+                item.is_alive = is_alive
 
     def det_isl_alive_stat(self):
 
