@@ -134,11 +134,11 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
             if first == "#":
                 if header is None or column_index is None:
                     raise RuntimeError(f"{file_name} Measurement data appears before the header")
-                row = raw_line[1:].split()
-                if len(row) < header_len:
-                    raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
                 if standard_header:
-                    idx_text, name, device_type, device_name, meas_type, weight_text, valid_text, value_text = row[:8]
+                    row = raw_line.split()
+                    if len(row) < header_len + 1:
+                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
+                    idx_text, name, device_type, device_name, meas_type, weight_text, valid_text, value_text = row[1:9]
                     if meas_type and "a" <= meas_type[0] <= "z":
                         meas_type = meas_type.upper()
                     idx = int_cell(idx_text)
@@ -146,6 +146,9 @@ def _read_measurements_direct(file_name: Path, measurement_cls):
                     valid = valid_text == "1"
                     value = float_cell(value_text)
                 else:
+                    row = raw_line[1:].split()
+                    if len(row) < header_len:
+                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
                     raw_device_type = row[dev_type_col]
                     device_type = device_type_cache.get(raw_device_type)
                     if device_type is None:

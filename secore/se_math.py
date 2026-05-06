@@ -108,7 +108,12 @@ class SparseJacobianBuilder:
         cols = np.asarray(cols, dtype=np.int32)
         values = np.asarray(values, dtype=np.float64)
         mask = cols >= 0
-        if not np.any(mask):
+        if not mask.any():
+            return
+        if mask.all():
+            self._row_chunks.append(rows)
+            self._col_chunks.append(cols)
+            self._data_chunks.append(values)
             return
         self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
         self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
@@ -191,7 +196,12 @@ class SparseJacobianBuilder:
             mask = cols >= 0
         else:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
-        if np.any(mask):
+        if mask.any():
+            if mask.all():
+                self._row_chunks.append(rows)
+                self._col_chunks.append(cols)
+                self._data_chunks.append(values)
+                return
             self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
             self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
             self._data_chunks.append(values[mask].astype(np.float64, copy=False))
