@@ -105,6 +105,17 @@ from ac_array_model import (
 )
 
 
+class _PPCNode:
+    __slots__ = ("idx", "name", "vbase", "voltage", "angle")
+
+    def __init__(self, idx, name, vbase, voltage, angle):
+        self.idx = idx
+        self.name = name
+        self.vbase = vbase
+        self.voltage = voltage
+        self.angle = angle
+
+
 # ==============================================================================
 # 核心工具函数
 # ==============================================================================
@@ -607,7 +618,7 @@ class ACPowerFlowCalc:
 
         bus_names = ppc.get("bus_name", np.asarray([f"bus_{int(idx)}" for idx in bus_ids], dtype=object))
         self.node_list = [
-            SimpleNamespace(
+            _PPCNode(
                 idx=int(bus[row, BUS_COLS["idx"]]),
                 name=str(bus_names[row]),
                 vbase=float(bus[row, BUS_COLS["vbase"]]),
@@ -630,7 +641,6 @@ class ACPowerFlowCalc:
         self._prepare_ppc_y_matrix(branch, transformer, shunt)
         self._prepare_ppc_zero_edges(zero_branch, switch, active_bus)
         self._finalize_prepared_arrays()
-        self._store_ppc_static()
         print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
 
     def _store_ppc_static(self):
@@ -714,7 +724,7 @@ class ACPowerFlowCalc:
         self.active_bus_rows = static["active_bus_rows"]
         self.row_to_pos = static["row_to_pos"]
         self.node_list = [
-            SimpleNamespace(idx=int(idx), name=str(name), vbase=float(vbase), voltage=float(voltage), angle=float(angle))
+            _PPCNode(int(idx), str(name), float(vbase), float(voltage), float(angle))
             for idx, name, vbase, voltage, angle in zip(
                 static["node_idx"],
                 static["node_name"],
