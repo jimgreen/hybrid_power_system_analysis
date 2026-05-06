@@ -1,7 +1,8 @@
 import numpy as np
 try:
     from scipy.sparse import coo_matrix, csr_matrix, diags, hstack, vstack
-    from scipy.sparse.linalg import spsolve
+    from scipy.sparse.csgraph import connected_components
+    from scipy.sparse.linalg import splu, spsolve
     SCIPY_AVAILABLE = True
 except ModuleNotFoundError:
     SCIPY_AVAILABLE = False
@@ -63,12 +64,44 @@ except ModuleNotFoundError:
     coo_matrix = _DenseCSR
     csr_matrix = _DenseCSR
 
+    def connected_components(graph, directed=False, return_labels=True):
+        dense = graph.toarray() if hasattr(graph, "toarray") else np.asarray(graph)
+        n = dense.shape[0]
+        labels = np.full(n, -1, dtype=np.int32)
+        comp = 0
+        for start in range(n):
+            if labels[start] >= 0:
+                continue
+            stack = [start]
+            labels[start] = comp
+            while stack:
+                node = stack.pop()
+                neighbors = np.nonzero(dense[node])[0]
+                if not directed:
+                    neighbors = np.union1d(neighbors, np.nonzero(dense[:, node])[0])
+                for neighbor in neighbors:
+                    if labels[neighbor] < 0:
+                        labels[neighbor] = comp
+                        stack.append(int(neighbor))
+            comp += 1
+        return (comp, labels) if return_labels else comp
+
     def spsolve(matrix, rhs):
         dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
         try:
             return np.linalg.solve(dense, rhs)
         except np.linalg.LinAlgError:
             return np.linalg.lstsq(dense, rhs, rcond=None)[0]
+
+    class _DenseLU:
+        def __init__(self, matrix):
+            self._dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+
+        def solve(self, rhs):
+            return spsolve(_DenseMatrix(self._dense), rhs)
+
+    def splu(matrix):
+        return _DenseLU(matrix)
 
 from collections import deque
 from typing import List, Tuple, Dict, Optional
@@ -220,8 +253,12 @@ class ACPowerFlowCalc:
         island=None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
+        algorithm: str = "nr",
     ):
         # 基础配置
+        algorithm = str(algorithm).strip().lower()
+        if algorithm not in {"nr", "pq"}:
+            raise ValueError(f"Unsupported AC power-flow algorithm: {algorithm!r}")
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -233,6 +270,8 @@ class ACPowerFlowCalc:
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
+        self.algorithm = algorithm
+        self.used_algorithm = algorithm
         self.target_island = island
         self.skipped_islands: List = []
         self.calc_islands: List = []
@@ -345,6 +384,10 @@ class ACPowerFlowCalc:
         self.ppc_shunt_pos = np.array([], dtype=np.int32)
         self.ppc_branch_rows = np.array([], dtype=np.int32)
         self.ppc_transformer_rows = np.array([], dtype=np.int32)
+        self.pq_Bp = None
+        self.pq_Bpp = None
+        self.pq_Bp_factor = None
+        self.pq_Bpp_factor = None
         self.result: Dict = {}
 
     @classmethod
@@ -557,6 +600,8 @@ class ACPowerFlowCalc:
         static = ppc.get("_pf_static")
         if static is not None:
             self._load_ppc_static(static)
+            if self.algorithm == "pq" and self.pq_Bp is None:
+                self._cache_pq_decoupled_matrices()
             print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
             return
 
@@ -575,20 +620,10 @@ class ACPowerFlowCalc:
         self._ppc_node_row_by_id = {} if self._ppc_sequential_node_ids else {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
         running_bus = bus[:, BUS_COLS["run_stat"]] == 1
 
-        parent = np.arange(n_bus_all, dtype=np.int32)
+        edge_i_parts = []
+        edge_j_parts = []
 
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return int(x)
-
-        def union(a: int, b: int) -> None:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[rb] = ra
-
-        def union_device_edges(dev_array, cols, require_closed=False):
+        def collect_device_edges(dev_array, cols, require_closed=False):
             if dev_array.size == 0:
                 return
             i_rows = self._ppc_node_rows(dev_array[:, cols["i_node"]])
@@ -596,26 +631,32 @@ class ACPowerFlowCalc:
             mask = (dev_array[:, cols["run_stat"]] == 1) & running_bus[i_rows] & running_bus[j_rows] & (i_rows != j_rows)
             if require_closed:
                 mask &= dev_array[:, cols["status"]] == 1
-            for i_row, j_row in zip(i_rows[mask], j_rows[mask]):
-                union(int(i_row), int(j_row))
+            if np.any(mask):
+                edge_i_parts.append(i_rows[mask])
+                edge_j_parts.append(j_rows[mask])
 
-        union_device_edges(branch, BRANCH_COLS)
-        union_device_edges(transformer, TRANSFORMER_COLS)
-        union_device_edges(zero_branch, ZERO_BRANCH_COLS)
-        union_device_edges(switch, SWITCH_COLS, require_closed=True)
+        collect_device_edges(branch, BRANCH_COLS)
+        collect_device_edges(transformer, TRANSFORMER_COLS)
+        collect_device_edges(zero_branch, ZERO_BRANCH_COLS)
+        collect_device_edges(switch, SWITCH_COLS, require_closed=True)
 
-        comp_has_slack = {}
+        if edge_i_parts:
+            graph_rows = np.concatenate(edge_i_parts + edge_j_parts).astype(np.int32, copy=False)
+            graph_cols = np.concatenate(edge_j_parts + edge_i_parts).astype(np.int32, copy=False)
+            graph_data = np.ones(graph_rows.size, dtype=np.int8)
+            graph = coo_matrix((graph_data, (graph_rows, graph_cols)), shape=(n_bus_all, n_bus_all)).tocsr()
+            _, comp_labels = connected_components(graph, directed=False, return_labels=True)
+        else:
+            comp_labels = np.arange(n_bus_all, dtype=np.int32)
+
+        slack_components = np.array([], dtype=comp_labels.dtype)
         if gen.size:
             gen_rows = self._ppc_node_rows(gen[:, GEN_COLS["node"]])
             gen_live = (gen[:, GEN_COLS["run_stat"]] == 1) & running_bus[gen_rows]
             slack_live = gen_live & (gen[:, GEN_COLS["control_type"]] == CTRL_SLACK)
-            for node_row in gen_rows[slack_live]:
-                comp_has_slack[find(int(node_row))] = True
+            slack_components = np.unique(comp_labels[gen_rows[slack_live]])
 
-        active_bus = np.zeros(n_bus_all, dtype=bool)
-        for row_idx in np.where(running_bus)[0]:
-            if comp_has_slack.get(find(int(row_idx)), False):
-                active_bus[row_idx] = True
+        active_bus = running_bus & np.isin(comp_labels, slack_components)
         if not np.any(active_bus):
             raise RuntimeError("电网中无带平衡节点的存活拓扑岛，无法进行潮流计算")
 
@@ -711,6 +752,27 @@ class ACPowerFlowCalc:
             "Y_jac_cols": self.Y_jac_cols,
             "Y_jac_data": self.Y_jac_data,
             "Y_jac_diag": self.Y_jac_diag,
+            "Y_jac_diag_idx": self.Y_jac_diag_idx,
+            "Y_jac_diag_nodes": self.Y_jac_diag_nodes,
+            "Y_jac_diag_g": self.Y_jac_diag_g,
+            "Y_jac_diag_b": self.Y_jac_diag_b,
+            "standard_jac_rows": self.standard_jac_rows,
+            "standard_jac_cols": self.standard_jac_cols,
+            "standard_jac_data": self.standard_jac_data,
+            "std_jac_p_theta_idx": self.std_jac_p_theta_idx,
+            "std_jac_p_vm_idx": self.std_jac_p_vm_idx,
+            "std_jac_q_theta_idx": self.std_jac_q_theta_idx,
+            "std_jac_q_vm_idx": self.std_jac_q_vm_idx,
+            "std_jac_p_theta_slice": self.std_jac_p_theta_slice,
+            "std_jac_p_vm_slice": self.std_jac_p_vm_slice,
+            "std_jac_q_theta_slice": self.std_jac_q_theta_slice,
+            "std_jac_q_vm_slice": self.std_jac_q_vm_slice,
+            "std_jac_load_p_slice": self.std_jac_load_p_slice,
+            "std_jac_load_q_slice": self.std_jac_load_q_slice,
+            "pq_Bp": self.pq_Bp,
+            "pq_Bpp": self.pq_Bpp,
+            "pq_Bp_factor": self.pq_Bp_factor,
+            "pq_Bpp_factor": self.pq_Bpp_factor,
             "branch_i": self.branch_i,
             "branch_j": self.branch_j,
             "branch_yff": self.branch_yff,
@@ -760,6 +822,12 @@ class ACPowerFlowCalc:
             "zero_b", "zero_phi_a", "zero_phi_b", "pq_theta_rows", "pq_v_cols",
             "theta_col_by_node", "v_col_by_node", "p_row_by_node", "q_row_by_node",
             "Y_jac_rows", "Y_jac_cols", "Y_jac_data", "Y_jac_diag",
+            "Y_jac_diag_idx", "Y_jac_diag_nodes", "Y_jac_diag_g", "Y_jac_diag_b",
+            "standard_jac_rows", "standard_jac_cols", "standard_jac_data",
+            "std_jac_p_theta_idx", "std_jac_p_vm_idx", "std_jac_q_theta_idx",
+            "std_jac_q_vm_idx", "std_jac_p_theta_slice", "std_jac_p_vm_slice",
+            "std_jac_q_theta_slice", "std_jac_q_vm_slice", "std_jac_load_p_slice",
+            "std_jac_load_q_slice", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
             "branch_i", "branch_j", "branch_yff", "branch_yft", "branch_ytf",
             "branch_ytt", "transformer_i", "transformer_j", "transformer_yff",
             "transformer_yft", "transformer_ytf", "transformer_ytt", "ppc_gen_rows",
@@ -768,6 +836,7 @@ class ACPowerFlowCalc:
         ):
             setattr(self, name, static[name])
         self.x = static["x0"].copy()
+        self.standard_jac_data = static["standard_jac_data"].copy()
 
     def _prepare_ppc_devices(self, branch, transformer, gen, load, shunt, zero_branch, switch, active_bus):
         """Convert live ppc device rows into compact node positions and specification arrays."""
@@ -967,6 +1036,7 @@ class ACPowerFlowCalc:
         self.x = np.zeros(self.total_vars, dtype=np.float64)
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
         self._cache_static_numeric_arrays()
+        self._cache_pq_decoupled_matrices()
         if self.total_vars != self.total_eq:
             warnings.warn(f"变量数({self.total_vars})与方程数({self.total_eq})不匹配！")
 
@@ -1015,12 +1085,165 @@ class ACPowerFlowCalc:
             self.Y_jac_cols = y_csr.indices.astype(np.int32, copy=True)
             self.Y_jac_data = y_csr.data.astype(np.complex128, copy=True)
             self.Y_jac_diag = y_csr.diagonal().astype(np.complex128, copy=False)
+            self.Y_jac_diag_idx = np.flatnonzero(self.Y_jac_rows == self.Y_jac_cols)
+            self.Y_jac_diag_nodes = self.Y_jac_rows[self.Y_jac_diag_idx]
+            self.Y_jac_diag_g = self.Y_jac_diag[self.Y_jac_diag_nodes].real
+            self.Y_jac_diag_b = self.Y_jac_diag[self.Y_jac_diag_nodes].imag
         else:
             self.Y_jac_rows = self.Y_jac_cols = np.array([], dtype=np.int32)
             self.Y_jac_data = self.Y_jac_diag = np.array([], dtype=np.complex128)
+            self.Y_jac_diag_idx = self.Y_jac_diag_nodes = np.array([], dtype=np.int32)
+            self.Y_jac_diag_g = self.Y_jac_diag_b = np.array([], dtype=np.float64)
+        self._cache_standard_jacobian_pattern()
         self.Y_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices = []
         self.Y_offdiag_data = []
+
+    def _cache_standard_jacobian_pattern(self):
+        """Cache fixed COO coordinates for the standard P/Q Jacobian."""
+        self.standard_jac_rows = np.array([], dtype=np.int32)
+        self.standard_jac_cols = np.array([], dtype=np.int32)
+        self.standard_jac_data = np.array([], dtype=np.float64)
+        self.std_jac_p_theta_idx = self.std_jac_p_vm_idx = np.array([], dtype=np.intp)
+        self.std_jac_q_theta_idx = self.std_jac_q_vm_idx = np.array([], dtype=np.intp)
+        self.std_jac_p_theta_slice = self.std_jac_p_vm_slice = slice(0, 0)
+        self.std_jac_q_theta_slice = self.std_jac_q_vm_slice = slice(0, 0)
+        self.std_jac_load_p_slice = self.std_jac_load_q_slice = slice(0, 0)
+
+        if not self.Y_jac_rows.size:
+            return
+
+        p_rows = self.p_row_by_node[self.Y_jac_rows]
+        q_rows = self.q_row_by_node[self.Y_jac_rows]
+        theta_cols = self.theta_col_by_node[self.Y_jac_cols]
+        v_cols = self.v_col_by_node[self.Y_jac_cols]
+
+        self.std_jac_p_theta_idx = np.flatnonzero((p_rows >= 0) & (theta_cols >= 0))
+        self.std_jac_p_vm_idx = np.flatnonzero((p_rows >= 0) & (v_cols >= 0))
+        self.std_jac_q_theta_idx = np.flatnonzero((q_rows >= 0) & (theta_cols >= 0))
+        self.std_jac_q_vm_idx = np.flatnonzero((q_rows >= 0) & (v_cols >= 0))
+
+        rows_parts = [
+            p_rows[self.std_jac_p_theta_idx],
+            p_rows[self.std_jac_p_vm_idx],
+            q_rows[self.std_jac_q_theta_idx],
+            q_rows[self.std_jac_q_vm_idx],
+        ]
+        cols_parts = [
+            theta_cols[self.std_jac_p_theta_idx],
+            v_cols[self.std_jac_p_vm_idx],
+            theta_cols[self.std_jac_q_theta_idx],
+            v_cols[self.std_jac_q_vm_idx],
+        ]
+        cursor = 0
+        self.std_jac_p_theta_slice = slice(cursor, cursor + self.std_jac_p_theta_idx.size)
+        cursor = self.std_jac_p_theta_slice.stop
+        self.std_jac_p_vm_slice = slice(cursor, cursor + self.std_jac_p_vm_idx.size)
+        cursor = self.std_jac_p_vm_slice.stop
+        self.std_jac_q_theta_slice = slice(cursor, cursor + self.std_jac_q_theta_idx.size)
+        cursor = self.std_jac_q_theta_slice.stop
+        self.std_jac_q_vm_slice = slice(cursor, cursor + self.std_jac_q_vm_idx.size)
+        cursor = self.std_jac_q_vm_slice.stop
+
+        if self.V_unknown.size:
+            v_load_cols = self.v_col_by_node[self.V_unknown]
+            rows_parts.extend((self.p_row_by_node[self.V_unknown], self.q_row_by_node[self.V_unknown]))
+            cols_parts.extend((v_load_cols, v_load_cols))
+            self.std_jac_load_p_slice = slice(cursor, cursor + self.V_unknown.size)
+            cursor = self.std_jac_load_p_slice.stop
+            self.std_jac_load_q_slice = slice(cursor, cursor + self.V_unknown.size)
+            cursor = self.std_jac_load_q_slice.stop
+
+        self.standard_jac_rows = np.concatenate(rows_parts).astype(np.int32, copy=False)
+        self.standard_jac_cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
+        self.standard_jac_data = np.empty(cursor, dtype=np.float64)
+
+    def _cache_pq_decoupled_matrices(self):
+        """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
+        self.pq_Bp = None
+        self.pq_Bpp = None
+        self.pq_Bp_factor = None
+        self.pq_Bpp_factor = None
+        if self.algorithm != "pq" or not SCIPY_AVAILABLE or self.Y is None or self.N_phi > 0:
+            return
+        b_matrix = self._build_fast_decoupled_b_matrix()
+        self.pq_Bp = b_matrix[self.theta_unknown, :][:, self.theta_unknown].tocsr()
+        self.pq_Bpp = b_matrix[self.V_unknown, :][:, self.V_unknown].tocsr()
+        if self.n_theta:
+            self.pq_Bp_factor = splu(self.pq_Bp.tocsc())
+        if self.n_V:
+            self.pq_Bpp_factor = splu(self.pq_Bpp.tocsc())
+
+    def _build_fast_decoupled_b_matrix(self):
+        """Build the fixed B matrix used by fast-decoupled load flow.
+
+        The fast-decoupled method relies on a lossless network approximation.
+        Using ``-Y.imag`` from the full AC admittance matrix includes the impact
+        of branch resistance and shunts, which seriously degrades convergence.
+        """
+        row_parts = []
+        col_parts = []
+        data_parts = []
+
+        def append_series(i, j, x, tap=None):
+            if i.size == 0:
+                return
+            b = np.divide(1.0, x, out=np.zeros_like(x, dtype=np.float64), where=np.abs(x) > 1e-12)
+            if tap is None:
+                yff = b
+                yft = -b
+                ytf = -b
+                ytt = b
+            else:
+                tap_mag = tap.copy()
+                tap_mag[np.abs(tap_mag) < 1e-12] = 1.0
+                yff = b / (tap_mag * tap_mag)
+                yft = -b / tap_mag
+                ytf = -b / tap_mag
+                ytt = b
+            row_parts.append(np.column_stack((i, i, j, j)).ravel())
+            col_parts.append(np.column_stack((i, j, i, j)).ravel())
+            data_parts.append(np.column_stack((yff, yft, ytf, ytt)).ravel())
+
+        if self.array_mode:
+            branch = self.ppc["branch"]
+            transformer = self.ppc["transformer"]
+            append_series(
+                self.branch_i,
+                self.branch_j,
+                branch[self.ppc_branch_rows, BRANCH_COLS["x"]] if self.ppc_branch_rows.size else np.array([], dtype=np.float64),
+            )
+            append_series(
+                self.transformer_i,
+                self.transformer_j,
+                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["x"]]
+                if self.ppc_transformer_rows.size
+                else np.array([], dtype=np.float64),
+                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["tap"]]
+                if self.ppc_transformer_rows.size
+                else np.array([], dtype=np.float64),
+            )
+        else:
+            append_series(
+                self.branch_i,
+                self.branch_j,
+                np.asarray([br.x for br in self.live_branches], dtype=np.float64),
+            )
+            append_series(
+                self.transformer_i,
+                self.transformer_j,
+                np.asarray([tr.x for tr in self.live_transformers], dtype=np.float64),
+                np.asarray([getattr(tr, "tap", 1.0) for tr in self.live_transformers], dtype=np.float64),
+            )
+
+        if not row_parts:
+            return csr_matrix((self.N, self.N), dtype=np.float64)
+        rows = np.concatenate(row_parts).astype(np.int32, copy=False)
+        cols = np.concatenate(col_parts).astype(np.int32, copy=False)
+        data = np.concatenate(data_parts).astype(np.float64, copy=False)
+        matrix = coo_matrix((data, (rows, cols)), shape=(self.N, self.N)).tocsr()
+        matrix.sum_duplicates()
+        return matrix
 
     # --------------------------------------------------------------------------
     # 预处理阶段（精简版）
@@ -1095,6 +1318,7 @@ class ACPowerFlowCalc:
         self.x = np.zeros(self.total_vars, dtype=np.float64)
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
         self._cache_static_arrays()
+        self._cache_pq_decoupled_matrices()
 
         # 维度校验
         print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
@@ -1708,78 +1932,42 @@ class ACPowerFlowCalc:
         p_vm = Vi * (G * cos_delta + B * sin_delta)
         q_vm = Vi * (G * sin_delta - B * cos_delta)
 
-        diag_mask = i == j
-        if np.any(diag_mask):
-            diag_nodes = i[diag_mask]
-            diag_y = self.Y_jac_diag[diag_nodes]
-            Gii = diag_y.real
-            Bii = diag_y.imag
+        diag_idx = self.Y_jac_diag_idx
+        if diag_idx.size:
+            diag_nodes = self.Y_jac_diag_nodes
+            Gii = self.Y_jac_diag_g
+            Bii = self.Y_jac_diag_b
             Vdiag = V[diag_nodes]
-            p_theta[diag_mask] = -Q[diag_nodes] - Bii * Vdiag * Vdiag
-            q_theta[diag_mask] = P[diag_nodes] - Gii * Vdiag * Vdiag
-            p_vm[diag_mask] = np.divide(
+            p_theta[diag_idx] = -Q[diag_nodes] - Bii * Vdiag * Vdiag
+            q_theta[diag_idx] = P[diag_nodes] - Gii * Vdiag * Vdiag
+            p_vm[diag_idx] = np.divide(
                 P[diag_nodes],
                 Vdiag,
                 out=np.zeros_like(Vdiag),
                 where=np.abs(Vdiag) > 1e-12,
             ) + Gii * Vdiag
-            q_vm[diag_mask] = np.divide(
+            q_vm[diag_idx] = np.divide(
                 Q[diag_nodes],
                 Vdiag,
                 out=np.zeros_like(Vdiag),
                 where=np.abs(Vdiag) > 1e-12,
             ) - Bii * Vdiag
 
-        p_rows = self.p_row_by_node[i]
-        q_rows = self.q_row_by_node[i]
-        theta_cols = self.theta_col_by_node[j]
-        v_cols = self.v_col_by_node[j]
-
-        rows_parts = []
-        cols_parts = []
-        data_parts = []
-
-        mask = (p_rows >= 0) & (theta_cols >= 0)
-        if np.any(mask):
-            rows_parts.append(p_rows[mask])
-            cols_parts.append(theta_cols[mask])
-            data_parts.append(p_theta[mask])
-
-        mask = (p_rows >= 0) & (v_cols >= 0)
-        if np.any(mask):
-            rows_parts.append(p_rows[mask])
-            cols_parts.append(v_cols[mask])
-            data_parts.append(p_vm[mask])
-
-        mask = (q_rows >= 0) & (theta_cols >= 0)
-        if np.any(mask):
-            rows_parts.append(q_rows[mask])
-            cols_parts.append(theta_cols[mask])
-            data_parts.append(q_theta[mask])
-
-        mask = (q_rows >= 0) & (v_cols >= 0)
-        if np.any(mask):
-            rows_parts.append(q_rows[mask])
-            cols_parts.append(v_cols[mask])
-            data_parts.append(q_vm[mask])
+        data = self.standard_jac_data
+        data[self.std_jac_p_theta_slice] = p_theta[self.std_jac_p_theta_idx]
+        data[self.std_jac_p_vm_slice] = p_vm[self.std_jac_p_vm_idx]
+        data[self.std_jac_q_theta_slice] = q_theta[self.std_jac_q_theta_idx]
+        data[self.std_jac_q_vm_slice] = q_vm[self.std_jac_q_vm_idx]
 
         if self.V_unknown.size:
             dPload_dV, dQload_dV = self._calc_load_power_derivatives(V)
-            p_load_rows = self.p_row_by_node[self.V_unknown]
-            v_load_cols = self.v_col_by_node[self.V_unknown]
-            q_load_rows = self.q_row_by_node[self.V_unknown]
-            rows_parts.extend((p_load_rows, q_load_rows))
-            cols_parts.extend((v_load_cols, v_load_cols))
-            data_parts.extend((dPload_dV[self.V_unknown], dQload_dV[self.V_unknown]))
+            data[self.std_jac_load_p_slice] = dPload_dV[self.V_unknown]
+            data[self.std_jac_load_q_slice] = dQload_dV[self.V_unknown]
 
-        if rows_parts:
-            rows = np.concatenate(rows_parts).astype(np.int32, copy=False)
-            cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
-            data = np.concatenate(data_parts).astype(np.float64, copy=False)
-        else:
-            rows = cols = np.array([], dtype=np.int32)
-            data = np.array([], dtype=np.float64)
-        J = coo_matrix((data, (rows, cols)), shape=(self.n_theta + self.n_V, self.n_theta + self.n_V)).tocsr()
+        J = coo_matrix(
+            (data, (self.standard_jac_rows, self.standard_jac_cols)),
+            shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
+        ).tocsr()
         J.sum_duplicates()
         return J
 
@@ -1956,7 +2144,17 @@ class ACPowerFlowCalc:
     # 迭代求解
     # --------------------------------------------------------------------------
     def run(self) -> int:
+        """执行所选潮流算法。"""
+        if self.algorithm == "pq" and self.N_phi == 0 and self.pq_Bp is not None and self.pq_Bpp is not None:
+            return self._run_pq_decoupled()
+        if self.algorithm == "pq":
+            print("PQ分解法不支持当前零阻抗扩展模型，自动回退到N-R法")
+            return self._run_newton_raphson(used_label="pq->nr")
+        return self._run_newton_raphson()
+
+    def _run_newton_raphson(self, used_label: str = "nr") -> int:
         """执行牛顿-拉夫逊迭代求解"""
+        self.used_algorithm = used_label
         self.converged = False
         self.iterations = 0
         x = self.x.copy()
@@ -1989,6 +2187,63 @@ class ACPowerFlowCalc:
         self.x = x
         self._write_back()
         return -1
+
+    def _run_pq_decoupled(self) -> int:
+        """执行快速PQ分解潮流。"""
+        self.used_algorithm = "pq"
+        self.converged = False
+        self.iterations = 0
+        x0 = self.x.copy()
+        x = x0.copy()
+        v_slice = slice(self.n_theta, self.n_theta + self.n_V)
+
+        for it in range(self.max_iter):
+            self.iterations += 1
+
+            theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+            dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
+            p_mis = dP[self.theta_unknown]
+            q_mis = dQ[self.V_unknown]
+            self.normF = max(
+                float(np.linalg.norm(p_mis, np.inf)) if p_mis.size else 0.0,
+                float(np.linalg.norm(q_mis, np.inf)) if q_mis.size else 0.0,
+            )
+            print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
+
+            if self.normF < self.tol:
+                print(f"PQ分解法收敛于第 {it + 1} 次迭代")
+                self.converged = True
+                self.x = x
+                self._write_back()
+                return 0
+
+            if self.n_theta:
+                rhs_p = np.divide(
+                    p_mis,
+                    V[self.theta_unknown],
+                    out=np.zeros_like(p_mis),
+                    where=V[self.theta_unknown] > self.min_voltage,
+                )
+                dtheta = self.pq_Bp_factor.solve(rhs_p)
+                x[:self.n_theta] -= dtheta
+
+            theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+            _, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
+            q_mis = dQ[self.V_unknown]
+            if self.n_V:
+                rhs_q = np.divide(
+                    q_mis,
+                    V[self.V_unknown],
+                    out=np.zeros_like(q_mis),
+                    where=V[self.V_unknown] > self.min_voltage,
+                )
+                dV = self.pq_Bpp_factor.solve(rhs_q)
+                x[v_slice] -= dV
+                np.maximum(x[v_slice], self.min_voltage, out=x[v_slice])
+
+        print(f"PQ分解法达到最大迭代次数 {self.max_iter}，未收敛，改用N-R法")
+        self.x = x0
+        return self._run_newton_raphson(used_label="pq->nr")
 
     def _write_back(self):
         """结果回填；数值计算批量完成，Python 循环只负责对象属性赋值。"""

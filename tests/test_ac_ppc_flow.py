@@ -83,6 +83,98 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["voltage"]], object_voltage, atol=1e-10)
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["angle"]], object_angle, atol=1e-10)
 
+    def test_ppc_flow_supports_pq_decoupled_algorithm(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_flow import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+
+        nr_calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        pq_calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
+        with contextlib.redirect_stdout(io.StringIO()):
+            nr_calc.prepare()
+            nr_rc = nr_calc.run()
+            pq_calc.prepare()
+            pq_rc = pq_calc.run()
+
+        self.assertEqual("nr", nr_calc.algorithm)
+        self.assertEqual("pq", pq_calc.algorithm)
+        self.assertEqual(0, nr_rc)
+        self.assertEqual(0, pq_rc)
+        self.assertTrue(pq_calc.converged)
+        self.assertEqual("pq", pq_calc.used_algorithm)
+        self.assertLess(pq_calc.iterations, 50)
+
+        cols = ppc["bus_cols"]
+        np.testing.assert_allclose(
+            pq_calc.result["bus"][:, cols["voltage"]],
+            nr_calc.result["bus"][:, cols["voltage"]],
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            pq_calc.result["bus"][:, cols["angle"]],
+            nr_calc.result["bus"][:, cols["angle"]],
+            atol=1e-5,
+        )
+
+    def test_invalid_power_flow_algorithm_is_rejected(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_flow import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        with self.assertRaises(ValueError):
+            ACPowerFlowCalc.from_ppc(ppc, algorithm="bad")
+
+    def test_ac_lf_benchmark_accepts_algorithm_option(self):
+        from lfcore import ac_lf_benchmark
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = ac_lf_benchmark.run_case("ieee300", repeats=1, profile=False, algorithm="pq")
+
+        self.assertEqual("pq", result["algorithm"])
+        self.assertEqual(0, result["rc"])
+        self.assertTrue(result["converged"])
+        self.assertLess(result["iterations"], 50)
+
+    def test_pq_algorithm_reuses_fixed_b_matrix_factorization(self):
+        import ac_lf
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_flow import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+
+        original_splu = ac_lf.splu
+        original_spsolve = ac_lf.spsolve
+        factor_shapes = []
+
+        def wrapped_splu(matrix, *args, **kwargs):
+            factor_shapes.append(matrix.shape)
+            return original_splu(matrix, *args, **kwargs)
+
+        def reject_spsolve(*_args, **_kwargs):
+            raise AssertionError("PQ iterations should reuse fixed B' and B'' factorizations")
+
+        ac_lf.splu = wrapped_splu
+        try:
+            calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
+            with contextlib.redirect_stdout(io.StringIO()):
+                calc.prepare()
+            ac_lf.spsolve = reject_spsolve
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = calc.run()
+            finally:
+                ac_lf.spsolve = original_spsolve
+        finally:
+            ac_lf.splu = original_splu
+
+        self.assertEqual(0, rc)
+        self.assertEqual("pq", calc.used_algorithm)
+        self.assertEqual([calc.pq_Bp.shape, calc.pq_Bpp.shape], factor_shapes)
+
     def test_ppc_standard_jacobian_avoids_sparse_block_stack(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file
@@ -108,6 +200,59 @@ class ACPPCFlowTest(unittest.TestCase):
         finally:
             ac_lf.hstack = original_hstack
             ac_lf.vstack = original_vstack
+
+    def test_ppc_standard_jacobian_caches_coordinate_pattern(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_flow import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        rows = calc.standard_jac_rows
+        cols = calc.standard_jac_cols
+        self.assertIsInstance(rows, np.ndarray)
+        self.assertIsInstance(cols, np.ndarray)
+        self.assertEqual(np.int32, rows.dtype)
+        self.assertEqual(np.int32, cols.dtype)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            first = calc.get_jacobi(calc.x)
+            second = calc.get_jacobi(calc.x)
+
+        self.assertIs(rows, calc.standard_jac_rows)
+        self.assertIs(cols, calc.standard_jac_cols)
+        np.testing.assert_array_equal(first.indptr, second.indptr)
+        np.testing.assert_array_equal(first.indices, second.indices)
+        np.testing.assert_allclose(first.data, second.data, atol=1e-12)
+
+    def test_ppc_prepare_uses_sparse_connected_components(self):
+        import ac_lf
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_flow import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+
+        original_connected_components = ac_lf.connected_components
+        calls = []
+
+        def wrapped_connected_components(*args, **kwargs):
+            calls.append(args[0].shape)
+            return original_connected_components(*args, **kwargs)
+
+        ac_lf.connected_components = wrapped_connected_components
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                calc.prepare()
+        finally:
+            ac_lf.connected_components = original_connected_components
+
+        self.assertEqual([(ppc["bus"].shape[0], ppc["bus"].shape[0])], calls)
+        self.assertGreater(calc.N, 0)
 
     def test_efile_dict_cache_reuses_unchanged_parse(self):
         from efile_read import clear_efile_cache, read_efile_dict_cached
