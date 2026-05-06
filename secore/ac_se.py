@@ -30,25 +30,6 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
         sys.path.insert(0, str(path))
 
 from ac_flow import matpower_branch_stamp, matpower_branch_stamp_vectorized
-from ac_array_model import (
-    BRANCH_COLS,
-    BUS_COLS,
-    CTRL_P,
-    CTRL_PQ,
-    CTRL_PV,
-    CTRL_SLACK,
-    GEN_COLS,
-    LOAD_COLS,
-    SHUNT_B,
-    SHUNT_COLS,
-    SHUNT_Q,
-    SHUNT_V,
-    SHUNT_Z,
-    SWITCH_COLS,
-    TRANSFORMER_COLS,
-    ZERO_BRANCH_COLS,
-    build_ac_ppc_from_e_file,
-)
 from ac_model import ACPowerNetwork
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook
@@ -98,596 +79,6 @@ _PSEUDO_MEASUREMENT_SUMMARY_TYPES = {
 }
 
 _OBSERVABILITY_RESULT_CACHE = {}
-
-
-class _ArrayACNode:
-    __slots__ = ("idx", "name", "vbase", "voltage", "angle", "run_stat", "isl", "isl_obj", "is_alive", "v_gens")
-
-    def __init__(self, idx, name, vbase, voltage, angle, run_stat):
-        self.idx = idx
-        self.name = name
-        self.vbase = vbase
-        self.voltage = voltage
-        self.angle = angle
-        self.run_stat = run_stat
-        self.isl = 0
-        self.isl_obj = None
-        self.is_alive = False
-        self.v_gens = []
-
-
-class _ArrayACBranch:
-    __slots__ = (
-        "idx",
-        "name",
-        "i_node",
-        "j_node",
-        "r",
-        "x",
-        "b",
-        "run_stat",
-        "i_p",
-        "i_q",
-        "i_c",
-        "j_p",
-        "j_q",
-        "j_c",
-        "i_node_obj",
-        "j_node_obj",
-        "is_alive",
-    )
-
-    def __init__(self, idx, name, i_node, j_node, r, x, b, run_stat):
-        self.idx = idx
-        self.name = name
-        self.i_node = i_node
-        self.j_node = j_node
-        self.r = r
-        self.x = x
-        self.b = b
-        self.run_stat = run_stat
-        self.i_p = self.i_q = self.i_c = None
-        self.j_p = self.j_q = self.j_c = None
-        self.i_node_obj = None
-        self.j_node_obj = None
-        self.is_alive = False
-
-
-class _ArrayACTransformer(_ArrayACBranch):
-    __slots__ = ("tap", "shift")
-
-    def __init__(self, idx, name, i_node, j_node, r, x, b, tap, shift, run_stat):
-        super().__init__(idx, name, i_node, j_node, r, x, b, run_stat)
-        self.tap = tap
-        self.shift = shift
-
-
-class _ArrayACLoad:
-    __slots__ = (
-        "idx",
-        "name",
-        "node",
-        "pv0",
-        "pv1",
-        "pv2",
-        "qv0",
-        "qv1",
-        "qv2",
-        "run_stat",
-        "p",
-        "q",
-        "current",
-        "node_obj",
-        "is_alive",
-    )
-
-    def __init__(self, idx, name, node, pv0, pv1, pv2, qv0, qv1, qv2, run_stat):
-        self.idx = idx
-        self.name = name
-        self.node = node
-        self.pv0 = pv0
-        self.pv1 = pv1
-        self.pv2 = pv2
-        self.qv0 = qv0
-        self.qv1 = qv1
-        self.qv2 = qv2
-        self.run_stat = run_stat
-        self.p = self.q = self.current = None
-        self.node_obj = None
-        self.is_alive = False
-
-
-class _ArrayACGenerator:
-    __slots__ = (
-        "idx",
-        "name",
-        "node",
-        "control_type",
-        "p_set",
-        "q_set",
-        "v_set",
-        "alpha",
-        "run_stat",
-        "p",
-        "q",
-        "current",
-        "node_obj",
-        "is_alive",
-    )
-
-    def __init__(self, idx, name, node, control_type, p_set, q_set, v_set, alpha, run_stat):
-        self.idx = idx
-        self.name = name
-        self.node = node
-        self.control_type = control_type
-        self.p_set = p_set
-        self.q_set = q_set
-        self.v_set = v_set
-        self.alpha = alpha
-        self.run_stat = run_stat
-        self.p = self.q = self.current = None
-        self.node_obj = None
-        self.is_alive = False
-
-
-class _ArrayACShuntCompensator:
-    __slots__ = (
-        "idx",
-        "name",
-        "node",
-        "control_type",
-        "q_set",
-        "g_set",
-        "b_set",
-        "v_set",
-        "run_stat",
-        "p",
-        "q",
-        "current",
-        "node_obj",
-        "is_alive",
-    )
-
-    def __init__(self, idx, name, node, control_type, q_set, g_set, b_set, v_set, run_stat):
-        self.idx = idx
-        self.name = name
-        self.node = node
-        self.control_type = control_type
-        self.q_set = q_set
-        self.g_set = g_set
-        self.b_set = b_set
-        self.v_set = v_set
-        self.run_stat = run_stat
-        self.p = self.q = self.current = None
-        self.node_obj = None
-        self.is_alive = False
-
-
-class _ArrayACSwitch:
-    __slots__ = (
-        "idx",
-        "name",
-        "i_node",
-        "j_node",
-        "status",
-        "run_stat",
-        "p",
-        "q",
-        "current",
-        "i_node_obj",
-        "j_node_obj",
-        "is_alive",
-    )
-
-    def __init__(self, idx, name, i_node, j_node, status, run_stat):
-        self.idx = idx
-        self.name = name
-        self.i_node = i_node
-        self.j_node = j_node
-        self.status = status
-        self.run_stat = run_stat
-        self.p = self.q = self.current = None
-        self.i_node_obj = None
-        self.j_node_obj = None
-        self.is_alive = False
-
-
-class _ArrayACZeroBranch:
-    __slots__ = (
-        "idx",
-        "name",
-        "i_node",
-        "j_node",
-        "run_stat",
-        "p",
-        "q",
-        "current",
-        "i_node_obj",
-        "j_node_obj",
-        "is_alive",
-    )
-
-    def __init__(self, idx, name, i_node, j_node, run_stat):
-        self.idx = idx
-        self.name = name
-        self.i_node = i_node
-        self.j_node = j_node
-        self.run_stat = run_stat
-        self.p = self.q = self.current = None
-        self.i_node_obj = None
-        self.j_node_obj = None
-        self.is_alive = False
-
-
-class _ArrayACIsland:
-    __slots__ = (
-        "idx",
-        "is_alive",
-        "nodes",
-        "gens",
-        "loads",
-        "branches",
-        "zero_branches",
-        "switches",
-        "transformers",
-        "shunt_compensators",
-        "slack_nodes",
-        "v_gens",
-    )
-
-    def __init__(self, idx):
-        self.idx = idx
-        self.is_alive = False
-        self.nodes = []
-        self.gens = []
-        self.loads = []
-        self.branches = []
-        self.zero_branches = []
-        self.switches = []
-        self.transformers = []
-        self.shunt_compensators = []
-        self.slack_nodes = []
-        self.v_gens = []
-
-
-class _ArrayACNetwork:
-    __slots__ = (
-        "ppc",
-        "p_base",
-        "p_base_kW",
-        "u_scale",
-        "p_scale",
-        "i_scale",
-        "nodes",
-        "branches",
-        "transformers",
-        "generators",
-        "loads",
-        "shunt_compensators",
-        "zero_branches",
-        "switches",
-        "islands",
-        "node_dict",
-        "branch_dict",
-        "transformer_dict",
-        "generator_dict",
-        "load_dict",
-        "shunt_compensator_dict",
-        "zero_branch_dict",
-        "switch_dict",
-    )
-
-    def __init__(self, ppc):
-        self.ppc = ppc
-        base = ppc["base"]
-        self.p_base = float(base[0])
-        self.u_scale = float(base[1])
-        self.p_scale = float(base[2])
-        self.i_scale = float(base[3])
-        self.p_base_kW = float(base[4])
-        self.nodes = []
-        self.branches = []
-        self.transformers = []
-        self.generators = []
-        self.loads = []
-        self.shunt_compensators = []
-        self.zero_branches = []
-        self.switches = []
-        self.islands = []
-        self.node_dict = {}
-        self.branch_dict = {}
-        self.transformer_dict = {}
-        self.generator_dict = {}
-        self.load_dict = {}
-        self.shunt_compensator_dict = {}
-        self.zero_branch_dict = {}
-        self.switch_dict = {}
-        self._build_objects()
-        self.topo()
-
-    def _build_objects(self):
-        bus = self.ppc["bus"]
-        for row, name in zip(bus, self.ppc["bus_name"]):
-            node = _ArrayACNode(
-                int(row[BUS_COLS["idx"]]),
-                str(name),
-                float(row[BUS_COLS["vbase"]]),
-                float(row[BUS_COLS["voltage"]]),
-                float(row[BUS_COLS["angle"]]),
-                int(row[BUS_COLS["run_stat"]]),
-            )
-            self.nodes.append(node)
-            self.node_dict[node.idx] = node
-
-        branch = self.ppc["branch"]
-        for row, name in zip(branch, self.ppc["branch_name"]):
-            dev = _ArrayACBranch(
-                int(row[BRANCH_COLS["idx"]]),
-                str(name),
-                int(row[BRANCH_COLS["i_node"]]),
-                int(row[BRANCH_COLS["j_node"]]),
-                float(row[BRANCH_COLS["r"]]),
-                float(row[BRANCH_COLS["x"]]),
-                float(row[BRANCH_COLS["b"]]),
-                int(row[BRANCH_COLS["run_stat"]]),
-            )
-            self.branches.append(dev)
-            self.branch_dict[dev.idx] = dev
-
-        transformer = self.ppc["transformer"]
-        for row, name in zip(transformer, self.ppc["transformer_name"]):
-            dev = _ArrayACTransformer(
-                int(row[TRANSFORMER_COLS["idx"]]),
-                str(name),
-                int(row[TRANSFORMER_COLS["i_node"]]),
-                int(row[TRANSFORMER_COLS["j_node"]]),
-                float(row[TRANSFORMER_COLS["r"]]),
-                float(row[TRANSFORMER_COLS["x"]]),
-                float(row[TRANSFORMER_COLS["b"]]),
-                float(row[TRANSFORMER_COLS["tap"]]),
-                float(row[TRANSFORMER_COLS["shift"]]),
-                int(row[TRANSFORMER_COLS["run_stat"]]),
-            )
-            self.transformers.append(dev)
-            self.transformer_dict[dev.idx] = dev
-
-        gen_control = {CTRL_PQ: "PQ", CTRL_P: "P", CTRL_PV: "PV", CTRL_SLACK: "V"}
-        gen = self.ppc["gen"]
-        for row, name in zip(gen, self.ppc["gen_name"]):
-            dev = _ArrayACGenerator(
-                int(row[GEN_COLS["idx"]]),
-                str(name),
-                int(row[GEN_COLS["node"]]),
-                gen_control.get(int(row[GEN_COLS["control_type"]]), "PQ"),
-                float(row[GEN_COLS["p_set"]]),
-                float(row[GEN_COLS["q_set"]]),
-                float(row[GEN_COLS["v_set"]]),
-                float(row[GEN_COLS["alpha"]]),
-                int(row[GEN_COLS["run_stat"]]),
-            )
-            self.generators.append(dev)
-            self.generator_dict[dev.idx] = dev
-
-        load = self.ppc["load"]
-        for row, name in zip(load, self.ppc["load_name"]):
-            dev = _ArrayACLoad(
-                int(row[LOAD_COLS["idx"]]),
-                str(name),
-                int(row[LOAD_COLS["node"]]),
-                float(row[LOAD_COLS["pv0"]]),
-                float(row[LOAD_COLS["pv1"]]),
-                float(row[LOAD_COLS["pv2"]]),
-                float(row[LOAD_COLS["qv0"]]),
-                float(row[LOAD_COLS["qv1"]]),
-                float(row[LOAD_COLS["qv2"]]),
-                int(row[LOAD_COLS["run_stat"]]),
-            )
-            self.loads.append(dev)
-            self.load_dict[dev.idx] = dev
-
-        shunt_control = {SHUNT_Q: "Q", SHUNT_V: "V", SHUNT_B: "B", SHUNT_Z: "Z"}
-        shunt = self.ppc["shunt"]
-        for row, name in zip(shunt, self.ppc["shunt_name"]):
-            dev = _ArrayACShuntCompensator(
-                int(row[SHUNT_COLS["idx"]]),
-                str(name),
-                int(row[SHUNT_COLS["node"]]),
-                shunt_control.get(int(row[SHUNT_COLS["control_type"]]), "Q"),
-                float(row[SHUNT_COLS["q_set"]]),
-                float(row[SHUNT_COLS["g_set"]]),
-                float(row[SHUNT_COLS["b_set"]]),
-                float(row[SHUNT_COLS["v_set"]]),
-                int(row[SHUNT_COLS["run_stat"]]),
-            )
-            self.shunt_compensators.append(dev)
-            self.shunt_compensator_dict[dev.idx] = dev
-
-        zero_branch = self.ppc["zero_branch"]
-        for row, name in zip(zero_branch, self.ppc["zero_branch_name"]):
-            dev = _ArrayACZeroBranch(
-                int(row[ZERO_BRANCH_COLS["idx"]]),
-                str(name),
-                int(row[ZERO_BRANCH_COLS["i_node"]]),
-                int(row[ZERO_BRANCH_COLS["j_node"]]),
-                int(row[ZERO_BRANCH_COLS["run_stat"]]),
-            )
-            self.zero_branches.append(dev)
-            self.zero_branch_dict[dev.idx] = dev
-
-        switch = self.ppc["switch"]
-        for row, name in zip(switch, self.ppc["switch_name"]):
-            dev = _ArrayACSwitch(
-                int(row[SWITCH_COLS["idx"]]),
-                str(name),
-                int(row[SWITCH_COLS["i_node"]]),
-                int(row[SWITCH_COLS["j_node"]]),
-                int(row[SWITCH_COLS["status"]]),
-                int(row[SWITCH_COLS["run_stat"]]),
-            )
-            self.switches.append(dev)
-            self.switch_dict[dev.idx] = dev
-
-        for dev in self.generators:
-            dev.node_obj = self.node_dict.get(dev.node)
-        for dev in self.loads:
-            dev.node_obj = self.node_dict.get(dev.node)
-        for dev in self.shunt_compensators:
-            dev.node_obj = self.node_dict.get(dev.node)
-        for devices in (self.branches, self.transformers, self.zero_branches, self.switches):
-            for dev in devices:
-                dev.i_node_obj = self.node_dict.get(dev.i_node)
-                dev.j_node_obj = self.node_dict.get(dev.j_node)
-
-    def topo(self):
-        bus = self.ppc["bus"]
-        n_bus = bus.shape[0]
-        bus_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
-        sequential_ids = bool(np.array_equal(bus_ids, np.arange(n_bus)))
-        node_row_by_id = None if sequential_ids else {int(node_id): row for row, node_id in enumerate(bus_ids)}
-        running_mask = bus[:, BUS_COLS["run_stat"]] == 1
-        parent = np.arange(n_bus, dtype=np.int32)
-
-        def node_rows(node_ids):
-            node_ids = np.asarray(node_ids, dtype=np.int64)
-            if sequential_ids:
-                return node_ids.astype(np.int32)
-            return np.fromiter((node_row_by_id[int(node_id)] for node_id in node_ids), dtype=np.int32, count=node_ids.size)
-
-        def find(row):
-            row = int(row)
-            while int(parent[row]) != row:
-                parent[row] = parent[int(parent[row])]
-                row = int(parent[row])
-            return row
-
-        def union(left_row, right_row):
-            root_l = find(left_row)
-            root_r = find(right_row)
-            if root_l != root_r:
-                parent[root_r] = root_l
-
-        def union_edges(dev_array, cols, require_closed=False):
-            if dev_array.size == 0:
-                return
-            i_rows = node_rows(dev_array[:, cols["i_node"]])
-            j_rows = node_rows(dev_array[:, cols["j_node"]])
-            live = (dev_array[:, cols["run_stat"]] == 1) & running_mask[i_rows] & running_mask[j_rows] & (i_rows != j_rows)
-            if require_closed:
-                live &= dev_array[:, cols["status"]] == 1
-            for left_row, right_row in zip(i_rows[live], j_rows[live]):
-                union(left_row, right_row)
-
-        union_edges(self.ppc["branch"], BRANCH_COLS)
-        union_edges(self.ppc["transformer"], TRANSFORMER_COLS)
-        union_edges(self.ppc["zero_branch"], ZERO_BRANCH_COLS)
-        union_edges(self.ppc["switch"], SWITCH_COLS, require_closed=True)
-
-        gen = self.ppc["gen"]
-        comp_has_slack = {}
-        if gen.size:
-            gen_rows = node_rows(gen[:, GEN_COLS["node"]])
-            live_gen = (gen[:, GEN_COLS["run_stat"]] == 1) & running_mask[gen_rows]
-            slack_gen = live_gen & (gen[:, GEN_COLS["control_type"]] == CTRL_SLACK)
-            for row in gen_rows[slack_gen]:
-                comp_has_slack[find(row)] = True
-
-        self.islands = []
-        root_to_island = {}
-        for row in np.flatnonzero(running_mask):
-            node = self.nodes[int(row)]
-            root = find(row)
-            island = root_to_island.get(root)
-            if island is None:
-                island = _ArrayACIsland(len(root_to_island) + 1)
-                island.is_alive = bool(comp_has_slack.get(root, False))
-                root_to_island[root] = island
-                self.islands.append(island)
-            node.isl = island.idx
-            node.isl_obj = island
-            island.nodes.append(node)
-
-        for row, node in enumerate(self.nodes):
-            node.v_gens = []
-            if not running_mask[row]:
-                node.isl = 0
-                node.isl_obj = None
-                node.is_alive = False
-
-        for gen in self.generators:
-            node = gen.node_obj
-            if gen.run_stat != 1 or node is None or node.isl_obj is None:
-                continue
-            island = node.isl_obj
-            island.gens.append(gen)
-            if gen.control_type in ("V", "SLACK", "PH"):
-                island.v_gens.append(gen)
-                node.v_gens.append(gen)
-                if node not in island.slack_nodes:
-                    island.slack_nodes.append(node)
-            elif gen.control_type == "PV":
-                island.v_gens.append(gen)
-                node.v_gens.append(gen)
-
-        for node in self.nodes:
-            node.is_alive = node.run_stat == 1 and node.isl_obj is not None and node.isl_obj.is_alive
-
-        for load in self.loads:
-            load.is_alive = load.run_stat == 1 and load.node_obj is not None and load.node_obj.is_alive
-            if load.is_alive:
-                load.node_obj.isl_obj.loads.append(load)
-
-        for sc in self.shunt_compensators:
-            sc.is_alive = sc.run_stat == 1 and sc.node_obj is not None and sc.node_obj.is_alive
-            if sc.is_alive:
-                sc.node_obj.isl_obj.shunt_compensators.append(sc)
-
-        for gen in self.generators:
-            gen.is_alive = gen.run_stat == 1 and gen.node_obj is not None and gen.node_obj.is_alive
-
-        for dev in self.branches:
-            dev.is_alive = (
-                dev.run_stat == 1
-                and dev.i_node_obj is not None
-                and dev.j_node_obj is not None
-                and dev.i_node_obj.is_alive
-                and dev.j_node_obj.is_alive
-            )
-            if dev.is_alive and dev.i_node_obj.isl_obj == dev.j_node_obj.isl_obj:
-                dev.i_node_obj.isl_obj.branches.append(dev)
-
-        for dev in self.transformers:
-            dev.is_alive = (
-                dev.run_stat == 1
-                and dev.i_node_obj is not None
-                and dev.j_node_obj is not None
-                and dev.i_node_obj.is_alive
-                and dev.j_node_obj.is_alive
-            )
-            if dev.is_alive and dev.i_node_obj.isl_obj == dev.j_node_obj.isl_obj:
-                dev.i_node_obj.isl_obj.transformers.append(dev)
-
-        for dev in self.zero_branches:
-            dev.is_alive = (
-                dev.run_stat == 1
-                and dev.i_node_obj is not None
-                and dev.j_node_obj is not None
-                and dev.i_node_obj.is_alive
-                and dev.j_node_obj.is_alive
-            )
-            if dev.is_alive and dev.i_node_obj.isl_obj == dev.j_node_obj.isl_obj:
-                dev.i_node_obj.isl_obj.zero_branches.append(dev)
-
-        for dev in self.switches:
-            dev.is_alive = (
-                dev.run_stat == 1
-                and dev.status == 1
-                and dev.i_node_obj is not None
-                and dev.j_node_obj is not None
-                and dev.i_node_obj.is_alive
-                and dev.j_node_obj.is_alive
-            )
-            if dev.is_alive and dev.i_node_obj.isl_obj == dev.j_node_obj.isl_obj:
-                dev.i_node_obj.isl_obj.switches.append(dev)
 
 
 def _file_cache_key(file_name: Path) -> Tuple[Path, int, int]:
@@ -965,11 +356,6 @@ class ACStateEstimator:
         self.transformer_by_name = {tr.name: tr for tr in self.network.transformers if getattr(tr, "is_alive", False)}
         self.generator_by_name = {gen.name: gen for gen in self.network.generators if getattr(gen, "is_alive", False)}
         self.load_by_name = {load.name: load for load in self.network.loads if getattr(load, "is_alive", False)}
-        self.shunt_compensator_by_name = {
-            sc.name: sc
-            for sc in self.network.shunt_compensators
-            if getattr(sc, "is_alive", False)
-        }
         self.zero_branch_by_name = {
             zbr.name: zbr
             for zbr in self.network.zero_branches
@@ -1046,7 +432,6 @@ class ACStateEstimator:
                 -np.ones(self.n_switch_current, dtype=np.float64),
             )
         )
-        self._profile_call("init.array_fast_paths", self._prepare_array_fast_paths)
         self.generator_power_idx_array = np.arange(self.n_generator_power, dtype=np.int32)
         self.load_power_idx_array = np.arange(self.n_load_power, dtype=np.int32)
         self.generator_balance_minus_ones = -np.ones(self.n_generator_power, dtype=np.float64)
@@ -1086,30 +471,18 @@ class ACStateEstimator:
         self.state_labels.extend(f"P_LOAD:{load.name}" for load in self.load_order)
         self.state_labels.extend(f"Q_LOAD:{load.name}" for load in self.load_order)
 
-        if self._array_ppc is not None:
-            self.branch_stamp_by_name = self._profile_call(
-                "init.branch_stamps",
-                self._build_array_branch_stamp_map,
-                False,
-            )
-            self.transformer_stamp_by_name = self._profile_call(
-                "init.transformer_stamps",
-                self._build_array_branch_stamp_map,
-                True,
-            )
-        else:
-            self.branch_stamp_by_name = self._profile_call(
-                "init.branch_stamps",
-                self._build_branch_stamp_map,
-                list(self.branch_by_name.values()),
-                False,
-            )
-            self.transformer_stamp_by_name = self._profile_call(
-                "init.transformer_stamps",
-                self._build_branch_stamp_map,
-                list(self.transformer_by_name.values()),
-                True,
-            )
+        self.branch_stamp_by_name = self._profile_call(
+            "init.branch_stamps",
+            self._build_branch_stamp_map,
+            list(self.branch_by_name.values()),
+            False,
+        )
+        self.transformer_stamp_by_name = self._profile_call(
+            "init.transformer_stamps",
+            self._build_branch_stamp_map,
+            list(self.transformer_by_name.values()),
+            True,
+        )
 
         self.Y = self._profile_call("init.y_matrix", self._build_y_matrix)
         self._profile_call("init.y_row_cache", self._prepare_y_row_cache)
@@ -1318,15 +691,11 @@ class ACStateEstimator:
                 meas.valid = False
 
     def _load_network(self, e_file: Path) -> ACPowerNetwork:
-        """Read the AC case via the array model and expose the object-like SE interface."""
-        ppc = self._profile_call(
-            "init.network_read_file",
-            build_ac_ppc_from_e_file,
-            e_file,
-            use_cache=True,
-            copy_arrays=False,
-        )
-        return self._profile_call("init.network_topo", _ArrayACNetwork, ppc)
+        """Read the AC case and build topology references used by measurements."""
+        network = ACPowerNetwork()
+        self._profile_call("init.network_read_file", network.read_from_file, e_file)
+        self._profile_call("init.network_topo", network.topo)
+        return network
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> List[Measurement]:
@@ -2331,37 +1700,6 @@ class ACStateEstimator:
     def _build_zero_tie_state_layout(self) -> None:
         """Compress AC voltage/angle states across ideal switches and zero branches."""
         n = len(self.nodes)
-        ppc = getattr(self.network, "ppc", None)
-        edge_left = edge_right = None
-        if ppc is not None:
-            zero = ppc["zero_branch"]
-            zero_names = ppc["zero_branch_name"]
-            zero_live = np.fromiter(
-                (str(name) in self.zero_branch_by_name for name in zero_names),
-                dtype=bool,
-                count=len(zero_names),
-            )
-            switch = ppc["switch"]
-            switch_names = ppc["switch_name"]
-            switch_live = np.fromiter(
-                (str(name) in self.switch_by_name for name in switch_names),
-                dtype=bool,
-                count=len(switch_names),
-            )
-            if np.any(zero_live) or np.any(switch_live):
-                left_parts = []
-                right_parts = []
-                if np.any(zero_live):
-                    zero_live_rows = zero[zero_live]
-                    left_parts.append(self._positions_from_node_ids(zero_live_rows[:, ZERO_BRANCH_COLS["i_node"]]))
-                    right_parts.append(self._positions_from_node_ids(zero_live_rows[:, ZERO_BRANCH_COLS["j_node"]]))
-                if np.any(switch_live):
-                    switch_live_rows = switch[switch_live]
-                    left_parts.append(self._positions_from_node_ids(switch_live_rows[:, SWITCH_COLS["i_node"]]))
-                    right_parts.append(self._positions_from_node_ids(switch_live_rows[:, SWITCH_COLS["j_node"]]))
-                edge_left = np.concatenate(left_parts)
-                edge_right = np.concatenate(right_parts)
-
         parent = np.arange(n, dtype=np.int32)
 
         def find(pos: int) -> int:
@@ -2376,13 +1714,9 @@ class ACStateEstimator:
             if root_l != root_r:
                 parent[root_r] = root_l
 
-        if edge_left is not None:
-            for left, right in zip(edge_left, edge_right):
-                union(int(left), int(right))
-        else:
-            for dev in [*self.zero_branches, *self.switches]:
-                if dev.i_node in self.node_pos and dev.j_node in self.node_pos:
-                    union(self.node_pos[dev.i_node], self.node_pos[dev.j_node])
+        for dev in [*self.zero_branches, *self.switches]:
+            if dev.i_node in self.node_pos and dev.j_node in self.node_pos:
+                union(self.node_pos[dev.i_node], self.node_pos[dev.j_node])
 
         groups: Dict[int, List[int]] = {}
         for pos in range(n):
@@ -2390,10 +1724,6 @@ class ACStateEstimator:
         components = [sorted(group) for group in groups.values()]
         components.sort(key=lambda group: group[0])
         self.zero_tie_components = components
-        self._assign_zero_tie_state_layout(components)
-
-    def _assign_zero_tie_state_layout(self, components: Sequence[Sequence[int]]) -> None:
-        n = len(self.nodes)
 
         self.angle_col = np.full(n, -1, dtype=np.int32)
         self.voltage_col = np.full(n, -1, dtype=np.int32)
@@ -2473,65 +1803,6 @@ class ACStateEstimator:
     def _build_y_matrix(self) -> np.ndarray:
         """Build the estimator admittance matrix with the same stamps as load flow."""
         n = len(self.nodes)
-        if self._array_ppc is not None:
-            branch_count = int(self._array_branch_i_pos.size)
-            transformer_count = int(self._array_transformer_i_pos.size)
-            shunt_count = int(self._array_y_shunt_pos.size)
-            if coo_matrix is not None:
-                if branch_count or transformer_count:
-                    rows = np.concatenate(
-                        (
-                            np.repeat(self._array_branch_i_pos, 2),
-                            np.repeat(self._array_branch_j_pos, 2),
-                            np.repeat(self._array_transformer_i_pos, 2),
-                            np.repeat(self._array_transformer_j_pos, 2),
-                            self._array_y_shunt_pos,
-                        )
-                    )
-                    cols = np.concatenate(
-                        (
-                            np.column_stack((self._array_branch_i_pos, self._array_branch_j_pos)).ravel(),
-                            np.column_stack((self._array_branch_i_pos, self._array_branch_j_pos)).ravel(),
-                            np.column_stack((self._array_transformer_i_pos, self._array_transformer_j_pos)).ravel(),
-                            np.column_stack((self._array_transformer_i_pos, self._array_transformer_j_pos)).ravel(),
-                            self._array_y_shunt_pos,
-                        )
-                    )
-                    data = np.concatenate(
-                        (
-                            np.column_stack((self._array_branch_yff, self._array_branch_yft)).ravel(),
-                            np.column_stack((self._array_branch_ytf, self._array_branch_ytt)).ravel(),
-                            np.column_stack((self._array_transformer_yff, self._array_transformer_yft)).ravel(),
-                            np.column_stack((self._array_transformer_ytf, self._array_transformer_ytt)).ravel(),
-                            self._array_y_shunt_value,
-                        )
-                    )
-                elif shunt_count:
-                    rows = self._array_y_shunt_pos
-                    cols = self._array_y_shunt_pos
-                    data = self._array_y_shunt_value
-                else:
-                    rows = cols = np.array([], dtype=np.int32)
-                    data = np.array([], dtype=np.complex128)
-                Y = coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
-                Y.sum_duplicates()
-                return Y
-
-            Y = np.zeros((n, n), dtype=np.complex128)
-            if branch_count:
-                np.add.at(Y, (self._array_branch_i_pos, self._array_branch_i_pos), self._array_branch_yff)
-                np.add.at(Y, (self._array_branch_i_pos, self._array_branch_j_pos), self._array_branch_yft)
-                np.add.at(Y, (self._array_branch_j_pos, self._array_branch_i_pos), self._array_branch_ytf)
-                np.add.at(Y, (self._array_branch_j_pos, self._array_branch_j_pos), self._array_branch_ytt)
-            if transformer_count:
-                np.add.at(Y, (self._array_transformer_i_pos, self._array_transformer_i_pos), self._array_transformer_yff)
-                np.add.at(Y, (self._array_transformer_i_pos, self._array_transformer_j_pos), self._array_transformer_yft)
-                np.add.at(Y, (self._array_transformer_j_pos, self._array_transformer_i_pos), self._array_transformer_ytf)
-                np.add.at(Y, (self._array_transformer_j_pos, self._array_transformer_j_pos), self._array_transformer_ytt)
-            if shunt_count:
-                np.add.at(Y, (self._array_y_shunt_pos, self._array_y_shunt_pos), self._array_y_shunt_value)
-            return Y
-
         if coo_matrix is not None:
             rows = []
             cols = []
@@ -2634,158 +1905,6 @@ class ACStateEstimator:
         for gen in self.generator_by_name.values():
             grouped.setdefault(self.node_pos[gen.node], []).append(gen)
         return grouped
-
-    def _positions_from_node_ids(self, node_ids: np.ndarray) -> np.ndarray:
-        return np.fromiter(
-            (self.node_pos[int(node_id)] for node_id in node_ids),
-            dtype=np.int32,
-            count=int(node_ids.size),
-        )
-
-    def _prepare_array_fast_paths(self) -> None:
-        """Prepare array-backed endpoint/stamp indexes for the direct AC model."""
-        ppc = getattr(self.network, "ppc", None)
-        self._array_ppc = ppc
-        self._array_branch_name_to_pos = {}
-        self._array_transformer_name_to_pos = {}
-        self._array_zero_branch_name_to_pos = {}
-        self._array_switch_name_to_pos = {}
-        self._array_branch_i_pos = self._array_branch_j_pos = np.array([], dtype=np.int32)
-        self._array_transformer_i_pos = self._array_transformer_j_pos = np.array([], dtype=np.int32)
-        self._array_zero_branch_i_pos = self._array_zero_branch_j_pos = np.array([], dtype=np.int32)
-        self._array_switch_i_pos = self._array_switch_j_pos = np.array([], dtype=np.int32)
-        self._array_branch_yff = self._array_branch_yft = self._array_branch_ytf = self._array_branch_ytt = np.array(
-            [], dtype=np.complex128
-        )
-        self._array_transformer_yff = self._array_transformer_yft = self._array_transformer_ytf = self._array_transformer_ytt = np.array(
-            [], dtype=np.complex128
-        )
-        self._array_y_shunt_pos = np.array([], dtype=np.int32)
-        self._array_y_shunt_value = np.array([], dtype=np.complex128)
-        if ppc is None:
-            return
-
-        branch = ppc["branch"]
-        branch_names_all = ppc["branch_name"]
-        branch_alive = np.fromiter(
-            (str(name) in self.branch_by_name for name in branch_names_all),
-            dtype=bool,
-            count=len(branch_names_all),
-        )
-        branch_live = branch[branch_alive]
-        self._array_branch_names = np.asarray([str(name) for name in branch_names_all[branch_alive]], dtype=object)
-        self._array_branch_name_to_pos = {name: pos for pos, name in enumerate(self._array_branch_names)}
-        if branch_live.size:
-            self._array_branch_i_pos = self._positions_from_node_ids(branch_live[:, BRANCH_COLS["i_node"]])
-            self._array_branch_j_pos = self._positions_from_node_ids(branch_live[:, BRANCH_COLS["j_node"]])
-            (
-                self._array_branch_yff,
-                self._array_branch_yft,
-                self._array_branch_ytf,
-                self._array_branch_ytt,
-            ) = matpower_branch_stamp_vectorized(
-                branch_live[:, BRANCH_COLS["r"]],
-                branch_live[:, BRANCH_COLS["x"]],
-                branch_live[:, BRANCH_COLS["b"]],
-            )
-
-        transformer = ppc["transformer"]
-        transformer_names_all = ppc["transformer_name"]
-        transformer_alive = np.fromiter(
-            (str(name) in self.transformer_by_name for name in transformer_names_all),
-            dtype=bool,
-            count=len(transformer_names_all),
-        )
-        transformer_live = transformer[transformer_alive]
-        self._array_transformer_names = np.asarray(
-            [str(name) for name in transformer_names_all[transformer_alive]],
-            dtype=object,
-        )
-        self._array_transformer_name_to_pos = {name: pos for pos, name in enumerate(self._array_transformer_names)}
-        if transformer_live.size:
-            self._array_transformer_i_pos = self._positions_from_node_ids(
-                transformer_live[:, TRANSFORMER_COLS["i_node"]]
-            )
-            self._array_transformer_j_pos = self._positions_from_node_ids(
-                transformer_live[:, TRANSFORMER_COLS["j_node"]]
-            )
-            (
-                self._array_transformer_yff,
-                self._array_transformer_yft,
-                self._array_transformer_ytf,
-                self._array_transformer_ytt,
-            ) = matpower_branch_stamp_vectorized(
-                transformer_live[:, TRANSFORMER_COLS["r"]],
-                transformer_live[:, TRANSFORMER_COLS["x"]],
-                transformer_live[:, TRANSFORMER_COLS["b"]],
-                transformer_live[:, TRANSFORMER_COLS["tap"]],
-                transformer_live[:, TRANSFORMER_COLS["shift"]],
-            )
-
-        zero_branch = ppc["zero_branch"]
-        zero_names_all = ppc["zero_branch_name"]
-        zero_alive = np.fromiter(
-            (str(name) in self.zero_branch_pos for name in zero_names_all),
-            dtype=bool,
-            count=len(zero_names_all),
-        )
-        zero_live = zero_branch[zero_alive]
-        self._array_zero_branch_names = np.asarray([str(name) for name in zero_names_all[zero_alive]], dtype=object)
-        self._array_zero_branch_name_to_pos = {name: pos for pos, name in enumerate(self._array_zero_branch_names)}
-        if zero_live.size:
-            self._array_zero_branch_i_pos = self._positions_from_node_ids(zero_live[:, ZERO_BRANCH_COLS["i_node"]])
-            self._array_zero_branch_j_pos = self._positions_from_node_ids(zero_live[:, ZERO_BRANCH_COLS["j_node"]])
-
-        switch = ppc["switch"]
-        switch_names_all = ppc["switch_name"]
-        switch_alive = np.fromiter(
-            (str(name) in self.switch_pos for name in switch_names_all),
-            dtype=bool,
-            count=len(switch_names_all),
-        )
-        switch_live = switch[switch_alive]
-        self._array_switch_names = np.asarray([str(name) for name in switch_names_all[switch_alive]], dtype=object)
-        self._array_switch_name_to_pos = {name: pos for pos, name in enumerate(self._array_switch_names)}
-        if switch_live.size:
-            self._array_switch_i_pos = self._positions_from_node_ids(switch_live[:, SWITCH_COLS["i_node"]])
-            self._array_switch_j_pos = self._positions_from_node_ids(switch_live[:, SWITCH_COLS["j_node"]])
-
-        shunt = ppc["shunt"]
-        shunt_names_all = ppc["shunt_name"]
-        shunt_alive = np.fromiter(
-            (str(name) in self.shunt_compensator_by_name for name in shunt_names_all),
-            dtype=bool,
-            count=len(shunt_names_all),
-        )
-        shunt_live = shunt[shunt_alive]
-        if shunt_live.size:
-            y_mask = (
-                (shunt_live[:, SHUNT_COLS["control_type"]] == SHUNT_B)
-                | (shunt_live[:, SHUNT_COLS["control_type"]] == SHUNT_Z)
-                | (shunt_live[:, SHUNT_COLS["g_set"]] != 0.0)
-            )
-            if np.any(y_mask):
-                y_shunt = shunt_live[y_mask]
-                values = y_shunt[:, SHUNT_COLS["g_set"]] + 1j * y_shunt[:, SHUNT_COLS["b_set"]]
-                nonzero = values != 0.0
-                if np.any(nonzero):
-                    self._array_y_shunt_pos = self._positions_from_node_ids(y_shunt[nonzero, SHUNT_COLS["node"]])
-                    self._array_y_shunt_value = values[nonzero].astype(np.complex128, copy=False)
-
-    def _build_array_branch_stamp_map(self, with_tap: bool) -> Dict[str, Tuple[complex, complex, complex, complex]]:
-        if with_tap:
-            names = self._array_transformer_names
-            yff = self._array_transformer_yff
-            yft = self._array_transformer_yft
-            ytf = self._array_transformer_ytf
-            ytt = self._array_transformer_ytt
-        else:
-            names = self._array_branch_names
-            yff = self._array_branch_yff
-            yft = self._array_branch_yft
-            ytf = self._array_branch_ytf
-            ytt = self._array_branch_ytt
-        return dict(zip(names, zip(yff, yft, ytf, ytt)))
 
     def _generator_shares(self) -> Dict[str, float]:
         """Split a node-level solved injection among co-located generators."""
@@ -3146,35 +2265,17 @@ class ACStateEstimator:
         current_y_mutual = []
 
         for row, meas in self._measurement_rows_for_types(measurements, ("ACBranch", "ACTransformer")):
-            if self._array_ppc is not None and meas.device_type == "ACBranch":
-                pos = self._array_branch_name_to_pos[meas.device_name]
-                i = int(self._array_branch_i_pos[pos])
-                j = int(self._array_branch_j_pos[pos])
-                yff = self._array_branch_yff[pos]
-                yft = self._array_branch_yft[pos]
-                ytf = self._array_branch_ytf[pos]
-                ytt = self._array_branch_ytt[pos]
-            elif self._array_ppc is not None and meas.device_type == "ACTransformer":
-                pos = self._array_transformer_name_to_pos[meas.device_name]
-                i = int(self._array_transformer_i_pos[pos])
-                j = int(self._array_transformer_j_pos[pos])
-                yff = self._array_transformer_yff[pos]
-                yft = self._array_transformer_yft[pos]
-                ytf = self._array_transformer_ytf[pos]
-                ytt = self._array_transformer_ytt[pos]
-            elif meas.device_type == "ACBranch":
+            if meas.device_type == "ACBranch":
                 device = self.branch_by_name[meas.device_name]
-                i = self.node_pos[device.i_node]
-                j = self.node_pos[device.j_node]
                 yff, yft, ytf, ytt = self.branch_stamp_by_name[device.name]
             elif meas.device_type == "ACTransformer":
                 device = self.transformer_by_name[meas.device_name]
-                i = self.node_pos[device.i_node]
-                j = self.node_pos[device.j_node]
                 yff, yft, ytf, ytt = self.transformer_stamp_by_name[device.name]
             else:
                 continue
 
+            i = self.node_pos[device.i_node]
+            j = self.node_pos[device.j_node]
             mtype = meas.meas_type
             if mtype == "V_FROM":
                 voltage_rows.append(row)
@@ -3505,52 +2606,42 @@ class ACStateEstimator:
             scalar_values.append(value)
 
         for row, meas in self._measurement_rows_for_types(measurements, ("ACZeroBranch", "ACSwitch")):
-            if self._array_ppc is not None and meas.device_type == "ACZeroBranch":
-                dev_pos = self._array_zero_branch_name_to_pos[meas.device_name]
-                i_pos = int(self._array_zero_branch_i_pos[dev_pos])
-                j_pos = int(self._array_zero_branch_j_pos[dev_pos])
-                current_position = self.zero_branch_pos[meas.device_name]
-            elif self._array_ppc is not None and meas.device_type == "ACSwitch":
-                dev_pos = self._array_switch_name_to_pos[meas.device_name]
-                i_pos = int(self._array_switch_i_pos[dev_pos])
-                j_pos = int(self._array_switch_j_pos[dev_pos])
-                current_position = self.switch_pos[meas.device_name]
-            elif meas.device_type == "ACZeroBranch":
+            if meas.device_type == "ACZeroBranch":
                 device = self.zero_branch_by_name[meas.device_name]
-                i_pos = self.node_pos[device.i_node]
-                j_pos = self.node_pos[device.j_node]
                 current_position = self.zero_branch_pos[device.name]
             elif meas.device_type == "ACSwitch":
                 device = self.switch_by_name[meas.device_name]
-                i_pos = self.node_pos[device.i_node]
-                j_pos = self.node_pos[device.j_node]
                 current_position = self.switch_pos[device.name]
             else:
                 continue
 
             mtype = meas.meas_type
             if meas.device_type == "ACZeroBranch" and mtype == "V_DIFF":
-                add_scalar(row, int(self.voltage_col[i_pos]), 1.0)
-                add_scalar(row, int(self.voltage_col[j_pos]), -1.0)
+                i = self.node_pos[device.i_node]
+                j = self.node_pos[device.j_node]
+                add_scalar(row, int(self.voltage_col[i]), 1.0)
+                add_scalar(row, int(self.voltage_col[j]), -1.0)
                 voltage_diff_rows.append(row)
-                voltage_diff_i.append(i_pos)
-                voltage_diff_j.append(j_pos)
+                voltage_diff_i.append(i)
+                voltage_diff_j.append(j)
                 handled_mask[row] = True
                 continue
             if meas.device_type == "ACZeroBranch" and mtype in ("ANGLE_DIFF", "THETA_DIFF"):
-                add_scalar(row, int(self.angle_col[i_pos]), 1.0)
-                add_scalar(row, int(self.angle_col[j_pos]), -1.0)
+                i = self.node_pos[device.i_node]
+                j = self.node_pos[device.j_node]
+                add_scalar(row, int(self.angle_col[i]), 1.0)
+                add_scalar(row, int(self.angle_col[j]), -1.0)
                 angle_diff_rows.append(row)
-                angle_diff_i.append(i_pos)
-                angle_diff_j.append(j_pos)
+                angle_diff_i.append(i)
+                angle_diff_j.append(j)
                 handled_mask[row] = True
                 continue
 
             if mtype.endswith("_FROM"):
-                pos = i_pos
+                pos = self.node_pos[device.i_node]
                 sign = 1.0
             elif mtype.endswith("_TO"):
-                pos = j_pos
+                pos = self.node_pos[device.j_node]
                 sign = -1.0
             else:
                 raise RuntimeError(f"Unsupported {meas.device_type} measurement type: {mtype}")

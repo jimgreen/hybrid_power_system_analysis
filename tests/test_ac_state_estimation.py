@@ -628,26 +628,27 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsInstance(direct.ACBranch[0], ac_model.ACBranch)
         self.assertTrue(hasattr(direct.ACBranch[0], "i_node_obj"))
 
-    def test_ac_network_load_uses_ac_array_model_by_default(self):
+    def test_ac_network_load_uses_direct_ac_constructor_by_default(self):
         import secore.ac_se
+        import ac_model
         from secore.ac_se import ACStateEstimator
 
-        original = secore.ac_se.build_ac_ppc_from_e_file
+        original = ac_model._build_ac_model_direct
         calls = 0
 
-        def counted_factory(path, *args, **kwargs):
+        def counted_factory(path):
             nonlocal calls
             calls += 1
-            return original(path, *args, **kwargs)
+            return original(path)
 
-        secore.ac_se.build_ac_ppc_from_e_file = counted_factory
+        ac_model._build_ac_model_direct = counted_factory
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
                 meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
             )
         finally:
-            secore.ac_se.build_ac_ppc_from_e_file = original
+            ac_model._build_ac_model_direct = original
 
         self.assertEqual(1, calls)
         self.assertTrue(estimator.nodes)
