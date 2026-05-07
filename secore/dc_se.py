@@ -10,14 +10,14 @@ import numpy as np
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
+for path in (ROOT_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from dc_lf import DCPowerFlowCalc
-from dc_array_model import DCPowerNetwork
+from lfcore.dc_lf import DCPowerFlowCalc
+from model.dc_array_model import DCPowerNetwork
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
-from efile_read import EBook
+from efile_read import EBook  # Retained for compatibility; measurement loading uses the direct parser below.
 from secore.se_math import (
     SparseJacobianBuilder,
     build_normal_equations,
@@ -33,8 +33,14 @@ from unit_system import dc_current_base_ka
 DEFAULT_CASE = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
 DEFAULT_MEAS = ROOT_DIR / "data" / "dc" / "dc_net_30.meas"
 
+_MEASUREMENT_REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
+_TERMINAL_KIND = {"P_FROM": 0, "V_FROM": 1, "I_FROM": 2, "P_TO": 3, "V_TO": 4, "I_TO": 5}
+_LOAD_MEASUREMENT_KIND = {"P_LOAD": 0, "V_LOAD": 1, "I_LOAD": 2}
+_GEN_MEASUREMENT_KIND = {"P_GEN": 0, "V_GEN": 1, "I_GEN": 2}
+_GEN_CONTROL_KIND = {"V": 0, "P": 1, "I": 2}
 
-@dataclass
+
+@dataclass(slots=True)
 class Measurement:
     idx: int
     name: str
@@ -111,6 +117,89 @@ def _print_iteration(
     )
 
 
+def _read_measurements_direct(meas_file: Path) -> List["Measurement"]:
+    """Read only the Measurement block without materializing a generic EBook dict."""
+    measurements: List[Measurement] = []
+    in_measurement = False
+    found_measurement_block = False
+    header = None
+    missing = ()
+    new_measurement = Measurement.__new__
+    append_measurement = measurements.append
+    intern = sys.intern
+    device_type_cache: Dict[str, str] = {}
+    meas_type_cache: Dict[str, str] = {}
+    device_type_cache_get = device_type_cache.get
+    meas_type_cache_get = meas_type_cache.get
+    idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
+
+    with Path(meas_file).open("r", encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, start=1):
+            if not raw_line or raw_line[0] in "\r\n":
+                continue
+            if not in_measurement:
+                if raw_line.startswith("<Measurement>"):
+                    in_measurement = True
+                    found_measurement_block = True
+                continue
+            first = raw_line[0]
+            if first == "<":
+                if raw_line.strip() == "</Measurement>":
+                    break
+                raise SyntaxError(f"Invalid Measurement row at line {line_no} in {meas_file}")
+            if first == "@":
+                names = raw_line[1:].split()
+                header = {name: idx for idx, name in enumerate(names)}
+                missing = tuple(name for name in _MEASUREMENT_REQUIRED_COLUMNS if name not in header)
+                if missing:
+                    raise RuntimeError(f"{meas_file} Measurement header is missing columns: {missing}")
+                idx_col = header["idx"]
+                name_col = header["name"]
+                dev_type_col = header["dev_type"]
+                dev_name_col = header["dev_name"]
+                meas_type_col = header["meas_type"]
+                weight_col = header["weight"]
+                valid_col = header["valid"]
+                value_col = header["value"]
+                continue
+            if first != "#":
+                raise SyntaxError(f"Invalid Measurement row at line {line_no} in {meas_file}")
+            if header is None:
+                raise RuntimeError(f"{meas_file} Measurement data appears before the header")
+
+            fields = raw_line[1:].split()
+            if len(fields) < len(header):
+                raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
+
+            raw_device_type = fields[dev_type_col]
+            device_type = device_type_cache_get(raw_device_type)
+            if device_type is None:
+                device_type = intern(raw_device_type)
+                device_type_cache[raw_device_type] = device_type
+            raw_meas_type = fields[meas_type_col]
+            meas_type = meas_type_cache_get(raw_meas_type)
+            if meas_type is None:
+                meas_type = intern(raw_meas_type.upper())
+                meas_type_cache[raw_meas_type] = meas_type
+
+            meas = new_measurement(Measurement)
+            meas.idx = int(fields[idx_col])
+            meas.name = fields[name_col]
+            meas.device_type = device_type
+            meas.device_name = fields[dev_name_col]
+            meas.meas_type = meas_type
+            meas.weight = float(fields[weight_col])
+            meas.valid = bool(int(fields[valid_col]))
+            meas.value = float(fields[value_col])
+            append_measurement(meas)
+
+    if not found_measurement_block:
+        raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
+    if header is None:
+        raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
+    return measurements
+
+
 class DCStateEstimator:
     def __init__(
         self,
@@ -147,6 +236,7 @@ class DCStateEstimator:
         self.u_scale = float(self.network.u_scale)
         self.p_scale = float(self.network.p_scale)
         self.i_scale = float(self.network.i_scale)
+        self._build_unit_scale_cache()
 
         self.nodes = sorted(
             [node for node in self.network.nodes if getattr(node, "is_alive", False)],
@@ -177,6 +267,7 @@ class DCStateEstimator:
         self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
         # Reference selection must see only active, unit-normalized real measurements.
         self._disable_unavailable_measurements()
+        self._build_measurement_scale_cache()
         self._convert_measurements_to_pu()
         self.node_voltage_measurements = self._node_voltage_measurements()
         self.node_degrees = self._node_incident_degrees()
@@ -218,6 +309,7 @@ class DCStateEstimator:
             self.state_labels.append(f"P_DCDC_TO:{conv.name}")
         self.state_labels.extend(f"P_VGEN:{gen.name}" for gen in self.v_generators)
         self._build_apply_state_index()
+        self._build_measurement_plan_device_cache()
         # Add priors after unit conversion because model objects are already normalized.
         self._add_pseudo_power_measurements()
         self.targeted_observability_pseudo_count = 0
@@ -377,6 +469,24 @@ class DCStateEstimator:
         self.voltage_state_pos = np.asarray(voltage_state_pos, dtype=np.int32)
         self.voltage_col = node_voltage_state.copy()
         self.n_voltage = int(self.voltage_state_pos.size)
+        if self.voltage_state_nodes:
+            self._voltage_expand_pos = np.concatenate(self.voltage_state_nodes).astype(np.int64, copy=False)
+            self._voltage_expand_col = np.concatenate(
+                [
+                    np.full(nodes.size, state_col, dtype=np.int64)
+                    for state_col, nodes in enumerate(self.voltage_state_nodes)
+                ]
+            )
+        else:
+            self._voltage_expand_pos = np.array([], dtype=np.int64)
+            self._voltage_expand_col = np.array([], dtype=np.int64)
+        if self.ref_voltages:
+            refs = sorted(self.ref_voltages.items())
+            self._ref_voltage_pos = np.asarray([pos for pos, _value in refs], dtype=np.int64)
+            self._ref_voltage_value = np.asarray([value for _pos, value in refs], dtype=np.float64)
+        else:
+            self._ref_voltage_pos = np.array([], dtype=np.int64)
+            self._ref_voltage_value = np.array([], dtype=np.float64)
 
     @staticmethod
     def _int_array(values: Sequence[int]) -> np.ndarray:
@@ -441,16 +551,107 @@ class DCStateEstimator:
         self._apply_dcdc_j = self._int_array([self.node_pos[conv.j_node] for conv in self._apply_dcdc_devices])
         self._apply_dcdc_pos = self._int_array([self.dcdc_pos[conv.name] for conv in self._apply_dcdc_devices])
 
+    def _build_measurement_plan_device_cache(self) -> None:
+        """Cache per-device row-plan metadata shared by all measurement types."""
+        self._node_plan_by_name = {
+            node.name: (self.node_pos[node.idx], int(self.voltage_col[self.node_pos[node.idx]]))
+            for node in self.node_by_name.values()
+        }
+        self._branch_plan_by_name = {}
+        for br in self.branch_by_name.values():
+            i = self.node_pos[br.i_node]
+            j = self.node_pos[br.j_node]
+            self._branch_plan_by_name[br.name] = (
+                i,
+                j,
+                int(self.voltage_col[i]),
+                int(self.voltage_col[j]),
+                1.0 / br.r,
+            )
+        self._load_plan_by_name = {}
+        for load in self.load_by_name.values():
+            pos = self.node_pos[load.node]
+            self._load_plan_by_name[load.name] = (
+                pos,
+                int(self.voltage_col[pos]),
+                load.pv0,
+                load.pv1,
+                load.pv2,
+            )
+        self._generator_plan_by_name = {}
+        for gen in self.generator_by_name.values():
+            ctrl = _GEN_CONTROL_KIND.get(gen.control_type)
+            if ctrl is None:
+                continue
+            pos = self.node_pos[gen.node]
+            vgen_pos = self.v_generator_pos[gen.name] if gen.control_type == "V" else -1
+            power_col = self.v_generator_start + vgen_pos if vgen_pos >= 0 else -1
+            self._generator_plan_by_name[gen.name] = (
+                ctrl,
+                pos,
+                int(self.voltage_col[pos]),
+                power_col,
+                vgen_pos,
+                gen.p_set,
+                gen.i_set,
+            )
+        self._switch_plan_by_name = {}
+        for sw in self.switch_by_name.values():
+            i = self.node_pos[sw.i_node]
+            j = self.node_pos[sw.j_node]
+            current_pos = self.switch_pos[sw.name]
+            self._switch_plan_by_name[sw.name] = (
+                i,
+                j,
+                int(self.voltage_col[i]),
+                int(self.voltage_col[j]),
+                self.switch_start + current_pos,
+                current_pos,
+            )
+        self._zero_branch_plan_by_name = {}
+        for zbr in self.zero_branch_by_name.values():
+            i = self.node_pos[zbr.i_node]
+            j = self.node_pos[zbr.j_node]
+            current_pos = self.zero_branch_pos.get(zbr.name, -1)
+            self._zero_branch_plan_by_name[zbr.name] = (
+                i,
+                j,
+                int(self.voltage_col[i]),
+                int(self.voltage_col[j]),
+                self.switch_start + current_pos if current_pos >= 0 else -1,
+                current_pos,
+            )
+        self._constraint_plan_by_name = {
+            name: (
+                self.node_pos[dev.i_node],
+                self.node_pos[dev.j_node],
+                int(self.voltage_col[self.node_pos[dev.i_node]]),
+                int(self.voltage_col[self.node_pos[dev.j_node]]),
+            )
+            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name}.items()
+        }
+        self._dcdc_plan_by_name = {}
+        for conv in self.dcdc_by_name.values():
+            conv_pos = self.dcdc_pos[conv.name]
+            p_col = self.dcdc_start + 2 * conv_pos
+            i = self.node_pos[conv.i_node]
+            j = self.node_pos[conv.j_node]
+            self._dcdc_plan_by_name[conv.name] = (
+                i,
+                j,
+                int(self.voltage_col[i]),
+                int(self.voltage_col[j]),
+                p_col,
+                p_col + 1,
+                conv_pos,
+            )
+
     @staticmethod
     def _load_network(e_file: Path, params: StateEstimationParameters, run_power_flow: bool = True) -> DCPowerNetwork:
         """Read the DC case and optionally run load flow once to seed the estimator."""
         network = DCPowerNetwork()
         network.read_from_file(e_file)
         network.topo()
-        with contextlib.redirect_stdout(io.StringIO()):
-            warnings, errors = network.check_topo()
-        if errors:
-            raise RuntimeError(f"Topology check failed for {e_file}: {errors}")
         if not run_power_flow:
             return network
 
@@ -470,93 +671,136 @@ class DCStateEstimator:
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> List[Measurement]:
-        data = EBook(meas_file).to_dict()
-        if "Measurement" not in data:
-            raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
-
-        measurements = []
-        for raw in data["Measurement"]["data"]:
-            measurements.append(
-                Measurement(
-                    idx=int(raw["idx"]),
-                    name=str(raw["name"]),
-                    device_type=str(raw["dev_type"]),
-                    device_name=str(raw["dev_name"]),
-                    meas_type=str(raw["meas_type"]).upper(),
-                    weight=float(raw["weight"]),
-                    valid=bool(int(raw["valid"])),
-                    value=float(raw["value"]),
-                )
-            )
-        return measurements
+        return _read_measurements_direct(meas_file)
 
     def _voltage_base(self, node_idx: int) -> float:
-        return float(self.network.node_dict[node_idx].vbase)
+        return self._node_vbase_by_idx[int(node_idx)]
 
     def _node_current_base(self, node_idx: int) -> float:
-        return self.i_scale * dc_current_base_ka(self.p_base_kW, self._voltage_base(node_idx))
+        return self._current_file_base_by_idx[int(node_idx)]
+
+    def _build_unit_scale_cache(self) -> None:
+        """Cache per-node unit bases used by measurement conversion."""
+        self._node_vbase_by_idx = {
+            int(node.idx): float(node.vbase)
+            for node in self.network.nodes
+        }
+        self._voltage_file_base_by_idx = {
+            node_idx: self.u_scale * vbase
+            for node_idx, vbase in self._node_vbase_by_idx.items()
+        }
+        self._current_file_base_by_idx = {
+            node_idx: self.i_scale * dc_current_base_ka(self.p_base_kW, vbase)
+            for node_idx, vbase in self._node_vbase_by_idx.items()
+        }
+
+    def _terminal_scale_tuple(self, i_node: int, j_node: int) -> Tuple[float, float, float, float, float, float]:
+        """Return scale values ordered by _TERMINAL_KIND."""
+        return (
+            self.p_base,
+            self._voltage_file_base_by_idx[int(i_node)],
+            self._current_file_base_by_idx[int(i_node)],
+            self.p_base,
+            self._voltage_file_base_by_idx[int(j_node)],
+            self._current_file_base_by_idx[int(j_node)],
+        )
+
+    def _build_measurement_scale_cache(self) -> None:
+        """Cache file-unit scale factors used by the measurement normalization pass."""
+        self._node_measurement_scale_by_name = {
+            node.name: self._voltage_file_base_by_idx[int(node.idx)]
+            for node in self.node_by_name.values()
+        }
+        self._branch_measurement_scale_by_name = {
+            br.name: self._terminal_scale_tuple(br.i_node, br.j_node)
+            for br in self.branch_by_name.values()
+        }
+        self._switch_measurement_scale_by_name = {
+            sw.name: self._terminal_scale_tuple(sw.i_node, sw.j_node)
+            for sw in self.switch_by_name.values()
+        }
+        self._zero_branch_measurement_scale_by_name = {
+            zbr.name: self._terminal_scale_tuple(zbr.i_node, zbr.j_node)
+            for zbr in self.zero_branch_by_name.values()
+        }
+        self._dcdc_measurement_scale_by_name = {
+            conv.name: self._terminal_scale_tuple(conv.i_node, conv.j_node)
+            for conv in self.dcdc_by_name.values()
+        }
+        self._generator_measurement_scale_by_name = {
+            gen.name: (
+                self.p_base,
+                self._voltage_file_base_by_idx[int(gen.node)],
+                self._current_file_base_by_idx[int(gen.node)],
+            )
+            for gen in self.generator_by_name.values()
+        }
+        self._load_measurement_scale_by_name = {
+            load.name: (
+                self.p_base,
+                self._voltage_file_base_by_idx[int(load.node)],
+                self._current_file_base_by_idx[int(load.node)],
+            )
+            for load in self.load_by_name.values()
+        }
+        self._constraint_measurement_scale_by_name = {
+            name: self._voltage_file_base_by_idx[int(dev.i_node)]
+            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name}.items()
+        }
 
     def _convert_measurements_to_pu(self) -> None:
         """Normalize file measurement values to the internal state-estimation units."""
-        def voltage_file_base(node_idx: int) -> float:
-            return self.u_scale * self._voltage_base(node_idx)
-
-        def power_file_base() -> float:
-            return self.p_base
-
-        def scale_terminal(meas: Measurement, device) -> float:
-            if meas.meas_type.startswith("P_"):
-                return power_file_base()
-            if meas.meas_type.endswith("_FROM"):
-                node_idx = device.i_node
-            elif meas.meas_type.endswith("_TO"):
-                node_idx = device.j_node
-            else:
-                return 1.0
-            if meas.meas_type.startswith("V_"):
-                return voltage_file_base(node_idx)
-            if meas.meas_type.startswith("I_"):
-                return self._node_current_base(node_idx)
-            return 1.0
+        terminal_kind = _TERMINAL_KIND.get
+        load_kind = _LOAD_MEASUREMENT_KIND.get
+        gen_kind = _GEN_MEASUREMENT_KIND.get
+        node_scale = self._node_measurement_scale_by_name.__getitem__
+        branch_scale = self._branch_measurement_scale_by_name.__getitem__
+        switch_scale = self._switch_measurement_scale_by_name.__getitem__
+        zero_branch_scale = self._zero_branch_measurement_scale_by_name.__getitem__
+        dcdc_scale = self._dcdc_measurement_scale_by_name.__getitem__
+        gen_scale = self._generator_measurement_scale_by_name.__getitem__
+        load_scale = self._load_measurement_scale_by_name.__getitem__
+        constraint_scale = self._constraint_measurement_scale_by_name.__getitem__
 
         for meas in self.measurements:
             if not meas.valid or meas.weight <= 0.0:
                 continue
             scale = 1.0
             mtype = meas.meas_type
+            device_name = meas.device_name
             if meas.device_type == "DCNode":
                 if mtype == "V":
-                    scale = voltage_file_base(self.node_by_name[meas.device_name].idx)
+                    scale = node_scale(device_name)
             elif meas.device_type == "DCBranch":
-                scale = scale_terminal(meas, self.branch_by_name[meas.device_name])
+                kind = terminal_kind(mtype)
+                if kind is not None:
+                    scale = branch_scale(device_name)[kind]
             elif meas.device_type == "DCSwitch":
-                scale = scale_terminal(meas, self.switch_by_name[meas.device_name])
+                kind = terminal_kind(mtype)
+                if kind is not None:
+                    scale = switch_scale(device_name)[kind]
             elif meas.device_type == "DCZeroBranch":
-                scale = scale_terminal(meas, self.zero_branch_by_name[meas.device_name])
+                kind = terminal_kind(mtype)
+                if kind is not None:
+                    scale = zero_branch_scale(device_name)[kind]
             elif meas.device_type == "DCZeroBranchConstraint":
                 if mtype == "V_DIFF":
-                    scale = voltage_file_base(self.zero_branch_by_name[meas.device_name].i_node)
+                    scale = constraint_scale(device_name)
             elif meas.device_type == "DCSwitchConstraint":
                 if mtype == "V_DIFF":
-                    scale = voltage_file_base(self.switch_by_name[meas.device_name].i_node)
+                    scale = constraint_scale(device_name)
             elif meas.device_type == "DCDCConverter":
-                scale = scale_terminal(meas, self.dcdc_by_name[meas.device_name])
+                kind = terminal_kind(mtype)
+                if kind is not None:
+                    scale = dcdc_scale(device_name)[kind]
             elif meas.device_type == "DCGenerator":
-                gen = self.generator_by_name[meas.device_name]
-                if mtype == "P_GEN":
-                    scale = power_file_base()
-                elif mtype == "V_GEN":
-                    scale = voltage_file_base(gen.node)
-                elif mtype == "I_GEN":
-                    scale = self._node_current_base(gen.node)
+                kind = gen_kind(mtype)
+                if kind is not None:
+                    scale = gen_scale(device_name)[kind]
             elif meas.device_type == "DCLoad":
-                load = self.load_by_name[meas.device_name]
-                if mtype == "P_LOAD":
-                    scale = power_file_base()
-                elif mtype == "V_LOAD":
-                    scale = voltage_file_base(load.node)
-                elif mtype == "I_LOAD":
-                    scale = self._node_current_base(load.node)
+                kind = load_kind(mtype)
+                if kind is not None:
+                    scale = load_scale(device_name)[kind]
             meas.value = float(meas.value) / scale
 
     def _active_device_keys(self) -> set:
@@ -883,10 +1127,10 @@ class DCStateEstimator:
         state_voltage = np.asarray(x[: self.n_voltage], dtype=np.float64).copy()
         state_voltage[state_voltage < self.voltage_floor] = self.voltage_floor
         voltage = np.ones(len(self.nodes), dtype=np.float64)
-        for state_col, component in enumerate(self.voltage_state_nodes):
-            voltage[component] = state_voltage[int(state_col)]
-        for pos, value in self.ref_voltages.items():
-            voltage[int(pos)] = float(value)
+        if self._voltage_expand_pos.size:
+            voltage[self._voltage_expand_pos] = state_voltage[self._voltage_expand_col]
+        if self._ref_voltage_pos.size:
+            voltage[self._ref_voltage_pos] = self._ref_voltage_value
         switch_current = np.asarray(x[self.switch_start : self.dcdc_start], dtype=np.float64)
         dcdc_power = np.asarray(x[self.dcdc_start : self.v_generator_start], dtype=np.float64)
         v_generator_power = np.asarray(x[self.v_generator_start :], dtype=np.float64)
@@ -1004,136 +1248,106 @@ class DCStateEstimator:
         constraint_rows, constraint_i, constraint_j, constraint_i_col, constraint_j_col = [], [], [], [], []
         dcdc_rows, dcdc_kind, dcdc_i, dcdc_j, dcdc_i_col, dcdc_j_col, dcdc_p_col, dcdc_q_col, dcdc_pos = [], [], [], [], [], [], [], [], []
 
-        terminal_kind = {"P_FROM": 0, "V_FROM": 1, "I_FROM": 2, "P_TO": 3, "V_TO": 4, "I_TO": 5}
-        scalar_kind = {"P_LOAD": 0, "V_LOAD": 1, "I_LOAD": 2}
-        gen_kind_map = {"P_GEN": 0, "V_GEN": 1, "I_GEN": 2}
-        gen_ctrl_map = {"V": 0, "P": 1, "I": 2}
-
         for row, meas in enumerate(measurements):
             mtype = meas.meas_type
             if meas.device_type == "DCNode":
                 if mtype != "V":
                     continue
-                node = self.node_by_name[meas.device_name]
-                pos = self.node_pos[node.idx]
+                pos, col = self._node_plan_by_name[meas.device_name]
                 node_rows.append(row)
                 node_pos.append(pos)
-                node_col.append(int(self.voltage_col[pos]))
+                node_col.append(col)
                 handled[row] = True
 
             elif meas.device_type == "DCBranch":
-                if mtype not in terminal_kind:
+                kind = _TERMINAL_KIND.get(mtype)
+                if kind is None:
                     continue
-                br = self.branch_by_name[meas.device_name]
-                i = self.node_pos[br.i_node]
-                j = self.node_pos[br.j_node]
+                i, j, i_col, j_col, inv_r = self._branch_plan_by_name[meas.device_name]
                 branch_rows.append(row)
-                branch_kind.append(terminal_kind[mtype])
+                branch_kind.append(kind)
                 branch_i.append(i)
                 branch_j.append(j)
-                branch_i_col.append(int(self.voltage_col[i]))
-                branch_j_col.append(int(self.voltage_col[j]))
-                branch_inv_r.append(1.0 / br.r)
+                branch_i_col.append(i_col)
+                branch_j_col.append(j_col)
+                branch_inv_r.append(inv_r)
                 handled[row] = True
 
             elif meas.device_type == "DCLoad":
-                if mtype not in scalar_kind:
+                kind = _LOAD_MEASUREMENT_KIND.get(mtype)
+                if kind is None:
                     continue
-                load = self.load_by_name[meas.device_name]
-                pos = self.node_pos[load.node]
+                pos, col, pv0, pv1, pv2 = self._load_plan_by_name[meas.device_name]
                 load_rows.append(row)
-                load_kind.append(scalar_kind[mtype])
+                load_kind.append(kind)
                 load_pos.append(pos)
-                load_col.append(int(self.voltage_col[pos]))
-                load_pv0.append(load.pv0)
-                load_pv1.append(load.pv1)
-                load_pv2.append(load.pv2)
+                load_col.append(col)
+                load_pv0.append(pv0)
+                load_pv1.append(pv1)
+                load_pv2.append(pv2)
                 handled[row] = True
 
             elif meas.device_type == "DCGenerator":
-                if mtype not in gen_kind_map:
+                kind = _GEN_MEASUREMENT_KIND.get(mtype)
+                if kind is None:
                     continue
-                gen = self.generator_by_name[meas.device_name]
-                ctrl = gen_ctrl_map.get(gen.control_type)
-                if ctrl is None:
-                    continue
-                power_col = -1
-                vgen_pos = -1
-                if gen.control_type == "V":
-                    vgen_pos = self.v_generator_pos[gen.name]
-                    power_col = self.v_generator_start + vgen_pos
-                pos = self.node_pos[gen.node]
+                ctrl, pos, col, power_col, vgen_pos, p_set, i_set = self._generator_plan_by_name[meas.device_name]
                 gen_rows.append(row)
-                gen_kind.append(gen_kind_map[mtype])
+                gen_kind.append(kind)
                 gen_ctrl.append(ctrl)
                 gen_pos.append(pos)
-                gen_col.append(int(self.voltage_col[pos]))
+                gen_col.append(col)
                 gen_p_col.append(power_col)
                 gen_vgen_pos.append(vgen_pos)
-                gen_p_set.append(gen.p_set)
-                gen_i_set.append(gen.i_set)
+                gen_p_set.append(p_set)
+                gen_i_set.append(i_set)
                 handled[row] = True
 
             elif meas.device_type in ("DCSwitch", "DCZeroBranch"):
-                if mtype not in terminal_kind:
+                kind = _TERMINAL_KIND.get(mtype)
+                if kind is None:
                     continue
-                device = (
-                    self.switch_by_name[meas.device_name]
+                i, j, i_col, j_col, current_col, current_pos = (
+                    self._switch_plan_by_name[meas.device_name]
                     if meas.device_type == "DCSwitch"
-                    else self.zero_branch_by_name[meas.device_name]
-                )
-                current_pos = (
-                    self.switch_pos[device.name]
-                    if meas.device_type == "DCSwitch"
-                    else self.zero_branch_pos.get(device.name, -1)
+                    else self._zero_branch_plan_by_name[meas.device_name]
                 )
                 if current_pos < 0 and mtype not in ("V_FROM", "V_TO"):
                     continue
                 switch_rows.append(row)
-                switch_kind.append(terminal_kind[mtype])
-                i = self.node_pos[device.i_node]
-                j = self.node_pos[device.j_node]
+                switch_kind.append(kind)
                 switch_i.append(i)
                 switch_j.append(j)
-                switch_i_col.append(int(self.voltage_col[i]))
-                switch_j_col.append(int(self.voltage_col[j]))
-                switch_col.append(self.switch_start + current_pos if current_pos >= 0 else -1)
+                switch_i_col.append(i_col)
+                switch_j_col.append(j_col)
+                switch_col.append(current_col)
                 switch_pos.append(current_pos)
                 handled[row] = True
 
             elif meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint"):
                 if mtype != "V_DIFF":
                     continue
-                device = (
-                    self.zero_branch_by_name[meas.device_name]
-                    if meas.device_type == "DCZeroBranchConstraint"
-                    else self.switch_by_name[meas.device_name]
-                )
-                i = self.node_pos[device.i_node]
-                j = self.node_pos[device.j_node]
+                i, j, i_col, j_col = self._constraint_plan_by_name[meas.device_name]
                 constraint_rows.append(row)
                 constraint_i.append(i)
                 constraint_j.append(j)
-                constraint_i_col.append(int(self.voltage_col[i]))
-                constraint_j_col.append(int(self.voltage_col[j]))
+                constraint_i_col.append(i_col)
+                constraint_j_col.append(j_col)
                 handled[row] = True
 
             elif meas.device_type == "DCDCConverter":
-                if mtype not in terminal_kind:
+                kind = _TERMINAL_KIND.get(mtype)
+                if kind is None:
                     continue
-                conv = self.dcdc_by_name[meas.device_name]
-                conv_pos = self.dcdc_pos[conv.name]
-                p_col = self.dcdc_start + 2 * conv_pos
-                i = self.node_pos[conv.i_node]
-                j = self.node_pos[conv.j_node]
+                i, j, i_col, j_col, p_col, q_col, conv_pos = self._dcdc_plan_by_name[meas.device_name]
                 dcdc_rows.append(row)
-                dcdc_kind.append(terminal_kind[mtype])
+                dcdc_kind.append(kind)
                 dcdc_i.append(i)
                 dcdc_j.append(j)
-                dcdc_i_col.append(int(self.voltage_col[i]))
-                dcdc_j_col.append(int(self.voltage_col[j]))
+                dcdc_i_col.append(i_col)
+                dcdc_j_col.append(j_col)
                 dcdc_p_col.append(p_col)
-                dcdc_q_col.append(p_col + 1)
+                dcdc_q_col.append(q_col)
                 dcdc_pos.append(conv_pos)
                 handled[row] = True
 

@@ -25,6 +25,58 @@ class DCStateEstimationTest(unittest.TestCase):
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return target
 
+    def test_measurement_loader_bypasses_generic_ebook_parser(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original_ebook = dc_se.EBook
+
+        def fail_ebook(*args, **kwargs):
+            raise AssertionError("generic EBook parser should not be used for DC measurements")
+
+        dc_se.EBook = fail_ebook
+        try:
+            measurements = DCStateEstimator._load_measurements(ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+        finally:
+            dc_se.EBook = original_ebook
+
+        self.assertGreater(len(measurements), 0)
+        self.assertEqual("DCNode", measurements[0].device_type)
+        self.assertEqual("V", measurements[0].meas_type)
+
+    def test_dc_network_load_uses_array_model_by_default(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
+
+        self.assertEqual("model.dc_array_model", estimator.network.__class__.__module__)
+        self.assertEqual("dc_ppc_v1", estimator.network.ppc["format"])
+
+    def test_estimator_load_network_skips_topology_check(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original_check_topo = dc_se.DCPowerNetwork.check_topo
+
+        def reject_check_topo(self):
+            raise AssertionError("main DC state-estimation load path should not call check_topo")
+
+        dc_se.DCPowerNetwork.check_topo = reject_check_topo
+        try:
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+            )
+        finally:
+            dc_se.DCPowerNetwork.check_topo = original_check_topo
+
+        self.assertTrue(estimator.nodes)
+
     def test_adds_low_weight_pseudo_power_measurements_for_unmetered_generators_and_loads(self):
         from secore.dc_se import DCStateEstimator
 
