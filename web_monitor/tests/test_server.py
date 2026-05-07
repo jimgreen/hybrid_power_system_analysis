@@ -11,7 +11,54 @@ sys.path.insert(0, str(WEB_ROOT))
 import server
 
 
+class FakeCursor:
+    def __init__(self, rows_by_sql):
+        self.rows_by_sql = rows_by_sql
+        self.last_sql = ""
+        self.last_params = ()
+        self.executed = []
+
+    def execute(self, sql, params=()):
+        self.last_sql = " ".join(sql.split())
+        self.last_params = params
+        self.executed.append((self.last_sql, params))
+
+    def fetchall(self):
+        return self.rows_by_sql.get(self.last_sql, [])
+
+    def fetchone(self):
+        rows = self.fetchall()
+        if isinstance(rows, dict):
+            return rows
+        return rows[0] if rows else None
+
+    def close(self):
+        pass
+
+
+class FakeConnection:
+    def __init__(self, rows_by_sql):
+        self.cursor_obj = FakeCursor(rows_by_sql)
+        self.committed = False
+
+    def cursor(self, *args, **kwargs):
+        return self.cursor_obj
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        pass
+
+
 class WebMonitorServerTest(unittest.TestCase):
+    def setUp(self):
+        self._original_data_source = server.DATA_SOURCE
+        server.DATA_SOURCE = server.CsvDataSource()
+
+    def tearDown(self):
+        server.DATA_SOURCE = self._original_data_source
+
     def test_api_payload_contains_all_monitor_sections(self):
         payload = server.build_snapshot()
 
@@ -120,6 +167,55 @@ class WebMonitorServerTest(unittest.TestCase):
         second_load = next(item for item in second["simu"]["metrics"] if item["label"] == "总有功负荷")
         self.assertEqual(first_load["value"], 100)
         self.assertEqual(second_load["value"], 200)
+
+    def test_mysql_data_source_builds_snapshot_from_database_rows(self):
+        rows = {
+            "SELECT `key`, value, unit FROM overview_summary ORDER BY display_order, id": [
+                {"key": "running_days", "value": "449", "unit": "天"},
+            ],
+            "SELECT page, label, value, unit, status FROM metrics ORDER BY page, display_order, id": [
+                {"page": "simu", "label": "总有功负荷", "value": "486.2", "unit": "MW", "status": "normal"},
+            ],
+            "SELECT page, time, object, message, status FROM alarms ORDER BY page, display_order, id": [],
+            "SELECT page, label, value, status FROM page_summary ORDER BY page, display_order, id": [
+                {"page": "simu", "label": "刷新周期", "value": "2 s", "status": "normal"},
+            ],
+            "SELECT label, value, unit FROM simu_bars ORDER BY display_order, id": [
+                {"label": "线路 L12", "value": "72", "unit": "%"},
+            ],
+            "SELECT id, status, value FROM simu_topology ORDER BY display_order, id": [
+                {"id": "BUS-101", "status": "ok", "value": "1.018 p.u."},
+            ],
+            "SELECT hour, wind_speed, temperature, solar_irradiance, load_value FROM simu_daily_curves ORDER BY hour": [
+                {"hour": "0", "wind_speed": "7.8", "temperature": "-18", "solar_irradiance": "0", "load_value": "138"},
+            ],
+            "SELECT label, value, unit FROM scada_columns ORDER BY display_order, id": [],
+            "SELECT name, status, detail FROM scada_stations ORDER BY display_order, id": [],
+            "SELECT name, percent, power, unit FROM agc_units ORDER BY display_order, id": [],
+            "SELECT score, up, down, response, cycle FROM agc_reserve ORDER BY id LIMIT 1": {
+                "score": "97.4", "up": "164", "down": "120", "response": "8.2", "cycle": "4",
+            },
+        }
+        fake_connection = FakeConnection(rows)
+        source = server.MySqlDataSource(connector_factory=lambda config: fake_connection, reload_interval=0)
+
+        payload = source.snapshot()
+
+        self.assertEqual(payload["summary"]["running_days"], 449)
+        self.assertEqual(payload["simu"]["metrics"][0]["value"], 486.2)
+        self.assertEqual(payload["simu"]["charts"]["daily"][0]["name"], "风速")
+        self.assertEqual(payload["agc"]["reserve"]["score"], 97.4)
+
+    def test_mysql_data_source_persists_simu_state(self):
+        fake_connection = FakeConnection({})
+        source = server.MySqlDataSource(connector_factory=lambda config: fake_connection, reload_interval=0)
+
+        source.save_simu_state({"sim_time": "01:30", "speed": 2.0, "status": "RUNNING"})
+
+        executed_sql, params = fake_connection.cursor_obj.executed[-1]
+        self.assertIn("UPDATE simu_state", executed_sql)
+        self.assertEqual(params, ("01:30", 2.0, "RUNNING"))
+        self.assertTrue(fake_connection.committed)
 
     def test_unknown_api_path_returns_404_json(self):
         status, headers, body = server.handle_api_path("/api/not-found")
