@@ -10,18 +10,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-try:
-    from scipy.sparse import coo_matrix, csr_matrix, issparse
-except Exception:
-    coo_matrix = csr_matrix = None
-
-    def issparse(_matrix):
-        return False
-
-try:
-    from scipy.sparse.csgraph import maximum_bipartite_matching as sp_maximum_bipartite_matching
-except Exception:
-    sp_maximum_bipartite_matching = None
+from scipy.sparse import coo_matrix, csr_matrix, issparse
+from scipy.sparse.csgraph import maximum_bipartite_matching as sp_maximum_bipartite_matching
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -720,7 +710,7 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
     loaded_network.source = str(source)
     loaded_network.read_from_file(source)
     loaded_network.source = str(source)
-    ppc = build_ac_ppc_from_network(loaded_network, copy_arrays=False, include_device_names=True)
+    ppc = build_ac_ppc_from_network(loaded_network)
     ppc["source"] = str(source)
     network = ACPowerNetwork()
     base = ppc["base"]
@@ -2041,7 +2031,7 @@ class ACStateEstimator:
 
     def _rank_restoring_candidate_indices(self, candidates: Sequence[Measurement], max_add: int) -> List[int]:
         """Select candidate rows that participate in a higher structural-rank matching."""
-        if max_add <= 0 or not candidates or sp_maximum_bipartite_matching is None:
+        if max_add <= 0 or not candidates:
             return []
         base_measurements = self.active_measurements
         x = self.initial_state()
@@ -2539,62 +2529,25 @@ class ACStateEstimator:
     def _build_y_matrix(self) -> np.ndarray:
         """Build the estimator admittance matrix with the same stamps as load flow."""
         n = len(self.nodes)
-        if coo_matrix is not None:
-            rows = []
-            cols = []
-            data = []
-
-            for br in self.branch_by_name.values():
-                i = self.node_pos[br.i_node]
-                j = self.node_pos[br.j_node]
-                yff, yft, ytf, ytt = self.branch_stamp_by_name[br.name]
-                rows.extend((i, i, j, j))
-                cols.extend((i, j, i, j))
-                data.extend((yff, yft, ytf, ytt))
-
-            for tr in self.transformer_by_name.values():
-                i = self.node_pos[tr.i_node]
-                j = self.node_pos[tr.j_node]
-                yff, yft, ytf, ytt = self.transformer_stamp_by_name[tr.name]
-                rows.extend((i, i, j, j))
-                cols.extend((i, j, i, j))
-                data.extend((yff, yft, ytf, ytt))
-
-            for sc in self.network.shunt_compensators:
-                if not getattr(sc, "is_alive", False):
-                    continue
-                if sc.node not in self.node_pos:
-                    continue
-                if sc.control_type in ("B", "Z") or sc.g_set != 0.0:
-                    y_sh = complex(sc.g_set, sc.b_set)
-                    if y_sh != 0.0:
-                        pos = self.node_pos[sc.node]
-                        rows.append(pos)
-                        cols.append(pos)
-                        data.append(y_sh)
-            Y = coo_matrix((np.asarray(data, dtype=np.complex128), (np.asarray(rows), np.asarray(cols))), shape=(n, n)).tocsr()
-            Y.sum_duplicates()
-            return Y
-
-        Y = np.zeros((n, n), dtype=np.complex128)
+        rows = []
+        cols = []
+        data = []
 
         for br in self.branch_by_name.values():
             i = self.node_pos[br.i_node]
             j = self.node_pos[br.j_node]
             yff, yft, ytf, ytt = self.branch_stamp_by_name[br.name]
-            Y[i, i] += yff
-            Y[i, j] += yft
-            Y[j, i] += ytf
-            Y[j, j] += ytt
+            rows.extend((i, i, j, j))
+            cols.extend((i, j, i, j))
+            data.extend((yff, yft, ytf, ytt))
 
         for tr in self.transformer_by_name.values():
             i = self.node_pos[tr.i_node]
             j = self.node_pos[tr.j_node]
             yff, yft, ytf, ytt = self.transformer_stamp_by_name[tr.name]
-            Y[i, i] += yff
-            Y[i, j] += yft
-            Y[j, i] += ytf
-            Y[j, j] += ytt
+            rows.extend((i, i, j, j))
+            cols.extend((i, j, i, j))
+            data.extend((yff, yft, ytf, ytt))
 
         for sc in self.network.shunt_compensators:
             if not getattr(sc, "is_alive", False):
@@ -2602,7 +2555,14 @@ class ACStateEstimator:
             if sc.node not in self.node_pos:
                 continue
             if sc.control_type in ("B", "Z") or sc.g_set != 0.0:
-                Y[self.node_pos[sc.node], self.node_pos[sc.node]] += complex(sc.g_set, sc.b_set)
+                y_sh = complex(sc.g_set, sc.b_set)
+                if y_sh != 0.0:
+                    pos = self.node_pos[sc.node]
+                    rows.append(pos)
+                    cols.append(pos)
+                    data.append(y_sh)
+        Y = coo_matrix((np.asarray(data, dtype=np.complex128), (np.asarray(rows), np.asarray(cols))), shape=(n, n)).tocsr()
+        Y.sum_duplicates()
         return Y
 
     def _prepare_y_row_cache(self) -> None:

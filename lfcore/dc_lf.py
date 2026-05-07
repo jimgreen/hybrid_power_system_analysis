@@ -36,77 +36,17 @@
 此方案满足用户所有要求：不引入最小二乘法（数学上等价但实现为线性系统），不做分组和分段求解，不假设连支电流为零，且能处理任意零阻抗支路拓扑。
 """
 
+import argparse
+import contextlib
+import io
 import importlib
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Dict, Optional
 
 import numpy as np
-try:
-    from scipy.sparse import coo_matrix, csr_matrix
-    from scipy.sparse.linalg import spsolve
-    SCIPY_AVAILABLE = True
-except ModuleNotFoundError:
-    SCIPY_AVAILABLE = False
-
-    class _DenseCSR:
-        """Small numpy-backed scipy sparse subset used when scipy is unavailable."""
-
-        def __init__(self, arg, shape=None):
-            if isinstance(arg, tuple):
-                data, (rows, cols) = arg
-                if shape is None:
-                    raise ValueError("shape is required for coordinate matrix input")
-                dtype = np.asarray(data).dtype if len(data) else float
-                self._dense = np.zeros(shape, dtype=dtype)
-                for value, row, col in zip(data, rows, cols):
-                    self._dense[int(row), int(col)] += value
-            else:
-                self._dense = np.asarray(arg)
-            self.shape = self._dense.shape
-
-        def dot(self, value):
-            return self._dense.dot(value)
-
-        def multiply(self, value):
-            return _DenseCSR(self._dense * np.asarray(value), shape=self.shape)
-
-        def setdiag(self, values):
-            diag_len = min(self._dense.shape)
-            self._dense[np.arange(diag_len), np.arange(diag_len)] = np.asarray(values)[:diag_len]
-
-        def diagonal(self):
-            return np.diag(self._dense)
-
-        def sum_duplicates(self):
-            return None
-
-        def tocoo(self):
-            rows, cols = np.nonzero(self._dense)
-            coo = _DenseCSR(self._dense, shape=self.shape)
-            coo.row = rows.astype(np.int32)
-            coo.col = cols.astype(np.int32)
-            coo.data = self._dense[rows, cols]
-            return coo
-
-        def tocsr(self):
-            return self
-
-        def toarray(self):
-            return self._dense.copy()
-
-        def __getitem__(self, key):
-            return _DenseCSR(self._dense[key], shape=np.asarray(self._dense[key]).shape)
-
-    coo_matrix = _DenseCSR
-    csr_matrix = _DenseCSR
-
-    def spsolve(matrix, rhs):
-        dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
-        try:
-            return np.linalg.solve(dense, rhs)
-        except np.linalg.LinAlgError:
-            return np.linalg.lstsq(dense, rhs, rcond=None)[0]
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
 from collections import deque
 from pathlib import Path
 import sys
@@ -116,28 +56,21 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
-try:
-    from model.dc_array_model import (
-        BRANCH_COLS as DC_BRANCH_COLS,
-        BUS_COLS as DC_BUS_COLS,
-        CTRL_I as DC_CTRL_I,
-        CTRL_P as DC_CTRL_P,
-        CTRL_V as DC_CTRL_V,
-        DCDC_COLS as DC_DCDC_COLS,
-        GEN_COLS as DC_GEN_COLS,
-        LOAD_COLS as DC_LOAD_COLS,
-        BREAK_COLS as DC_BREAK_COLS,
-        SWITCH_COLS as DC_SWITCH_COLS,
-        ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
-        build_dc_ppc_from_network,
-    )
-except Exception:
-    DC_BRANCH_COLS = DC_BUS_COLS = DC_DCDC_COLS = DC_GEN_COLS = DC_LOAD_COLS = None
-    DC_BREAK_COLS = DC_SWITCH_COLS = DC_ZERO_BRANCH_COLS = None
-    build_dc_ppc_from_network = None
-    DC_CTRL_P = 0
-    DC_CTRL_V = 1
-    DC_CTRL_I = 2
+from model.dc_array_model import (
+    BRANCH_COLS as DC_BRANCH_COLS,
+    BUS_COLS as DC_BUS_COLS,
+    CTRL_I as DC_CTRL_I,
+    CTRL_P as DC_CTRL_P,
+    CTRL_V as DC_CTRL_V,
+    DCDC_COLS as DC_DCDC_COLS,
+    GEN_COLS as DC_GEN_COLS,
+    LOAD_COLS as DC_LOAD_COLS,
+    BREAK_COLS as DC_BREAK_COLS,
+    SWITCH_COLS as DC_SWITCH_COLS,
+    ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    build_dc_network_from_ppc,
+    build_dc_ppc_from_e_file as _build_dc_ppc_from_e_file,
+)
 
 
 @dataclass
@@ -150,23 +83,21 @@ class DCLFResult:
     generators: Dict[str, SimpleNamespace] = field(default_factory=dict)
     loads: Dict[str, SimpleNamespace] = field(default_factory=dict)
 
-
-DCLFReslt = DCLFResult
-
-
 def _device_key(device) -> str:
     return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
 
 
-def load_dc_network_from_e_file(file_name, use_cache: bool = True, run_topo: bool = False):
-    """Read a DC E file via the efile_read-backed array model loader."""
-    from model.dc_array_model import DCPowerNetwork
+def load_dc_ppc_from_e_file(file_name) -> Dict:
+    """Read a DC E file into a ppc dictionary."""
+    source = Path(file_name).resolve()
+    ppc = _build_dc_ppc_from_e_file(source)
+    ppc["source"] = str(source)
+    return ppc
 
-    network = DCPowerNetwork()
-    network.read_from_file(file_name, use_cache=use_cache)
-    network.ppc = build_dc_ppc_from_network(network, copy_arrays=True)
-    if run_topo:
-        network.topo()
+
+def _dc_network_from_ppc(ppc):
+    network = build_dc_network_from_ppc(ppc)
+    network.topo()
     return network
 
 
@@ -196,7 +127,7 @@ def _load_named_sparse_solver(solver_name):
         try:
             if importlib.util.find_spec(module_name) is None:
                 continue
-        except (ImportError, ModuleNotFoundError, ValueError):
+        except (ImportError, ValueError):
             continue
         try:
             module = importlib.import_module(module_name)
@@ -217,14 +148,13 @@ def solve_sparse_system(matrix, rhs, solver_name="scipy"):
     if solver_name in {"scipy", "superlu", "default"}:
         return spsolve(matrix, rhs)
 
-    if SCIPY_AVAILABLE:
-        solver = _load_named_sparse_solver(solver_name)
-        if solver is not None:
-            try:
-                return solver(matrix, rhs)
-            except Exception:
-                _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
-                _OPTIONAL_SPARSE_MISSING.add(solver_name)
+    solver = _load_named_sparse_solver(solver_name)
+    if solver is not None:
+        try:
+            return solver(matrix, rhs)
+        except Exception:
+            _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
+            _OPTIONAL_SPARSE_MISSING.add(solver_name)
     return spsolve(matrix, rhs)
 
 
@@ -288,12 +218,6 @@ class DCPowerFlowCalc:
         self.iterations = 0
         self.normF = np.inf
         self.verbose = False
-
-    @classmethod
-    def from_e_file(cls, file_name, use_cache: bool = True, run_topo: bool = False, **kwargs):
-        """Create a solver from a DC E file through the shared efile reader path."""
-        network = load_dc_network_from_e_file(file_name, use_cache=use_cache, run_topo=run_topo)
-        return cls(network, **kwargs)
 
     def _alive_node_lookup_array(self):
         """Return a dense node-id to active solver-position lookup when possible."""
@@ -1392,20 +1316,8 @@ class DCPowerFlowCalc:
         self.x = x
         return -1
 
-if __name__ == "__main__":
-    from model.dc_array_model import DCPowerNetwork
-
-    net = DCPowerNetwork()
-    net.read_from_file(ROOT_DIR / "data" / "dc" / "dc_net_30.e")
-
-    net.topo()
-
-    net.print_isl_info()
-
-    # 8. 运行潮流计算
-    print("=== 开始直流电网潮流计算===")
-    calc = DCPowerFlowCalc(net)
-    calc.run()
+def print_dc_result(calc: DCPowerFlowCalc) -> None:
+    net = calc.model
 
     # 9. 输出详细结果
     print("\n===输出直流电网潮流计算结果===")
@@ -1462,3 +1374,43 @@ if __name__ == "__main__":
     print(f"   总发电功率: {total_gen_power:.6f} pu")
     print(f"   总负荷功率: {total_load_power:.6f} pu")
     print(f"   网损: {total_loss:.6f} pu")
+
+
+def _run_with_optional_output(emit_output: bool, func, *args, **kwargs):
+    if emit_output:
+        return func(*args, **kwargs)
+    with contextlib.redirect_stdout(io.StringIO()):
+        return func(*args, **kwargs)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="DC power flow")
+    parser.add_argument("file", nargs="?", default=str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"), help="DC E file path")
+    parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
+    parser.add_argument("--tol", type=float, default=None)
+    parser.add_argument("--max-iter", type=int, default=None)
+    parser.add_argument("--min-voltage", type=float, default=None)
+    parser.add_argument("--linear-solver", default="scipy")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    network = _dc_network_from_ppc(load_dc_ppc_from_e_file(args.file))
+    calc = DCPowerFlowCalc(
+        network,
+        parameter_file=args.para,
+        tol=args.tol,
+        max_iter=args.max_iter,
+        min_voltage=args.min_voltage,
+        linear_solver=args.linear_solver,
+    )
+    if not args.quiet:
+        calc.model.print_isl_info()
+        print("=== 开始直流电网潮流计算===")
+    rc = _run_with_optional_output(not args.quiet, calc.run, verbose=not args.quiet)
+    if not args.quiet:
+        print_dc_result(calc)
+    return 0 if rc == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

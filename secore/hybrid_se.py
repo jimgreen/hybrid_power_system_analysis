@@ -651,7 +651,7 @@ class HybridStateEstimator:
         params: StateEstimationParameters,
     ) -> Tuple[HybridPowerNetwork, HybridPowerFlowCalc, np.ndarray, np.ndarray]:
         """Load a hybrid case and build flat/E-file state seeds for the estimator."""
-        network = HybridPowerNetwork.read_from_file(e_file, use_array_ac=False)
+        network = HybridPowerNetwork.read_from_file(e_file)
         with contextlib.redirect_stdout(io.StringIO()):
             ac_warnings, ac_errors, dc_warnings, dc_errors = network.prepare(verbose=False)
         if ac_errors or dc_errors:

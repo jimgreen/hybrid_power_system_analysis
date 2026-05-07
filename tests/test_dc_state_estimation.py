@@ -129,14 +129,14 @@ class DCStateEstimationTest(unittest.TestCase):
         import secore.dc_se as dc_se
         from secore.dc_se import DCStateEstimator
 
-        original = dc_se.load_dc_network_from_e_file
+        original = dc_se.load_dc_ppc_from_e_file
         calls = []
 
         def counted_loader(path, *args, **kwargs):
             calls.append(Path(path).name)
             return original(path, *args, **kwargs)
 
-        dc_se.load_dc_network_from_e_file = counted_loader
+        dc_se.load_dc_ppc_from_e_file = counted_loader
         try:
             estimator = DCStateEstimator(
                 e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
@@ -144,7 +144,7 @@ class DCStateEstimationTest(unittest.TestCase):
                 flat_start=True,
             )
         finally:
-            dc_se.load_dc_network_from_e_file = original
+            dc_se.load_dc_ppc_from_e_file = original
 
         self.assertEqual(["dc_net_30.e"], calls)
         self.assertEqual("dc_ppc_v1", estimator.network.ppc["format"])
@@ -305,7 +305,7 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertIn(("DCDCConverter", "conv_2", "V_FROM"), pseudo_keys)
         self.assertIn(("DCDCConverter", "conv_2", "V_TO"), pseudo_keys)
 
-    def test_adds_low_weight_pseudo_measurements_for_unmetered_nodes_switches_and_zero_branches(self):
+    def test_adds_low_weight_pseudo_measurements_for_unmetered_nodes_breaks_and_zero_branches(self):
         from secore.dc_se import DCStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -317,7 +317,7 @@ class DCStateEstimationTest(unittest.TestCase):
                         "@ idx name dev_type dev_name meas_type weight valid value",
                         "# 1 v_nd_1 DCNode nd_1 V 1.0 1 160",
                         "# 2 v_nd_2_bad DCNode nd_2 V 1.0 0 160",
-                        "# 3 p_sw_bad DCSwitch sw_0_1 P_FROM 1.0 0 0",
+                        "# 3 p_brk_bad DCBreak sw_0_1 P_FROM 1.0 0 0",
                         "# 4 p_zbr_bad DCZeroBranch zbr_1_2 P_FROM 1.0 0 0",
                         "</Measurement>",
                         "",
@@ -342,7 +342,7 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertNotIn(("DCNode", "nd_2", "V"), pseudo_keys)
         self.assertFalse(any(device_type == "DCNode" and meas_type == "V" for device_type, _name, meas_type in pseudo_keys))
         for meas_type in ("P_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("DCSwitch", "sw_0_1", meas_type), pseudo_keys)
+            self.assertIn(("DCBreak", "sw_0_1", meas_type), pseudo_keys)
             self.assertIn(("DCZeroBranch", "zbr_1_2", meas_type), pseudo_keys)
         self.assertIn("zbr_1_2", estimator.zero_branch_pos)
 

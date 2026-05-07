@@ -1,109 +1,12 @@
+import argparse
+import contextlib
+import io
 from dataclasses import dataclass, field
 
 import numpy as np
-try:
-    from scipy.sparse import coo_matrix, csr_matrix, diags, hstack, vstack
-    from scipy.sparse.csgraph import connected_components
-    from scipy.sparse.linalg import splu, spsolve
-    SCIPY_AVAILABLE = True
-except ModuleNotFoundError:
-    SCIPY_AVAILABLE = False
-    class _DenseCSR:
-        """Small numpy-backed scipy sparse subset used when scipy is unavailable."""
-
-        def __init__(self, arg, shape=None):
-            if isinstance(arg, tuple):
-                data, (rows, cols) = arg
-                if shape is None:
-                    raise ValueError("shape is required for coordinate matrix input")
-                dtype = np.asarray(data).dtype if len(data) else float
-                self._dense = np.zeros(shape, dtype=dtype)
-                for value, row, col in zip(data, rows, cols):
-                    self._dense[int(row), int(col)] += value
-            else:
-                self._dense = np.asarray(arg)
-            self.shape = self._dense.shape
-            self._refresh_csr()
-
-        def _refresh_csr(self):
-            indptr = [0]
-            indices = []
-            data = []
-            for row in range(self._dense.shape[0]):
-                nz = np.nonzero(self._dense[row])[0]
-                indices.extend(nz.tolist())
-                data.extend(self._dense[row, nz].tolist())
-                indptr.append(len(indices))
-            self.indptr = np.asarray(indptr, dtype=np.int32)
-            self.indices = np.asarray(indices, dtype=np.int32)
-            self.data = np.asarray(data, dtype=self._dense.dtype)
-
-        def dot(self, value):
-            return self._dense.dot(value)
-
-        def sum_duplicates(self):
-            return None
-
-        def tocsr(self):
-            return self
-
-        def toarray(self):
-            return self._dense.copy()
-
-        def __getitem__(self, key):
-            return self._dense[key]
-
-    class _DenseMatrix:
-        """Lightweight dense matrix wrapper for Jacobians when scipy is unavailable."""
-
-        def __init__(self, dense):
-            self._dense = np.asarray(dense)
-            self.shape = self._dense.shape
-
-        def toarray(self):
-            return self._dense.copy()
-
-    coo_matrix = _DenseCSR
-    csr_matrix = _DenseCSR
-
-    def connected_components(graph, directed=False, return_labels=True):
-        dense = graph.toarray() if hasattr(graph, "toarray") else np.asarray(graph)
-        n = dense.shape[0]
-        labels = np.full(n, -1, dtype=np.int32)
-        comp = 0
-        for start in range(n):
-            if labels[start] >= 0:
-                continue
-            stack = [start]
-            labels[start] = comp
-            while stack:
-                node = stack.pop()
-                neighbors = np.nonzero(dense[node])[0]
-                if not directed:
-                    neighbors = np.union1d(neighbors, np.nonzero(dense[:, node])[0])
-                for neighbor in neighbors:
-                    if labels[neighbor] < 0:
-                        labels[neighbor] = comp
-                        stack.append(int(neighbor))
-            comp += 1
-        return (comp, labels) if return_labels else comp
-
-    def spsolve(matrix, rhs):
-        dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
-        try:
-            return np.linalg.solve(dense, rhs)
-        except np.linalg.LinAlgError:
-            return np.linalg.lstsq(dense, rhs, rcond=None)[0]
-
-    class _DenseLU:
-        def __init__(self, matrix):
-            self._dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
-
-        def solve(self, rhs):
-            return spsolve(_DenseMatrix(self._dense), rhs)
-
-    def splu(matrix):
-        return _DenseLU(matrix)
+from scipy.sparse import coo_matrix, csr_matrix, diags, hstack, vstack
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import splu, spsolve
 
 from collections import deque
 from typing import List, Tuple, Dict, Optional
@@ -152,21 +55,11 @@ class ACLFResult:
     generators: Dict[str, SimpleNamespace] = field(default_factory=dict)
     loads: Dict[str, SimpleNamespace] = field(default_factory=dict)
 
-
-ACLFReslt = ACLFResult
-DCLFReslt = ACLFResult
-
-
 def _device_key(device) -> str:
     return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
 
 
-def load_ac_ppc_from_e_file(
-    file_name,
-    use_cache: bool = True,
-    copy_arrays: bool = True,
-    include_device_names: bool = True,
-) -> Dict:
+def load_ac_ppc_from_e_file(file_name) -> Dict:
     """Read an AC E file via efile_read-backed array model loading."""
     from ac_model import ACPowerNetwork
 
@@ -175,11 +68,7 @@ def load_ac_ppc_from_e_file(
     network.source = str(source)
     network.read_from_file(source)
     network.source = str(source)
-    ppc = build_ac_ppc_from_network(
-        network,
-        copy_arrays=copy_arrays,
-        include_device_names=include_device_names,
-    )
+    ppc = build_ac_ppc_from_network(network)
     ppc["source"] = str(source)
     return ppc
 
@@ -214,7 +103,7 @@ def _load_named_sparse_solver(solver_name):
         try:
             if importlib.util.find_spec(module_name) is None:
                 continue
-        except (ImportError, ModuleNotFoundError, ValueError):
+        except (ImportError, ValueError):
             continue
         try:
             module = importlib.import_module(module_name)
@@ -235,14 +124,13 @@ def solve_sparse_system(matrix, rhs, solver_name="scipy"):
     if solver_name in {"scipy", "superlu", "default"}:
         return spsolve(matrix, rhs)
 
-    if SCIPY_AVAILABLE:
-        solver = _load_named_sparse_solver(solver_name)
-        if solver is not None:
-            try:
-                return solver(matrix, rhs)
-            except Exception:
-                _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
-                _OPTIONAL_SPARSE_MISSING.add(solver_name)
+    solver = _load_named_sparse_solver(solver_name)
+    if solver is not None:
+        try:
+            return solver(matrix, rhs)
+        except Exception:
+            _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
+            _OPTIONAL_SPARSE_MISSING.add(solver_name)
     return spsolve(matrix, rhs)
 
 
@@ -335,15 +223,10 @@ def matpower_branch_stamp_vectorized(r, x, b=0.0, tap=1.0, shift=0.0):
 
 
 def build_jacobian_matrix(rows, cols, data, shape):
-    """Build a sparse Jacobian, falling back to a dense wrapper when scipy is absent."""
-    if SCIPY_AVAILABLE:
-        J = coo_matrix((np.array(data), (np.array(rows), np.array(cols))), shape=shape).tocsr()
-        J.sum_duplicates()
-        return J
-
-    dense = np.zeros(shape, dtype=np.float64)
-    np.add.at(dense, (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)), np.asarray(data))
-    return _DenseMatrix(dense)
+    """Build a sparse Jacobian from COO triplets."""
+    J = coo_matrix((np.array(data), (np.array(rows), np.array(cols))), shape=shape).tocsr()
+    J.sum_duplicates()
+    return J
 
 
 # ==============================================================================
@@ -542,17 +425,6 @@ class ACPowerFlowCalc:
         self._residual_work = np.array([], dtype=np.float64)
         self.result: Dict = {}
 
-    @classmethod
-    def from_ppc(cls, ppc: Dict, **kwargs):
-        """Create a solver directly from an AC NumPy ppc dictionary."""
-        return cls(ppc, **kwargs)
-
-    @classmethod
-    def from_e_file(cls, file_name, use_cache: bool = True, **kwargs):
-        """Create a solver from an AC E file through the shared efile reader path."""
-        ppc = load_ac_ppc_from_e_file(file_name, use_cache=use_cache, copy_arrays=True)
-        return cls.from_ppc(ppc, **kwargs)
-
     def _cache_node_type_masks(self):
         self._slack_mask = self.node_type == 'SLACK'
         self._fixed_voltage_mask = self._slack_mask | (self.node_type == 'PV')
@@ -625,28 +497,11 @@ class ACPowerFlowCalc:
         self.load_obj_pos = np.asarray([self.node_pos[ld.node] for ld in self.live_loads], dtype=np.int32)
         self.shunt_pos = np.asarray([self.node_pos[sc.node] for sc in self.live_shunts], dtype=np.int32)
 
-        if SCIPY_AVAILABLE:
-            # 稀疏矩阵批量 Jacobian 不使用逐行 Y 缓存，跳过可减少大算例 prepare 时间。
-            self.Y_diag = np.array([], dtype=np.complex128)
-            self.Y_offdiag_indices = []
-            self.Y_offdiag_data = []
-            return
-
-        self.Y_diag = np.zeros(self.N, dtype=np.complex128)
+        # 稀疏矩阵批量 Jacobian 不使用逐行 Y 缓存，跳过可减少大算例 prepare 时间。
+        self.Y_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices = []
         self.Y_offdiag_data = []
-        # The loop Jacobian fallback repeatedly scans Y row by row, so cache diagonal
-        # and off-diagonal slices once during prepare().
-        for i in range(self.N):
-            row_slice = slice(self.Y.indptr[i], self.Y.indptr[i + 1])
-            j_list = self.Y.indices[row_slice]
-            y_list = self.Y.data[row_slice]
-            diag_mask = j_list == i
-            if np.any(diag_mask):
-                self.Y_diag[i] = y_list[np.where(diag_mask)[0][0]]
-            off_mask = ~diag_mask
-            self.Y_offdiag_indices.append(j_list[off_mask])
-            self.Y_offdiag_data.append(y_list[off_mask])
+        return
 
     # --------------------------------------------------------------------------
     # 私有辅助函数（精简版）
@@ -1386,24 +1241,17 @@ class ACPowerFlowCalc:
         self.p_row_by_node[self.theta_unknown] = self.theta_col_by_node[self.theta_unknown]
         self.v_col_by_node[self.V_unknown] = self.n_theta + np.arange(self.n_V, dtype=np.int32)
         self.q_row_by_node[self.V_unknown] = self.n_theta + np.arange(self.n_V, dtype=np.int32)
-        if SCIPY_AVAILABLE:
-            y_csr = self.Y.tocsr()
-            self.Y_jac_rows = np.repeat(np.arange(self.N, dtype=np.int32), np.diff(y_csr.indptr))
-            self.Y_jac_cols = y_csr.indices.astype(np.int32, copy=True)
-            self.Y_jac_data = y_csr.data.astype(np.complex128, copy=True)
-            self.Y_jac_g = self.Y_jac_data.real
-            self.Y_jac_b = self.Y_jac_data.imag
-            self.Y_jac_diag = y_csr.diagonal().astype(np.complex128, copy=False)
-            self.Y_jac_diag_idx = np.flatnonzero(self.Y_jac_rows == self.Y_jac_cols)
-            self.Y_jac_diag_nodes = self.Y_jac_rows[self.Y_jac_diag_idx]
-            self.Y_jac_diag_g = self.Y_jac_diag[self.Y_jac_diag_nodes].real
-            self.Y_jac_diag_b = self.Y_jac_diag[self.Y_jac_diag_nodes].imag
-        else:
-            self.Y_jac_rows = self.Y_jac_cols = np.array([], dtype=np.int32)
-            self.Y_jac_data = self.Y_jac_diag = np.array([], dtype=np.complex128)
-            self.Y_jac_g = self.Y_jac_b = np.array([], dtype=np.float64)
-            self.Y_jac_diag_idx = self.Y_jac_diag_nodes = np.array([], dtype=np.int32)
-            self.Y_jac_diag_g = self.Y_jac_diag_b = np.array([], dtype=np.float64)
+        y_csr = self.Y.tocsr()
+        self.Y_jac_rows = np.repeat(np.arange(self.N, dtype=np.int32), np.diff(y_csr.indptr))
+        self.Y_jac_cols = y_csr.indices.astype(np.int32, copy=True)
+        self.Y_jac_data = y_csr.data.astype(np.complex128, copy=True)
+        self.Y_jac_g = self.Y_jac_data.real
+        self.Y_jac_b = self.Y_jac_data.imag
+        self.Y_jac_diag = y_csr.diagonal().astype(np.complex128, copy=False)
+        self.Y_jac_diag_idx = np.flatnonzero(self.Y_jac_rows == self.Y_jac_cols)
+        self.Y_jac_diag_nodes = self.Y_jac_rows[self.Y_jac_diag_idx]
+        self.Y_jac_diag_g = self.Y_jac_diag[self.Y_jac_diag_nodes].real
+        self.Y_jac_diag_b = self.Y_jac_diag[self.Y_jac_diag_nodes].imag
         self._cache_standard_jacobian_pattern()
         self.Y_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices = []
@@ -1491,7 +1339,7 @@ class ACPowerFlowCalc:
         self.standard_jac_rows = np.concatenate(rows_parts).astype(np.int32, copy=False)
         self.standard_jac_cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
         self.standard_jac_data = np.empty(cursor, dtype=np.float64)
-        if SCIPY_AVAILABLE and cursor:
+        if cursor:
             marker = np.arange(cursor, dtype=np.float64)
             pattern = coo_matrix(
                 (marker, (self.standard_jac_rows, self.standard_jac_cols)),
@@ -1516,7 +1364,7 @@ class ACPowerFlowCalc:
         self.pq_Bpp = None
         self.pq_Bp_factor = None
         self.pq_Bpp_factor = None
-        if self.algorithm != "pq" or not SCIPY_AVAILABLE or self.Y is None or self.N_phi > 0:
+        if self.algorithm != "pq" or self.Y is None or self.N_phi > 0:
             return
         b_matrix = self._build_fast_decoupled_b_matrix()
         self.pq_Bp = b_matrix[self.theta_unknown, :][:, self.theta_unknown].tocsr()
@@ -2414,9 +2262,6 @@ class ACPowerFlowCalc:
 
     def get_jacobi(self, x: np.ndarray) -> csr_matrix:
         """计算雅可比矩阵。标准AC部分使用稀疏矩阵批量公式，零阻抗扩展按块追加。"""
-        if not SCIPY_AVAILABLE:
-            return self._get_jacobi_loop(x)
-
         if self._state_x_obj is x:
             theta = self._cache['theta']
             V = self._cache['V']
@@ -2593,10 +2438,6 @@ class ACPowerFlowCalc:
 
     def _build_newton_system(self, x: np.ndarray):
         """Compute residual and Jacobian together for one Newton iteration."""
-        if not SCIPY_AVAILABLE:
-            F = self.get_f(x)
-            return F, self._get_jacobi_loop(x)
-
         theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
         dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
         F = self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
@@ -3116,13 +2957,7 @@ class ACPowerFlowCalc:
         }
         self.lf_result = self._build_lf_result()
 
-if __name__ == "__main__":
-    file_name = sys.argv[1] if len(sys.argv) > 1 else str(ROOT_DIR / "data" / "ac" / "ieee300.e")
-
-    # 数组化加载和潮流计算共用一次 E 文件解析。
-    calc = ACPowerFlowCalc.from_e_file(file_name)
-    calc.prepare()
-    rc = calc.run()
+def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     for isl in calc.skipped_islands:
         print(f"跳过岛屿 {isl.idx}: 无可用平衡节点或定电压源")
 
@@ -3256,3 +3091,44 @@ if __name__ == "__main__":
     print(f"   总发电功率: {total_gen_power:.6f} pu")
     print(f"   总负荷功率: {total_load_power:.6f} pu")
     print(f"   总网损: {total_loss:.6f} pu (支路: {p_loss_br:.6f} pu, 变压器: {p_loss_tr:.6f} pu, 并联电导: {p_loss_gs:.6f} pu)")
+
+
+def _run_with_optional_output(emit_output: bool, func, *args, **kwargs):
+    if emit_output:
+        return func(*args, **kwargs)
+    with contextlib.redirect_stdout(io.StringIO()):
+        return func(*args, **kwargs)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="AC power flow")
+    parser.add_argument("file", nargs="?", default=str(ROOT_DIR / "data" / "ac" / "ieee300.e"), help="AC E file path")
+    parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
+    parser.add_argument("--tol", type=float, default=None)
+    parser.add_argument("--max-iter", type=int, default=None)
+    parser.add_argument("--min-voltage", type=float, default=None)
+    parser.add_argument("--algorithm", choices=("nr", "pq"), default="nr")
+    parser.add_argument("--linear-solver", default="scipy")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    ppc = load_ac_ppc_from_e_file(args.file)
+    calc = ACPowerFlowCalc(
+        ppc,
+        parameter_file=args.para,
+        tol=args.tol,
+        max_iter=args.max_iter,
+        min_voltage=args.min_voltage,
+        algorithm=args.algorithm,
+        linear_solver=args.linear_solver,
+    )
+    verbose = not args.quiet
+    _run_with_optional_output(verbose, calc.prepare)
+    rc = _run_with_optional_output(verbose, calc.run)
+    if not args.quiet:
+        print_ac_result(calc, rc)
+    return 0 if rc == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

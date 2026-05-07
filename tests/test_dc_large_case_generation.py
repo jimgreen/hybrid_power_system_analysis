@@ -76,34 +76,24 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import build_dc_ppc_from_network as original_builder
 
         case_path = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
-        previous_builder = getattr(dc_lf, "build_dc_ppc_from_network", None)
-        previous_file_builder = getattr(dc_lf, "build_dc_ppc_from_e_file", None)
+        original_loader = dc_lf._build_dc_ppc_from_e_file
         calls = []
 
-        def counted_builder(network, *args, **kwargs):
-            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
-            return original_builder(network, *args, **kwargs)
+        def counted_loader(file_name):
+            calls.append(Path(file_name).name)
+            return original_loader(file_name)
 
-        def reject_file_builder(*_args, **_kwargs):
-            raise AssertionError("DC LF should build ppc from an already loaded DCPowerNetwork")
-
-        dc_lf.build_dc_ppc_from_network = counted_builder
-        if previous_file_builder is not None:
-            dc_lf.build_dc_ppc_from_e_file = reject_file_builder
+        dc_lf._build_dc_ppc_from_e_file = counted_loader
         try:
-            calc = DCPowerFlowCalc.from_e_file(case_path)
+            ppc = dc_lf.load_dc_ppc_from_e_file(case_path)
+            network = dc_lf._dc_network_from_ppc(ppc)
+            calc = DCPowerFlowCalc(network)
         finally:
-            if previous_builder is None:
-                del dc_lf.build_dc_ppc_from_network
-            else:
-                dc_lf.build_dc_ppc_from_network = previous_builder
-            if previous_file_builder is not None:
-                dc_lf.build_dc_ppc_from_e_file = previous_file_builder
+            dc_lf._build_dc_ppc_from_e_file = original_loader
 
-        self.assertEqual([("DCPowerNetwork", 30, True)], calls)
+        self.assertEqual(["dc_net_30.e"], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("dc_ppc_v1", calc.ppc["format"])
 
@@ -157,10 +147,8 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
         ppc = build_dc_ppc_from_e_file(e_file)
         cached_ppc = build_dc_ppc_from_e_file(e_file)
-        copied_ppc = build_dc_ppc_from_e_file(e_file, copy_arrays=True)
 
         self.assertIs(ppc, cached_ppc)
-        self.assertIsNot(ppc["bus"], copied_ppc["bus"])
         self.assertEqual("dc_ppc_v1", ppc["format"])
         self.assertEqual((30, len(BUS_COLS)), ppc["bus"].shape)
         self.assertEqual((37, len(BRANCH_COLS)), ppc["branch"].shape)
@@ -177,12 +165,12 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import BUS_COLS, DCPowerNetwork, build_dc_ppc_from_e_file, build_dc_ppc_from_network
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
-        expected = build_dc_ppc_from_e_file(e_file, use_cache=False, copy_arrays=True)
+        expected = build_dc_ppc_from_e_file(e_file)
         network = DCPowerNetwork()
         network.read_from_file(e_file)
 
         network.nodes[0].voltage = 0.987654
-        ppc = build_dc_ppc_from_network(network, copy_arrays=True)
+        ppc = build_dc_ppc_from_network(network)
 
         for key in ("branch", "load", "gen", "zero_branch", "switch", "break", "dcdc"):
             np.testing.assert_allclose(ppc[key], expected[key])
@@ -194,20 +182,21 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model import dc_array_model
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        dc_array_model.clear_dc_ppc_cache(e_file)
         original = dc_array_model.build_dc_ppc_from_network
         calls = []
 
-        def counted_builder(network, *args, **kwargs):
-            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
-            return original(network, *args, **kwargs)
+        def counted_builder(network):
+            calls.append((network.__class__.__name__, len(network.nodes)))
+            return original(network)
 
         dc_array_model.build_dc_ppc_from_network = counted_builder
         try:
-            ppc = dc_array_model.build_dc_ppc_from_e_file(e_file, use_cache=False, copy_arrays=True)
+            ppc = dc_array_model.build_dc_ppc_from_e_file(e_file)
         finally:
             dc_array_model.build_dc_ppc_from_network = original
 
-        self.assertEqual([("DCPowerNetwork", 30, False)], calls)
+        self.assertEqual([("DCPowerNetwork", 30)], calls)
         self.assertEqual("dc_ppc_v1", ppc["format"])
 
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):

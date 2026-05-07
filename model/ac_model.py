@@ -1,7 +1,3 @@
-import keyword
-from types import SimpleNamespace
-
-
 class ACIsl:
     def __init__(self, idx, is_alive):
         self.idx = idx
@@ -171,97 +167,11 @@ class ACTransformer:
         self.j_q = None
         self.j_c = None
 
-from efile_read import efile_factory_from_file_cached, efile_factory_from_rows, read_efile_rows_cached
+from efile_read import efile_factory_from_file, efile_factory_from_rows
 from unit_system import normalize_model_named_units
 
 
-_AC_DIRECT_TABLES = {
-    "PowerBase",
-    "ACNode",
-    "ACBranch",
-    "ACLoad",
-    "ACGenerator",
-    "ACShuntCompensator",
-    "ACZeroBranch",
-    "ACSwitch",
-    "ACBreak",
-    "ACTransformer",
-}
-
-
-def _to_int(value, default=0):
-    return default if value == "" else int(value)
-
-
-def _to_float(value, default=0.0):
-    return default if value == "" else float(value)
-
-
-def _row_dict(header, row):
-    return {name: row[idx] if idx < len(row) else "" for idx, name in enumerate(header)}
-
-
-def _set_present_attrs(obj, values):
-    for key, value in values.items():
-        if value == "":
-            setattr(obj, key, value)
-            continue
-        try:
-            parsed = int(value)
-        except ValueError:
-            try:
-                parsed = float(value)
-            except ValueError:
-                parsed = value
-        setattr(obj, key, parsed)
-    return obj
-
-
-def _parse_direct_cell(value):
-    if value == "":
-        return value
-    try:
-        return int(value)
-    except ValueError:
-        try:
-            return float(value)
-        except ValueError:
-            return value
-
-
-def _header_index(header, name):
-    try:
-        return header.index(name)
-    except ValueError:
-        return None
-
-
-def _int_arg(header, name, default=0):
-    idx = _header_index(header, name)
-    return repr(default) if idx is None else f"_to_int(row[{idx}], {default!r})"
-
-
-def _float_arg(header, name, default=0.0):
-    idx = _header_index(header, name)
-    return repr(default) if idx is None else f"_to_float(row[{idx}], {default!r})"
-
-
-def _str_arg(header, name, default=""):
-    idx = _header_index(header, name)
-    return repr(default) if idx is None else f"row[{idx}]"
-
-
-def _header_attr_lines(header):
-    lines = ["        values = obj.__dict__"]
-    for idx, attr in enumerate(header):
-        lines.append(f"        values[{attr!r}] = _parse_direct_cell(row[{idx}])")
-    return lines
-
-
-_AC_DIRECT_BUILDER_CACHE = {}
-
-
-_AC_DIRECT_CLASS_BY_TABLE = {
+_AC_ROW_CLASS_BY_TABLE = {
     "ACNode": ACNode,
     "ACBranch": ACBranch,
     "ACLoad": ACLoad,
@@ -274,7 +184,7 @@ _AC_DIRECT_CLASS_BY_TABLE = {
 }
 
 
-_AC_DIRECT_DEFAULT_ATTRS = {
+_AC_ROW_DEFAULT_ATTRS = {
     "ACNode": {
         "idx": 0,
         "name": "",
@@ -415,127 +325,20 @@ _AC_DIRECT_DEFAULT_ATTRS = {
 }
 
 
-_AC_DIRECT_INT_ATTRS = frozenset(("idx", "i_node", "j_node", "node", "isl", "run_stat", "status"))
-_AC_DIRECT_FLOAT_ATTRS = frozenset(
-    (
-        "vbase",
-        "voltage",
-        "angle",
-        "r",
-        "x",
-        "b",
-        "tap",
-        "shift",
-        "pbase",
-        "pv0",
-        "pv1",
-        "pv2",
-        "qbase",
-        "qv0",
-        "qv1",
-        "qv2",
-        "p",
-        "q",
-        "current",
-        "i_p",
-        "i_q",
-        "i_c",
-        "j_p",
-        "j_q",
-        "j_c",
-        "p_set",
-        "q_set",
-        "v_set",
-        "alpha",
-        "q_set",
-        "g_set",
-        "b_set",
-        "p_base",
-        "u_scale",
-        "p_scale",
-        "i_scale",
-    )
-)
+def _coerce_ac_rows(rows, table_name):
+    row_cls = _AC_ROW_CLASS_BY_TABLE[table_name]
+    defaults = _AC_ROW_DEFAULT_ATTRS.get(table_name, {})
+    output = []
+    for row in rows:
+        if isinstance(row, row_cls):
+            output.append(row)
+            continue
+        obj = row_cls.__new__(row_cls)
+        obj.__dict__.update(defaults)
+        obj.__dict__.update(getattr(row, "__dict__", {}))
+        output.append(obj)
+    return output
 
-
-def _direct_cell_assignment(attr, idx):
-    value_expr = f"row[{idx}]"
-    if attr in _AC_DIRECT_INT_ATTRS:
-        parsed_expr = f"{value_expr} if {value_expr} == '' else int({value_expr})"
-    elif attr in _AC_DIRECT_FLOAT_ATTRS:
-        parsed_expr = f"{value_expr} if {value_expr} == '' else float({value_expr})"
-    else:
-        parsed_expr = value_expr
-    if attr.isidentifier() and not keyword.iskeyword(attr):
-        return f"        obj.{attr} = {parsed_expr}"
-    return f"        setattr(obj, {attr!r}, {parsed_expr})"
-
-
-def _generated_direct_row_lines(table_name, header):
-    if table_name == "PowerBase":
-        lines = ["        obj = SimpleNamespace()"]
-    else:
-        lines = [
-            "        obj = new_row(row_cls)",
-        ]
-    assigned = set()
-    for idx, attr in enumerate(header):
-        assigned.add(attr)
-        lines.append(_direct_cell_assignment(attr, idx))
-    for attr, default in _AC_DIRECT_DEFAULT_ATTRS.get(table_name, {}).items():
-        if attr not in assigned:
-            if attr.isidentifier() and not keyword.iskeyword(attr):
-                lines.append(f"        obj.{attr} = {default!r}")
-            else:
-                lines.append(f"        setattr(obj, {attr!r}, {default!r})")
-    return lines
-
-
-def _generated_ac_table_builder(table_name, header):
-    key = (table_name, tuple(header))
-    cached = _AC_DIRECT_BUILDER_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    if table_name != "PowerBase" and table_name not in _AC_DIRECT_CLASS_BY_TABLE:
-        raise ValueError(f"Unsupported direct AC table: {table_name}")
-
-    lines = [
-        "def build(rows, row_cls=None):",
-        "    output = []",
-        "    append = output.append",
-        "    new_row = None if row_cls is None else row_cls.__new__",
-        "    for row in rows:",
-        *_generated_direct_row_lines(table_name, header),
-        "        append(obj)",
-        "    return output",
-    ]
-    namespace = globals().copy()
-    exec("\n".join(lines), namespace)
-    generated = namespace["build"]
-    row_cls = _AC_DIRECT_CLASS_BY_TABLE.get(table_name)
-
-    def builder(rows):
-        return generated(rows, row_cls)
-
-    _AC_DIRECT_BUILDER_CACHE[key] = builder
-    return builder
-
-
-def _build_ac_model_direct(file_name):
-    data = read_efile_rows_cached(file_name, use_cache=False)
-    fallback_tables = {key: value for key, value in data.items() if key not in _AC_DIRECT_TABLES}
-    fallback = efile_factory_from_rows(fallback_tables) if fallback_tables else SimpleNamespace()
-    model = fallback
-
-    for table_name in _AC_DIRECT_TABLES:
-        table = data.get(table_name, {})
-        header = table.get("header_list", [])
-        rows = table.get("rows", [])
-        builder = _generated_ac_table_builder(table_name, header)
-        setattr(model, table_name, builder(rows))
-
-    return model
 
 class ACPowerNetwork:
     def __init__(self):
@@ -603,22 +406,21 @@ class ACPowerNetwork:
         self.transformers.append(trfm)
         return trfm
 
-    def read_from_file(self, file_name):
-        self.model = _build_ac_model_direct(file_name)
+    def _load_from_model(self):
         self.p_base = normalize_model_named_units(self.model)
         self.p_base_kW = float(self.model.p_base_kW)
         self.u_scale = float(self.model.u_scale)
         self.p_scale = float(self.model.p_scale)
         self.i_scale = float(self.model.i_scale)
-        self.branches = getattr(self.model, 'ACBranch', [])
-        self.nodes = getattr(self.model, 'ACNode', [])
-        self.generators = getattr(self.model, 'ACGenerator', [])
-        self.loads = getattr(self.model, 'ACLoad', [])
-        self.switches = getattr(self.model, 'ACSwitch', [])
-        self.breakers = getattr(self.model, 'ACBreak', [])
-        self.zero_branches = getattr(self.model, 'ACZeroBranch', [])
-        self.transformers = getattr(self.model, 'ACTransformer', [])
-        self.shunt_compensators = getattr(self.model, 'ACShuntCompensator', [])
+        self.branches = _coerce_ac_rows(getattr(self.model, 'ACBranch', []), "ACBranch")
+        self.nodes = _coerce_ac_rows(getattr(self.model, 'ACNode', []), "ACNode")
+        self.generators = _coerce_ac_rows(getattr(self.model, 'ACGenerator', []), "ACGenerator")
+        self.loads = _coerce_ac_rows(getattr(self.model, 'ACLoad', []), "ACLoad")
+        self.switches = _coerce_ac_rows(getattr(self.model, 'ACSwitch', []), "ACSwitch")
+        self.breakers = _coerce_ac_rows(getattr(self.model, 'ACBreak', []), "ACBreak")
+        self.zero_branches = _coerce_ac_rows(getattr(self.model, 'ACZeroBranch', []), "ACZeroBranch")
+        self.transformers = _coerce_ac_rows(getattr(self.model, 'ACTransformer', []), "ACTransformer")
+        self.shunt_compensators = _coerce_ac_rows(getattr(self.model, 'ACShuntCompensator', []), "ACShuntCompensator")
         self.node_dict = {}
         self.bus_dict = {}
         self.node_to_bus = {}
@@ -632,6 +434,14 @@ class ACPowerNetwork:
         self.shunt_compensator_dict = {}
         self.islands = []
         self.buses = []
+
+    def read_from_model(self, model):
+        self.model = efile_factory_from_rows(model) if isinstance(model, dict) else model
+        self._load_from_model()
+
+    def read_from_file(self, file_name):
+        self.source = str(file_name)
+        self.read_from_model(efile_factory_from_file(file_name))
 
     def format_assoc(self):
         """

@@ -136,7 +136,7 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertTrue(object_calc.converged)
 
         ppc = build_ac_ppc_from_e_file(case_path)
-        ppc_calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        ppc_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             ppc_calc.prepare()
             ppc_rc = ppc_calc.run()
@@ -156,8 +156,8 @@ class ACPPCFlowTest(unittest.TestCase):
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
 
-        nr_calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
-        pq_calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
+        nr_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        pq_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
         with contextlib.redirect_stdout(io.StringIO()):
             nr_calc.prepare()
             nr_rc = nr_calc.run()
@@ -191,7 +191,7 @@ class ACPPCFlowTest(unittest.TestCase):
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         with self.assertRaises(ValueError):
-            ACPowerFlowCalc.from_ppc(ppc, algorithm="bad")
+            ACPowerFlowCalc(ppc, algorithm="bad")
 
     def test_ac_power_flow_can_load_e_file_through_efile_reader_path(self):
         import ac_lf
@@ -203,9 +203,9 @@ class ACPPCFlowTest(unittest.TestCase):
         previous_file_builder = getattr(ac_lf, "build_ac_ppc_from_e_file", None)
         calls = []
 
-        def counted_builder(network, *args, **kwargs):
-            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
-            return original_builder(network, *args, **kwargs)
+        def counted_builder(network):
+            calls.append((network.__class__.__name__, len(network.nodes)))
+            return original_builder(network)
 
         def reject_file_builder(*_args, **_kwargs):
             raise AssertionError("AC LF should build ppc from an already loaded ACPowerNetwork")
@@ -214,7 +214,8 @@ class ACPPCFlowTest(unittest.TestCase):
         if previous_file_builder is not None:
             ac_lf.build_ac_ppc_from_e_file = reject_file_builder
         try:
-            calc = ACPowerFlowCalc.from_e_file(case_path, tol=1e-8, max_iter=50)
+            ppc = ac_lf.load_ac_ppc_from_e_file(case_path)
+            calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         finally:
             if previous_builder is None:
                 del ac_lf.build_ac_ppc_from_network
@@ -223,7 +224,7 @@ class ACPPCFlowTest(unittest.TestCase):
             if previous_file_builder is not None:
                 ac_lf.build_ac_ppc_from_e_file = previous_file_builder
 
-        self.assertEqual([("ACPowerNetwork", 300, True)], calls)
+        self.assertEqual([("ACPowerNetwork", 300)], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
 
@@ -232,13 +233,13 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_model import ACPowerNetwork
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
-        expected = build_ac_ppc_from_e_file(case_path, use_cache=False, copy_arrays=True)
+        expected = build_ac_ppc_from_e_file(case_path)
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             network.read_from_file(case_path)
 
         network.nodes[0].voltage = 0.987654
-        ppc = build_ac_ppc_from_network(network, copy_arrays=True)
+        ppc = build_ac_ppc_from_network(network)
 
         for key in ("branch", "transformer", "gen", "load", "shunt", "zero_branch", "switch", "break"):
             np.testing.assert_allclose(ppc[key], expected[key])
@@ -250,27 +251,30 @@ class ACPPCFlowTest(unittest.TestCase):
         import ac_array_model
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        ac_array_model.clear_ac_ppc_cache(case_path)
         original = ac_array_model.build_ac_ppc_from_network
         calls = []
 
-        def counted_builder(network, *args, **kwargs):
-            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
-            return original(network, *args, **kwargs)
+        def counted_builder(network):
+            calls.append((network.__class__.__name__, len(network.nodes)))
+            return original(network)
 
         ac_array_model.build_ac_ppc_from_network = counted_builder
         try:
-            ppc = ac_array_model.build_ac_ppc_from_e_file(case_path, use_cache=False, copy_arrays=True)
+            ppc = ac_array_model.build_ac_ppc_from_e_file(case_path)
         finally:
             ac_array_model.build_ac_ppc_from_network = original
 
-        self.assertEqual([("ACPowerNetwork", 300, False)], calls)
+        self.assertEqual([("ACPowerNetwork", 300)], calls)
         self.assertEqual("ac_ppc_v1", ppc["format"])
 
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
         source = (ROOT_DIR / "lfcore" / "ac_lf.py").read_text(encoding="utf-8")
-        main_block = source.split('if __name__ == "__main__":', 1)[1]
+        main_block = source.split("def main", 1)[1].split('if __name__ == "__main__":', 1)[0]
 
-        self.assertIn("ACPowerFlowCalc.from_e_file", main_block)
+        self.assertIn("load_ac_ppc_from_e_file(args.file)", main_block)
+        self.assertIn("ACPowerFlowCalc(", main_block)
+        self.assertNotIn("ACPowerFlowCalc.from_e_file", main_block)
         self.assertNotIn("read_from_file", main_block)
         self.assertNotIn("ACPowerNetwork", main_block)
 
@@ -306,7 +310,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
         ac_lf.splu = wrapped_splu
         try:
-            calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
+            calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
             with contextlib.redirect_stdout(io.StringIO()):
                 calc.prepare()
             ac_lf.spsolve = reject_spsolve
@@ -328,7 +332,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
-        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
 
@@ -347,7 +351,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
-        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
         self.assertEqual(0, calc.N_phi)
@@ -372,7 +376,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
-        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
 
@@ -400,7 +404,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
-        calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
 
         original_connected_components = ac_lf.connected_components
         calls = []
@@ -419,8 +423,8 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual([(ppc["bus"].shape[0], ppc["bus"].shape[0])], calls)
         self.assertGreater(calc.N, 0)
 
-    def test_efile_dict_cache_reuses_unchanged_parse(self):
-        from efile_read import clear_efile_cache, read_efile_dict_cached
+    def test_efile_factory_from_file_returns_fresh_model_without_cache(self):
+        from efile_read import efile_factory_from_file
 
         content = "\n".join(
             [
@@ -432,13 +436,13 @@ class ACPPCFlowTest(unittest.TestCase):
             ]
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "cache.e"
+            path = Path(tmp_dir) / "factory.e"
             path.write_text(content, encoding="utf-8")
-            clear_efile_cache()
-            first = read_efile_dict_cached(path)
-            second = read_efile_dict_cached(path)
+            first = efile_factory_from_file(path)
+            second = efile_factory_from_file(path)
 
-        self.assertIs(first, second)
+        self.assertIsNot(first, second)
+        self.assertEqual(first.PowerBase[0].p_base, second.PowerBase[0].p_base)
 
 
 if __name__ == "__main__":

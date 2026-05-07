@@ -4,30 +4,18 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-try:
-    from scipy.sparse import coo_matrix as SP_COO_MATRIX
-    from scipy.sparse import csc_matrix as SP_CSC_MATRIX
-    from scipy.sparse import csr_matrix as SP_CSR_MATRIX
-    from scipy.sparse import issparse as SP_ISSPARSE
-except Exception:
-    SP_COO_MATRIX = None
-    SP_CSC_MATRIX = None
-    SP_CSR_MATRIX = None
-    SP_ISSPARSE = None
-
-try:
-    from scipy.sparse.csgraph import structural_rank as SP_STRUCTURAL_RANK
-except Exception:
-    SP_STRUCTURAL_RANK = None
-
-try:
-    from scipy.sparse.linalg import MatrixRankWarning as SP_MATRIX_RANK_WARNING
-    from scipy.sparse.linalg import splu as SP_SPLU
-    from scipy.sparse.linalg import spsolve as SP_SPSOLVE
-except Exception:
-    SP_MATRIX_RANK_WARNING = None
-    SP_SPLU = None
-    SP_SPSOLVE = None
+from scipy.linalg import cho_factor as CHO_FACTOR
+from scipy.linalg import cho_solve as CHO_SOLVE
+from scipy.linalg.lapack import dposv as DPOSV
+from scipy.linalg.lapack import dpotrf as DPOTRF
+from scipy.sparse import coo_matrix as SP_COO_MATRIX
+from scipy.sparse import csc_matrix as SP_CSC_MATRIX
+from scipy.sparse import csr_matrix as SP_CSR_MATRIX
+from scipy.sparse import issparse as SP_ISSPARSE
+from scipy.sparse.csgraph import structural_rank as SP_STRUCTURAL_RANK
+from scipy.sparse.linalg import MatrixRankWarning as SP_MATRIX_RANK_WARNING
+from scipy.sparse.linalg import splu as SP_SPLU
+from scipy.sparse.linalg import spsolve as SP_SPSOLVE
 
 try:
     from sksparse.cholmod import cholesky as CHOLMOD_CHOLESKY
@@ -35,20 +23,6 @@ try:
 except Exception:
     CHOLMOD_CHOLESKY = None
     CHOLMOD_ANALYZE = None
-
-try:
-    from scipy.linalg.lapack import dposv as DPOSV
-    from scipy.linalg.lapack import dpotrf as DPOTRF
-except Exception:
-    DPOSV = None
-    DPOTRF = None
-
-try:
-    from scipy.linalg import cho_factor as CHO_FACTOR
-    from scipy.linalg import cho_solve as CHO_SOLVE
-except Exception:
-    CHO_FACTOR = None
-    CHO_SOLVE = None
 
 
 ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
@@ -362,11 +336,6 @@ class SparseJacobianBuilder:
                 copy=False,
             )
         rows, cols, data = self._coo_arrays()
-        if SP_COO_MATRIX is None:
-            dense = np.zeros(self.shape, dtype=np.float64)
-            if rows.size:
-                np.add.at(dense, (rows, cols), data)
-            return dense
         if self._cached_pattern_linear is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
             n_cols = int(self.shape[1])
             linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
@@ -384,31 +353,30 @@ class SparseJacobianBuilder:
                     copy=False,
                 )
         csr = SP_COO_MATRIX((data, (rows, cols)), shape=self.shape).tocsr(copy=False)
-        if SP_CSR_MATRIX is not None:
-            indptr = csr.indptr.astype(np.int32, copy=True)
-            indices = csr.indices.astype(np.int32, copy=True)
-            pattern_rows = np.repeat(np.arange(self.shape[0], dtype=np.int64), np.diff(indptr).astype(np.int64, copy=False))
-            pattern_linear = pattern_rows * np.int64(self.shape[1]) + indices.astype(np.int64, copy=False)
-            self._cached_pattern_linear = pattern_linear
-            self._cached_pattern_indptr = indptr
-            self._cached_pattern_indices = indices
-            if self._assume_fixed_pattern:
-                n_cols = int(self.shape[1])
-                linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
-                slot = np.searchsorted(pattern_linear, linear)
-                if slot.size and int(slot.max()) < pattern_linear.size and np.array_equal(pattern_linear[slot], linear):
-                    self._set_cached_slot_positions(slot)
-                    self._cached_csr_data = csr.data
+        indptr = csr.indptr.astype(np.int32, copy=True)
+        indices = csr.indices.astype(np.int32, copy=True)
+        pattern_rows = np.repeat(np.arange(self.shape[0], dtype=np.int64), np.diff(indptr).astype(np.int64, copy=False))
+        pattern_linear = pattern_rows * np.int64(self.shape[1]) + indices.astype(np.int64, copy=False)
+        self._cached_pattern_linear = pattern_linear
+        self._cached_pattern_indptr = indptr
+        self._cached_pattern_indices = indices
+        if self._assume_fixed_pattern:
+            n_cols = int(self.shape[1])
+            linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
+            slot = np.searchsorted(pattern_linear, linear)
+            if slot.size and int(slot.max()) < pattern_linear.size and np.array_equal(pattern_linear[slot], linear):
+                self._set_cached_slot_positions(slot)
+                self._cached_csr_data = csr.data
         return csr
 
 
 def is_sparse_matrix(matrix) -> bool:
-    return bool(SP_ISSPARSE is not None and SP_ISSPARSE(matrix))
+    return bool(SP_ISSPARSE(matrix))
 
 
 def sparse_structural_rank(matrix) -> Optional[int]:
-    """Return sparse structural rank when SciPy provides the graph matcher."""
-    if SP_STRUCTURAL_RANK is None or not is_sparse_matrix(matrix):
+    """Return sparse structural rank for sparse matrices."""
+    if not is_sparse_matrix(matrix):
         return None
     return int(SP_STRUCTURAL_RANK(matrix))
 
@@ -419,7 +387,7 @@ def matrix_is_empty(matrix) -> bool:
 
 def _normal_equation_structural_pattern(H):
     """Return the structural pattern implied by H.T @ H, retaining zero entries."""
-    if SP_COO_MATRIX is None or not is_sparse_matrix(H):
+    if not is_sparse_matrix(H):
         return None
     H_csc = H if getattr(H, "format", None) == "csc" else H.tocsc()
     digest = hashlib.blake2b(
@@ -442,7 +410,7 @@ def _normal_equation_structural_pattern(H):
 
 def _expand_sparse_matrix_to_pattern(matrix, pattern):
     """Return matrix on the union pattern, keeping explicit structural zeros."""
-    if pattern is None or SP_COO_MATRIX is None or SP_CSC_MATRIX is None:
+    if pattern is None:
         return matrix
     matrix_csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
     pattern_csc = pattern if getattr(pattern, "format", None) == "csc" else pattern.tocsc()
@@ -568,7 +536,7 @@ def observability_rank_details(
             return state_count, 0, np.array([], dtype=np.float64), weak_states
         except Exception:
             pass
-    if normal_factor_diag is None and is_sparse_matrix(gram) and SP_SPLU is not None:
+    if normal_factor_diag is None and is_sparse_matrix(gram):
         gram_csc = gram.tocsc()
         try:
             lu = SP_SPLU(gram_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
@@ -584,20 +552,12 @@ def observability_rank_details(
                 return state_count, 0, np.array([], dtype=np.float64), weak_states
         except Exception:
             pass
-    elif normal_factor_diag is None and DPOTRF is not None:
+    elif normal_factor_diag is None:
         chol, info = DPOTRF(gram, lower=True, clean=False, overwrite_a=False)
         if info == 0:
             diag = np.diag(chol)
             if diag.size == state_count and float(np.min(diag)) > tol:
                 return state_count, 0, np.array([], dtype=np.float64), weak_states
-    elif normal_factor_diag is None:
-        try:
-            chol = np.linalg.cholesky(gram)
-            diag = np.diag(chol)
-            if diag.size == state_count and float(np.min(diag)) > tol:
-                return state_count, 0, np.array([], dtype=np.float64), weak_states
-        except np.linalg.LinAlgError:
-            pass
 
     if state_count > dense_svd_limit:
         # Dense SVD of multi-thousand-state sparse Jacobians can dominate the
@@ -798,30 +758,25 @@ def _solve_normal_equations_no_cholmod(
     rhs: np.ndarray,
     return_factor_diag: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if SP_SPLU is not None:
-        try:
-            lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
-            factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
-            return lu.solve(rhs), factor_diag
-        except Exception:
-            pass
-        try:
-            lu = SP_SPLU(gain_csc)
-            factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
-            return lu.solve(rhs), factor_diag
-        except Exception:
-            pass
-    if SP_SPSOLVE is not None:
-        try:
-            if SP_MATRIX_RANK_WARNING is None:
-                dx = SP_SPSOLVE(gain_csc, rhs)
-            else:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", SP_MATRIX_RANK_WARNING)
-                    dx = SP_SPSOLVE(gain_csc, rhs)
-            return dx, None
-        except Exception:
-            pass
+    try:
+        lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
+        factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
+        return lu.solve(rhs), factor_diag
+    except Exception:
+        pass
+    try:
+        lu = SP_SPLU(gain_csc)
+        factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
+        return lu.solve(rhs), factor_diag
+    except Exception:
+        pass
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SP_MATRIX_RANK_WARNING)
+            dx = SP_SPSOLVE(gain_csc, rhs)
+        return dx, None
+    except Exception:
+        pass
     return _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
 
 
@@ -830,22 +785,20 @@ def _solve_dense_normal_equations(
     rhs: np.ndarray,
     return_factor_diag: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if DPOSV is not None:
-        try:
-            factor, dx, info = DPOSV(gain, rhs.copy(), lower=True, overwrite_a=False, overwrite_b=True)
-            if info == 0:
-                factor_diag = np.diag(factor).copy() if return_factor_diag else None
-                return dx, factor_diag
-        except Exception:
-            pass
-    if CHO_FACTOR is not None and CHO_SOLVE is not None:
-        try:
-            factor = CHO_FACTOR(gain, lower=True, check_finite=False)
-            dx = CHO_SOLVE(factor, rhs, check_finite=False)
-            factor_diag = np.diag(factor[0]).copy() if return_factor_diag else None
+    try:
+        factor, dx, info = DPOSV(gain, rhs.copy(), lower=True, overwrite_a=False, overwrite_b=True)
+        if info == 0:
+            factor_diag = np.diag(factor).copy() if return_factor_diag else None
             return dx, factor_diag
-        except Exception:
-            pass
+    except Exception:
+        pass
+    try:
+        factor = CHO_FACTOR(gain, lower=True, check_finite=False)
+        dx = CHO_SOLVE(factor, rhs, check_finite=False)
+        factor_diag = np.diag(factor[0]).copy() if return_factor_diag else None
+        return dx, factor_diag
+    except Exception:
+        pass
     try:
         return np.linalg.solve(gain, rhs), None
     except np.linalg.LinAlgError:

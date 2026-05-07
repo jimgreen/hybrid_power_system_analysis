@@ -5,11 +5,6 @@ from pathlib import Path
 
 
 _QUOTED_SPLIT_RE = re.compile(r"\s+(?=(?:[^']*'[^']*')*[^']*$)")
-_CLASS_CACHE = {}
-_ROW_CLASS_CACHE = {}
-_EFILE_CACHE = {}
-_EFILE_ROW_CACHE = {}
-_EFILE_CACHE_LOCK = threading.Lock()
 
 
 def _looks_numeric_cell(value):
@@ -202,44 +197,6 @@ class EBook():
             fp.write(''.join(parts))
 
 
-def _efile_cache_key(file_path):
-    path = Path(file_path).resolve()
-    stat = path.stat()
-    return path, stat.st_mtime_ns, stat.st_size
-
-
-def read_efile_dict_cached(file_path, use_cache=True):
-    """Read an E file as raw table dictionaries and reuse the parse while unchanged."""
-    if not use_cache:
-        return EBook(file_path).to_dict()
-    key = _efile_cache_key(file_path)
-    path = key[0]
-    with _EFILE_CACHE_LOCK:
-        cached = _EFILE_CACHE.get(path)
-        if cached is not None and cached[0] == key:
-            return cached[1]
-    data = EBook(path).to_dict()
-    with _EFILE_CACHE_LOCK:
-        _EFILE_CACHE[path] = (key, data)
-    return data
-
-
-def read_efile_rows_cached(file_path, use_cache=True):
-    """Read an E file as raw header/row token lists and reuse the parse while unchanged."""
-    if not use_cache:
-        return _read_efile_rows(file_path)
-    key = _efile_cache_key(file_path)
-    path = key[0]
-    with _EFILE_CACHE_LOCK:
-        cached = _EFILE_ROW_CACHE.get(path)
-        if cached is not None and cached[0] == key:
-            return cached[1]
-    data = _read_efile_rows(path)
-    with _EFILE_CACHE_LOCK:
-        _EFILE_ROW_CACHE[path] = (key, data)
-    return data
-
-
 def _read_efile_rows(file_path):
     data = {}
     block_name = None
@@ -296,18 +253,6 @@ def _read_efile_rows(file_path):
     return data
 
 
-def clear_efile_cache(file_path=None):
-    """Clear all cached E parses, or just one file when a path is supplied."""
-    with _EFILE_CACHE_LOCK:
-        if file_path is None:
-            _EFILE_CACHE.clear()
-            _EFILE_ROW_CACHE.clear()
-        else:
-            path = Path(file_path).resolve()
-            _EFILE_CACHE.pop(path, None)
-            _EFILE_ROW_CACHE.pop(path, None)
-
-
 class _Base:
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -324,10 +269,6 @@ def _class_factory(class_name, attrs, converters=None):
         converters = tuple(_convert_cell for _ in attrs)
     else:
         converters = tuple(converters)
-    key = (class_name, tuple(attrs), tuple(id(converter) for converter in converters))
-    cached = _CLASS_CACHE.get(key)
-    if cached is not None:
-        return cached
     attr_names = tuple(attrs)
 
     init_globals = {}
@@ -380,9 +321,7 @@ def _class_factory(class_name, attrs, converters=None):
 
     attributes = {attr: None for attr in attrs}
     attributes["__init__"] = __init__
-    cls = type(class_name, (_Base,), attributes)
-    _CLASS_CACHE[key] = cls
-    return cls
+    return type(class_name, (_Base,), attributes)
 
 
 def _row_class_factory(class_name, attrs, converters=None):
@@ -392,10 +331,6 @@ def _row_class_factory(class_name, attrs, converters=None):
         converters = tuple(_convert_cell for _ in attrs)
     else:
         converters = tuple(converters)
-    key = (class_name, tuple(attrs), tuple(id(converter) for converter in converters))
-    cached = _ROW_CLASS_CACHE.get(key)
-    if cached is not None:
-        return cached
 
     init_globals = {}
     init_lines = [
@@ -444,9 +379,7 @@ def _row_class_factory(class_name, attrs, converters=None):
     exec("\n".join(init_lines), init_globals)
     attributes = {attr: None for attr in attrs}
     attributes["__init__"] = init_globals["__init__"]
-    cls = type(class_name, (_Base,), attributes)
-    _ROW_CLASS_CACHE[key] = cls
-    return cls
+    return type(class_name, (_Base,), attributes)
 
 
 def _infer_row_converters(header, rows):
@@ -484,8 +417,8 @@ def efile_factory_from_rows(data):
     return new_cls_dict
 
 
-def efile_factory_from_file_cached(file_path, use_cache=True):
-    return efile_factory_from_rows(read_efile_rows_cached(file_path, use_cache=use_cache))
+def efile_factory_from_file(file_path):
+    return efile_factory_from_rows(_read_efile_rows(file_path))
 
 
 def efile_factory(data):

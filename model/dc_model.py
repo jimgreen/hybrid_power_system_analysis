@@ -141,7 +141,7 @@ class DCDCConverter:
 
 
 
-from efile_read import efile_factory,EBook
+from efile_read import efile_factory_from_file, efile_factory_from_rows
 from unit_system import normalize_model_named_units
 
 
@@ -209,27 +209,43 @@ class DCPowerNetwork:
         self.dcdc_converters.append(dc)
         return dc
 
-    def read_from_file(self, file_name):
-        self.model = efile_factory(EBook(file_name).to_dict())
+    def _load_from_model(self):
         self.p_base = normalize_model_named_units(self.model)
         self.p_base_kW = float(self.model.p_base_kW)
         self.u_scale = float(self.model.u_scale)
         self.p_scale = float(self.model.p_scale)
         self.i_scale = float(self.model.i_scale)
-        self.branches = self.model.DCBranch
-        self.nodes = self.model.DCNode
-        self.generators = self.model.DCGenerator
-        self.loads = self.model.DCLoad
-        self.dcdc_converters = self.model.DCDCConverter
-        self.switches = self.model.DCSwitch
-        self.zero_branches = self.model.DCZeroBranch
+        self.branches = getattr(self.model, 'DCBranch', [])
+        self.nodes = getattr(self.model, 'DCNode', [])
+        self.generators = getattr(self.model, 'DCGenerator', [])
+        self.loads = getattr(self.model, 'DCLoad', [])
+        self.dcdc_converters = getattr(self.model, 'DCDCConverter', [])
+        self.switches = getattr(self.model, 'DCSwitch', [])
+        self.zero_branches = getattr(self.model, 'DCZeroBranch', [])
         self.breakers = [
             self._coerce_break(row)
             for row in getattr(self.model, 'DCBreak', [])
         ]
         self.buses = []
+        self.islands = []
+        self.node_dict = {}
         self.bus_dict = {}
         self.node_to_bus = {}
+        self.switch_dict = {}
+        self.break_dict = {}
+        self.load_dict = {}
+        self.generator_dict = {}
+        self.zero_branche_dict = {}
+        self.branche_dict = {}
+        self.dcdc_converter_dict = {}
+
+    def read_from_model(self, model):
+        self.model = efile_factory_from_rows(model) if isinstance(model, dict) else model
+        self._load_from_model()
+
+    def read_from_file(self, file_name):
+        self.source = str(file_name)
+        self.read_from_model(efile_factory_from_file(file_name))
 
     @staticmethod
     def _coerce_break(row):

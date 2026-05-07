@@ -57,6 +57,130 @@ def _write_se_para(
 
 
 class AlgorithmParameterFileTest(unittest.TestCase):
+    def test_ac_lf_cli_accepts_parameter_file_argument(self):
+        import lfcore.ac_lf as ac_lf
+
+        calls = []
+
+        class FakeCalc:
+            skipped_islands = []
+            converged = True
+            iterations = 0
+            normF = 0.0
+
+            def __init__(self, ppc, **kwargs):
+                calls.append(("calc", ppc["format"], kwargs.get("parameter_file")))
+
+            def prepare(self):
+                calls.append("prepare")
+
+            def run(self):
+                calls.append("run")
+                return 0
+
+        original_loader = ac_lf.load_ac_ppc_from_e_file
+        original_calc = ac_lf.ACPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return {"format": "ac_ppc_v1"}
+
+        ac_lf.load_ac_ppc_from_e_file = fake_loader
+        ac_lf.ACPowerFlowCalc = FakeCalc
+        try:
+            rc = ac_lf.main(["data/ac/ieee39.e", "--para", "custom_lf.para", "--quiet"])
+        finally:
+            ac_lf.load_ac_ppc_from_e_file = original_loader
+            ac_lf.ACPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual([("load", "ieee39.e"), ("calc", "ac_ppc_v1", "custom_lf.para"), "prepare", "run"], calls)
+
+    def test_dc_lf_cli_accepts_parameter_file_argument(self):
+        import lfcore.dc_lf as dc_lf
+
+        calls = []
+
+        class FakeCalc:
+            converged = True
+            iterations = 0
+            normF = 0.0
+
+            def __init__(self, network, **kwargs):
+                calls.append(("calc", network, kwargs.get("parameter_file")))
+                self.model = network
+
+            def run(self, **_kwargs):
+                calls.append("run")
+                return 0
+
+        original_loader = dc_lf.load_dc_ppc_from_e_file
+        original_network_builder = dc_lf._dc_network_from_ppc
+        original_calc = dc_lf.DCPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return {"format": "dc_ppc_v1"}
+
+        def fake_network_builder(ppc):
+            calls.append(("network", ppc["format"]))
+            return "dc-network"
+
+        dc_lf.load_dc_ppc_from_e_file = fake_loader
+        dc_lf._dc_network_from_ppc = fake_network_builder
+        dc_lf.DCPowerFlowCalc = FakeCalc
+        try:
+            rc = dc_lf.main(["data/dc/dc_net_30.e", "--para", "custom_lf.para", "--quiet"])
+        finally:
+            dc_lf.load_dc_ppc_from_e_file = original_loader
+            dc_lf._dc_network_from_ppc = original_network_builder
+            dc_lf.DCPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual(
+            [("load", "dc_net_30.e"), ("network", "dc_ppc_v1"), ("calc", "dc-network", "custom_lf.para"), "run"],
+            calls,
+        )
+
+    def test_hybrid_lf_cli_accepts_parameter_file_argument(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        calls = []
+
+        class FakeCalc:
+            converged = True
+
+            def __init__(self, network, **kwargs):
+                calls.append(("calc", network, kwargs.get("parameter_file")))
+
+            def prepare(self):
+                calls.append("prepare")
+
+            def run(self):
+                calls.append("run")
+                return 0
+
+            def _build_lf_result(self):
+                return hybrid_lf.HybridLFResult(calc=self, rc=0)
+
+        original_loader = hybrid_lf._read_lf_network_from_file
+        original_calc = hybrid_lf.HybridPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return "hybrid-network"
+
+        hybrid_lf._read_lf_network_from_file = fake_loader
+        hybrid_lf.HybridPowerFlowCalc = FakeCalc
+        try:
+            rc = hybrid_lf.main(["data/hybrid/hybrid_net_40.e", "--para", "custom_lf.para", "--quiet"])
+        finally:
+            hybrid_lf._read_lf_network_from_file = original_loader
+            hybrid_lf.HybridPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "custom_lf.para"), "prepare", "run"], calls)
+
     def test_power_flow_classes_read_algorithm_parameters_from_lf_para(self):
         from algorithm_parameters import load_lf_parameters
         from lfcore.ac_lf import ACPowerFlowCalc

@@ -360,16 +360,16 @@ class ACStateEstimationTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            original_factory = efile_read.efile_factory_from_file_cached
+            original_factory = efile_read.efile_factory_from_file
 
             def reject_factory(_file_name):
                 raise AssertionError("measurement loading should use raw rows, not row objects")
 
-            efile_read.efile_factory_from_file_cached = reject_factory
+            efile_read.efile_factory_from_file = reject_factory
             try:
                 measurements = Measurement.read_from_file(meas_file)
             finally:
-                efile_read.efile_factory_from_file_cached = original_factory
+                efile_read.efile_factory_from_file = original_factory
 
         self.assertEqual(1, len(measurements))
         self.assertEqual("V", measurements[0].meas_type)
@@ -397,16 +397,8 @@ class ACStateEstimationTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            original_read_rows = efile_read.read_efile_rows_cached
-
-            def reject_read_rows(_file_name):
-                raise AssertionError("measurement loading should use the dedicated Measurement parser")
-
-            efile_read.read_efile_rows_cached = reject_read_rows
-            try:
-                measurements = Measurement.read_from_file(meas_file)
-            finally:
-                efile_read.read_efile_rows_cached = original_read_rows
+            self.assertFalse(hasattr(efile_read, "read_efile_rows_cached"))
+            measurements = Measurement.read_from_file(meas_file)
 
         self.assertEqual(1, len(measurements))
         self.assertEqual("V", measurements[0].meas_type)
@@ -689,73 +681,32 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(8, rows[1].idx)
         self.assertEqual("", rows[1].value)
 
-    def test_ac_direct_model_constructor_matches_generic_counts(self):
-        import secore.ac_se
-        import ac_model
+    def test_ac_model_prunes_obsolete_direct_cache_helpers(self):
+        import model.ac_model as ac_model
 
-        path = ROOT_DIR / "data" / "ac" / "ieee39.e"
-        direct = ac_model._build_ac_model_direct(path)
-        generic = ac_model.efile_factory_from_file_cached(path)
-
-        for attr in (
-            "ACNode",
-            "ACBranch",
-            "ACLoad",
-            "ACGenerator",
-            "ACTransformer",
-            "ACZeroBranch",
-            "ACSwitch",
-            "ACShuntCompensator",
-        ):
-            self.assertEqual(len(getattr(generic, attr, [])), len(getattr(direct, attr, [])))
-
-    def test_ac_direct_model_constructor_bypasses_row_dicts(self):
-        import secore.ac_se
-        import ac_model
-
-        original = ac_model._row_dict
-
-        def reject_row_dict(*_args, **_kwargs):
-            raise AssertionError("generated AC direct constructor should not build per-row dictionaries")
-
-        ac_model._row_dict = reject_row_dict
-        try:
-            direct = ac_model._build_ac_model_direct(ROOT_DIR / "data" / "ac" / "ieee39.e")
-        finally:
-            ac_model._row_dict = original
-
-        self.assertTrue(getattr(direct, "ACNode", []))
-
-    def test_ac_direct_model_constructor_bypasses_ac_class_initializers(self):
-        import secore.ac_se
-        import ac_model
-
-        patched_classes = (
-            ac_model.ACNode,
-            ac_model.ACBranch,
-            ac_model.ACLoad,
-            ac_model.ACGenerator,
-            ac_model.ACShuntCompensator,
-            ac_model.ACZeroBranch,
-            ac_model.ACSwitch,
-            ac_model.ACTransformer,
+        obsolete_names = (
+            "_AC_DIRECT_BUILDER_CACHE",
+            "_AC_DIRECT_FLOAT_ATTRS",
+            "_AC_DIRECT_INT_ATTRS",
+            "_AC_DIRECT_TABLES",
+            "_build_ac_model_direct",
+            "_build_ac_model_from_cache",
+            "_direct_cell_assignment",
+            "_float_arg",
+            "_generated_ac_table_builder",
+            "_generated_direct_row_lines",
+            "_header_attr_lines",
+            "_header_index",
+            "_int_arg",
+            "_parse_direct_cell",
+            "_row_dict",
+            "_set_present_attrs",
+            "_str_arg",
+            "_to_float",
+            "_to_int",
         )
-        originals = {cls: cls.__init__ for cls in patched_classes}
 
-        def reject_init(self, *_args, **_kwargs):
-            raise AssertionError("direct AC constructor should bypass AC class __init__")
-
-        for cls in patched_classes:
-            cls.__init__ = reject_init
-        try:
-            direct = ac_model._build_ac_model_direct(ROOT_DIR / "data" / "ac" / "ieee39.e")
-        finally:
-            for cls, original in originals.items():
-                cls.__init__ = original
-
-        self.assertIsInstance(direct.ACNode[0], ac_model.ACNode)
-        self.assertIsInstance(direct.ACBranch[0], ac_model.ACBranch)
-        self.assertTrue(hasattr(direct.ACBranch[0], "i_node_obj"))
+        self.assertEqual([], [name for name in obsolete_names if hasattr(ac_model, name)])
 
     def test_ac_network_load_builds_ppc_from_loaded_network(self):
         import secore.ac_se
@@ -766,9 +717,9 @@ class ACStateEstimationTest(unittest.TestCase):
         previous_file_loader = getattr(secore.ac_se, "load_ac_ppc_from_e_file", None)
         calls = []
 
-        def counted_builder(network, *args, **kwargs):
-            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
-            return original_builder(network, *args, **kwargs)
+        def counted_builder(network):
+            calls.append((network.__class__.__name__, len(network.nodes)))
+            return original_builder(network)
 
         def reject_file_loader(*_args, **_kwargs):
             raise AssertionError("AC SE should build ppc from an already loaded ACPowerNetwork")
@@ -789,7 +740,7 @@ class ACStateEstimationTest(unittest.TestCase):
             if previous_file_loader is not None:
                 secore.ac_se.load_ac_ppc_from_e_file = previous_file_loader
 
-        self.assertEqual([("ACPowerNetwork", 39, False)], calls)
+        self.assertEqual([("ACPowerNetwork", 39)], calls)
         self.assertTrue(estimator.nodes)
         self.assertTrue(hasattr(estimator.network, "_array_model"))
 

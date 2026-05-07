@@ -7,14 +7,9 @@ MODEL_DIR = Path(__file__).resolve().parent
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-try:
-    from ac_model import ACPowerNetwork
-    from dc_array_model import DCPowerNetwork
-    from hybrid_array_model import build_hybrid_model_from_ppc, build_hybrid_ppc_from_e_file
-except ImportError:
-    from ac_model import ACPowerNetwork
-    from dc_array_model import DCPowerNetwork
-    from hybrid_array_model import build_hybrid_model_from_ppc, build_hybrid_ppc_from_e_file
+from ac_model import ACPowerNetwork
+from dc_array_model import DCPowerNetwork
+from hybrid_array_model import build_hybrid_model_from_ppc, build_hybrid_ppc_from_e_file
 
 
 ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
@@ -144,23 +139,8 @@ class HybridPowerNetwork:
     hybrid_islands: List[HybridIsland] = field(default_factory=list)
 
     @classmethod
-    def read_from_file(cls, file_name, **_ignored) -> "HybridPowerNetwork":
-        ppc = build_hybrid_ppc_from_e_file(file_name, use_cache=True, copy_arrays=True)
-        model = build_hybrid_model_from_ppc(ppc)
-        network = cls(
-            ac=model.ac,
-            dc=model.dc,
-            dcac_converters=getattr(model, "DCACConverter", []),
-            acac_converters=getattr(model, "ACACConverter", []),
-        )
-        network.ppc = ppc
-        network._ac_ppc = ppc["ac"]
-        network._dc_ppc = ppc["dc"]
-        network.p_base = float(model.p_base)
-        network.p_base_kW = float(model.p_base_kW)
-        network.u_scale = float(model.u_scale)
-        network.p_scale = float(model.p_scale)
-        network.i_scale = float(model.i_scale)
+    def read_from_file(cls, file_name) -> "HybridPowerNetwork":
+        network, _ppc = build_hybrid_ppc_from_e_file(file_name)
         return network
 
     @property

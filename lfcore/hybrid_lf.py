@@ -8,8 +8,6 @@ from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
-from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import spsolve
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -21,11 +19,13 @@ MODEL_DIR = ROOT_DIR / "model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-from ac_lf import ACLFResult, ACPowerFlowCalc
+from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, coo_matrix, solve_sparse_system
 from dc_lf import DCLFResult, DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
-from model.hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
-from model.hybrid_array_model import (
+from hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
+from ac_array_model import build_ac_network_from_ppc
+from dc_array_model import build_dc_network_from_ppc
+from hybrid_array_model import (
     ACAC_COLS,
     ACAC_CONTROL_LABEL,
     DCAC_COLS,
@@ -41,182 +41,12 @@ def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
 
 
-def _names(ppc, key, prefix, count):
-    values = ppc.get(key)
-    if values is None:
-        return [f"{prefix}_{idx}" for idx in range(count)]
-    return [str(value) for value in values]
-
-
-class _PPCDeviceView:
-    def __init__(self, owner, table_key, name_key, prefix, build_item):
-        self.owner = owner
-        self.table_key = table_key
-        self.name_key = name_key
-        self.prefix = prefix
-        self.build_item = build_item
-
-    def _rows(self):
-        result = getattr(self.owner, "result", None)
-        if isinstance(result, dict) and self.table_key in result:
-            return result[self.table_key]
-        return self.owner.ppc[self.table_key]
-
-    def __len__(self):
-        return int(self.owner.ppc[self.table_key].shape[0])
-
-    def __iter__(self):
-        rows = self._rows()
-        names = _names(self.owner.ppc, self.name_key, self.prefix, rows.shape[0])
-        for pos, row in enumerate(rows):
-            yield self.build_item(row, names[pos])
-
-
-def _build_lf_ac_facade(ac_ppc):
-    """Build only the AC object lists needed for LF result reporting."""
-    from ac_array_model import BRANCH_COLS, BUS_COLS, GEN_COLS, LOAD_COLS, SHUNT_COLS, TRANSFORMER_COLS
-
-    base = ac_ppc["base"]
-    facade = SimpleNamespace(
-        ppc=ac_ppc,
-        result=None,
-        _lf_lightweight=True,
-        p_base=float(base[0]),
-        u_scale=float(base[1]),
-        p_scale=float(base[2]),
-        i_scale=float(base[3]),
-        p_base_kW=float(base[4]),
-        node_dict={},
-        zero_branches=[],
-        switches=[],
-        islands=[],
-        topo=lambda: None,
-        format_assoc=lambda: None,
-    )
-    facade.nodes = _PPCDeviceView(
-        facade,
-        "bus",
-        "bus_name",
-        "bus",
-        lambda row, name: _array_device(
-            row[BUS_COLS["idx"]],
-            name,
-            vbase=float(row[BUS_COLS["vbase"]]),
-            voltage=float(row[BUS_COLS["voltage"]]),
-            angle=float(row[BUS_COLS["angle"]]),
-            run_stat=int(row[BUS_COLS["run_stat"]]),
-            isl=int(row[BUS_COLS["isl"]]),
-            isl_obj=None,
-            is_alive=int(row[BUS_COLS["run_stat"]]) == 1,
-        ),
-    )
-    facade.generators = _PPCDeviceView(
-        facade,
-        "gen",
-        "gen_name",
-        "gen",
-        lambda row, name: _array_device(
-            row[GEN_COLS["idx"]],
-            name,
-            node=int(row[GEN_COLS["node"]]),
-            p_set=float(row[GEN_COLS["p_set"]]),
-            q_set=float(row[GEN_COLS["q_set"]]),
-            v_set=float(row[GEN_COLS["v_set"]]),
-            p=float(row[GEN_COLS["p"]]),
-            q=float(row[GEN_COLS["q"]]),
-            current=float(row[GEN_COLS["current"]]),
-            run_stat=int(row[GEN_COLS["run_stat"]]),
-            is_alive=int(row[GEN_COLS["run_stat"]]) == 1,
-        ),
-    )
-    facade.loads = _PPCDeviceView(
-        facade,
-        "load",
-        "load_name",
-        "load",
-        lambda row, name: _array_device(
-            row[LOAD_COLS["idx"]],
-            name,
-            node=int(row[LOAD_COLS["node"]]),
-            p=float(row[LOAD_COLS["p"]]),
-            q=float(row[LOAD_COLS["q"]]),
-            current=float(row[LOAD_COLS["current"]]),
-            run_stat=int(row[LOAD_COLS["run_stat"]]),
-            is_alive=int(row[LOAD_COLS["run_stat"]]) == 1,
-        ),
-    )
-    facade.shunt_compensators = _PPCDeviceView(
-        facade,
-        "shunt",
-        "shunt_name",
-        "shunt",
-        lambda row, name: _array_device(
-            row[SHUNT_COLS["idx"]],
-            name,
-            node=int(row[SHUNT_COLS["node"]]),
-            p=float(row[SHUNT_COLS["p"]]),
-            q=float(row[SHUNT_COLS["q"]]),
-            current=float(row[SHUNT_COLS["current"]]),
-            run_stat=int(row[SHUNT_COLS["run_stat"]]),
-            is_alive=int(row[SHUNT_COLS["run_stat"]]) == 1,
-        ),
-    )
-    facade.branches = _PPCDeviceView(
-        facade,
-        "branch",
-        "branch_name",
-        "branch",
-        lambda row, name: _array_device(
-            row[BRANCH_COLS["idx"]],
-            name,
-            i_node=int(row[BRANCH_COLS["i_node"]]),
-            j_node=int(row[BRANCH_COLS["j_node"]]),
-            i_p=float(row[BRANCH_COLS["i_p"]]),
-            i_q=float(row[BRANCH_COLS["i_q"]]),
-            i_c=float(row[BRANCH_COLS["i_c"]]),
-            j_p=float(row[BRANCH_COLS["j_p"]]),
-            j_q=float(row[BRANCH_COLS["j_q"]]),
-            j_c=float(row[BRANCH_COLS["j_c"]]),
-            run_stat=int(row[BRANCH_COLS["run_stat"]]),
-            is_alive=int(row[BRANCH_COLS["run_stat"]]) == 1,
-        ),
-    )
-    facade.transformers = _PPCDeviceView(
-        facade,
-        "transformer",
-        "transformer_name",
-        "transformer",
-        lambda row, name: _array_device(
-            row[TRANSFORMER_COLS["idx"]],
-            name,
-            i_node=int(row[TRANSFORMER_COLS["i_node"]]),
-            j_node=int(row[TRANSFORMER_COLS["j_node"]]),
-            i_p=float(row[TRANSFORMER_COLS["i_p"]]),
-            i_q=float(row[TRANSFORMER_COLS["i_q"]]),
-            i_c=float(row[TRANSFORMER_COLS["i_c"]]),
-            j_p=float(row[TRANSFORMER_COLS["j_p"]]),
-            j_q=float(row[TRANSFORMER_COLS["j_q"]]),
-            j_c=float(row[TRANSFORMER_COLS["j_c"]]),
-            run_stat=int(row[TRANSFORMER_COLS["run_stat"]]),
-            is_alive=int(row[TRANSFORMER_COLS["run_stat"]]) == 1,
-        ),
-    )
-    return facade
+def _build_lf_ac_network(ac_ppc):
+    return build_ac_network_from_ppc(ac_ppc)
 
 
 def _build_lf_dc_network(dc_ppc):
-    from model.dc_array_model import DCPowerNetwork
-
-    network = DCPowerNetwork()
-    network.ppc = dc_ppc
-    base = dc_ppc["base"]
-    network.p_base = float(base["p_base"])
-    network.p_base_kW = float(base["p_base_kW"])
-    network.u_scale = float(base["u_scale"])
-    network.p_scale = float(base["p_scale"])
-    network.i_scale = float(base["i_scale"])
-    network._load_objects_from_ppc(dc_ppc)
-    return network
+    return build_dc_network_from_ppc(dc_ppc)
 
 
 def _build_lf_converters(ppc):
@@ -274,8 +104,8 @@ def _build_lf_converters(ppc):
 
 
 def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
-    ppc = build_hybrid_ppc_from_e_file(file_name, use_cache=True, copy_arrays=True)
-    ac = _build_lf_ac_facade(ppc["ac"])
+    _model_network, ppc = build_hybrid_ppc_from_e_file(file_name)
+    ac = _build_lf_ac_network(ppc["ac"])
     dc = _build_lf_dc_network(ppc["dc"])
     dcac, acac = _build_lf_converters(ppc)
     network = HybridPowerNetwork(ac=ac, dc=dc, dcac_converters=dcac, acac_converters=acac)
@@ -292,50 +122,6 @@ def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
 
 
 @dataclass
-class HybridPowerFlowResult:
-    network: HybridPowerNetwork
-    ac_network: Any
-    dc_network: Any
-    calc: "HybridPowerFlowCalc"
-    ac: Optional[ACPowerFlowCalc]
-    dc: Optional[DCPowerFlowCalc]
-    rc: int
-    ac_warnings: List[str]
-    ac_errors: List[str]
-    dc_warnings: List[str]
-    dc_errors: List[str]
-    lf_result: Optional["HybridLFResult"] = None
-
-    @property
-    def total_nodes(self) -> int:
-        return self.network.total_nodes
-
-    @property
-    def converged(self) -> bool:
-        return self.rc == 0 and self.calc.converged and not self.ac_errors and not self.dc_errors
-
-    @property
-    def global_jacobian_shape(self) -> Tuple[int, int]:
-        return self.calc.last_jacobian_shape
-
-    @property
-    def has_ac(self) -> bool:
-        return len(self.ac_network.nodes) > 0
-
-    @property
-    def has_dc(self) -> bool:
-        return len(self.dc_network.nodes) > 0
-
-    @property
-    def has_dcac(self) -> bool:
-        return len(self.network.dcac_converters) > 0
-
-    @property
-    def has_acac(self) -> bool:
-        return len(self.network.acac_converters) > 0
-
-
-@dataclass
 class DCACLFResult:
     dcac_converters: dict = field(default_factory=dict)
 
@@ -347,10 +133,59 @@ class ACACLFResult:
 
 @dataclass
 class HybridLFResult:
+    network: Optional[HybridPowerNetwork] = None
+    ac_network: Any = None
+    dc_network: Any = None
+    calc: Optional["HybridPowerFlowCalc"] = None
+    ac_calc: Optional[ACPowerFlowCalc] = None
+    dc_calc: Optional[DCPowerFlowCalc] = None
+    rc: int = -1
+    ac_warnings: List[str] = field(default_factory=list)
+    ac_errors: List[str] = field(default_factory=list)
+    dc_warnings: List[str] = field(default_factory=list)
+    dc_errors: List[str] = field(default_factory=list)
     ac: Optional[ACLFResult] = None
     dc: Optional[DCLFResult] = None
     dcac: DCACLFResult = field(default_factory=DCACLFResult)
     acac: ACACLFResult = field(default_factory=ACACLFResult)
+
+    @property
+    def lf_result(self) -> "HybridLFResult":
+        return self
+
+    @property
+    def total_nodes(self) -> int:
+        return 0 if self.network is None else self.network.total_nodes
+
+    @property
+    def converged(self) -> bool:
+        return (
+            self.rc == 0
+            and self.calc is not None
+            and self.calc.converged
+            and not self.ac_errors
+            and not self.dc_errors
+        )
+
+    @property
+    def global_jacobian_shape(self) -> Tuple[int, int]:
+        return (0, 0) if self.calc is None else self.calc.last_jacobian_shape
+
+    @property
+    def has_ac(self) -> bool:
+        return self.ac_network is not None and len(self.ac_network.nodes) > 0
+
+    @property
+    def has_dc(self) -> bool:
+        return self.dc_network is not None and len(self.dc_network.nodes) > 0
+
+    @property
+    def has_dcac(self) -> bool:
+        return self.network is not None and len(self.network.dcac_converters) > 0
+
+    @property
+    def has_acac(self) -> bool:
+        return self.network is not None and len(self.network.acac_converters) > 0
 
 
 def _run_with_optional_output(verbose: bool, func, *args, **kwargs):
@@ -375,6 +210,7 @@ class HybridPowerFlowCalc:
         verbose=True,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
+        linear_solver: str = "scipy",
     ):
         self.network = network
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
@@ -385,14 +221,15 @@ class HybridPowerFlowCalc:
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.verbose = verbose
+        self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
         self.ac_calc = (
-            ACPowerFlowCalc.from_ppc(network._ac_ppc, parameters=self.params)
+            ACPowerFlowCalc(network._ac_ppc, parameters=self.params, linear_solver=self.linear_solver)
             if self.has_ac and hasattr(network, "_ac_ppc")
-            else ACPowerFlowCalc(network.ac, parameters=self.params) if self.has_ac else None
+            else ACPowerFlowCalc(network.ac, parameters=self.params, linear_solver=self.linear_solver) if self.has_ac else None
         )
-        self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params) if self.has_dc else None
+        self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver) if self.has_dc else None
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -416,6 +253,7 @@ class HybridPowerFlowCalc:
         self._clear_dcac_arrays()
         self._clear_acac_arrays()
         self._clear_converter_jacobian_structure()
+        self.lf_result = None
 
     def prepare(self):
         """Build the global hybrid state vector and block equation layout."""
@@ -1051,7 +889,7 @@ class HybridPowerFlowCalc:
                 self._write_back(x)
                 return 0
 
-            delta = spsolve(J, -F)
+            delta = solve_sparse_system(J, -F, self.linear_solver)
             x += delta
 
         self.x = x
@@ -1193,12 +1031,15 @@ class HybridPowerFlowCalc:
                 conv.j_c = float(cur_j)
         self.lf_result = self._build_lf_result(ac_V, dc_V)
 
-    @staticmethod
-    def _device_key(device) -> str:
-        return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
-
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
         result = HybridLFResult(
+            network=self.network,
+            ac_network=self.network.ac,
+            dc_network=self.network.dc,
+            calc=self,
+            ac_calc=self.ac_calc,
+            dc_calc=self.dc_calc,
+            rc=0 if self.converged else -1,
             ac=getattr(self.ac_calc, "lf_result", None),
             dc=getattr(self.dc_calc, "lf_result", None),
         )
@@ -1207,7 +1048,7 @@ class HybridPowerFlowCalc:
                 continue
             dc_v = float(getattr(conv.dc_node_obj, "voltage", 0.0) or 0.0)
             ac_v = float(getattr(conv.ac_node_obj, "voltage", 0.0) or 0.0)
-            result.dcac.dcac_converters[self._device_key(conv)] = SimpleNamespace(
+            result.dcac.dcac_converters[_lf_device_key(conv)] = SimpleNamespace(
                 i_p=float(getattr(conv, "dc_p", 0.0) or 0.0),
                 i_c=float(getattr(conv, "dc_i", 0.0) or 0.0),
                 i_v=dc_v,
@@ -1221,7 +1062,7 @@ class HybridPowerFlowCalc:
                 continue
             i_v = float(getattr(conv.i_node_obj, "voltage", 0.0) or 0.0)
             j_v = float(getattr(conv.j_node_obj, "voltage", 0.0) or 0.0)
-            result.acac.acac_converters[self._device_key(conv)] = SimpleNamespace(
+            result.acac.acac_converters[_lf_device_key(conv)] = SimpleNamespace(
                 i_p=float(getattr(conv, "i_p", 0.0) or 0.0),
                 i_q=float(getattr(conv, "i_q", 0.0) or 0.0),
                 i_c=float(getattr(conv, "i_c", getattr(conv, "i_i", 0.0)) or 0.0),
@@ -1234,6 +1075,33 @@ class HybridPowerFlowCalc:
         return result
 
 
+def _hybrid_result_from_calc(
+    calc,
+    rc: int,
+    ac_warnings=None,
+    ac_errors=None,
+    dc_warnings=None,
+    dc_errors=None,
+) -> HybridLFResult:
+    result = getattr(calc, "lf_result", None)
+    if result is None:
+        result = calc._build_lf_result()
+    network = getattr(calc, "network", None)
+    if network is not None:
+        result.network = network
+        result.ac_network = network.ac
+        result.dc_network = network.dc
+    result.calc = calc
+    result.ac_calc = getattr(calc, "ac_calc", None)
+    result.dc_calc = getattr(calc, "dc_calc", None)
+    result.rc = rc
+    result.ac_warnings = list(ac_warnings or [])
+    result.ac_errors = list(ac_errors or [])
+    result.dc_warnings = list(dc_warnings or [])
+    result.dc_errors = list(dc_errors or [])
+    return result
+
+
 def run_hybrid_power_flow(
     file_name=DEFAULT_HYBRID_EFILE,
     tol=None,
@@ -1242,14 +1110,14 @@ def run_hybrid_power_flow(
     verbose=True,
     parameter_file=DEFAULT_LF_PARAMETER_FILE,
     parameters: Optional[PowerFlowParameters] = None,
-) -> HybridPowerFlowResult:
-    network = _read_lf_network_from_file(file_name)
-
+    linear_solver: str = "scipy",
+) -> HybridLFResult:
     # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
     # topology diagnostics remain available through HybridPowerNetwork.prepare()
     # and check_topology(), but the Newton path avoids that duplicate object scan.
     ac_warnings, ac_errors, dc_warnings, dc_errors = [], [], [], []
 
+    network = _read_lf_network_from_file(file_name)
     calc = HybridPowerFlowCalc(
         network,
         tol=tol,
@@ -1258,44 +1126,18 @@ def run_hybrid_power_flow(
         verbose=verbose,
         parameter_file=parameter_file,
         parameters=parameters,
+        linear_solver=linear_solver,
     )
 
     if ac_errors or dc_errors:
-        return HybridPowerFlowResult(
-            network=network,
-            ac_network=network.ac,
-            dc_network=network.dc,
-            calc=calc,
-            ac=calc.ac_calc,
-            dc=calc.dc_calc,
-            rc=-1,
-            ac_warnings=ac_warnings,
-            ac_errors=ac_errors,
-            dc_warnings=dc_warnings,
-            dc_errors=dc_errors,
-            lf_result=getattr(calc, "lf_result", None),
-        )
+        return _hybrid_result_from_calc(calc, -1, ac_warnings, ac_errors, dc_warnings, dc_errors)
 
     _run_with_optional_output(verbose, calc.prepare)
     rc = _run_with_optional_output(verbose, calc.run)
-
-    return HybridPowerFlowResult(
-        network=network,
-        ac_network=network.ac,
-        dc_network=network.dc,
-        calc=calc,
-        ac=calc.ac_calc,
-        dc=calc.dc_calc,
-        rc=rc,
-        ac_warnings=ac_warnings,
-        ac_errors=ac_errors,
-        dc_warnings=dc_warnings,
-        dc_errors=dc_errors,
-        lf_result=getattr(calc, "lf_result", None),
-    )
+    return _hybrid_result_from_calc(calc, rc, ac_warnings, ac_errors, dc_warnings, dc_errors)
 
 
-def print_hybrid_result(result: HybridPowerFlowResult):
+def print_hybrid_result(result: HybridLFResult):
     print("\n=== 交直流联合潮流计算结果 ===")
     print(f"节点总数: {result.total_nodes} (AC={len(result.ac_network.nodes)}, DC={len(result.dc_network.nodes)})")
 
@@ -1340,12 +1182,12 @@ def print_hybrid_result(result: HybridPowerFlowResult):
         )
 
     print("\n8. 收敛信息:")
-    if result.ac is not None:
-        print(f"   AC: {'已收敛' if result.ac.converged else '未收敛'}, iter={result.ac.iterations}, normF={result.ac.normF:.3e}")
+    if result.ac_calc is not None:
+        print(f"   AC: {'已收敛' if result.ac_calc.converged else '未收敛'}, iter={result.ac_calc.iterations}, normF={result.ac_calc.normF:.3e}")
     else:
         print("   AC: 文件中无 AC 子网")
-    if result.dc is not None:
-        print(f"   DC: {'已收敛' if result.dc.converged else '未收敛'}, iter={result.dc.iterations}, normF={result.dc.normF:.3e}")
+    if result.dc_calc is not None:
+        print(f"   DC: {'已收敛' if result.dc_calc.converged else '未收敛'}, iter={result.dc_calc.iterations}, normF={result.dc_calc.normF:.3e}")
     else:
         print("   DC: 文件中无 DC 子网")
     print(f"   Hybrid: {'已收敛' if result.converged else '未收敛'}")
@@ -1359,24 +1201,31 @@ def print_hybrid_result(result: HybridPowerFlowResult):
     print(f"   DC: gen={dc_gen:.6f} pu, load={dc_load:.6f} pu, diff={dc_gen - dc_load:.6f} pu")
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Hybrid AC/DC power flow")
     parser.add_argument("file", nargs="?", default=str(DEFAULT_HYBRID_EFILE), help="hybrid E file path")
     parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
+    parser.add_argument("--linear-solver", default="scipy", help="Sparse linear solver name shared with AC/DC LF.")
     parser.add_argument("--quiet", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    result = run_hybrid_power_flow(
-        args.file,
+    verbose = not args.quiet
+    network = _read_lf_network_from_file(args.file)
+    calc = HybridPowerFlowCalc(
+        network,
         tol=args.tol,
         max_iter=args.max_iter,
         min_voltage=args.min_voltage,
-        verbose=not args.quiet,
+        verbose=verbose,
         parameter_file=args.para,
+        linear_solver=args.linear_solver,
     )
+    _run_with_optional_output(verbose, calc.prepare)
+    rc = _run_with_optional_output(verbose, calc.run)
+    result = _hybrid_result_from_calc(calc, rc)
     if not args.quiet:
         print_hybrid_result(result)
     return 0 if result.converged else 1
