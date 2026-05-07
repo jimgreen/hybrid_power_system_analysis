@@ -263,15 +263,6 @@ def _limit_control_step(model, device, target: float, kind: str) -> float:
     return _clamp(target, before - step, before + step)
 
 
-def _set_ctrl_strategy(device, strategy: str) -> None:
-    device.ctrl_strategy = strategy
-
-
-def _clear_control_strategies(model) -> None:
-    for _, device in _dev_ctrl_rows(model):
-        device.ctrl_strategy = ""
-
-
 def _set_p_ctrl(
     model,
     device,
@@ -279,14 +270,11 @@ def _set_p_ctrl(
     kind: str,
     lower: float,
     upper: float,
-    strategy: str = "",
 ) -> Tuple[float, float]:
     before = _current_control_value(device)
     bounded = _clamp(target, lower, upper)
     after = _clamp(_limit_control_step(model, device, bounded, kind), lower, upper)
     device.p_ctrl = after
-    if strategy:
-        _set_ctrl_strategy(device, strategy)
     return before, after
 
 
@@ -384,17 +372,12 @@ def _dev_ctrl_rows(model) -> Iterable[Tuple[str, object]]:
             yield dev_type, device
 
 
-def _format_dev_ctrl_row(prefix: str, dev_type, dev_id, name, value, strategy="") -> str:
-    return f"{prefix} {str(dev_type):<16} {str(dev_id):<6} {str(name):<10} {_format_ctrl_value(value):<10} {str(strategy)}"
+def _format_dev_ctrl_row(prefix: str, dev_type, dev_id, name, p_ctrl, p_real) -> str:
+    return f"{prefix} {str(dev_type):<16} {str(dev_id):<6} {str(name):<10} {_format_ctrl_value(p_ctrl):<10} {_format_ctrl_value(p_real)}"
 
 
-def _control_strategy(device) -> str:
-    strategy = str(getattr(device, "ctrl_strategy", "") or "")
-    if strategy:
-        return strategy
-    if not _is_running(device):
-        return "停运"
-    return "保持"
+def _real_power(device) -> float:
+    return _as_float(getattr(device, "p_cur", getattr(device, "p_ctrl", 0.0)))
 
 
 def _format_yt_ctrl_row(prefix: str, yt_id, name, rtu, pnt, value) -> str:
@@ -410,7 +393,7 @@ def export_control_results(model, output_file: Path) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "<dev_ctrl>",
-        _format_dev_ctrl_row("@", "dev_type", "id", "name", "p_ctrl", "strategy"),
+        _format_dev_ctrl_row("@", "dev_type", "id", "name", "p_ctrl", "p_real"),
     ]
     for dev_type, device in _dev_ctrl_rows(model):
         lines.append(
@@ -420,7 +403,7 @@ def export_control_results(model, output_file: Path) -> None:
                 getattr(device, "id", ""),
                 getattr(device, "name", ""),
                 getattr(device, "p_ctrl", getattr(device, "p_cur", 0.0)),
-                _control_strategy(device),
+                _real_power(device),
             )
         )
     lines.extend(
@@ -557,7 +540,6 @@ def _dispatch_renewable_priority(logger, model, load_target: float) -> float:
         for gen in devices:
             if not _is_running(gen):
                 gen.p_ctrl = 0.0
-                _set_ctrl_strategy(gen, "停运")
                 continue
             available = max(0.0, _as_float(getattr(gen, "p_fur", getattr(gen, "p_cur", 0.0))))
             p_max = _as_float(getattr(gen, "p_max", available), available)
@@ -571,7 +553,7 @@ def _dispatch_renewable_priority(logger, model, load_target: float) -> float:
     supplied = 0.0
     for group_name, gen, available, p_max in renewable_units:
         target = available * scale
-        before, after = _set_p_ctrl(model, gen, target, "renew", 0.0, p_max, "风光协同")
+        before, after = _set_p_ctrl(model, gen, target, "renew", 0.0, p_max)
         supplied += after
         logger.info(
             "%s协同出力 %s p_ctrl %.3f -> %.3f p_fur=%.3f",
@@ -590,16 +572,14 @@ def _charge_storage(logger, model, surplus: float) -> float:
     for estore in _storage_by_soc(model, reverse=False):
         if not _is_running(estore):
             estore.p_ctrl = 0.0
-            _set_ctrl_strategy(estore, "停运")
             continue
         soc = _as_float(getattr(estore, "soc_cur", 0.0))
         if not _can_charge_storage(model, estore):
             estore.p_ctrl = 0.0
-            _set_ctrl_strategy(estore, "SOC禁止充电")
             continue
         limit = _as_float(getattr(estore, "charge_p_max", 0.0))
         target = -min(remaining, limit)
-        before, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit, "储能充电")
+        before, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit)
         absorbed = max(0.0, -after)
         remaining -= absorbed
         logger.info("储能优先充电 %s p_ctrl %.3f -> %.3f soc=%.3f", estore.name, before, after, soc)
@@ -613,16 +593,14 @@ def _discharge_storage(logger, model, deficit: float) -> float:
     for estore in _storage_by_soc(model, reverse=True):
         if not _is_running(estore):
             estore.p_ctrl = 0.0
-            _set_ctrl_strategy(estore, "停运")
             continue
         soc = _as_float(getattr(estore, "soc_cur", 0.0))
         if not _can_discharge_storage(model, estore):
             estore.p_ctrl = 0.0
-            _set_ctrl_strategy(estore, "SOC禁止放电")
             continue
         limit = _as_float(getattr(estore, "dis_charge_p_max", 0.0))
         target = min(remaining, limit)
-        before, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit, "储能放电")
+        before, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit)
         supplied = max(0.0, after)
         remaining -= supplied
         logger.info("储能补缺放电 %s p_ctrl %.3f -> %.3f soc=%.3f", estore.name, before, after, soc)
@@ -636,12 +614,11 @@ def _dispatch_diesel(logger, model, deficit: float) -> float:
     for gen in getattr(model, "diesel_generator", []):
         if not _is_running(gen):
             gen.p_ctrl = 0.0
-            _set_ctrl_strategy(gen, "停运")
             continue
         p_min = _as_float(getattr(gen, "p_min", 0.0))
         p_max = _as_float(getattr(gen, "p_max", 0.0))
         target = _clamp(remaining, p_min if remaining >= p_min else 0.0, p_max)
-        before, after = _set_p_ctrl(model, gen, target, "diesel", 0.0, p_max, "柴发补缺")
+        before, after = _set_p_ctrl(model, gen, target, "diesel", 0.0, p_max)
         remaining -= after
         logger.info("柴发补缺 %s p_ctrl %.3f -> %.3f", gen.name, before, after)
         if remaining <= 0.0:
@@ -661,7 +638,7 @@ def _curtail_renewable(logger, model, surplus: float) -> float:
             if reducible <= 0.0:
                 continue
             target = before - min(reducible, remaining)
-            _, after = _set_p_ctrl(model, gen, target, "renew", lower, before, "新能源弃电")
+            _, after = _set_p_ctrl(model, gen, target, "renew", lower, before)
             reduced = before - after
             remaining -= reduced
             logger.info("富余无法消纳，弃风弃光 %s p_ctrl %.3f -> %.3f", gen.name, before, after)
@@ -682,7 +659,7 @@ def _restore_renewable(logger, model, shortage: float) -> float:
             if headroom <= 0.0:
                 continue
             target = before + min(headroom, remaining)
-            _, after = _set_p_ctrl(model, gen, target, "renew", before, available, "减少弃电")
+            _, after = _set_p_ctrl(model, gen, target, "renew", before, available)
             increased = after - before
             remaining -= increased
             logger.info("减少新能源弃电 %s p_ctrl %.3f -> %.3f", gen.name, before, after)
@@ -698,7 +675,7 @@ def _reduce_storage_discharge(logger, model, surplus: float) -> float:
         if not _is_running(estore) or before <= 0.0:
             continue
         target = before - min(before, remaining)
-        _, after = _set_p_ctrl(model, estore, target, "storage", 0.0, before, "减少储能放电")
+        _, after = _set_p_ctrl(model, estore, target, "storage", 0.0, before)
         reduced = before - after
         remaining -= reduced
         logger.info("柴发低于下限，减少储能放电 %s p_ctrl %.3f -> %.3f", estore.name, before, after)
@@ -714,7 +691,7 @@ def _reduce_storage_charge(logger, model, shortage: float) -> float:
         if not _is_running(estore) or before >= 0.0:
             continue
         target = before + min(-before, remaining)
-        _, after = _set_p_ctrl(model, estore, target, "storage", before, 0.0, "减少储能充电")
+        _, after = _set_p_ctrl(model, estore, target, "storage", before, 0.0)
         increased = after - before
         remaining -= increased
         logger.info("柴发高于下限，减少储能充电 %s p_ctrl %.3f -> %.3f", estore.name, before, after)
@@ -737,7 +714,7 @@ def _force_storage_charge(logger, model, surplus: float) -> float:
         if charge <= 0.0:
             continue
         target = before - charge
-        _, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit, "储能转充电")
+        _, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit)
         actual_charge = before - after
         remaining -= actual_charge
         logger.info("新能源已降至下限，储能转充电 %s p_ctrl %.3f -> %.3f", estore.name, before, after)
@@ -760,7 +737,7 @@ def _force_storage_discharge(logger, model, shortage: float) -> float:
         if discharge <= 0.0:
             continue
         target = before + discharge
-        _, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit, "储能转放电")
+        _, after = _set_p_ctrl(model, estore, target, "storage", -limit, limit)
         actual_discharge = after - before
         remaining -= actual_discharge
         logger.info("新能源已恢复至最大可发，储能转放电 %s p_ctrl %.3f -> %.3f", estore.name, before, after)
@@ -839,7 +816,6 @@ def _send_fuel_cell_support(logger, model, deficit: float) -> float:
 
 def do_wind_solar_priority_ctrl(logger, model) -> None:
     """Default AGC strategy: wind/PV first, storage/hydrogen for surplus, storage/diesel for deficit."""
-    _clear_control_strategies(model)
     load_target = _load_target(model)
     logger.info("AGC 风光优先控制开始: load_target=%.3f", load_target)
 

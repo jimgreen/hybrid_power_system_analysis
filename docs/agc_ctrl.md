@@ -240,7 +240,7 @@ agc_balance_mismatch =
 
 ```text
 <dev_ctrl>
-@ dev_type id name p_ctrl strategy
+@ dev_type id name p_ctrl p_real
 # wind_generator ...
 # pv_generator ...
 # estorage ...
@@ -260,7 +260,7 @@ agc_balance_mismatch =
 
 其中：
 
-- `dev_ctrl` 记录风机、光伏、储能、柴发的最终 `p_ctrl` 和本周期最终控制策略 `strategy`。
+- `dev_ctrl` 记录风机、光伏、储能、柴发的最终控制值 `p_ctrl` 和实时值 `p_real`，用于对比控制目标与当前状态；`p_real` 优先取设备 `p_cur`，缺失时回退为 `p_ctrl`。
 - `yt_ctrl` 记录本周期下发过的制氢或燃料电池遥调指令。
 - `agc_result` 记录最终功率不平衡量。
 
