@@ -5706,6 +5706,14 @@ class HybridStateEstimator:
         delegate = self._delegate()
         if delegate is not None:
             return delegate.jacobian(x, measurements)
+        if (
+            measurements is None
+            and (
+                getattr(self, "_active_ac_hybrid_rows", np.array([], dtype=np.int32)).size
+                or getattr(self, "_active_dc_hybrid_rows", np.array([], dtype=np.int32)).size
+            )
+        ):
+            return self.jacobian_sparse(x).toarray()
         return self._assemble_jacobian(x, measurements, sparse=False)
 
     def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None):
