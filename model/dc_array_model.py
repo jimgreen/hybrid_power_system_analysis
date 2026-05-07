@@ -213,7 +213,7 @@ def build_dc_ppc_from_e_file(
             raw_voltage = _float_cell(row, node_cols, "voltage", raw_vbase)
             bus[out_row, BUS_COLS["idx"]] = idx
             bus[out_row, BUS_COLS["vbase"]] = raw_vbase / u_scale
-            bus[out_row, BUS_COLS["voltage"]] = raw_voltage / (u_scale * raw_vbase)
+            bus[out_row, BUS_COLS["voltage"]] = raw_voltage / raw_vbase
             bus[out_row, BUS_COLS["isl"]] = _float_cell(row, node_cols, "isl", 0.0)
             bus[out_row, BUS_COLS["run_stat"]] = _float_cell(row, node_cols, "run_stat", 1.0)
             raw_vbase_by_idx[idx] = raw_vbase
@@ -267,9 +267,7 @@ def build_dc_ppc_from_e_file(
         gen[out_row, GEN_COLS["node"]] = node
         gen[out_row, GEN_COLS["control_type"]] = CTRL_CODE[str(_cell(row, gen_cols, "control_type", "P"))]
         gen[out_row, GEN_COLS["p_set"]] = _float_cell(row, gen_cols, "p_set") / p_base
-        gen[out_row, GEN_COLS["v_set"]] = _float_cell(row, gen_cols, "v_set") / (
-            u_scale * raw_vbase_by_idx[node]
-        )
+        gen[out_row, GEN_COLS["v_set"]] = _float_cell(row, gen_cols, "v_set") / raw_vbase_by_idx[node]
         gen[out_row, GEN_COLS["i_set"]] = _float_cell(row, gen_cols, "i_set") / _current_scale(
             power_base_kw, i_scale, raw_vbase_by_idx, node
         )
@@ -324,9 +322,7 @@ def build_dc_ppc_from_e_file(
         dcdc[out_row, DCDC_COLS["i_set"]] = _float_cell(row, dcdc_cols, "i_set") / _current_scale(
             power_base_kw, i_scale, raw_vbase_by_idx, i_node
         )
-        dcdc[out_row, DCDC_COLS["v_set"]] = _float_cell(row, dcdc_cols, "v_set") / (
-            u_scale * raw_vbase_by_idx[i_node]
-        )
+        dcdc[out_row, DCDC_COLS["v_set"]] = _float_cell(row, dcdc_cols, "v_set") / raw_vbase_by_idx[i_node]
         dcdc[out_row, DCDC_COLS["run_stat"]] = _float_cell(row, dcdc_cols, "run_stat", 1.0)
         dcdc[out_row, DCDC_COLS["i_p"]] = _float_cell(row, dcdc_cols, "i_p") / p_base
         dcdc[out_row, DCDC_COLS["j_p"]] = _float_cell(row, dcdc_cols, "j_p") / p_base
