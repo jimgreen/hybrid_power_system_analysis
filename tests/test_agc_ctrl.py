@@ -7,6 +7,95 @@ from agc import agc_ctrl
 
 
 class AGCControlTest(unittest.TestCase):
+    def test_agc_control_once_runs_one_control_cycle_without_gather(self):
+        output = Path("tmp_test/agc_once_dev_ctrl.e")
+        output.parent.mkdir(exist_ok=True)
+        if output.exists():
+            output.unlink()
+        self.addCleanup(lambda: output.exists() and output.unlink())
+
+        model = SimpleNamespace(
+            wind_generator=[],
+            pv_generator=[],
+            estorage=[],
+            diesel_generator=[],
+            yt=[],
+        )
+        config = SimpleNamespace(
+            model=model,
+            logger=logging.getLogger("test"),
+            gather_count=3,
+            control_count=2,
+            ctrl_output_file=output,
+        )
+        calls = []
+
+        def control(logger, emodel):
+            calls.append("control")
+            emodel.agc_balance_mismatch = 0.0
+
+        def check(logger, emodel):
+            calls.append("check")
+
+        agc_ctrl.agc_control_once(config, control, check)
+
+        self.assertEqual(config.gather_count, 3)
+        self.assertEqual(config.control_count, 3)
+        self.assertEqual(calls, ["control", "check"])
+        self.assertTrue(output.exists())
+
+    def test_agc_control_step_runs_one_gather_and_control_cycle(self):
+        output = Path("tmp_test/agc_step_dev_ctrl.e")
+        output.parent.mkdir(exist_ok=True)
+        if output.exists():
+            output.unlink()
+        self.addCleanup(lambda: output.exists() and output.unlink())
+
+        model = SimpleNamespace(
+            yc=[],
+            yx=[],
+            diesel_generator=[],
+            pv_generator=[],
+            wind_generator=[],
+            energyconsumer=[],
+            estorage=[],
+            yt=[],
+            wind_speed=None,
+            solor_irrad=None,
+            env_temp=None,
+        )
+        config = SimpleNamespace(
+            model=model,
+            logger=logging.getLogger("test"),
+            gather_count=0,
+            control_count=0,
+            ctrl_output_file=output,
+            fes_client=SimpleNamespace(
+                get_yc_value=lambda schema, context, rtu, pnt: (False, "", None),
+                get_yx_value=lambda schema, context, rtu, pnt: (False, "", None),
+                schema=None,
+                context=None,
+            ),
+        )
+        calls = []
+
+        def forecast(logger, emodel, wind_speed, solar_irrad, env_temp):
+            calls.append("forecast")
+
+        def control(logger, emodel):
+            calls.append("control")
+            emodel.agc_balance_mismatch = 0.0
+
+        def check(logger, emodel):
+            calls.append("check")
+
+        agc_ctrl.agc_control_step(config, control, check, forecast)
+
+        self.assertEqual(config.gather_count, 1)
+        self.assertEqual(config.control_count, 1)
+        self.assertEqual(calls, ["forecast", "control", "check"])
+        self.assertTrue(output.exists())
+
     def test_export_control_results_writes_dev_ctrl_e(self):
         output = Path("tmp_test/agc_unit_dev_ctrl.e")
         output.parent.mkdir(exist_ok=True)
@@ -16,16 +105,16 @@ class AGCControlTest(unittest.TestCase):
 
         model = SimpleNamespace(
             wind_generator=[
-                SimpleNamespace(id=1, name="wind", p_ctrl=12.5),
+                SimpleNamespace(id=1, name="wind", p_ctrl=12.5, ctrl_strategy="风光协同"),
             ],
             pv_generator=[
-                SimpleNamespace(id=2, name="pv", p_ctrl=7.5),
+                SimpleNamespace(id=2, name="pv", p_ctrl=7.5, ctrl_strategy="风光协同"),
             ],
             estorage=[
-                SimpleNamespace(id=3, name="storage", p_ctrl=-4.0),
+                SimpleNamespace(id=3, name="storage", p_ctrl=-4.0, ctrl_strategy="储能充电"),
             ],
             diesel_generator=[
-                SimpleNamespace(id=4, name="diesel", p_ctrl=80.0),
+                SimpleNamespace(id=4, name="diesel", p_ctrl=80.0, ctrl_strategy="柴发补缺"),
             ],
             yt=[
                 SimpleNamespace(id=5, name="hydrogen", rtu=3, pnt=3, ctrl_value=6.0),
@@ -37,16 +126,38 @@ class AGCControlTest(unittest.TestCase):
 
         text = output.read_text(encoding="utf-8")
         self.assertIn("<dev_ctrl>", text)
-        self.assertIn("@ dev_type         id     name       p_ctrl", text)
-        self.assertIn("# wind_generator   1      wind       12.500000", text)
-        self.assertIn("# pv_generator     2      pv         7.500000", text)
-        self.assertIn("# estorage         3      storage    -4.000000", text)
-        self.assertIn("# diesel_generator 4      diesel     80.000000", text)
+        self.assertIn("@ dev_type         id     name       p_ctrl     strategy", text)
+        self.assertIn("# wind_generator   1      wind       12.500000  风光协同", text)
+        self.assertIn("# pv_generator     2      pv         7.500000   风光协同", text)
+        self.assertIn("# estorage         3      storage    -4.000000  储能充电", text)
+        self.assertIn("# diesel_generator 4      diesel     80.000000  柴发补缺", text)
         self.assertIn("<yt_ctrl>", text)
         self.assertIn("@ id     name       rtu    pnt    value", text)
         self.assertIn("# 5      hydrogen   3      3      6.000000", text)
         self.assertIn("@ name                 value", text)
         self.assertIn("# agc_balance_mismatch 1.250000", text)
+
+    def test_export_control_results_fills_default_device_strategy(self):
+        output = Path("tmp_test/agc_unit_dev_ctrl_default_strategy.e")
+        output.parent.mkdir(exist_ok=True)
+        if output.exists():
+            output.unlink()
+        self.addCleanup(lambda: output.exists() and output.unlink())
+
+        model = SimpleNamespace(
+            wind_generator=[SimpleNamespace(id=1, name="wind", p_ctrl=0.0, run_stat=1)],
+            pv_generator=[],
+            estorage=[],
+            diesel_generator=[SimpleNamespace(id=2, name="diesel", p_ctrl=0.0, run_stat=0)],
+            yt=[],
+            agc_balance_mismatch=0.0,
+        )
+
+        agc_ctrl.export_control_results(model, output)
+
+        text = output.read_text(encoding="utf-8")
+        self.assertIn("# wind_generator   1      wind       0.000000   保持", text)
+        self.assertIn("# diesel_generator 2      diesel     0.000000   停运", text)
 
     def test_device_p_step_overrides_global_default(self):
         model = SimpleNamespace(para=[])

@@ -40,6 +40,12 @@ AGC 控制以一个控制周期内的负荷目标为输入，生成各类设备�
 
 ## 3. 主控制流程
 
+控制程序支持两种执行方式：
+
+- 周期执行：默认进入 AGC 循环，按 `CTRL_TRIGGER` / `GATHER_TRIGGER` 周期运行。
+- 单步执行：命令行增加 `--step`，立即执行一次“采集 -> 预测 -> 控制 -> 校验 -> 输出”后退出，不等待周期对齐。
+- 单步控制：命令行增加 `--ctrl-step`，立即执行一次“控制 -> 校验 -> 输出”后退出，不做采集和新能源预测，适合使用模型中已有运行态数据直接触发一次控制。
+
 ```mermaid
 flowchart TD
     A["开始控制周期"] --> B["计算负荷目标 load_target"]
@@ -234,7 +240,7 @@ agc_balance_mismatch =
 
 ```text
 <dev_ctrl>
-@ dev_type id name p_ctrl
+@ dev_type id name p_ctrl strategy
 # wind_generator ...
 # pv_generator ...
 # estorage ...
@@ -254,7 +260,7 @@ agc_balance_mismatch =
 
 其中：
 
-- `dev_ctrl` 记录风机、光伏、储能、柴发的最终 `p_ctrl`。
+- `dev_ctrl` 记录风机、光伏、储能、柴发的最终 `p_ctrl` 和本周期最终控制策略 `strategy`。
 - `yt_ctrl` 记录本周期下发过的制氢或燃料电池遥调指令。
 - `agc_result` 记录最终功率不平衡量。
 
