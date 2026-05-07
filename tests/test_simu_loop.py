@@ -96,7 +96,8 @@ class SimulationLoopTest(unittest.TestCase):
             model_file=model_path,
             meas_file=meas_path,
             weather_file=tmp / "weather.e",
-            dev_ctrl_file=tmp / "dev_ctrl.e",
+            dev_stat_file=tmp / "dev_stat.e",
+            yt_ctrl_file=tmp / "yt_ctrl.e",
             real_file=real_path,
             scada_file=scada_path,
             period_seconds=60.0,
@@ -127,6 +128,45 @@ class SimulationLoopTest(unittest.TestCase):
         self.assertIn("INFO", text)
         self.assertIn("cycle message", text)
 
+    def test_storage_soc_update_keeps_dev_stat_columns_space_aligned(self):
+        from efile_read import EBook
+        from simu.simu_loop import update_storage_soc
+
+        tmp = TMP_ROOT / "soc_alignment"
+        tmp.mkdir(parents=True, exist_ok=True)
+        dev_stat = tmp / "dev_stat.e"
+        dev_stat.write_text(
+            "\n".join(
+                [
+                    "<StorageStatus>",
+                    "@ dev_type idx name run_stat soc_curr",
+                    "# ESS 3 ess01 1 0.5",
+                    "</StorageStatus>",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        model = EBook(
+            {
+                "DCDCConverter": [
+                    {
+                        "idx": "3",
+                        "name": "ess01_dcdc",
+                        "p_set": "60",
+                        "run_stat": "1",
+                    }
+                ]
+            }
+        )
+
+        changed = update_storage_soc(dev_stat, model, 60.0)
+
+        text = dev_stat.read_text(encoding="utf-8")
+        self.assertEqual(1, changed)
+        self.assertNotIn("\t", text)
+        self.assertIn("@ dev_type  idx  name", text)
+
     def test_run_loop_logs_cycle_summary(self):
         from simu.simu_loop import SimulationConfig, SimulationResult, run_loop, setup_logger
 
@@ -138,7 +178,8 @@ class SimulationLoopTest(unittest.TestCase):
             model_file=tmp / "ieee39.e",
             meas_file=tmp / "meas.e",
             weather_file=tmp / "weather.e",
-            dev_ctrl_file=tmp / "dev_ctrl.e",
+            dev_stat_file=tmp / "dev_stat.e",
+            yt_ctrl_file=tmp / "yt_ctrl.e",
             real_file=tmp / "real.e",
             scada_file=tmp / "scada.e",
             loop_count=1,
