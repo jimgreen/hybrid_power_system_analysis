@@ -150,8 +150,16 @@ def _build_matpower_ppc(acppc):
             if bus_row is None or row_to_comp[bus_row] < 0:
                 continue
             comp = row_to_comp[bus_row]
-            pd[comp] += (row[LOAD_COLS["pv0"]] + row[LOAD_COLS["pv1"]] + row[LOAD_COLS["pv2"]]) * base_mva
-            qd[comp] += (row[LOAD_COLS["qv0"]] + row[LOAD_COLS["qv1"]] + row[LOAD_COLS["qv2"]]) * base_mva
+            pd[comp] += (
+                row[LOAD_COLS["pbase"]]
+                * (row[LOAD_COLS["pv0"]] + row[LOAD_COLS["pv1"]] + row[LOAD_COLS["pv2"]])
+                * base_mva
+            )
+            qd[comp] += (
+                row[LOAD_COLS["qbase"]]
+                * (row[LOAD_COLS["qv0"]] + row[LOAD_COLS["qv1"]] + row[LOAD_COLS["qv2"]])
+                * base_mva
+            )
 
     if shunt0.size:
         for row in shunt0[shunt0[:, SHUNT_COLS["run_stat"]] == 1]:

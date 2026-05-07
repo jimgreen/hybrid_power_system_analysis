@@ -44,18 +44,18 @@ class ACBranch:
         self.j_node_obj = None
 
 class ACLoad:
-    def __init__(self, idx, node, p_base, p_v0, p_v1, p_v2, q_base, q_v0, q_v1, q_v2, run_stat=1):
+    def __init__(self, idx, node, pbase, pv0, pv1, pv2, qbase, qv0, qv1, qv2, run_stat=1):
         self.idx = idx
         self.node = node
         self.run_stat = run_stat
-        self.p_base = p_base
-        self.p_v0 = p_v0
-        self.p_v1 = p_v1
-        self.p_v2 = p_v2
-        self.q_base = q_base
-        self.q_v0 = q_v0
-        self.q_v1 = q_v1
-        self.q_v2 = q_v2
+        self.pbase = pbase
+        self.pv0 = pv0
+        self.pv1 = pv1
+        self.pv2 = pv2
+        self.qbase = qbase
+        self.qv0 = qv0
+        self.qv1 = qv1
+        self.qv2 = qv2
 
         self.p = None
         self.q = None
@@ -274,9 +274,11 @@ _AC_DIRECT_DEFAULT_ATTRS = {
         "idx": 0,
         "name": "",
         "node": 0,
+        "pbase": 1.0,
         "pv0": 0.0,
         "pv1": 0.0,
         "pv2": 0.0,
+        "qbase": 1.0,
         "qv0": 0.0,
         "qv1": 0.0,
         "qv2": 0.0,
@@ -378,9 +380,11 @@ _AC_DIRECT_FLOAT_ATTRS = frozenset(
         "b",
         "tap",
         "shift",
+        "pbase",
         "pv0",
         "pv1",
         "pv2",
+        "qbase",
         "qv0",
         "qv1",
         "qv2",
@@ -518,8 +522,8 @@ class ACPowerNetwork:
         self.branches.append(br)
         return br
 
-    def add_load(self, idx, node, p_base, p_v0, p_v1, p_v2, q_base, q_v0, q_v1, q_v2, run_stat=1):
-        ld = ACLoad(idx, node, p_base, p_v0, p_v1, p_v2, q_base, q_v0, q_v1, q_v2, run_stat)
+    def add_load(self, idx, node, pbase, pv0, pv1, pv2, qbase, qv0, qv1, qv2, run_stat=1):
+        ld = ACLoad(idx, node, pbase, pv0, pv1, pv2, qbase, qv0, qv1, qv2, run_stat)
         self.loads.append(ld)
         return ld
 

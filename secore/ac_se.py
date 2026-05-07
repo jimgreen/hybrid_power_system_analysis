@@ -4,7 +4,6 @@ import io
 import math
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -53,6 +52,18 @@ from ac_array_model import (
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook
+from model.meas_model import (
+    BadDataItem,
+    DEVICE_TYPE_CODES,
+    EstimateResult,
+    Measurement,
+    MeasurementList,
+    MeasurementTable,
+    ObservabilityResult,
+    measurement_table_from_measurements,
+    print_iteration as _print_iteration,
+    print_iteration_header as _print_iteration_header,
+)
 from secore.se_math import (
     ANGLE_MEASUREMENT_TYPES,
     SparseJacobianBuilder,
@@ -76,18 +87,7 @@ DEFAULT_CASE = ROOT_DIR / "data" / "ac" / "ieee39.e"
 DEFAULT_MEAS = ROOT_DIR / "data" / "ac" / "ieee39.meas"
 
 
-_DEVICE_TYPE_CODES = {
-    "ACNode": 1,
-    "ACBranch": 2,
-    "ACTransformer": 3,
-    "ACLoad": 4,
-    "ACGenerator": 5,
-    "ACZeroBranch": 6,
-    "ACZeroBranchConstraint": 7,
-    "ACSwitchConstraint": 8,
-    "ACSwitch": 9,
-    "ACPowerBalance": 10,
-}
+_DEVICE_TYPE_CODES = DEVICE_TYPE_CODES
 
 _TERMINAL_POWER_MEASUREMENT_TYPES = frozenset(("P_FROM", "Q_FROM", "P_TO", "Q_TO"))
 _PSEUDO_DEVICE_SUMMARY_TYPES = frozenset(("ACGenerator", "ACLoad"))
@@ -149,9 +149,11 @@ class _ACArrayObject:
         "q_set",
         "v_set",
         "alpha",
+        "pbase",
         "pv0",
         "pv1",
         "pv2",
+        "qbase",
         "qv0",
         "qv1",
         "qv2",
@@ -348,89 +350,11 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
     return MeasurementList(measurements, table, normalized=scale_context is not None)
 
 
-@dataclass
-class MeasurementTable:
-    idx: np.ndarray
-    name: np.ndarray
-    device_type: np.ndarray
-    device_name: np.ndarray
-    meas_type: np.ndarray
-    weight: np.ndarray
-    valid: np.ndarray
-    value: np.ndarray
-    device_type_code: np.ndarray
-    angle_mask: np.ndarray
-
-
-class MeasurementList(list):
-    __slots__ = ("table", "normalized")
-
-    def __init__(self, measurements=(), table: Optional[MeasurementTable] = None, normalized: bool = False):
-        super().__init__(measurements)
-        self.table = table
-        self.normalized = bool(normalized)
-
-
 def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) -> MeasurementTable:
-    table = getattr(measurements, "table", None)
-    if table is not None:
-        table_size = int(table.idx.size)
-        measurement_count = len(measurements)
-        if measurement_count == table_size:
-            return table
-        if table_size < measurement_count:
-            tail_table = _measurement_table_from_measurements(tuple(measurements[table_size:]))
-            table = MeasurementTable(
-                idx=np.concatenate((table.idx, tail_table.idx)),
-                name=np.concatenate((table.name, tail_table.name)),
-                device_type=np.concatenate((table.device_type, tail_table.device_type)),
-                device_name=np.concatenate((table.device_name, tail_table.device_name)),
-                meas_type=np.concatenate((table.meas_type, tail_table.meas_type)),
-                weight=np.concatenate((table.weight, tail_table.weight)),
-                valid=np.concatenate((table.valid, tail_table.valid)),
-                value=np.concatenate((table.value, tail_table.value)),
-                device_type_code=np.concatenate((table.device_type_code, tail_table.device_type_code)),
-                angle_mask=np.concatenate((table.angle_mask, tail_table.angle_mask)),
-            )
-            try:
-                measurements.table = table
-            except AttributeError:
-                pass
-            return table
-    count = len(measurements)
-    idx = np.empty(count, dtype=np.int64)
-    name = np.empty(count, dtype=object)
-    device_type = np.empty(count, dtype=object)
-    device_name = np.empty(count, dtype=object)
-    meas_type = np.empty(count, dtype=object)
-    weight = np.empty(count, dtype=np.float64)
-    valid = np.empty(count, dtype=bool)
-    value = np.empty(count, dtype=np.float64)
-    device_type_code = np.empty(count, dtype=np.int16)
-    angle_mask = np.empty(count, dtype=bool)
-    angle_types = ANGLE_MEASUREMENT_TYPES
-    for pos, meas in enumerate(measurements):
-        idx[pos] = int(meas.idx)
-        name[pos] = meas.name
-        device_type[pos] = meas.device_type
-        device_name[pos] = meas.device_name
-        meas_type[pos] = meas.meas_type
-        weight[pos] = float(meas.weight)
-        valid[pos] = bool(meas.valid)
-        value[pos] = float(meas.value)
-        device_type_code[pos] = _DEVICE_TYPE_CODES.get(meas.device_type, 0)
-        angle_mask[pos] = meas.meas_type in angle_types
-    return MeasurementTable(
-        idx=idx,
-        name=name,
-        device_type=device_type,
-        device_name=device_name,
-        meas_type=meas_type,
-        weight=weight,
-        valid=valid,
-        value=value,
-        device_type_code=device_type_code,
-        angle_mask=angle_mask,
+    return measurement_table_from_measurements(
+        measurements,
+        device_type_codes=_DEVICE_TYPE_CODES,
+        angle_measurement_types=ANGLE_MEASUREMENT_TYPES,
     )
 
 
@@ -829,9 +753,11 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
         load.idx = int(row[LOAD_COLS["idx"]])
         load.name = str(load_names[pos])
         load.node = int(row[LOAD_COLS["node"]])
+        load.pbase = float(row[LOAD_COLS["pbase"]])
         load.pv0 = float(row[LOAD_COLS["pv0"]])
         load.pv1 = float(row[LOAD_COLS["pv1"]])
         load.pv2 = float(row[LOAD_COLS["pv2"]])
+        load.qbase = float(row[LOAD_COLS["qbase"]])
         load.qv0 = float(row[LOAD_COLS["qv0"]])
         load.qv1 = float(row[LOAD_COLS["qv1"]])
         load.qv2 = float(row[LOAD_COLS["qv2"]])
@@ -861,108 +787,6 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
     _fast_topo_network(network)
     network._array_model = ppc
     return network
-
-
-@dataclass(init=False, slots=True)
-class Measurement:
-    idx: int
-    name: str
-    device_type: str
-    device_name: str
-    meas_type: str
-    weight: float
-    valid: bool
-    value: float
-
-    def __init__(
-        self,
-        idx: int,
-        name: str,
-        device_type: str,
-        device_name: str,
-        meas_type: str,
-        weight: float,
-        valid: bool,
-        value: float,
-    ) -> None:
-        self.idx = idx
-        self.name = name
-        self.device_type = device_type
-        self.device_name = device_name
-        self.meas_type = meas_type
-        self.weight = weight
-        self.valid = valid
-        self.value = value
-
-    @property
-    def device(self) -> str:
-        return f"{self.device_type}:{self.device_name}"
-
-    @classmethod
-    def read_from_file(cls, file_name: Path, scale_context=None) -> List["Measurement"]:
-        if scale_context is None:
-            return _read_measurements_direct(file_name, cls)
-        return _read_measurements_direct(file_name, cls, scale_context)
-
-@dataclass
-class ObservabilityResult:
-    observable: bool
-    rank: int
-    state_count: int
-    measurement_count: int
-    deficiency: int
-    singular_values: np.ndarray
-    weak_states: List[Tuple[str, float]]
-
-
-@dataclass
-class EstimateResult:
-    converged: bool
-    iterations: int
-    objective: float
-    max_correction: float
-    residual_inf: float
-    x: np.ndarray
-    z_est: np.ndarray
-    residual: np.ndarray
-    H: Optional[np.ndarray]
-    gain: Optional[np.ndarray]
-    measurements: List[Measurement]
-    observability: ObservabilityResult
-
-
-@dataclass
-class BadDataItem:
-    measurement: Measurement
-    residual: float
-    normalized_residual: float
-    estimated_value: float
-    measured_value: float
-
-
-def _print_iteration_header() -> None:
-    print("Iteration process:")
-    print("  iter objective      max_dx      norm_res    step   status")
-
-
-def _print_iteration(
-    iteration: int,
-    objective: float,
-    residual_inf: float,
-    max_correction: float,
-    step_scale: Optional[float],
-    converged: bool,
-) -> None:
-    step = "-" if step_scale is None else f"{step_scale:.3f}"
-    status = "converged" if converged else ""
-    print(
-        f"  {iteration:4d} "
-        f"{objective:12.6e} "
-        f"{max_correction:10.3e} "
-        f"{residual_inf:10.3e} "
-        f"{step:>6s} "
-        f"{status}"
-    )
 
 
 class ACStateEstimator:
@@ -1055,12 +879,12 @@ class ACStateEstimator:
             self.load_order = sorted(self.load_by_name.values(), key=lambda item: item.idx)
         self.generator_pos_array = np.asarray([self.node_pos[gen.node] for gen in self.generator_order], dtype=np.int32)
         self.load_pos_array = np.asarray([self.node_pos[load.node] for load in self.load_order], dtype=np.int32)
-        self.load_pv0_array = np.asarray([load.pv0 for load in self.load_order], dtype=np.float64)
-        self.load_pv1_array = np.asarray([load.pv1 for load in self.load_order], dtype=np.float64)
-        self.load_pv2_array = np.asarray([load.pv2 for load in self.load_order], dtype=np.float64)
-        self.load_qv0_array = np.asarray([load.qv0 for load in self.load_order], dtype=np.float64)
-        self.load_qv1_array = np.asarray([load.qv1 for load in self.load_order], dtype=np.float64)
-        self.load_qv2_array = np.asarray([load.qv2 for load in self.load_order], dtype=np.float64)
+        self.load_pv0_array = np.asarray([getattr(load, "pbase", 1.0) * load.pv0 for load in self.load_order], dtype=np.float64)
+        self.load_pv1_array = np.asarray([getattr(load, "pbase", 1.0) * load.pv1 for load in self.load_order], dtype=np.float64)
+        self.load_pv2_array = np.asarray([getattr(load, "pbase", 1.0) * load.pv2 for load in self.load_order], dtype=np.float64)
+        self.load_qv0_array = np.asarray([getattr(load, "qbase", 1.0) * load.qv0 for load in self.load_order], dtype=np.float64)
+        self.load_qv1_array = np.asarray([getattr(load, "qbase", 1.0) * load.qv1 for load in self.load_order], dtype=np.float64)
+        self.load_qv2_array = np.asarray([getattr(load, "qbase", 1.0) * load.qv2 for load in self.load_order], dtype=np.float64)
         self.n_nodes = len(self.nodes)
         # Reference-bus voltage values must be known before the compact state layout
         # is built, so real file measurements are normalized after the estimator maps exist.
@@ -1833,8 +1657,8 @@ class ACStateEstimator:
         # Loads may be voltage dependent, so evaluate the ZIP model at the current seed voltage.
         node = getattr(load, "node_obj", None)
         voltage = float(getattr(node, "voltage", 1.0) or 1.0)
-        p = load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage
-        q = load.qv0 + load.qv1 * voltage + load.qv2 * voltage * voltage
+        p = getattr(load, "pbase", 1.0) * (load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage)
+        q = getattr(load, "qbase", 1.0) * (load.qv0 + load.qv1 * voltage + load.qv2 * voltage * voltage)
         return float(p), float(q)
 
     def _active_angle_measurement_counts(self) -> Dict[int, int]:

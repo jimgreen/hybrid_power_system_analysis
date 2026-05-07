@@ -21,8 +21,8 @@
 </DCBranch>
 
 <DCLoad>
-@ idx name node pv0 pv1 pv2 run_stat p current
-# 0   ld_1 0    100 0   0   1        0 0
+@ idx name node pbase pv0 pv1 pv2 run_stat p current
+# 0   ld_1 0    1.0    100 0   0   1        0 0
 </DCLoad>
 
 <DCGenerator>

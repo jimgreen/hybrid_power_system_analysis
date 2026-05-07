@@ -20,11 +20,11 @@
 </DCBranch>
 
 <DCLoad>
-@ idx name     node pv0 pv1 pv2 run_stat p current
-# 0   load_1_1 0    100 0   0   1        0 0
-# 1   load_1_2 1    0   0   50  1        0 0
-# 2   load_1_3 2    50  80  0   1        0 0
-# 3   load_1_3 3    70  20  80  1        0 0
+@ idx name     node pbase pv0 pv1 pv2 run_stat p current
+# 0   load_1_1 0    1.0    100 0   0   1        0 0
+# 1   load_1_2 1    1.0    0   0   50  1        0 0
+# 2   load_1_3 2    1.0    50  80  0   1        0 0
+# 3   load_1_3 3    1.0    70  20  80  1        0 0
 </DCLoad>
 
 <DCGenerator>

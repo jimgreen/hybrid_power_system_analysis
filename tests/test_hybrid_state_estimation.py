@@ -69,6 +69,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(theta, 0.0)
 
     def test_ieee3k_flat_start_first_step_keeps_angles_zero_without_angle_pseudos(self):
+        import warnings
+        from scipy.sparse.linalg import MatrixRankWarning
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
@@ -80,13 +82,16 @@ class HybridStateEstimationTest(unittest.TestCase):
         x0 = estimator.initial_state()
         ac = estimator.calc.ac_calc
 
-        result = estimator.estimate(verbose=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = estimator.estimate(verbose=False)
         full_x = estimator._expand_state(x0)
         theta, _voltage, _, _ = ac._extract_state_vars(full_x[: estimator.calc.ac_size], update_cache=False)
 
         np.testing.assert_allclose(theta, 0.0)
         self.assertTrue(np.isfinite(result.objective))
         self.assertFalse(any(meas.meas_type in ("ANGLE", "THETA") for meas in result.measurements))
+        self.assertFalse(any(isinstance(w.message, MatrixRankWarning) for w in caught))
 
     def test_ac_angle_residuals_wrap_across_two_pi(self):
         from dataclasses import replace

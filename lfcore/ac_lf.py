@@ -1122,12 +1122,12 @@ class ACPowerFlowCalc:
             self.load_info = np.column_stack(
                 (
                     self.ppc_load_pos,
-                    load[self.ppc_load_rows, LOAD_COLS["pv0"]],
-                    load[self.ppc_load_rows, LOAD_COLS["pv1"]],
-                    load[self.ppc_load_rows, LOAD_COLS["pv2"]],
-                    load[self.ppc_load_rows, LOAD_COLS["qv0"]],
-                    load[self.ppc_load_rows, LOAD_COLS["qv1"]],
-                    load[self.ppc_load_rows, LOAD_COLS["qv2"]],
+                    load[self.ppc_load_rows, LOAD_COLS["pbase"]] * load[self.ppc_load_rows, LOAD_COLS["pv0"]],
+                    load[self.ppc_load_rows, LOAD_COLS["pbase"]] * load[self.ppc_load_rows, LOAD_COLS["pv1"]],
+                    load[self.ppc_load_rows, LOAD_COLS["pbase"]] * load[self.ppc_load_rows, LOAD_COLS["pv2"]],
+                    load[self.ppc_load_rows, LOAD_COLS["qbase"]] * load[self.ppc_load_rows, LOAD_COLS["qv0"]],
+                    load[self.ppc_load_rows, LOAD_COLS["qbase"]] * load[self.ppc_load_rows, LOAD_COLS["qv1"]],
+                    load[self.ppc_load_rows, LOAD_COLS["qbase"]] * load[self.ppc_load_rows, LOAD_COLS["qv2"]],
                 )
             )
 
@@ -1863,7 +1863,17 @@ class ACPowerFlowCalc:
         # 处理负荷（精简）
         for ld in self.isl.loads:
             if ld.is_alive:
-                self.load_info.append((self.node_pos[ld.node], ld.pv0, ld.pv1, ld.pv2, ld.qv0, ld.qv1, ld.qv2))
+                pbase = float(getattr(ld, "pbase", 1.0))
+                qbase = float(getattr(ld, "qbase", 1.0))
+                self.load_info.append((
+                    self.node_pos[ld.node],
+                    pbase * ld.pv0,
+                    pbase * ld.pv1,
+                    pbase * ld.pv2,
+                    qbase * ld.qv0,
+                    qbase * ld.qv1,
+                    qbase * ld.qv2,
+                ))
 
         # 确保存在平衡节点（精简）
         if self.slack_node == -1:

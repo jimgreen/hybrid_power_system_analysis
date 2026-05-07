@@ -3,7 +3,6 @@ import contextlib
 import io
 import math
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -30,6 +29,18 @@ from ac_array_model import (
 from ac_lf import ACPowerFlowCalc, matpower_branch_stamp, matpower_branch_stamp_vectorized
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
+from model.meas_model import (
+    BadDataItem,
+    EstimateResult,
+    GEN_CONTROL_KIND,
+    Measurement,
+    ObservabilityResult,
+    print_iteration as _print_iteration,
+    print_iteration_header as _print_iteration_header,
+)
+from secore.ac_se import (
+    _read_measurements_direct as _read_measurements_direct_shared,
+)
 from secore.se_math import (
     ANGLE_MEASUREMENT_TYPES,
     SparseJacobianBuilder,
@@ -52,181 +63,9 @@ DEFAULT_MEAS = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
 AC_ARRAY_PPC_MIN_BUSES = 1000
 
 
-@dataclass(slots=True)
-class Measurement:
-    idx: int
-    name: str
-    device_type: str
-    device_name: str
-    meas_type: str
-    weight: float
-    valid: bool
-    value: float
-
-    @property
-    def device(self) -> str:
-        return f"{self.device_type}:{self.device_name}"
-
-
-@dataclass
-class ObservabilityResult:
-    observable: bool
-    rank: int
-    state_count: int
-    measurement_count: int
-    deficiency: int
-    singular_values: np.ndarray
-    weak_states: List[Tuple[str, float]]
-
-
-@dataclass
-class EstimateResult:
-    converged: bool
-    iterations: int
-    objective: float
-    max_correction: float
-    residual_inf: float
-    x: np.ndarray
-    z_est: np.ndarray
-    residual: np.ndarray
-    H: np.ndarray
-    gain: np.ndarray
-    measurements: List[Measurement]
-    observability: ObservabilityResult
-
-
-@dataclass
-class BadDataItem:
-    measurement: Measurement
-    residual: float
-    normalized_residual: float
-    estimated_value: float
-    measured_value: float
-
-
 def _read_measurements_direct(meas_file: Path) -> List[Measurement]:
-    """Read only the <Measurement> block without building EBook row dictionaries."""
-    required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
-    header = None
-    column_index = None
-    standard_header = False
-    idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
-    measurements: List[Measurement] = []
-    append_measurement = measurements.append
-    new_measurement = Measurement.__new__
-    int_cell = int
-    float_cell = float
-    device_type_cache: Dict[str, str] = {}
-    measurement_type_cache: Dict[str, str] = {}
-    in_measurement = False
-
-    with open(meas_file, mode="rt", encoding="utf8") as fp:
-        for line_no, raw_line in enumerate(fp, start=1):
-            first = raw_line[0] if raw_line else ""
-            if not in_measurement:
-                if first == "<" and raw_line.strip() == "<Measurement>":
-                    in_measurement = True
-                continue
-            if first == "@":
-                header = raw_line[1:].split()
-                column_index = {name: idx for idx, name in enumerate(header)}
-                missing = [name for name in required_columns if name not in column_index]
-                if missing:
-                    raise RuntimeError(f"{meas_file} Measurement header is missing columns: {missing}")
-                standard_header = tuple(header[: len(required_columns)]) == required_columns
-                idx_col = column_index["idx"]
-                name_col = column_index["name"]
-                dev_type_col = column_index["dev_type"]
-                dev_name_col = column_index["dev_name"]
-                meas_type_col = column_index["meas_type"]
-                weight_col = column_index["weight"]
-                valid_col = column_index["valid"]
-                value_col = column_index["value"]
-                continue
-            if first == "#":
-                if header is None or column_index is None:
-                    raise RuntimeError(f"{meas_file} Measurement data appears before the header")
-                if standard_header:
-                    row = raw_line[1:].split(maxsplit=7)
-                    if len(row) < len(required_columns):
-                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
-                    idx_text = row[0]
-                    name = row[1]
-                    raw_device_type = row[2]
-                    device_name = row[3]
-                    raw_meas_type = row[4]
-                    weight_text = row[5]
-                    valid_text = row[6]
-                    value_text = row[7]
-                else:
-                    row = raw_line[1:].split(maxsplit=len(header) - 1)
-                    if len(row) < len(header):
-                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
-                    idx_text = row[idx_col]
-                    name = row[name_col]
-                    raw_device_type = row[dev_type_col]
-                    device_name = row[dev_name_col]
-                    raw_meas_type = row[meas_type_col]
-                    weight_text = row[weight_col]
-                    valid_text = row[valid_col]
-                    value_text = row[value_col]
-                device_type = device_type_cache.get(raw_device_type)
-                if device_type is None:
-                    device_type = raw_device_type
-                    device_type_cache[raw_device_type] = device_type
-                meas_type = measurement_type_cache.get(raw_meas_type)
-                if meas_type is None:
-                    meas_type = raw_meas_type.upper()
-                    measurement_type_cache[raw_meas_type] = meas_type
-                meas = new_measurement(Measurement)
-                meas.idx = int_cell(idx_text)
-                meas.name = name
-                meas.device_type = device_type
-                meas.device_name = device_name
-                meas.meas_type = meas_type
-                meas.weight = float_cell(weight_text)
-                meas.valid = valid_text == "1"
-                meas.value = float_cell(value_text)
-                append_measurement(meas)
-                continue
-
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line == "</Measurement>":
-                break
-            raise SyntaxError(f"Invalid Measurement row at line {line_no} in {meas_file}")
-
-    if not in_measurement:
-        raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
-    if header is None:
-        raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
-    return measurements
-
-
-def _print_iteration_header() -> None:
-    print("Iteration process:")
-    print("  iter objective      max_dx      norm_res    step   status")
-
-
-def _print_iteration(
-    iteration: int,
-    objective: float,
-    residual_inf: float,
-    max_correction: float,
-    step_scale: Optional[float],
-    converged: bool,
-) -> None:
-    step = "-" if step_scale is None else f"{step_scale:.3f}"
-    status = "converged" if converged else ""
-    print(
-        f"  {iteration:4d} "
-        f"{objective:12.6e} "
-        f"{max_correction:10.3e} "
-        f"{residual_inf:10.3e} "
-        f"{step:>6s} "
-        f"{status}"
-    )
+    """Read Measurement rows through the shared AC/DC SE parser."""
+    return _read_measurements_direct_shared(meas_file, Measurement)
 
 
 class HybridStateEstimator:
@@ -446,7 +285,7 @@ class HybridStateEstimator:
             calc.ac_calc = ACPowerFlowCalc.from_ppc(ppc, parameters=calc.params, keep_node_objects=True)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
-        if use_array_ppc:
+        if calc.ac_calc is not None and getattr(calc.ac_calc, "isl", None) is None:
             HybridStateEstimator._attach_array_ac_object_island(calc.ac_calc, network.ac)
         flat_x = calc.x.copy()
         file_x = HybridStateEstimator._file_state_vector(calc)
@@ -687,6 +526,19 @@ class HybridStateEstimator:
         return next_idx + 1
 
     @staticmethod
+    def _load_zip_coefficients(load) -> Tuple[float, float, float, float, float, float]:
+        """Return ZIP coefficients from the shared load field names."""
+        pbase = float(getattr(load, "pbase", 1.0) or 0.0)
+        qbase = float(getattr(load, "qbase", 1.0) or 0.0)
+        p0 = pbase * float(getattr(load, "pv0", 0.0) or 0.0)
+        p1 = pbase * float(getattr(load, "pv1", 0.0) or 0.0)
+        p2 = pbase * float(getattr(load, "pv2", 0.0) or 0.0)
+        q0 = qbase * float(getattr(load, "qv0", 0.0) or 0.0)
+        q1 = qbase * float(getattr(load, "qv1", 0.0) or 0.0)
+        q2 = qbase * float(getattr(load, "qv2", 0.0) or 0.0)
+        return p0, p1, p2, q0, q1, q2
+
+    @staticmethod
     def _ac_generator_pseudo_power(gen) -> Tuple[float, float]:
         # Hybrid load flow writes solved injections back before the estimator is built.
         p = getattr(gen, "p", None)
@@ -704,8 +556,9 @@ class HybridStateEstimator:
             return float(p), float(q)
         node = getattr(load, "node_obj", None)
         voltage = float(getattr(node, "voltage", 1.0) or 1.0)
-        p = load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage
-        q = load.qv0 + load.qv1 * voltage + load.qv2 * voltage * voltage
+        p0, p1, p2, q0, q1, q2 = HybridStateEstimator._load_zip_coefficients(load)
+        p = p0 + p1 * voltage + p2 * voltage * voltage
+        q = q0 + q1 * voltage + q2 * voltage * voltage
         return float(p), float(q)
 
     @staticmethod
@@ -729,7 +582,8 @@ class HybridStateEstimator:
             return float(p)
         node = getattr(load, "node_obj", None)
         voltage = float(getattr(node, "voltage", 1.0) or 1.0)
-        return float(load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage)
+        p0, p1, p2, _, _, _ = HybridStateEstimator._load_zip_coefficients(load)
+        return float(p0 + p1 * voltage + p2 * voltage * voltage)
 
     def _active_ac_angle_measurement_counts(self) -> Dict[str, int]:
         """Count usable local P/Q or direct angle measurements per AC node."""
@@ -781,13 +635,25 @@ class HybridStateEstimator:
     def _add_pseudo_topology_measurements(self, next_idx: int) -> int:
         """Add weak priors for topology devices that have no usable measurement row."""
         measured_keys = self._active_measurement_keys()
+        ac_node_voltage = self._ac_node_voltage_measurements() if self.calc.ac_calc is not None else {}
+        dc_node_voltage = self._dc_node_voltage_measurements() if self.calc.dc_calc is not None else {}
+
+        def ac_terminal_voltage(node_obj) -> float:
+            if node_obj is not None and node_obj.idx in ac_node_voltage:
+                return float(ac_node_voltage[node_obj.idx])
+            return float(getattr(node_obj, "voltage", 1.0) or 1.0)
+
+        def dc_terminal_voltage(node_obj) -> float:
+            if node_obj is not None and node_obj.idx in dc_node_voltage:
+                return float(dc_node_voltage[node_obj.idx])
+            return float(getattr(node_obj, "voltage", 1.0) or 1.0)
 
         for device_type, devices in (
             ("ACZeroBranch", sorted(self.ac_zero_branch_by_name.values(), key=lambda item: item.idx)),
             ("ACSwitch", sorted(self.ac_switch_by_name.values(), key=lambda item: item.idx)),
         ):
             for dev in devices:
-                voltage = float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0)
+                voltage = ac_terminal_voltage(getattr(dev, "i_node_obj", None))
                 values = (
                     ("P_FROM", float(getattr(dev, "p", 0.0) or 0.0)),
                     ("Q_FROM", float(getattr(dev, "q", 0.0) or 0.0)),
@@ -811,12 +677,13 @@ class HybridStateEstimator:
             ("DCZeroBranch", sorted(self.dc_zero_branch_by_name.values(), key=lambda item: item.idx)),
         ):
             for dev in devices:
-                voltage = float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0)
-                values = (
+                voltage = dc_terminal_voltage(getattr(dev, "i_node_obj", None))
+                values = [
                     ("P_FROM", float(getattr(dev, "p", 0.0) or 0.0)),
                     ("V_FROM", voltage),
-                    ("I_FROM", float(getattr(dev, "current", 0.0) or 0.0)),
-                )
+                ]
+                if not (device_type == "DCZeroBranch" and dev.i_node in dc_node_voltage):
+                    values.append(("I_FROM", float(getattr(dev, "current", 0.0) or 0.0)))
                 for meas_type, value in values:
                     if (device_type, dev.name, meas_type) in measured_keys:
                         continue
@@ -1307,7 +1174,7 @@ class HybridStateEstimator:
         ac = self.calc.ac_calc
         if ac is None:
             return {}
-        ref_by_island = {getattr(node, "isl", None): node for node in self.ac_reference_nodes}
+        ref_by_node_idx = {int(node.idx): node for node in self.ac_reference_nodes}
         offsets: Dict[int, float] = {}
 
         def original_angle(pos: int) -> float:
@@ -1316,7 +1183,7 @@ class HybridStateEstimator:
         for island in self.network.ac.islands:
             if not getattr(island, "is_alive", False):
                 continue
-            ref = ref_by_island.get(getattr(island, "idx", None))
+            ref = next((node for node in island.nodes if int(node.idx) in ref_by_node_idx), None)
             if ref is None or ref.idx not in ac.node_pos:
                 continue
             offset = original_angle(ac.node_pos[ref.idx])
@@ -2048,16 +1915,17 @@ class HybridStateEstimator:
                     add(row, v_col)
                     skip[row] = True
                 elif mtype in ("P_LOAD", "Q_LOAD", "I_LOAD"):
+                    p0, p1, p2, q0, q1, q2 = self._load_zip_coefficients(load)
                     ac_load_rows.append(row)
                     ac_load_kind.append({"P_LOAD": 0, "Q_LOAD": 1, "I_LOAD": 2}[mtype])
                     ac_load_v_pos.append(pos)
                     ac_load_v_col.append(v_col)
-                    ac_load_pv0.append(float(load.pv0))
-                    ac_load_pv1.append(float(load.pv1))
-                    ac_load_pv2.append(float(load.pv2))
-                    ac_load_qv0.append(float(load.qv0))
-                    ac_load_qv1.append(float(load.qv1))
-                    ac_load_qv2.append(float(load.qv2))
+                    ac_load_pv0.append(p0)
+                    ac_load_pv1.append(p1)
+                    ac_load_pv2.append(p2)
+                    ac_load_qv0.append(q0)
+                    ac_load_qv1.append(q1)
+                    ac_load_qv2.append(q2)
                     skip[row] = True
 
             elif dtype == "ACGenerator" and ac is not None and mtype == "V_GEN":
@@ -2163,13 +2031,14 @@ class HybridStateEstimator:
                     add(row, v_col)
                     skip[row] = True
                 elif mtype in ("P_LOAD", "I_LOAD"):
+                    p0, p1, p2, _, _, _ = self._load_zip_coefficients(load)
                     dc_load_rows.append(row)
                     dc_load_kind.append(0 if mtype == "P_LOAD" else 1)
                     dc_load_v_pos.append(pos)
                     dc_load_v_col.append(v_col)
-                    dc_load_pv0.append(float(load.pv0))
-                    dc_load_pv1.append(float(load.pv1))
-                    dc_load_pv2.append(float(load.pv2))
+                    dc_load_pv0.append(p0)
+                    dc_load_pv1.append(p1)
+                    dc_load_pv2.append(p2)
                     skip[row] = True
 
             elif dtype == "DCGenerator" and dc is not None:
@@ -2603,18 +2472,19 @@ class HybridStateEstimator:
 
                 elif dtype == "ACLoad" and ac is not None:
                     pos = np.asarray([ac.node_pos[dev.node] for dev in devices], dtype=np.int32)
+                    coeff = np.asarray([self._load_zip_coefficients(dev) for dev in devices], dtype=np.float64)
                     fast_groups.append(
                         (
                             "ACLoad",
                             mtype,
                             rows,
                             pos,
-                            np.asarray([dev.pv0 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.pv1 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.pv2 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.qv0 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.qv1 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.qv2 for dev in devices], dtype=np.float64),
+                            coeff[:, 0],
+                            coeff[:, 1],
+                            coeff[:, 2],
+                            coeff[:, 3],
+                            coeff[:, 4],
+                            coeff[:, 5],
                         )
                     )
 
@@ -2649,8 +2519,10 @@ class HybridStateEstimator:
 
                 elif dtype == "DCGenerator" and dc is not None:
                     pos = np.asarray([dc.alive_node_dict[dev.node] for dev in devices], dtype=np.int32)
-                    ctrl_map = {"V": 0, "P": 1, "I": 2}
-                    ctrl = np.asarray([ctrl_map[str(dev.control_type).upper()] for dev in devices], dtype=np.int8)
+                    ctrl = np.asarray(
+                        [GEN_CONTROL_KIND[str(dev.control_type).upper()] for dev in devices],
+                        dtype=np.int8,
+                    )
                     p_col = np.asarray(
                         [self.dc_v_generator_col_by_name.get(dev.name, -1) for dev in devices],
                         dtype=np.int32,
@@ -2661,15 +2533,16 @@ class HybridStateEstimator:
 
                 elif dtype == "DCLoad" and dc is not None:
                     pos = np.asarray([dc.alive_node_dict[dev.node] for dev in devices], dtype=np.int32)
+                    coeff = np.asarray([self._load_zip_coefficients(dev) for dev in devices], dtype=np.float64)
                     fast_groups.append(
                         (
                             "DCLoad",
                             mtype,
                             rows,
                             pos,
-                            np.asarray([dev.pv0 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.pv1 for dev in devices], dtype=np.float64),
-                            np.asarray([dev.pv2 for dev in devices], dtype=np.float64),
+                            coeff[:, 0],
+                            coeff[:, 1],
+                            coeff[:, 2],
                         )
                     )
 
@@ -4926,10 +4799,11 @@ class HybridStateEstimator:
                 pos = ac.node_pos[load.node]
                 v = ac_V[pos]
                 voltage_col = int(self.ac_voltage_state_col[pos])
-                p = load.pv0 + load.pv1 * v + load.pv2 * v * v
-                q = load.qv0 + load.qv1 * v + load.qv2 * v * v
-                dp = load.pv1 + 2.0 * load.pv2 * v
-                dq = load.qv1 + 2.0 * load.qv2 * v
+                p0, p1, p2, q0, q1, q2 = self._load_zip_coefficients(load)
+                p = p0 + p1 * v + p2 * v * v
+                q = q0 + q1 * v + q2 * v * v
+                dp = p1 + 2.0 * p2 * v
+                dq = q1 + 2.0 * q2 * v
                 if mtype == "P_LOAD":
                     self._add_derivative(H, row, voltage_col, dp)
                 elif mtype == "Q_LOAD":
@@ -5076,12 +4950,13 @@ class HybridStateEstimator:
                 pos = dc.alive_node_dict[load.node]
                 v = dc_V[pos]
                 voltage_col = int(self.dc_voltage_state_col[pos])
+                p0, p1, p2, _, _, _ = self._load_zip_coefficients(load)
                 if mtype == "P_LOAD":
-                    self._add_derivative(H, row, voltage_col, load.pv1 + 2.0 * load.pv2 * v)
+                    self._add_derivative(H, row, voltage_col, p1 + 2.0 * p2 * v)
                 elif mtype == "V_LOAD":
                     self._add_derivative(H, row, voltage_col, 1.0)
                 elif mtype == "I_LOAD":
-                    self._add_derivative(H, row, voltage_col, load.pv2 - load.pv0 / (v * v))
+                    self._add_derivative(H, row, voltage_col, p2 - p0 / (v * v))
                 else:
                     raise RuntimeError(f"Unsupported DCLoad measurement type: {mtype}")
 

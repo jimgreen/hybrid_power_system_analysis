@@ -66012,7 +66012,7 @@
 </DCBranch>
 
 <DCLoad>
-@ idx   name       node  pv0 pv1 pv2 run_stat p current
+@ idx   name       node  pbase  pv0 pv1 pv2 run_stat p current
 # 0     load_1     1     35  4   2   1        0 0      
 # 1     load_2     2     30  3   2.5 1        0 0      
 # 2     load_3     4     25  4   1.5 1        0 0      

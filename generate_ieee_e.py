@@ -184,9 +184,11 @@ def convert_case(case_name, out_path):
                 str(load_idx),
                 f"load_{bus_id}",
                 str(bus_index[bus_id]),
+                "1.0",
                 _fmt(pd),
                 "0.0",
                 "0.0",
+                "1.0",
                 _fmt(qd),
                 "0.0",
                 "0.0",
@@ -200,7 +202,7 @@ def convert_case(case_name, out_path):
     _write_block(
         lines,
         "ACLoad",
-        ["idx", "name", "node", "pv0", "pv1", "pv2", "qv0", "qv1", "qv2", "run_stat", "p", "q", "current"],
+        ["idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "qbase", "qv0", "qv1", "qv2", "run_stat", "p", "q", "current"],
         load_rows,
     )
 

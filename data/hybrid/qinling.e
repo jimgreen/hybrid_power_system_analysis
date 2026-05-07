@@ -58,10 +58,10 @@
 </ACBranch>
 
 <ACLoad>
-@ idx name      node pv0 pv1 pv2 qv0 qv1 qv2 run_stat p q current
-# 0   load_ac_1 22   350 0   0   120 0   0   1        0 0 0
-# 1   load_ac_2 23   250 0   0   80  0   0   1        0 0 0
-# 2   h2_load   29   100 0   0   0   0   0   1        0 0 0
+@ idx name      node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat p q current
+# 0   load_ac_1 22   1.0   350 0   0   1.0   120 0   0   1        0 0 0
+# 1   load_ac_2 23   1.0   250 0   0   1.0   80  0   0   1        0 0 0
+# 2   h2_load   29   1.0   100 0   0   1.0   0   0   0   1        0 0 0
 </ACLoad>
 
 <ACGenerator>

@@ -38,12 +38,13 @@ BRANCH_COLS = {
 LOAD_COLS = {
     "idx": 0,
     "node": 1,
-    "pv0": 2,
-    "pv1": 3,
-    "pv2": 4,
-    "run_stat": 5,
-    "p": 6,
-    "current": 7,
+    "pbase": 2,
+    "pv0": 3,
+    "pv1": 4,
+    "pv2": 5,
+    "run_stat": 6,
+    "p": 7,
+    "current": 8,
 }
 GEN_COLS = {
     "idx": 0,
@@ -249,9 +250,10 @@ def build_dc_ppc_from_e_file(
         node = _int_cell(row, load_cols, "node")
         load[out_row, LOAD_COLS["idx"]] = _int_cell(row, load_cols, "idx")
         load[out_row, LOAD_COLS["node"]] = node
-        load[out_row, LOAD_COLS["pv0"]] = _float_cell(row, load_cols, "pv0") / p_base
-        load[out_row, LOAD_COLS["pv1"]] = _float_cell(row, load_cols, "pv1") / p_base
-        load[out_row, LOAD_COLS["pv2"]] = _float_cell(row, load_cols, "pv2") / p_base
+        load[out_row, LOAD_COLS["pbase"]] = _float_cell(row, load_cols, "pbase", 1.0) / p_base
+        load[out_row, LOAD_COLS["pv0"]] = _float_cell(row, load_cols, "pv0")
+        load[out_row, LOAD_COLS["pv1"]] = _float_cell(row, load_cols, "pv1")
+        load[out_row, LOAD_COLS["pv2"]] = _float_cell(row, load_cols, "pv2")
         load[out_row, LOAD_COLS["run_stat"]] = _float_cell(row, load_cols, "run_stat", 1.0)
         load[out_row, LOAD_COLS["p"]] = _float_cell(row, load_cols, "p") / p_base
         load[out_row, LOAD_COLS["current"]] = _float_cell(row, load_cols, "current") / _current_scale(
@@ -433,11 +435,12 @@ class DCPowerNetwork:
         self.branches.append(br)
         return br
 
-    def add_load(self, idx, node, pv0, pv1, pv2, run_stat=1):
+    def add_load(self, idx, node, pbase, pv0, pv1, pv2, run_stat=1):
         ld = _device(
             idx,
             f"load_{idx}",
             node=int(node),
+            pbase=float(pbase),
             pv0=float(pv0),
             pv1=float(pv1),
             pv2=float(pv2),
@@ -574,6 +577,7 @@ class DCPowerNetwork:
                     row[LOAD_COLS["idx"]],
                     name,
                     node=int(row[LOAD_COLS["node"]]),
+                    pbase=float(row[LOAD_COLS["pbase"]]),
                     pv0=float(row[LOAD_COLS["pv0"]]),
                     pv1=float(row[LOAD_COLS["pv1"]]),
                     pv2=float(row[LOAD_COLS["pv2"]]),

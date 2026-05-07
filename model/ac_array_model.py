@@ -88,16 +88,18 @@ GEN_COLS = {
 LOAD_COLS = {
     "idx": 0,
     "node": 1,
-    "pv0": 2,
-    "pv1": 3,
-    "pv2": 4,
-    "qv0": 5,
-    "qv1": 6,
-    "qv2": 7,
-    "run_stat": 8,
-    "p": 9,
-    "q": 10,
-    "current": 11,
+    "pbase": 2,
+    "pv0": 3,
+    "pv1": 4,
+    "pv2": 5,
+    "qbase": 6,
+    "qv0": 7,
+    "qv1": 8,
+    "qv2": 9,
+    "run_stat": 10,
+    "p": 11,
+    "q": 12,
+    "current": 13,
 }
 SHUNT_COLS = {
     "idx": 0,
@@ -449,25 +451,29 @@ def build_ac_ppc_from_e_file(
     load_rows = _rows(raw, "ACLoad")
     load_cols = _columns(raw, "ACLoad")
     load_name_col = load_cols.get("name")
-    load_target_cols = tuple(LOAD_COLS[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
     load = np.zeros((len(load_rows), len(LOAD_COLS)), dtype=np.float64)
     if load_rows:
         load_idx_col = load_cols["idx"]
         load_node_col = load_cols["node"]
         load_run_col = load_cols["run_stat"]
-        load_value_cols = tuple(load_cols[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
-        load_table = _row_array(load_rows)
-        load_numeric = _numeric_columns(
-            load_table,
-            (load_idx_col, load_node_col, *load_value_cols, load_run_col),
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-        )
-        load[:, LOAD_COLS["idx"]] = load_numeric[:, 0]
-        load[:, LOAD_COLS["node"]] = load_numeric[:, 1]
+        load_value_cols = tuple(load_cols.get(key) for key in ("pbase", "pv0", "pv1", "pv2", "qbase", "qv0", "qv1", "qv2"))
+        pbase_col, pv0_col, pv1_col, pv2_col, qbase_col, qv0_col, qv1_col, qv2_col = load_value_cols
+        load[:, LOAD_COLS["idx"]] = _float_column(load_rows, load_idx_col)
+        load[:, LOAD_COLS["node"]] = _float_column(load_rows, load_node_col)
         inv_p_base = 1.0 / p_base
-        for offset, target_col in enumerate(load_target_cols, start=2):
-            load[:, target_col] = load_numeric[:, offset] * inv_p_base
-        load[:, LOAD_COLS["run_stat"]] = load_numeric[:, 8]
+        load[:, LOAD_COLS["pbase"]] = (
+            _float_column(load_rows, pbase_col, 1.0) if pbase_col is not None else np.ones(len(load_rows))
+        ) * inv_p_base
+        load[:, LOAD_COLS["pv0"]] = _float_column(load_rows, pv0_col) if pv0_col is not None else 0.0
+        load[:, LOAD_COLS["pv1"]] = _float_column(load_rows, pv1_col) if pv1_col is not None else 0.0
+        load[:, LOAD_COLS["pv2"]] = _float_column(load_rows, pv2_col) if pv2_col is not None else 0.0
+        load[:, LOAD_COLS["qbase"]] = (
+            _float_column(load_rows, qbase_col, 1.0) if qbase_col is not None else np.ones(len(load_rows))
+        ) * inv_p_base
+        load[:, LOAD_COLS["qv0"]] = _float_column(load_rows, qv0_col) if qv0_col is not None else 0.0
+        load[:, LOAD_COLS["qv1"]] = _float_column(load_rows, qv1_col) if qv1_col is not None else 0.0
+        load[:, LOAD_COLS["qv2"]] = _float_column(load_rows, qv2_col) if qv2_col is not None else 0.0
+        load[:, LOAD_COLS["run_stat"]] = _float_column(load_rows, load_run_col, 1.0)
     load_names = (
         np.asarray(
             [

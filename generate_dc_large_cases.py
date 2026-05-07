@@ -87,7 +87,7 @@ def _build_case_tables(n_nodes: int) -> List[tuple]:
 
         for node_local, pv0, pv1, pv2 in load_specs:
             node = base + node_local
-            loads.append((load_idx, f"load_{load_idx + 1}", node, pv0, pv1, pv2, 1, 0, 0))
+            loads.append((load_idx, f"load_{load_idx + 1}", node, 1.0, pv0, pv1, pv2, 1, 0, 0))
             load_idx += 1
 
         generators.append((gen_idx, f"gen_v_{block + 1}", base + 0, "V", 160.0, 0.0, 0.0, 1, 0, 0))
@@ -127,7 +127,7 @@ def _build_case_tables(n_nodes: int) -> List[tuple]:
         ("PowerBase", ("p_base", "u_scale", "p_scale", "i_scale"), [(POWER_BASE, U_SCALE, P_SCALE, I_SCALE)]),
         ("DCNode", ("idx", "name", "vbase", "voltage", "isl", "run_stat"), nodes),
         ("DCBranch", ("idx", "name", "i_node", "j_node", "r", "run_stat", "i_p", "j_p", "current"), branches),
-        ("DCLoad", ("idx", "name", "node", "pv0", "pv1", "pv2", "run_stat", "p", "current"), loads),
+        ("DCLoad", ("idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "run_stat", "p", "current"), loads),
         ("DCGenerator", ("idx", "name", "node", "control_type", "v_set", "p_set", "i_set", "run_stat", "p", "current"), generators),
         ("DCZeroBranch", ("idx", "name", "i_node", "j_node", "run_stat", "p", "current"), zero_branches),
         ("DCSwitch", ("idx", "name", "i_node", "j_node", "status", "run_stat", "p", "current"), switches),

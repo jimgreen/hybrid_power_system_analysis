@@ -36,14 +36,14 @@
 </ACBranch>
 
 <ACLoad>
-@ idx name   node pv0 pv1 pv2 qv0 qv1 qv2 run_stat p q current
-# 0   load_3 3    50  30  20  40  40  20  1        0 0 0
-# 1   load_4 4    60  20  20  50  30  20  1        0 0 0
-# 2   load_5 5    40  40  20  30  40  30  1        0 0 0
-# 3   load_6 6    50  30  20  50  30  20  1        0 0 0
-# 4   load_7 7    70  20  10  60  20  20  1        0 0 0
-# 5   load_8 8    50  30  20  40  30  30  1        0 0 0
-# 6   load_9 9    60  20  20  50  30  20  1        0 0 0
+@ idx name   node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat p q current
+# 0   load_3 3    1.0    50  30  20  1.0  40  40  20  1        0 0 0
+# 1   load_4 4    1.0    60  20  20  1.0  50  30  20  1        0 0 0
+# 2   load_5 5    1.0    40  40  20  1.0  30  40  30  1        0 0 0
+# 3   load_6 6    1.0    50  30  20  1.0  50  30  20  1        0 0 0
+# 4   load_7 7    1.0    70  20  10  1.0  60  20  20  1        0 0 0
+# 5   load_8 8    1.0    50  30  20  1.0  40  30  30  1        0 0 0
+# 6   load_9 9    1.0    60  20  20  1.0  50  30  20  1        0 0 0
 </ACLoad>
 
 <ACGenerator>

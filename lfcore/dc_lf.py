@@ -312,9 +312,10 @@ class DCPowerFlowCalc:
                 load_pos_all = self._map_nodes_with_lookup(load[:, DC_LOAD_COLS["node"]], node_lookup)
                 load_mask = (load[:, DC_LOAD_COLS["run_stat"]] == 1) & (load_pos_all >= 0)
                 load_pos = load_pos_all[load_mask]
-                load_pv0 = load[load_mask, DC_LOAD_COLS["pv0"]].astype(np.float64, copy=False)
-                load_pv1 = load[load_mask, DC_LOAD_COLS["pv1"]].astype(np.float64, copy=False)
-                load_pv2 = load[load_mask, DC_LOAD_COLS["pv2"]].astype(np.float64, copy=False)
+                load_pbase = load[load_mask, DC_LOAD_COLS["pbase"]].astype(np.float64, copy=False)
+                load_pv0 = load_pbase * load[load_mask, DC_LOAD_COLS["pv0"]]
+                load_pv1 = load_pbase * load[load_mask, DC_LOAD_COLS["pv1"]]
+                load_pv2 = load_pbase * load[load_mask, DC_LOAD_COLS["pv2"]]
                 np.add.at(self.P_const, load_pos, -load_pv0)
                 np.add.at(self.I_shunt, load_pos, load_pv1)
                 nz_load = load_pv2 != 0.0
@@ -378,11 +379,15 @@ class DCPowerFlowCalc:
             load_nodes = []
             load_g = []
             for ld, node in self.alive_loads:
-                self.P_const[node] -= ld.pv0
-                self.I_shunt[node] += ld.pv1
-                if ld.pv2 != 0.0:
+                pbase = float(getattr(ld, "pbase", 1.0))
+                pv0 = pbase * ld.pv0
+                pv1 = pbase * ld.pv1
+                pv2 = pbase * ld.pv2
+                self.P_const[node] -= pv0
+                self.I_shunt[node] += pv1
+                if pv2 != 0.0:
                     load_nodes.append(node)
-                    load_g.append(ld.pv2)
+                    load_g.append(pv2)
             load_nodes_arr = np.asarray(load_nodes, dtype=np.int32) if load_nodes else np.array([], dtype=np.int32)
             load_g_arr = np.asarray(load_g, dtype=np.float64) if load_nodes else np.array([], dtype=np.float64)
 
@@ -1067,7 +1072,8 @@ class DCPowerFlowCalc:
                 ld.current = 0.0
                 continue
             v = V_final[idx]
-            ld.p = ld.pv0 + ld.pv1 * v + ld.pv2 * v * v
+            pbase = float(getattr(ld, "pbase", 1.0))
+            ld.p = pbase * (ld.pv0 + ld.pv1 * v + ld.pv2 * v * v)
             ld.current = ld.p / v
             P_inj[idx] += ld.p
 

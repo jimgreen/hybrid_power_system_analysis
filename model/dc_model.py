@@ -40,10 +40,11 @@ class DCBranch:
         self.j_node_obj = None
 
 class DCLoad:
-    def __init__(self, idx, node, pv0, pv1, pv2, run_stat=1):
+    def __init__(self, idx, node, pbase, pv0, pv1, pv2, run_stat=1):
         self.idx = idx
         self.node = node
         self.run_stat = run_stat
+        self.pbase = pbase
         self.pv0 = pv0
         self.pv1 = pv1
         self.pv2 = pv2
@@ -142,8 +143,8 @@ class DCPowerNetwork:
         self.branches.append(br)
         return br
 
-    def add_load(self, idx, node, pv0, pv1, pv2, run_stat=1):
-        ld = DCLoad(idx, node, pv0, pv1, pv2, run_stat)
+    def add_load(self, idx, node, pbase, pv0, pv1, pv2, run_stat=1):
+        ld = DCLoad(idx, node, pbase, pv0, pv1, pv2, run_stat)
         self.loads.append(ld)
         return ld
 

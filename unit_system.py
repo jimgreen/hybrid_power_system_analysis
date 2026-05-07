@@ -157,7 +157,11 @@ def normalize_model_named_units(model) -> float:
 
     for load in getattr(model, "ACLoad", []):
         node = ac_nodes.get(load.node)
-        _scale_power_attrs_in_dict(load, ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2", "p", "q"), p_base)
+        if not hasattr(load, "pbase"):
+            load.pbase = 1.0
+        if not hasattr(load, "qbase"):
+            load.qbase = 1.0
+        _scale_power_attrs_in_dict(load, ("pbase", "qbase", "p", "q"), p_base)
         scale_base = ac_current_scales.get(load.node)
         if scale_base is not None:
             _scale_attr_in_dict(load, "current", scale_base)
@@ -200,7 +204,9 @@ def normalize_model_named_units(model) -> float:
 
     for load in getattr(model, "DCLoad", []):
         node = dc_nodes.get(load.node)
-        _scale_power_attrs_in_dict(load, ("pv0", "pv1", "pv2", "p"), p_base)
+        if not hasattr(load, "pbase"):
+            load.pbase = 1.0
+        _scale_power_attrs_in_dict(load, ("pbase", "p"), p_base)
         scale_base = dc_current_scales.get(load.node)
         if scale_base is not None:
             _scale_attr_in_dict(load, "current", scale_base)
