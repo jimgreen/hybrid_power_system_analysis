@@ -39,7 +39,7 @@
 import importlib
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 try:
@@ -260,15 +260,35 @@ class DCPowerFlowCalc:
     def __init__(
         self,
         model,
+        tol: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        min_voltage: Optional[float] = None,
+        island=None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
-        parameters: PowerFlowParameters = None,
+        parameters: Optional[PowerFlowParameters] = None,
+        algorithm: str = "nr",
+        keep_node_objects: bool = True,
         linear_solver: str = "scipy",
     ):
+        algorithm = str(algorithm).strip().lower()
+        if algorithm not in {"nr"}:
+            raise ValueError(f"Unsupported DC power-flow algorithm: {algorithm!r}")
         self.model = model
         self.ppc = getattr(model, "ppc", None)
         self.array_mode = isinstance(self.ppc, dict) and self.ppc.get("format") == "dc_ppc_v1"
-        self.params = parameters or load_lf_parameters(parameter_file)
+        self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
+            tol=tol,
+            max_iter=max_iter,
+            min_voltage=min_voltage,
+        )
         self.runtime_params = self.params
+        self.tol = self.params.tol
+        self.max_iter = self.params.max_iter
+        self.min_voltage = self.params.min_voltage
+        self.algorithm = algorithm
+        self.used_algorithm = algorithm
+        self.target_island = island
+        self.keep_node_objects = bool(keep_node_objects)
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self.converged = False
         self.iterations = 0
@@ -1313,6 +1333,9 @@ class DCPowerFlowCalc:
             divergence_threshold=divergence_threshold,
         )
         self.runtime_params = params
+        self.tol = params.tol
+        self.max_iter = params.max_iter
+        self.min_voltage = params.min_voltage
         self.verbose = verbose
         G, x = self.prepare()
         self.converged = False

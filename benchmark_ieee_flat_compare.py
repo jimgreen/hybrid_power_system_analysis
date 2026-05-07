@@ -38,6 +38,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
         sys.path.insert(0, str(path))
 
 from ac_array_model import (  # noqa: E402
+    BREAK_COLS,
     BRANCH_COLS,
     BUS_COLS,
     CTRL_P,
@@ -85,7 +86,7 @@ def _run_silent(func, *args, **kwargs):
 def _build_matpower_ppc(acppc):
     """Convert the array E-file model into a PYPOWER/MATPOWER ppc.
 
-    Ideal zero-impedance branches and closed switches are represented by
+    Ideal zero-impedance branches, closed switches, and closed breaks are represented by
     collapsing their terminal buses. That gives PYPOWER the same electrical
     network without stamping singular zero-impedance admittances.
     """
@@ -98,6 +99,7 @@ def _build_matpower_ppc(acppc):
     shunt0 = np.asarray(acppc["shunt"])
     zero0 = np.asarray(acppc["zero_branch"])
     switch0 = np.asarray(acppc["switch"])
+    break0 = np.asarray(acppc.get("break", np.zeros((0, len(BREAK_COLS)), dtype=float)))
 
     node_ids = bus0[:, BUS_COLS["idx"]].astype(np.int64)
     row_by_node = {int(node): row for row, node in enumerate(node_ids)}
@@ -116,6 +118,13 @@ def _build_matpower_ppc(acppc):
         for row in switch0[live]:
             left = row_by_node.get(int(row[SWITCH_COLS["i_node"]]))
             right = row_by_node.get(int(row[SWITCH_COLS["j_node"]]))
+            if left is not None and right is not None and active_bus[left] and active_bus[right]:
+                dsu.union(left, right)
+    if break0.size:
+        live = (break0[:, BREAK_COLS["run_stat"]] == 1) & (break0[:, BREAK_COLS["status"]] == 1)
+        for row in break0[live]:
+            left = row_by_node.get(int(row[BREAK_COLS["i_node"]]))
+            right = row_by_node.get(int(row[BREAK_COLS["j_node"]]))
             if left is not None and right is not None and active_bus[left] and active_bus[right]:
                 dsu.union(left, right)
 
