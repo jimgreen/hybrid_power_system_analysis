@@ -330,11 +330,12 @@ class DCPowerFlowCalc:
         方程：功率平衡（除松弛节点外各节点） + 松弛节点电压方程 + 零阻抗电压约束（树支） + φ参考固定 + DC-DC方程
         变量数与方程数严格相等。
         """
-        self.alive_nodes = [
+        bus_nodes = [] if self.keep_node_objects else [
             bus
             for bus in getattr(self.model, "buses", [])
             if getattr(bus, "isl_obj", None) is not None and bus.isl_obj.is_alive
-        ] or [
+        ]
+        self.alive_nodes = bus_nodes or [
             node
             for node in self.model.nodes
             if node.isl_obj is not None and node.isl_obj.is_alive
@@ -1264,7 +1265,13 @@ class DCPowerFlowCalc:
             result.nodes[_device_key(node)] = SimpleNamespace(
                 volt=float(getattr(node, "voltage", 0.0) or 0.0),
             )
-        for br in getattr(self.model, "branches", []):
+        branch_devices = getattr(self, "_lf_branch_devices", None)
+        if branch_devices is not None:
+            inactive_branch_devices = getattr(self, "_lf_inactive_branch_devices", [])
+            branch_devices = list(branch_devices) + list(inactive_branch_devices)
+        else:
+            branch_devices = getattr(self.model, "branches", [])
+        for br in branch_devices:
             result.branches[_device_key(br)] = SimpleNamespace(
                 i_p=float(getattr(br, "i_p", 0.0) or 0.0),
                 i_c=float(getattr(br, "current", 0.0) or 0.0),
