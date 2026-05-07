@@ -292,8 +292,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         for name in expected_refs:
             node = estimator.dc_node_by_name[name]
             pos = dc.alive_node_dict[node.idx]
+            sub_pos = estimator._dc_sub_estimator.node_pos[node.idx]
             ref_voltage = estimator.dc_node_voltage_measurements[node.idx]
-            self.assertEqual(-1, int(estimator.dc_voltage_state_col[pos]))
+            self.assertEqual(-1, int(estimator.dc_voltage_state_col[sub_pos]))
             self.assertAlmostEqual(ref_voltage, dc_voltage[pos])
 
     def test_dc_net_30_matches_dc_state_estimator_result(self):
@@ -369,6 +370,31 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(ac_h.nnz, hybrid_h[estimator._active_ac_hybrid_rows, :].nnz)
         diff = (hybrid_ac_h - ac_h).tocoo()
         self.assertEqual(0, diff.nnz)
+
+    def test_mixed_network_includes_ac_sub_estimator_power_balance_rows(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        ac_balance_rows = [
+            row
+            for row, meas in enumerate(estimator.active_measurements)
+            if meas.device_type == "ACPowerBalance"
+        ]
+        coupled_ac_nodes = estimator._converter_coupled_ac_node_names()
+        expected_balance_count = sum(
+            1
+            for meas in estimator._ac_sub_estimator.active_measurements
+            if meas.device_type == "ACPowerBalance" and meas.device_name not in coupled_ac_nodes
+        )
+        delegated_rows = set(int(row) for row in estimator._active_ac_hybrid_rows)
+
+        self.assertEqual(expected_balance_count, len(ac_balance_rows))
+        self.assertTrue(all(row in delegated_rows for row in ac_balance_rows))
 
     def test_dc_sub_delegation_excludes_hybrid_only_voltage_states(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -482,6 +508,8 @@ class HybridStateEstimationTest(unittest.TestCase):
             (meas.device_type, meas.meas_type)
             for row, meas in enumerate(estimator.active_measurements)
             if not estimator._jacobian_static_skip[row]
+            and not estimator._active_ac_delegated_row_mask[row]
+            and not estimator._active_dc_delegated_row_mask[row]
         }
 
         for key in (
@@ -1063,9 +1091,9 @@ class HybridStateEstimationTest(unittest.TestCase):
             )
         )
         for meas_type in ("P_FROM", "Q_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("ACSwitch", "sw_diesel_ac", meas_type), pseudo_keys)
+            self.assertIn(("ACBreak", "sw_diesel_ac", meas_type), pseudo_keys)
         for meas_type in ("P_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("DCSwitch", "sw_wt01_dc", meas_type), pseudo_keys)
+            self.assertIn(("DCBreak", "sw_wt01_dc", meas_type), pseudo_keys)
 
     def test_adds_low_weight_pseudo_measurements_for_unmetered_hybrid_zero_branches(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -1193,10 +1221,13 @@ class HybridStateEstimationTest(unittest.TestCase):
         )
         self.assertTrue(any(label.startswith("I_ZERO:zbr_") for label in estimator.state_labels))
 
+        dc_result = dc_estimator.estimate(verbose=False)
         result = estimator.estimate(verbose=False)
-        self.assertTrue(result.observability.observable)
-        self.assertTrue(result.converged)
-        self.assertLess(result.residual_inf, 1e-6)
+        self.assertEqual(dc_result.observability.observable, result.observability.observable)
+        self.assertEqual(dc_result.converged, result.converged)
+        self.assertEqual(dc_result.iterations, result.iterations)
+        self.assertAlmostEqual(dc_result.objective, result.objective, places=12)
+        self.assertAlmostEqual(dc_result.residual_inf, result.residual_inf, places=12)
 
     def test_hybrid_se_adds_dc_ideal_branch_voltage_constraints(self):
         from secore.dc_se import DCStateEstimator
