@@ -349,6 +349,27 @@ class HybridStateEstimationTest(unittest.TestCase):
         diff = (hybrid_dc_h - dc_h).tocoo()
         self.assertEqual(0, diff.nnz)
 
+    def test_mixed_network_reuses_ac_state_estimator_jacobian_block(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        x = estimator.initial_state()
+        hybrid_h = estimator.jacobian_sparse(x)
+        ac_x = estimator._ac_sub_state_from_hybrid(x)
+        ac_h = estimator._ac_sub_estimator.jacobian_sparse(ac_x, estimator._active_ac_sub_measurements)
+        hybrid_ac_h = hybrid_h[estimator._active_ac_hybrid_rows, :][:, estimator._ac_sub_to_hybrid_cols]
+
+        self.assertGreater(estimator._active_ac_hybrid_rows.size, 0)
+        self.assertEqual(ac_h.shape, hybrid_ac_h.shape)
+        self.assertEqual(ac_h.nnz, hybrid_h[estimator._active_ac_hybrid_rows, :].nnz)
+        diff = (hybrid_ac_h - ac_h).tocoo()
+        self.assertEqual(0, diff.nnz)
+
     def test_dc_sub_delegation_excludes_hybrid_only_voltage_states(self):
         from secore.hybrid_se import HybridStateEstimator
 

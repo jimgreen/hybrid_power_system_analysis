@@ -351,16 +351,93 @@ class HybridStateEstimator:
         return f"{prefix_map.get(prefix, prefix)}:{name}"
 
     @staticmethod
+    def _ac_sub_state_label_to_hybrid(label: str) -> str:
+        prefix, name = label.split(":", 1)
+        if prefix == "theta":
+            return f"AC_THETA:{name}"
+        if prefix == "V":
+            return f"AC_V:{name}"
+        if prefix.startswith("I_") and prefix.endswith("_RE"):
+            return f"AC_I_RE:{name}"
+        if prefix.startswith("I_") and prefix.endswith("_IM"):
+            return f"AC_I_IM:{name}"
+        if prefix == "P_GEN":
+            return f"AC_GEN_P:{name}"
+        if prefix == "Q_GEN":
+            return f"AC_GEN_Q:{name}"
+        if prefix == "P_LOAD":
+            return f"AC_LOAD_P:{name}"
+        if prefix == "Q_LOAD":
+            return f"AC_LOAD_Q:{name}"
+        return label
+
+    @staticmethod
     def _measurement_key(meas: Measurement) -> Tuple[str, str, str]:
         return (meas.device_type, meas.device_name, meas.meas_type)
 
     def _build_sub_estimator_composition_maps(self) -> None:
         """Map reusable subsystem estimator rows/columns into the hybrid state space."""
+        self._ac_sub_to_hybrid_cols = np.array([], dtype=np.int32)
+        self._active_ac_sub_measurements: List[Measurement] = []
+        self._active_ac_sub_rows = np.array([], dtype=np.int32)
+        self._active_ac_hybrid_rows = np.array([], dtype=np.int32)
+        self._active_ac_delegated_row_mask = np.zeros(len(getattr(self, "active_measurements", [])), dtype=bool)
         self._dc_sub_to_hybrid_cols = np.array([], dtype=np.int32)
         self._active_dc_sub_measurements: List[Measurement] = []
         self._active_dc_sub_rows = np.array([], dtype=np.int32)
         self._active_dc_hybrid_rows = np.array([], dtype=np.int32)
         self._active_dc_delegated_row_mask = np.zeros(len(getattr(self, "active_measurements", [])), dtype=bool)
+        self._build_ac_sub_estimator_composition_map()
+        self._build_dc_sub_estimator_composition_map()
+
+    def _build_ac_sub_estimator_composition_map(self) -> None:
+        ac_sub = getattr(self, "_ac_sub_estimator", None)
+        if ac_sub is None or self._delegate() is not None:
+            return
+
+        hybrid_col_by_label = {label: idx for idx, label in enumerate(self.state_labels)}
+        mapped_cols = np.asarray(
+            [hybrid_col_by_label.get(self._ac_sub_state_label_to_hybrid(label), -1) for label in ac_sub.state_labels],
+            dtype=np.int32,
+        )
+
+        sub_rows_by_key: Dict[Tuple[str, str, str], List[int]] = {}
+        for row, meas in enumerate(ac_sub.active_measurements):
+            sub_rows_by_key.setdefault(self._measurement_key(meas), []).append(row)
+
+        probe_x = ac_sub.initial_state()
+        hybrid_rows: List[int] = []
+        sub_rows: List[int] = []
+        sub_measurements: List[Measurement] = []
+        for h_row, meas in enumerate(self.active_measurements):
+            if meas.device_type.startswith("DC") or meas.device_type in ("DCDCConverter", "DCACConverter", "ACACConverter"):
+                continue
+            rows = sub_rows_by_key.get(self._measurement_key(meas))
+            if not rows:
+                continue
+            sub_row = rows[0]
+            sub_meas = ac_sub.active_measurements[sub_row]
+            try:
+                sub_h = ac_sub.jacobian_sparse(probe_x, [sub_meas]).tocoo()
+            except Exception:
+                continue
+            if sub_h.nnz == 0 or np.any(mapped_cols[sub_h.col.astype(np.int32, copy=False)] < 0):
+                continue
+            rows.pop(0)
+            hybrid_rows.append(h_row)
+            sub_rows.append(sub_row)
+            sub_measurements.append(sub_meas)
+
+        if not hybrid_rows:
+            return
+        self._ac_sub_to_hybrid_cols = mapped_cols
+        self._active_ac_sub_measurements = sub_measurements
+        self._active_ac_sub_rows = np.asarray(sub_rows, dtype=np.int32)
+        self._active_ac_hybrid_rows = np.asarray(hybrid_rows, dtype=np.int32)
+        self._active_ac_delegated_row_mask = np.zeros(len(self.active_measurements), dtype=bool)
+        self._active_ac_delegated_row_mask[self._active_ac_hybrid_rows] = True
+
+    def _build_dc_sub_estimator_composition_map(self) -> None:
         dc_sub = getattr(self, "_dc_sub_estimator", None)
         if dc_sub is None or self._delegate() is not None:
             return
@@ -1619,6 +1696,10 @@ class HybridStateEstimator:
         self.ac_zero_current_cols_by_name: Dict[str, Tuple[int, int]] = {}
         self.dc_zero_current_col_by_name: Dict[str, int] = {}
         self.dc_v_generator_col_by_name: Dict[str, int] = {}
+        self.ac_generator_p_col_by_name: Dict[str, int] = {}
+        self.ac_generator_q_col_by_name: Dict[str, int] = {}
+        self.ac_load_p_col_by_name: Dict[str, int] = {}
+        self.ac_load_q_col_by_name: Dict[str, int] = {}
         self.ac_reference_nodes: List[object] = []
         self.ac_reference_voltage_by_pos: Dict[int, float] = {}
         self.ac_reference_angle_by_pos: Dict[int, float] = {}
@@ -1752,6 +1833,17 @@ class HybridStateEstimator:
                     self.ac_zero_phi_a,
                     self.ac_zero_phi_b,
                 )
+
+            for gen in sorted(self.ac_generator_by_name.values(), key=lambda item: item.idx):
+                p_col = add_virtual(f"AC_GEN_P:{gen.name}")
+                q_col = add_virtual(f"AC_GEN_Q:{gen.name}")
+                self.ac_generator_p_col_by_name[gen.name] = p_col
+                self.ac_generator_q_col_by_name[gen.name] = q_col
+            for load in sorted(self.ac_load_by_name.values(), key=lambda item: item.idx):
+                p_col = add_virtual(f"AC_LOAD_P:{load.name}")
+                q_col = add_virtual(f"AC_LOAD_Q:{load.name}")
+                self.ac_load_p_col_by_name[load.name] = p_col
+                self.ac_load_q_col_by_name[load.name] = q_col
 
         if self.calc.dc_calc is not None:
             dc = self.calc.dc_calc
@@ -2234,18 +2326,7 @@ class HybridStateEstimator:
                     add(row, v_col)
                     skip[row] = True
                 elif mtype in ("P_LOAD", "Q_LOAD", "I_LOAD"):
-                    p0, p1, p2, q0, q1, q2 = self._load_zip_coefficients(load)
-                    ac_load_rows.append(row)
-                    ac_load_kind.append({"P_LOAD": 0, "Q_LOAD": 1, "I_LOAD": 2}[mtype])
-                    ac_load_v_pos.append(pos)
-                    ac_load_v_col.append(v_col)
-                    ac_load_pv0.append(p0)
-                    ac_load_pv1.append(p1)
-                    ac_load_pv2.append(p2)
-                    ac_load_qv0.append(q0)
-                    ac_load_qv1.append(q1)
-                    ac_load_qv2.append(q2)
-                    skip[row] = True
+                    pass
 
             elif dtype == "ACGenerator" and ac is not None and mtype == "V_GEN":
                 gen = self.ac_generator_by_name.get(meas.device_name)
@@ -2256,14 +2337,7 @@ class HybridStateEstimator:
             elif dtype == "ACGenerator" and ac is not None and mtype in ("P_GEN", "Q_GEN", "I_GEN"):
                 gen = self.ac_generator_by_name.get(meas.device_name)
                 if gen is not None and gen.node in ac.node_pos:
-                    bucket = ac_gen_dynamic.setdefault(gen.name, [gen, [], [], []])
-                    if mtype == "P_GEN":
-                        bucket[1].append(row)
-                    elif mtype == "Q_GEN":
-                        bucket[2].append(row)
-                    else:
-                        bucket[3].append(row)
-                    skip[row] = True
+                    pass
 
             elif dtype == "DCBranch" and dc is not None:
                 br = self.dc_branch_by_name.get(meas.device_name)
@@ -2794,24 +2868,22 @@ class HybridStateEstimator:
 
                 elif dtype == "ACGenerator" and ac is not None:
                     pos = np.asarray([ac.node_pos[dev.node] for dev in devices], dtype=np.int32)
-                    share = np.asarray([self.ac_gen_share_by_name.get(dev.name, 1.0) for dev in devices], dtype=np.float64)
-                    fast_groups.append(("ACGenerator", mtype, rows, pos, share))
+                    p_cols = np.asarray([self.ac_generator_p_col_by_name[dev.name] for dev in devices], dtype=np.int32)
+                    q_cols = np.asarray([self.ac_generator_q_col_by_name[dev.name] for dev in devices], dtype=np.int32)
+                    fast_groups.append(("ACGenerator", mtype, rows, pos, p_cols, q_cols))
 
                 elif dtype == "ACLoad" and ac is not None:
                     pos = np.asarray([ac.node_pos[dev.node] for dev in devices], dtype=np.int32)
-                    coeff = np.asarray([self._load_zip_coefficients(dev) for dev in devices], dtype=np.float64)
+                    p_cols = np.asarray([self.ac_load_p_col_by_name[dev.name] for dev in devices], dtype=np.int32)
+                    q_cols = np.asarray([self.ac_load_q_col_by_name[dev.name] for dev in devices], dtype=np.int32)
                     fast_groups.append(
                         (
                             "ACLoad",
                             mtype,
                             rows,
                             pos,
-                            coeff[:, 0],
-                            coeff[:, 1],
-                            coeff[:, 2],
-                            coeff[:, 3],
-                            coeff[:, 4],
-                            coeff[:, 5],
+                            p_cols,
+                            q_cols,
                         )
                     )
 
@@ -2993,13 +3065,12 @@ class HybridStateEstimator:
                     values[rows] = sign * (power.real if mtype.startswith("P") else power.imag)
 
             elif kind == "ACGenerator":
-                pos, share = group[3], group[4]
+                pos, p_cols, q_cols = group[3], group[4], group[5]
                 if mtype == "V_GEN":
                     values[rows] = ac_voltage[pos]
                 else:
-                    p_total, q_total = ac_generator_power_totals()
-                    p = share * p_total[pos]
-                    q = share * q_total[pos]
+                    p = state[p_cols]
+                    q = state[q_cols]
                     if mtype == "P_GEN":
                         values[rows] = p
                     elif mtype == "Q_GEN":
@@ -3008,10 +3079,10 @@ class HybridStateEstimator:
                         values[rows] = np.divide(np.hypot(p, q), ac_voltage[pos], out=np.zeros(rows.size), where=np.abs(ac_voltage[pos]) > self.min_current_voltage)
 
             elif kind == "ACLoad":
-                pos, pv0, pv1, pv2, qv0, qv1, qv2 = group[3], group[4], group[5], group[6], group[7], group[8], group[9]
+                pos, p_cols, q_cols = group[3], group[4], group[5]
                 voltage = ac_voltage[pos]
-                p = pv0 + pv1 * voltage + pv2 * voltage * voltage
-                q = qv0 + qv1 * voltage + qv2 * voltage * voltage
+                p = state[p_cols]
+                q = state[q_cols]
                 if mtype == "P_LOAD":
                     values[rows] = p
                 elif mtype == "Q_LOAD":
@@ -3144,6 +3215,12 @@ class HybridStateEstimator:
     def _evaluate_active_measurements(self, x: np.ndarray) -> np.ndarray:
         if self._active_eval_fast_supported:
             values = self._evaluate_active_measurements_fast(x)
+            ac_sub_x = self._ac_sub_state_from_hybrid(x)
+            if ac_sub_x is not None and self._active_ac_hybrid_rows.size:
+                values[self._active_ac_hybrid_rows] = self._ac_sub_estimator.evaluate(
+                    ac_sub_x,
+                    self._active_ac_sub_measurements,
+                )
             dc_sub_x = self._dc_sub_state_from_hybrid(x)
             if dc_sub_x is not None and self._active_dc_hybrid_rows.size:
                 values[self._active_dc_hybrid_rows] = self._dc_sub_estimator.evaluate(
@@ -3501,6 +3578,20 @@ class HybridStateEstimator:
             )
             x[self.ac_zero_re_cols] = current.real
             x[self.ac_zero_im_cols] = current.imag
+        for gen in self.ac_generator_by_name.values():
+            if gen.name in self.ac_generator_p_col_by_name:
+                x[self.ac_generator_p_col_by_name[gen.name]] = (
+                    float(getattr(gen, "p_set", 0.0) or 0.0) if flat else float(getattr(gen, "p", 0.0) or 0.0)
+                )
+            if gen.name in self.ac_generator_q_col_by_name:
+                x[self.ac_generator_q_col_by_name[gen.name]] = (
+                    float(getattr(gen, "q_set", 0.0) or 0.0) if flat else float(getattr(gen, "q", 0.0) or 0.0)
+                )
+        for load in self.ac_load_by_name.values():
+            if load.name in self.ac_load_p_col_by_name:
+                x[self.ac_load_p_col_by_name[load.name]] = float(getattr(load, "p", 0.0) or 0.0)
+            if load.name in self.ac_load_q_col_by_name:
+                x[self.ac_load_q_col_by_name[load.name]] = float(getattr(load, "q", 0.0) or 0.0)
 
         if self.calc.dc_calc is not None and self.dc_zero_cols.size:
             dc = self.calc.dc_calc
@@ -3611,6 +3702,39 @@ class HybridStateEstimator:
             return None
         return np.asarray(x, dtype=np.float64)[cols]
 
+    def _ac_sub_state_from_hybrid(self, x: np.ndarray) -> Optional[np.ndarray]:
+        cols = getattr(self, "_ac_sub_to_hybrid_cols", np.array([], dtype=np.int32))
+        ac_sub = getattr(self, "_ac_sub_estimator", None)
+        if ac_sub is None or cols.size != ac_sub.n_state:
+            return None
+        state = np.zeros(ac_sub.n_state, dtype=np.float64)
+        mapped = cols >= 0
+        state[mapped] = np.asarray(x, dtype=np.float64)[cols[mapped]]
+        sub_initial = ac_sub.initial_state()
+        state[~mapped] = sub_initial[~mapped]
+        return state
+
+    def _append_ac_sub_jacobian(self, H: SparseJacobianBuilder, x: np.ndarray) -> None:
+        """Append reusable AC subsystem rows from ACStateEstimator into hybrid H."""
+        if not getattr(self, "_active_ac_sub_measurements", None):
+            return
+        ac_sub_x = self._ac_sub_state_from_hybrid(x)
+        if ac_sub_x is None:
+            return
+        sub_h = self._ac_sub_estimator.jacobian_sparse(ac_sub_x, self._active_ac_sub_measurements).tocoo()
+        if sub_h.nnz == 0:
+            return
+        sub_cols = sub_h.col.astype(np.int32, copy=False)
+        hybrid_cols = self._ac_sub_to_hybrid_cols[sub_cols]
+        keep = hybrid_cols >= 0
+        if not np.any(keep):
+            return
+        H._append_arrays(
+            self._active_ac_hybrid_rows[sub_h.row.astype(np.int32, copy=False)[keep]],
+            hybrid_cols[keep],
+            sub_h.data.astype(np.float64, copy=False)[keep],
+        )
+
     def _append_dc_sub_jacobian(self, H: SparseJacobianBuilder, x: np.ndarray) -> None:
         """Append reusable DC subsystem rows from DCStateEstimator into hybrid H."""
         if not getattr(self, "_active_dc_sub_measurements", None):
@@ -3648,6 +3772,24 @@ class HybridStateEstimator:
         self.calc._write_back(self.calc.x)
         if self.calc.ac_calc is not None and getattr(self.calc.ac_calc, "array_mode", False):
             self._sync_ac_zero_objects_from_array_result()
+        for gen in self.ac_generator_by_name.values():
+            p_col = self.ac_generator_p_col_by_name.get(gen.name)
+            q_col = self.ac_generator_q_col_by_name.get(gen.name)
+            if p_col is not None:
+                gen.p = float(state[p_col])
+            if q_col is not None:
+                gen.q = float(state[q_col])
+            voltage = float(getattr(gen.node_obj, "voltage", 1.0) or 1.0)
+            gen.current = self._safe_current(float(getattr(gen, "p", 0.0) or 0.0), float(getattr(gen, "q", 0.0) or 0.0), voltage)
+        for load in self.ac_load_by_name.values():
+            p_col = self.ac_load_p_col_by_name.get(load.name)
+            q_col = self.ac_load_q_col_by_name.get(load.name)
+            if p_col is not None:
+                load.p = float(state[p_col])
+            if q_col is not None:
+                load.q = float(state[q_col])
+            voltage = float(getattr(load.node_obj, "voltage", 1.0) or 1.0)
+            load.current = self._safe_current(float(getattr(load, "p", 0.0) or 0.0), float(getattr(load, "q", 0.0) or 0.0), voltage)
         for gen, pos in self.dc_v_generator_states:
             gen.p = float(state[pos])
             voltage = float(gen.node_obj.voltage)
@@ -3684,8 +3826,7 @@ class HybridStateEstimator:
                 dev.q = float(switch[row_idx, SWITCH_COLS["q"]])
                 dev.current = float(switch[row_idx, SWITCH_COLS["current"]])
 
-    @staticmethod
-    def _safe_current(p: float, q_or_v: float, voltage: Optional[float] = None) -> float:
+    def _safe_current(self, p: float, q_or_v: float, voltage: Optional[float] = None) -> float:
         if voltage is None:
             voltage = q_or_v
             q = 0.0
@@ -3755,65 +3896,21 @@ class HybridStateEstimator:
         """Append vectorized dynamic Jacobian rows for simple DC/converter measurements."""
         if ac_theta is not None and ac_voltage is not None and self._jac_ac_branch_power_rows.size:
             rows = self._jac_ac_branch_power_rows
-            own = self._jac_ac_branch_power_own
-            other = self._jac_ac_branch_power_other
-            angle = ac_theta[own] - ac_theta[other]
-            exp_angle = np.exp(1j * angle)
-            y_self_conj = np.conj(self._jac_ac_branch_power_y_self)
-            y_mutual_conj = np.conj(self._jac_ac_branch_power_y_mutual)
-            off = y_mutual_conj * ac_voltage[own] * ac_voltage[other] * exp_angle
-            dtheta_own = 1j * off
-            dtheta_other = -1j * off
-            dvoltage_own = 2.0 * y_self_conj * ac_voltage[own] + y_mutual_conj * ac_voltage[other] * exp_angle
-            dvoltage_other = y_mutual_conj * ac_voltage[own] * exp_angle
-            is_p = self._jac_ac_branch_power_is_p
-            H.add_many(
-                np.concatenate((rows, rows, rows, rows)),
-                np.concatenate(
-                    (
-                        self.ac_theta_state_col[own],
-                        self.ac_theta_state_col[other],
-                        self.ac_voltage_state_col[own],
-                        self.ac_voltage_state_col[other],
-                    )
-                ),
-                np.concatenate(
-                    (
-                        np.where(is_p, dtheta_own.real, dtheta_own.imag),
-                        np.where(is_p, dtheta_other.real, dtheta_other.imag),
-                        np.where(is_p, dvoltage_own.real, dvoltage_own.imag),
-                        np.where(is_p, dvoltage_other.real, dvoltage_other.imag),
-                    )
-                ),
-            )
-
-        if (
-            ac_theta is not None
-            and ac_voltage is not None
-            and ac_voltage_complex is not None
-            and self._jac_ac_branch_current_rows.size
-        ):
-            rows = self._jac_ac_branch_current_rows
-            own = self._jac_ac_branch_current_own
-            other = self._jac_ac_branch_current_other
-            y_self = self._jac_ac_branch_current_y_self
-            y_mutual = self._jac_ac_branch_current_y_mutual
-            v_own = ac_voltage_complex[own]
-            v_other = ac_voltage_complex[other]
-            current = y_self * v_own + y_mutual * v_other
-            current_abs = np.abs(current)
-            valid = current_abs > 1e-12
-            if np.any(valid):
-                scale = np.zeros_like(current, dtype=np.complex128)
-                scale[valid] = np.conj(current[valid]) / current_abs[valid]
-                exp_own = np.exp(1j * ac_theta[own])
-                exp_other = np.exp(1j * ac_theta[other])
-                values = (
-                    (scale * (1j * y_self * v_own)).real,
-                    (scale * (1j * y_mutual * v_other)).real,
-                    (scale * (y_self * exp_own)).real,
-                    (scale * (y_mutual * exp_other)).real,
-                )
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                own = self._jac_ac_branch_power_own[keep]
+                other = self._jac_ac_branch_power_other[keep]
+                angle = ac_theta[own] - ac_theta[other]
+                exp_angle = np.exp(1j * angle)
+                y_self_conj = np.conj(self._jac_ac_branch_power_y_self[keep])
+                y_mutual_conj = np.conj(self._jac_ac_branch_power_y_mutual[keep])
+                off = y_mutual_conj * ac_voltage[own] * ac_voltage[other] * exp_angle
+                dtheta_own = 1j * off
+                dtheta_other = -1j * off
+                dvoltage_own = 2.0 * y_self_conj * ac_voltage[own] + y_mutual_conj * ac_voltage[other] * exp_angle
+                dvoltage_other = y_mutual_conj * ac_voltage[own] * exp_angle
+                is_p = self._jac_ac_branch_power_is_p[keep]
                 H.add_many(
                     np.concatenate((rows, rows, rows, rows)),
                     np.concatenate(
@@ -3824,89 +3921,153 @@ class HybridStateEstimator:
                             self.ac_voltage_state_col[other],
                         )
                     ),
-                    np.concatenate(values),
-                    np.tile(valid, 4),
+                    np.concatenate(
+                        (
+                            np.where(is_p, dtheta_own.real, dtheta_own.imag),
+                            np.where(is_p, dtheta_other.real, dtheta_other.imag),
+                            np.where(is_p, dvoltage_own.real, dvoltage_own.imag),
+                            np.where(is_p, dvoltage_other.real, dvoltage_other.imag),
+                        )
+                    ),
                 )
+
+        if (
+            ac_theta is not None
+            and ac_voltage is not None
+            and ac_voltage_complex is not None
+            and self._jac_ac_branch_current_rows.size
+        ):
+            rows = self._jac_ac_branch_current_rows
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                own = self._jac_ac_branch_current_own[keep]
+                other = self._jac_ac_branch_current_other[keep]
+                y_self = self._jac_ac_branch_current_y_self[keep]
+                y_mutual = self._jac_ac_branch_current_y_mutual[keep]
+                v_own = ac_voltage_complex[own]
+                v_other = ac_voltage_complex[other]
+                current = y_self * v_own + y_mutual * v_other
+                current_abs = np.abs(current)
+                valid = current_abs > 1e-12
+                if np.any(valid):
+                    scale = np.zeros_like(current, dtype=np.complex128)
+                    scale[valid] = np.conj(current[valid]) / current_abs[valid]
+                    exp_own = np.exp(1j * ac_theta[own])
+                    exp_other = np.exp(1j * ac_theta[other])
+                    values = (
+                        (scale * (1j * y_self * v_own)).real,
+                        (scale * (1j * y_mutual * v_other)).real,
+                        (scale * (y_self * exp_own)).real,
+                        (scale * (y_mutual * exp_other)).real,
+                    )
+                    H.add_many(
+                        np.concatenate((rows, rows, rows, rows)),
+                        np.concatenate(
+                            (
+                                self.ac_theta_state_col[own],
+                                self.ac_theta_state_col[other],
+                                self.ac_voltage_state_col[own],
+                                self.ac_voltage_state_col[other],
+                            )
+                        ),
+                        np.concatenate(values),
+                        np.tile(valid, 4),
+                    )
 
         if ac_voltage is not None and self._jac_ac_load_rows.size:
             rows = self._jac_ac_load_rows
-            kind = self._jac_ac_load_kind
-            voltage = ac_voltage[self._jac_ac_load_v_pos]
-            p = self._jac_ac_load_pv0 + self._jac_ac_load_pv1 * voltage + self._jac_ac_load_pv2 * voltage * voltage
-            q = self._jac_ac_load_qv0 + self._jac_ac_load_qv1 * voltage + self._jac_ac_load_qv2 * voltage * voltage
-            dp = self._jac_ac_load_pv1 + 2.0 * self._jac_ac_load_pv2 * voltage
-            dq = self._jac_ac_load_qv1 + 2.0 * self._jac_ac_load_qv2 * voltage
-            values = np.empty(rows.size, dtype=np.float64)
-            p_mask = kind == 0
-            q_mask = kind == 1
-            i_mask = kind == 2
-            values[p_mask] = dp[p_mask]
-            values[q_mask] = dq[q_mask]
-            if np.any(i_mask):
-                s_abs = np.hypot(p[i_mask], q[i_mask])
-                v_i = voltage[i_mask]
-                valid_i = (s_abs > 1e-12) & (np.abs(v_i) > self.min_current_voltage)
-                i_values = np.zeros(s_abs.size, dtype=np.float64)
-                if np.any(valid_i):
-                    i_values[valid_i] = (
-                        (p[i_mask][valid_i] * dp[i_mask][valid_i] + q[i_mask][valid_i] * dq[i_mask][valid_i])
-                        / (s_abs[valid_i] * v_i[valid_i])
-                        - s_abs[valid_i] / (v_i[valid_i] * v_i[valid_i])
-                    )
-                values[i_mask] = i_values
-            H.add_many(rows, self._jac_ac_load_v_col, values)
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                kind = self._jac_ac_load_kind[keep]
+                voltage = ac_voltage[self._jac_ac_load_v_pos[keep]]
+                pv0 = self._jac_ac_load_pv0[keep]
+                pv1 = self._jac_ac_load_pv1[keep]
+                pv2 = self._jac_ac_load_pv2[keep]
+                qv0 = self._jac_ac_load_qv0[keep]
+                qv1 = self._jac_ac_load_qv1[keep]
+                qv2 = self._jac_ac_load_qv2[keep]
+                p = pv0 + pv1 * voltage + pv2 * voltage * voltage
+                q = qv0 + qv1 * voltage + qv2 * voltage * voltage
+                dp = pv1 + 2.0 * pv2 * voltage
+                dq = qv1 + 2.0 * qv2 * voltage
+                values = np.empty(rows.size, dtype=np.float64)
+                p_mask = kind == 0
+                q_mask = kind == 1
+                i_mask = kind == 2
+                values[p_mask] = dp[p_mask]
+                values[q_mask] = dq[q_mask]
+                if np.any(i_mask):
+                    s_abs = np.hypot(p[i_mask], q[i_mask])
+                    v_i = voltage[i_mask]
+                    valid_i = (s_abs > 1e-12) & (np.abs(v_i) > self.min_current_voltage)
+                    i_values = np.zeros(s_abs.size, dtype=np.float64)
+                    if np.any(valid_i):
+                        i_values[valid_i] = (
+                            (p[i_mask][valid_i] * dp[i_mask][valid_i] + q[i_mask][valid_i] * dq[i_mask][valid_i])
+                            / (s_abs[valid_i] * v_i[valid_i])
+                            - s_abs[valid_i] / (v_i[valid_i] * v_i[valid_i])
+                        )
+                    values[i_mask] = i_values
+                H.add_many(rows, self._jac_ac_load_v_col[keep], values)
 
         if ac_voltage is not None and ac_voltage_complex is not None and self._jac_ac_zero_current_rows.size:
-            re_col = self._jac_ac_zero_current_re_col
-            im_col = self._jac_ac_zero_current_im_col
-            current_re = x[re_col]
-            current_im = x[im_col]
-            current_abs = np.hypot(current_re, current_im)
-            valid = current_abs > 1e-12
-            if np.any(valid):
-                H._append_arrays(
-                    np.repeat(self._jac_ac_zero_current_rows[valid], 2),
-                    np.column_stack((re_col[valid], im_col[valid])).ravel(),
-                    np.column_stack((current_re[valid] / current_abs[valid], current_im[valid] / current_abs[valid])).ravel(),
-                )
+            rows = self._jac_ac_zero_current_rows
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                re_col = self._jac_ac_zero_current_re_col[keep]
+                im_col = self._jac_ac_zero_current_im_col[keep]
+                current_re = x[re_col]
+                current_im = x[im_col]
+                current_abs = np.hypot(current_re, current_im)
+                valid = current_abs > 1e-12
+                if np.any(valid):
+                    H._append_arrays(
+                        np.repeat(rows[valid], 2),
+                        np.column_stack((re_col[valid], im_col[valid])).ravel(),
+                        np.column_stack((current_re[valid] / current_abs[valid], current_im[valid] / current_abs[valid])).ravel(),
+                    )
 
         if ac_voltage is not None and ac_voltage_complex is not None and self._jac_ac_zero_power_rows.size:
             rows = self._jac_ac_zero_power_rows
-            pos = self._jac_ac_zero_power_pos
-            sign = self._jac_ac_zero_power_sign
-            is_p = self._jac_ac_zero_power_is_p
-            voltage = ac_voltage[pos]
-            voltage_complex = ac_voltage_complex[pos]
-            current = x[self._jac_ac_zero_power_re_col] + 1j * x[self._jac_ac_zero_power_im_col]
-            s = voltage_complex * np.conj(current)
-            dtheta = 1j * s
-            dvoltage = np.zeros(rows.size, dtype=np.complex128)
-            valid_v = np.abs(voltage) > 1e-12
-            dvoltage[valid_v] = s[valid_v] / voltage[valid_v]
-            dcurrent_re = voltage_complex
-            dcurrent_im = -1j * voltage_complex
-            H.add_many(
-                rows,
-                self._jac_ac_zero_power_theta_col,
-                sign * np.where(is_p, dtheta.real, dtheta.imag),
-            )
-            H._append_arrays(
-                np.repeat(rows, 3),
-                np.column_stack(
-                    (
-                        self._jac_ac_zero_power_v_col,
-                        self._jac_ac_zero_power_re_col,
-                        self._jac_ac_zero_power_im_col,
-                    )
-                ).ravel(),
-                np.column_stack(
-                    (
-                        sign * np.where(is_p, dvoltage.real, dvoltage.imag),
-                        sign * np.where(is_p, dcurrent_re.real, dcurrent_re.imag),
-                        sign * np.where(is_p, dcurrent_im.real, dcurrent_im.imag),
-                    )
-                ).ravel(),
-            )
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                pos = self._jac_ac_zero_power_pos[keep]
+                sign = self._jac_ac_zero_power_sign[keep]
+                is_p = self._jac_ac_zero_power_is_p[keep]
+                theta_col = self._jac_ac_zero_power_theta_col[keep]
+                v_col = self._jac_ac_zero_power_v_col[keep]
+                re_col = self._jac_ac_zero_power_re_col[keep]
+                im_col = self._jac_ac_zero_power_im_col[keep]
+                voltage = ac_voltage[pos]
+                voltage_complex = ac_voltage_complex[pos]
+                current = x[re_col] + 1j * x[im_col]
+                s = voltage_complex * np.conj(current)
+                dtheta = 1j * s
+                dvoltage = np.zeros(rows.size, dtype=np.complex128)
+                valid_v = np.abs(voltage) > 1e-12
+                dvoltage[valid_v] = s[valid_v] / voltage[valid_v]
+                dcurrent_re = voltage_complex
+                dcurrent_im = -1j * voltage_complex
+                H.add_many(
+                    rows,
+                    theta_col,
+                    sign * np.where(is_p, dtheta.real, dtheta.imag),
+                )
+                H._append_arrays(
+                    np.repeat(rows, 3),
+                    np.column_stack((v_col, re_col, im_col)).ravel(),
+                    np.column_stack(
+                        (
+                            sign * np.where(is_p, dvoltage.real, dvoltage.imag),
+                            sign * np.where(is_p, dcurrent_re.real, dcurrent_re.imag),
+                            sign * np.where(is_p, dcurrent_im.real, dcurrent_im.imag),
+                        )
+                    ).ravel(),
+                )
 
         if dc_voltage is not None and self._jac_dc_branch_power_rows.size:
             rows = self._jac_dc_branch_power_rows
@@ -4142,6 +4303,7 @@ class HybridStateEstimator:
         q_zero: np.ndarray,
         p_load_dv: np.ndarray,
         q_load_dv: np.ndarray,
+        skip_rows: Optional[np.ndarray] = None,
     ) -> None:
         """Append AC generator P/Q/I rows while reusing each AC-node injection derivative.
 
@@ -4290,6 +4452,9 @@ class HybridStateEstimator:
                     return
                 rows = row_by_group[groups]
                 mask = (rows >= 0) & (values != 0.0)
+                if skip_rows is not None and np.any(mask):
+                    active = np.nonzero(mask)[0]
+                    mask[active] &= ~skip_rows[rows[active]]
                 if np.any(mask):
                     H._append_arrays(rows[mask], cols[mask], values[mask])
 
@@ -4324,6 +4489,10 @@ class HybridStateEstimator:
             i_group_rows = self._jac_ac_gen_single_i_row
             i_groups = np.flatnonzero(i_group_rows >= 0).astype(np.int32, copy=False)
             if i_groups.size:
+                if skip_rows is not None:
+                    i_groups = i_groups[~skip_rows[i_group_rows[i_groups]]]
+                if not i_groups.size:
+                    return
                 i_share = self._jac_ac_gen_single_share[i_groups]
                 p = i_share * p_total[i_groups]
                 q = i_share * q_total[i_groups]
@@ -4340,6 +4509,11 @@ class HybridStateEstimator:
 
         append_rows = self._append_sparse_rows_unchecked
 
+        def filter_skipped_rows(rows: np.ndarray) -> np.ndarray:
+            if skip_rows is None or rows.size == 0:
+                return rows
+            return rows[~skip_rows[rows]]
+
         for group, share, p_rows, q_rows, i_rows in self._jac_ac_generator_items:
             group = int(group)
             pos = int(node_pos[group])
@@ -4349,6 +4523,9 @@ class HybridStateEstimator:
             cols = entry_cols_array[start:end]
             dP = share * entry_dP_array[start:end]
             dQ = share * entry_dQ_array[start:end]
+            p_rows = filter_skipped_rows(p_rows)
+            q_rows = filter_skipped_rows(q_rows)
+            i_rows = filter_skipped_rows(i_rows)
             append_rows(H, p_rows, cols, dP)
             append_rows(H, q_rows, cols, dQ)
             if i_rows.size:
@@ -5027,6 +5204,11 @@ class HybridStateEstimator:
             if sparse
             else np.zeros((len(measurements), self.n_state), dtype=np.float64)
         )
+        ac_delegated_mask = (
+            self._active_ac_delegated_row_mask
+            if active_sparse and getattr(self, "_active_ac_hybrid_rows", np.array([], dtype=np.int32)).size
+            else None
+        )
         dc_delegated_mask = (
             self._active_dc_delegated_row_mask
             if active_sparse and getattr(self, "_active_dc_hybrid_rows", np.array([], dtype=np.int32)).size
@@ -5034,24 +5216,43 @@ class HybridStateEstimator:
         )
         static_skip = None
         if active_sparse:
-            static_skip = self._jacobian_static_skip.copy() if dc_delegated_mask is not None else self._jacobian_static_skip
+            if ac_delegated_mask is not None or dc_delegated_mask is not None:
+                static_skip = self._jacobian_static_skip.copy()
+            else:
+                static_skip = self._jacobian_static_skip
+            if ac_delegated_mask is not None:
+                static_skip[ac_delegated_mask] = True
             if dc_delegated_mask is not None:
                 static_skip[dc_delegated_mask] = True
             if self._jacobian_static_rows.size:
-                if dc_delegated_mask is None:
+                delegated_mask = None
+                if ac_delegated_mask is not None and dc_delegated_mask is not None:
+                    delegated_mask = ac_delegated_mask | dc_delegated_mask
+                elif ac_delegated_mask is not None:
+                    delegated_mask = ac_delegated_mask
+                elif dc_delegated_mask is not None:
+                    delegated_mask = dc_delegated_mask
+                if delegated_mask is None:
                     H._append_arrays(
                         self._jacobian_static_rows,
                         self._jacobian_static_cols,
                         self._jacobian_static_data,
                     )
                 else:
-                    keep_static = ~dc_delegated_mask[self._jacobian_static_rows]
+                    keep_static = ~delegated_mask[self._jacobian_static_rows]
                     H._append_arrays(
                         self._jacobian_static_rows[keep_static],
                         self._jacobian_static_cols[keep_static],
                         self._jacobian_static_data[keep_static],
                     )
-            self._append_fast_dynamic_jacobian(H, x, ac_theta, ac_V, ac_Vc, dc_V, dc_delegated_mask)
+            dynamic_delegated_mask = dc_delegated_mask
+            if ac_delegated_mask is not None and dc_delegated_mask is not None:
+                dynamic_delegated_mask = ac_delegated_mask | dc_delegated_mask
+            elif ac_delegated_mask is not None:
+                dynamic_delegated_mask = ac_delegated_mask
+            self._append_fast_dynamic_jacobian(H, x, ac_theta, ac_V, ac_Vc, dc_V, dynamic_delegated_mask)
+            if ac_delegated_mask is not None:
+                self._append_ac_sub_jacobian(H, x)
             if dc_delegated_mask is not None:
                 self._append_dc_sub_jacobian(H, x)
             if ac is not None and self._jac_ac_generator_items:
@@ -5072,6 +5273,7 @@ class HybridStateEstimator:
                     ac_q_zero,
                     ac_p_load_dv,
                     ac_q_load_dv,
+                    skip_rows=ac_delegated_mask,
                 )
 
         row_iter = (
@@ -5197,21 +5399,22 @@ class HybridStateEstimator:
                 pos = ac.node_pos[load.node]
                 v = ac_V[pos]
                 voltage_col = int(self.ac_voltage_state_col[pos])
-                p0, p1, p2, q0, q1, q2 = self._load_zip_coefficients(load)
-                p = p0 + p1 * v + p2 * v * v
-                q = q0 + q1 * v + q2 * v * v
-                dp = p1 + 2.0 * p2 * v
-                dq = q1 + 2.0 * q2 * v
+                p_col = self.ac_load_p_col_by_name[load.name]
+                q_col = self.ac_load_q_col_by_name[load.name]
+                p = float(x[p_col])
+                q = float(x[q_col])
                 if mtype == "P_LOAD":
-                    self._add_derivative(H, row, voltage_col, dp)
+                    self._add_derivative(H, row, p_col, 1.0)
                 elif mtype == "Q_LOAD":
-                    self._add_derivative(H, row, voltage_col, dq)
+                    self._add_derivative(H, row, q_col, 1.0)
                 elif mtype == "V_LOAD":
                     self._add_derivative(H, row, voltage_col, 1.0)
                 elif mtype == "I_LOAD":
                     s_abs = float(np.hypot(p, q))
                     if s_abs > 1e-12 and abs(v) > self.min_current_voltage:
-                        self._add_derivative(H, row, voltage_col, (p * dp + q * dq) / (s_abs * v) - s_abs / (v * v))
+                        self._add_derivative(H, row, p_col, p / (s_abs * v))
+                        self._add_derivative(H, row, q_col, q / (s_abs * v))
+                        self._add_derivative(H, row, voltage_col, -s_abs / (v * v))
                 else:
                     raise RuntimeError(f"Unsupported ACLoad measurement type: {mtype}")
 
@@ -5222,35 +5425,20 @@ class HybridStateEstimator:
                 if mtype == "V_GEN":
                     self._add_derivative(H, row, voltage_col, 1.0)
                     continue
-                if ac_p_load_dv is None or ac_q_load_dv is None:
-                    ac_p_load_dv, ac_q_load_dv = self._ac_load_power_derivatives(ac_V)
-                if ac_s_network is None:
-                    ac_s_network = ac_Vc * np.conj(ac.Y.dot(ac_Vc))
-                if gen.name not in ac_gen_cache:
-                    ac_gen_cache[gen.name] = self._ac_generator_power_and_derivatives(
-                        gen,
-                        x,
-                        ac_theta,
-                        ac_V,
-                        ac_Vc,
-                        ac_s_network,
-                        ac_p_load,
-                        ac_q_load,
-                        ac_p_zero,
-                        ac_q_zero,
-                        ac_p_load_dv,
-                        ac_q_load_dv,
-                    )
-                p, q, cols, dP, dQ = ac_gen_cache[gen.name]
+                p_col = self.ac_generator_p_col_by_name[gen.name]
+                q_col = self.ac_generator_q_col_by_name[gen.name]
+                p = float(x[p_col])
+                q = float(x[q_col])
                 if mtype == "P_GEN":
-                    self._add_measurement_row(H, row, cols, dP)
+                    self._add_derivative(H, row, p_col, 1.0)
                 elif mtype == "Q_GEN":
-                    self._add_measurement_row(H, row, cols, dQ)
+                    self._add_derivative(H, row, q_col, 1.0)
                 elif mtype == "I_GEN":
                     s_abs = float(np.hypot(p, q))
                     if s_abs > 1e-12 and abs(ac_V[pos]) > self.min_current_voltage:
-                        dI = (p * dP + q * dQ) / (s_abs * ac_V[pos])
-                        self._add_measurement_row(H, row, cols, dI)
+                        scale = 1.0 / (s_abs * ac_V[pos])
+                        self._add_derivative(H, row, p_col, p * scale)
+                        self._add_derivative(H, row, q_col, q * scale)
                         self._add_derivative(H, row, voltage_col, -s_abs / (ac_V[pos] * ac_V[pos]))
                 else:
                     raise RuntimeError(f"Unsupported ACGenerator measurement type: {mtype}")
