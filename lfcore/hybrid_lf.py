@@ -454,16 +454,6 @@ class HybridPowerFlowCalc:
         x[3::4] = self.acac_j_q_set
         return x
 
-    def _state_values(self, ac_x, dc_x):
-        """Extract node voltage arrays needed by converter equations from sub-solver states."""
-        ac_theta = ac_V = None
-        dc_V = None
-        if self.ac_calc is not None:
-            ac_theta, ac_V, _, _ = self.ac_calc._extract_state_vars(ac_x)
-        if self.dc_calc is not None:
-            dc_V = dc_x[:self.dc_calc.N]
-        return ac_theta, ac_V, dc_V
-
     def _cached_state_values(self, ac_x, dc_x):
         """Reuse AC sub-solver state cache after AC residual/Jacobian evaluation."""
         ac_theta = ac_V = None
@@ -477,6 +467,84 @@ class HybridPowerFlowCalc:
         if self.dc_calc is not None:
             dc_V = dc_x[:self.dc_calc.N]
         return ac_theta, ac_V, dc_V
+
+    def _append_converter_residuals(self, parts, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V):
+        """Inject converter port powers and append converter equation residuals."""
+        if self.N_dcac:
+            parts.append(self._append_dcac_residuals(ac_f, dc_f, dcac_x, ac_V, dc_V))
+        if self.N_acac:
+            parts.append(self._append_acac_residuals(ac_f, acac_x, ac_V))
+
+    def _append_dcac_residuals(self, ac_f, dc_f, dcac_x, ac_V, dc_V):
+        """Mutate AC/DC nodal residuals and return DC/AC converter residual rows."""
+        dcac = dcac_x.reshape(self.N_dcac, 3)
+        dc_p = dcac[:, 0]
+        ac_p = dcac[:, 1]
+        ac_q = dcac[:, 2]
+        # Converter port powers are injected into the existing AC/DC nodal balance rows.
+        np.add.at(ac_f, self.dcac_ac_p_row, ac_p)
+        np.add.at(ac_f, self.dcac_ac_q_row, ac_q)
+        if self.dcac_dc_eq_mask.any():
+            np.add.at(dc_f, self.dcac_dc_eq[self.dcac_dc_eq_mask], dc_p[self.dcac_dc_eq_mask])
+
+        va = ac_V[self.dcac_ac_pos]
+        vd = dc_V[self.dcac_dc_pos]
+        va2 = va * va
+        vd2 = vd * vd
+        dcac_f = np.empty(self.N_dcac * 3, dtype=np.float64)
+        # r1+r2 converter loss equation in per-unit power/voltage variables.
+        dcac_f[0::3] = (
+            vd2 * va2 * (dc_p + ac_p)
+            - self.dcac_r1 * dc_p * dc_p * va2
+            - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
+        )
+        f_ctrl = np.empty(self.N_dcac, dtype=np.float64)
+        f_ctrl[self.dcac_ctrl_dc_v_mask] = (
+            vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
+        )
+        f_ctrl[self.dcac_ctrl_ac_v_mask] = (
+            va[self.dcac_ctrl_ac_v_mask] - self.dcac_v_ac_set[self.dcac_ctrl_ac_v_mask]
+        )
+        f_ctrl[self.dcac_ctrl_ac_p_mask] = (
+            ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
+        )
+        dcac_f[1::3] = f_ctrl
+        dcac_f[2::3] = ac_q - self.dcac_q_ac_set
+        return dcac_f
+
+    def _append_acac_residuals(self, ac_f, acac_x, ac_V):
+        """Mutate AC nodal residuals and return AC/AC converter residual rows."""
+        acac = acac_x.reshape(self.N_acac, 4)
+        i_p = acac[:, 0]
+        i_q = acac[:, 1]
+        j_p = acac[:, 2]
+        j_q = acac[:, 3]
+        # ACAC port powers couple two AC PQ nodes inside the same global system.
+        np.add.at(ac_f, self.acac_i_p_row, i_p)
+        np.add.at(ac_f, self.acac_i_q_row, i_q)
+        np.add.at(ac_f, self.acac_j_p_row, j_p)
+        np.add.at(ac_f, self.acac_j_q_row, j_q)
+
+        vi = ac_V[self.acac_i_pos]
+        vj = ac_V[self.acac_j_pos]
+        vi2 = vi * vi
+        vj2 = vj * vj
+        acac_f = np.empty(self.N_acac * 4, dtype=np.float64)
+        acac_f[0::4] = (
+            vi2 * vj2 * (i_p + j_p)
+            - self.acac_r1 * (i_p * i_p + i_q * i_q) * vj2
+            - self.acac_r2 * (j_p * j_p + j_q * j_q) * vi2
+        )
+        acac_f[1::4] = i_p - self.acac_p_set
+        f2 = np.empty(self.N_acac, dtype=np.float64)
+        f3 = np.empty(self.N_acac, dtype=np.float64)
+        f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
+        f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
+        f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
+        f3[self.acac_v_j_mask] = vj[self.acac_v_j_mask] - self.acac_j_v_set[self.acac_v_j_mask]
+        acac_f[2::4] = f2
+        acac_f[3::4] = f3
+        return acac_f
 
     def get_f(self, x):
         """Assemble global residuals for AC, DC, DCAC and ACAC equations."""
@@ -493,73 +561,7 @@ class HybridPowerFlowCalc:
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
-        if self.N_dcac:
-            dcac = dcac_x.reshape(self.N_dcac, 3)
-            dc_p = dcac[:, 0]
-            ac_p = dcac[:, 1]
-            ac_q = dcac[:, 2]
-            # Converter port powers are injected into the existing AC/DC nodal balance rows.
-            np.add.at(ac_f, self.dcac_ac_p_row, ac_p)
-            np.add.at(ac_f, self.dcac_ac_q_row, ac_q)
-            if self.dcac_dc_eq_mask.any():
-                np.add.at(dc_f, self.dcac_dc_eq[self.dcac_dc_eq_mask], dc_p[self.dcac_dc_eq_mask])
-
-            va = ac_V[self.dcac_ac_pos]
-            vd = dc_V[self.dcac_dc_pos]
-            va2 = va * va
-            vd2 = vd * vd
-            dcac_f = np.empty(self.N_dcac * 3, dtype=np.float64)
-            # r1+r2 converter loss equation in per-unit power/voltage variables.
-            dcac_f[0::3] = (
-                vd2 * va2 * (dc_p + ac_p)
-                - self.dcac_r1 * dc_p * dc_p * va2
-                - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
-            )
-            f_ctrl = np.empty(self.N_dcac, dtype=np.float64)
-            f_ctrl[self.dcac_ctrl_dc_v_mask] = (
-                vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
-            )
-            f_ctrl[self.dcac_ctrl_ac_v_mask] = (
-                va[self.dcac_ctrl_ac_v_mask] - self.dcac_v_ac_set[self.dcac_ctrl_ac_v_mask]
-            )
-            f_ctrl[self.dcac_ctrl_ac_p_mask] = (
-                ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
-            )
-            dcac_f[1::3] = f_ctrl
-            dcac_f[2::3] = ac_q - self.dcac_q_ac_set
-            parts.append(dcac_f)
-        if self.N_acac:
-            acac = acac_x.reshape(self.N_acac, 4)
-            i_p = acac[:, 0]
-            i_q = acac[:, 1]
-            j_p = acac[:, 2]
-            j_q = acac[:, 3]
-            # ACAC port powers couple two AC PQ nodes inside the same global system.
-            np.add.at(ac_f, self.acac_i_p_row, i_p)
-            np.add.at(ac_f, self.acac_i_q_row, i_q)
-            np.add.at(ac_f, self.acac_j_p_row, j_p)
-            np.add.at(ac_f, self.acac_j_q_row, j_q)
-
-            vi = ac_V[self.acac_i_pos]
-            vj = ac_V[self.acac_j_pos]
-            vi2 = vi * vi
-            vj2 = vj * vj
-            acac_f = np.empty(self.N_acac * 4, dtype=np.float64)
-            acac_f[0::4] = (
-                vi2 * vj2 * (i_p + j_p)
-                - self.acac_r1 * (i_p * i_p + i_q * i_q) * vj2
-                - self.acac_r2 * (j_p * j_p + j_q * j_q) * vi2
-            )
-            acac_f[1::4] = i_p - self.acac_p_set
-            f2 = np.empty(self.N_acac, dtype=np.float64)
-            f3 = np.empty(self.N_acac, dtype=np.float64)
-            f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
-            f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
-            f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
-            f3[self.acac_v_j_mask] = vj[self.acac_v_j_mask] - self.acac_j_v_set[self.acac_v_j_mask]
-            acac_f[2::4] = f2
-            acac_f[3::4] = f3
-            parts.append(acac_f)
+        self._append_converter_residuals(parts, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
         return np.concatenate(parts)
 
     def get_jacobi(self, x):
@@ -569,7 +571,7 @@ class HybridPowerFlowCalc:
         dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x) if self.dc_calc is not None else None
         return self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
 
-    def _assemble_jacobian(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None):
+    def _assemble_jacobian(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None, ac_V=None, dc_V=None):
         """Build the global sparse Jacobian from prepared sub-solver blocks."""
         row_parts = []
         col_parts = []
@@ -586,8 +588,7 @@ class HybridPowerFlowCalc:
             col_parts.append(dc_coo.col + self.ac_size)
             data_parts.append(dc_coo.data)
 
-        ac_V = dc_V = None
-        if self.N_dcac or self.N_acac:
+        if (self.N_dcac or self.N_acac) and (ac_V is None or (self.N_dcac and dc_V is None)):
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
         if self.N_dcac:
             self._append_dcac_jacobian_terms(row_parts, col_parts, data_parts, dcac_x, ac_V, dc_V)
@@ -625,73 +626,10 @@ class HybridPowerFlowCalc:
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
-        if self.N_dcac:
-            dcac = dcac_x.reshape(self.N_dcac, 3)
-            dc_p = dcac[:, 0]
-            ac_p = dcac[:, 1]
-            ac_q = dcac[:, 2]
-            np.add.at(ac_f, self.dcac_ac_p_row, ac_p)
-            np.add.at(ac_f, self.dcac_ac_q_row, ac_q)
-            if self.dcac_dc_eq_mask.any():
-                np.add.at(dc_f, self.dcac_dc_eq[self.dcac_dc_eq_mask], dc_p[self.dcac_dc_eq_mask])
-
-            va = ac_V[self.dcac_ac_pos]
-            vd = dc_V[self.dcac_dc_pos]
-            va2 = va * va
-            vd2 = vd * vd
-            dcac_f = np.empty(self.N_dcac * 3, dtype=np.float64)
-            dcac_f[0::3] = (
-                vd2 * va2 * (dc_p + ac_p)
-                - self.dcac_r1 * dc_p * dc_p * va2
-                - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
-            )
-            f_ctrl = np.empty(self.N_dcac, dtype=np.float64)
-            f_ctrl[self.dcac_ctrl_dc_v_mask] = (
-                vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
-            )
-            f_ctrl[self.dcac_ctrl_ac_v_mask] = (
-                va[self.dcac_ctrl_ac_v_mask] - self.dcac_v_ac_set[self.dcac_ctrl_ac_v_mask]
-            )
-            f_ctrl[self.dcac_ctrl_ac_p_mask] = (
-                ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
-            )
-            dcac_f[1::3] = f_ctrl
-            dcac_f[2::3] = ac_q - self.dcac_q_ac_set
-            parts.append(dcac_f)
-        if self.N_acac:
-            acac = acac_x.reshape(self.N_acac, 4)
-            i_p = acac[:, 0]
-            i_q = acac[:, 1]
-            j_p = acac[:, 2]
-            j_q = acac[:, 3]
-            np.add.at(ac_f, self.acac_i_p_row, i_p)
-            np.add.at(ac_f, self.acac_i_q_row, i_q)
-            np.add.at(ac_f, self.acac_j_p_row, j_p)
-            np.add.at(ac_f, self.acac_j_q_row, j_q)
-
-            vi = ac_V[self.acac_i_pos]
-            vj = ac_V[self.acac_j_pos]
-            vi2 = vi * vi
-            vj2 = vj * vj
-            acac_f = np.empty(self.N_acac * 4, dtype=np.float64)
-            acac_f[0::4] = (
-                vi2 * vj2 * (i_p + j_p)
-                - self.acac_r1 * (i_p * i_p + i_q * i_q) * vj2
-                - self.acac_r2 * (j_p * j_p + j_q * j_q) * vi2
-            )
-            acac_f[1::4] = i_p - self.acac_p_set
-            f2 = np.empty(self.N_acac, dtype=np.float64)
-            f3 = np.empty(self.N_acac, dtype=np.float64)
-            f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
-            f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
-            f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
-            f3[self.acac_v_j_mask] = vj[self.acac_v_j_mask] - self.acac_j_v_set[self.acac_v_j_mask]
-            acac_f[2::4] = f2
-            acac_f[3::4] = f3
-            parts.append(acac_f)
+        self._append_converter_residuals(parts, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
 
         F = np.concatenate(parts)
-        J = self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
+        J = self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j, ac_V, dc_V)
         return F, J
 
     def _append_dcac_jacobian_terms(self, row_parts, col_parts, data_parts, dcac_x, ac_V, dc_V):
