@@ -349,6 +349,27 @@ class HybridStateEstimationTest(unittest.TestCase):
         diff = (hybrid_dc_h - dc_h).tocoo()
         self.assertEqual(0, diff.nnz)
 
+    def test_dc_sub_delegation_excludes_hybrid_only_voltage_states(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        delegated_rows = set(int(row) for row in estimator._active_dc_hybrid_rows)
+        hybrid_only_rows = [
+            row
+            for row, meas in enumerate(estimator.active_measurements)
+            if meas.device_type == "DCNode"
+            and meas.device_name == "wt01_line_dc"
+            and meas.meas_type == "V"
+        ]
+
+        self.assertEqual(1, len(hybrid_only_rows))
+        self.assertNotIn(hybrid_only_rows[0], delegated_rows)
+
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
         from secore.hybrid_se import HybridStateEstimator
 

@@ -372,6 +372,59 @@ class HybridStateEstimator:
         mapped_cols = np.asarray(mapped_cols, dtype=np.int32)
         if mapped_cols.size != dc_sub.n_state or np.any(mapped_cols < 0):
             return
+        dc_sub_voltage_hybrid_cols = {
+            int(mapped_cols[idx])
+            for idx, label in enumerate(dc_sub.state_labels)
+            if label.startswith("V:") and int(mapped_cols[idx]) >= 0
+        }
+
+        def dc_voltage_cols_compatible(meas: Measurement) -> bool:
+            """Only delegate rows whose DC voltage dependencies use the same hybrid states."""
+            dc = self.calc.dc_calc
+            if dc is None:
+                return False
+            node_idxs: List[int] = []
+            dtype = meas.device_type
+            if dtype == "DCNode":
+                node = self.dc_node_by_name.get(meas.device_name)
+                if node is not None:
+                    node_idxs.append(node.idx)
+            elif dtype == "DCBranch":
+                dev = self.dc_branch_by_name.get(meas.device_name)
+                if dev is not None:
+                    node_idxs.extend([dev.i_node, dev.j_node])
+            elif dtype in ("DCSwitch", "DCZeroBranch", "DCBreak"):
+                dev = (
+                    self.dc_switch_by_name.get(meas.device_name)
+                    if dtype == "DCSwitch"
+                    else self.dc_zero_branch_by_name.get(meas.device_name)
+                    if dtype == "DCZeroBranch"
+                    else self.dc_break_by_name.get(meas.device_name)
+                )
+                if dev is not None:
+                    node_idxs.extend([dev.i_node, dev.j_node])
+            elif dtype == "DCLoad":
+                dev = self.dc_load_by_name.get(meas.device_name)
+                if dev is not None:
+                    node_idxs.append(dev.node)
+            elif dtype == "DCGenerator":
+                dev = self.dc_generator_by_name.get(meas.device_name)
+                if dev is not None:
+                    node_idxs.append(dev.node)
+            elif dtype == "DCDCConverter":
+                dev = self.dcdc_by_name.get(meas.device_name)
+                if dev is not None:
+                    node_idxs.extend([dev.i_node, dev.j_node])
+            else:
+                return True
+
+            for node_idx in node_idxs:
+                if node_idx not in dc.alive_node_dict:
+                    return False
+                col = int(self.dc_voltage_state_col[int(dc.alive_node_dict[node_idx])])
+                if col >= 0 and col not in dc_sub_voltage_hybrid_cols:
+                    return False
+            return True
 
         sub_rows_by_key: Dict[Tuple[str, str, str], List[int]] = {}
         for row, meas in enumerate(dc_sub.active_measurements):
@@ -383,6 +436,8 @@ class HybridStateEstimator:
         for h_row, meas in enumerate(self.active_measurements):
             rows = sub_rows_by_key.get(self._measurement_key(meas))
             if not rows:
+                continue
+            if not dc_voltage_cols_compatible(meas):
                 continue
             sub_row = rows.pop(0)
             hybrid_rows.append(h_row)
