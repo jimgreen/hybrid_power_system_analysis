@@ -164,6 +164,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(ac_estimator.state_layout()["state_labels"], hybrid_estimator.ac_state_layout["state_labels"])
         self.assertEqual(ac_estimator.state_layout()["n_state"], hybrid_estimator.ac_state_layout["n_state"])
         self.assertIsInstance(hybrid_estimator._delegate(), ACStateEstimator)
+        self.assertEqual(hybrid_estimator.n_state, hybrid_estimator.ac_state_cols.size)
+        self.assertFalse(hybrid_estimator.dc_state_cols.size)
+        self.assertFalse(hybrid_estimator.hybrid_state_cols.size)
         np.testing.assert_allclose(ac_estimator.initial_state(), hybrid_estimator.initial_state())
 
     def test_ieee3k_flat_start_keeps_angle_state_zero(self):
@@ -328,6 +331,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(dc_result.residual, hybrid_result.residual, rtol=0.0, atol=0.0)
         np.testing.assert_allclose(dc_normalized, hybrid_normalized, rtol=0.0, atol=0.0)
         self.assertEqual(len(dc_bad_items), len(hybrid_bad_items))
+        self.assertFalse(hybrid_estimator.ac_state_cols.size)
+        self.assertEqual(hybrid_estimator.n_state, hybrid_estimator.dc_state_cols.size)
+        self.assertFalse(hybrid_estimator.hybrid_state_cols.size)
 
     def test_mixed_network_reuses_dc_state_estimator_jacobian_block(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -395,6 +401,105 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(expected_balance_count, len(ac_balance_rows))
         self.assertTrue(all(row in delegated_rows for row in ac_balance_rows))
+
+    def test_mixed_network_partitions_active_measurements_into_ac_dc_and_hybrid_blocks(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        partitioned = list(estimator.ac_meas) + list(estimator.dc_meas) + list(estimator.hybrid_meas)
+        partitioned_ids = {id(meas) for meas in partitioned}
+        active_ids = {id(meas) for meas in estimator.active_measurements}
+        ac_rows = set(int(row) for row in estimator.ac_meas_rows)
+        dc_rows = set(int(row) for row in estimator.dc_meas_rows)
+        hybrid_rows = set(int(row) for row in estimator.hybrid_meas_rows)
+
+        self.assertEqual(len(estimator.active_measurements), len(partitioned))
+        self.assertEqual(active_ids, partitioned_ids)
+        self.assertFalse(ac_rows & dc_rows)
+        self.assertFalse(ac_rows & hybrid_rows)
+        self.assertFalse(dc_rows & hybrid_rows)
+        self.assertTrue(estimator.ac_meas)
+        self.assertTrue(estimator.dc_meas)
+        self.assertTrue(estimator.hybrid_meas)
+        self.assertTrue(all(meas.device_type in estimator._AC_MEASUREMENT_DEVICE_TYPES for meas in estimator.ac_meas))
+        self.assertTrue(all(meas.device_type in estimator._DC_MEASUREMENT_DEVICE_TYPES for meas in estimator.dc_meas))
+        self.assertTrue(all(meas.device_type in estimator._HYBRID_MEASUREMENT_DEVICE_TYPES for meas in estimator.hybrid_meas))
+        self.assertTrue(set(int(row) for row in estimator._active_ac_hybrid_rows).issubset(ac_rows))
+        self.assertTrue(set(int(row) for row in estimator._active_dc_hybrid_rows).issubset(dc_rows))
+        self.assertFalse(set(int(row) for row in estimator._active_ac_hybrid_rows) & hybrid_rows)
+        self.assertFalse(set(int(row) for row in estimator._active_dc_hybrid_rows) & hybrid_rows)
+
+    def test_measurement_partition_uses_device_ownership_not_device_name_text(self):
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        dc_named_like_ac = Measurement(1, "m1", "DCNode", "ac_named_dc_bus", "V", 1.0, True, 1.0)
+        ac_named_like_dc = Measurement(2, "m2", "ACNode", "dc_named_ac_bus", "V", 1.0, True, 1.0)
+        hybrid_named_like_dc = Measurement(3, "m3", "DCACConverter", "dc_named_converter", "P_AC", 1.0, True, 1.0)
+
+        self.assertEqual("dc", HybridStateEstimator._measurement_side(dc_named_like_ac))
+        self.assertEqual("ac", HybridStateEstimator._measurement_side(ac_named_like_dc))
+        self.assertEqual("hybrid", HybridStateEstimator._measurement_side(hybrid_named_like_dc))
+
+    def test_mixed_network_partitions_state_variables_into_ac_dc_and_hybrid_blocks(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        ac_cols = set(int(col) for col in estimator.ac_state_cols)
+        dc_cols = set(int(col) for col in estimator.dc_state_cols)
+        hybrid_cols = set(int(col) for col in estimator.hybrid_state_cols)
+        all_cols = ac_cols | dc_cols | hybrid_cols
+
+        self.assertEqual(set(range(estimator.n_state)), all_cols)
+        self.assertFalse(ac_cols & dc_cols)
+        self.assertFalse(ac_cols & hybrid_cols)
+        self.assertFalse(dc_cols & hybrid_cols)
+        self.assertTrue(ac_cols)
+        self.assertTrue(dc_cols)
+        self.assertTrue(hybrid_cols)
+        self.assertEqual([estimator.state_labels[col] for col in estimator.ac_state_cols], estimator.ac_vars)
+        self.assertEqual([estimator.state_labels[col] for col in estimator.dc_state_cols], estimator.dc_vars)
+        self.assertEqual([estimator.state_labels[col] for col in estimator.hybrid_state_cols], estimator.hybrid_vars)
+        self.assertEqual(slice(0, estimator.ac_state_cols.size), estimator.ac_state_slice)
+        self.assertEqual(
+            slice(estimator.ac_state_cols.size, estimator.ac_state_cols.size + estimator.dc_state_cols.size),
+            estimator.dc_state_slice,
+        )
+        self.assertEqual(
+            slice(estimator.ac_state_cols.size + estimator.dc_state_cols.size, estimator.n_state),
+            estimator.hybrid_state_slice,
+        )
+        self.assertTrue(all(estimator.state_sides[int(col)] == "ac" for col in estimator.ac_state_cols))
+        self.assertTrue(all(estimator.state_sides[int(col)] == "dc" for col in estimator.dc_state_cols))
+        self.assertTrue(all(estimator.state_sides[int(col)] == "hybrid" for col in estimator.hybrid_state_cols))
+
+    def test_state_partition_uses_layout_side_metadata_not_label_text(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        expected_ac_cols = estimator.ac_state_cols.copy()
+        expected_dc_cols = estimator.dc_state_cols.copy()
+        expected_hybrid_cols = estimator.hybrid_state_cols.copy()
+        estimator.state_labels = [f"ambiguous_state_{idx}" for idx in range(estimator.n_state)]
+        estimator._partition_state_variables()
+
+        np.testing.assert_array_equal(expected_ac_cols, estimator.ac_state_cols)
+        np.testing.assert_array_equal(expected_dc_cols, estimator.dc_state_cols)
+        np.testing.assert_array_equal(expected_hybrid_cols, estimator.hybrid_state_cols)
 
     def test_dc_sub_delegation_excludes_hybrid_only_voltage_states(self):
         from secore.hybrid_se import HybridStateEstimator
