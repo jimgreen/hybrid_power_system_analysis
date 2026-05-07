@@ -909,8 +909,8 @@ class ACStateEstimator:
         self.min_current_voltage = self.params.min_current_voltage
 
         profile_start = time.perf_counter()
-        self.network = self._profile_call("init.load_network", self._load_network, self.e_file)
-        self.measurements = self._profile_call("init.load_measurements", self._load_measurements, self.meas_file)
+        self.network = self._load_network(self.e_file)
+        self.measurements = self._load_measurements(self.meas_file)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
         self.u_scale = float(self.network.u_scale)
@@ -989,19 +989,19 @@ class ACStateEstimator:
         self.n_nodes = len(self.nodes)
         # Reference-bus voltage values must be known before the compact state layout
         # is built, so real file measurements are normalized after the estimator maps exist.
-        self._profile_call("init.convert_measurements", self._convert_measurements_to_pu)
-        self.node_voltage_measurements = self._profile_call("init.node_voltage_measurements", self._node_voltage_measurements)
-        self.node_degrees = self._profile_call("init.node_degrees", self._node_incident_degrees)
-        self.references = self._profile_call("init.references", self._select_reference_nodes)
+        self._convert_measurements_to_pu()
+        self.node_voltage_measurements = self._node_voltage_measurements()
+        self.node_degrees = self._node_incident_degrees()
+        self.references = self._select_reference_nodes()
         self.ref_idx = {self.node_pos[node.idx] for node in self.references}
         self.reference_voltage_by_pos = {
             self.node_pos[node.idx]: self.node_voltage_measurements[node.idx]
             for node in self.references
             if node.idx in self.node_voltage_measurements and node.idx in self.node_pos
         }
-        self.reference_angle_by_pos = self._profile_call("init.reference_angles", self._reference_angle_offsets)
-        self._profile_call("init.rebase_angles", self._rebase_angle_measurements)
-        self._profile_call("init.zero_tie_layout", self._build_zero_tie_state_layout)
+        self.reference_angle_by_pos = self._reference_angle_offsets()
+        self._rebase_angle_measurements()
+        self._build_zero_tie_state_layout()
         self.zero_current_devices = (
             [("Z", zbr) for zbr in self.zero_branches]
             + [("B", brk) for brk in self.breakers]
@@ -1086,49 +1086,27 @@ class ACStateEstimator:
         self.state_labels.extend(f"P_LOAD:{load.name}" for load in self.load_order)
         self.state_labels.extend(f"Q_LOAD:{load.name}" for load in self.load_order)
 
-        self.branch_stamp_by_name = self._profile_call(
-            "init.branch_stamps",
-            self._build_branch_stamp_map,
-            list(self.branch_by_name.values()),
-            False,
-        )
-        self.transformer_stamp_by_name = self._profile_call(
-            "init.transformer_stamps",
-            self._build_branch_stamp_map,
-            list(self.transformer_by_name.values()),
-            True,
-        )
+        self.branch_stamp_by_name = self._build_branch_stamp_map(list(self.branch_by_name.values()), False)
+        self.transformer_stamp_by_name = self._build_branch_stamp_map(list(self.transformer_by_name.values()), True)
 
-        self.Y = self._profile_call("init.y_matrix", self._build_y_matrix)
-        self._profile_call("init.y_row_cache", self._prepare_y_row_cache)
-        self.loads_at_pos = self._profile_call("init.group_loads", self._group_loads)
-        self.generators_at_pos = self._profile_call("init.group_generators", self._group_generators)
-        self.generator_share_by_name = self._profile_call("init.generator_shares", self._generator_shares)
+        self.Y = self._build_y_matrix()
+        self._prepare_y_row_cache()
+        self.loads_at_pos = self._group_loads()
+        self.generators_at_pos = self._group_generators()
+        self.generator_share_by_name = self._generator_shares()
         self._initial_observability_cache = None
         # Add priors after unit conversion because model objects are already normalized.
-        self._profile_call("init.pseudo_measurements", self._add_pseudo_power_measurements)
-        self._profile_call("init.seed_power_state", self._seed_power_state_arrays_from_measurements)
-        self._profile_call("init.power_balance_constraints", self._add_power_balance_constraint_measurements)
+        self._add_pseudo_power_measurements()
+        self._seed_power_state_arrays_from_measurements()
+        self._add_power_balance_constraint_measurements()
         self.targeted_observability_pseudo_count = 0
-        self._profile_call("init.active_refresh", self._refresh_active_measurement_indexes)
-        self.targeted_observability_pseudo_count = self._profile_call(
-            "init.targeted_observability",
-            self._add_targeted_observability_pseudo_measurements,
-        )
+        self._refresh_active_measurement_indexes()
+        self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
 
     def _record_profile_time(self, name: str, elapsed: float) -> None:
         if self.profile_enabled:
             self.profile_times[name] = self.profile_times.get(name, 0.0) + float(elapsed)
-
-    def _profile_call(self, name: str, func, *args, **kwargs):
-        if not self.profile_enabled:
-            return func(*args, **kwargs)
-        start = time.perf_counter()
-        try:
-            return func(*args, **kwargs)
-        finally:
-            self._record_profile_time(name, time.perf_counter() - start)
 
     def _default_observability_cache_key(self) -> Tuple[object, ...]:
         return (
@@ -1395,11 +1373,11 @@ class ACStateEstimator:
     def _load_network(self, e_file: Path) -> ACPowerNetwork:
         """Read the AC case and build topology references used by measurements."""
         try:
-            return self._profile_call("init.network_read_file", _build_ac_se_network_from_ppc, e_file)
+            return _build_ac_se_network_from_ppc(e_file)
         except (KeyError, ValueError, RuntimeError):
             network = ACPowerNetwork()
-            self._profile_call("init.network_read_file", network.read_from_file, e_file)
-            self._profile_call("init.network_topo", _fast_topo_network, network)
+            network.read_from_file(e_file)
+            _fast_topo_network(network)
             return network
 
     @staticmethod
@@ -5576,9 +5554,9 @@ class ACStateEstimator:
 
         x = self.initial_state() if x0 is None else x0.copy()
         if measurements is self.active_measurements and x0 is None:
-            observability = self._profile_call("solve.observability", self.observability_analysis)
+            observability = self.observability_analysis()
         else:
-            observability = self._profile_call("solve.observability", self.observability_analysis, x, measurements)
+            observability = self.observability_analysis(x, measurements)
         z, weight = self._measurement_vectors(measurements)
         uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
         weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
@@ -5605,7 +5583,7 @@ class ACStateEstimator:
 
         for iteration in range(1, iteration_limit + 1):
             if cached_z_est is None:
-                z_est = self._profile_call("solve.evaluate", self.evaluate, x, measurements)
+                z_est = self.evaluate(x, measurements)
                 start = time.perf_counter() if self.profile_enabled else None
                 residual = self._measurement_residual(z, z_est, measurements)
                 objective = self._weighted_objective(weight, residual)
@@ -5617,16 +5595,14 @@ class ACStateEstimator:
                 objective = cached_objective
                 cached_z_est = cached_residual = cached_objective = None
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            H = self._profile_call("solve.jacobian", self.jacobian_sparse, x, measurements)
+            H = self.jacobian_sparse(x, measurements)
             if normal_pattern is None and issparse(H):
                 normal_pattern = _normal_equation_structural_pattern(H)
                 if measurements is self.active_measurements:
                     self._active_normal_pattern = normal_pattern
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
-            gain, rhs = self._profile_call(
-                "solve.normal_equations",
-                build_normal_equations,
+            gain, rhs = build_normal_equations(
                 H,
                 residual,
                 weight,
@@ -5636,9 +5612,7 @@ class ACStateEstimator:
                 normal_pattern=normal_pattern,
                 assume_normal_pattern_matches=measurements is self.active_measurements,
             )
-            dx, normal_factor_diag = self._profile_call(
-                "solve.factor_solve",
-                normal_solver.solve,
+            dx, normal_factor_diag = normal_solver.solve(
                 gain,
                 rhs,
                 return_factor_diag=False,
@@ -5664,7 +5638,7 @@ class ACStateEstimator:
                     candidate[self.n_angle : self.base_switch_re],
                     self.voltage_floor,
                 )
-                candidate_z_est = self._profile_call("solve.line_search_evaluate", self.evaluate, candidate, measurements)
+                candidate_z_est = self.evaluate(candidate, measurements)
                 start = time.perf_counter() if self.profile_enabled else None
                 candidate_residual = self._measurement_residual(z, candidate_z_est, measurements)
                 candidate_objective = self._weighted_objective(weight, candidate_residual)
@@ -5702,7 +5676,7 @@ class ACStateEstimator:
 
             if verbose:
                 if cached_residual is None:
-                    cached_z_est = self._profile_call("solve.verbose_evaluate", self.evaluate, x, measurements)
+                    cached_z_est = self.evaluate(x, measurements)
                     cached_residual = self._measurement_residual(z, cached_z_est, measurements)
                     cached_objective = self._weighted_objective(weight, cached_residual)
                 updated_residual = cached_residual
@@ -5732,7 +5706,7 @@ class ACStateEstimator:
 
         if not final_quantities_current:
             if cached_z_est is None:
-                z_est = self._profile_call("solve.final_evaluate", self.evaluate, x, measurements)
+                z_est = self.evaluate(x, measurements)
                 start = time.perf_counter() if self.profile_enabled else None
                 residual = self._measurement_residual(z, z_est, measurements)
                 objective = self._weighted_objective(weight, residual)
@@ -5743,12 +5717,10 @@ class ACStateEstimator:
                 residual = cached_residual
                 objective = cached_objective
         if final_diagnostics and not final_quantities_current:
-            H = self._profile_call("solve.final_jacobian", self.jacobian_sparse, x, measurements)
+            H = self.jacobian_sparse(x, measurements)
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
-            gain, _ = self._profile_call(
-                "solve.final_normal_equations",
-                build_normal_equations,
+            gain, _ = build_normal_equations(
                 H,
                 residual,
                 weight,

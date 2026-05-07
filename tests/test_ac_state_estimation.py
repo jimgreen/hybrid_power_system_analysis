@@ -782,6 +782,10 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(estimator.nodes)
         self.assertTrue(hasattr(estimator.network, "_array_model"))
 
+    def test_ac_state_estimator_does_not_use_profile_call_wrapper(self):
+        source = (ROOT_DIR / "secore" / "ac_se.py").read_text(encoding="utf-8")
+        self.assertNotIn("_profile_call", source)
+
     def test_normalize_model_named_units_reuses_current_base_per_node(self):
         import unit_system
         from efile_read import efile_factory
