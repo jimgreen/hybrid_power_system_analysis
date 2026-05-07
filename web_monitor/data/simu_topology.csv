@@ -1,0 +1,6 @@
+id,status,value
+BUS-101,ok,1.018 p.u.
+BUS-205,normal,66%
+BUS-309,warn,0.958 p.u.
+BUS-412,ok,49%
+BUS-518,normal,38 MW

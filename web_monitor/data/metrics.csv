@@ -1,0 +1,13 @@
+﻿page,label,value,unit,status
+simu,仿真步长,0.50,s,normal
+simu,总有功负荷,486.2,MW,normal
+simu,平均电压,1.012,p.u.,normal
+simu,事件队列,7,条,warning
+scada,遥测点数,12846,点,normal
+scada,遥信变位,18,次,normal
+scada,通道在线率,98.9,%,normal
+scada,异常测点,23,点,warning
+agc,ACE,-12.6,MW,normal
+agc,系统频率,50.01,Hz,normal
+agc,可调容量,284,MW,normal
+agc,执行机组,6,台,warning

@@ -127,16 +127,16 @@
             <div class="link" style="left:338px;top:122px;width:210px;transform:rotate(40deg)"></div>
             <div class="link" style="left:132px;top:228px;width:254px;transform:rotate(-22deg)"></div>
             <div class="link" style="left:438px;top:80px;width:160px;transform:rotate(72deg)"></div>
-            <div class="station" style="left:48px;top:58px"><strong>主站 A</strong><span>延迟 22 ms</span></div>
-            <div class="station" style="left:298px;top:110px"><strong>变电站 110kV</strong><span>质量 99.9%</span></div>
-            <div class="station warn" style="left:430px;top:244px"><strong>采集终端 D3</strong><span>质量 96.2%</span></div>
-            <div class="station" style="left:530px;top:72px"><strong>主站 B</strong><span>延迟 25 ms</span></div>
-            <div class="station" style="left:138px;top:226px"><strong>馈线终端 F8</strong><span>质量 99.3%</span></div>
+            <div class="station" data-station="主站 A" style="left:48px;top:58px"><strong>主站 A</strong><span>延迟 22 ms</span></div>
+            <div class="station" data-station="变电站 110kV" style="left:298px;top:110px"><strong>变电站 110kV</strong><span>质量 99.9%</span></div>
+            <div class="station warn" data-station="采集终端 D3" style="left:430px;top:244px"><strong>采集终端 D3</strong><span>质量 96.2%</span></div>
+            <div class="station" data-station="主站 B" style="left:530px;top:72px"><strong>主站 B</strong><span>延迟 25 ms</span></div>
+            <div class="station" data-station="馈线终端 F8" style="left:138px;top:226px"><strong>馈线终端 F8</strong><span>质量 99.3%</span></div>
           </div>
         </article>
         <article class="card chart">
           <div class="section-title"><h2>采集吞吐</h2><span>最近 8 周期</span></div>
-          <div class="chart-body">
+          <div class="chart-body" id="scada-columns">
             <div class="column"><div style="height:46%"></div><span>T-7</span></div>
             <div class="column"><div style="height:58%"></div><span>T-6</span></div>
             <div class="column"><div style="height:63%"></div><span>T-5</span></div>
@@ -151,7 +151,7 @@
           <div class="section-title"><h2>SCADA告警</h2><span>自动刷新</span></div>
           <table>
             <thead><tr><th>时间</th><th>测点</th><th>内容</th><th>状态</th></tr></thead>
-            <tbody>
+            <tbody id="scada-alarms">
               <tr><td>14:03:52</td><td>AI-2201</td><td>遥测跳变过滤</td><td><span class="tag warn">关注</span></td></tr>
               <tr><td>14:02:31</td><td>DI-1108</td><td>开关量变位</td><td><span class="tag">已采集</span></td></tr>
               <tr><td>14:01:45</td><td>CH-B02</td><td>备用通道切换</td><td><span class="tag">正常</span></td></tr>
@@ -161,7 +161,7 @@
         </article>
         <article class="card control-card">
           <div class="section-title"><h2>采集摘要</h2><span>SCADA</span></div>
-          <div class="control-list">
+          <div class="control-list" id="scada-summary">
             <div class="control-item"><span>采集周期</span><strong>2 s</strong></div>
             <div class="control-item"><span>主站模式</span><strong>双机热备</strong></div>
             <div class="control-item"><span>坏数据过滤</span><strong style="color:var(--green)">启用</strong></div>
@@ -174,13 +174,70 @@
   </div>
   <script>
     const clock = document.getElementById("clock");
+    const metricTargets = {
+      "遥测点数": '[data-live="telemetry"]',
+      "遥信变位": '[data-live="signal"]',
+      "通道在线率": '[data-live="channel"]',
+      "异常测点": '[data-live="bad"]'
+    };
+
+    function renderMetrics(metrics) {
+      for (const item of metrics || []) {
+        const selector = metricTargets[item.label];
+        if (!selector) continue;
+        const value = item.label === "遥测点数" ? Number(item.value).toLocaleString("zh-CN") : item.value;
+        document.querySelector(selector).innerHTML = value + ' <span class="unit">' + item.unit + '</span>';
+      }
+    }
+
+    function renderColumns(items) {
+      document.getElementById("scada-columns").innerHTML = (items || []).map((item) => {
+        return '<div class="column"><div style="height:' + item.value + '%"></div><span>' + item.label + '</span></div>';
+      }).join("");
+    }
+
+    function renderAlarms(items) {
+      document.getElementById("scada-alarms").innerHTML = (items || []).map((item) => {
+        const warn = item.status === "关注" ? " warn" : "";
+        return '<tr><td>' + item.time + '</td><td>' + item.object + '</td><td>' + item.message + '</td><td><span class="tag' + warn + '">' + item.status + '</span></td></tr>';
+      }).join("");
+    }
+
+    function renderSummary(items) {
+      document.getElementById("scada-summary").innerHTML = (items || []).map((item) => {
+        const color = ["启用", "在线"].includes(item.value) ? ' style="color:var(--green)"' : "";
+        return '<div class="control-item"><span>' + item.label + '</span><strong' + color + '>' + item.value + '</strong></div>';
+      }).join("");
+    }
+
+    function renderStations(items) {
+      for (const item of items || []) {
+        const station = document.querySelector('[data-station="' + item.name + '"]');
+        if (!station) continue;
+        station.className = "station" + (item.status === "warn" ? " warn" : "");
+        station.innerHTML = '<strong>' + item.name + '</strong><span>' + item.detail + '</span>';
+      }
+    }
+
+    async function loadBackendData() {
+      const response = await fetch("/api/scada", { cache: "no-store" });
+      if (!response.ok) throw new Error("SCADA API unavailable");
+      const data = await response.json();
+      renderMetrics(data.metrics);
+      renderColumns(data.charts && data.charts.columns);
+      renderAlarms(data.alarms);
+      renderSummary(data.summary);
+      renderStations(data.stations);
+    }
     function tick() {
       const now = new Date();
       clock.textContent = now.toLocaleString("zh-CN", { hour12: false });
+      loadBackendData().catch(() => {
       document.querySelector('[data-live="telemetry"]').innerHTML = (12820 + Math.floor(Math.random() * 70)).toLocaleString("zh-CN") + ' <span class="unit">点</span>';
       document.querySelector('[data-live="signal"]').innerHTML = (12 + Math.floor(Math.random() * 10)) + ' <span class="unit">次</span>';
       document.querySelector('[data-live="channel"]').innerHTML = (98.4 + Math.random() * 1.3).toFixed(1) + ' <span class="unit">%</span>';
       document.querySelector('[data-live="bad"]').innerHTML = (18 + Math.floor(Math.random() * 9)) + ' <span class="unit">点</span>';
+      });
     }
     tick();
     setInterval(tick, 2000);

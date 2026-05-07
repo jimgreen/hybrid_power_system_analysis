@@ -1,0 +1,16 @@
+page,label,value,status
+simu,模型文件,real.e,normal
+simu,计算模式,AC/DC Hybrid,normal
+simu,当前断面,Case-20260507,normal
+simu,刷新周期,2 s,normal
+simu,收敛状态,正常,normal
+scada,采集周期,2 s,normal
+scada,主站模式,双机热备,normal
+scada,坏数据过滤,启用,normal
+scada,遥测合格率,99.7%,normal
+scada,链路状态,在线,normal
+agc,控制模式,定频率偏差,normal
+agc,死区,±20 MW,normal
+agc,分配策略,按速率优先,normal
+agc,指令校验,通过,normal
+agc,闭环状态,投入,normal

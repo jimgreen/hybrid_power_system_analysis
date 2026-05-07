@@ -337,11 +337,11 @@
             <div class="line" style="left:331px;top:145px;width:205px;transform:rotate(32deg)"></div>
             <div class="line" style="left:147px;top:210px;width:268px;transform:rotate(-18deg)"></div>
             <div class="line" style="left:462px;top:87px;width:170px;transform:rotate(67deg)"></div>
-            <div class="bus ok" style="left:54px;top:68px">BUS-101</div>
-            <div class="bus" style="left:306px;top:120px">BUS-205</div>
-            <div class="bus warn" style="left:430px;top:245px">BUS-309</div>
-            <div class="bus ok" style="left:540px;top:78px">BUS-412</div>
-            <div class="bus" style="left:150px;top:214px">BUS-518</div>
+            <div class="bus ok" data-bus="BUS-101" style="left:54px;top:68px">BUS-101</div>
+            <div class="bus" data-bus="BUS-205" style="left:306px;top:120px">BUS-205</div>
+            <div class="bus warn" data-bus="BUS-309" style="left:430px;top:245px">BUS-309</div>
+            <div class="bus ok" data-bus="BUS-412" style="left:540px;top:78px">BUS-412</div>
+            <div class="bus" data-bus="BUS-518" style="left:150px;top:214px">BUS-518</div>
           </div>
         </article>
 
@@ -350,7 +350,7 @@
             <h2>仿真关键量</h2>
             <span>最近 15 分钟</span>
           </div>
-          <div class="trend-body">
+          <div class="trend-body" id="simu-bars">
             <div class="bar-row"><span>线路 L12</span><div class="track"><div class="fill" style="width:72%"></div></div><span>72%</span></div>
             <div class="bar-row"><span>线路 L18</span><div class="track"><div class="fill" style="width:58%"></div></div><span>58%</span></div>
             <div class="bar-row"><span>线路 L23</span><div class="track"><div class="fill" style="width:81%"></div></div><span>81%</span></div>
@@ -367,7 +367,7 @@
           </div>
           <table>
             <thead><tr><th>时间</th><th>对象</th><th>事件</th><th>状态</th></tr></thead>
-            <tbody>
+            <tbody id="simu-alarms">
               <tr><td>14:03:18</td><td>BUS-309</td><td>电压越限预警</td><td><span class="tag warn">关注</span></td></tr>
               <tr><td>14:02:44</td><td>LINE-L23</td><td>负载率升高</td><td><span class="tag warn">关注</span></td></tr>
               <tr><td>14:01:21</td><td>GEN-G02</td><td>出力指令更新</td><td><span class="tag">正常</span></td></tr>
@@ -381,7 +381,7 @@
             <h2>运行摘要</h2>
             <span>SIMU</span>
           </div>
-          <div class="control-list">
+          <div class="control-list" id="simu-summary">
             <div class="control-item"><span>模型文件</span><strong>real.e</strong></div>
             <div class="control-item"><span>计算模式</span><strong>AC/DC Hybrid</strong></div>
             <div class="control-item"><span>当前断面</span><strong>Case-20260507</strong></div>
@@ -395,15 +395,76 @@
 
   <script>
     const clock = document.getElementById("clock");
+    const metricTargets = {
+      "仿真步长": '[data-live="step"]',
+      "总有功负荷": '[data-live="load"]',
+      "平均电压": '[data-live="voltage"]',
+      "事件队列": '[data-live="events"]'
+    };
+
+    function metricHtml(item) {
+      return item.value + ' <span class="unit">' + item.unit + '</span>';
+    }
+
+    function renderMetrics(metrics) {
+      for (const item of metrics || []) {
+        const selector = metricTargets[item.label];
+        if (selector) document.querySelector(selector).innerHTML = metricHtml(item);
+      }
+    }
+
+    function renderBars(items) {
+      const host = document.getElementById("simu-bars");
+      host.innerHTML = (items || []).map((item) => {
+        const width = item.unit === "%" ? Number(item.value) : Math.min(100, Number(item.value) * 64);
+        return '<div class="bar-row"><span>' + item.label + '</span><div class="track"><div class="fill" style="width:' + width + '%"></div></div><span>' + item.value + item.unit + '</span></div>';
+      }).join("");
+    }
+
+    function renderAlarms(items) {
+      document.getElementById("simu-alarms").innerHTML = (items || []).map((item) => {
+        const warn = item.status === "关注" ? " warn" : "";
+        return '<tr><td>' + item.time + '</td><td>' + item.object + '</td><td>' + item.message + '</td><td><span class="tag' + warn + '">' + item.status + '</span></td></tr>';
+      }).join("");
+    }
+
+    function renderSummary(items) {
+      document.getElementById("simu-summary").innerHTML = (items || []).map((item) => {
+        const color = item.value === "正常" ? ' style="color:var(--green)"' : "";
+        return '<div class="control-item"><span>' + item.label + '</span><strong' + color + '>' + item.value + '</strong></div>';
+      }).join("");
+    }
+
+    function renderTopology(items) {
+      for (const item of items || []) {
+        const node = document.querySelector('[data-bus="' + item.id + '"]');
+        if (!node) continue;
+        node.className = "bus " + (item.status === "ok" ? "ok" : item.status === "warn" ? "warn" : "");
+        node.textContent = item.id + " " + item.value;
+      }
+    }
+
+    async function loadBackendData() {
+      const response = await fetch("/api/simu", { cache: "no-store" });
+      if (!response.ok) throw new Error("SIMU API unavailable");
+      const data = await response.json();
+      renderMetrics(data.metrics);
+      renderBars(data.charts && data.charts.bars);
+      renderAlarms(data.alarms);
+      renderSummary(data.summary);
+      renderTopology(data.topology);
+    }
     function tick() {
       const now = new Date();
       clock.textContent = now.toLocaleString("zh-CN", { hour12: false });
+      loadBackendData().catch(() => {
       const load = 482 + Math.random() * 10;
       const voltage = 1.006 + Math.random() * 0.014;
       const events = 5 + Math.floor(Math.random() * 5);
       document.querySelector('[data-live="load"]').innerHTML = load.toFixed(1) + ' <span class="unit">MW</span>';
       document.querySelector('[data-live="voltage"]').innerHTML = voltage.toFixed(3) + ' <span class="unit">p.u.</span>';
       document.querySelector('[data-live="events"]').innerHTML = events + ' <span class="unit">条</span>';
+      });
     }
     tick();
     setInterval(tick, 2000);

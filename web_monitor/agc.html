@@ -124,7 +124,7 @@
         <article class="card metric"><div class="label">执行机组</div><div class="value" data-live="units">6 <span class="unit">台</span></div><div class="delta">1 台限幅运行</div></article>
         <article class="card dispatch">
           <div class="section-title"><h2>机组调节指令</h2><span>AGC dispatch</span></div>
-          <div class="dispatch-body">
+          <div class="dispatch-body" id="agc-units">
             <div class="unit-row"><strong>GEN-01</strong><div class="track"><div class="fill" style="width:74%"></div></div><span>148 MW</span></div>
             <div class="unit-row"><strong>GEN-02</strong><div class="track"><div class="fill" style="width:61%"></div></div><span>122 MW</span></div>
             <div class="unit-row"><strong>GEN-03</strong><div class="track"><div class="fill" style="width:83%"></div></div><span>166 MW</span></div>
@@ -136,8 +136,8 @@
         <article class="card reserve">
           <div class="section-title"><h2>调节性能</h2><span>CPS1</span></div>
           <div class="reserve-body">
-            <div class="gauge"><div><strong>97.4</strong><span>控制性能</span></div></div>
-            <div class="reserve-list">
+            <div class="gauge" id="agc-gauge"><div><strong>97.4</strong><span>控制性能</span></div></div>
+            <div class="reserve-list" id="agc-reserve">
               <div class="reserve-item"><span>上调备用</span><strong>164 MW</strong></div>
               <div class="reserve-item"><span>下调备用</span><strong>120 MW</strong></div>
               <div class="reserve-item"><span>平均响应</span><strong>8.2 s</strong></div>
@@ -149,7 +149,7 @@
           <div class="section-title"><h2>AGC指令记录</h2><span>自动刷新</span></div>
           <table>
             <thead><tr><th>时间</th><th>对象</th><th>指令</th><th>状态</th></tr></thead>
-            <tbody>
+            <tbody id="agc-alarms">
               <tr><td>14:03:48</td><td>GEN-03</td><td>上调 4.5 MW</td><td><span class="tag">已执行</span></td></tr>
               <tr><td>14:03:12</td><td>GEN-06</td><td>下调 2.0 MW</td><td><span class="tag">已执行</span></td></tr>
               <tr><td>14:02:39</td><td>GEN-04</td><td>达到调节限幅</td><td><span class="tag warn">关注</span></td></tr>
@@ -159,7 +159,7 @@
         </article>
         <article class="card control-card">
           <div class="section-title"><h2>控制摘要</h2><span>AGC</span></div>
-          <div class="control-list">
+          <div class="control-list" id="agc-summary">
             <div class="control-item"><span>控制模式</span><strong>定频率偏差</strong></div>
             <div class="control-item"><span>死区</span><strong>±20 MW</strong></div>
             <div class="control-item"><span>分配策略</span><strong>按速率优先</strong></div>
@@ -172,15 +172,76 @@
   </div>
   <script>
     const clock = document.getElementById("clock");
+    const metricTargets = {
+      "ACE": '[data-live="ace"]',
+      "系统频率": '[data-live="freq"]',
+      "可调容量": '[data-live="reserve"]',
+      "执行机组": '[data-live="units"]'
+    };
+
+    function renderMetrics(metrics) {
+      for (const item of metrics || []) {
+        const selector = metricTargets[item.label];
+        if (!selector) continue;
+        const value = item.label === "系统频率" ? Number(item.value).toFixed(2) : item.value;
+        document.querySelector(selector).innerHTML = value + ' <span class="unit">' + item.unit + '</span>';
+      }
+    }
+
+    function renderUnits(items) {
+      document.getElementById("agc-units").innerHTML = (items || []).map((item) => {
+        return '<div class="unit-row"><strong>' + item.name + '</strong><div class="track"><div class="fill" style="width:' + item.percent + '%"></div></div><span>' + item.power + ' ' + item.unit + '</span></div>';
+      }).join("");
+    }
+
+    function renderReserve(data) {
+      if (!data) return;
+      const score = Number(data.score);
+      document.getElementById("agc-gauge").style.background = 'conic-gradient(var(--green) 0 ' + score + '%, rgba(132, 178, 224, 0.13) ' + score + '% 100%)';
+      document.getElementById("agc-gauge").innerHTML = '<div><strong>' + score.toFixed(1) + '</strong><span>控制性能</span></div>';
+      document.getElementById("agc-reserve").innerHTML = [
+        ["上调备用", data.up + " MW"],
+        ["下调备用", data.down + " MW"],
+        ["平均响应", data.response + " s"],
+        ["闭环周期", data.cycle + " s"]
+      ].map((row) => '<div class="reserve-item"><span>' + row[0] + '</span><strong>' + row[1] + '</strong></div>').join("");
+    }
+
+    function renderAlarms(items) {
+      document.getElementById("agc-alarms").innerHTML = (items || []).map((item) => {
+        const warn = item.status === "关注" ? " warn" : "";
+        return '<tr><td>' + item.time + '</td><td>' + item.object + '</td><td>' + item.message + '</td><td><span class="tag' + warn + '">' + item.status + '</span></td></tr>';
+      }).join("");
+    }
+
+    function renderSummary(items) {
+      document.getElementById("agc-summary").innerHTML = (items || []).map((item) => {
+        const color = ["通过", "投入"].includes(item.value) ? ' style="color:var(--green)"' : "";
+        return '<div class="control-item"><span>' + item.label + '</span><strong' + color + '>' + item.value + '</strong></div>';
+      }).join("");
+    }
+
+    async function loadBackendData() {
+      const response = await fetch("/api/agc", { cache: "no-store" });
+      if (!response.ok) throw new Error("AGC API unavailable");
+      const data = await response.json();
+      renderMetrics(data.metrics);
+      renderUnits(data.units || (data.charts && data.charts.units));
+      renderReserve(data.reserve);
+      renderAlarms(data.alarms);
+      renderSummary(data.summary);
+    }
     function tick() {
       const now = new Date();
       clock.textContent = now.toLocaleString("zh-CN", { hour12: false });
+      loadBackendData().catch(() => {
       const ace = -18 + Math.random() * 28;
       const freq = 49.98 + Math.random() * 0.05;
       document.querySelector('[data-live="ace"]').innerHTML = ace.toFixed(1) + ' <span class="unit">MW</span>';
       document.querySelector('[data-live="freq"]').innerHTML = freq.toFixed(2) + ' <span class="unit">Hz</span>';
       document.querySelector('[data-live="reserve"]').innerHTML = (270 + Math.floor(Math.random() * 28)) + ' <span class="unit">MW</span>';
       document.querySelector('[data-live="units"]').innerHTML = (5 + Math.floor(Math.random() * 3)) + ' <span class="unit">台</span>';
+      });
     }
     tick();
     setInterval(tick, 2000);
