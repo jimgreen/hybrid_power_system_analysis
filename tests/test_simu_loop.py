@@ -114,6 +114,48 @@ class SimulationLoopTest(unittest.TestCase):
         self.assertIn("100", real_text)
         self.assertEqual(real_text, scada_text)
 
+    def test_dev_stat_converter_setpoint_updates_dcac_pq_setpoints(self):
+        from efile_read import EBook
+        from simu.simu_loop import apply_dev_stat_file
+
+        tmp = TMP_ROOT / "converter_setpoint"
+        tmp.mkdir(parents=True, exist_ok=True)
+        dev_stat = tmp / "dev_stat.e"
+        dev_stat.write_text(
+            "\n".join(
+                [
+                    "<ConverterSetpoint>",
+                    "@ dev_type idx name run_stat p_set q_set",
+                    "# DCACConverter 10 grid_inv_acp 1 -320 45",
+                    "</ConverterSetpoint>",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        model = EBook(
+            {
+                "DCACConverter": [
+                    {
+                        "idx": "10",
+                        "name": "grid_inv_acp",
+                        "p_ac_set": "-350",
+                        "q_ac_set": "0",
+                        "v_ac_set": "0",
+                        "run_stat": "0",
+                    }
+                ]
+            }
+        )
+
+        changed = apply_dev_stat_file(model, dev_stat)
+
+        row = model.data["DCACConverter"].data[0]
+        self.assertEqual(3, changed)
+        self.assertEqual("-320", row["p_ac_set"])
+        self.assertEqual("45", row["q_ac_set"])
+        self.assertEqual("1", row["run_stat"])
+
     def test_simulation_logger_writes_to_configured_log_file(self):
         from simu.simu_loop import setup_logger
 

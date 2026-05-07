@@ -243,18 +243,21 @@
 # DCDCConverter  5    ess03_dcdc    1         60     0      0
 # DCDCConverter  6    ess04_dcdc    1         60     0      0
 # DCDCConverter  7    ess05_dcdc    1         60     0      0
-# DCACConverter  0    wt01_rect     1         10     0      0
-# DCACConverter  1    wt02_rect     1         10     0      0
-# DCACConverter  2    wt03_rect     1         10     0      0
-# DCACConverter  3    wt04_rect     1         10     0      0
-# DCACConverter  4    wt05_rect     1         10     0      0
-# DCACConverter  5    wt06_rect     1         10     0      0
-# DCACConverter  6    wt07_rect     1         10     0      0
-# DCACConverter  7    wt08_rect     1         10     0      0
-# DCACConverter  8    wt09_rect     1         10     0      0
-# DCACConverter  9    wt10_rect     1         10     0      0
-# DCACConverter  10   grid_inv_acp  1         -350   0      0
 </GeneratorSetpoint>
+<ConverterSetpoint>
+@ dev_type       idx  name          run_stat  p_set  q_set
+# DCACConverter  0    wt01_rect     1         10     0
+# DCACConverter  1    wt02_rect     1         10     0
+# DCACConverter  2    wt03_rect     1         10     0
+# DCACConverter  3    wt04_rect     1         10     0
+# DCACConverter  4    wt05_rect     1         10     0
+# DCACConverter  5    wt06_rect     1         10     0
+# DCACConverter  6    wt07_rect     1         10     0
+# DCACConverter  7    wt08_rect     1         10     0
+# DCACConverter  8    wt09_rect     1         10     0
+# DCACConverter  9    wt10_rect     1         10     0
+# DCACConverter  10   grid_inv_acp  1         -350   0
+</ConverterSetpoint>
 <LoadSetpoint>
 @ dev_type  idx  name       run_stat  p_set  q_set
 # ACLoad    0    load_ac_1  1         350    120

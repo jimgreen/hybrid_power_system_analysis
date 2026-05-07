@@ -264,6 +264,11 @@ def apply_dev_stat_file(model_book: EBook, dev_stat_file: Path) -> int:
         for row in block.data:
             changed += _apply_setpoint_row(model_book, row)
 
+    block = stat_book.data.get("ConverterSetpoint")
+    if block is not None:
+        for row in block.data:
+            changed += _apply_setpoint_row(model_book, row)
+
     block = stat_book.data.get("LoadSetpoint")
     if block is not None:
         for row in block.data:
