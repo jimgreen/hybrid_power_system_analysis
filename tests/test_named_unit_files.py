@@ -13,6 +13,9 @@ sys.path.insert(0, str(ROOT_DIR / "lfcore"))
 
 
 MEAS_FILES = sorted((ROOT_DIR / "data").glob("**/*.meas"))
+E_FILES = sorted((ROOT_DIR / "data").glob("**/*.e"))
+E_FILES.extend(path for path in (ROOT_DIR / "agc").glob("*.e"))
+E_FILES.extend(path for path in (ROOT_DIR / "simu").glob("*.e"))
 
 
 class NamedUnitFileTest(unittest.TestCase):
@@ -81,6 +84,45 @@ class NamedUnitFileTest(unittest.TestCase):
                 weight = float(row["weight"])
                 self.assertGreaterEqual(weight, 0.1)
                 self.assertLessEqual(weight, 10.0)
+
+    def test_dc_load_rows_match_pbase_header_width(self):
+        self.assertTrue(E_FILES)
+        malformed = []
+        for e_path in E_FILES:
+            in_dc_load = False
+            header = None
+            with e_path.open(encoding="utf-8") as fp:
+                for line_no, raw_line in enumerate(fp, start=1):
+                    line = raw_line.strip()
+                    if line == "<DCLoad>":
+                        in_dc_load = True
+                        header = None
+                        continue
+                    if not in_dc_load:
+                        continue
+                    if line == "</DCLoad>":
+                        break
+                    if not line:
+                        continue
+                    if line.startswith("@"):
+                        header = line[1:].split()
+                        continue
+                    if not line.startswith("#"):
+                        continue
+                    if header is None:
+                        malformed.append((e_path.relative_to(ROOT_DIR).as_posix(), line_no, "missing header"))
+                        continue
+                    cells = line[1:].split()
+                    if "pbase" in header and len(cells) != len(header):
+                        malformed.append(
+                            (
+                                e_path.relative_to(ROOT_DIR).as_posix(),
+                                line_no,
+                                f"{len(cells)} cells for {len(header)} headers",
+                            )
+                        )
+
+        self.assertEqual([], malformed[:10])
 
     def test_ac_node_angle_is_degrees_in_file_and_radians_in_network(self):
         from efile_read import EBook
