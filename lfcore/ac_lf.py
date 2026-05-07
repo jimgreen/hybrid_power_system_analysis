@@ -138,7 +138,7 @@ from ac_array_model import (
     SWITCH_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
-    build_ac_ppc_from_e_file,
+    build_ac_ppc_from_network,
 )
 
 
@@ -168,12 +168,20 @@ def load_ac_ppc_from_e_file(
     include_device_names: bool = True,
 ) -> Dict:
     """Read an AC E file via efile_read-backed array model loading."""
-    return build_ac_ppc_from_e_file(
-        file_name,
-        use_cache=use_cache,
+    from ac_model import ACPowerNetwork
+
+    source = Path(file_name).resolve()
+    network = ACPowerNetwork()
+    network.source = str(source)
+    network.read_from_file(source)
+    network.source = str(source)
+    ppc = build_ac_ppc_from_network(
+        network,
         copy_arrays=copy_arrays,
         include_device_names=include_device_names,
     )
+    ppc["source"] = str(source)
+    return ppc
 
 
 _SPARSE_SOLVER = None

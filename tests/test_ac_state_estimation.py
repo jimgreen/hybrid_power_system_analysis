@@ -757,28 +757,39 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsInstance(direct.ACBranch[0], ac_model.ACBranch)
         self.assertTrue(hasattr(direct.ACBranch[0], "i_node_obj"))
 
-    def test_ac_network_load_uses_array_model_by_default(self):
+    def test_ac_network_load_builds_ppc_from_loaded_network(self):
         import secore.ac_se
+        from ac_array_model import build_ac_ppc_from_network as original_builder
         from secore.ac_se import ACStateEstimator
 
-        original = secore.ac_se.load_ac_ppc_from_e_file
-        calls = 0
+        previous_builder = getattr(secore.ac_se, "build_ac_ppc_from_network", None)
+        previous_file_loader = getattr(secore.ac_se, "load_ac_ppc_from_e_file", None)
+        calls = []
 
-        def counted_factory(path, *args, **kwargs):
-            nonlocal calls
-            calls += 1
-            return original(path, *args, **kwargs)
+        def counted_builder(network, *args, **kwargs):
+            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
+            return original_builder(network, *args, **kwargs)
 
-        secore.ac_se.load_ac_ppc_from_e_file = counted_factory
+        def reject_file_loader(*_args, **_kwargs):
+            raise AssertionError("AC SE should build ppc from an already loaded ACPowerNetwork")
+
+        secore.ac_se.build_ac_ppc_from_network = counted_builder
+        if previous_file_loader is not None:
+            secore.ac_se.load_ac_ppc_from_e_file = reject_file_loader
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
                 meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
             )
         finally:
-            secore.ac_se.load_ac_ppc_from_e_file = original
+            if previous_builder is None:
+                del secore.ac_se.build_ac_ppc_from_network
+            else:
+                secore.ac_se.build_ac_ppc_from_network = previous_builder
+            if previous_file_loader is not None:
+                secore.ac_se.load_ac_ppc_from_e_file = previous_file_loader
 
-        self.assertEqual(1, calls)
+        self.assertEqual([("ACPowerNetwork", 39, False)], calls)
         self.assertTrue(estimator.nodes)
         self.assertTrue(hasattr(estimator.network, "_array_model"))
 
@@ -1368,7 +1379,7 @@ class ACStateEstimationTest(unittest.TestCase):
                         "@ idx name dev_type dev_name meas_type weight valid value",
                         "# 1 v_nd_1 ACNode nd_1 V 1.0 1 100",
                         "# 2 v_nd_2_bad ACNode nd_2 V 1.0 0 100",
-                        "# 3 p_sw_bad ACSwitch sw_0_1 P_FROM 1.0 0 0",
+                        "# 3 p_sw_bad ACBreak sw_0_1 P_FROM 1.0 0 0",
                         "# 4 p_zbr_bad ACZeroBranch zbr_1_2 P_FROM 1.0 0 0",
                         "</Measurement>",
                         "",
@@ -1393,7 +1404,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertNotIn(("ACNode", "nd_2", "V"), pseudo_keys)
         self.assertFalse(any(device_type == "ACNode" and meas_type == "V" for device_type, _name, meas_type in pseudo_keys))
         for meas_type in ("P_FROM", "Q_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("ACSwitch", "sw_0_1", meas_type), pseudo_keys)
+            self.assertIn(("ACBreak", "sw_0_1", meas_type), pseudo_keys)
             self.assertIn(("ACZeroBranch", "zbr_1_2", meas_type), pseudo_keys)
 
     def test_jacobian_uses_direct_derivatives_without_repeated_evaluation(self):
@@ -1447,7 +1458,7 @@ class ACStateEstimationTest(unittest.TestCase):
         dense = estimator.jacobian(x)
 
         active_devices = {meas.device_type for meas in estimator.active_measurements}
-        self.assertIn("ACSwitch", active_devices)
+        self.assertIn("ACBreak", active_devices)
         self.assertIn("ACZeroBranch", active_devices)
 
         def fail_scalar_zero_current_path(*args, **kwargs):
@@ -2397,7 +2408,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn("I_TO", active_types)
         self.assertIn("I_GEN", active_types)
         self.assertIn("I_LOAD", active_types)
-        self.assertIn("ACSwitch", active_devices)
+        self.assertIn("ACBreak", active_devices)
 
         result = estimator.estimate()
         self.assertTrue(result.converged)

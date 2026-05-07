@@ -195,23 +195,35 @@ class ACPPCFlowTest(unittest.TestCase):
 
     def test_ac_power_flow_can_load_e_file_through_efile_reader_path(self):
         import ac_lf
+        from ac_array_model import build_ac_ppc_from_network as original_builder
         from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
-        original = ac_lf.build_ac_ppc_from_e_file
+        previous_builder = getattr(ac_lf, "build_ac_ppc_from_network", None)
+        previous_file_builder = getattr(ac_lf, "build_ac_ppc_from_e_file", None)
         calls = []
 
-        def counted_loader(path, *args, **kwargs):
-            calls.append((Path(path).name, kwargs.get("copy_arrays")))
-            return original(path, *args, **kwargs)
+        def counted_builder(network, *args, **kwargs):
+            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
+            return original_builder(network, *args, **kwargs)
 
-        ac_lf.build_ac_ppc_from_e_file = counted_loader
+        def reject_file_builder(*_args, **_kwargs):
+            raise AssertionError("AC LF should build ppc from an already loaded ACPowerNetwork")
+
+        ac_lf.build_ac_ppc_from_network = counted_builder
+        if previous_file_builder is not None:
+            ac_lf.build_ac_ppc_from_e_file = reject_file_builder
         try:
             calc = ACPowerFlowCalc.from_e_file(case_path, tol=1e-8, max_iter=50)
         finally:
-            ac_lf.build_ac_ppc_from_e_file = original
+            if previous_builder is None:
+                del ac_lf.build_ac_ppc_from_network
+            else:
+                ac_lf.build_ac_ppc_from_network = previous_builder
+            if previous_file_builder is not None:
+                ac_lf.build_ac_ppc_from_e_file = previous_file_builder
 
-        self.assertEqual([("ieee300.e", True)], calls)
+        self.assertEqual([("ACPowerNetwork", 300, True)], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
 

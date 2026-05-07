@@ -76,22 +76,34 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_network as original_builder
 
         case_path = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
-        original = dc_lf.build_dc_ppc_from_e_file
+        previous_builder = getattr(dc_lf, "build_dc_ppc_from_network", None)
+        previous_file_builder = getattr(dc_lf, "build_dc_ppc_from_e_file", None)
         calls = []
 
-        def counted_loader(path, *args, **kwargs):
-            calls.append((Path(path).name, kwargs.get("copy_arrays")))
-            return original(path, *args, **kwargs)
+        def counted_builder(network, *args, **kwargs):
+            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
+            return original_builder(network, *args, **kwargs)
 
-        dc_lf.build_dc_ppc_from_e_file = counted_loader
+        def reject_file_builder(*_args, **_kwargs):
+            raise AssertionError("DC LF should build ppc from an already loaded DCPowerNetwork")
+
+        dc_lf.build_dc_ppc_from_network = counted_builder
+        if previous_file_builder is not None:
+            dc_lf.build_dc_ppc_from_e_file = reject_file_builder
         try:
             calc = DCPowerFlowCalc.from_e_file(case_path)
         finally:
-            dc_lf.build_dc_ppc_from_e_file = original
+            if previous_builder is None:
+                del dc_lf.build_dc_ppc_from_network
+            else:
+                dc_lf.build_dc_ppc_from_network = previous_builder
+            if previous_file_builder is not None:
+                dc_lf.build_dc_ppc_from_e_file = previous_file_builder
 
-        self.assertEqual([("dc_net_30.e", True)], calls)
+        self.assertEqual([("DCPowerNetwork", 30, True)], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("dc_ppc_v1", calc.ppc["format"])
 

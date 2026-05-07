@@ -129,12 +129,12 @@ try:
         BREAK_COLS as DC_BREAK_COLS,
         SWITCH_COLS as DC_SWITCH_COLS,
         ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
-        build_dc_ppc_from_e_file,
+        build_dc_ppc_from_network,
     )
 except Exception:
     DC_BRANCH_COLS = DC_BUS_COLS = DC_DCDC_COLS = DC_GEN_COLS = DC_LOAD_COLS = None
     DC_BREAK_COLS = DC_SWITCH_COLS = DC_ZERO_BRANCH_COLS = None
-    build_dc_ppc_from_e_file = None
+    build_dc_ppc_from_network = None
     DC_CTRL_P = 0
     DC_CTRL_V = 1
     DC_CTRL_I = 2
@@ -163,14 +163,8 @@ def load_dc_network_from_e_file(file_name, use_cache: bool = True, run_topo: boo
     from model.dc_array_model import DCPowerNetwork
 
     network = DCPowerNetwork()
-    network.ppc = build_dc_ppc_from_e_file(file_name, use_cache=use_cache, copy_arrays=True)
-    base = network.ppc["base"]
-    network.p_base = float(base["p_base"])
-    network.p_base_kW = float(base["p_base_kW"])
-    network.u_scale = float(base["u_scale"])
-    network.p_scale = float(base["p_scale"])
-    network.i_scale = float(base["i_scale"])
-    network._load_objects_from_ppc(network.ppc)
+    network.read_from_file(file_name, use_cache=use_cache)
+    network.ppc = build_dc_ppc_from_network(network, copy_arrays=True)
     if run_topo:
         network.topo()
     return network
