@@ -4,6 +4,7 @@ import io
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -24,9 +25,270 @@ from ac_lf import ACPowerFlowCalc
 from dc_lf import DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from model.hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
+from model.hybrid_array_model import (
+    ACAC_COLS,
+    ACAC_CONTROL_LABEL,
+    DCAC_COLS,
+    DCAC_CONTROL_LABEL,
+    build_hybrid_ppc_from_e_file,
+)
 
 
 DEFAULT_HYBRID_EFILE = ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e"
+
+
+def _array_device(idx, name=None, **values):
+    return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
+
+
+def _names(ppc, key, prefix, count):
+    values = ppc.get(key)
+    if values is None:
+        return [f"{prefix}_{idx}" for idx in range(count)]
+    return [str(value) for value in values]
+
+
+class _PPCDeviceView:
+    def __init__(self, owner, table_key, name_key, prefix, build_item):
+        self.owner = owner
+        self.table_key = table_key
+        self.name_key = name_key
+        self.prefix = prefix
+        self.build_item = build_item
+
+    def _rows(self):
+        result = getattr(self.owner, "result", None)
+        if isinstance(result, dict) and self.table_key in result:
+            return result[self.table_key]
+        return self.owner.ppc[self.table_key]
+
+    def __len__(self):
+        return int(self.owner.ppc[self.table_key].shape[0])
+
+    def __iter__(self):
+        rows = self._rows()
+        names = _names(self.owner.ppc, self.name_key, self.prefix, rows.shape[0])
+        for pos, row in enumerate(rows):
+            yield self.build_item(row, names[pos])
+
+
+def _build_lf_ac_facade(ac_ppc):
+    """Build only the AC object lists needed for LF result reporting."""
+    from ac_array_model import BRANCH_COLS, BUS_COLS, GEN_COLS, LOAD_COLS, SHUNT_COLS, TRANSFORMER_COLS
+
+    base = ac_ppc["base"]
+    facade = SimpleNamespace(
+        ppc=ac_ppc,
+        result=None,
+        _lf_lightweight=True,
+        p_base=float(base[0]),
+        u_scale=float(base[1]),
+        p_scale=float(base[2]),
+        i_scale=float(base[3]),
+        p_base_kW=float(base[4]),
+        node_dict={},
+        zero_branches=[],
+        switches=[],
+        islands=[],
+        topo=lambda: None,
+        format_assoc=lambda: None,
+    )
+    facade.nodes = _PPCDeviceView(
+        facade,
+        "bus",
+        "bus_name",
+        "bus",
+        lambda row, name: _array_device(
+            row[BUS_COLS["idx"]],
+            name,
+            vbase=float(row[BUS_COLS["vbase"]]),
+            voltage=float(row[BUS_COLS["voltage"]]),
+            angle=float(row[BUS_COLS["angle"]]),
+            run_stat=int(row[BUS_COLS["run_stat"]]),
+            isl=int(row[BUS_COLS["isl"]]),
+            isl_obj=None,
+            is_alive=int(row[BUS_COLS["run_stat"]]) == 1,
+        ),
+    )
+    facade.generators = _PPCDeviceView(
+        facade,
+        "gen",
+        "gen_name",
+        "gen",
+        lambda row, name: _array_device(
+            row[GEN_COLS["idx"]],
+            name,
+            node=int(row[GEN_COLS["node"]]),
+            p_set=float(row[GEN_COLS["p_set"]]),
+            q_set=float(row[GEN_COLS["q_set"]]),
+            v_set=float(row[GEN_COLS["v_set"]]),
+            p=float(row[GEN_COLS["p"]]),
+            q=float(row[GEN_COLS["q"]]),
+            current=float(row[GEN_COLS["current"]]),
+            run_stat=int(row[GEN_COLS["run_stat"]]),
+            is_alive=int(row[GEN_COLS["run_stat"]]) == 1,
+        ),
+    )
+    facade.loads = _PPCDeviceView(
+        facade,
+        "load",
+        "load_name",
+        "load",
+        lambda row, name: _array_device(
+            row[LOAD_COLS["idx"]],
+            name,
+            node=int(row[LOAD_COLS["node"]]),
+            p=float(row[LOAD_COLS["p"]]),
+            q=float(row[LOAD_COLS["q"]]),
+            current=float(row[LOAD_COLS["current"]]),
+            run_stat=int(row[LOAD_COLS["run_stat"]]),
+            is_alive=int(row[LOAD_COLS["run_stat"]]) == 1,
+        ),
+    )
+    facade.shunt_compensators = _PPCDeviceView(
+        facade,
+        "shunt",
+        "shunt_name",
+        "shunt",
+        lambda row, name: _array_device(
+            row[SHUNT_COLS["idx"]],
+            name,
+            node=int(row[SHUNT_COLS["node"]]),
+            p=float(row[SHUNT_COLS["p"]]),
+            q=float(row[SHUNT_COLS["q"]]),
+            current=float(row[SHUNT_COLS["current"]]),
+            run_stat=int(row[SHUNT_COLS["run_stat"]]),
+            is_alive=int(row[SHUNT_COLS["run_stat"]]) == 1,
+        ),
+    )
+    facade.branches = _PPCDeviceView(
+        facade,
+        "branch",
+        "branch_name",
+        "branch",
+        lambda row, name: _array_device(
+            row[BRANCH_COLS["idx"]],
+            name,
+            i_node=int(row[BRANCH_COLS["i_node"]]),
+            j_node=int(row[BRANCH_COLS["j_node"]]),
+            i_p=float(row[BRANCH_COLS["i_p"]]),
+            i_q=float(row[BRANCH_COLS["i_q"]]),
+            i_c=float(row[BRANCH_COLS["i_c"]]),
+            j_p=float(row[BRANCH_COLS["j_p"]]),
+            j_q=float(row[BRANCH_COLS["j_q"]]),
+            j_c=float(row[BRANCH_COLS["j_c"]]),
+            run_stat=int(row[BRANCH_COLS["run_stat"]]),
+            is_alive=int(row[BRANCH_COLS["run_stat"]]) == 1,
+        ),
+    )
+    facade.transformers = _PPCDeviceView(
+        facade,
+        "transformer",
+        "transformer_name",
+        "transformer",
+        lambda row, name: _array_device(
+            row[TRANSFORMER_COLS["idx"]],
+            name,
+            i_node=int(row[TRANSFORMER_COLS["i_node"]]),
+            j_node=int(row[TRANSFORMER_COLS["j_node"]]),
+            i_p=float(row[TRANSFORMER_COLS["i_p"]]),
+            i_q=float(row[TRANSFORMER_COLS["i_q"]]),
+            i_c=float(row[TRANSFORMER_COLS["i_c"]]),
+            j_p=float(row[TRANSFORMER_COLS["j_p"]]),
+            j_q=float(row[TRANSFORMER_COLS["j_q"]]),
+            j_c=float(row[TRANSFORMER_COLS["j_c"]]),
+            run_stat=int(row[TRANSFORMER_COLS["run_stat"]]),
+            is_alive=int(row[TRANSFORMER_COLS["run_stat"]]) == 1,
+        ),
+    )
+    return facade
+
+
+def _build_lf_dc_network(dc_ppc):
+    from model.dc_array_model import DCPowerNetwork
+
+    network = DCPowerNetwork()
+    network.ppc = dc_ppc
+    base = dc_ppc["base"]
+    network.p_base = float(base["p_base"])
+    network.p_base_kW = float(base["p_base_kW"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network._load_objects_from_ppc(dc_ppc)
+    return network
+
+
+def _build_lf_converters(ppc):
+    dcac = [
+        _array_device(
+            row[DCAC_COLS["idx"]],
+            ppc["dcac_name"][pos],
+            ac_node=int(row[DCAC_COLS["ac_node"]]),
+            dc_node=int(row[DCAC_COLS["dc_node"]]),
+            r1=float(row[DCAC_COLS["r1"]]),
+            r2=float(row[DCAC_COLS["r2"]]),
+            control_type=DCAC_CONTROL_LABEL.get(int(row[DCAC_COLS["control_type"]]), "DCV"),
+            p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
+            q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
+            v_ac_set=float(row[DCAC_COLS["v_ac_set"]]),
+            v_dc_set=float(row[DCAC_COLS["v_dc_set"]]),
+            run_stat=int(row[DCAC_COLS["run_stat"]]),
+            dc_p=float(row[DCAC_COLS["dc_p"]]),
+            ac_p=float(row[DCAC_COLS["ac_p"]]),
+            ac_q=float(row[DCAC_COLS["ac_q"]]),
+            dc_i=float(row[DCAC_COLS["dc_i"]]),
+            ac_i=float(row[DCAC_COLS["ac_i"]]),
+            ac_node_obj=None,
+            dc_node_obj=None,
+        )
+        for pos, row in enumerate(ppc["dcac"])
+    ]
+    acac = [
+        _array_device(
+            row[ACAC_COLS["idx"]],
+            ppc["acac_name"][pos],
+            i_node=int(row[ACAC_COLS["i_node"]]),
+            j_node=int(row[ACAC_COLS["j_node"]]),
+            r1=float(row[ACAC_COLS["r1"]]),
+            r2=float(row[ACAC_COLS["r2"]]),
+            control_type=ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
+            p_set=float(row[ACAC_COLS["p_set"]]),
+            i_q_set=float(row[ACAC_COLS["i_q_set"]]),
+            j_q_set=float(row[ACAC_COLS["j_q_set"]]),
+            i_v_set=float(row[ACAC_COLS["i_v_set"]]),
+            j_v_set=float(row[ACAC_COLS["j_v_set"]]),
+            run_stat=int(row[ACAC_COLS["run_stat"]]),
+            i_p=float(row[ACAC_COLS["i_p"]]),
+            i_q=float(row[ACAC_COLS["i_q"]]),
+            j_p=float(row[ACAC_COLS["j_p"]]),
+            j_q=float(row[ACAC_COLS["j_q"]]),
+            i_i=float(row[ACAC_COLS["i_i"]]),
+            j_i=float(row[ACAC_COLS["j_i"]]),
+            i_node_obj=None,
+            j_node_obj=None,
+        )
+        for pos, row in enumerate(ppc["acac"])
+    ]
+    return dcac, acac
+
+
+def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
+    ppc = build_hybrid_ppc_from_e_file(file_name, use_cache=True, copy_arrays=True)
+    ac = _build_lf_ac_facade(ppc["ac"])
+    dc = _build_lf_dc_network(ppc["dc"])
+    dcac, acac = _build_lf_converters(ppc)
+    network = HybridPowerNetwork(ac=ac, dc=dc, dcac_converters=dcac, acac_converters=acac)
+    network.ppc = ppc
+    network._ac_ppc = ppc["ac"]
+    network._dc_ppc = ppc["dc"]
+    base = ppc["base"]
+    network.p_base = float(base[0])
+    network.u_scale = float(base[1])
+    network.p_scale = float(base[2])
+    network.i_scale = float(base[3])
+    network.p_base_kW = float(base[4])
+    return network
 
 
 @dataclass
@@ -784,6 +1046,9 @@ class HybridPowerFlowCalc:
         result = self.ac_calc.result
         if not result:
             return
+        if getattr(self.network.ac, "_lf_lightweight", False):
+            self.network.ac.result = result
+            return
 
         def iter_aligned(devices, rows, idx_col):
             if len(devices) == len(rows) and all(int(dev.idx) == int(row[idx_col]) for dev, row in zip(devices, rows)):
@@ -916,7 +1181,7 @@ def run_hybrid_power_flow(
     parameter_file=DEFAULT_LF_PARAMETER_FILE,
     parameters: Optional[PowerFlowParameters] = None,
 ) -> HybridPowerFlowResult:
-    network = HybridPowerNetwork.read_from_file(file_name)
+    network = _read_lf_network_from_file(file_name)
 
     # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
     # topology diagnostics remain available through HybridPowerNetwork.prepare()

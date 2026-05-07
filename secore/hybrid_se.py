@@ -16,15 +16,8 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
         sys.path.insert(0, str(path))
 
 from ac_array_model import (
-    BRANCH_COLS,
-    BUS_COLS,
-    GEN_COLS,
-    LOAD_COLS,
-    SHUNT_COLS,
     SWITCH_COLS,
-    TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
-    build_ac_ppc_from_e_file,
 )
 from ac_lf import ACPowerFlowCalc, matpower_branch_stamp, matpower_branch_stamp_vectorized
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
@@ -60,7 +53,6 @@ from unit_system import ac_current_base_ka, dc_current_base_ka
 
 DEFAULT_CASE = ROOT_DIR / "data" / "hybrid" / "qinling.e"
 DEFAULT_MEAS = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
-AC_ARRAY_PPC_MIN_BUSES = 1000
 
 
 def _read_measurements_direct(meas_file: Path) -> List[Measurement]:
@@ -272,7 +264,6 @@ class HybridStateEstimator:
             and not network.dcac_converters
             and not network.acac_converters
         )
-        use_array_ppc = pure_ac and len(network.ac.nodes) >= AC_ARRAY_PPC_MIN_BUSES
         calc = HybridPowerFlowCalc(
             network,
             tol=params.power_flow_tol,
@@ -280,9 +271,6 @@ class HybridStateEstimator:
             min_voltage=params.power_flow_min_voltage,
             verbose=False,
         )
-        if use_array_ppc:
-            ppc = build_ac_ppc_from_e_file(e_file, copy_arrays=False, include_device_names=True)
-            calc.ac_calc = ACPowerFlowCalc.from_ppc(ppc, parameters=calc.params, keep_node_objects=True)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
         if calc.ac_calc is not None and getattr(calc.ac_calc, "isl", None) is None:
@@ -3217,12 +3205,6 @@ class HybridStateEstimator:
             dc_phi_start = self.calc.ac_size + dc.N
             full[dc_phi_start : dc_phi_start + dc.N_phi] = phi
         return full
-        if self.calc.ac_calc is not None:
-            ac = self.calc.ac_calc
-            cols.extend(int(ac.n_theta + ac.V_idx[int(pos)]) for pos in ac.V_unknown)
-        if self.calc.dc_calc is not None:
-            cols.extend(int(self.calc.ac_size + idx) for idx in range(self.calc.dc_calc.N))
-        return np.asarray(cols, dtype=np.int32)
 
     def _expand_state_mapped_only(self, x: np.ndarray) -> np.ndarray:
         """Expand mapped state columns without reconstructing zero-branch phi variables.
@@ -3259,99 +3241,19 @@ class HybridStateEstimator:
         self.calc.x = full_x.copy()
         self.calc._write_back(self.calc.x)
         if self.calc.ac_calc is not None and getattr(self.calc.ac_calc, "array_mode", False):
-            self._sync_ac_objects_from_array_result()
+            self._sync_ac_zero_objects_from_array_result()
         for gen, pos in self.dc_v_generator_states:
             gen.p = float(state[pos])
             voltage = float(gen.node_obj.voltage)
             gen.current = gen.p / voltage if abs(voltage) > self.min_current_voltage else 0.0
         self._last_written_state = state.copy()
 
-    def _sync_ac_objects_from_array_result(self) -> None:
-        """Mirror array PPC AC results back to object devices used by fallback paths and output."""
+    def _sync_ac_zero_objects_from_array_result(self) -> None:
+        """Mirror array-mode ideal AC branch results not covered by HybridPowerFlowCalc."""
         ac_calc = self.calc.ac_calc
         result = getattr(ac_calc, "result", None)
         if not result:
             return
-
-        bus = result.get("bus")
-        if bus is not None:
-            bus_names = ac_calc.ppc.get("bus_name")
-            if bus_names is not None:
-                for row_idx in ac_calc.active_bus_rows:
-                    row = int(row_idx)
-                    node = self.ac_node_by_name.get(str(bus_names[row]))
-                    if node is None:
-                        continue
-                    node.voltage = float(bus[row, BUS_COLS["voltage"]])
-                    node.angle = float(bus[row, BUS_COLS["angle"]])
-
-        gen = result.get("gen")
-        gen_names = ac_calc.ppc.get("gen_name")
-        if gen is not None and gen_names is not None:
-            for row_idx in ac_calc.ppc_gen_rows:
-                row = int(row_idx)
-                dev = self.ac_generator_by_name.get(str(gen_names[row]))
-                if dev is None:
-                    continue
-                dev.p = float(gen[row, GEN_COLS["p"]])
-                dev.q = float(gen[row, GEN_COLS["q"]])
-                dev.current = float(gen[row, GEN_COLS["current"]])
-
-        load = result.get("load")
-        load_names = ac_calc.ppc.get("load_name")
-        if load is not None and load_names is not None:
-            for row_idx in ac_calc.ppc_load_rows:
-                row = int(row_idx)
-                dev = self.ac_load_by_name.get(str(load_names[row]))
-                if dev is None:
-                    continue
-                dev.p = float(load[row, LOAD_COLS["p"]])
-                dev.q = float(load[row, LOAD_COLS["q"]])
-                dev.current = float(load[row, LOAD_COLS["current"]])
-
-        shunt = result.get("shunt")
-        shunt_names = ac_calc.ppc.get("shunt_name")
-        if shunt is not None and shunt_names is not None:
-            for row_idx in ac_calc.ppc_shunt_rows:
-                row = int(row_idx)
-                dev = self.network.ac.shunt_compensator_dict.get(int(shunt[row, SHUNT_COLS["idx"]]))
-                if dev is None:
-                    dev = next((item for item in self.network.ac.shunt_compensators if item.name == str(shunt_names[row])), None)
-                if dev is None:
-                    continue
-                dev.p = float(shunt[row, SHUNT_COLS["p"]])
-                dev.q = float(shunt[row, SHUNT_COLS["q"]])
-                dev.current = float(shunt[row, SHUNT_COLS["current"]])
-
-        branch = result.get("branch")
-        branch_names = ac_calc.ppc.get("branch_name")
-        if branch is not None and branch_names is not None:
-            for row_idx in ac_calc.ppc_branch_rows:
-                row = int(row_idx)
-                dev = self.ac_branch_by_name.get(str(branch_names[row]))
-                if dev is None:
-                    continue
-                dev.i_p = float(branch[row, BRANCH_COLS["i_p"]])
-                dev.i_q = float(branch[row, BRANCH_COLS["i_q"]])
-                dev.i_c = float(branch[row, BRANCH_COLS["i_c"]])
-                dev.j_p = float(branch[row, BRANCH_COLS["j_p"]])
-                dev.j_q = float(branch[row, BRANCH_COLS["j_q"]])
-                dev.j_c = float(branch[row, BRANCH_COLS["j_c"]])
-
-        transformer = result.get("transformer")
-        transformer_names = ac_calc.ppc.get("transformer_name")
-        if transformer is not None and transformer_names is not None:
-            for row_idx in ac_calc.ppc_transformer_rows:
-                row = int(row_idx)
-                dev = self.ac_transformer_by_name.get(str(transformer_names[row]))
-                if dev is None:
-                    continue
-                dev.i_p = float(transformer[row, TRANSFORMER_COLS["i_p"]])
-                dev.i_q = float(transformer[row, TRANSFORMER_COLS["i_q"]])
-                dev.i_c = float(transformer[row, TRANSFORMER_COLS["i_c"]])
-                dev.j_p = float(transformer[row, TRANSFORMER_COLS["j_p"]])
-                dev.j_q = float(transformer[row, TRANSFORMER_COLS["j_q"]])
-                dev.j_c = float(transformer[row, TRANSFORMER_COLS["j_c"]])
 
         zero_branch = result.get("zero_branch")
         zero_names = ac_calc.ppc.get("zero_branch_name")
