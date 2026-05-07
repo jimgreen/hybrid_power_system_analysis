@@ -1205,10 +1205,10 @@ class DCPowerFlowCalc:
         return -1
 
 if __name__ == "__main__":
-    from dc_array_model import DCPowerNetwork
+    from model.dc_array_model import DCPowerNetwork
 
     net = DCPowerNetwork()
-    net.read_from_file("../../data/dc/dc_net_30.e")
+    net.read_from_file(ROOT_DIR / "data" / "dc" / "dc_net_30.e")
 
     net.topo()
 
