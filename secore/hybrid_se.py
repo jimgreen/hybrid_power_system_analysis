@@ -5,6 +5,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -15,8 +16,18 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from efile_read import EBook
-from ac_lf import matpower_branch_stamp, matpower_branch_stamp_vectorized
+from ac_array_model import (
+    BRANCH_COLS,
+    BUS_COLS,
+    GEN_COLS,
+    LOAD_COLS,
+    SHUNT_COLS,
+    SWITCH_COLS,
+    TRANSFORMER_COLS,
+    ZERO_BRANCH_COLS,
+    build_ac_ppc_from_e_file,
+)
+from ac_lf import ACPowerFlowCalc, matpower_branch_stamp, matpower_branch_stamp_vectorized
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 from secore.se_math import (
@@ -38,6 +49,7 @@ from unit_system import ac_current_base_ka, dc_current_base_ka
 
 DEFAULT_CASE = ROOT_DIR / "data" / "hybrid" / "qinling.e"
 DEFAULT_MEAS = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+AC_ARRAY_PPC_MIN_BUSES = 1000
 
 
 @dataclass(slots=True)
@@ -90,6 +102,106 @@ class BadDataItem:
     normalized_residual: float
     estimated_value: float
     measured_value: float
+
+
+def _read_measurements_direct(meas_file: Path) -> List[Measurement]:
+    """Read only the <Measurement> block without building EBook row dictionaries."""
+    required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
+    header = None
+    column_index = None
+    standard_header = False
+    idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
+    measurements: List[Measurement] = []
+    append_measurement = measurements.append
+    new_measurement = Measurement.__new__
+    int_cell = int
+    float_cell = float
+    device_type_cache: Dict[str, str] = {}
+    measurement_type_cache: Dict[str, str] = {}
+    in_measurement = False
+
+    with open(meas_file, mode="rt", encoding="utf8") as fp:
+        for line_no, raw_line in enumerate(fp, start=1):
+            first = raw_line[0] if raw_line else ""
+            if not in_measurement:
+                if first == "<" and raw_line.strip() == "<Measurement>":
+                    in_measurement = True
+                continue
+            if first == "@":
+                header = raw_line[1:].split()
+                column_index = {name: idx for idx, name in enumerate(header)}
+                missing = [name for name in required_columns if name not in column_index]
+                if missing:
+                    raise RuntimeError(f"{meas_file} Measurement header is missing columns: {missing}")
+                standard_header = tuple(header[: len(required_columns)]) == required_columns
+                idx_col = column_index["idx"]
+                name_col = column_index["name"]
+                dev_type_col = column_index["dev_type"]
+                dev_name_col = column_index["dev_name"]
+                meas_type_col = column_index["meas_type"]
+                weight_col = column_index["weight"]
+                valid_col = column_index["valid"]
+                value_col = column_index["value"]
+                continue
+            if first == "#":
+                if header is None or column_index is None:
+                    raise RuntimeError(f"{meas_file} Measurement data appears before the header")
+                if standard_header:
+                    row = raw_line[1:].split(maxsplit=7)
+                    if len(row) < len(required_columns):
+                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
+                    idx_text = row[0]
+                    name = row[1]
+                    raw_device_type = row[2]
+                    device_name = row[3]
+                    raw_meas_type = row[4]
+                    weight_text = row[5]
+                    valid_text = row[6]
+                    value_text = row[7]
+                else:
+                    row = raw_line[1:].split(maxsplit=len(header) - 1)
+                    if len(row) < len(header):
+                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
+                    idx_text = row[idx_col]
+                    name = row[name_col]
+                    raw_device_type = row[dev_type_col]
+                    device_name = row[dev_name_col]
+                    raw_meas_type = row[meas_type_col]
+                    weight_text = row[weight_col]
+                    valid_text = row[valid_col]
+                    value_text = row[value_col]
+                device_type = device_type_cache.get(raw_device_type)
+                if device_type is None:
+                    device_type = raw_device_type
+                    device_type_cache[raw_device_type] = device_type
+                meas_type = measurement_type_cache.get(raw_meas_type)
+                if meas_type is None:
+                    meas_type = raw_meas_type.upper()
+                    measurement_type_cache[raw_meas_type] = meas_type
+                meas = new_measurement(Measurement)
+                meas.idx = int_cell(idx_text)
+                meas.name = name
+                meas.device_type = device_type
+                meas.device_name = device_name
+                meas.meas_type = meas_type
+                meas.weight = float_cell(weight_text)
+                meas.valid = valid_text == "1"
+                meas.value = float_cell(value_text)
+                append_measurement(meas)
+                continue
+
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "</Measurement>":
+                break
+            raise SyntaxError(f"Invalid Measurement row at line {line_no} in {meas_file}")
+
+    if not in_measurement:
+        raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
+    if header is None:
+        raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
+    return measurements
 
 
 def _print_iteration_header() -> None:
@@ -297,25 +409,7 @@ class HybridStateEstimator:
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> List[Measurement]:
-        data = EBook(meas_file).to_dict()
-        if "Measurement" not in data:
-            raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
-
-        measurements = []
-        for raw in data["Measurement"]["data"]:
-            measurements.append(
-                Measurement(
-                    idx=int(raw["idx"]),
-                    name=str(raw["name"]),
-                    device_type=str(raw["dev_type"]),
-                    device_name=str(raw["dev_name"]),
-                    meas_type=str(raw["meas_type"]).upper(),
-                    weight=float(raw["weight"]),
-                    valid=bool(int(raw["valid"])),
-                    value=float(raw["value"]),
-                )
-            )
-        return measurements
+        return _read_measurements_direct(meas_file)
 
     @staticmethod
     def _load_case(
@@ -323,7 +417,7 @@ class HybridStateEstimator:
         params: StateEstimationParameters,
     ) -> Tuple[HybridPowerNetwork, HybridPowerFlowCalc, np.ndarray, np.ndarray]:
         """Load a hybrid case and build flat/E-file state seeds for the estimator."""
-        network = HybridPowerNetwork.read_from_file(e_file)
+        network = HybridPowerNetwork.read_from_file(e_file, use_array_ac=False)
         with contextlib.redirect_stdout(io.StringIO()):
             ac_warnings, ac_errors, dc_warnings, dc_errors = network.prepare(verbose=False)
         if ac_errors or dc_errors:
@@ -333,6 +427,13 @@ class HybridStateEstimator:
                 f"ac_warnings={ac_warnings}, dc_warnings={dc_warnings}"
             )
 
+        pure_ac = (
+            bool(network.ac.nodes)
+            and not network.dc.nodes
+            and not network.dcac_converters
+            and not network.acac_converters
+        )
+        use_array_ppc = pure_ac and len(network.ac.nodes) >= AC_ARRAY_PPC_MIN_BUSES
         calc = HybridPowerFlowCalc(
             network,
             tol=params.power_flow_tol,
@@ -340,11 +441,15 @@ class HybridStateEstimator:
             min_voltage=params.power_flow_min_voltage,
             verbose=False,
         )
+        if use_array_ppc:
+            ppc = build_ac_ppc_from_e_file(e_file, copy_arrays=False, include_device_names=True)
+            calc.ac_calc = ACPowerFlowCalc.from_ppc(ppc, parameters=calc.params, keep_node_objects=True)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
+        if use_array_ppc:
+            HybridStateEstimator._attach_array_ac_object_island(calc.ac_calc, network.ac)
         flat_x = calc.x.copy()
         file_x = HybridStateEstimator._file_state_vector(calc)
-        pure_ac = calc.ac_calc is not None and calc.dc_calc is None and calc.N_dcac == 0 and calc.N_acac == 0
         if pure_ac and params.flat_start:
             power_flow_x = file_x
         else:
@@ -358,6 +463,26 @@ class HybridStateEstimator:
             power_flow_x = calc.x.copy()
         calc._write_back(power_flow_x)
         return network, calc, flat_x, power_flow_x
+
+    @staticmethod
+    def _attach_array_ac_object_island(ac_calc: ACPowerFlowCalc, ac_grid) -> None:
+        """Expose object device lists expected by SE while AC math uses array PPC."""
+        ac_calc.isl = SimpleNamespace(
+            nodes=[node for node in ac_grid.nodes if getattr(node, "is_alive", False)],
+            gens=ac_grid.generators,
+            loads=ac_grid.loads,
+            branches=ac_grid.branches,
+            transformers=ac_grid.transformers,
+            shunt_compensators=ac_grid.shunt_compensators,
+            zero_branches=ac_grid.zero_branches,
+            switches=ac_grid.switches,
+            slack_nodes=[
+                node
+                for island in getattr(ac_grid, "islands", [])
+                for node in getattr(island, "slack_nodes", [])
+                if getattr(island, "is_alive", False)
+            ],
+        )
 
     @staticmethod
     def _file_state_vector(calc: HybridPowerFlowCalc) -> np.ndarray:
@@ -3260,11 +3385,123 @@ class HybridStateEstimator:
         full_x = self._expand_state(state)
         self.calc.x = full_x.copy()
         self.calc._write_back(self.calc.x)
+        if self.calc.ac_calc is not None and getattr(self.calc.ac_calc, "array_mode", False):
+            self._sync_ac_objects_from_array_result()
         for gen, pos in self.dc_v_generator_states:
             gen.p = float(state[pos])
             voltage = float(gen.node_obj.voltage)
             gen.current = gen.p / voltage if abs(voltage) > self.min_current_voltage else 0.0
         self._last_written_state = state.copy()
+
+    def _sync_ac_objects_from_array_result(self) -> None:
+        """Mirror array PPC AC results back to object devices used by fallback paths and output."""
+        ac_calc = self.calc.ac_calc
+        result = getattr(ac_calc, "result", None)
+        if not result:
+            return
+
+        bus = result.get("bus")
+        if bus is not None:
+            bus_names = ac_calc.ppc.get("bus_name")
+            if bus_names is not None:
+                for row_idx in ac_calc.active_bus_rows:
+                    row = int(row_idx)
+                    node = self.ac_node_by_name.get(str(bus_names[row]))
+                    if node is None:
+                        continue
+                    node.voltage = float(bus[row, BUS_COLS["voltage"]])
+                    node.angle = float(bus[row, BUS_COLS["angle"]])
+
+        gen = result.get("gen")
+        gen_names = ac_calc.ppc.get("gen_name")
+        if gen is not None and gen_names is not None:
+            for row_idx in ac_calc.ppc_gen_rows:
+                row = int(row_idx)
+                dev = self.ac_generator_by_name.get(str(gen_names[row]))
+                if dev is None:
+                    continue
+                dev.p = float(gen[row, GEN_COLS["p"]])
+                dev.q = float(gen[row, GEN_COLS["q"]])
+                dev.current = float(gen[row, GEN_COLS["current"]])
+
+        load = result.get("load")
+        load_names = ac_calc.ppc.get("load_name")
+        if load is not None and load_names is not None:
+            for row_idx in ac_calc.ppc_load_rows:
+                row = int(row_idx)
+                dev = self.ac_load_by_name.get(str(load_names[row]))
+                if dev is None:
+                    continue
+                dev.p = float(load[row, LOAD_COLS["p"]])
+                dev.q = float(load[row, LOAD_COLS["q"]])
+                dev.current = float(load[row, LOAD_COLS["current"]])
+
+        shunt = result.get("shunt")
+        shunt_names = ac_calc.ppc.get("shunt_name")
+        if shunt is not None and shunt_names is not None:
+            for row_idx in ac_calc.ppc_shunt_rows:
+                row = int(row_idx)
+                dev = self.network.ac.shunt_compensator_dict.get(int(shunt[row, SHUNT_COLS["idx"]]))
+                if dev is None:
+                    dev = next((item for item in self.network.ac.shunt_compensators if item.name == str(shunt_names[row])), None)
+                if dev is None:
+                    continue
+                dev.p = float(shunt[row, SHUNT_COLS["p"]])
+                dev.q = float(shunt[row, SHUNT_COLS["q"]])
+                dev.current = float(shunt[row, SHUNT_COLS["current"]])
+
+        branch = result.get("branch")
+        branch_names = ac_calc.ppc.get("branch_name")
+        if branch is not None and branch_names is not None:
+            for row_idx in ac_calc.ppc_branch_rows:
+                row = int(row_idx)
+                dev = self.ac_branch_by_name.get(str(branch_names[row]))
+                if dev is None:
+                    continue
+                dev.i_p = float(branch[row, BRANCH_COLS["i_p"]])
+                dev.i_q = float(branch[row, BRANCH_COLS["i_q"]])
+                dev.i_c = float(branch[row, BRANCH_COLS["i_c"]])
+                dev.j_p = float(branch[row, BRANCH_COLS["j_p"]])
+                dev.j_q = float(branch[row, BRANCH_COLS["j_q"]])
+                dev.j_c = float(branch[row, BRANCH_COLS["j_c"]])
+
+        transformer = result.get("transformer")
+        transformer_names = ac_calc.ppc.get("transformer_name")
+        if transformer is not None and transformer_names is not None:
+            for row_idx in ac_calc.ppc_transformer_rows:
+                row = int(row_idx)
+                dev = self.ac_transformer_by_name.get(str(transformer_names[row]))
+                if dev is None:
+                    continue
+                dev.i_p = float(transformer[row, TRANSFORMER_COLS["i_p"]])
+                dev.i_q = float(transformer[row, TRANSFORMER_COLS["i_q"]])
+                dev.i_c = float(transformer[row, TRANSFORMER_COLS["i_c"]])
+                dev.j_p = float(transformer[row, TRANSFORMER_COLS["j_p"]])
+                dev.j_q = float(transformer[row, TRANSFORMER_COLS["j_q"]])
+                dev.j_c = float(transformer[row, TRANSFORMER_COLS["j_c"]])
+
+        zero_branch = result.get("zero_branch")
+        zero_names = ac_calc.ppc.get("zero_branch_name")
+        if zero_branch is not None and zero_names is not None:
+            for row_idx in np.nonzero(zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] == 1)[0]:
+                dev = self.ac_zero_branch_by_name.get(str(zero_names[int(row_idx)]))
+                if dev is None:
+                    continue
+                dev.p = float(zero_branch[row_idx, ZERO_BRANCH_COLS["p"]])
+                dev.q = float(zero_branch[row_idx, ZERO_BRANCH_COLS["q"]])
+                dev.current = float(zero_branch[row_idx, ZERO_BRANCH_COLS["current"]])
+
+        switch = result.get("switch")
+        switch_names = ac_calc.ppc.get("switch_name")
+        if switch is not None and switch_names is not None:
+            mask = (switch[:, SWITCH_COLS["run_stat"]] == 1) & (switch[:, SWITCH_COLS["status"]] == 1)
+            for row_idx in np.nonzero(mask)[0]:
+                dev = self.ac_switch_by_name.get(str(switch_names[int(row_idx)]))
+                if dev is None:
+                    continue
+                dev.p = float(switch[row_idx, SWITCH_COLS["p"]])
+                dev.q = float(switch[row_idx, SWITCH_COLS["q"]])
+                dev.current = float(switch[row_idx, SWITCH_COLS["current"]])
 
     @staticmethod
     def _safe_current(p: float, q_or_v: float, voltage: Optional[float] = None) -> float:

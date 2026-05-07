@@ -4,6 +4,7 @@ import io
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -26,6 +27,243 @@ from unit_system import normalize_model_named_units
 
 DEFAULT_HYBRID_EFILE = ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e"
 ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
+_PURE_AC_EXCLUDED_TAGS = (
+    "<DCNode>",
+    "<DCBranch>",
+    "<DCLoad>",
+    "<DCGenerator>",
+    "<DCShuntCompensator>",
+    "<DCZeroBranch>",
+    "<DCSwitch>",
+    "<DCDCConverter>",
+    "<DCACConverter>",
+    "<ACACConverter>",
+)
+
+
+class _FastDevice:
+    """Small hashable attribute container used by the AC-only array fast path."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _is_pure_ac_file(file_name) -> bool:
+    text = Path(file_name).read_text(encoding="utf-8")
+    return "<ACNode>" in text and not any(tag in text for tag in _PURE_AC_EXCLUDED_TAGS)
+
+
+def _fast_ac_network_from_ppc(ppc) -> "HybridACGrid":
+    from ac_array_model import (
+        BRANCH_COLS,
+        BUS_COLS,
+        GEN_COLS,
+        LOAD_COLS,
+        SHUNT_COLS,
+        SWITCH_COLS,
+        TRANSFORMER_COLS,
+        ZERO_BRANCH_COLS,
+        CTRL_P,
+        CTRL_PQ,
+        CTRL_PV,
+        CTRL_SLACK,
+        SHUNT_B,
+        SHUNT_Q,
+        SHUNT_V,
+        SHUNT_Z,
+    )
+
+    ctrl_name = {
+        CTRL_PQ: "PQ",
+        CTRL_P: "P",
+        CTRL_PV: "PV",
+        CTRL_SLACK: "V",
+    }
+    shunt_ctrl_name = {
+        SHUNT_Q: "Q",
+        SHUNT_V: "V",
+        SHUNT_B: "B",
+        SHUNT_Z: "Z",
+    }
+
+    def names(key, fallback_prefix, count):
+        values = ppc.get(key)
+        if values is None:
+            return [f"{fallback_prefix}_{idx}" for idx in range(count)]
+        return [str(value) for value in values]
+
+    bus_names = names("bus_name", "bus", ppc["bus"].shape[0])
+    branch_names = names("branch_name", "branch", ppc["branch"].shape[0])
+    transformer_names = names("transformer_name", "transformer", ppc["transformer"].shape[0])
+    gen_names = names("gen_name", "gen", ppc["gen"].shape[0])
+    load_names = names("load_name", "load", ppc["load"].shape[0])
+    shunt_names = names("shunt_name", "shunt", ppc["shunt"].shape[0])
+    zero_branch_names = names("zero_branch_name", "zero_branch", ppc["zero_branch"].shape[0])
+    switch_names = names("switch_name", "switch", ppc["switch"].shape[0])
+
+    nodes = [
+        _FastDevice(
+            idx=int(row[BUS_COLS["idx"]]),
+            name=bus_names[pos],
+            vbase=float(row[BUS_COLS["vbase"]]),
+            voltage=float(row[BUS_COLS["voltage"]]),
+            angle=float(row[BUS_COLS["angle"]]),
+            isl=int(row[BUS_COLS["isl"]]),
+            run_stat=int(row[BUS_COLS["run_stat"]]),
+            v_gens=[],
+            is_alive=False,
+            isl_obj=None,
+        )
+        for pos, row in enumerate(ppc["bus"])
+    ]
+    branches = [
+        _FastDevice(
+            idx=int(row[BRANCH_COLS["idx"]]),
+            name=branch_names[pos],
+            i_node=int(row[BRANCH_COLS["i_node"]]),
+            j_node=int(row[BRANCH_COLS["j_node"]]),
+            r=float(row[BRANCH_COLS["r"]]),
+            x=float(row[BRANCH_COLS["x"]]),
+            b=float(row[BRANCH_COLS["b"]]),
+            run_stat=int(row[BRANCH_COLS["run_stat"]]),
+            i_p=0.0,
+            i_q=0.0,
+            i_c=0.0,
+            j_p=0.0,
+            j_q=0.0,
+            j_c=0.0,
+            i_node_obj=None,
+            j_node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["branch"])
+    ]
+    transformers = [
+        _FastDevice(
+            idx=int(row[TRANSFORMER_COLS["idx"]]),
+            name=transformer_names[pos],
+            i_node=int(row[TRANSFORMER_COLS["i_node"]]),
+            j_node=int(row[TRANSFORMER_COLS["j_node"]]),
+            r=float(row[TRANSFORMER_COLS["r"]]),
+            x=float(row[TRANSFORMER_COLS["x"]]),
+            b=float(row[TRANSFORMER_COLS["b"]]),
+            tap=float(row[TRANSFORMER_COLS["tap"]]),
+            shift=float(row[TRANSFORMER_COLS["shift"]]),
+            run_stat=int(row[TRANSFORMER_COLS["run_stat"]]),
+            i_p=0.0,
+            i_q=0.0,
+            i_c=0.0,
+            j_p=0.0,
+            j_q=0.0,
+            j_c=0.0,
+            i_node_obj=None,
+            j_node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["transformer"])
+    ]
+    generators = [
+        _FastDevice(
+            idx=int(row[GEN_COLS["idx"]]),
+            name=gen_names[pos],
+            node=int(row[GEN_COLS["node"]]),
+            control_type=ctrl_name.get(int(row[GEN_COLS["control_type"]]), "PQ"),
+            p_set=float(row[GEN_COLS["p_set"]]),
+            q_set=float(row[GEN_COLS["q_set"]]),
+            v_set=float(row[GEN_COLS["v_set"]]),
+            alpha=float(row[GEN_COLS["alpha"]]),
+            run_stat=int(row[GEN_COLS["run_stat"]]),
+            p=float(row[GEN_COLS["p"]]),
+            q=float(row[GEN_COLS["q"]]),
+            current=float(row[GEN_COLS["current"]]),
+            node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["gen"])
+    ]
+    loads = [
+        _FastDevice(
+            idx=int(row[LOAD_COLS["idx"]]),
+            name=load_names[pos],
+            node=int(row[LOAD_COLS["node"]]),
+            pv0=float(row[LOAD_COLS["pv0"]]),
+            pv1=float(row[LOAD_COLS["pv1"]]),
+            pv2=float(row[LOAD_COLS["pv2"]]),
+            qv0=float(row[LOAD_COLS["qv0"]]),
+            qv1=float(row[LOAD_COLS["qv1"]]),
+            qv2=float(row[LOAD_COLS["qv2"]]),
+            run_stat=int(row[LOAD_COLS["run_stat"]]),
+            p=float(row[LOAD_COLS["p"]]),
+            q=float(row[LOAD_COLS["q"]]),
+            current=float(row[LOAD_COLS["current"]]),
+            node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["load"])
+    ]
+    shunts = [
+        _FastDevice(
+            idx=int(row[SHUNT_COLS["idx"]]),
+            name=shunt_names[pos],
+            node=int(row[SHUNT_COLS["node"]]),
+            control_type=shunt_ctrl_name.get(int(row[SHUNT_COLS["control_type"]]), "Q"),
+            q_set=float(row[SHUNT_COLS["q_set"]]),
+            g_set=float(row[SHUNT_COLS["g_set"]]),
+            b_set=float(row[SHUNT_COLS["b_set"]]),
+            v_set=float(row[SHUNT_COLS["v_set"]]),
+            run_stat=int(row[SHUNT_COLS["run_stat"]]),
+            p=float(row[SHUNT_COLS["p"]]),
+            q=float(row[SHUNT_COLS["q"]]),
+            current=float(row[SHUNT_COLS["current"]]),
+            node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["shunt"])
+    ]
+    zero_branches = [
+        _FastDevice(
+            idx=int(row[ZERO_BRANCH_COLS["idx"]]),
+            name=zero_branch_names[pos],
+            i_node=int(row[ZERO_BRANCH_COLS["i_node"]]),
+            j_node=int(row[ZERO_BRANCH_COLS["j_node"]]),
+            run_stat=int(row[ZERO_BRANCH_COLS["run_stat"]]),
+            p=float(row[ZERO_BRANCH_COLS["p"]]),
+            q=float(row[ZERO_BRANCH_COLS["q"]]),
+            current=float(row[ZERO_BRANCH_COLS["current"]]),
+            i_node_obj=None,
+            j_node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["zero_branch"])
+    ]
+    switches = [
+        _FastDevice(
+            idx=int(row[SWITCH_COLS["idx"]]),
+            name=switch_names[pos],
+            i_node=int(row[SWITCH_COLS["i_node"]]),
+            j_node=int(row[SWITCH_COLS["j_node"]]),
+            status=int(row[SWITCH_COLS["status"]]),
+            run_stat=int(row[SWITCH_COLS["run_stat"]]),
+            p=float(row[SWITCH_COLS["p"]]),
+            q=float(row[SWITCH_COLS["q"]]),
+            current=float(row[SWITCH_COLS["current"]]),
+            i_node_obj=None,
+            j_node_obj=None,
+            is_alive=False,
+        )
+        for pos, row in enumerate(ppc["switch"])
+    ]
+    model = SimpleNamespace(
+        ACNode=nodes,
+        ACBranch=branches,
+        ACTransformer=transformers,
+        ACGenerator=generators,
+        ACLoad=loads,
+        ACShuntCompensator=shunts,
+        ACZeroBranch=zero_branches,
+        ACSwitch=switches,
+    )
+    return HybridACGrid(model)
 
 
 class _ACIsland:
@@ -733,8 +971,27 @@ class HybridPowerNetwork:
     hybrid_islands: List[HybridIsland] = field(default_factory=list)
 
     @classmethod
-    def read_from_file(cls, file_name) -> "HybridPowerNetwork":
+    def read_from_file(cls, file_name, *, use_array_ac: bool = True) -> "HybridPowerNetwork":
         path = str(file_name)
+        if use_array_ac and _is_pure_ac_file(path):
+            from ac_array_model import build_ac_ppc_from_e_file
+
+            ppc = build_ac_ppc_from_e_file(path, use_cache=True, copy_arrays=False)
+            network = cls(
+                ac=_fast_ac_network_from_ppc(ppc),
+                dc=HybridDCGrid(SimpleNamespace(DCNode=[], DCBranch=[], DCGenerator=[], DCLoad=[], DCShuntCompensator=[], DCZeroBranch=[], DCSwitch=[], DCDCConverter=[], DCACConverter=[], ACACConverter=[])),
+                dcac_converters=[],
+                acac_converters=[],
+            )
+            network._ac_ppc = ppc
+            network._fast_ac_only = True
+            network.p_base = float(ppc["base"][0])
+            network.p_base_kW = float(ppc["base"][4])
+            network.u_scale = float(ppc["base"][1])
+            network.p_scale = float(ppc["base"][2])
+            network.i_scale = float(ppc["base"][3])
+            return network
+
         model = efile_factory_from_file_cached(path)
         normalize_model_named_units(model)
         network = cls(
@@ -748,6 +1005,7 @@ class HybridPowerNetwork:
         network.u_scale = float(model.u_scale)
         network.p_scale = float(model.p_scale)
         network.i_scale = float(model.i_scale)
+        network._fast_ac_only = False
         return network
 
     @property
@@ -934,6 +1192,8 @@ class HybridPowerNetwork:
 
     def prepare(self, verbose: bool = True) -> Tuple[List[str], List[str], List[str], List[str]]:
         """Prepare topology and return AC/DC warnings and errors without running Newton."""
+        if getattr(self, "_fast_ac_only", False):
+            return [], [], [], []
         self.topo()
         if verbose and self.ac.nodes:
             self.ac.print_isl_info()
@@ -1076,7 +1336,12 @@ class HybridPowerFlowCalc:
         self.verbose = verbose
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
-        self.ac_calc = ACPowerFlowCalc(network.ac, parameters=self.params) if self.has_ac else None
+        self._ac_ppc_fast_path = bool(getattr(network, "_fast_ac_only", False) and hasattr(network, "_ac_ppc"))
+        self.ac_calc = (
+            ACPowerFlowCalc.from_ppc(network._ac_ppc, parameters=self.params)
+            if self._ac_ppc_fast_path
+            else ACPowerFlowCalc(network.ac, parameters=self.params) if self.has_ac else None
+        )
         self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params) if self.has_dc else None
         self.converged = False
         self.iterations = 0
@@ -1668,6 +1933,8 @@ class HybridPowerFlowCalc:
         """Execute unified Newton iterations over the full hybrid state vector."""
         if self.x.size == 0:
             self.prepare()
+        if self._can_delegate_to_ac_solver():
+            return self._run_ac_only()
 
         self.converged = False
         x = self.x.copy()
@@ -1708,6 +1975,97 @@ class HybridPowerFlowCalc:
         self.x = x
         self._write_back(x)
         return -1
+
+    def _can_delegate_to_ac_solver(self) -> bool:
+        """Return True when the hybrid wrapper contains only an uncoupled AC network."""
+        return (
+            self.ac_calc is not None
+            and self.dc_calc is None
+            and self.N_dcac == 0
+            and self.N_acac == 0
+        )
+
+    def _run_ac_only(self) -> int:
+        """Use the optimized AC load-flow loop for pure AC cases."""
+        rc = _run_with_optional_output(self.verbose, self.ac_calc.run)
+        self.converged = bool(self.ac_calc.converged)
+        self.iterations = int(self.ac_calc.iterations)
+        self.normF = float(self.ac_calc.normF)
+        self.x = self.ac_calc.x.copy()
+        self.total_vars = int(self.ac_calc.total_vars)
+        self.total_eq = int(self.ac_calc.total_eq)
+        self.last_jacobian_shape = (self.total_eq, self.total_vars)
+        if self._ac_ppc_fast_path:
+            self._write_ac_ppc_result_to_network()
+        return rc
+
+    def _write_ac_ppc_result_to_network(self) -> None:
+        """Copy array-mode AC results back to the hybrid AC object facade."""
+        from ac_array_model import BRANCH_COLS, BUS_COLS, GEN_COLS, LOAD_COLS, SHUNT_COLS, TRANSFORMER_COLS
+
+        result = self.ac_calc.result
+        if not result:
+            return
+
+        node_by_idx = {int(node.idx): node for node in self.network.ac.nodes}
+        for row in result["bus"]:
+            node = node_by_idx.get(int(row[BUS_COLS["idx"]]))
+            if node is not None:
+                node.voltage = float(row[BUS_COLS["voltage"]])
+                node.angle = float(row[BUS_COLS["angle"]])
+                node.isl = int(row[BUS_COLS["isl"]])
+                node.is_alive = int(row[BUS_COLS["run_stat"]]) == 1
+
+        gen_by_idx = {int(gen.idx): gen for gen in self.network.ac.generators}
+        for row in result["gen"]:
+            gen = gen_by_idx.get(int(row[GEN_COLS["idx"]]))
+            if gen is not None:
+                gen.p = float(row[GEN_COLS["p"]])
+                gen.q = float(row[GEN_COLS["q"]])
+                gen.current = float(row[GEN_COLS["current"]])
+                gen.is_alive = int(row[GEN_COLS["run_stat"]]) == 1
+
+        load_by_idx = {int(load.idx): load for load in self.network.ac.loads}
+        for row in result["load"]:
+            load = load_by_idx.get(int(row[LOAD_COLS["idx"]]))
+            if load is not None:
+                load.p = float(row[LOAD_COLS["p"]])
+                load.q = float(row[LOAD_COLS["q"]])
+                load.current = float(row[LOAD_COLS["current"]])
+                load.is_alive = int(row[LOAD_COLS["run_stat"]]) == 1
+
+        shunt_by_idx = {int(shunt.idx): shunt for shunt in self.network.ac.shunt_compensators}
+        for row in result["shunt"]:
+            shunt = shunt_by_idx.get(int(row[SHUNT_COLS["idx"]]))
+            if shunt is not None:
+                shunt.p = float(row[SHUNT_COLS["p"]])
+                shunt.q = float(row[SHUNT_COLS["q"]])
+                shunt.current = float(row[SHUNT_COLS["current"]])
+                shunt.is_alive = int(row[SHUNT_COLS["run_stat"]]) == 1
+
+        branch_by_idx = {int(branch.idx): branch for branch in self.network.ac.branches}
+        for row in result["branch"]:
+            branch = branch_by_idx.get(int(row[BRANCH_COLS["idx"]]))
+            if branch is not None:
+                branch.i_p = float(row[BRANCH_COLS["i_p"]])
+                branch.i_q = float(row[BRANCH_COLS["i_q"]])
+                branch.i_c = float(row[BRANCH_COLS["i_c"]])
+                branch.j_p = float(row[BRANCH_COLS["j_p"]])
+                branch.j_q = float(row[BRANCH_COLS["j_q"]])
+                branch.j_c = float(row[BRANCH_COLS["j_c"]])
+                branch.is_alive = int(row[BRANCH_COLS["run_stat"]]) == 1
+
+        transformer_by_idx = {int(transformer.idx): transformer for transformer in self.network.ac.transformers}
+        for row in result["transformer"]:
+            transformer = transformer_by_idx.get(int(row[TRANSFORMER_COLS["idx"]]))
+            if transformer is not None:
+                transformer.i_p = float(row[TRANSFORMER_COLS["i_p"]])
+                transformer.i_q = float(row[TRANSFORMER_COLS["i_q"]])
+                transformer.i_c = float(row[TRANSFORMER_COLS["i_c"]])
+                transformer.j_p = float(row[TRANSFORMER_COLS["j_p"]])
+                transformer.j_q = float(row[TRANSFORMER_COLS["j_q"]])
+                transformer.j_c = float(row[TRANSFORMER_COLS["j_c"]])
+                transformer.is_alive = int(row[TRANSFORMER_COLS["run_stat"]]) == 1
 
     def _write_back(self, x):
         """Write final global state back into AC, DC and converter model objects."""
