@@ -53,6 +53,26 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertTrue(calc.converged)
         self.assertEqual("not-installed-solver", calc.linear_solver)
 
+    def test_dc_solver_prepare_uses_array_model_fast_path(self):
+        import numpy as np
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import DCPowerNetwork
+
+        network = DCPowerNetwork()
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.topo()
+        calc = DCPowerFlowCalc(network)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            G, x = calc.prepare()
+
+        self.assertTrue(calc.array_mode)
+        self.assertEqual((30, 30), G.shape)
+        self.assertEqual(70, x.size)
+        np.testing.assert_array_equal(calc.branch_i[:3], np.asarray([0, 1, 2], dtype=np.int32))
+        np.testing.assert_array_equal(calc.branch_j[:3], np.asarray([1, 2, 3], dtype=np.int32))
+        self.assertEqual(9, calc.N_dcdc)
+
     def test_run_reuses_combined_dc_newton_system_builder(self):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import DCPowerNetwork

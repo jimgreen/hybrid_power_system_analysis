@@ -112,6 +112,25 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
+try:
+    from model.dc_array_model import (
+        BRANCH_COLS as DC_BRANCH_COLS,
+        BUS_COLS as DC_BUS_COLS,
+        CTRL_I as DC_CTRL_I,
+        CTRL_P as DC_CTRL_P,
+        CTRL_V as DC_CTRL_V,
+        DCDC_COLS as DC_DCDC_COLS,
+        GEN_COLS as DC_GEN_COLS,
+        LOAD_COLS as DC_LOAD_COLS,
+        SWITCH_COLS as DC_SWITCH_COLS,
+        ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    )
+except Exception:
+    DC_BRANCH_COLS = DC_BUS_COLS = DC_DCDC_COLS = DC_GEN_COLS = DC_LOAD_COLS = None
+    DC_SWITCH_COLS = DC_ZERO_BRANCH_COLS = None
+    DC_CTRL_P = 0
+    DC_CTRL_V = 1
+    DC_CTRL_I = 2
 
 
 _OPTIONAL_SPARSE_SOLVERS = {}
@@ -203,6 +222,8 @@ class DCPowerFlowCalc:
         linear_solver: str = "scipy",
     ):
         self.model = model
+        self.ppc = getattr(model, "ppc", None)
+        self.array_mode = isinstance(self.ppc, dict) and self.ppc.get("format") == "dc_ppc_v1"
         self.params = parameters or load_lf_parameters(parameter_file)
         self.runtime_params = self.params
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
@@ -210,6 +231,27 @@ class DCPowerFlowCalc:
         self.iterations = 0
         self.normF = np.inf
         self.verbose = False
+
+    def _alive_node_lookup_array(self):
+        """Return a dense node-id to active solver-position lookup when possible."""
+        if self.alive_node_ids.size == 0:
+            return np.array([], dtype=np.int32)
+        if np.any(self.alive_node_ids < 0):
+            return None
+        max_node_id = int(np.max(self.alive_node_ids))
+        lookup = np.full(max_node_id + 1, -1, dtype=np.int32)
+        lookup[self.alive_node_ids.astype(np.int64)] = np.arange(self.N, dtype=np.int32)
+        return lookup
+
+    @staticmethod
+    def _map_nodes_with_lookup(node_ids, lookup):
+        node_ids = np.asarray(node_ids, dtype=np.int64)
+        mapped = np.full(node_ids.shape, -1, dtype=np.int32)
+        if lookup is None or lookup.size == 0:
+            return mapped
+        valid = (node_ids >= 0) & (node_ids < lookup.size)
+        mapped[valid] = lookup[node_ids[valid]]
+        return mapped
 
     def prepare(self):
         """
@@ -231,58 +273,135 @@ class DCPowerFlowCalc:
         self.alive_node_dict = {node.idx: idx for idx, node in enumerate(self.alive_nodes)}
         self.alive_node_ids = np.asarray([node.idx for node in self.alive_nodes], dtype=np.int32)
 
-        # ---------- 1. 数据预处理 ----------
-        self.alive_branch_tuple = [
-            (idx, self.alive_node_dict[br.i_node], self.alive_node_dict[br.j_node], float(br.r))
-            for idx, br in enumerate(self.model.branches)
-            if br.is_alive and br.i_node in self.alive_node_dict and br.j_node in self.alive_node_dict
-        ]
-        self.alive_loads = [
-            (load, self.alive_node_dict[load.node])
-            for load in self.model.loads
-            if load.is_alive and load.node in self.alive_node_dict
-        ]
-        self.alive_generators = [
-            (gen, self.alive_node_dict[gen.node])
-            for gen in self.model.generators
-            if gen.is_alive and gen.node in self.alive_node_dict
-        ]
-
         self.P_const = np.zeros(self.N, dtype=np.float64)   # 注入为正：P型发电机 - P型负荷
         self.I_shunt = np.zeros(self.N, dtype=np.float64)   # 消耗为正：负荷电流 - 发电电流
         self.slack_gen_info = {}
+        node_lookup = self._alive_node_lookup_array() if self.array_mode else None
 
-        # V型发电机提供电压参考；P/I型发电机进入节点功率方程。
-        for gen, node in self.alive_generators:
-            if gen.control_type == 'V':
-                self.slack_gen_info.setdefault(node, []).append(gen)
-            elif gen.control_type == 'P':
-                self.P_const[node] += gen.p_set
-            elif gen.control_type == 'I':
-                self.I_shunt[node] -= gen.i_set
+        # ---------- 1. 数据预处理 ----------
+        if self.array_mode:
+            ppc = self.ppc
+
+            branch = ppc["branch"]
+            if branch.size:
+                branch_i_all = self._map_nodes_with_lookup(branch[:, DC_BRANCH_COLS["i_node"]], node_lookup)
+                branch_j_all = self._map_nodes_with_lookup(branch[:, DC_BRANCH_COLS["j_node"]], node_lookup)
+                branch_mask = (
+                    (branch[:, DC_BRANCH_COLS["run_stat"]] == 1)
+                    & (branch_i_all >= 0)
+                    & (branch_j_all >= 0)
+                )
+                self.branch_idx = np.nonzero(branch_mask)[0].astype(np.int32)
+                self.branch_i = branch_i_all[branch_mask].astype(np.int32, copy=False)
+                self.branch_j = branch_j_all[branch_mask].astype(np.int32, copy=False)
+                self.branch_r = branch[branch_mask, DC_BRANCH_COLS["r"]].astype(np.float64, copy=False)
             else:
-                raise ValueError(f"未知发电机控制类型: {gen.control_type}")
+                branch_mask = np.array([], dtype=bool)
+                self.branch_idx = self.branch_i = self.branch_j = np.array([], dtype=np.int32)
+                self.branch_r = np.array([], dtype=np.float64)
+            if np.any(self.branch_r <= 0.0):
+                bad = int(np.where(self.branch_r <= 0.0)[0][0])
+                raise ValueError(f"支路电阻必须为正数: r={self.branch_r[bad]}")
+            self._lf_branch_devices = [self.model.branches[int(idx)] for idx in self.branch_idx]
+            self._lf_inactive_branch_devices = [
+                self.model.branches[int(idx)] for idx in np.nonzero(~branch_mask)[0]
+            ]
 
-        load_nodes = []
-        load_g = []
-        for ld, node in self.alive_loads:
-            self.P_const[node] -= ld.pv0
-            self.I_shunt[node] += ld.pv1
-            if ld.pv2 != 0.0:
-                load_nodes.append(node)
-                load_g.append(ld.pv2)
+            load = ppc["load"]
+            if load.size:
+                load_pos_all = self._map_nodes_with_lookup(load[:, DC_LOAD_COLS["node"]], node_lookup)
+                load_mask = (load[:, DC_LOAD_COLS["run_stat"]] == 1) & (load_pos_all >= 0)
+                load_pos = load_pos_all[load_mask]
+                load_pv0 = load[load_mask, DC_LOAD_COLS["pv0"]].astype(np.float64, copy=False)
+                load_pv1 = load[load_mask, DC_LOAD_COLS["pv1"]].astype(np.float64, copy=False)
+                load_pv2 = load[load_mask, DC_LOAD_COLS["pv2"]].astype(np.float64, copy=False)
+                np.add.at(self.P_const, load_pos, -load_pv0)
+                np.add.at(self.I_shunt, load_pos, load_pv1)
+                nz_load = load_pv2 != 0.0
+                load_nodes_arr = load_pos[nz_load].astype(np.int32, copy=False)
+                load_g_arr = load_pv2[nz_load]
+            else:
+                load_nodes_arr = np.array([], dtype=np.int32)
+                load_g_arr = np.array([], dtype=np.float64)
+
+            gen = ppc["gen"]
+            if gen.size:
+                gen_pos_all = self._map_nodes_with_lookup(gen[:, DC_GEN_COLS["node"]], node_lookup)
+                gen_mask = (gen[:, DC_GEN_COLS["run_stat"]] == 1) & (gen_pos_all >= 0)
+                gen_pos = gen_pos_all[gen_mask]
+                gen_active = gen[gen_mask]
+                gen_ctrl = gen_active[:, DC_GEN_COLS["control_type"]].astype(np.int8, copy=False)
+                gen_rows = np.nonzero(gen_mask)[0]
+                p_mask = gen_ctrl == DC_CTRL_P
+                i_mask = gen_ctrl == DC_CTRL_I
+                v_mask = gen_ctrl == DC_CTRL_V
+                if np.any(p_mask):
+                    np.add.at(self.P_const, gen_pos[p_mask], gen_active[p_mask, DC_GEN_COLS["p_set"]])
+                if np.any(i_mask):
+                    np.add.at(self.I_shunt, gen_pos[i_mask], -gen_active[i_mask, DC_GEN_COLS["i_set"]])
+                if np.any(v_mask):
+                    for row_idx, node in zip(gen_rows[v_mask], gen_pos[v_mask]):
+                        self.slack_gen_info.setdefault(int(node), []).append(self.model.generators[int(row_idx)])
+                bad_ctrl = ~(p_mask | i_mask | v_mask)
+                if np.any(bad_ctrl):
+                    raise ValueError(f"未知发电机控制类型: {gen_ctrl[int(np.where(bad_ctrl)[0][0])]}")
+            self.alive_loads = []
+            self.alive_generators = []
+        else:
+            self.alive_branch_tuple = [
+                (idx, self.alive_node_dict[br.i_node], self.alive_node_dict[br.j_node], float(br.r))
+                for idx, br in enumerate(self.model.branches)
+                if br.is_alive and br.i_node in self.alive_node_dict and br.j_node in self.alive_node_dict
+            ]
+            self.alive_loads = [
+                (load, self.alive_node_dict[load.node])
+                for load in self.model.loads
+                if load.is_alive and load.node in self.alive_node_dict
+            ]
+            self.alive_generators = [
+                (gen, self.alive_node_dict[gen.node])
+                for gen in self.model.generators
+                if gen.is_alive and gen.node in self.alive_node_dict
+            ]
+
+            # V型发电机提供电压参考；P/I型发电机进入节点功率方程。
+            for gen, node in self.alive_generators:
+                if gen.control_type == 'V':
+                    self.slack_gen_info.setdefault(node, []).append(gen)
+                elif gen.control_type == 'P':
+                    self.P_const[node] += gen.p_set
+                elif gen.control_type == 'I':
+                    self.I_shunt[node] -= gen.i_set
+                else:
+                    raise ValueError(f"未知发电机控制类型: {gen.control_type}")
+
+            load_nodes = []
+            load_g = []
+            for ld, node in self.alive_loads:
+                self.P_const[node] -= ld.pv0
+                self.I_shunt[node] += ld.pv1
+                if ld.pv2 != 0.0:
+                    load_nodes.append(node)
+                    load_g.append(ld.pv2)
+            load_nodes_arr = np.asarray(load_nodes, dtype=np.int32) if load_nodes else np.array([], dtype=np.int32)
+            load_g_arr = np.asarray(load_g, dtype=np.float64) if load_nodes else np.array([], dtype=np.float64)
 
         # G 矩阵只包含线性电导；恒功率、恒电流和二次负荷项分开放入方程。
         rows_parts = []
         cols_parts = []
         data_parts = []
-        if load_nodes:
-            load_nodes_arr = np.asarray(load_nodes, dtype=np.int32)
+        if load_nodes_arr.size:
             rows_parts.append(load_nodes_arr)
             cols_parts.append(load_nodes_arr)
-            data_parts.append(np.asarray(load_g, dtype=np.float64))
+            data_parts.append(load_g_arr)
 
-        if self.alive_branch_tuple:
+        if self.array_mode:
+            if self.branch_idx.size:
+                branch_g = 1.0 / self.branch_r
+                rows_parts.append(np.concatenate((self.branch_i, self.branch_j, self.branch_i, self.branch_j)))
+                cols_parts.append(np.concatenate((self.branch_i, self.branch_j, self.branch_j, self.branch_i)))
+                data_parts.append(np.concatenate((branch_g, branch_g, -branch_g, -branch_g)))
+        elif self.alive_branch_tuple:
             branch_arr = np.asarray(self.alive_branch_tuple, dtype=object)
             self.branch_idx = branch_arr[:, 0].astype(np.int32)
             self.branch_i = branch_arr[:, 1].astype(np.int32)
@@ -298,11 +417,12 @@ class DCPowerFlowCalc:
         else:
             self.branch_idx = self.branch_i = self.branch_j = np.array([], dtype=np.int32)
             self.branch_r = np.array([], dtype=np.float64)
-        alive_branch_idx = {int(idx) for idx in self.branch_idx}
-        self._lf_branch_devices = [self.model.branches[int(idx)] for idx in self.branch_idx]
-        self._lf_inactive_branch_devices = [
-            br for idx, br in enumerate(self.model.branches) if idx not in alive_branch_idx
-        ]
+        if not self.array_mode:
+            alive_branch_idx = {int(idx) for idx in self.branch_idx}
+            self._lf_branch_devices = [self.model.branches[int(idx)] for idx in self.branch_idx]
+            self._lf_inactive_branch_devices = [
+                br for idx, br in enumerate(self.model.branches) if idx not in alive_branch_idx
+            ]
 
         if rows_parts:
             G_rows = np.concatenate(rows_parts)
@@ -315,20 +435,65 @@ class DCPowerFlowCalc:
         self.G = G
 
         # ---------- 2. 零阻抗支路处理（节点电位法） ----------
-        self.zero_edges = [
-            ('Z', zb_idx, self.alive_node_dict[zb.i_node], self.alive_node_dict[zb.j_node])
-            for zb_idx, zb in enumerate(self.model.zero_branches)
-            if zb.is_alive and zb.i_node in self.alive_node_dict and zb.j_node in self.alive_node_dict
-        ]
-        for sw_idx, sw in enumerate(self.model.switches):
-            if (
-                sw.is_alive
-                and sw.status == 1
-                and sw.run_stat == 1
-                and sw.i_node in self.alive_node_dict
-                and sw.j_node in self.alive_node_dict
-            ):
-                self.zero_edges.append(('S', sw_idx, self.alive_node_dict[sw.i_node], self.alive_node_dict[sw.j_node]))
+        if self.array_mode:
+            zero_branch = self.ppc["zero_branch"]
+            zero_parts = []
+            if zero_branch.size:
+                zero_i_all = self._map_nodes_with_lookup(zero_branch[:, DC_ZERO_BRANCH_COLS["i_node"]], node_lookup)
+                zero_j_all = self._map_nodes_with_lookup(zero_branch[:, DC_ZERO_BRANCH_COLS["j_node"]], node_lookup)
+                zero_mask = (
+                    (zero_branch[:, DC_ZERO_BRANCH_COLS["run_stat"]] == 1)
+                    & (zero_i_all >= 0)
+                    & (zero_j_all >= 0)
+                )
+                if np.any(zero_mask):
+                    zero_parts.extend(
+                        zip(
+                            np.repeat("Z", int(np.count_nonzero(zero_mask))),
+                            np.nonzero(zero_mask)[0].astype(np.int32),
+                            zero_i_all[zero_mask],
+                            zero_j_all[zero_mask],
+                        )
+                    )
+
+            switch = self.ppc["switch"]
+            if switch.size:
+                switch_i_all = self._map_nodes_with_lookup(switch[:, DC_SWITCH_COLS["i_node"]], node_lookup)
+                switch_j_all = self._map_nodes_with_lookup(switch[:, DC_SWITCH_COLS["j_node"]], node_lookup)
+                switch_mask = (
+                    (switch[:, DC_SWITCH_COLS["run_stat"]] == 1)
+                    & (switch[:, DC_SWITCH_COLS["status"]] == 1)
+                    & (switch_i_all >= 0)
+                    & (switch_j_all >= 0)
+                )
+                if np.any(switch_mask):
+                    zero_parts.extend(
+                        zip(
+                            np.repeat("S", int(np.count_nonzero(switch_mask))),
+                            np.nonzero(switch_mask)[0].astype(np.int32),
+                            switch_i_all[switch_mask],
+                            switch_j_all[switch_mask],
+                        )
+                    )
+            self.zero_edges = [
+                (str(tp), int(dev_idx), int(i_node), int(j_node))
+                for tp, dev_idx, i_node, j_node in zero_parts
+            ]
+        else:
+            self.zero_edges = [
+                ('Z', zb_idx, self.alive_node_dict[zb.i_node], self.alive_node_dict[zb.j_node])
+                for zb_idx, zb in enumerate(self.model.zero_branches)
+                if zb.is_alive and zb.i_node in self.alive_node_dict and zb.j_node in self.alive_node_dict
+            ]
+            for sw_idx, sw in enumerate(self.model.switches):
+                if (
+                    sw.is_alive
+                    and sw.status == 1
+                    and sw.run_stat == 1
+                    and sw.i_node in self.alive_node_dict
+                    and sw.j_node in self.alive_node_dict
+                ):
+                    self.zero_edges.append(('S', sw_idx, self.alive_node_dict[sw.i_node], self.alive_node_dict[sw.j_node]))
 
         zero_adj = [[] for _ in range(self.N)]
         for edge_idx, (_, _, i_node, j_node) in enumerate(self.zero_edges):
@@ -364,6 +529,9 @@ class DCPowerFlowCalc:
         self.comp_nodes = comp_nodes
         self.comp_tree_edges = []
         for nodes, edge_indices in zip(comp_nodes, comp_edge_indices):
+            if len(edge_indices) == len(nodes) - 1:
+                self.comp_tree_edges.append(list(edge_indices))
+                continue
             local_idx = {node: i for i, node in enumerate(nodes)}
             local_edges = []
             orig_indices = []
@@ -415,36 +583,68 @@ class DCPowerFlowCalc:
         self.ref_phi_idx = np.asarray(self.ref_phi_idx, dtype=np.int32)
 
         # ---------- 3. DC-DC变流器 ----------
-        self.alive_dcdc_tuples = [
-            (idx, self.alive_node_dict[dc.i_node], self.alive_node_dict[dc.j_node], dc.control_type,
-             dc.p_set, dc.i_set, dc.v_set, dc.r1, dc.r2)
-            for idx, dc in enumerate(self.model.dcdc_converters)
-            if dc.is_alive and dc.i_node in self.alive_node_dict and dc.j_node in self.alive_node_dict
-        ]
-        self.N_dcdc = len(self.alive_dcdc_tuples)
-        if self.N_dcdc:
-            # DCDC 采用 r1 + 理想变压 + r2 模型，因此两端功率都作为未知量。
-            dcdc_arr = np.asarray(self.alive_dcdc_tuples, dtype=object)
-            self.dcdc_idx = dcdc_arr[:, 0].astype(np.int32)
-            self.dcdc_i = dcdc_arr[:, 1].astype(np.int32)
-            self.dcdc_j = dcdc_arr[:, 2].astype(np.int32)
-            self.dcdc_ctrl = dcdc_arr[:, 3]
-            self.dcdc_p_set = dcdc_arr[:, 4].astype(np.float64)
-            self.dcdc_i_set = dcdc_arr[:, 5].astype(np.float64)
-            self.dcdc_v_set = dcdc_arr[:, 6].astype(np.float64)
-            self.dcdc_r1 = dcdc_arr[:, 7].astype(np.float64)
-            self.dcdc_r2 = dcdc_arr[:, 8].astype(np.float64)
-            ctrl_map = {"P": 0, "V": 1, "I": 2}
-            try:
-                self.dcdc_ctrl_code = np.asarray([ctrl_map[str(ctrl)] for ctrl in self.dcdc_ctrl], dtype=np.int8)
-            except KeyError as exc:
-                raise ValueError(f"未知DC-DC控制模式: {exc.args[0]}") from exc
+        if self.array_mode:
+            dcdc = self.ppc["dcdc"]
+            if dcdc.size:
+                dcdc_i_all = self._map_nodes_with_lookup(dcdc[:, DC_DCDC_COLS["i_node"]], node_lookup)
+                dcdc_j_all = self._map_nodes_with_lookup(dcdc[:, DC_DCDC_COLS["j_node"]], node_lookup)
+                dcdc_mask = (
+                    (dcdc[:, DC_DCDC_COLS["run_stat"]] == 1)
+                    & (dcdc_i_all >= 0)
+                    & (dcdc_j_all >= 0)
+                )
+                dcdc_active = dcdc[dcdc_mask]
+                self.dcdc_idx = np.nonzero(dcdc_mask)[0].astype(np.int32)
+                self.dcdc_i = dcdc_i_all[dcdc_mask].astype(np.int32, copy=False)
+                self.dcdc_j = dcdc_j_all[dcdc_mask].astype(np.int32, copy=False)
+                self.dcdc_ctrl_code = dcdc_active[:, DC_DCDC_COLS["control_type"]].astype(np.int8, copy=False)
+                self.dcdc_p_set = dcdc_active[:, DC_DCDC_COLS["p_set"]].astype(np.float64, copy=False)
+                self.dcdc_i_set = dcdc_active[:, DC_DCDC_COLS["i_set"]].astype(np.float64, copy=False)
+                self.dcdc_v_set = dcdc_active[:, DC_DCDC_COLS["v_set"]].astype(np.float64, copy=False)
+                self.dcdc_r1 = dcdc_active[:, DC_DCDC_COLS["r1"]].astype(np.float64, copy=False)
+                self.dcdc_r2 = dcdc_active[:, DC_DCDC_COLS["r2"]].astype(np.float64, copy=False)
+            else:
+                self.dcdc_idx = self.dcdc_i = self.dcdc_j = np.array([], dtype=np.int32)
+                self.dcdc_ctrl_code = np.array([], dtype=np.int8)
+                self.dcdc_p_set = self.dcdc_i_set = self.dcdc_v_set = np.array([], dtype=np.float64)
+                self.dcdc_r1 = self.dcdc_r2 = np.array([], dtype=np.float64)
+            self.N_dcdc = self.dcdc_idx.size
+            self.dcdc_ctrl = self.dcdc_ctrl_code
+            self.alive_dcdc_tuples = []
+            bad_ctrl = ~np.isin(self.dcdc_ctrl_code, np.asarray([DC_CTRL_P, DC_CTRL_V, DC_CTRL_I], dtype=np.int8))
+            if np.any(bad_ctrl):
+                raise ValueError(f"未知DC-DC控制模式: {self.dcdc_ctrl_code[int(np.where(bad_ctrl)[0][0])]}")
         else:
-            self.dcdc_idx = self.dcdc_i = self.dcdc_j = np.array([], dtype=np.int32)
-            self.dcdc_ctrl = np.array([], dtype=object)
-            self.dcdc_ctrl_code = np.array([], dtype=np.int8)
-            self.dcdc_p_set = self.dcdc_i_set = self.dcdc_v_set = np.array([], dtype=np.float64)
-            self.dcdc_r1 = self.dcdc_r2 = np.array([], dtype=np.float64)
+            self.alive_dcdc_tuples = [
+                (idx, self.alive_node_dict[dc.i_node], self.alive_node_dict[dc.j_node], dc.control_type,
+                 dc.p_set, dc.i_set, dc.v_set, dc.r1, dc.r2)
+                for idx, dc in enumerate(self.model.dcdc_converters)
+                if dc.is_alive and dc.i_node in self.alive_node_dict and dc.j_node in self.alive_node_dict
+            ]
+            self.N_dcdc = len(self.alive_dcdc_tuples)
+            if self.N_dcdc:
+                # DCDC 采用 r1 + 理想变压 + r2 模型，因此两端功率都作为未知量。
+                dcdc_arr = np.asarray(self.alive_dcdc_tuples, dtype=object)
+                self.dcdc_idx = dcdc_arr[:, 0].astype(np.int32)
+                self.dcdc_i = dcdc_arr[:, 1].astype(np.int32)
+                self.dcdc_j = dcdc_arr[:, 2].astype(np.int32)
+                self.dcdc_ctrl = dcdc_arr[:, 3]
+                self.dcdc_p_set = dcdc_arr[:, 4].astype(np.float64)
+                self.dcdc_i_set = dcdc_arr[:, 5].astype(np.float64)
+                self.dcdc_v_set = dcdc_arr[:, 6].astype(np.float64)
+                self.dcdc_r1 = dcdc_arr[:, 7].astype(np.float64)
+                self.dcdc_r2 = dcdc_arr[:, 8].astype(np.float64)
+                ctrl_map = {"P": 0, "V": 1, "I": 2}
+                try:
+                    self.dcdc_ctrl_code = np.asarray([ctrl_map[str(ctrl)] for ctrl in self.dcdc_ctrl], dtype=np.int8)
+                except KeyError as exc:
+                    raise ValueError(f"未知DC-DC控制模式: {exc.args[0]}") from exc
+            else:
+                self.dcdc_idx = self.dcdc_i = self.dcdc_j = np.array([], dtype=np.int32)
+                self.dcdc_ctrl = np.array([], dtype=object)
+                self.dcdc_ctrl_code = np.array([], dtype=np.int8)
+                self.dcdc_p_set = self.dcdc_i_set = self.dcdc_v_set = np.array([], dtype=np.float64)
+                self.dcdc_r1 = self.dcdc_r2 = np.array([], dtype=np.float64)
 
         # ---------- 4. 确定松弛节点 ----------
         self.slack_nodes = {node: gens[0].v_set for node, gens in self.slack_gen_info.items()}
@@ -507,8 +707,100 @@ class DCPowerFlowCalc:
         self.dcdc_ctrl_v_mask = self.dcdc_ctrl_code == 1
         self.dcdc_ctrl_i_mask = self.dcdc_ctrl_code == 2
         self.dcdc_ones = np.ones(self.N_dcdc, dtype=np.float64)
+        self._prepare_static_jacobian_indices()
 
         return G, x
+
+    def _prepare_static_jacobian_indices(self):
+        """Precompute Jacobian row/column indices that are constant across Newton steps."""
+        self.zero_i_eq = self.node_eq[self.zero_i] if self.zero_i.size else np.array([], dtype=np.int32)
+        self.zero_j_eq = self.node_eq[self.zero_j] if self.zero_j.size else np.array([], dtype=np.int32)
+        self.zero_i_unknown_mask = self.zero_i_eq >= 0
+        self.zero_j_unknown_mask = self.zero_j_eq >= 0
+        self.zero_i_unknown_count = int(np.count_nonzero(self.zero_i_unknown_mask))
+        self.zero_j_unknown_count = int(np.count_nonzero(self.zero_j_unknown_mask))
+        if self.zero_i_unknown_count:
+            self.zero_i_rows_jac = np.repeat(self.zero_i_eq[self.zero_i_unknown_mask], 3)
+            self.zero_i_cols_jac = np.empty(3 * self.zero_i_unknown_count, dtype=np.int32)
+            self.zero_i_cols_jac[0::3] = self.N + self.zero_phi_a[self.zero_i_unknown_mask]
+            self.zero_i_cols_jac[1::3] = self.N + self.zero_phi_b[self.zero_i_unknown_mask]
+            self.zero_i_cols_jac[2::3] = self.zero_i[self.zero_i_unknown_mask]
+        else:
+            self.zero_i_rows_jac = self.zero_i_cols_jac = np.array([], dtype=np.int32)
+        if self.zero_j_unknown_count:
+            self.zero_j_rows_jac = np.repeat(self.zero_j_eq[self.zero_j_unknown_mask], 3)
+            self.zero_j_cols_jac = np.empty(3 * self.zero_j_unknown_count, dtype=np.int32)
+            self.zero_j_cols_jac[0::3] = self.N + self.zero_phi_a[self.zero_j_unknown_mask]
+            self.zero_j_cols_jac[1::3] = self.N + self.zero_phi_b[self.zero_j_unknown_mask]
+            self.zero_j_cols_jac[2::3] = self.zero_j[self.zero_j_unknown_mask]
+        else:
+            self.zero_j_rows_jac = self.zero_j_cols_jac = np.array([], dtype=np.int32)
+
+        if self.n_known:
+            self.known_rows_jac = self.eq_known_start + np.arange(self.n_known, dtype=np.int32)
+            self.known_cols_jac = self.slack_node_arr
+            self.known_data_jac = np.ones(self.n_known, dtype=np.float64)
+        else:
+            self.known_rows_jac = self.known_cols_jac = np.array([], dtype=np.int32)
+            self.known_data_jac = np.array([], dtype=np.float64)
+
+        if self.n_zero_constraint:
+            self.zero_con_rows_jac = np.repeat(self.zero_con_rows, 2)
+            self.zero_con_cols_jac = np.empty(2 * self.n_zero_constraint, dtype=np.int32)
+            self.zero_con_data_jac = np.empty(2 * self.n_zero_constraint, dtype=np.float64)
+            self.zero_con_cols_jac[0::2] = self.zero_con_i
+            self.zero_con_cols_jac[1::2] = self.zero_con_j
+            self.zero_con_data_jac[0::2] = 1.0
+            self.zero_con_data_jac[1::2] = -1.0
+        else:
+            self.zero_con_rows_jac = self.zero_con_cols_jac = np.array([], dtype=np.int32)
+            self.zero_con_data_jac = np.array([], dtype=np.float64)
+
+        if self.n_phi_fix:
+            self.phi_fix_cols_jac = self.N + self.ref_phi_idx
+            self.phi_fix_data_jac = np.ones(self.n_phi_fix, dtype=np.float64)
+        else:
+            self.phi_fix_cols_jac = np.array([], dtype=np.int32)
+            self.phi_fix_data_jac = np.array([], dtype=np.float64)
+
+        if self.N_dcdc:
+            self.dcdc_i_eq = self.node_eq[self.dcdc_i]
+            self.dcdc_j_eq = self.node_eq[self.dcdc_j]
+            self.dcdc_i_unknown_mask = self.dcdc_i_eq >= 0
+            self.dcdc_j_unknown_mask = self.dcdc_j_eq >= 0
+            self.dcdc_i_unknown_idx = np.where(self.dcdc_i_unknown_mask)[0].astype(np.int32)
+            self.dcdc_j_unknown_idx = np.where(self.dcdc_j_unknown_mask)[0].astype(np.int32)
+            self.dcdc_i_eq_rows_jac = self.dcdc_i_eq[self.dcdc_i_unknown_mask]
+            self.dcdc_j_eq_rows_jac = self.dcdc_j_eq[self.dcdc_j_unknown_mask]
+            self.dcdc_i_eq_cols_jac = self.dcdc_p_col[self.dcdc_i_unknown_idx]
+            self.dcdc_j_eq_cols_jac = self.dcdc_q_col[self.dcdc_j_unknown_idx]
+            self.dcdc_i_eq_data_jac = np.ones(self.dcdc_i_unknown_idx.size, dtype=np.float64)
+            self.dcdc_j_eq_data_jac = np.ones(self.dcdc_j_unknown_idx.size, dtype=np.float64)
+
+            self.dcdc_ctrl_p_count = int(np.count_nonzero(self.dcdc_ctrl_p_mask))
+            self.dcdc_ctrl_v_count = int(np.count_nonzero(self.dcdc_ctrl_v_mask))
+            self.dcdc_ctrl_i_count = int(np.count_nonzero(self.dcdc_ctrl_i_mask))
+            self.dcdc_ctrl_p_data_jac = np.ones(self.dcdc_ctrl_p_count, dtype=np.float64)
+            self.dcdc_ctrl_v_data_jac = np.ones(self.dcdc_ctrl_v_count, dtype=np.float64)
+            self.dcdc_ctrl_i_rows_jac = np.repeat(self.dcdc_eq_ctrl[self.dcdc_ctrl_i_mask], 2)
+            if self.dcdc_ctrl_i_count:
+                self.dcdc_ctrl_i_cols_jac = np.empty(2 * self.dcdc_ctrl_i_count, dtype=np.int32)
+                self.dcdc_ctrl_i_data_jac = np.empty(2 * self.dcdc_ctrl_i_count, dtype=np.float64)
+                self.dcdc_ctrl_i_cols_jac[0::2] = self.dcdc_p_col[self.dcdc_ctrl_i_mask]
+                self.dcdc_ctrl_i_cols_jac[1::2] = self.dcdc_i[self.dcdc_ctrl_i_mask]
+                self.dcdc_ctrl_i_data_jac[0::2] = 1.0
+                self.dcdc_ctrl_i_data_jac[1::2] = -self.dcdc_i_set[self.dcdc_ctrl_i_mask]
+            else:
+                self.dcdc_ctrl_i_cols_jac = np.array([], dtype=np.int32)
+                self.dcdc_ctrl_i_data_jac = np.array([], dtype=np.float64)
+            self.dcdc_loss_rows_jac = np.repeat(self.dcdc_eq_loss, 4)
+            self.dcdc_loss_cols_jac = np.empty(self.N_dcdc * 4, dtype=np.int32)
+            self.dcdc_loss_cols_jac[0::4] = self.dcdc_p_col
+            self.dcdc_loss_cols_jac[1::4] = self.dcdc_q_col
+            self.dcdc_loss_cols_jac[2::4] = self.dcdc_i
+            self.dcdc_loss_cols_jac[3::4] = self.dcdc_j
+        else:
+            self.dcdc_i_unknown_idx = self.dcdc_j_unknown_idx = np.array([], dtype=np.int32)
 
     def _eval_newton_terms(self, G, x):
         """Evaluate DC Newton quantities shared by residual and Jacobian."""
@@ -565,108 +857,67 @@ class DCPowerFlowCalc:
         if self.zero_i.size:
             current = terms["zero_current"]
 
-            eq_i = self.node_eq[self.zero_i]
-            mask_i = eq_i >= 0
-            if np.any(mask_i):
-                n = int(np.count_nonzero(mask_i))
-                cols = np.empty(3 * n, dtype=np.int32)
-                data = np.empty(3 * n, dtype=np.float64)
-                cols[0::3] = self.N + self.zero_phi_a[mask_i]
-                cols[1::3] = self.N + self.zero_phi_b[mask_i]
-                cols[2::3] = self.zero_i[mask_i]
-                data[0::3] = V[self.zero_i[mask_i]]
-                data[1::3] = -V[self.zero_i[mask_i]]
-                data[2::3] = current[mask_i]
-                rows_parts.append(np.repeat(eq_i[mask_i], 3))
-                cols_parts.append(cols)
+            if self.zero_i_unknown_count:
+                data = np.empty(3 * self.zero_i_unknown_count, dtype=np.float64)
+                data[0::3] = V[self.zero_i[self.zero_i_unknown_mask]]
+                data[1::3] = -V[self.zero_i[self.zero_i_unknown_mask]]
+                data[2::3] = current[self.zero_i_unknown_mask]
+                rows_parts.append(self.zero_i_rows_jac)
+                cols_parts.append(self.zero_i_cols_jac)
                 data_parts.append(data)
 
-            eq_j = self.node_eq[self.zero_j]
-            mask_j = eq_j >= 0
-            if np.any(mask_j):
-                n = int(np.count_nonzero(mask_j))
-                cols = np.empty(3 * n, dtype=np.int32)
-                data = np.empty(3 * n, dtype=np.float64)
-                cols[0::3] = self.N + self.zero_phi_a[mask_j]
-                cols[1::3] = self.N + self.zero_phi_b[mask_j]
-                cols[2::3] = self.zero_j[mask_j]
-                data[0::3] = -V[self.zero_j[mask_j]]
-                data[1::3] = V[self.zero_j[mask_j]]
-                data[2::3] = -current[mask_j]
-                rows_parts.append(np.repeat(eq_j[mask_j], 3))
-                cols_parts.append(cols)
+            if self.zero_j_unknown_count:
+                data = np.empty(3 * self.zero_j_unknown_count, dtype=np.float64)
+                data[0::3] = -V[self.zero_j[self.zero_j_unknown_mask]]
+                data[1::3] = V[self.zero_j[self.zero_j_unknown_mask]]
+                data[2::3] = -current[self.zero_j_unknown_mask]
+                rows_parts.append(self.zero_j_rows_jac)
+                cols_parts.append(self.zero_j_cols_jac)
                 data_parts.append(data)
 
         # 8.3 DC-DC功率变量对节点功率方程的偏导
         if self.N_dcdc:
-            eq_i = self.node_eq[self.dcdc_i]
-            mask_i = eq_i >= 0
-            if np.any(mask_i):
-                idx = np.where(mask_i)[0].astype(np.int32)
-                rows_parts.append(eq_i[mask_i])
-                cols_parts.append(self.N + self.N_phi + idx * 2)
-                data_parts.append(np.ones(idx.size, dtype=np.float64))
-
-            eq_j = self.node_eq[self.dcdc_j]
-            mask_j = eq_j >= 0
-            if np.any(mask_j):
-                idx = np.where(mask_j)[0].astype(np.int32)
-                rows_parts.append(eq_j[mask_j])
-                cols_parts.append(self.N + self.N_phi + idx * 2 + 1)
-                data_parts.append(np.ones(idx.size, dtype=np.float64))
+            if self.dcdc_i_unknown_idx.size:
+                rows_parts.append(self.dcdc_i_eq_rows_jac)
+                cols_parts.append(self.dcdc_i_eq_cols_jac)
+                data_parts.append(self.dcdc_i_eq_data_jac)
+            if self.dcdc_j_unknown_idx.size:
+                rows_parts.append(self.dcdc_j_eq_rows_jac)
+                cols_parts.append(self.dcdc_j_eq_cols_jac)
+                data_parts.append(self.dcdc_j_eq_data_jac)
 
         # 8.4 松弛节点电压方程行
         if self.n_known:
-            rows_parts.append(self.eq_known_start + np.arange(self.n_known, dtype=np.int32))
-            cols_parts.append(self.slack_node_arr)
-            data_parts.append(np.ones(self.n_known, dtype=np.float64))
+            rows_parts.append(self.known_rows_jac)
+            cols_parts.append(self.known_cols_jac)
+            data_parts.append(self.known_data_jac)
 
         # 8.5 零阻抗电压约束行
         if self.n_zero_constraint:
-            cols = np.empty(2 * self.n_zero_constraint, dtype=np.int32)
-            data = np.empty(2 * self.n_zero_constraint, dtype=np.float64)
-            cols[0::2] = self.zero_con_i
-            cols[1::2] = self.zero_con_j
-            data[0::2] = 1.0
-            data[1::2] = -1.0
-            rows_parts.append(np.repeat(self.zero_con_rows, 2))
-            cols_parts.append(cols)
-            data_parts.append(data)
+            rows_parts.append(self.zero_con_rows_jac)
+            cols_parts.append(self.zero_con_cols_jac)
+            data_parts.append(self.zero_con_data_jac)
 
         # 8.6 φ参考固定行
         if self.n_phi_fix:
             rows_parts.append(self.phi_fix_rows)
-            cols_parts.append(self.N + self.ref_phi_idx)
-            data_parts.append(np.ones(self.n_phi_fix, dtype=np.float64))
+            cols_parts.append(self.phi_fix_cols_jac)
+            data_parts.append(self.phi_fix_data_jac)
 
         # 8.7 DC-DC方程行
         if self.N_dcdc:
-            if np.any(self.dcdc_ctrl_p_mask):
+            if self.dcdc_ctrl_p_count:
                 rows_parts.append(self.dcdc_eq_ctrl[self.dcdc_ctrl_p_mask])
                 cols_parts.append(self.dcdc_p_col[self.dcdc_ctrl_p_mask])
-                data_parts.append(np.ones(int(np.count_nonzero(self.dcdc_ctrl_p_mask)), dtype=np.float64))
-            if np.any(self.dcdc_ctrl_v_mask):
+                data_parts.append(self.dcdc_ctrl_p_data_jac)
+            if self.dcdc_ctrl_v_count:
                 rows_parts.append(self.dcdc_eq_ctrl[self.dcdc_ctrl_v_mask])
                 cols_parts.append(self.dcdc_i[self.dcdc_ctrl_v_mask])
-                data_parts.append(np.ones(int(np.count_nonzero(self.dcdc_ctrl_v_mask)), dtype=np.float64))
-            if np.any(self.dcdc_ctrl_i_mask):
-                rows_parts.append(np.repeat(self.dcdc_eq_ctrl[self.dcdc_ctrl_i_mask], 2))
-                cols_parts.append(
-                    np.column_stack(
-                        (
-                            self.dcdc_p_col[self.dcdc_ctrl_i_mask],
-                            self.dcdc_i[self.dcdc_ctrl_i_mask],
-                        )
-                    ).ravel()
-                )
-                data_parts.append(
-                    np.column_stack(
-                        (
-                            np.ones(int(np.count_nonzero(self.dcdc_ctrl_i_mask)), dtype=np.float64),
-                            -self.dcdc_i_set[self.dcdc_ctrl_i_mask],
-                        )
-                    ).ravel()
-                )
+                data_parts.append(self.dcdc_ctrl_v_data_jac)
+            if self.dcdc_ctrl_i_count:
+                rows_parts.append(self.dcdc_ctrl_i_rows_jac)
+                cols_parts.append(self.dcdc_ctrl_i_cols_jac)
+                data_parts.append(self.dcdc_ctrl_i_data_jac)
 
             vi = terms["dcdc_vi"]
             vj = terms["dcdc_vj"]
@@ -681,8 +932,8 @@ class DCPowerFlowCalc:
             loss_data[1::4] = vi2 * vj2 - 2.0 * self.dcdc_r2 * pj * vi2
             loss_data[2::4] = 2.0 * vi * vj2 * (pi + pj) - 2.0 * self.dcdc_r2 * pj2 * vi
             loss_data[3::4] = 2.0 * vj * vi2 * (pi + pj) - 2.0 * self.dcdc_r1 * pi2 * vj
-            rows_parts.append(np.repeat(self.dcdc_eq_loss, 4))
-            cols_parts.append(np.column_stack((self.dcdc_p_col, self.dcdc_q_col, self.dcdc_i, self.dcdc_j)).ravel())
+            rows_parts.append(self.dcdc_loss_rows_jac)
+            cols_parts.append(self.dcdc_loss_cols_jac)
             data_parts.append(loss_data)
 
         if rows_parts:
@@ -839,17 +1090,31 @@ class DCPowerFlowCalc:
             P_inj[idx] -= gen.p
 
         # DC-DC变流器
-        for d_idx, (idx, i_node, j_node, ctrl, p_set, i_set, v_set, r1, r2) in enumerate(self.alive_dcdc_tuples):
-            dc = self.model.dcdc_converters[idx]
-            dc.i_p = Pdc_final[d_idx * 2]
-            dc.j_p = Pdc_final[d_idx * 2 + 1]
-            vi = V_final[i_node]
-            vj = V_final[j_node]
-            dc.i_c = dc.i_p / vi if abs(vi) > self.runtime_params.min_voltage else 0.0
-            dc.j_c = dc.j_p / vj if abs(vj) > self.runtime_params.min_voltage else 0.0
-
-            P_inj[i_node] += dc.i_p
-            P_inj[j_node] += dc.j_p  # eta
+        if self.N_dcdc:
+            dcdc_i_p = Pdc_final[0::2]
+            dcdc_j_p = Pdc_final[1::2]
+            dcdc_vi = V_final[self.dcdc_i]
+            dcdc_vj = V_final[self.dcdc_j]
+            dcdc_i_c = np.divide(
+                dcdc_i_p,
+                dcdc_vi,
+                out=np.zeros_like(dcdc_i_p),
+                where=np.abs(dcdc_vi) > self.runtime_params.min_voltage,
+            )
+            dcdc_j_c = np.divide(
+                dcdc_j_p,
+                dcdc_vj,
+                out=np.zeros_like(dcdc_j_p),
+                where=np.abs(dcdc_vj) > self.runtime_params.min_voltage,
+            )
+            np.add.at(P_inj, self.dcdc_i, dcdc_i_p)
+            np.add.at(P_inj, self.dcdc_j, dcdc_j_p)
+            for dc_idx, i_p, j_p, i_c, j_c in zip(self.dcdc_idx, dcdc_i_p, dcdc_j_p, dcdc_i_c, dcdc_j_c):
+                dc = self.model.dcdc_converters[int(dc_idx)]
+                dc.i_p = float(i_p)
+                dc.j_p = float(j_p)
+                dc.i_c = float(i_c)
+                dc.j_c = float(j_c)
 
         # P_inj 是剩余的不平衡功率，由平衡机来承担。。。
 
