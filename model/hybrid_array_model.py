@@ -11,6 +11,7 @@ try:
         BUS_COLS as AC_BUS_COLS,
         GEN_COLS as AC_GEN_COLS,
         LOAD_COLS as AC_LOAD_COLS,
+        BREAK_COLS as AC_BREAK_COLS,
         SHUNT_COLS as AC_SHUNT_COLS,
         SWITCH_COLS as AC_SWITCH_COLS,
         TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
@@ -33,6 +34,7 @@ try:
         ACNode,
         ACShuntCompensator,
         ACSwitch,
+        ACBreak,
         ACTransformer,
         ACZeroBranch,
     )
@@ -42,6 +44,7 @@ try:
         DCDC_COLS as DC_DCDC_COLS,
         GEN_COLS as DC_GEN_COLS,
         LOAD_COLS as DC_LOAD_COLS,
+        BREAK_COLS as DC_BREAK_COLS,
         SWITCH_COLS as DC_SWITCH_COLS,
         ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
         DCPowerNetwork,
@@ -55,6 +58,7 @@ except ImportError:
         BUS_COLS as AC_BUS_COLS,
         GEN_COLS as AC_GEN_COLS,
         LOAD_COLS as AC_LOAD_COLS,
+        BREAK_COLS as AC_BREAK_COLS,
         SHUNT_COLS as AC_SHUNT_COLS,
         SWITCH_COLS as AC_SWITCH_COLS,
         TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
@@ -77,6 +81,7 @@ except ImportError:
         ACNode,
         ACShuntCompensator,
         ACSwitch,
+        ACBreak,
         ACTransformer,
         ACZeroBranch,
     )
@@ -86,6 +91,7 @@ except ImportError:
         DCDC_COLS as DC_DCDC_COLS,
         GEN_COLS as DC_GEN_COLS,
         LOAD_COLS as DC_LOAD_COLS,
+        BREAK_COLS as DC_BREAK_COLS,
         SWITCH_COLS as DC_SWITCH_COLS,
         ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
         DCPowerNetwork,
@@ -305,6 +311,7 @@ def _empty_ac_ppc(raw: Dict, source: Path) -> Dict:
         "shunt": _empty(len(AC_SHUNT_COLS)),
         "zero_branch": _empty(len(AC_ZERO_BRANCH_COLS)),
         "switch": _empty(len(AC_SWITCH_COLS)),
+        "break": _empty(len(AC_BREAK_COLS)),
         "bus_name": np.asarray([], dtype=object),
         "branch_name": np.asarray([], dtype=object),
         "transformer_name": np.asarray([], dtype=object),
@@ -313,6 +320,7 @@ def _empty_ac_ppc(raw: Dict, source: Path) -> Dict:
         "shunt_name": np.asarray([], dtype=object),
         "zero_branch_name": np.asarray([], dtype=object),
         "switch_name": np.asarray([], dtype=object),
+        "break_name": np.asarray([], dtype=object),
     }
 
 
@@ -333,6 +341,7 @@ def _empty_dc_ppc(raw: Dict) -> Dict:
         "gen": _empty(len(DC_GEN_COLS)),
         "zero_branch": _empty(len(DC_ZERO_BRANCH_COLS)),
         "switch": _empty(len(DC_SWITCH_COLS)),
+        "break": _empty(len(DC_BREAK_COLS)),
         "dcdc": _empty(len(DC_DCDC_COLS)),
         "node_pos": {},
         "bus_name": np.asarray([], dtype=object),
@@ -341,6 +350,7 @@ def _empty_dc_ppc(raw: Dict) -> Dict:
         "gen_name": np.asarray([], dtype=object),
         "zero_branch_name": np.asarray([], dtype=object),
         "switch_name": np.asarray([], dtype=object),
+        "break_name": np.asarray([], dtype=object),
         "dcdc_name": np.asarray([], dtype=object),
     }
 
@@ -467,6 +477,7 @@ def _build_ac_network(ppc: Dict) -> ACPowerNetwork:
     shunt_names = _list_ac_names(ppc, "shunt_name", "shunt", ppc["shunt"].shape[0])
     zero_branch_names = _list_ac_names(ppc, "zero_branch_name", "zero_branch", ppc["zero_branch"].shape[0])
     switch_names = _list_ac_names(ppc, "switch_name", "switch", ppc["switch"].shape[0])
+    break_names = _list_ac_names(ppc, "break_name", "break", ppc.get("break", _empty(len(AC_BREAK_COLS))).shape[0])
 
     network = ACPowerNetwork()
     base = ppc["base"]
@@ -495,6 +506,7 @@ def _build_ac_network(ppc: Dict) -> ACPowerNetwork:
         node.loads = []
         node.branches = []
         node.switches = []
+        node.breakers = []
         node.zero_branches = []
         node.transformers = []
         node.shunt_compensators = []
@@ -586,8 +598,19 @@ def _build_ac_network(ppc: Dict) -> ACPowerNetwork:
         )
         for row in ppc["switch"]
     ]
+    network.breakers = [
+        ACBreak(
+            int(row[AC_BREAK_COLS["idx"]]),
+            int(row[AC_BREAK_COLS["i_node"]]),
+            int(row[AC_BREAK_COLS["j_node"]]),
+            int(row[AC_BREAK_COLS["status"]]),
+            int(row[AC_BREAK_COLS["run_stat"]]),
+        )
+        for row in ppc.get("break", _empty(len(AC_BREAK_COLS)))
+    ]
     network.node_dict = {}
     network.switch_dict = {}
+    network.break_dict = {}
     network.load_dict = {}
     network.generator_dict = {}
     network.zero_branch_dict = {}
@@ -645,6 +668,12 @@ def _build_ac_network(ppc: Dict) -> ACPowerNetwork:
         obj.p = float(row[AC_SWITCH_COLS["p"]])
         obj.q = float(row[AC_SWITCH_COLS["q"]])
         obj.current = float(row[AC_SWITCH_COLS["current"]])
+        obj.is_alive = False
+    for obj, row, name in zip(network.breakers, ppc.get("break", _empty(len(AC_BREAK_COLS))), break_names):
+        obj.name = name
+        obj.p = float(row[AC_BREAK_COLS["p"]])
+        obj.q = float(row[AC_BREAK_COLS["q"]])
+        obj.current = float(row[AC_BREAK_COLS["current"]])
         obj.is_alive = False
     return network
 
@@ -724,6 +753,7 @@ def build_hybrid_model_from_ppc(ppc: Dict):
         DCGenerator=dc_network.generators,
         DCZeroBranch=dc_network.zero_branches,
         DCSwitch=dc_network.switches,
+        DCBreak=getattr(dc_network, "breakers", []),
         DCDCConverter=dc_network.dcdc_converters,
         DCShuntCompensator=[],
         DCACConverter=dcac,

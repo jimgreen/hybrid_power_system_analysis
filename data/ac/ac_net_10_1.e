@@ -68,8 +68,12 @@
 
 <ACSwitch>
 @ idx name   i_node j_node status run_stat p q current
-# 0   sw_7_8 7      8      1      1        0 0 0
 </ACSwitch>
+
+<ACBreak>
+@ idx name   i_node j_node status run_stat p q current
+# 0   sw_7_8 7      8      1      1        0 0 0
+</ACBreak>
 
 <ACTransformer>
 @ idx name   i_node j_node r    x   b   tap  shift run_stat i_p i_q i_c j_p j_q j_c

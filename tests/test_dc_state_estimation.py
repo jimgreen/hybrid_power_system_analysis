@@ -10,6 +10,43 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class DCStateEstimationTest(unittest.TestCase):
+    def test_dc_break_is_parsed_as_distinct_zero_tie_device(self):
+        from model.dc_array_model import SWITCH_COLS, build_dc_ppc_from_e_file
+        from model.dc_model import DCBreak, DCPowerNetwork as ObjectDCPowerNetwork
+
+        source = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_path = Path(tmp_dir) / "dc_break.e"
+            text = source.read_text(encoding="utf-8")
+            switch_start = text.index("<DCSwitch>")
+            switch_end = text.index("</DCSwitch>", switch_start) + len("</DCSwitch>")
+            break_start = text.index("<DCBreak>")
+            break_end = text.index("</DCBreak>", break_start) + len("</DCBreak>")
+            text = (
+                text[:switch_start]
+                + "<DCSwitch>\n@ idx name     i_node j_node status run_stat p current\n</DCSwitch>\n\n"
+                + "<DCBreak>\n@ idx name     i_node j_node status run_stat p current\n"
+                + "# 0   brk_0_1   0      1      1      1        0 0\n"
+                + "</DCBreak>"
+                + text[break_end:]
+            )
+            case_path.write_text(text, encoding="utf-8")
+
+            ppc = build_dc_ppc_from_e_file(case_path)
+            network = ObjectDCPowerNetwork()
+            network.read_from_file(case_path)
+            network.topo()
+
+        self.assertEqual(0, ppc["switch"].shape[0])
+        self.assertEqual(1, ppc["break"].shape[0])
+        self.assertEqual("brk_0_1", ppc["break_name"][0])
+        self.assertEqual(0, int(ppc["break"][0, SWITCH_COLS["i_node"]]))
+        self.assertEqual(1, int(ppc["break"][0, SWITCH_COLS["j_node"]]))
+        self.assertEqual(1, len(network.breakers))
+        self.assertIsInstance(network.breakers[0], DCBreak)
+        self.assertEqual("brk_0_1", network.breakers[0].name)
+        self.assertTrue(network.node_dict[0].isl_obj is network.node_dict[1].isl_obj)
+
     @staticmethod
     def _all_valid_measurement_file(tmp_dir, source: Path) -> Path:
         """Build a temporary measurement file with every existing row marked valid."""
@@ -302,7 +339,7 @@ class DCStateEstimationTest(unittest.TestCase):
             estimator.voltage_col[estimator.node_pos[zbr.i_node]],
             estimator.voltage_col[estimator.node_pos[zbr.j_node]],
         )
-        sw = estimator.switch_by_name["sw_0_1"]
+        sw = estimator.break_by_name["sw_0_1"]
         self.assertEqual(
             estimator.voltage_col[estimator.node_pos[sw.i_node]],
             estimator.voltage_col[estimator.node_pos[sw.j_node]],

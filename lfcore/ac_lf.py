@@ -751,6 +751,7 @@ class ACPowerFlowCalc:
         shunt = np.asarray(ppc.get("shunt", np.zeros((0, len(SHUNT_COLS)))), dtype=np.float64)
         zero_branch = np.asarray(ppc.get("zero_branch", np.zeros((0, len(ZERO_BRANCH_COLS)))), dtype=np.float64)
         switch = np.asarray(ppc.get("switch", np.zeros((0, len(SWITCH_COLS)))), dtype=np.float64)
+        breaker = np.asarray(ppc.get("break", np.zeros((0, len(SWITCH_COLS)))), dtype=np.float64)
 
         n_bus_all = bus.shape[0]
         bus_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
@@ -776,6 +777,7 @@ class ACPowerFlowCalc:
         collect_device_edges(branch, BRANCH_COLS)
         collect_device_edges(transformer, TRANSFORMER_COLS)
         collect_device_edges(zero_branch, ZERO_BRANCH_COLS)
+        collect_device_edges(breaker, SWITCH_COLS, require_closed=True)
         collect_device_edges(switch, SWITCH_COLS, require_closed=True)
 
         if edge_i_parts:
@@ -843,7 +845,7 @@ class ACPowerFlowCalc:
 
         self._prepare_ppc_devices(branch, transformer, gen, load, shunt, zero_branch, switch, active_bus)
         self._prepare_ppc_y_matrix(branch, transformer, shunt)
-        self._prepare_ppc_zero_edges(zero_branch, switch, active_bus)
+        self._prepare_ppc_zero_edges(zero_branch, switch, active_bus, breaker)
         self._finalize_prepared_arrays()
         print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
 
@@ -1218,7 +1220,7 @@ class ACPowerFlowCalc:
         self.Y = csr_matrix((data, (rows, cols)), shape=(self.N, self.N))
         self.Y.sum_duplicates()
 
-    def _prepare_ppc_zero_edges(self, zero_branch, switch, active_bus):
+    def _prepare_ppc_zero_edges(self, zero_branch, switch, active_bus, breaker=None):
         self.zero_edges = []
         if zero_branch.size:
             i_rows = self._ppc_node_rows(zero_branch[:, ZERO_BRANCH_COLS["i_node"]])
@@ -1228,6 +1230,19 @@ class ACPowerFlowCalc:
                 a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
                 if not self._is_redundant_slack_zero_edge(a, b):
                     self.zero_edges.append((int(row_idx), 0, a, b))
+        if breaker is not None and breaker.size:
+            i_rows = self._ppc_node_rows(breaker[:, SWITCH_COLS["i_node"]])
+            j_rows = self._ppc_node_rows(breaker[:, SWITCH_COLS["j_node"]])
+            live = (
+                (breaker[:, SWITCH_COLS["run_stat"]] == 1)
+                & (breaker[:, SWITCH_COLS["status"]] == 1)
+                & active_bus[i_rows]
+                & active_bus[j_rows]
+            )
+            for row_idx in np.where(live)[0]:
+                a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
+                if not self._is_redundant_slack_zero_edge(a, b):
+                    self.zero_edges.append((int(row_idx), 2, a, b))
         if switch.size:
             i_rows = self._ppc_node_rows(switch[:, SWITCH_COLS["i_node"]])
             j_rows = self._ppc_node_rows(switch[:, SWITCH_COLS["j_node"]])
@@ -1632,6 +1647,12 @@ class ACPowerFlowCalc:
             if self._is_redundant_slack_zero_edge(a, b):
                 continue
             self.zero_edges.append((idx, 0, a, b))
+        for idx, brk in [(idx, brk) for idx, brk in enumerate(getattr(self.isl, "breakers", [])) if brk.is_alive]:
+            a = self.node_pos[brk.i_node]
+            b = self.node_pos[brk.j_node]
+            if self._is_redundant_slack_zero_edge(a, b):
+                continue
+            self.zero_edges.append((idx, 2, a, b))
         for idx, sw in [(idx,sw) for idx, sw in enumerate(self.isl.switches) if sw.is_alive and sw.status == 1]:
             a = self.node_pos[sw.i_node]
             b = self.node_pos[sw.j_node]
@@ -2736,6 +2757,8 @@ class ACPowerFlowCalc:
 
         for zb in self.isl.zero_branches:
             zb.current = zb.p = zb.q = 0.0
+        for brk in getattr(self.isl, "breakers", []):
+            brk.current = brk.p = brk.q = 0.0
 
         for dev_idx, dev_type, a, current in zip(
             self.zero_idx,
@@ -2743,7 +2766,12 @@ class ACPowerFlowCalc:
             self.zero_a,
             I_ab,
         ):
-            dev = self.isl.zero_branches[int(dev_idx)] if dev_type == 0 else self.isl.switches[int(dev_idx)]
+            if dev_type == 0:
+                dev = self.isl.zero_branches[int(dev_idx)]
+            elif dev_type == 2:
+                dev = self.isl.breakers[int(dev_idx)]
+            else:
+                dev = self.isl.switches[int(dev_idx)]
             s_from = Vc[a] * np.conj(current)
             dev.current = float(abs(current))
             dev.p = float(s_from.real)
@@ -2862,12 +2890,17 @@ class ACPowerFlowCalc:
 
         zero_branch = self.ppc["zero_branch"].copy()
         switch = self.ppc["switch"].copy()
+        breaker = self.ppc.get("break", np.zeros((0, len(SWITCH_COLS)))).copy()
         for dev_idx, dev_type, a, current in zip(self.zero_idx, self.zero_type, self.zero_a, I_ab):
             s_from = Vc[a] * np.conj(current)
             if dev_type == 0:
                 zero_branch[dev_idx, ZERO_BRANCH_COLS["p"]] = s_from.real
                 zero_branch[dev_idx, ZERO_BRANCH_COLS["q"]] = s_from.imag
                 zero_branch[dev_idx, ZERO_BRANCH_COLS["current"]] = abs(current)
+            elif dev_type == 2:
+                breaker[dev_idx, SWITCH_COLS["p"]] = s_from.real
+                breaker[dev_idx, SWITCH_COLS["q"]] = s_from.imag
+                breaker[dev_idx, SWITCH_COLS["current"]] = abs(current)
             else:
                 switch[dev_idx, SWITCH_COLS["p"]] = s_from.real
                 switch[dev_idx, SWITCH_COLS["q"]] = s_from.imag
@@ -2882,6 +2915,7 @@ class ACPowerFlowCalc:
             "transformer": transformer,
             "zero_branch": zero_branch,
             "switch": switch,
+            "break": breaker,
         }
 
 if __name__ == "__main__":

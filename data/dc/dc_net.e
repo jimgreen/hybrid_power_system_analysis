@@ -45,10 +45,14 @@
 
 <DCSwitch>
 @ idx name     i_node j_node status run_stat p current
-# 0   sw_1_2_3 2      3      1      1        0 0
 # 1   sw_1_2_3 2      3      1      1        0 0
-# 2   sw_1_2_3 2      3      1      1        0 0
 </DCSwitch>
+
+<DCBreak>
+@ idx name     i_node j_node status run_stat p current
+# 0   sw_1_2_3 2      3      1      1        0 0
+# 2   sw_1_2_3 2      3      1      1        0 0
+</DCBreak>
 
 <DCDCConverter>
 @ idx name       i_node j_node r1    r2    control_type p_set i_set v_set run_stat i_p j_p i_c j_c

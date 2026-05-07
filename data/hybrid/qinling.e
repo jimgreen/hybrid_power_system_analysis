@@ -81,12 +81,16 @@
 
 <ACSwitch>
 @ idx name          i_node j_node status run_stat p q current
-# 0   sw_diesel_ac  20     25     1      1        0 0 0
 # 1   sw_load1_ac   20     26     1      1        0 0 0
-# 2   sw_load2_ac   20     27     1      1        0 0 0
 # 3   sw_inv_ac     20     28     1      1        0 0 0
-# 4   sw_h2_load_ac 20     30     1      1        0 0 0
 </ACSwitch>
+
+<ACBreak>
+@ idx name          i_node j_node status run_stat p q current
+# 0   sw_diesel_ac  20     25     1      1        0 0 0
+# 2   sw_load2_ac   20     27     1      1        0 0 0
+# 4   sw_h2_load_ac 20     30     1      1        0 0 0
+</ACBreak>
 
 <DCNode>
 @ idx name          vbase voltage isl run_stat
@@ -181,27 +185,31 @@
 
 <DCSwitch>
 @ idx name        i_node j_node status run_stat p current
-# 0   sw_wt01_dc  28     0      1      1        0 0
 # 1   sw_wt02_dc  29     0      1      1        0 0
-# 2   sw_wt03_dc  30     0      1      1        0 0
 # 3   sw_wt04_dc  31     0      1      1        0 0
-# 4   sw_wt05_dc  32     0      1      1        0 0
 # 5   sw_wt06_dc  33     0      1      1        0 0
-# 6   sw_wt07_dc  34     0      1      1        0 0
 # 7   sw_wt08_dc  35     0      1      1        0 0
-# 8   sw_wt09_dc  36     0      1      1        0 0
 # 9   sw_wt10_dc  37     0      1      1        0 0
-# 10  sw_pv01_dc  38     0      1      1        0 0
 # 11  sw_pv02_dc  39     0      1      1        0 0
-# 12  sw_pv03_dc  40     0      1      1        0 0
 # 13  sw_ess01_dc 41     0      1      1        0 0
-# 14  sw_ess02_dc 42     0      1      1        0 0
 # 15  sw_ess03_dc 43     0      1      1        0 0
-# 16  sw_ess04_dc 44     0      1      1        0 0
 # 17  sw_ess05_dc 45     0      1      1        0 0
-# 18  sw_grid_dc  46     0      1      1        0 0
 # 19  sw_fc01_dc  48     0      1      1        0 0
 </DCSwitch>
+
+<DCBreak>
+@ idx name        i_node j_node status run_stat p current
+# 0   sw_wt01_dc  28     0      1      1        0 0
+# 2   sw_wt03_dc  30     0      1      1        0 0
+# 4   sw_wt05_dc  32     0      1      1        0 0
+# 6   sw_wt07_dc  34     0      1      1        0 0
+# 8   sw_wt09_dc  36     0      1      1        0 0
+# 10  sw_pv01_dc  38     0      1      1        0 0
+# 12  sw_pv03_dc  40     0      1      1        0 0
+# 14  sw_ess02_dc 42     0      1      1        0 0
+# 16  sw_ess04_dc 44     0      1      1        0 0
+# 18  sw_grid_dc  46     0      1      1        0 0
+</DCBreak>
 
 <DCDCConverter>
 @ idx name       i_node j_node r1    r2    control_type p_set i_set v_set run_stat i_p j_p i_c j_c

@@ -8,6 +8,7 @@ class DCIsl:
         self.branches = []
         self.zero_branches = []
         self.switches = []
+        self.breakers = []
         self.dcdc_converters = []
         self.slack_nodes = []
         self.v_gens = []
@@ -89,6 +90,9 @@ class DCSwitch:
         self.i_node_obj = None
         self.j_node_obj = None
 
+class DCBreak(DCSwitch):
+    pass
+
 class DCDCConverter:
     def __init__(self, idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat=1):
         self.idx = idx
@@ -123,10 +127,12 @@ class DCPowerNetwork:
         self.generators = []
         self.zero_branches = []
         self.switches = []
+        self.breakers = []
         self.dcdc_converters = []
 
         self.node_dict = {}
         self.switch_dict = {}
+        self.break_dict = {}
         self.load_dict = {}
         self.generator_dict = {}
         self.zero_branche_dict = {}
@@ -163,6 +169,11 @@ class DCPowerNetwork:
         self.switches.append(sw)
         return sw
 
+    def add_break(self, idx, i_node, j_node, status, run_stat=1):
+        brk = DCBreak(idx, i_node, j_node, status, run_stat)
+        self.breakers.append(brk)
+        return brk
+
     def add_dcdc_converter(self, idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat=1):
         dc = DCDCConverter(idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat)
         self.dcdc_converters.append(dc)
@@ -182,6 +193,24 @@ class DCPowerNetwork:
         self.dcdc_converters = self.model.DCDCConverter
         self.switches = self.model.DCSwitch
         self.zero_branches = self.model.DCZeroBranch
+        self.breakers = [
+            self._coerce_break(row)
+            for row in getattr(self.model, 'DCBreak', [])
+        ]
+
+    @staticmethod
+    def _coerce_break(row):
+        brk = DCBreak(
+            getattr(row, "idx", 0),
+            getattr(row, "i_node", 0),
+            getattr(row, "j_node", 0),
+            getattr(row, "status", 1),
+            getattr(row, "run_stat", 1),
+        )
+        brk.name = getattr(row, "name", f"brk_{brk.idx}")
+        brk.p = getattr(row, "p", None)
+        brk.current = getattr(row, "current", None)
+        return brk
 
     def format_assoc(self):
         """
@@ -191,6 +220,7 @@ class DCPowerNetwork:
         # 建立节点索引到节点对象的映射
         self.node_dict = {node.idx: node for node in self.nodes}
         self.switch_dict = {sw.idx: sw for sw in self.switches}
+        self.break_dict = {brk.idx: brk for brk in self.breakers}
         self.load_dict = {ld.idx: ld for ld in self.loads}
         self.generator_dict = {gen.idx: gen for gen in self.generators}
         self.zero_branche_dict = {zbr.idx: zbr for zbr in self.zero_branches}
@@ -202,6 +232,7 @@ class DCPowerNetwork:
             node.loads = []
             node.branches = []
             node.switches = []
+            node.breakers = []
             node.dcdc_converters = []
             node.zero_branches = []
 
@@ -231,6 +262,14 @@ class DCPowerNetwork:
                 sw.i_node_obj.switches.append(sw)
             if sw.j_node_obj:
                 sw.j_node_obj.switches.append(sw)
+
+        for brk in self.breakers:
+            brk.i_node_obj = self.node_dict.get(brk.i_node, None)
+            brk.j_node_obj = self.node_dict.get(brk.j_node, None)
+            if brk.i_node_obj:
+                brk.i_node_obj.breakers.append(brk)
+            if brk.j_node_obj:
+                brk.j_node_obj.breakers.append(brk)
 
         for cv in self.dcdc_converters:
             cv.i_node_obj = self.node_dict.get(cv.i_node, None)
@@ -280,6 +319,11 @@ class DCPowerNetwork:
         for dev in self.zero_branches:
             add_edge(dev)
 
+        # 添加断路器（breakers），按零阻抗支路处理，同时受 status 和 run_stat 控制
+        for dev in self.breakers:
+            if dev.status == 1:
+                add_edge(dev)
+
         # 添加开关（switches），仅考虑闭合状态（status == 1）
         for dev in self.switches:
             if dev.status == 1:
@@ -324,6 +368,7 @@ class DCPowerNetwork:
             isl.dcdc_converters = []
             isl.zero_branches = []
             isl.switches = []
+            isl.breakers = []
 
 
         for node in self.nodes:
@@ -391,6 +436,14 @@ class DCPowerNetwork:
             if zbr.i_node_obj.isl_obj and zbr.j_node_obj.isl_obj and zbr.i_node_obj.isl_obj ==  zbr.j_node_obj.isl_obj:
                 zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
 
+        for brk in self.breakers:
+            if brk.run_stat == 0 or brk.status == 0:
+                continue
+            if brk.i_node_obj is None or brk.j_node_obj is None:
+                continue
+            if brk.i_node_obj.isl_obj and brk.j_node_obj.isl_obj and brk.i_node_obj.isl_obj ==  brk.j_node_obj.isl_obj:
+                brk.i_node_obj.isl_obj.breakers.append(brk)
+
         # 检查松弛节点
         for node in self.nodes:
             if node.isl_obj is None:
@@ -436,6 +489,12 @@ class DCPowerNetwork:
                 continue
             zbr.is_alive = zbr.i_node_obj.is_alive and zbr.j_node_obj.is_alive
 
+        for brk in self.breakers:
+            if brk.i_node_obj is None or brk.j_node_obj is None or brk.run_stat == 0 or brk.status == 0:
+                brk.is_alive = False
+                continue
+            brk.is_alive = brk.i_node_obj.is_alive and brk.j_node_obj.is_alive
+
         for sw in self.switches:
             if sw.i_node_obj is None or sw.j_node_obj is None or sw.status == 0 or sw.run_stat == 0:
                 sw.is_alive = False
@@ -472,6 +531,10 @@ class DCPowerNetwork:
             print(f"    zero_branches = {len(isl.zero_branches)}:")
             for zbr in isl.zero_branches:
                 print(f"        {zbr.idx} {zbr.name} i_node = {zbr.i_node} j_node = {zbr.j_node}")
+
+            print(f"    breakers = {len(getattr(isl, 'breakers', []))}:")
+            for brk in getattr(isl, 'breakers', []):
+                print(f"        {brk.idx} {brk.name} i_node = {brk.i_node} j_node = {brk.j_node} status = {brk.status}")
 
             print(f"    dcdc_converters = {len(isl.dcdc_converters)}:")
             for dcc in isl.dcdc_converters:
@@ -514,6 +577,11 @@ class DCPowerNetwork:
                 continue
             check_node(sw.i_node, 'Switch', sw)
             check_node(sw.j_node, 'Switch', sw)
+        for brk in self.breakers:
+            if brk.run_stat == 0 or brk.status == 0:
+                continue
+            check_node(brk.i_node, 'Break', brk)
+            check_node(brk.j_node, 'Break', brk)
         for ld in self.loads:
             if ld.run_stat == 0:
                 continue

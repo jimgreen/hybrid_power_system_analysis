@@ -40,6 +40,7 @@ from ac_array_model import (
     CTRL_SLACK,
     GEN_COLS,
     LOAD_COLS,
+    BREAK_COLS,
     SHUNT_B,
     SHUNT_COLS,
     SHUNT_Q,
@@ -95,7 +96,7 @@ _PSEUDO_MEASUREMENT_SUMMARY_TYPES = {
     "ACGenerator": frozenset(("P_GEN", "Q_GEN")),
     "ACLoad": frozenset(("P_LOAD", "Q_LOAD")),
     "ACZeroBranch": frozenset(("P_FROM", "Q_FROM", "V_FROM", "I_FROM")),
-    "ACSwitch": frozenset(("P_FROM", "Q_FROM", "V_FROM", "I_FROM")),
+    "ACBreak": frozenset(("P_FROM", "Q_FROM", "V_FROM", "I_FROM")),
 }
 
 _OBSERVABILITY_RESULT_CACHE = {}
@@ -128,6 +129,7 @@ class _ACArrayObject:
         "loads",
         "branches",
         "switches",
+        "breakers",
         "zero_branches",
         "transformers",
         "shunt_compensators",
@@ -398,7 +400,7 @@ def _measurement_scale_lookup(
             node = node_by_name.get(device_name)
             return node_scale(node.idx) if node is not None else None
         return 1.0
-    if device_type in {"ACBranch", "ACTransformer", "ACZeroBranch", "ACSwitch"}:
+    if device_type in {"ACBranch", "ACTransformer", "ACZeroBranch", "ACBreak"}:
         device = (
             branch_by_name.get(device_name)
             if device_type == "ACBranch"
@@ -406,7 +408,9 @@ def _measurement_scale_lookup(
             if device_type == "ACTransformer"
             else zero_branch_by_name.get(device_name)
             if device_type == "ACZeroBranch"
-            else switch_by_name.get(device_name)
+            else getattr(scale_context, "break_by_name", {}).get(device_name)
+            if device_type == "ACBreak"
+            else None
         )
         if device is None:
             return None
@@ -469,6 +473,7 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
     network.shunt_compensator_dict = {dev.idx: dev for dev in network.shunt_compensators}
     network.zero_branch_dict = {dev.idx: dev for dev in network.zero_branches}
     network.switch_dict = {dev.idx: dev for dev in network.switches}
+    network.break_dict = {dev.idx: dev for dev in getattr(network, "breakers", [])}
 
     for node in nodes:
         node.isl = 0
@@ -478,6 +483,7 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
         node.loads = []
         node.branches = []
         node.switches = []
+        node.breakers = []
         node.zero_branches = []
         node.transformers = []
         node.shunt_compensators = []
@@ -520,6 +526,8 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
         connect_device(dev)
     for dev in network.zero_branches:
         connect_device(dev)
+    for dev in getattr(network, "breakers", []):
+        connect_device(dev, require_closed=True)
     for dev in network.switches:
         connect_device(dev, require_closed=True)
 
@@ -539,6 +547,7 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
                 branches=[],
                 zero_branches=[],
                 switches=[],
+                breakers=[],
                 transformers=[],
                 shunt_compensators=[],
                 slack_nodes=[],
@@ -616,6 +625,8 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
         finalize_branch_like(dev, "transformers")
     for dev in network.zero_branches:
         finalize_branch_like(dev, "zero_branches")
+    for dev in getattr(network, "breakers", []):
+        finalize_branch_like(dev, "breakers", require_closed=True)
     for dev in network.switches:
         finalize_branch_like(dev, "switches", require_closed=True)
 
@@ -626,8 +637,10 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
     network.alive_load_by_name = {load.name: load for load in network.loads if load.is_alive}
     network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in network.zero_branches if zbr.is_alive}
     network.alive_switch_by_name = {sw.name: sw for sw in network.switches if sw.is_alive}
+    network.alive_break_by_name = {brk.name: brk for brk in getattr(network, "breakers", []) if brk.is_alive}
     network.alive_zero_branches = sorted(network.alive_zero_branch_by_name.values(), key=lambda item: item.idx)
     network.alive_switches = sorted(network.alive_switch_by_name.values(), key=lambda item: item.idx)
+    network.alive_breakers = sorted(network.alive_break_by_name.values(), key=lambda item: item.idx)
     network.alive_generator_order = sorted(network.alive_generator_by_name.values(), key=lambda item: item.idx)
     network.alive_load_order = sorted(network.alive_load_by_name.values(), key=lambda item: item.idx)
 
@@ -726,6 +739,12 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
         ppc["switch_name"],
         SWITCH_COLS,
         {"status": SWITCH_COLS["status"]},
+    )
+    network.breakers = make_branch_like(
+        ppc.get("break", np.zeros((0, len(BREAK_COLS)))),
+        ppc.get("break_name", np.asarray([], dtype=object)),
+        BREAK_COLS,
+        {"status": BREAK_COLS["status"]},
     )
     network.generators = []
     append_gen = network.generators.append
@@ -856,8 +875,10 @@ class ACStateEstimator:
             self.load_by_name = self.network.alive_load_by_name
             self.zero_branch_by_name = self.network.alive_zero_branch_by_name
             self.switch_by_name = self.network.alive_switch_by_name
+            self.break_by_name = self.network.alive_break_by_name
             self.zero_branches = self.network.alive_zero_branches
             self.switches = self.network.alive_switches
+            self.breakers = self.network.alive_breakers
         else:
             self.branch_by_name = {br.name: br for br in self.network.branches if getattr(br, "is_alive", False)}
             self.transformer_by_name = {tr.name: tr for tr in self.network.transformers if getattr(tr, "is_alive", False)}
@@ -869,8 +890,10 @@ class ACStateEstimator:
                 if getattr(zbr, "is_alive", False)
             }
             self.switch_by_name = {sw.name: sw for sw in self.network.switches if getattr(sw, "is_alive", False)}
+            self.break_by_name = {brk.name: brk for brk in getattr(self.network, "breakers", []) if getattr(brk, "is_alive", False)}
             self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
             self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
+            self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
         if hasattr(self.network, "alive_generator_order"):
             self.generator_order = self.network.alive_generator_order
             self.load_order = self.network.alive_load_order
@@ -901,10 +924,14 @@ class ACStateEstimator:
         self.reference_angle_by_pos = self._profile_call("init.reference_angles", self._reference_angle_offsets)
         self._profile_call("init.rebase_angles", self._rebase_angle_measurements)
         self._profile_call("init.zero_tie_layout", self._build_zero_tie_state_layout)
-        self.zero_current_devices = [("Z", zbr) for zbr in self.zero_branches] + [("S", sw) for sw in self.switches]
+        self.zero_current_devices = (
+            [("Z", zbr) for zbr in self.zero_branches]
+            + [("B", brk) for brk in self.breakers]
+        )
         self.zero_current_pos = {(kind, dev.name): pos for pos, (kind, dev) in enumerate(self.zero_current_devices)}
         self.zero_branch_pos = {zbr.name: self.zero_current_pos[("Z", zbr.name)] for zbr in self.zero_branches}
-        self.switch_pos = {sw.name: self.zero_current_pos[("S", sw.name)] for sw in self.switches}
+        self.switch_pos = {}
+        self.break_pos = {brk.name: self.zero_current_pos[("B", brk.name)] for brk in self.breakers}
         self.zero_current_by_node = {pos: [] for pos in range(len(self.nodes))}
         for idx, (_, dev) in enumerate(self.zero_current_devices):
             if dev.i_node in self.node_pos:
@@ -1255,7 +1282,7 @@ class ACStateEstimator:
             "ACNode": self.node_by_name,
             "ACBranch": self.branch_by_name,
             "ACTransformer": self.transformer_by_name,
-            "ACSwitch": self.switch_by_name,
+            "ACBreak": self.break_by_name,
             "ACZeroBranch": self.zero_branch_by_name,
             "ACGenerator": self.generator_by_name,
             "ACLoad": self.load_by_name,
@@ -1264,7 +1291,10 @@ class ACStateEstimator:
         if table is not None and len(table.device_type) == len(self.measurements):
             for row in np.flatnonzero(np.asarray(table.valid, dtype=bool) & (np.asarray(table.weight, dtype=np.float64) > 0.0)):
                 meas = self.measurements[int(row)]
-                if meas.device_type in ("ACZeroBranchConstraint", "ACSwitchConstraint"):
+                if meas.device_type in ("ACSwitch", "ACSwitchConstraint"):
+                    meas.valid = False
+                    continue
+                if meas.device_type in ("ACZeroBranchConstraint", "ACBreakConstraint"):
                     meas.valid = False
                     continue
                 devices = device_maps.get(meas.device_type)
@@ -1274,7 +1304,10 @@ class ACStateEstimator:
         for meas in self.measurements:
             if not meas.valid or meas.weight <= 0.0:
                 continue
-            if meas.device_type in ("ACZeroBranchConstraint", "ACSwitchConstraint"):
+            if meas.device_type in ("ACSwitch", "ACSwitchConstraint"):
+                meas.valid = False
+                continue
+            if meas.device_type in ("ACZeroBranchConstraint", "ACBreakConstraint"):
                 meas.valid = False
                 continue
             devices = device_maps.get(meas.device_type)
@@ -1333,8 +1366,8 @@ class ACStateEstimator:
             return self._terminal_measurement_scale(meas, self.transformer_by_name[meas.device_name])
         if meas.device_type == "ACZeroBranch":
             return self._terminal_measurement_scale(meas, self.zero_branch_by_name[meas.device_name])
-        if meas.device_type == "ACSwitch":
-            return self._terminal_measurement_scale(meas, self.switch_by_name[meas.device_name])
+        if meas.device_type == "ACBreak":
+            return self._terminal_measurement_scale(meas, self.break_by_name[meas.device_name])
         if meas.device_type == "ACGenerator":
             gen = self.generator_by_name[meas.device_name]
             if meas.meas_type in ("P_GEN", "Q_GEN"):
@@ -1429,14 +1462,14 @@ class ACStateEstimator:
             )
             for name, device in self.zero_branch_by_name.items()
         }
-        switch_terminal_scale_by_name = {
+        break_terminal_scale_by_name = {
             name: (
                 voltage_scale_by_node[device.i_node],
                 current_scale_by_node[device.i_node],
                 voltage_scale_by_node[device.j_node],
                 current_scale_by_node[device.j_node],
             )
-            for name, device in self.switch_by_name.items()
+            for name, device in self.break_by_name.items()
         }
         generator_node_scale_by_name = {
             name: (voltage_scale_by_node[gen.node], current_scale_by_node[gen.node])
@@ -1451,7 +1484,7 @@ class ACStateEstimator:
             "ACBranch": branch_terminal_scale_by_name,
             "ACTransformer": transformer_terminal_scale_by_name,
             "ACZeroBranch": zero_branch_terminal_scale_by_name,
-            "ACSwitch": switch_terminal_scale_by_name,
+            "ACBreak": break_terminal_scale_by_name,
         }
         active_device_keys = set()
         active_measurement_keys = set()
@@ -1513,7 +1546,7 @@ class ACStateEstimator:
                 valid_array[pos] = False
                 meas.valid = False
                 continue
-            elif device_type == "ACSwitchConstraint":
+            elif device_type == "ACBreakConstraint":
                 valid_array[pos] = False
                 meas.valid = False
                 continue
@@ -1684,8 +1717,8 @@ class ACStateEstimator:
                 dev = self.transformer_by_name.get(meas.device_name)
             elif meas.device_type == "ACZeroBranch":
                 dev = self.zero_branch_by_name.get(meas.device_name)
-            elif meas.device_type == "ACSwitch":
-                dev = self.switch_by_name.get(meas.device_name)
+            elif meas.device_type == "ACBreak":
+                dev = self.break_by_name.get(meas.device_name)
             else:
                 dev = None
             if dev is not None:
@@ -1707,7 +1740,7 @@ class ACStateEstimator:
 
         for device_type, devices in (
             ("ACZeroBranch", self.zero_branches),
-            ("ACSwitch", self.switches),
+            ("ACBreak", self.breakers),
         ):
             for dev in devices:
                 voltage = float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0)
@@ -1902,7 +1935,7 @@ class ACStateEstimator:
         device_maps = {
             "ACBranch": self.branch_by_name,
             "ACTransformer": self.transformer_by_name,
-            "ACSwitch": self.switch_by_name,
+            "ACBreak": self.break_by_name,
             "ACZeroBranch": self.zero_branch_by_name,
             "ACGenerator": self.generator_by_name,
             "ACLoad": self.load_by_name,
@@ -2158,12 +2191,12 @@ class ACStateEstimator:
             next_idx, added_p_to = add("ACZeroBranch", name, "P_TO", -float(getattr(dev, "p", 0.0) or 0.0))
             next_idx, added_q_to = add("ACZeroBranch", name, "Q_TO", -float(getattr(dev, "q", 0.0) or 0.0))
             return next_idx, added_p + added_q + added_p_to + added_q_to
-        if prefix in ("I_S_RE", "I_S_IM") and name in self.switch_by_name:
-            dev = self.switch_by_name[name]
-            next_idx, added_p = add("ACSwitch", name, "P_FROM", float(getattr(dev, "p", 0.0) or 0.0))
-            next_idx, added_q = add("ACSwitch", name, "Q_FROM", float(getattr(dev, "q", 0.0) or 0.0))
-            next_idx, added_p_to = add("ACSwitch", name, "P_TO", -float(getattr(dev, "p", 0.0) or 0.0))
-            next_idx, added_q_to = add("ACSwitch", name, "Q_TO", -float(getattr(dev, "q", 0.0) or 0.0))
+        if prefix in ("I_B_RE", "I_B_IM") and name in self.break_by_name:
+            dev = self.break_by_name[name]
+            next_idx, added_p = add("ACBreak", name, "P_FROM", float(getattr(dev, "p", 0.0) or 0.0))
+            next_idx, added_q = add("ACBreak", name, "Q_FROM", float(getattr(dev, "q", 0.0) or 0.0))
+            next_idx, added_p_to = add("ACBreak", name, "P_TO", -float(getattr(dev, "p", 0.0) or 0.0))
+            next_idx, added_q_to = add("ACBreak", name, "Q_TO", -float(getattr(dev, "q", 0.0) or 0.0))
             return next_idx, added_p + added_q + added_p_to + added_q_to
         if prefix in ("P_GEN", "Q_GEN") and name in self.generator_by_name:
             p, q = self._generator_pseudo_power(self.generator_by_name[name])
@@ -2182,7 +2215,7 @@ class ACStateEstimator:
             for meas in self.measurements
             if meas.valid
             and meas.weight > 0.0
-            and meas.device_type in ("ACZeroBranchConstraint", "ACSwitchConstraint")
+            and meas.device_type in ("ACZeroBranchConstraint", "ACBreakConstraint")
         }
         next_idx = self._next_measurement_idx()
         weight = 10.0
@@ -2191,8 +2224,8 @@ class ACStateEstimator:
             for zbr in sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
         ]
         ideal_devices.extend(
-            ("ACSwitchConstraint", sw)
-            for sw in sorted(self.switch_by_name.values(), key=lambda item: item.idx)
+            ("ACBreakConstraint", brk)
+            for brk in sorted(self.break_by_name.values(), key=lambda item: item.idx)
         )
         for device_type, dev in ideal_devices:
             for meas_type in ("V_DIFF",):
@@ -2263,6 +2296,7 @@ class ACStateEstimator:
             self.transformer_by_name.values(),
             self.zero_branch_by_name.values(),
             self.switch_by_name.values(),
+            self.break_by_name.values(),
         )
         for devices in device_groups:
             for dev in devices:
@@ -2353,7 +2387,7 @@ class ACStateEstimator:
             if root_l != root_r:
                 parent[root_r] = root_l
 
-        for dev in [*self.zero_branches, *self.switches]:
+        for dev in [*self.zero_branches, *self.switches, *self.breakers]:
             if dev.i_node in self.node_pos and dev.j_node in self.node_pos:
                 union(self.node_pos[dev.i_node], self.node_pos[dev.j_node])
 
@@ -3241,18 +3275,18 @@ class ACStateEstimator:
                     values[row] = theta[self.node_pos[zbr.i_node]] - theta[self.node_pos[zbr.j_node]]
                 else:
                     raise RuntimeError(f"Unsupported ACZeroBranchConstraint measurement type: {mtype}")
-            elif device_type == "ACSwitchConstraint":
-                sw = self.switch_by_name[device_name]
+            elif device_type == "ACBreakConstraint":
+                brk = self.break_by_name[device_name]
                 if mtype == "V_DIFF":
-                    values[row] = voltage[self.node_pos[sw.i_node]] - voltage[self.node_pos[sw.j_node]]
+                    values[row] = voltage[self.node_pos[brk.i_node]] - voltage[self.node_pos[brk.j_node]]
                 elif mtype in ("ANGLE_DIFF", "THETA_DIFF"):
-                    values[row] = theta[self.node_pos[sw.i_node]] - theta[self.node_pos[sw.j_node]]
+                    values[row] = theta[self.node_pos[brk.i_node]] - theta[self.node_pos[brk.j_node]]
                 else:
-                    raise RuntimeError(f"Unsupported ACSwitchConstraint measurement type: {mtype}")
-            elif device_type == "ACSwitch":
-                sw = self.switch_by_name[device_name]
-                current = switch_current[self.switch_pos[sw.name]]
-                values[row] = self._zero_current_measurement_value(sw, current, mtype, voltage, voltage_complex)
+                    raise RuntimeError(f"Unsupported ACBreakConstraint measurement type: {mtype}")
+            elif device_type == "ACBreak":
+                brk = self.break_by_name[device_name]
+                current = switch_current[self.break_pos[brk.name]]
+                values[row] = self._zero_current_measurement_value(brk, current, mtype, voltage, voltage_complex)
             elif device_type == "ACPowerBalance":
                 pos = self.node_pos[self.node_by_name[device_name].idx]
                 p_balance, q_balance = self._power_balance_totals(x, voltage_complex, switch_current)
@@ -3314,7 +3348,7 @@ class ACStateEstimator:
             if active_plan is not None:
                 return active_plan
             table = self.active_measurement_table
-            rows = self._active_measurement_rows_for_types(("ACZeroBranch", "ACSwitch"))
+            rows = self._active_measurement_rows_for_types(("ACZeroBranch", "ACBreak"))
             handled_mask = np.zeros(len(table.idx), dtype=bool)
             scalar_rows, scalar_cols, scalar_values = [], [], []
             voltage_rows, voltage_pos = [], []
@@ -3329,9 +3363,11 @@ class ACStateEstimator:
                 if dtype == "ACZeroBranch":
                     device = self.zero_branch_by_name[name]
                     current_position = self.zero_branch_pos[device.name]
+                elif dtype == "ACBreak":
+                    device = self.break_by_name[name]
+                    current_position = self.break_pos[device.name]
                 else:
-                    device = self.switch_by_name[name]
-                    current_position = self.switch_pos[device.name]
+                    continue
                 if dtype == "ACZeroBranch" and mtype == "V_DIFF":
                     i = self.node_pos[device.i_node]
                     j = self.node_pos[device.j_node]
@@ -3425,13 +3461,13 @@ class ACStateEstimator:
             scalar_cols.append(col)
             scalar_values.append(value)
 
-        for row, meas in self._measurement_rows_for_types(measurements, ("ACZeroBranch", "ACSwitch")):
+        for row, meas in self._measurement_rows_for_types(measurements, ("ACZeroBranch", "ACBreak")):
             if meas.device_type == "ACZeroBranch":
                 device = self.zero_branch_by_name[meas.device_name]
                 current_position = self.zero_branch_pos[device.name]
-            elif meas.device_type == "ACSwitch":
-                device = self.switch_by_name[meas.device_name]
-                current_position = self.switch_pos[device.name]
+            elif meas.device_type == "ACBreak":
+                device = self.break_by_name[meas.device_name]
+                current_position = self.break_pos[device.name]
             else:
                 continue
 
@@ -3885,7 +3921,7 @@ class ACStateEstimator:
                 return active_plan
             table = self.active_measurement_table
             rows = self._active_measurement_rows_for_types(
-                ("ACNode", "ACGenerator", "ACLoad", "ACZeroBranchConstraint", "ACSwitchConstraint"),
+                ("ACNode", "ACGenerator", "ACLoad", "ACZeroBranchConstraint", "ACBreakConstraint"),
             )
             handled = np.zeros(len(table.idx), dtype=bool)
             scalar_rows, scalar_cols, scalar_values = [], [], []
@@ -3943,8 +3979,12 @@ class ACStateEstimator:
                         load_index.append(self.load_state_index_by_name[load.name])
                         load_kind.append({"P_LOAD": 0, "Q_LOAD": 1, "I_LOAD": 2}[mtype])
                         handled[row] = True
-                elif dtype in ("ACZeroBranchConstraint", "ACSwitchConstraint"):
-                    device = self.zero_branch_by_name[name] if dtype == "ACZeroBranchConstraint" else self.switch_by_name[name]
+                elif dtype in ("ACZeroBranchConstraint", "ACBreakConstraint"):
+                    device = (
+                        self.zero_branch_by_name[name]
+                        if dtype == "ACZeroBranchConstraint"
+                        else self.break_by_name[name]
+                    )
                     i = self.node_pos[device.i_node]
                     j = self.node_pos[device.j_node]
                     if mtype == "V_DIFF":
@@ -4005,7 +4045,7 @@ class ACStateEstimator:
 
         for row, meas in self._measurement_rows_for_types(
             measurements,
-            ("ACNode", "ACGenerator", "ACLoad", "ACZeroBranchConstraint", "ACSwitchConstraint"),
+            ("ACNode", "ACGenerator", "ACLoad", "ACZeroBranchConstraint", "ACBreakConstraint"),
         ):
             mtype = meas.meas_type
             if meas.device_type == "ACNode":
@@ -4045,11 +4085,11 @@ class ACStateEstimator:
                     load_kind.append({"P_LOAD": 0, "Q_LOAD": 1, "I_LOAD": 2}[mtype])
                     handled[row] = True
 
-            elif meas.device_type in ("ACZeroBranchConstraint", "ACSwitchConstraint"):
+            elif meas.device_type in ("ACZeroBranchConstraint", "ACBreakConstraint"):
                 device = (
                     self.zero_branch_by_name[meas.device_name]
                     if meas.device_type == "ACZeroBranchConstraint"
-                    else self.switch_by_name[meas.device_name]
+                    else self.break_by_name[meas.device_name]
                 )
                 i = self.node_pos[device.i_node]
                 j = self.node_pos[device.j_node]
@@ -5311,31 +5351,31 @@ class ACStateEstimator:
                 else:
                     raise RuntimeError(f"Unsupported ACZeroBranchConstraint measurement type: {mtype}")
 
-            elif device_type == "ACSwitchConstraint":
-                sw = self.switch_by_name[device_name]
+            elif device_type == "ACBreakConstraint":
+                brk = self.break_by_name[device_name]
                 if mtype == "V_DIFF":
-                    H[row, self.voltage_col[self.node_pos[sw.i_node]]] = 1.0
-                    H[row, self.voltage_col[self.node_pos[sw.j_node]]] = -1.0
+                    H[row, self.voltage_col[self.node_pos[brk.i_node]]] = 1.0
+                    H[row, self.voltage_col[self.node_pos[brk.j_node]]] = -1.0
                 elif mtype in ("ANGLE_DIFF", "THETA_DIFF"):
-                    i_col = self.angle_col[self.node_pos[sw.i_node]]
-                    j_col = self.angle_col[self.node_pos[sw.j_node]]
+                    i_col = self.angle_col[self.node_pos[brk.i_node]]
+                    j_col = self.angle_col[self.node_pos[brk.j_node]]
                     if i_col >= 0:
                         H[row, i_col] = 1.0
                     if j_col >= 0:
                         H[row, j_col] = -1.0
                 else:
-                    raise RuntimeError(f"Unsupported ACSwitchConstraint measurement type: {mtype}")
+                    raise RuntimeError(f"Unsupported ACBreakConstraint measurement type: {mtype}")
 
-            elif device_type == "ACSwitch":
-                sw = self.switch_by_name[device_name]
-                sw_idx = self.switch_pos[sw.name]
+            elif device_type == "ACBreak":
+                brk = self.break_by_name[device_name]
+                brk_idx = self.break_pos[brk.name]
                 self._add_zero_current_measurement_derivatives(
                     H,
                     row,
                     mtype,
-                    sw,
-                    switch_current[sw_idx],
-                    sw_idx,
+                    brk,
+                    switch_current[brk_idx],
+                    brk_idx,
                     voltage_complex,
                     voltage,
                 )

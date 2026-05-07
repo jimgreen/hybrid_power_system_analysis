@@ -27,6 +27,10 @@ DEVICE_TYPE_CODES = {
     "DCDCConverter": 19,
     "DCACConverter": 20,
     "ACACConverter": 21,
+    "ACBreak": 22,
+    "ACBreakConstraint": 23,
+    "DCBreak": 24,
+    "DCBreakConstraint": 25,
 }
 
 TERMINAL_MEASUREMENT_KIND = {"P_FROM": 0, "V_FROM": 1, "I_FROM": 2, "P_TO": 3, "V_TO": 4, "I_TO": 5}

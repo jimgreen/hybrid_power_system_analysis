@@ -133,6 +133,7 @@ SWITCH_COLS = {
     "q": 6,
     "current": 7,
 }
+BREAK_COLS = SWITCH_COLS
 
 _AC_PPC_CACHE = {}
 _AC_PPC_CACHE_LOCK = threading.Lock()
@@ -568,38 +569,38 @@ def build_ac_ppc_from_e_file(
         else None
     )
 
-    switch_rows = _rows(raw, "ACSwitch")
-    switch_cols = _columns(raw, "ACSwitch")
-    switch_name_col = switch_cols.get("name")
-    switch = np.zeros((len(switch_rows), len(SWITCH_COLS)), dtype=np.float64)
-    if switch_rows:
-        switch_idx_col = switch_cols["idx"]
-        switch_i_col = switch_cols["i_node"]
-        switch_j_col = switch_cols["j_node"]
-        switch_status_col = switch_cols["status"]
-        switch_run_col = switch_cols["run_stat"]
-        switch_table = _row_array(switch_rows)
-        switch_numeric = _numeric_columns(
-            switch_table,
-            (switch_idx_col, switch_i_col, switch_j_col, switch_status_col, switch_run_col),
-            (0.0, 0.0, 0.0, 1.0, 1.0),
+    def build_switch_like(block: str):
+        rows = _rows(raw, block)
+        cols = _columns(raw, block)
+        name_col = cols.get("name")
+        array = np.zeros((len(rows), len(SWITCH_COLS)), dtype=np.float64)
+        if rows:
+            table = _row_array(rows)
+            numeric = _numeric_columns(
+                table,
+                (cols["idx"], cols["i_node"], cols["j_node"], cols["status"], cols["run_stat"]),
+                (0.0, 0.0, 0.0, 1.0, 1.0),
+            )
+            array[:, SWITCH_COLS["idx"]] = numeric[:, 0]
+            array[:, SWITCH_COLS["i_node"]] = numeric[:, 1]
+            array[:, SWITCH_COLS["j_node"]] = numeric[:, 2]
+            array[:, SWITCH_COLS["status"]] = numeric[:, 3]
+            array[:, SWITCH_COLS["run_stat"]] = numeric[:, 4]
+        names = (
+            np.asarray(
+                [
+                    row[name_col] if name_col is not None and row[name_col] else f"{block.lower()}_{pos}"
+                    for pos, row in enumerate(rows)
+                ],
+                dtype=object,
+            )
+            if include_device_names
+            else None
         )
-        switch[:, SWITCH_COLS["idx"]] = switch_numeric[:, 0]
-        switch[:, SWITCH_COLS["i_node"]] = switch_numeric[:, 1]
-        switch[:, SWITCH_COLS["j_node"]] = switch_numeric[:, 2]
-        switch[:, SWITCH_COLS["status"]] = switch_numeric[:, 3]
-        switch[:, SWITCH_COLS["run_stat"]] = switch_numeric[:, 4]
-    switch_names = (
-        np.asarray(
-            [
-                row[switch_name_col] if switch_name_col is not None and row[switch_name_col] else f"switch_{pos}"
-                for pos, row in enumerate(switch_rows)
-            ],
-            dtype=object,
-        )
-        if include_device_names
-        else None
-    )
+        return rows, cols, array, names
+
+    switch_rows, switch_cols, switch, switch_names = build_switch_like("ACSwitch")
+    break_rows, break_cols, break_array, break_names = build_switch_like("ACBreak")
 
     ppc = {
         "format": "ac_ppc_v1",
@@ -613,6 +614,7 @@ def build_ac_ppc_from_e_file(
         "shunt": shunt,
         "zero_branch": zero_branch,
         "switch": switch,
+        "break": break_array,
         "bus_name": bus_names,
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
@@ -622,6 +624,7 @@ def build_ac_ppc_from_e_file(
         "shunt_cols": SHUNT_COLS,
         "zero_branch_cols": ZERO_BRANCH_COLS,
         "switch_cols": SWITCH_COLS,
+        "break_cols": BREAK_COLS,
         "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
     }
@@ -635,6 +638,7 @@ def build_ac_ppc_from_e_file(
                 "shunt_name": shunt_names,
                 "zero_branch_name": zero_branch_names,
                 "switch_name": switch_names,
+                "break_name": break_names,
             }
         )
     if use_cache:

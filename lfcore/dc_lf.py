@@ -122,12 +122,13 @@ try:
         DCDC_COLS as DC_DCDC_COLS,
         GEN_COLS as DC_GEN_COLS,
         LOAD_COLS as DC_LOAD_COLS,
+        BREAK_COLS as DC_BREAK_COLS,
         SWITCH_COLS as DC_SWITCH_COLS,
         ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
     )
 except Exception:
     DC_BRANCH_COLS = DC_BUS_COLS = DC_DCDC_COLS = DC_GEN_COLS = DC_LOAD_COLS = None
-    DC_SWITCH_COLS = DC_ZERO_BRANCH_COLS = None
+    DC_BREAK_COLS = DC_SWITCH_COLS = DC_ZERO_BRANCH_COLS = None
     DC_CTRL_P = 0
     DC_CTRL_V = 1
     DC_CTRL_I = 2
@@ -484,6 +485,26 @@ class DCPowerFlowCalc:
                 (str(tp), int(dev_idx), int(i_node), int(j_node))
                 for tp, dev_idx, i_node, j_node in zero_parts
             ]
+            breaker = self.ppc.get("break")
+            if breaker is not None and breaker.size:
+                break_i_all = self._map_nodes_with_lookup(breaker[:, DC_BREAK_COLS["i_node"]], node_lookup)
+                break_j_all = self._map_nodes_with_lookup(breaker[:, DC_BREAK_COLS["j_node"]], node_lookup)
+                break_mask = (
+                    (breaker[:, DC_BREAK_COLS["run_stat"]] == 1)
+                    & (breaker[:, DC_BREAK_COLS["status"]] == 1)
+                    & (break_i_all >= 0)
+                    & (break_j_all >= 0)
+                )
+                if np.any(break_mask):
+                    self.zero_edges.extend(
+                        (str(tp), int(dev_idx), int(i_node), int(j_node))
+                        for tp, dev_idx, i_node, j_node in zip(
+                            np.repeat("B", int(np.count_nonzero(break_mask))),
+                            np.nonzero(break_mask)[0].astype(np.int32),
+                            break_i_all[break_mask],
+                            break_j_all[break_mask],
+                        )
+                    )
         else:
             self.zero_edges = [
                 ('Z', zb_idx, self.alive_node_dict[zb.i_node], self.alive_node_dict[zb.j_node])
@@ -499,6 +520,15 @@ class DCPowerFlowCalc:
                     and sw.j_node in self.alive_node_dict
                 ):
                     self.zero_edges.append(('S', sw_idx, self.alive_node_dict[sw.i_node], self.alive_node_dict[sw.j_node]))
+            for brk_idx, brk in enumerate(getattr(self.model, "breakers", [])):
+                if (
+                    brk.is_alive
+                    and brk.status == 1
+                    and brk.run_stat == 1
+                    and brk.i_node in self.alive_node_dict
+                    and brk.j_node in self.alive_node_dict
+                ):
+                    self.zero_edges.append(('B', brk_idx, self.alive_node_dict[brk.i_node], self.alive_node_dict[brk.j_node]))
 
         zero_adj = [[] for _ in range(self.N)]
         for edge_idx, (_, _, i_node, j_node) in enumerate(self.zero_edges):
@@ -1062,6 +1092,12 @@ class DCPowerFlowCalc:
                 sw.current = current
                 sw.p = V_final[i_node] * current
                 P_inj[i_node] += sw.p
+                P_inj[j_node] -= V_final[j_node] * current
+            if tp == 'B':
+                brk = self.model.breakers[zb_idx]
+                brk.current = current
+                brk.p = V_final[i_node] * current
+                P_inj[i_node] += brk.p
                 P_inj[j_node] -= V_final[j_node] * current
 
         # 负荷

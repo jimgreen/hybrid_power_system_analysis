@@ -12,6 +12,7 @@ class ACIsl:
         self.branches = []
         self.zero_branches = []
         self.switches = []
+        self.breakers = []
         self.slack_nodes = []
         self.v_gens = []
 
@@ -120,6 +121,10 @@ class ACSwitch:
         self.j_node_obj = None
 
 
+class ACBreak(ACSwitch):
+    pass
+
+
 class ACTransformer:
     def __init__(self, idx, i_node, j_node, r, x, tap, shift, b=0.0, run_stat=1):
         self.idx = idx
@@ -153,6 +158,7 @@ _AC_DIRECT_TABLES = {
     "ACShuntCompensator",
     "ACZeroBranch",
     "ACSwitch",
+    "ACBreak",
     "ACTransformer",
 }
 
@@ -237,6 +243,7 @@ _AC_DIRECT_CLASS_BY_TABLE = {
     "ACShuntCompensator": ACShuntCompensator,
     "ACZeroBranch": ACZeroBranch,
     "ACSwitch": ACSwitch,
+    "ACBreak": ACBreak,
     "ACTransformer": ACTransformer,
 }
 
@@ -332,6 +339,19 @@ _AC_DIRECT_DEFAULT_ATTRS = {
         "j_node_obj": None,
     },
     "ACSwitch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "status": 1,
+        "run_stat": 1,
+        "p": None,
+        "q": None,
+        "current": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "ACBreak": {
         "idx": 0,
         "name": "",
         "i_node": 0,
@@ -499,12 +519,14 @@ class ACPowerNetwork:
         self.generators = []
         self.zero_branches = []
         self.switches = []
+        self.breakers = []
         self.transformers = []
         self.shunt_compensators = []
         self.islands = []
 
         self.node_dict = {}
         self.switch_dict = {}
+        self.break_dict = {}
         self.load_dict = {}
         self.generator_dict = {}
         self.zero_branch_dict = {}
@@ -542,6 +564,11 @@ class ACPowerNetwork:
         self.switches.append(sw)
         return sw
 
+    def add_break(self, idx, i_node, j_node, status, run_stat=1):
+        brk = ACBreak(idx, i_node, j_node, status, run_stat)
+        self.breakers.append(brk)
+        return brk
+
     def add_transformer(self, idx, i_node, j_node, r, x, tap, shift, b=0.0, run_stat=1):
         trfm = ACTransformer(idx, i_node, j_node, r, x, tap, shift, b, run_stat)
         self.transformers.append(trfm)
@@ -559,11 +586,13 @@ class ACPowerNetwork:
         self.generators = getattr(self.model, 'ACGenerator', [])
         self.loads = getattr(self.model, 'ACLoad', [])
         self.switches = getattr(self.model, 'ACSwitch', [])
+        self.breakers = getattr(self.model, 'ACBreak', [])
         self.zero_branches = getattr(self.model, 'ACZeroBranch', [])
         self.transformers = getattr(self.model, 'ACTransformer', [])
         self.shunt_compensators = getattr(self.model, 'ACShuntCompensator', [])
         self.node_dict = {}
         self.switch_dict = {}
+        self.break_dict = {}
         self.load_dict = {}
         self.generator_dict = {}
         self.zero_branch_dict = {}
@@ -580,6 +609,7 @@ class ACPowerNetwork:
         # 建立节点索引到节点对象的映射
         self.node_dict = {node.idx: node for node in self.nodes}
         self.switch_dict = {sw.idx: sw for sw in self.switches}
+        self.break_dict = {brk.idx: brk for brk in self.breakers}
         self.load_dict = {ld.idx: ld for ld in self.loads}
         self.generator_dict = {gen.idx: gen for gen in self.generators}
         self.zero_branch_dict = {zbr.idx: zbr for zbr in self.zero_branches}
@@ -592,6 +622,7 @@ class ACPowerNetwork:
             node.loads = []
             node.branches = []
             node.switches = []
+            node.breakers = []
             node.zero_branches = []
             node.transformers = []
             node.shunt_compensators = []
@@ -635,6 +666,14 @@ class ACPowerNetwork:
                 sw.i_node_obj.switches.append(sw)
             if sw.j_node_obj:
                 sw.j_node_obj.switches.append(sw)
+
+        for brk in self.breakers:
+            brk.i_node_obj = self.node_dict.get(brk.i_node, None)
+            brk.j_node_obj = self.node_dict.get(brk.j_node, None)
+            if brk.i_node_obj:
+                brk.i_node_obj.breakers.append(brk)
+            if brk.j_node_obj:
+                brk.j_node_obj.breakers.append(brk)
 
         for zbr in self.zero_branches:
             zbr.i_node_obj = self.node_dict.get(zbr.i_node, None)
@@ -694,6 +733,9 @@ class ACPowerNetwork:
         # 添加零阻抗支路（zero_branches）
         for dev in self.zero_branches:
             add_edge(dev)
+        for dev in self.breakers:
+            if dev.status == 1:
+                add_edge(dev)
 
         # 添加开关（switches），仅考虑闭合状态（status == 1）
         for dev in self.switches:
@@ -731,6 +773,7 @@ class ACPowerNetwork:
             isl.branches = []
             isl.zero_branches = []
             isl.switches = []
+            isl.breakers = []
             isl.transformers = []
             isl.shunt_compensators = []
 
@@ -806,6 +849,14 @@ class ACPowerNetwork:
             if zbr.i_node_obj.isl_obj and zbr.j_node_obj.isl_obj and zbr.i_node_obj.isl_obj ==  zbr.j_node_obj.isl_obj:
                 zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
 
+        for brk in self.breakers:
+            if brk.run_stat == 0 or brk.status == 0:
+                continue
+            if brk.i_node_obj is None or brk.j_node_obj is None:
+                continue
+            if brk.i_node_obj.isl_obj and brk.j_node_obj.isl_obj and brk.i_node_obj.isl_obj == brk.j_node_obj.isl_obj:
+                brk.i_node_obj.isl_obj.breakers.append(brk)
+
         for isl in self.islands:
             if len(isl.slack_nodes)  >= 1:
                 isl.is_alive = True
@@ -858,6 +909,12 @@ class ACPowerNetwork:
                 zbr.is_alive = False
                 continue
             zbr.is_alive = zbr.i_node_obj.is_alive and zbr.j_node_obj.is_alive
+
+        for brk in self.breakers:
+            if brk.i_node_obj is None or brk.j_node_obj is None or brk.run_stat == 0 or brk.status == 0:
+                brk.is_alive = False
+                continue
+            brk.is_alive = brk.i_node_obj.is_alive and brk.j_node_obj.is_alive
 
         for sw in self.switches:
             if sw.i_node_obj is None or sw.j_node_obj is None or sw.status == 0 or sw.run_stat == 0:
@@ -939,6 +996,12 @@ class ACPowerNetwork:
             check_node(zb.i_node, 'ZeroBranch', zb)
             check_node(zb.j_node, 'ZeroBranch', zb)
 
+        for brk in self.breakers:
+            if brk.run_stat == 0 or brk.status == 0:
+                continue
+            check_node(brk.i_node, 'Break', brk)
+            check_node(brk.j_node, 'Break', brk)
+
         for sw in self.switches:
             if sw.run_stat == 0:
                 continue
@@ -1003,6 +1066,17 @@ class ACPowerNetwork:
                 str_info = f" 零阻抗支路 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
                 errors.append(str_info)
 
+        for dev in self.breakers:
+            if dev.run_stat != 1 or dev.status != 1:
+                continue
+            if dev.i_node_obj is None or dev.j_node_obj is None:
+                continue
+            if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
+                continue
+            if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
+                str_info = f" 断路器 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
+                errors.append(str_info)
+
         # 检查每个岛屿
         for isl in self.islands:
             # 电压控制源唯一性（松弛节点或定V发电机）
@@ -1044,8 +1118,10 @@ class ACPowerNetwork:
             return False
         slack_ids = {node.idx for node in slack_nodes}
         adj = {node.idx: set() for node in slack_nodes}
-        for zbr in self.zero_branches:
+        for zbr in [*self.zero_branches, *self.breakers]:
             if getattr(zbr, "run_stat", 1) != 1:
+                continue
+            if isinstance(zbr, ACBreak) and getattr(zbr, "status", 1) != 1:
                 continue
             if zbr.i_node in slack_ids and zbr.j_node in slack_ids:
                 adj[zbr.i_node].add(zbr.j_node)

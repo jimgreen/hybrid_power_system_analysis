@@ -124,6 +124,9 @@ class HybridStateEstimator:
         self.ac_switch_by_name = {
             sw.name: sw for sw in self.network.ac.switches if getattr(sw, "is_alive", False)
         }
+        self.ac_break_by_name = {
+            brk.name: brk for brk in getattr(self.network.ac, "breakers", []) if getattr(brk, "is_alive", False)
+        }
         self.ac_zero_branch_by_name = {
             zbr.name: zbr for zbr in self.network.ac.zero_branches if getattr(zbr, "is_alive", False)
         }
@@ -138,6 +141,9 @@ class HybridStateEstimator:
         }
         self.dc_switch_by_name = {
             sw.name: sw for sw in self.network.dc.switches if getattr(sw, "is_alive", False)
+        }
+        self.dc_break_by_name = {
+            brk.name: brk for brk in getattr(self.network.dc, "breakers", []) if getattr(brk, "is_alive", False)
         }
         self.dc_zero_branch_by_name = {
             zbr.name: zbr for zbr in self.network.dc.zero_branches if getattr(zbr, "is_alive", False)
@@ -217,14 +223,17 @@ class HybridStateEstimator:
             "ACBranch": self.ac_branch_by_name,
             "ACTransformer": self.ac_transformer_by_name,
             "ACSwitch": self.ac_switch_by_name,
+            "ACBreak": self.ac_break_by_name,
             "ACZeroBranch": self.ac_zero_branch_by_name,
             "ACGenerator": self.ac_generator_by_name,
             "ACLoad": self.ac_load_by_name,
             "DCBranch": self.dc_branch_by_name,
             "DCSwitch": self.dc_switch_by_name,
+            "DCBreak": self.dc_break_by_name,
             "DCZeroBranch": self.dc_zero_branch_by_name,
             "DCZeroBranchConstraint": self.dc_zero_branch_by_name,
             "DCSwitchConstraint": self.dc_switch_by_name,
+            "DCBreakConstraint": self.dc_break_by_name,
             "DCGenerator": self.dc_generator_by_name,
             "DCLoad": self.dc_load_by_name,
             "DCDCConverter": self.dcdc_by_name,
@@ -410,12 +419,16 @@ class HybridStateEstimator:
                 scale = ac_terminal_scale(meas, self.ac_transformer_by_name[meas.device_name])
             elif meas.device_type == "ACSwitch":
                 scale = ac_terminal_scale(meas, self.ac_switch_by_name[meas.device_name])
+            elif meas.device_type == "ACBreak":
+                scale = ac_terminal_scale(meas, self.ac_break_by_name[meas.device_name])
             elif meas.device_type == "ACZeroBranch":
                 scale = ac_terminal_scale(meas, self.ac_zero_branch_by_name[meas.device_name])
             elif meas.device_type == "DCBranch":
                 scale = dc_terminal_scale(meas, self.dc_branch_by_name[meas.device_name])
             elif meas.device_type == "DCSwitch":
                 scale = dc_terminal_scale(meas, self.dc_switch_by_name[meas.device_name])
+            elif meas.device_type == "DCBreak":
+                scale = dc_terminal_scale(meas, self.dc_break_by_name[meas.device_name])
             elif meas.device_type == "DCZeroBranch":
                 scale = dc_terminal_scale(meas, self.dc_zero_branch_by_name[meas.device_name])
             elif meas.device_type == "DCZeroBranchConstraint":
@@ -424,6 +437,9 @@ class HybridStateEstimator:
             elif meas.device_type == "DCSwitchConstraint":
                 if mtype == "V_DIFF":
                     scale = self._dc_voltage_file_base(self.dc_switch_by_name[meas.device_name].i_node)
+            elif meas.device_type == "DCBreakConstraint":
+                if mtype == "V_DIFF":
+                    scale = self._dc_voltage_file_base(self.dc_break_by_name[meas.device_name].i_node)
             elif meas.device_type == "DCDCConverter":
                 scale = dc_terminal_scale(meas, self.dcdc_by_name[meas.device_name])
             elif meas.device_type == "ACGenerator":
@@ -598,6 +614,8 @@ class HybridStateEstimator:
                 dev = self.ac_zero_branch_by_name.get(meas.device_name)
             elif meas.device_type == "ACSwitch":
                 dev = self.ac_switch_by_name.get(meas.device_name)
+            elif meas.device_type == "ACBreak":
+                dev = self.ac_break_by_name.get(meas.device_name)
             elif meas.device_type == "ACACConverter":
                 dev = self.acac_by_name.get(meas.device_name)
             else:
@@ -639,6 +657,7 @@ class HybridStateEstimator:
         for device_type, devices in (
             ("ACZeroBranch", sorted(self.ac_zero_branch_by_name.values(), key=lambda item: item.idx)),
             ("ACSwitch", sorted(self.ac_switch_by_name.values(), key=lambda item: item.idx)),
+            ("ACBreak", sorted(self.ac_break_by_name.values(), key=lambda item: item.idx)),
         ):
             for dev in devices:
                 voltage = ac_terminal_voltage(getattr(dev, "i_node_obj", None))
@@ -662,6 +681,7 @@ class HybridStateEstimator:
 
         for device_type, devices in (
             ("DCSwitch", sorted(self.dc_switch_by_name.values(), key=lambda item: item.idx)),
+            ("DCBreak", sorted(self.dc_break_by_name.values(), key=lambda item: item.idx)),
             ("DCZeroBranch", sorted(self.dc_zero_branch_by_name.values(), key=lambda item: item.idx)),
         ):
             for dev in devices:
@@ -966,10 +986,16 @@ class HybridStateEstimator:
             return next_idx, 0
 
         if prefix in ("AC_I_RE", "AC_I_IM"):
-            dev = self.ac_switch_by_name.get(name) or self.ac_zero_branch_by_name.get(name)
+            dev = self.ac_switch_by_name.get(name) or self.ac_zero_branch_by_name.get(name) or self.ac_break_by_name.get(name)
             if dev is None:
                 return next_idx, 0
-            device_type = "ACSwitch" if name in self.ac_switch_by_name else "ACZeroBranch"
+            device_type = (
+                "ACSwitch"
+                if name in self.ac_switch_by_name
+                else "ACBreak"
+                if name in self.ac_break_by_name
+                else "ACZeroBranch"
+            )
             next_idx, added_p = add(
                 device_type,
                 name,
@@ -987,11 +1013,11 @@ class HybridStateEstimator:
             return next_idx, added_p + added_q + added_p_to + added_q_to
 
         if prefix == "DC_I":
-            dev = self.dc_switch_by_name.get(name) or self.dc_zero_branch_by_name.get(name)
+            dev = self.dc_switch_by_name.get(name) or self.dc_zero_branch_by_name.get(name) or self.dc_break_by_name.get(name)
             if dev is None:
                 return next_idx, 0
             return add(
-                "DCSwitch" if name in self.dc_switch_by_name else "DCZeroBranch",
+                "DCSwitch" if name in self.dc_switch_by_name else "DCBreak" if name in self.dc_break_by_name else "DCZeroBranch",
                 name,
                 "I_FROM",
                 float(getattr(dev, "current", 0.0) or 0.0),
@@ -1032,7 +1058,7 @@ class HybridStateEstimator:
             for meas in self.measurements
             if meas.valid
             and meas.weight > 0.0
-            and meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint")
+            and meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint", "DCBreakConstraint")
         }
         next_idx = max((meas.idx for meas in self.measurements), default=0) + 1
         weight = 10.0
@@ -1043,6 +1069,10 @@ class HybridStateEstimator:
         ideal_devices.extend(
             ("DCSwitchConstraint", sw)
             for sw in sorted(self.dc_switch_by_name.values(), key=lambda item: item.idx)
+        )
+        ideal_devices.extend(
+            ("DCBreakConstraint", brk)
+            for brk in sorted(self.dc_break_by_name.values(), key=lambda item: item.idx)
         )
         for device_type, dev in ideal_devices:
             key = (device_type, dev.name, "V_DIFF")
@@ -1122,6 +1152,7 @@ class HybridStateEstimator:
             self.ac_transformer_by_name.values(),
             self.ac_zero_branch_by_name.values(),
             self.ac_switch_by_name.values(),
+            self.ac_break_by_name.values(),
         )
         for devices in device_groups:
             for dev in devices:
@@ -1246,6 +1277,7 @@ class HybridStateEstimator:
             self.dc_branch_by_name.values(),
             self.dc_zero_branch_by_name.values(),
             self.dc_switch_by_name.values(),
+            self.dc_break_by_name.values(),
         )
         for devices in device_groups:
             for dev in devices:
@@ -1414,7 +1446,16 @@ class HybridStateEstimator:
                 re_cols = []
                 im_cols = []
                 for row in range(ac.zero_a.size):
-                    dev = ac.isl.zero_branches[int(ac.zero_idx[row])] if int(ac.zero_type[row]) == 0 else ac.isl.switches[int(ac.zero_idx[row])]
+                    zero_type = int(ac.zero_type[row])
+                    if zero_type == 0:
+                        dev = ac.isl.zero_branches[int(ac.zero_idx[row])]
+                    elif zero_type == 2:
+                        break_devices = getattr(ac.isl, "breakers", None)
+                        if break_devices is None:
+                            break_devices = sorted(self.ac_break_by_name.values(), key=lambda item: item.idx)
+                        dev = break_devices[int(ac.zero_idx[row])]
+                    else:
+                        dev = ac.isl.switches[int(ac.zero_idx[row])]
                     re_col = add_virtual(f"AC_I_RE:{dev.name}")
                     im_col = add_virtual(f"AC_I_IM:{dev.name}")
                     re_cols.append(re_col)
@@ -1461,13 +1502,18 @@ class HybridStateEstimator:
                 measured_zero_current = {
                     meas.device_name
                     for meas in self.active_measurements
-                    if meas.device_type == "DCZeroBranch"
+                    if meas.device_type in ("DCZeroBranch", "DCBreak")
                     and meas.meas_type in ("P_FROM", "P_TO", "I_FROM", "I_TO")
                 }
                 for row in range(dc.zero_phi_a.size):
                     tp = str(dc.zero_type[row])
                     dev_idx = int(dc.zero_dev_idx[row])
-                    dev = dc.model.zero_branches[dev_idx] if tp == "Z" else dc.model.switches[dev_idx]
+                    if tp == "Z":
+                        dev = dc.model.zero_branches[dev_idx]
+                    elif tp == "B":
+                        dev = dc.model.breakers[dev_idx]
+                    else:
+                        dev = dc.model.switches[dev_idx]
                     if tp == "Z" and dev.name not in measured_zero_current:
                         continue
                     col = add_virtual(f"DC_I:{dev.name}")
@@ -1793,12 +1839,14 @@ class HybridStateEstimator:
                     add(row, int(self.dc_voltage_state_col[dc.alive_node_dict[node.idx]]))
                     skip[row] = True
 
-            elif dtype in ("DCZeroBranchConstraint", "DCSwitchConstraint") and dc is not None:
+            elif dtype in ("DCZeroBranchConstraint", "DCSwitchConstraint", "DCBreakConstraint") and dc is not None:
                 if mtype != "V_DIFF":
                     continue
                 device = (
                     self.dc_zero_branch_by_name.get(meas.device_name)
                     if dtype == "DCZeroBranchConstraint"
+                    else self.dc_break_by_name.get(meas.device_name)
+                    if dtype == "DCBreakConstraint"
                     else self.dc_switch_by_name.get(meas.device_name)
                 )
                 if device is None or device.i_node not in dc.alive_node_dict or device.j_node not in dc.alive_node_dict:
@@ -1858,10 +1906,12 @@ class HybridStateEstimator:
                     ac_branch_current_y_mutual.append(ytf)
                     skip[row] = True
 
-            elif dtype in ("ACSwitch", "ACZeroBranch") and ac is not None:
+            elif dtype in ("ACSwitch", "ACZeroBranch", "ACBreak") and ac is not None:
                 device = (
                     self.ac_switch_by_name.get(meas.device_name)
                     if dtype == "ACSwitch"
+                    else self.ac_break_by_name.get(meas.device_name)
+                    if dtype == "ACBreak"
                     else self.ac_zero_branch_by_name.get(meas.device_name)
                 )
                 if device is None:
@@ -1968,10 +2018,12 @@ class HybridStateEstimator:
                     dc_branch_power_from.append(mtype == "P_FROM")
                     skip[row] = True
 
-            elif dtype in ("DCSwitch", "DCZeroBranch") and dc is not None:
+            elif dtype in ("DCSwitch", "DCZeroBranch", "DCBreak") and dc is not None:
                 device = (
                     self.dc_switch_by_name.get(meas.device_name)
                     if dtype == "DCSwitch"
+                    else self.dc_break_by_name.get(meas.device_name)
+                    if dtype == "DCBreak"
                     else self.dc_zero_branch_by_name.get(meas.device_name)
                 )
                 if device is None or device.i_node not in dc.alive_node_dict or device.j_node not in dc.alive_node_dict:
@@ -2312,6 +2364,8 @@ class HybridStateEstimator:
             return self.ac_transformer_by_name[name]
         if dtype == "ACSwitch":
             return self.ac_switch_by_name[name]
+        if dtype == "ACBreak":
+            return self.ac_break_by_name[name]
         if dtype == "ACZeroBranch":
             return self.ac_zero_branch_by_name[name]
         if dtype == "ACGenerator":
@@ -2322,10 +2376,14 @@ class HybridStateEstimator:
             return self.dc_branch_by_name[name]
         if dtype == "DCSwitch":
             return self.dc_switch_by_name[name]
+        if dtype == "DCBreak":
+            return self.dc_break_by_name[name]
         if dtype == "DCZeroBranch":
             return self.dc_zero_branch_by_name[name]
         if dtype == "DCSwitchConstraint":
             return self.dc_switch_by_name[name]
+        if dtype == "DCBreakConstraint":
+            return self.dc_break_by_name[name]
         if dtype == "DCZeroBranchConstraint":
             return self.dc_zero_branch_by_name[name]
         if dtype == "DCGenerator":
@@ -2371,7 +2429,7 @@ class HybridStateEstimator:
                     pos = np.asarray([dc.alive_node_dict[dev.idx] for dev in devices], dtype=np.int32)
                     fast_groups.append(("DCNode", mtype, rows, pos))
 
-                elif dtype in ("DCZeroBranchConstraint", "DCSwitchConstraint") and dc is not None:
+                elif dtype in ("DCZeroBranchConstraint", "DCSwitchConstraint", "DCBreakConstraint") and dc is not None:
                     if mtype != "V_DIFF":
                         supported = False
                         continue
@@ -2415,7 +2473,7 @@ class HybridStateEstimator:
                         )
                     )
 
-                elif dtype in ("ACSwitch", "ACZeroBranch") and ac is not None:
+                elif dtype in ("ACSwitch", "ACZeroBranch", "ACBreak") and ac is not None:
                     if mtype in ("V_FROM", "V_TO"):
                         handled_rows = rows
                         handled_devices = devices
@@ -2482,7 +2540,7 @@ class HybridStateEstimator:
                     inv_r = np.asarray([1.0 / dev.r for dev in devices], dtype=np.float64)
                     fast_groups.append(("DCBranch", mtype, rows, i_pos, j_pos, inv_r))
 
-                elif dtype in ("DCSwitch", "DCZeroBranch") and dc is not None:
+                elif dtype in ("DCSwitch", "DCZeroBranch", "DCBreak") and dc is not None:
                     if mtype in ("V_FROM", "V_TO"):
                         handled_rows = rows
                         handled_devices = devices
@@ -2844,7 +2902,7 @@ class HybridStateEstimator:
                 else:
                     raise RuntimeError(f"Unsupported {dtype} measurement type: {mtype}")
 
-            elif dtype in ("ACSwitch", "ACZeroBranch"):
+            elif dtype in ("ACSwitch", "ACZeroBranch", "ACBreak"):
                 if mtype == "P_FROM":
                     fill(values, rows, (float(getattr(dev, "p", 0.0) or 0.0) for dev in devices))
                 elif mtype == "Q_FROM":
@@ -2904,7 +2962,7 @@ class HybridStateEstimator:
                 else:
                     raise RuntimeError(f"Unsupported DCBranch measurement type: {mtype}")
 
-            elif dtype in ("DCSwitch", "DCZeroBranch"):
+            elif dtype in ("DCSwitch", "DCZeroBranch", "DCBreak"):
                 if mtype == "P_FROM":
                     fill(values, rows, (float(getattr(dev, "p", 0.0) or 0.0) for dev in devices))
                 elif mtype == "V_FROM":
@@ -4423,6 +4481,8 @@ class HybridStateEstimator:
                 values[row] = self._ac_line_value(self.ac_transformer_by_name[meas.device_name], mtype)
             elif meas.device_type == "ACSwitch":
                 values[row] = self._ac_zero_value(self.ac_switch_by_name[meas.device_name], mtype)
+            elif meas.device_type == "ACBreak":
+                values[row] = self._ac_zero_value(self.ac_break_by_name[meas.device_name], mtype)
             elif meas.device_type == "ACZeroBranch":
                 values[row] = self._ac_zero_value(self.ac_zero_branch_by_name[meas.device_name], mtype)
             elif meas.device_type == "ACGenerator":
@@ -4461,8 +4521,15 @@ class HybridStateEstimator:
                 if mtype != "V_DIFF":
                     raise RuntimeError(f"Unsupported DCSwitchConstraint measurement type: {mtype}")
                 values[row] = sw.i_node_obj.voltage - sw.j_node_obj.voltage
+            elif meas.device_type == "DCBreakConstraint":
+                brk = self.dc_break_by_name[meas.device_name]
+                if mtype != "V_DIFF":
+                    raise RuntimeError(f"Unsupported DCBreakConstraint measurement type: {mtype}")
+                values[row] = brk.i_node_obj.voltage - brk.j_node_obj.voltage
             elif meas.device_type == "DCSwitch":
                 values[row] = self._dc_zero_value(self.dc_switch_by_name[meas.device_name], mtype)
+            elif meas.device_type == "DCBreak":
+                values[row] = self._dc_zero_value(self.dc_break_by_name[meas.device_name], mtype)
             elif meas.device_type == "DCZeroBranch":
                 values[row] = self._dc_zero_value(self.dc_zero_branch_by_name[meas.device_name], mtype)
             elif meas.device_type == "DCGenerator":
@@ -4655,10 +4722,12 @@ class HybridStateEstimator:
                 else:
                     raise RuntimeError(f"Unsupported {meas.device_type} measurement type: {mtype}")
 
-            elif meas.device_type in ("ACSwitch", "ACZeroBranch"):
+            elif meas.device_type in ("ACSwitch", "ACZeroBranch", "ACBreak"):
                 device = (
                     self.ac_switch_by_name[meas.device_name]
                     if meas.device_type == "ACSwitch"
+                    else self.ac_break_by_name[meas.device_name]
+                    if meas.device_type == "ACBreak"
                     else self.ac_zero_branch_by_name[meas.device_name]
                 )
                 i = ac.node_pos[device.i_node]
@@ -4765,12 +4834,14 @@ class HybridStateEstimator:
                     raise RuntimeError(f"Unsupported DCNode measurement type: {mtype}")
                 self._add_derivative(H, row, int(self.dc_voltage_state_col[dc.alive_node_dict[node.idx]]), 1.0)
 
-            elif meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint"):
+            elif meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint", "DCBreakConstraint"):
                 if mtype != "V_DIFF":
                     raise RuntimeError(f"Unsupported {meas.device_type} measurement type: {mtype}")
                 device = (
                     self.dc_zero_branch_by_name[meas.device_name]
                     if meas.device_type == "DCZeroBranchConstraint"
+                    else self.dc_break_by_name[meas.device_name]
+                    if meas.device_type == "DCBreakConstraint"
                     else self.dc_switch_by_name[meas.device_name]
                 )
                 i = dc.alive_node_dict[device.i_node]
@@ -4806,10 +4877,12 @@ class HybridStateEstimator:
                 else:
                     raise RuntimeError(f"Unsupported DCBranch measurement type: {mtype}")
 
-            elif meas.device_type in ("DCSwitch", "DCZeroBranch"):
+            elif meas.device_type in ("DCSwitch", "DCZeroBranch", "DCBreak"):
                 device = (
                     self.dc_switch_by_name[meas.device_name]
                     if meas.device_type == "DCSwitch"
+                    else self.dc_break_by_name[meas.device_name]
+                    if meas.device_type == "DCBreak"
                     else self.dc_zero_branch_by_name[meas.device_name]
                 )
                 i = dc.alive_node_dict[device.i_node]

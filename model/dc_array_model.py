@@ -74,6 +74,7 @@ SWITCH_COLS = {
     "p": 5,
     "current": 6,
 }
+BREAK_COLS = SWITCH_COLS
 DCDC_COLS = {
     "idx": 0,
     "i_node": 1,
@@ -293,20 +294,26 @@ def build_dc_ppc_from_e_file(
             power_base_kw, i_scale, raw_vbase_by_idx, i_node
         )
 
-    switch_rows = _rows(raw, "DCSwitch")
-    switch_cols = _columns(raw, "DCSwitch")
-    switch = np.zeros((len(switch_rows), len(SWITCH_COLS)), dtype=np.float64)
-    for out_row, row in enumerate(switch_rows):
-        i_node = _int_cell(row, switch_cols, "i_node")
-        switch[out_row, SWITCH_COLS["idx"]] = _int_cell(row, switch_cols, "idx")
-        switch[out_row, SWITCH_COLS["i_node"]] = i_node
-        switch[out_row, SWITCH_COLS["j_node"]] = _int_cell(row, switch_cols, "j_node")
-        switch[out_row, SWITCH_COLS["status"]] = _float_cell(row, switch_cols, "status", 1.0)
-        switch[out_row, SWITCH_COLS["run_stat"]] = _float_cell(row, switch_cols, "run_stat", 1.0)
-        switch[out_row, SWITCH_COLS["p"]] = _float_cell(row, switch_cols, "p") / p_base
-        switch[out_row, SWITCH_COLS["current"]] = _float_cell(row, switch_cols, "current") / _current_scale(
-            power_base_kw, i_scale, raw_vbase_by_idx, i_node
-        )
+    def build_switch_like(block: str):
+        rows = _rows(raw, block)
+        cols = _columns(raw, block)
+        out = np.zeros((len(rows), len(SWITCH_COLS)), dtype=np.float64)
+        for out_row, row in enumerate(rows):
+            i_node = _int_cell(row, cols, "i_node")
+            out[out_row, SWITCH_COLS["idx"]] = _int_cell(row, cols, "idx")
+            out[out_row, SWITCH_COLS["i_node"]] = i_node
+            out[out_row, SWITCH_COLS["j_node"]] = _int_cell(row, cols, "j_node")
+            out[out_row, SWITCH_COLS["status"]] = _float_cell(row, cols, "status", 1.0)
+            out[out_row, SWITCH_COLS["run_stat"]] = _float_cell(row, cols, "run_stat", 1.0)
+            out[out_row, SWITCH_COLS["p"]] = _float_cell(row, cols, "p") / p_base
+            out[out_row, SWITCH_COLS["current"]] = _float_cell(row, cols, "current") / _current_scale(
+                power_base_kw, i_scale, raw_vbase_by_idx, i_node
+            )
+        names = np.asarray([_cell(row, cols, "name", f"{block.lower()}_{pos}") for pos, row in enumerate(rows)], dtype=object)
+        return rows, out, names
+
+    switch_rows, switch, switch_names = build_switch_like("DCSwitch")
+    break_rows, break_array, break_names = build_switch_like("DCBreak")
 
     dcdc_rows = _rows(raw, "DCDCConverter")
     dcdc_cols = _columns(raw, "DCDCConverter")
@@ -350,6 +357,7 @@ def build_dc_ppc_from_e_file(
         "gen": gen if len(gen_rows) else _empty(len(GEN_COLS)),
         "zero_branch": zero_branch if len(zero_rows) else _empty(len(ZERO_BRANCH_COLS)),
         "switch": switch if len(switch_rows) else _empty(len(SWITCH_COLS)),
+        "break": break_array if len(break_rows) else _empty(len(BREAK_COLS)),
         "dcdc": dcdc if len(dcdc_rows) else _empty(len(DCDC_COLS)),
         "node_pos": node_pos,
     }
@@ -360,7 +368,8 @@ def build_dc_ppc_from_e_file(
             load_name=np.asarray([_cell(row, load_cols, "name", "") for row in load_rows], dtype=object),
             gen_name=np.asarray([_cell(row, gen_cols, "name", "") for row in gen_rows], dtype=object),
             zero_branch_name=np.asarray([_cell(row, zero_cols, "name", "") for row in zero_rows], dtype=object),
-            switch_name=np.asarray([_cell(row, switch_cols, "name", "") for row in switch_rows], dtype=object),
+            switch_name=switch_names,
+            break_name=break_names,
             dcdc_name=np.asarray([_cell(row, dcdc_cols, "name", "") for row in dcdc_rows], dtype=object),
         )
 
@@ -380,6 +389,7 @@ class DCIsl:
         self.branches = []
         self.zero_branches = []
         self.switches = []
+        self.breakers = []
         self.dcdc_converters = []
         self.slack_nodes = []
         self.v_gens = []
@@ -401,6 +411,7 @@ class DCPowerNetwork:
         self.islands = []
         self.node_dict = {}
         self.switch_dict = {}
+        self.break_dict = {}
         self.load_dict = {}
         self.generator_dict = {}
         self.zero_branche_dict = {}
@@ -499,6 +510,22 @@ class DCPowerNetwork:
         )
         self.switches.append(sw)
         return sw
+
+    def add_break(self, idx, i_node, j_node, status, run_stat=1):
+        brk = _device(
+            idx,
+            f"brk_{idx}",
+            i_node=int(i_node),
+            j_node=int(j_node),
+            status=int(status),
+            run_stat=int(run_stat),
+            current=None,
+            p=None,
+            i_node_obj=None,
+            j_node_obj=None,
+        )
+        self.breakers.append(brk)
+        return brk
 
     def add_dcdc_converter(self, idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat=1):
         conv = _device(
@@ -639,6 +666,23 @@ class DCPowerNetwork:
                 )
             )
 
+        self.breakers = []
+        for row, name in zip(ppc.get("break", _empty(len(BREAK_COLS))), ppc.get("break_name", [])):
+            self.breakers.append(
+                _device(
+                    row[BREAK_COLS["idx"]],
+                    name,
+                    i_node=int(row[BREAK_COLS["i_node"]]),
+                    j_node=int(row[BREAK_COLS["j_node"]]),
+                    status=int(row[BREAK_COLS["status"]]),
+                    run_stat=int(row[BREAK_COLS["run_stat"]]),
+                    p=float(row[BREAK_COLS["p"]]),
+                    current=float(row[BREAK_COLS["current"]]),
+                    i_node_obj=None,
+                    j_node_obj=None,
+                )
+            )
+
         self.dcdc_converters = []
         for row, name in zip(ppc["dcdc"], ppc.get("dcdc_name", [])):
             self.dcdc_converters.append(
@@ -666,6 +710,7 @@ class DCPowerNetwork:
     def format_assoc(self):
         self.node_dict = {node.idx: node for node in self.nodes}
         self.switch_dict = {sw.idx: sw for sw in self.switches}
+        self.break_dict = {brk.idx: brk for brk in self.breakers}
         self.load_dict = {ld.idx: ld for ld in self.loads}
         self.generator_dict = {gen.idx: gen for gen in self.generators}
         self.zero_branche_dict = {zbr.idx: zbr for zbr in self.zero_branches}
@@ -677,6 +722,7 @@ class DCPowerNetwork:
             node.loads = []
             node.branches = []
             node.switches = []
+            node.breakers = []
             node.dcdc_converters = []
             node.zero_branches = []
             node.is_alive = False
@@ -703,6 +749,13 @@ class DCPowerNetwork:
                 sw.i_node_obj.switches.append(sw)
             if sw.j_node_obj:
                 sw.j_node_obj.switches.append(sw)
+        for brk in self.breakers:
+            brk.i_node_obj = self.node_dict.get(brk.i_node, None)
+            brk.j_node_obj = self.node_dict.get(brk.j_node, None)
+            if brk.i_node_obj:
+                brk.i_node_obj.breakers.append(brk)
+            if brk.j_node_obj:
+                brk.j_node_obj.breakers.append(brk)
         for conv in self.dcdc_converters:
             conv.i_node_obj = self.node_dict.get(conv.i_node, None)
             conv.j_node_obj = self.node_dict.get(conv.j_node, None)
@@ -742,6 +795,9 @@ class DCPowerNetwork:
             add_edge(dev)
         for dev in self.zero_branches:
             add_edge(dev)
+        for dev in self.breakers:
+            if dev.status == 1:
+                add_edge(dev)
         for dev in self.switches:
             if dev.status == 1:
                 add_edge(dev)
@@ -779,6 +835,7 @@ class DCPowerNetwork:
             isl.dcdc_converters = []
             isl.zero_branches = []
             isl.switches = []
+            isl.breakers = []
 
         for node in self.nodes:
             node.v_gens = []
@@ -838,6 +895,13 @@ class DCPowerNetwork:
                 continue
             if zbr.i_node_obj.isl_obj and zbr.j_node_obj.isl_obj and zbr.i_node_obj.isl_obj == zbr.j_node_obj.isl_obj:
                 zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
+        for brk in self.breakers:
+            if brk.run_stat == 0 or brk.status == 0:
+                continue
+            if brk.i_node_obj is None or brk.j_node_obj is None:
+                continue
+            if brk.i_node_obj.isl_obj and brk.j_node_obj.isl_obj and brk.i_node_obj.isl_obj == brk.j_node_obj.isl_obj:
+                brk.i_node_obj.isl_obj.breakers.append(brk)
 
         for node in self.nodes:
             if node.isl_obj is None:
@@ -873,6 +937,15 @@ class DCPowerNetwork:
                 and zbr.run_stat == 1
                 and zbr.i_node_obj.is_alive
                 and zbr.j_node_obj.is_alive
+            )
+        for brk in self.breakers:
+            brk.is_alive = (
+                brk.i_node_obj is not None
+                and brk.j_node_obj is not None
+                and brk.run_stat == 1
+                and brk.status == 1
+                and brk.i_node_obj.is_alive
+                and brk.j_node_obj.is_alive
             )
         for sw in self.switches:
             sw.is_alive = (
@@ -913,6 +986,9 @@ class DCPowerNetwork:
             print(f"    zero_branches = {len(isl.zero_branches)}:")
             for zbr in isl.zero_branches:
                 print(f"        {zbr.idx} {zbr.name} i_node = {zbr.i_node} j_node = {zbr.j_node}")
+            print(f"    breakers = {len(getattr(isl, 'breakers', []))}:")
+            for brk in getattr(isl, "breakers", []):
+                print(f"        {brk.idx} {brk.name} i_node = {brk.i_node} j_node = {brk.j_node} status = {brk.status}")
             print(f"    dcdc_converters = {len(isl.dcdc_converters)}:")
             for dcc in isl.dcdc_converters:
                 print(f"        {dcc.idx} {dcc.name} i_node = {dcc.i_node} j_node = {dcc.j_node} r1 = {dcc.r1} r2 = {dcc.r2} control_type = {dcc.control_type}")
@@ -943,6 +1019,10 @@ class DCPowerNetwork:
             if sw.run_stat:
                 check_node(sw.i_node, "Switch", sw)
                 check_node(sw.j_node, "Switch", sw)
+        for brk in self.breakers:
+            if brk.run_stat and brk.status:
+                check_node(brk.i_node, "Break", brk)
+                check_node(brk.j_node, "Break", brk)
         for ld in self.loads:
             if ld.run_stat:
                 check_node(ld.node, "Load", ld)

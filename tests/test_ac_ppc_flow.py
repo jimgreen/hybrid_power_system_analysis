@@ -17,6 +17,44 @@ sys.path.insert(0, str(ROOT_DIR / "lfcore"))
 
 
 class ACPPCFlowTest(unittest.TestCase):
+    def test_ac_break_is_parsed_as_distinct_zero_tie_device(self):
+        from ac_array_model import SWITCH_COLS, build_ac_ppc_from_e_file
+        from ac_model import ACPowerNetwork, ACBreak
+
+        source = ROOT_DIR / "data" / "ac" / "ac_net_10.e"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_path = Path(tmp_dir) / "ac_break.e"
+            text = source.read_text(encoding="utf-8")
+            switch_start = text.index("<ACSwitch>")
+            switch_end = text.index("</ACSwitch>", switch_start) + len("</ACSwitch>")
+            break_start = text.index("<ACBreak>")
+            break_end = text.index("</ACBreak>", break_start) + len("</ACBreak>")
+            text = (
+                text[:switch_start]
+                + "<ACSwitch>\n@ idx name   i_node j_node status run_stat p q current\n</ACSwitch>\n\n"
+                + "<ACBreak>\n@ idx name   i_node j_node status run_stat p q current\n"
+                + "# 0   brk_7_8 7      8      1      1        0 0 0\n"
+                + "</ACBreak>"
+                + text[break_end:]
+            )
+            case_path.write_text(text, encoding="utf-8")
+
+            ppc = build_ac_ppc_from_e_file(case_path)
+            network = ACPowerNetwork()
+            with contextlib.redirect_stdout(io.StringIO()):
+                network.read_from_file(case_path)
+                network.topo()
+
+        self.assertEqual(0, ppc["switch"].shape[0])
+        self.assertEqual(1, ppc["break"].shape[0])
+        self.assertEqual("brk_7_8", ppc["break_name"][0])
+        self.assertEqual(7, int(ppc["break"][0, SWITCH_COLS["i_node"]]))
+        self.assertEqual(8, int(ppc["break"][0, SWITCH_COLS["j_node"]]))
+        self.assertEqual(1, len(network.breakers))
+        self.assertIsInstance(network.breakers[0], ACBreak)
+        self.assertEqual("brk_7_8", network.breakers[0].name)
+        self.assertTrue(network.node_dict[7].isl_obj is network.node_dict[8].isl_obj)
+
     def test_object_y_matrix_uses_vectorized_branch_stamps(self):
         import ac_lf
         from ac_lf import ACPowerFlowCalc

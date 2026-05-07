@@ -114,17 +114,21 @@
 
 <DCSwitch>
 @ idx name     i_node j_node status run_stat p current
-# 0   sw_0_1   0      1      1      1        0 0
 # 1   sw_2_3   2      3      1      1        0 0
-# 2   sw_4_5   4      5      1      1        0 0
 # 3   sw_6_8   6      8      1      1        0 0
-# 4   sw_9_11  9      11     1      1        0 0
 # 5   sw_10_12 10     12     1      1        0 0
-# 6   sw_13_14 13     14     1      1        0 0
 # 7   sw_15_17 15     17     1      1        0 0
-# 8   sw_18_19 18     19     1      1        0 0
 # 9   sw_22_23 22     23     1      1        0 0
 </DCSwitch>
+
+<DCBreak>
+@ idx name     i_node j_node status run_stat p current
+# 0   sw_0_1   0      1      1      1        0 0
+# 2   sw_4_5   4      5      1      1        0 0
+# 4   sw_9_11  9      11     1      1        0 0
+# 6   sw_13_14 13     14     1      1        0 0
+# 8   sw_18_19 18     19     1      1        0 0
+</DCBreak>
 
 <DCDCConverter>
 @ idx name      i_node j_node r1     r2     control_type p_set i_set  v_set run_stat i_p j_p i_c j_c

@@ -245,6 +245,7 @@ class DCStateEstimator:
         self.load_by_name = {load.name: load for load in self.network.loads if getattr(load, "is_alive", False)}
         self.generator_by_name = {gen.name: gen for gen in self.network.generators if getattr(gen, "is_alive", False)}
         self.switch_by_name = {sw.name: sw for sw in self.network.switches if getattr(sw, "is_alive", False)}
+        self.break_by_name = {brk.name: brk for brk in getattr(self.network, "breakers", []) if getattr(brk, "is_alive", False)}
         self.zero_branch_by_name = {
             zbr.name: zbr
             for zbr in self.network.zero_branches
@@ -257,6 +258,7 @@ class DCStateEstimator:
         }
 
         self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
+        self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
         self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
         # Reference selection must see only active, unit-normalized real measurements.
         self._disable_unavailable_measurements()
@@ -266,10 +268,10 @@ class DCStateEstimator:
         self.node_degrees = self._node_incident_degrees()
         self.references = self._select_reference_nodes()
         self._build_zero_tie_voltage_layout()
-        self.zero_current_devices = [("S", sw) for sw in self.switches] + [
+        self.zero_current_devices = [
             ("Z", zbr)
             for zbr in self.zero_branches
-        ]
+        ] + [("B", brk) for brk in self.breakers]
         self.dcdc_converters = sorted(self.dcdc_by_name.values(), key=lambda item: item.idx)
         self.v_generators = sorted(
             [gen for gen in self.generator_by_name.values() if gen.control_type == "V"],
@@ -277,7 +279,8 @@ class DCStateEstimator:
         )
 
         self.zero_current_pos = {(kind, dev.name): pos for pos, (kind, dev) in enumerate(self.zero_current_devices)}
-        self.switch_pos = {sw.name: self.zero_current_pos[("S", sw.name)] for sw in self.switches}
+        self.switch_pos = {}
+        self.break_pos = {brk.name: self.zero_current_pos[("B", brk.name)] for brk in self.breakers}
         self.zero_branch_pos = {
             zbr.name: self.zero_current_pos[("Z", zbr.name)]
             for zbr in self.zero_branches
@@ -295,8 +298,8 @@ class DCStateEstimator:
         self.n_state = self.v_generator_start + self.n_v_generator
 
         self.state_labels = [f"V:{self.nodes[pos].name}" for pos in self.voltage_state_pos]
-        self.state_labels.extend(f"I_SWITCH:{sw.name}" for sw in self.switches)
         self.state_labels.extend(f"I_ZERO:{zbr.name}" for zbr in self.zero_branches if zbr.name in self.zero_branch_pos)
+        self.state_labels.extend(f"I_BREAK:{brk.name}" for brk in self.breakers)
         for conv in self.dcdc_converters:
             self.state_labels.append(f"P_DCDC_FROM:{conv.name}")
             self.state_labels.append(f"P_DCDC_TO:{conv.name}")
@@ -355,7 +358,7 @@ class DCStateEstimator:
         device_maps = {
             "DCNode": self.node_by_name,
             "DCBranch": self.branch_by_name,
-            "DCSwitch": self.switch_by_name,
+            "DCBreak": self.break_by_name,
             "DCZeroBranch": self.zero_branch_by_name,
             "DCGenerator": self.generator_by_name,
             "DCLoad": self.load_by_name,
@@ -364,7 +367,10 @@ class DCStateEstimator:
         for meas in self.measurements:
             if not meas.valid or meas.weight <= 0.0:
                 continue
-            if meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint"):
+            if meas.device_type in ("DCSwitch", "DCSwitchConstraint"):
+                meas.valid = False
+                continue
+            if meas.device_type in ("DCZeroBranchConstraint", "DCBreakConstraint"):
                 meas.valid = False
                 continue
             devices = device_maps.get(meas.device_type)
@@ -397,6 +403,7 @@ class DCStateEstimator:
             self.branch_by_name.values(),
             self.zero_branch_by_name.values(),
             self.switch_by_name.values(),
+            self.break_by_name.values(),
         )
         for devices in device_groups:
             for dev in devices:
@@ -449,7 +456,7 @@ class DCStateEstimator:
             if root_l != root_r:
                 parent[root_r] = root_l
 
-        for dev in [*self.zero_branches, *self.switches]:
+        for dev in [*self.zero_branches, *self.switches, *self.breakers]:
             if dev.i_node in self.node_pos and dev.j_node in self.node_pos:
                 union(self.node_pos[dev.i_node], self.node_pos[dev.j_node])
 
@@ -553,10 +560,15 @@ class DCStateEstimator:
             dtype=np.float64,
         )
 
-        self._apply_switch_devices = list(self.switch_by_name.values())
-        self._apply_switch_i = self._int_array([self.node_pos[sw.i_node] for sw in self._apply_switch_devices])
-        self._apply_switch_j = self._int_array([self.node_pos[sw.j_node] for sw in self._apply_switch_devices])
-        self._apply_switch_pos = self._int_array([self.switch_pos[sw.name] for sw in self._apply_switch_devices])
+        self._apply_switch_devices = []
+        self._apply_switch_i = self._int_array([])
+        self._apply_switch_j = self._int_array([])
+        self._apply_switch_pos = self._int_array([])
+
+        self._apply_break_devices = list(self.break_by_name.values())
+        self._apply_break_i = self._int_array([self.node_pos[brk.i_node] for brk in self._apply_break_devices])
+        self._apply_break_j = self._int_array([self.node_pos[brk.j_node] for brk in self._apply_break_devices])
+        self._apply_break_pos = self._int_array([self.break_pos[brk.name] for brk in self._apply_break_devices])
 
         self._apply_zero_branch_devices = [
             zbr for zbr in self.zero_branch_by_name.values() if zbr.name in self.zero_branch_pos
@@ -615,11 +627,12 @@ class DCStateEstimator:
                 gen.i_set,
             )
         self._switch_plan_by_name = {}
-        for sw in self.switch_by_name.values():
-            i = self.node_pos[sw.i_node]
-            j = self.node_pos[sw.j_node]
-            current_pos = self.switch_pos[sw.name]
-            self._switch_plan_by_name[sw.name] = (
+        self._break_plan_by_name = {}
+        for brk in self.break_by_name.values():
+            i = self.node_pos[brk.i_node]
+            j = self.node_pos[brk.j_node]
+            current_pos = self.break_pos[brk.name]
+            self._break_plan_by_name[brk.name] = (
                 i,
                 j,
                 int(self.voltage_col[i]),
@@ -647,7 +660,7 @@ class DCStateEstimator:
                 int(self.voltage_col[self.node_pos[dev.i_node]]),
                 int(self.voltage_col[self.node_pos[dev.j_node]]),
             )
-            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name}.items()
+            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name, **self.break_by_name}.items()
         }
         self._dcdc_plan_by_name = {}
         for conv in self.dcdc_by_name.values():
@@ -734,9 +747,9 @@ class DCStateEstimator:
             br.name: self._terminal_scale_tuple(br.i_node, br.j_node)
             for br in self.branch_by_name.values()
         }
-        self._switch_measurement_scale_by_name = {
-            sw.name: self._terminal_scale_tuple(sw.i_node, sw.j_node)
-            for sw in self.switch_by_name.values()
+        self._break_measurement_scale_by_name = {
+            brk.name: self._terminal_scale_tuple(brk.i_node, brk.j_node)
+            for brk in self.break_by_name.values()
         }
         self._zero_branch_measurement_scale_by_name = {
             zbr.name: self._terminal_scale_tuple(zbr.i_node, zbr.j_node)
@@ -764,7 +777,7 @@ class DCStateEstimator:
         }
         self._constraint_measurement_scale_by_name = {
             name: self._voltage_file_base_by_idx[int(dev.i_node)]
-            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name}.items()
+            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name, **self.break_by_name}.items()
         }
 
     def _convert_measurements_to_pu(self) -> None:
@@ -774,7 +787,7 @@ class DCStateEstimator:
         gen_kind = _GEN_MEASUREMENT_KIND.get
         node_scale = self._node_measurement_scale_by_name.__getitem__
         branch_scale = self._branch_measurement_scale_by_name.__getitem__
-        switch_scale = self._switch_measurement_scale_by_name.__getitem__
+        break_scale = self._break_measurement_scale_by_name.__getitem__
         zero_branch_scale = self._zero_branch_measurement_scale_by_name.__getitem__
         dcdc_scale = self._dcdc_measurement_scale_by_name.__getitem__
         gen_scale = self._generator_measurement_scale_by_name.__getitem__
@@ -794,10 +807,10 @@ class DCStateEstimator:
                 kind = terminal_kind(mtype)
                 if kind is not None:
                     scale = branch_scale(device_name)[kind]
-            elif meas.device_type == "DCSwitch":
+            elif meas.device_type == "DCBreak":
                 kind = terminal_kind(mtype)
                 if kind is not None:
-                    scale = switch_scale(device_name)[kind]
+                    scale = break_scale(device_name)[kind]
             elif meas.device_type == "DCZeroBranch":
                 kind = terminal_kind(mtype)
                 if kind is not None:
@@ -805,7 +818,7 @@ class DCStateEstimator:
             elif meas.device_type == "DCZeroBranchConstraint":
                 if mtype == "V_DIFF":
                     scale = constraint_scale(device_name)
-            elif meas.device_type == "DCSwitchConstraint":
+            elif meas.device_type == "DCBreakConstraint":
                 if mtype == "V_DIFF":
                     scale = constraint_scale(device_name)
             elif meas.device_type == "DCDCConverter":
@@ -889,8 +902,8 @@ class DCStateEstimator:
         measured_keys = self._active_measurement_keys()
 
         for device_type, devices in (
-            ("DCSwitch", self.switches),
             ("DCZeroBranch", self.zero_branches),
+            ("DCBreak", self.breakers),
         ):
             for dev in devices:
                 voltage = float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0)
@@ -1061,12 +1074,12 @@ class DCStateEstimator:
 
         if prefix == "V" and name in self.node_by_name:
             return next_idx, 0
-        if prefix == "I_SWITCH" and name in self.switch_by_name:
-            dev = self.switch_by_name[name]
-            return add("DCSwitch", name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
         if prefix == "I_ZERO" and name in self.zero_branch_by_name:
             dev = self.zero_branch_by_name[name]
             return add("DCZeroBranch", name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
+        if prefix == "I_BREAK" and name in self.break_by_name:
+            dev = self.break_by_name[name]
+            return add("DCBreak", name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
         if prefix == "P_DCDC_FROM" and name in self.dcdc_by_name:
             return add("DCDCConverter", name, "P_FROM", float(getattr(self.dcdc_by_name[name], "i_p", 0.0) or 0.0))
         if prefix == "P_DCDC_TO" and name in self.dcdc_by_name:
@@ -1082,7 +1095,7 @@ class DCStateEstimator:
             for meas in self.measurements
             if meas.valid
             and meas.weight > 0.0
-            and meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint")
+            and meas.device_type in ("DCZeroBranchConstraint", "DCBreakConstraint")
         }
         next_idx = max((meas.idx for meas in self.measurements), default=0) + 1
         weight = 10.0
@@ -1091,8 +1104,8 @@ class DCStateEstimator:
             for zbr in sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
         ]
         ideal_devices.extend(
-            ("DCSwitchConstraint", sw)
-            for sw in sorted(self.switch_by_name.values(), key=lambda item: item.idx)
+            ("DCBreakConstraint", brk)
+            for brk in sorted(self.break_by_name.values(), key=lambda item: item.idx)
         )
         for device_type, dev in ideal_devices:
             key = (device_type, dev.name, "V_DIFF")
@@ -1124,9 +1137,6 @@ class DCStateEstimator:
         for col, node_pos in enumerate(self.voltage_state_pos):
             node = self.nodes[int(node_pos)]
             x[col] = float(getattr(node, "voltage", 1.0) or 1.0)
-        for sw in self.switches:
-            pos = self.switch_start + self.switch_pos[sw.name]
-            x[pos] = float(getattr(sw, "current", 0.0) or 0.0)
         for zbr in self.zero_branches:
             if zbr.name not in self.zero_branch_pos:
                 continue
@@ -1192,17 +1202,6 @@ class DCStateEstimator:
             raise RuntimeError(f"Unsupported DCGenerator control type: {gen.control_type}")
         return p, v, current
 
-    def _switch_values(
-        self,
-        sw,
-        voltage: np.ndarray,
-        switch_current: np.ndarray,
-    ) -> Tuple[float, float, float, float, float, float]:
-        current = switch_current[self.switch_pos[sw.name]]
-        vi = voltage[self.node_pos[sw.i_node]]
-        vj = voltage[self.node_pos[sw.j_node]]
-        return vi * current, vi, current, -vj * current, vj, -current
-
     def _zero_branch_values(
         self,
         zbr,
@@ -1212,6 +1211,17 @@ class DCStateEstimator:
         current = switch_current[self.zero_branch_pos[zbr.name]]
         vi = voltage[self.node_pos[zbr.i_node]]
         vj = voltage[self.node_pos[zbr.j_node]]
+        return vi * current, vi, current, -vj * current, vj, -current
+
+    def _break_values(
+        self,
+        brk,
+        voltage: np.ndarray,
+        switch_current: np.ndarray,
+    ) -> Tuple[float, float, float, float, float, float]:
+        current = switch_current[self.break_pos[brk.name]]
+        vi = voltage[self.node_pos[brk.i_node]]
+        vj = voltage[self.node_pos[brk.j_node]]
         return vi * current, vi, current, -vj * current, vj, -current
 
     def _dcdc_values(
@@ -1322,15 +1332,14 @@ class DCStateEstimator:
                 gen_i_set.append(i_set)
                 handled[row] = True
 
-            elif meas.device_type in ("DCSwitch", "DCZeroBranch"):
+            elif meas.device_type in ("DCZeroBranch", "DCBreak"):
                 kind = _TERMINAL_KIND.get(mtype)
                 if kind is None:
                     continue
-                i, j, i_col, j_col, current_col, current_pos = (
-                    self._switch_plan_by_name[meas.device_name]
-                    if meas.device_type == "DCSwitch"
-                    else self._zero_branch_plan_by_name[meas.device_name]
-                )
+                if meas.device_type == "DCBreak":
+                    i, j, i_col, j_col, current_col, current_pos = self._break_plan_by_name[meas.device_name]
+                else:
+                    i, j, i_col, j_col, current_col, current_pos = self._zero_branch_plan_by_name[meas.device_name]
                 if current_pos < 0 and mtype not in ("V_FROM", "V_TO"):
                     continue
                 switch_rows.append(row)
@@ -1343,7 +1352,7 @@ class DCStateEstimator:
                 switch_pos.append(current_pos)
                 handled[row] = True
 
-            elif meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint"):
+            elif meas.device_type in ("DCZeroBranchConstraint", "DCBreakConstraint"):
                 if mtype != "V_DIFF":
                     continue
                 i, j, i_col, j_col = self._constraint_plan_by_name[meas.device_name]
@@ -1596,9 +1605,9 @@ class DCStateEstimator:
                     values[row] = current
                 else:
                     raise RuntimeError(f"Unsupported DCGenerator measurement type: {mtype}")
-            elif meas.device_type == "DCSwitch":
-                sw = self.switch_by_name[meas.device_name]
-                values[row] = self._terminal_value(mtype, self._switch_values(sw, voltage, switch_current))
+            elif meas.device_type == "DCBreak":
+                brk = self.break_by_name[meas.device_name]
+                values[row] = self._terminal_value(mtype, self._break_values(brk, voltage, switch_current))
             elif meas.device_type == "DCZeroBranch":
                 zbr = self.zero_branch_by_name[meas.device_name]
                 if mtype in ("V_FROM", "V_TO"):
@@ -1611,11 +1620,11 @@ class DCStateEstimator:
                 if mtype != "V_DIFF":
                     raise RuntimeError(f"Unsupported DCZeroBranchConstraint measurement type: {mtype}")
                 values[row] = voltage[self.node_pos[zbr.i_node]] - voltage[self.node_pos[zbr.j_node]]
-            elif meas.device_type == "DCSwitchConstraint":
-                sw = self.switch_by_name[meas.device_name]
+            elif meas.device_type == "DCBreakConstraint":
+                brk = self.break_by_name[meas.device_name]
                 if mtype != "V_DIFF":
-                    raise RuntimeError(f"Unsupported DCSwitchConstraint measurement type: {mtype}")
-                values[row] = voltage[self.node_pos[sw.i_node]] - voltage[self.node_pos[sw.j_node]]
+                    raise RuntimeError(f"Unsupported DCBreakConstraint measurement type: {mtype}")
+                values[row] = voltage[self.node_pos[brk.i_node]] - voltage[self.node_pos[brk.j_node]]
             elif meas.device_type == "DCDCConverter":
                 conv = self.dcdc_by_name[meas.device_name]
                 values[row] = self._terminal_value(mtype, self._dcdc_values(conv, voltage, dcdc_power))
@@ -1918,14 +1927,14 @@ class DCStateEstimator:
                 else:
                     raise RuntimeError(f"Unsupported DCGenerator control type: {gen.control_type}")
 
-            elif meas.device_type == "DCSwitch":
-                sw = self.switch_by_name[meas.device_name]
-                i = self.node_pos[sw.i_node]
-                j = self.node_pos[sw.j_node]
+            elif meas.device_type == "DCBreak":
+                brk = self.break_by_name[meas.device_name]
+                i = self.node_pos[brk.i_node]
+                j = self.node_pos[brk.j_node]
                 i_state = int(self.voltage_col[i])
                 j_state = int(self.voltage_col[j])
-                i_col = self.switch_start + self.switch_pos[sw.name]
-                current = switch_current[self.switch_pos[sw.name]]
+                i_col = self.switch_start + self.break_pos[brk.name]
+                current = switch_current[self.break_pos[brk.name]]
                 vi = voltage[i]
                 vj = voltage[j]
                 if mtype == "P_FROM":
@@ -1943,7 +1952,7 @@ class DCStateEstimator:
                 elif mtype == "I_TO":
                     self._add_derivative(H, row, i_col, -1.0)
                 else:
-                    raise RuntimeError(f"Unsupported DCSwitch measurement type: {mtype}")
+                    raise RuntimeError(f"Unsupported DCBreak measurement type: {mtype}")
 
             elif meas.device_type == "DCZeroBranch":
                 zbr = self.zero_branch_by_name[meas.device_name]
@@ -1979,12 +1988,12 @@ class DCStateEstimator:
                 self._add_derivative(H, row, int(self.voltage_col[self.node_pos[zbr.i_node]]), 1.0)
                 self._add_derivative(H, row, int(self.voltage_col[self.node_pos[zbr.j_node]]), -1.0)
 
-            elif meas.device_type == "DCSwitchConstraint":
-                sw = self.switch_by_name[meas.device_name]
+            elif meas.device_type == "DCBreakConstraint":
+                brk = self.break_by_name[meas.device_name]
                 if mtype != "V_DIFF":
-                    raise RuntimeError(f"Unsupported DCSwitchConstraint measurement type: {mtype}")
-                self._add_derivative(H, row, int(self.voltage_col[self.node_pos[sw.i_node]]), 1.0)
-                self._add_derivative(H, row, int(self.voltage_col[self.node_pos[sw.j_node]]), -1.0)
+                    raise RuntimeError(f"Unsupported DCBreakConstraint measurement type: {mtype}")
+                self._add_derivative(H, row, int(self.voltage_col[self.node_pos[brk.i_node]]), 1.0)
+                self._add_derivative(H, row, int(self.voltage_col[self.node_pos[brk.j_node]]), -1.0)
 
             elif meas.device_type == "DCDCConverter":
                 conv = self.dcdc_by_name[meas.device_name]
@@ -2279,6 +2288,14 @@ class DCStateEstimator:
                 sw.p = float(pf)
                 sw.current = float(cur)
 
+        if self._apply_break_devices:
+            vi = voltage[self._apply_break_i]
+            current = switch_current[self._apply_break_pos]
+            p_from = vi * current
+            for brk, pf, cur in zip(self._apply_break_devices, p_from, current):
+                brk.p = float(pf)
+                brk.current = float(cur)
+
         if self._apply_zero_branch_devices:
             vi = voltage[self._apply_zero_branch_i]
             current = switch_current[self._apply_zero_branch_pos]
@@ -2311,12 +2328,6 @@ class DCStateEstimator:
         if len(self.nodes) > limit:
             print(f"  ... {len(self.nodes) - limit} more nodes")
 
-        if self.switches:
-            print("Estimated switch currents:")
-            for sw in self.switches[:limit]:
-                print(f"  {sw.name:10s} I={switch_current[self.switch_pos[sw.name]]:.9f}")
-            if len(self.switches) > limit:
-                print(f"  ... {len(self.switches) - limit} more switches")
         estimated_zero_branches = [zbr for zbr in self.zero_branches if zbr.name in self.zero_branch_pos]
         if estimated_zero_branches:
             print("Estimated zero-branch currents:")
@@ -2324,6 +2335,12 @@ class DCStateEstimator:
                 print(f"  {zbr.name:10s} I={switch_current[self.zero_branch_pos[zbr.name]]:.9f}")
             if len(estimated_zero_branches) > limit:
                 print(f"  ... {len(estimated_zero_branches) - limit} more zero branches")
+        if self.breakers:
+            print("Estimated break currents:")
+            for brk in self.breakers[:limit]:
+                print(f"  {brk.name:10s} I={switch_current[self.break_pos[brk.name]]:.9f}")
+            if len(self.breakers) > limit:
+                print(f"  ... {len(self.breakers) - limit} more breaks")
 
         if self.dcdc_converters:
             print("Estimated DCDC port powers:")
