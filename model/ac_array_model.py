@@ -302,16 +302,16 @@ def build_ac_ppc_from_e_file(
 
     branch_rows = _rows(raw, "ACBranch")
     branch_cols = _columns(raw, "ACBranch")
-    branch_idx_col = branch_cols["idx"]
     branch_name_col = branch_cols.get("name")
-    branch_i_col = branch_cols["i_node"]
-    branch_j_col = branch_cols["j_node"]
-    branch_r_col = branch_cols["r"]
-    branch_x_col = branch_cols["x"]
-    branch_b_col = branch_cols["b"]
-    branch_run_col = branch_cols["run_stat"]
     branch = np.zeros((len(branch_rows), len(BRANCH_COLS)), dtype=np.float64)
     if branch_rows:
+        branch_idx_col = branch_cols["idx"]
+        branch_i_col = branch_cols["i_node"]
+        branch_j_col = branch_cols["j_node"]
+        branch_r_col = branch_cols["r"]
+        branch_x_col = branch_cols["x"]
+        branch_b_col = branch_cols["b"]
+        branch_run_col = branch_cols["run_stat"]
         branch_table = _row_array(branch_rows)
         branch_numeric = _numeric_columns(
             branch_table,
@@ -339,18 +339,18 @@ def build_ac_ppc_from_e_file(
 
     transformer_rows = _rows(raw, "ACTransformer")
     transformer_cols = _columns(raw, "ACTransformer")
-    transformer_idx_col = transformer_cols["idx"]
     transformer_name_col = transformer_cols.get("name")
-    transformer_i_col = transformer_cols["i_node"]
-    transformer_j_col = transformer_cols["j_node"]
-    transformer_r_col = transformer_cols["r"]
-    transformer_x_col = transformer_cols["x"]
-    transformer_b_col = transformer_cols["b"]
-    transformer_tap_col = transformer_cols["tap"]
-    transformer_shift_col = transformer_cols["shift"]
-    transformer_run_col = transformer_cols["run_stat"]
     transformer = np.zeros((len(transformer_rows), len(TRANSFORMER_COLS)), dtype=np.float64)
     if transformer_rows:
+        transformer_idx_col = transformer_cols["idx"]
+        transformer_i_col = transformer_cols["i_node"]
+        transformer_j_col = transformer_cols["j_node"]
+        transformer_r_col = transformer_cols["r"]
+        transformer_x_col = transformer_cols["x"]
+        transformer_b_col = transformer_cols["b"]
+        transformer_tap_col = transformer_cols["tap"]
+        transformer_shift_col = transformer_cols["shift"]
+        transformer_run_col = transformer_cols["run_stat"]
         transformer_table = _row_array(transformer_rows)
         transformer_numeric = _numeric_columns(
             transformer_table,
@@ -390,17 +390,17 @@ def build_ac_ppc_from_e_file(
 
     gen_rows = _rows(raw, "ACGenerator")
     gen_cols = _columns(raw, "ACGenerator")
-    gen_idx_col = gen_cols["idx"]
     gen_name_col = gen_cols.get("name")
-    gen_node_col = gen_cols["node"]
-    gen_control_col = gen_cols["control_type"]
-    gen_p_col = gen_cols["p_set"]
-    gen_q_col = gen_cols["q_set"]
-    gen_v_col = gen_cols["v_set"]
     gen_alpha_col = gen_cols.get("alpha")
-    gen_run_col = gen_cols["run_stat"]
     gen = np.zeros((len(gen_rows), len(GEN_COLS)), dtype=np.float64)
     if gen_rows:
+        gen_idx_col = gen_cols["idx"]
+        gen_node_col = gen_cols["node"]
+        gen_control_col = gen_cols["control_type"]
+        gen_p_col = gen_cols["p_set"]
+        gen_q_col = gen_cols["q_set"]
+        gen_v_col = gen_cols["v_set"]
+        gen_run_col = gen_cols["run_stat"]
         gen_table = _row_array(gen_rows)
         gen_nodes = gen_table[:, gen_node_col].astype(np.float64, copy=False)
         gen_raw_vbase = np.fromiter(
@@ -448,14 +448,14 @@ def build_ac_ppc_from_e_file(
 
     load_rows = _rows(raw, "ACLoad")
     load_cols = _columns(raw, "ACLoad")
-    load_idx_col = load_cols["idx"]
     load_name_col = load_cols.get("name")
-    load_node_col = load_cols["node"]
-    load_run_col = load_cols["run_stat"]
-    load_value_cols = tuple(load_cols[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
     load_target_cols = tuple(LOAD_COLS[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
     load = np.zeros((len(load_rows), len(LOAD_COLS)), dtype=np.float64)
     if load_rows:
+        load_idx_col = load_cols["idx"]
+        load_node_col = load_cols["node"]
+        load_run_col = load_cols["run_stat"]
+        load_value_cols = tuple(load_cols[key] for key in ("pv0", "pv1", "pv2", "qv0", "qv1", "qv2"))
         load_table = _row_array(load_rows)
         load_numeric = _numeric_columns(
             load_table,
@@ -482,17 +482,17 @@ def build_ac_ppc_from_e_file(
 
     shunt_rows = _rows(raw, "ACShuntCompensator")
     shunt_cols = _columns(raw, "ACShuntCompensator")
-    shunt_idx_col = shunt_cols["idx"]
     shunt_name_col = shunt_cols.get("name")
-    shunt_node_col = shunt_cols["node"]
-    shunt_control_col = shunt_cols["control_type"]
-    shunt_q_col = shunt_cols["q_set"]
-    shunt_g_col = shunt_cols["g_set"]
-    shunt_b_col = shunt_cols["b_set"]
-    shunt_v_col = shunt_cols["v_set"]
-    shunt_run_col = shunt_cols["run_stat"]
     shunt = np.zeros((len(shunt_rows), len(SHUNT_COLS)), dtype=np.float64)
     if shunt_rows:
+        shunt_idx_col = shunt_cols["idx"]
+        shunt_node_col = shunt_cols["node"]
+        shunt_control_col = shunt_cols["control_type"]
+        shunt_q_col = shunt_cols["q_set"]
+        shunt_g_col = shunt_cols["g_set"]
+        shunt_b_col = shunt_cols["b_set"]
+        shunt_v_col = shunt_cols["v_set"]
+        shunt_run_col = shunt_cols["run_stat"]
         shunt_table = _row_array(shunt_rows)
         shunt_nodes = shunt_table[:, shunt_node_col].astype(np.float64, copy=False)
         shunt_raw_vbase = np.fromiter(
@@ -533,13 +533,13 @@ def build_ac_ppc_from_e_file(
 
     zero_rows = _rows(raw, "ACZeroBranch")
     zero_cols = _columns(raw, "ACZeroBranch")
-    zero_idx_col = zero_cols["idx"]
     zero_name_col = zero_cols.get("name")
-    zero_i_col = zero_cols["i_node"]
-    zero_j_col = zero_cols["j_node"]
-    zero_run_col = zero_cols["run_stat"]
     zero_branch = np.zeros((len(zero_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64)
     if zero_rows:
+        zero_idx_col = zero_cols["idx"]
+        zero_i_col = zero_cols["i_node"]
+        zero_j_col = zero_cols["j_node"]
+        zero_run_col = zero_cols["run_stat"]
         zero_table = _row_array(zero_rows)
         zero_numeric = _numeric_columns(
             zero_table,
@@ -564,14 +564,14 @@ def build_ac_ppc_from_e_file(
 
     switch_rows = _rows(raw, "ACSwitch")
     switch_cols = _columns(raw, "ACSwitch")
-    switch_idx_col = switch_cols["idx"]
     switch_name_col = switch_cols.get("name")
-    switch_i_col = switch_cols["i_node"]
-    switch_j_col = switch_cols["j_node"]
-    switch_status_col = switch_cols["status"]
-    switch_run_col = switch_cols["run_stat"]
     switch = np.zeros((len(switch_rows), len(SWITCH_COLS)), dtype=np.float64)
     if switch_rows:
+        switch_idx_col = switch_cols["idx"]
+        switch_i_col = switch_cols["i_node"]
+        switch_j_col = switch_cols["j_node"]
+        switch_status_col = switch_cols["status"]
+        switch_run_col = switch_cols["run_stat"]
         switch_table = _row_array(switch_rows)
         switch_numeric = _numeric_columns(
             switch_table,

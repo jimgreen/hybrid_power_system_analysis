@@ -55,8 +55,9 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertNotIn("DCPowerNetwork", source)
         self.assertFalse(hasattr(hybrid_net_flow, "ACPowerNetwork"))
         self.assertFalse(hasattr(hybrid_net_flow, "DCPowerNetwork"))
-        self.assertTrue(hasattr(hybrid_net_flow, "HybridACGrid"))
-        self.assertTrue(hasattr(hybrid_net_flow, "HybridDCGrid"))
+        self.assertFalse(hasattr(hybrid_net_flow, "HybridACGrid"))
+        self.assertFalse(hasattr(hybrid_net_flow, "HybridDCGrid"))
+        self.assertTrue(hasattr(hybrid_net_flow, "HybridPowerNetwork"))
 
     def test_hybrid_net_40_runs_from_self_contained_network(self):
         from scipy.sparse import issparse
@@ -139,6 +140,24 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         calc._write_back(calc.x)
         self.assertEqual(1, call_count)
 
+    def test_hybrid_network_load_uses_array_model_for_all_case_shapes(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        ac_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "ac" / "ieee300.e")
+        dc_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "dc" / "dc_net_30.e")
+        hybrid_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+
+        self.assertEqual("hybrid_ppc_v1", ac_network.ppc["format"])
+        self.assertEqual("hybrid_ppc_v1", dc_network.ppc["format"])
+        self.assertEqual("hybrid_ppc_v1", hybrid_network.ppc["format"])
+        self.assertTrue(hasattr(ac_network, "_ac_ppc"))
+        self.assertTrue(hasattr(dc_network, "_dc_ppc"))
+        self.assertTrue(hasattr(hybrid_network, "_ac_ppc"))
+        self.assertTrue(hasattr(hybrid_network, "_dc_ppc"))
+        self.assertTrue(ac_network.ac.nodes)
+        self.assertTrue(dc_network.dc.nodes)
+        self.assertTrue(hybrid_network.dcac_converters or hybrid_network.acac_converters)
+
     def test_converter_initial_values_and_writeback_use_cached_arrays(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 
@@ -172,8 +191,11 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
         network.topo()
 
-        self.assertIsInstance(network.ac, hybrid_net_flow.HybridACGrid)
-        self.assertIsInstance(network.dc, hybrid_net_flow.HybridDCGrid)
+        from ac_model import ACPowerNetwork
+        from dc_array_model import DCPowerNetwork
+
+        self.assertIsInstance(network.ac, ACPowerNetwork)
+        self.assertIsInstance(network.dc, DCPowerNetwork)
         self.assertEqual(len(network.ac.islands), 1)
         self.assertEqual(len(network.dc.islands), 3)
         self.assertEqual(len(network.hybrid_islands), 1)
@@ -243,23 +265,25 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
     def test_main_hybrid_power_flow_skips_topology_diagnostics(self):
         import hybrid_net_flow
+        from ac_model import ACPowerNetwork
+        from dc_array_model import DCPowerNetwork
 
-        original_ac_check_topo = hybrid_net_flow.HybridACGrid.check_topo
-        original_dc_check_topo = hybrid_net_flow.HybridDCGrid.check_topo
+        original_ac_check_topo = ACPowerNetwork.check_topo
+        original_dc_check_topo = DCPowerNetwork.check_topo
 
         def reject_check_topo(*_args, **_kwargs):
             raise AssertionError("main hybrid load-flow path should not call check_topo")
 
-        hybrid_net_flow.HybridACGrid.check_topo = reject_check_topo
-        hybrid_net_flow.HybridDCGrid.check_topo = reject_check_topo
+        ACPowerNetwork.check_topo = reject_check_topo
+        DCPowerNetwork.check_topo = reject_check_topo
         try:
             result = hybrid_net_flow.run_hybrid_power_flow(
                 ROOT / "data" / "hybrid" / "qinling.e",
                 verbose=False,
             )
         finally:
-            hybrid_net_flow.HybridACGrid.check_topo = original_ac_check_topo
-            hybrid_net_flow.HybridDCGrid.check_topo = original_dc_check_topo
+            ACPowerNetwork.check_topo = original_ac_check_topo
+            DCPowerNetwork.check_topo = original_dc_check_topo
 
         self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
 

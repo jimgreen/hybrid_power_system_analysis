@@ -1,10 +1,9 @@
-import argparse
+﻿import argparse
 import contextlib
 import io
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -17,1246 +16,17 @@ if str(ROOT_DIR) not in sys.path:
 LFCORE_DIR = Path(__file__).resolve().parent
 if str(LFCORE_DIR) not in sys.path:
     sys.path.insert(0, str(LFCORE_DIR))
+MODEL_DIR = ROOT_DIR / "model"
+if str(MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(MODEL_DIR))
 
-from efile_read import efile_factory_from_file_cached
 from ac_lf import ACPowerFlowCalc
 from dc_lf import DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
-from unit_system import normalize_model_named_units
+from model.hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
 
 
 DEFAULT_HYBRID_EFILE = ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e"
-ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
-_PURE_AC_EXCLUDED_TAGS = (
-    "<DCNode>",
-    "<DCBranch>",
-    "<DCLoad>",
-    "<DCGenerator>",
-    "<DCShuntCompensator>",
-    "<DCZeroBranch>",
-    "<DCSwitch>",
-    "<DCDCConverter>",
-    "<DCACConverter>",
-    "<ACACConverter>",
-)
-
-
-class _FastDevice:
-    """Small hashable attribute container used by the AC-only array fast path."""
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-def _is_pure_ac_file(file_name) -> bool:
-    text = Path(file_name).read_text(encoding="utf-8")
-    return "<ACNode>" in text and not any(tag in text for tag in _PURE_AC_EXCLUDED_TAGS)
-
-
-def _fast_ac_network_from_ppc(ppc) -> "HybridACGrid":
-    from ac_array_model import (
-        BRANCH_COLS,
-        BUS_COLS,
-        GEN_COLS,
-        LOAD_COLS,
-        SHUNT_COLS,
-        SWITCH_COLS,
-        TRANSFORMER_COLS,
-        ZERO_BRANCH_COLS,
-        CTRL_P,
-        CTRL_PQ,
-        CTRL_PV,
-        CTRL_SLACK,
-        SHUNT_B,
-        SHUNT_Q,
-        SHUNT_V,
-        SHUNT_Z,
-    )
-
-    ctrl_name = {
-        CTRL_PQ: "PQ",
-        CTRL_P: "P",
-        CTRL_PV: "PV",
-        CTRL_SLACK: "V",
-    }
-    shunt_ctrl_name = {
-        SHUNT_Q: "Q",
-        SHUNT_V: "V",
-        SHUNT_B: "B",
-        SHUNT_Z: "Z",
-    }
-
-    def names(key, fallback_prefix, count):
-        values = ppc.get(key)
-        if values is None:
-            return [f"{fallback_prefix}_{idx}" for idx in range(count)]
-        return [str(value) for value in values]
-
-    bus_names = names("bus_name", "bus", ppc["bus"].shape[0])
-    branch_names = names("branch_name", "branch", ppc["branch"].shape[0])
-    transformer_names = names("transformer_name", "transformer", ppc["transformer"].shape[0])
-    gen_names = names("gen_name", "gen", ppc["gen"].shape[0])
-    load_names = names("load_name", "load", ppc["load"].shape[0])
-    shunt_names = names("shunt_name", "shunt", ppc["shunt"].shape[0])
-    zero_branch_names = names("zero_branch_name", "zero_branch", ppc["zero_branch"].shape[0])
-    switch_names = names("switch_name", "switch", ppc["switch"].shape[0])
-
-    nodes = [
-        _FastDevice(
-            idx=int(row[BUS_COLS["idx"]]),
-            name=bus_names[pos],
-            vbase=float(row[BUS_COLS["vbase"]]),
-            voltage=float(row[BUS_COLS["voltage"]]),
-            angle=float(row[BUS_COLS["angle"]]),
-            isl=int(row[BUS_COLS["isl"]]),
-            run_stat=int(row[BUS_COLS["run_stat"]]),
-            v_gens=[],
-            is_alive=False,
-            isl_obj=None,
-        )
-        for pos, row in enumerate(ppc["bus"])
-    ]
-    branches = [
-        _FastDevice(
-            idx=int(row[BRANCH_COLS["idx"]]),
-            name=branch_names[pos],
-            i_node=int(row[BRANCH_COLS["i_node"]]),
-            j_node=int(row[BRANCH_COLS["j_node"]]),
-            r=float(row[BRANCH_COLS["r"]]),
-            x=float(row[BRANCH_COLS["x"]]),
-            b=float(row[BRANCH_COLS["b"]]),
-            run_stat=int(row[BRANCH_COLS["run_stat"]]),
-            i_p=0.0,
-            i_q=0.0,
-            i_c=0.0,
-            j_p=0.0,
-            j_q=0.0,
-            j_c=0.0,
-            i_node_obj=None,
-            j_node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["branch"])
-    ]
-    transformers = [
-        _FastDevice(
-            idx=int(row[TRANSFORMER_COLS["idx"]]),
-            name=transformer_names[pos],
-            i_node=int(row[TRANSFORMER_COLS["i_node"]]),
-            j_node=int(row[TRANSFORMER_COLS["j_node"]]),
-            r=float(row[TRANSFORMER_COLS["r"]]),
-            x=float(row[TRANSFORMER_COLS["x"]]),
-            b=float(row[TRANSFORMER_COLS["b"]]),
-            tap=float(row[TRANSFORMER_COLS["tap"]]),
-            shift=float(row[TRANSFORMER_COLS["shift"]]),
-            run_stat=int(row[TRANSFORMER_COLS["run_stat"]]),
-            i_p=0.0,
-            i_q=0.0,
-            i_c=0.0,
-            j_p=0.0,
-            j_q=0.0,
-            j_c=0.0,
-            i_node_obj=None,
-            j_node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["transformer"])
-    ]
-    generators = [
-        _FastDevice(
-            idx=int(row[GEN_COLS["idx"]]),
-            name=gen_names[pos],
-            node=int(row[GEN_COLS["node"]]),
-            control_type=ctrl_name.get(int(row[GEN_COLS["control_type"]]), "PQ"),
-            p_set=float(row[GEN_COLS["p_set"]]),
-            q_set=float(row[GEN_COLS["q_set"]]),
-            v_set=float(row[GEN_COLS["v_set"]]),
-            alpha=float(row[GEN_COLS["alpha"]]),
-            run_stat=int(row[GEN_COLS["run_stat"]]),
-            p=float(row[GEN_COLS["p"]]),
-            q=float(row[GEN_COLS["q"]]),
-            current=float(row[GEN_COLS["current"]]),
-            node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["gen"])
-    ]
-    loads = [
-        _FastDevice(
-            idx=int(row[LOAD_COLS["idx"]]),
-            name=load_names[pos],
-            node=int(row[LOAD_COLS["node"]]),
-            pv0=float(row[LOAD_COLS["pv0"]]),
-            pv1=float(row[LOAD_COLS["pv1"]]),
-            pv2=float(row[LOAD_COLS["pv2"]]),
-            qv0=float(row[LOAD_COLS["qv0"]]),
-            qv1=float(row[LOAD_COLS["qv1"]]),
-            qv2=float(row[LOAD_COLS["qv2"]]),
-            run_stat=int(row[LOAD_COLS["run_stat"]]),
-            p=float(row[LOAD_COLS["p"]]),
-            q=float(row[LOAD_COLS["q"]]),
-            current=float(row[LOAD_COLS["current"]]),
-            node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["load"])
-    ]
-    shunts = [
-        _FastDevice(
-            idx=int(row[SHUNT_COLS["idx"]]),
-            name=shunt_names[pos],
-            node=int(row[SHUNT_COLS["node"]]),
-            control_type=shunt_ctrl_name.get(int(row[SHUNT_COLS["control_type"]]), "Q"),
-            q_set=float(row[SHUNT_COLS["q_set"]]),
-            g_set=float(row[SHUNT_COLS["g_set"]]),
-            b_set=float(row[SHUNT_COLS["b_set"]]),
-            v_set=float(row[SHUNT_COLS["v_set"]]),
-            run_stat=int(row[SHUNT_COLS["run_stat"]]),
-            p=float(row[SHUNT_COLS["p"]]),
-            q=float(row[SHUNT_COLS["q"]]),
-            current=float(row[SHUNT_COLS["current"]]),
-            node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["shunt"])
-    ]
-    zero_branches = [
-        _FastDevice(
-            idx=int(row[ZERO_BRANCH_COLS["idx"]]),
-            name=zero_branch_names[pos],
-            i_node=int(row[ZERO_BRANCH_COLS["i_node"]]),
-            j_node=int(row[ZERO_BRANCH_COLS["j_node"]]),
-            run_stat=int(row[ZERO_BRANCH_COLS["run_stat"]]),
-            p=float(row[ZERO_BRANCH_COLS["p"]]),
-            q=float(row[ZERO_BRANCH_COLS["q"]]),
-            current=float(row[ZERO_BRANCH_COLS["current"]]),
-            i_node_obj=None,
-            j_node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["zero_branch"])
-    ]
-    switches = [
-        _FastDevice(
-            idx=int(row[SWITCH_COLS["idx"]]),
-            name=switch_names[pos],
-            i_node=int(row[SWITCH_COLS["i_node"]]),
-            j_node=int(row[SWITCH_COLS["j_node"]]),
-            status=int(row[SWITCH_COLS["status"]]),
-            run_stat=int(row[SWITCH_COLS["run_stat"]]),
-            p=float(row[SWITCH_COLS["p"]]),
-            q=float(row[SWITCH_COLS["q"]]),
-            current=float(row[SWITCH_COLS["current"]]),
-            i_node_obj=None,
-            j_node_obj=None,
-            is_alive=False,
-        )
-        for pos, row in enumerate(ppc["switch"])
-    ]
-    model = SimpleNamespace(
-        ACNode=nodes,
-        ACBranch=branches,
-        ACTransformer=transformers,
-        ACGenerator=generators,
-        ACLoad=loads,
-        ACShuntCompensator=shunts,
-        ACZeroBranch=zero_branches,
-        ACSwitch=switches,
-    )
-    return HybridACGrid(model)
-
-
-class _ACIsland:
-    def __init__(self, idx: int):
-        self.idx = idx
-        self.reset()
-
-    def reset(self):
-        self.is_alive = False
-        self.nodes = []
-        self.gens = []
-        self.loads = []
-        self.branches = []
-        self.zero_branches = []
-        self.switches = []
-        self.transformers = []
-        self.shunt_compensators = []
-        self.slack_nodes = []
-        self.v_gens = []
-
-
-class _DCIsland:
-    def __init__(self, idx: int):
-        self.idx = idx
-        self.reset()
-
-    def reset(self):
-        self.is_alive = False
-        self.nodes = []
-        self.gens = []
-        self.loads = []
-        self.branches = []
-        self.zero_branches = []
-        self.switches = []
-        self.dcdc_converters = []
-        self.slack_nodes = []
-        self.v_gens = []
-        self.v_dcdcs = []
-
-
-class _GridBase:
-    @staticmethod
-    def _is_running(dev) -> bool:
-        return dev.run_stat == 1
-
-    @staticmethod
-    def _same_live_island(dev) -> bool:
-        return (
-            dev.i_node_obj is not None
-            and dev.j_node_obj is not None
-            and dev.i_node_obj.isl_obj is not None
-            and dev.i_node_obj.isl_obj == dev.j_node_obj.isl_obj
-        )
-
-    @staticmethod
-    def _name(dev) -> str:
-        return getattr(dev, "name", str(getattr(dev, "idx", "")))
-
-
-class HybridACGrid(_GridBase):
-    def __init__(self, model):
-        self.model = model
-        self.nodes = getattr(model, "ACNode", [])
-        self.branches = getattr(model, "ACBranch", [])
-        self.loads = getattr(model, "ACLoad", [])
-        self.generators = getattr(model, "ACGenerator", [])
-        self.zero_branches = getattr(model, "ACZeroBranch", [])
-        self.switches = getattr(model, "ACSwitch", [])
-        self.transformers = getattr(model, "ACTransformer", [])
-        self.shunt_compensators = getattr(model, "ACShuntCompensator", [])
-        self.islands = []
-        self.node_dict = {}
-        self.switch_dict = {}
-        self.load_dict = {}
-        self.generator_dict = {}
-        self.zero_branch_dict = {}
-        self.branch_dict = {}
-        self.transformer_dict = {}
-        self.shunt_compensator_dict = {}
-
-    def format_assoc(self):
-        """Rebuild AC device dictionaries and attach each device to its terminal nodes."""
-        self.node_dict = {node.idx: node for node in self.nodes}
-        self.switch_dict = {sw.idx: sw for sw in self.switches}
-        self.load_dict = {ld.idx: ld for ld in self.loads}
-        self.generator_dict = {gen.idx: gen for gen in self.generators}
-        self.zero_branch_dict = {zbr.idx: zbr for zbr in self.zero_branches}
-        self.branch_dict = {br.idx: br for br in self.branches}
-        self.transformer_dict = {tr.idx: tr for tr in self.transformers}
-        self.shunt_compensator_dict = {sc.idx: sc for sc in self.shunt_compensators}
-
-        for node in self.nodes:
-            node.v_gens = []
-            node.is_alive = False
-
-        node_get = self.node_dict.get
-        for gen in self.generators:
-            gen.node_obj = node_get(gen.node)
-        for ld in self.loads:
-            ld.node_obj = node_get(ld.node)
-        for sc in self.shunt_compensators:
-            sc.node_obj = node_get(sc.node)
-        for br in self.branches:
-            br.i_node_obj = node_get(br.i_node)
-            br.j_node_obj = node_get(br.j_node)
-        for tr in self.transformers:
-            tr.i_node_obj = node_get(tr.i_node)
-            tr.j_node_obj = node_get(tr.j_node)
-        for sw in self.switches:
-            sw.i_node_obj = node_get(sw.i_node)
-            sw.j_node_obj = node_get(sw.j_node)
-        for zbr in self.zero_branches:
-            zbr.i_node_obj = node_get(zbr.i_node)
-            zbr.j_node_obj = node_get(zbr.j_node)
-
-    def topo(self):
-        """Find AC connectivity islands using running branches, transformers and closed switches."""
-        self.format_assoc()
-        self.islands = []
-        for node in self.nodes:
-            node.isl = 0
-            node.isl_obj = None
-
-        running_nodes = [node for node in self.nodes if node.run_stat == 1]
-        adj = {node: [] for node in running_nodes}
-
-        def add_edge(dev):
-            if (
-                dev.run_stat == 1
-                and dev.i_node_obj in adj
-                and dev.j_node_obj in adj
-                and dev.i_node_obj != dev.j_node_obj
-            ):
-                adj[dev.i_node_obj].append(dev.j_node_obj)
-                adj[dev.j_node_obj].append(dev.i_node_obj)
-
-        for dev in self.branches:
-            add_edge(dev)
-        for dev in self.transformers:
-            add_edge(dev)
-        for dev in self.zero_branches:
-            add_edge(dev)
-        for dev in self.switches:
-            if dev.status == 1:
-                add_edge(dev)
-
-        island_idx = 0
-        for node in running_nodes:
-            if node.isl != 0:
-                continue
-            island_idx += 1
-            island = _ACIsland(island_idx)
-            self.islands.append(island)
-            node.isl = island_idx
-            node.isl_obj = island
-            stack = [node]
-            while stack:
-                cur = stack.pop()
-                for nxt in adj[cur]:
-                    if nxt.isl == 0:
-                        nxt.isl = island_idx
-                        nxt.isl_obj = island
-                        stack.append(nxt)
-
-        self.det_isl_alive_stat()
-
-    def det_isl_alive_stat(self):
-        """Populate live AC islands and mark devices that participate in load flow."""
-        for island in self.islands:
-            island.reset()
-
-        for node in self.nodes:
-            node.v_gens = []
-            if node.isl_obj is not None:
-                node.isl_obj.nodes.append(node)
-
-        for gen in self.generators:
-            if gen.run_stat != 1 or gen.node_obj is None or gen.node_obj.isl_obj is None:
-                continue
-            island = gen.node_obj.isl_obj
-            island.gens.append(gen)
-            if gen.control_type in ("V", "SLACK", "PH"):
-                island.is_alive = True
-                gen.node_obj.v_gens.append(gen)
-                island.v_gens.append(gen)
-                if gen.node_obj not in island.slack_nodes:
-                    island.slack_nodes.append(gen.node_obj)
-            elif gen.control_type == "PV":
-                gen.node_obj.v_gens.append(gen)
-                island.v_gens.append(gen)
-
-        for ld in self.loads:
-            if ld.run_stat == 1 and ld.node_obj is not None and ld.node_obj.isl_obj is not None:
-                ld.node_obj.isl_obj.loads.append(ld)
-        for sc in self.shunt_compensators:
-            if sc.run_stat == 1 and sc.node_obj is not None and sc.node_obj.isl_obj is not None:
-                sc.node_obj.isl_obj.shunt_compensators.append(sc)
-        for sw in self.switches:
-            if sw.run_stat == 1 and sw.status == 1 and self._same_live_island(sw):
-                sw.i_node_obj.isl_obj.switches.append(sw)
-        for br in self.branches:
-            if br.run_stat == 1 and self._same_live_island(br):
-                br.i_node_obj.isl_obj.branches.append(br)
-        for tr in self.transformers:
-            if tr.run_stat == 1 and self._same_live_island(tr):
-                tr.i_node_obj.isl_obj.transformers.append(tr)
-        for zbr in self.zero_branches:
-            if zbr.run_stat == 1 and self._same_live_island(zbr):
-                zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
-
-        for island in self.islands:
-            island.is_alive = len(island.slack_nodes) >= 1
-
-        for node in self.nodes:
-            node.is_alive = node.isl_obj is not None and node.isl_obj.is_alive
-        for ld in self.loads:
-            ld.is_alive = ld.node_obj is not None and ld.run_stat == 1 and ld.node_obj.is_alive
-        for gen in self.generators:
-            gen.is_alive = gen.node_obj is not None and gen.run_stat == 1 and gen.node_obj.is_alive
-        for sc in self.shunt_compensators:
-            sc.is_alive = sc.node_obj is not None and sc.run_stat == 1 and sc.node_obj.is_alive
-        for dev in [*self.branches, *self.transformers, *self.zero_branches]:
-            dev.is_alive = (
-                dev.run_stat == 1
-                and dev.i_node_obj is not None
-                and dev.j_node_obj is not None
-                and dev.i_node_obj.is_alive
-                and dev.j_node_obj.is_alive
-            )
-        for sw in self.switches:
-            sw.is_alive = (
-                sw.run_stat == 1
-                and sw.status == 1
-                and sw.i_node_obj is not None
-                and sw.j_node_obj is not None
-                and sw.i_node_obj.is_alive
-                and sw.j_node_obj.is_alive
-            )
-
-    def print_isl_info(self):
-        for island in self.islands:
-            print(f"AC island {island.idx} is_alive = {island.is_alive}")
-            print(f"    nodes = {len(island.nodes)}")
-            print(f"    gens = {len(island.gens)}")
-            print(f"    loads = {len(island.loads)}")
-            print(f"    branches = {len(island.branches)}")
-            print(f"    transformers = {len(island.transformers)}")
-            print(f"    switches = {len(island.switches)}")
-            print(f"    zero_branches = {len(island.zero_branches)}")
-            print(f"    shunt_compensators = {len(island.shunt_compensators)}")
-
-    def _slack_reference(self, node):
-        """Return the fixed phasor imposed by the running slack generator on a node."""
-        for gen in getattr(node, "v_gens", []):
-            if gen.run_stat == 1 and str(gen.control_type).upper() in {"V", "SLACK", "PH"}:
-                return float(gen.v_set), float(getattr(node, "angle", 0.0) or 0.0)
-        return float(getattr(node, "voltage", 1.0) or 1.0), float(getattr(node, "angle", 0.0) or 0.0)
-
-    @staticmethod
-    def _angle_close(left: float, right: float, tol: float = 1e-10) -> bool:
-        diff = (left - right + np.pi) % (2.0 * np.pi) - np.pi
-        return abs(diff) <= tol
-
-    def _slack_nodes_are_redundant_zero_ties(self, island) -> bool:
-        """Allow equal fixed-voltage slack nodes only when ideal ties make them one node."""
-        slack_nodes = list(getattr(island, "slack_nodes", []))
-        if len(slack_nodes) <= 1:
-            return True
-
-        parent = {node.idx: node.idx for node in island.nodes}
-
-        def find(node_idx):
-            root = node_idx
-            while parent[root] != root:
-                root = parent[root]
-            while parent[node_idx] != node_idx:
-                node_idx, parent[node_idx] = parent[node_idx], root
-            return root
-
-        def union(left, right):
-            if left not in parent or right not in parent:
-                return
-            left_root = find(left)
-            right_root = find(right)
-            if left_root != right_root:
-                parent[right_root] = left_root
-
-        for dev in island.zero_branches:
-            if dev.run_stat == 1:
-                union(dev.i_node, dev.j_node)
-        for dev in island.switches:
-            if dev.run_stat == 1 and getattr(dev, "status", 0) == 1:
-                union(dev.i_node, dev.j_node)
-
-        first_root = find(slack_nodes[0].idx)
-        if any(find(node.idx) != first_root for node in slack_nodes[1:]):
-            return False
-
-        ref_voltage, ref_angle = self._slack_reference(slack_nodes[0])
-        for node in slack_nodes[1:]:
-            voltage, angle = self._slack_reference(node)
-            if abs(voltage - ref_voltage) > 1e-10 or not self._angle_close(angle, ref_angle):
-                return False
-        return True
-
-    def check_topo(self, extra_node_refs=None):
-        if not self.islands:
-            self.topo()
-        errors = []
-        warns = []
-        node_ref_count = {node.idx: 0 for node in self.nodes}
-        for node_idx, count in (extra_node_refs or {}).items():
-            if node_idx in node_ref_count:
-                node_ref_count[node_idx] += count
-
-        def check_node(node_idx, dev_type, dev):
-            if node_idx not in self.node_dict:
-                errors.append(f"设备 {dev_type}[{dev.idx}] {self._name(dev)} 引用的节点 {node_idx} 不存在")
-            elif self.node_dict[node_idx].run_stat == 1:
-                node_ref_count[node_idx] += 1
-
-        for br in self.branches:
-            if br.run_stat == 1:
-                check_node(br.i_node, "ACBranch", br)
-                check_node(br.j_node, "ACBranch", br)
-        for tr in self.transformers:
-            if tr.run_stat == 1:
-                check_node(tr.i_node, "ACTransformer", tr)
-                check_node(tr.j_node, "ACTransformer", tr)
-        for zbr in self.zero_branches:
-            if zbr.run_stat == 1:
-                check_node(zbr.i_node, "ACZeroBranch", zbr)
-                check_node(zbr.j_node, "ACZeroBranch", zbr)
-        for sw in self.switches:
-            if sw.run_stat == 1:
-                check_node(sw.i_node, "ACSwitch", sw)
-                check_node(sw.j_node, "ACSwitch", sw)
-        for ld in self.loads:
-            if ld.run_stat == 1:
-                check_node(ld.node, "ACLoad", ld)
-        for gen in self.generators:
-            if gen.run_stat == 1:
-                check_node(gen.node, "ACGenerator", gen)
-        for sc in self.shunt_compensators:
-            if sc.run_stat == 1:
-                check_node(sc.node, "ACShuntCompensator", sc)
-
-        for node in self.nodes:
-            if node.run_stat != 1:
-                continue
-            if node_ref_count[node.idx] == 0:
-                errors.append(f"节点 {node.idx} {self._name(node)} 未关联任何设备")
-            elif node_ref_count[node.idx] == 1:
-                warns.append(f"节点 {node.idx} {self._name(node)} 单端悬空，请检查！")
-
-        for dev_type, devices in (
-            ("支路", self.branches),
-            ("开关", self.switches),
-            ("零阻抗支路", self.zero_branches),
-        ):
-            for dev in devices:
-                if dev.run_stat != 1:
-                    continue
-                if dev.i_node_obj is None or dev.j_node_obj is None:
-                    continue
-                if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
-                    continue
-                if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
-                    errors.append(
-                        f"{dev_type} {dev.idx} {self._name(dev)} 两端节点的电压基值不同:"
-                        f"{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
-                    )
-
-        for island in self.islands:
-            if len(island.slack_nodes) > 1:
-                names = " ".join(self._name(node) for node in island.slack_nodes)
-                if self._slack_nodes_are_redundant_zero_ties(island):
-                    warns.append(f"岛屿 {island.idx} 存在多个零阻抗等值平衡节点，按冗余参考处理: {names}")
-                else:
-                    errors.append(f"岛屿 {island.idx} 存在多个平衡节点: {names}")
-            if len(island.slack_nodes) == 0:
-                warns.append(f"岛屿 {island.idx} , 无平衡节点，跳过潮流计算")
-
-        return warns, errors
-
-
-class HybridDCGrid(_GridBase):
-    def __init__(self, model):
-        self.model = model
-        self.nodes = getattr(model, "DCNode", [])
-        self.branches = getattr(model, "DCBranch", [])
-        self.loads = getattr(model, "DCLoad", [])
-        self.generators = getattr(model, "DCGenerator", [])
-        self.zero_branches = getattr(model, "DCZeroBranch", [])
-        self.switches = getattr(model, "DCSwitch", [])
-        self.dcdc_converters = getattr(model, "DCDCConverter", [])
-        self.islands = []
-        self.node_dict = {}
-        self.switch_dict = {}
-        self.load_dict = {}
-        self.generator_dict = {}
-        self.zero_branch_dict = {}
-        self.branch_dict = {}
-        self.dcdc_converter_dict = {}
-
-    def format_assoc(self):
-        """Rebuild DC device dictionaries and attach each device to its terminal nodes."""
-        self.node_dict = {node.idx: node for node in self.nodes}
-        self.switch_dict = {sw.idx: sw for sw in self.switches}
-        self.load_dict = {ld.idx: ld for ld in self.loads}
-        self.generator_dict = {gen.idx: gen for gen in self.generators}
-        self.zero_branch_dict = {zbr.idx: zbr for zbr in self.zero_branches}
-        self.branch_dict = {br.idx: br for br in self.branches}
-        self.dcdc_converter_dict = {conv.idx: conv for conv in self.dcdc_converters}
-
-        for node in self.nodes:
-            node.v_gens = []
-            node.v_dcdcs = []
-            node.v_set = 0.0
-            node.is_slack = False
-            node.is_alive = False
-
-        node_get = self.node_dict.get
-        for gen in self.generators:
-            gen.node_obj = node_get(gen.node)
-        for ld in self.loads:
-            ld.node_obj = node_get(ld.node)
-        for br in self.branches:
-            br.i_node_obj = node_get(br.i_node)
-            br.j_node_obj = node_get(br.j_node)
-        for sw in self.switches:
-            sw.i_node_obj = node_get(sw.i_node)
-            sw.j_node_obj = node_get(sw.j_node)
-        for zbr in self.zero_branches:
-            zbr.i_node_obj = node_get(zbr.i_node)
-            zbr.j_node_obj = node_get(zbr.j_node)
-        for conv in self.dcdc_converters:
-            conv.i_node_obj = node_get(conv.i_node)
-            conv.j_node_obj = node_get(conv.j_node)
-
-    def topo(self):
-        """Find DC connectivity islands using running resistive/zero branches and closed switches."""
-        self.format_assoc()
-        self.islands = []
-        for node in self.nodes:
-            node.isl = 0
-            node.isl_obj = None
-
-        running_nodes = [node for node in self.nodes if node.run_stat == 1]
-        adj = {node: [] for node in running_nodes}
-
-        def add_edge(dev):
-            if (
-                dev.run_stat == 1
-                and dev.i_node_obj in adj
-                and dev.j_node_obj in adj
-                and dev.i_node_obj != dev.j_node_obj
-            ):
-                adj[dev.i_node_obj].append(dev.j_node_obj)
-                adj[dev.j_node_obj].append(dev.i_node_obj)
-
-        for dev in self.branches:
-            add_edge(dev)
-        for dev in self.zero_branches:
-            add_edge(dev)
-        for dev in self.switches:
-            if dev.status == 1:
-                add_edge(dev)
-
-        island_idx = 0
-        for node in running_nodes:
-            if node.isl != 0:
-                continue
-            island_idx += 1
-            island = _DCIsland(island_idx)
-            self.islands.append(island)
-            node.isl = island_idx
-            node.isl_obj = island
-            stack = [node]
-            while stack:
-                cur = stack.pop()
-                for nxt in adj[cur]:
-                    if nxt.isl == 0:
-                        nxt.isl = island_idx
-                        nxt.isl_obj = island
-                        stack.append(nxt)
-
-        self.det_isl_alive_stat()
-
-    def det_isl_alive_stat(self):
-        """Populate live DC islands, including V references from generators and DCDC converters."""
-        for island in self.islands:
-            island.reset()
-
-        for node in self.nodes:
-            node.v_gens = []
-            node.v_dcdcs = []
-            node.v_set = 0.0
-            node.is_slack = False
-
-        for gen in self.generators:
-            if gen.run_stat != 1 or gen.node_obj is None or gen.node_obj.isl_obj is None:
-                continue
-            island = gen.node_obj.isl_obj
-            island.gens.append(gen)
-            if gen.control_type == "V":
-                gen.node_obj.v_gens.append(gen)
-                island.v_gens.append(gen)
-
-        for conv in self.dcdc_converters:
-            if conv.run_stat != 1 or conv.i_node_obj is None or conv.j_node_obj is None:
-                continue
-            if conv.i_node_obj.isl_obj is not None:
-                conv.i_node_obj.isl_obj.dcdc_converters.append(conv)
-            if conv.j_node_obj.isl_obj is not None and conv.j_node_obj.isl_obj != conv.i_node_obj.isl_obj:
-                conv.j_node_obj.isl_obj.dcdc_converters.append(conv)
-            if conv.control_type == "V" and conv.i_node_obj.isl_obj is not None:
-                conv.i_node_obj.v_dcdcs.append(conv)
-                conv.i_node_obj.isl_obj.v_dcdcs.append(conv)
-
-        for ld in self.loads:
-            if ld.run_stat == 1 and ld.node_obj is not None and ld.node_obj.isl_obj is not None:
-                ld.node_obj.isl_obj.loads.append(ld)
-        for sw in self.switches:
-            if sw.run_stat == 1 and sw.status == 1 and self._same_live_island(sw):
-                sw.i_node_obj.isl_obj.switches.append(sw)
-        for br in self.branches:
-            if br.run_stat == 1 and self._same_live_island(br):
-                br.i_node_obj.isl_obj.branches.append(br)
-        for zbr in self.zero_branches:
-            if zbr.run_stat == 1 and self._same_live_island(zbr):
-                zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
-
-        for node in self.nodes:
-            if node.isl_obj is not None:
-                node.isl_obj.nodes.append(node)
-            refs = node.v_gens + node.v_dcdcs
-            if refs and node.isl_obj is not None:
-                node.isl_obj.slack_nodes.append(node)
-                node.is_slack = True
-                node.v_set = refs[0].v_set
-
-        for island in self.islands:
-            island.is_alive = len(island.slack_nodes) >= 1
-
-        for node in self.nodes:
-            node.is_alive = node.isl_obj is not None and node.isl_obj.is_alive
-        for ld in self.loads:
-            ld.is_alive = ld.node_obj is not None and ld.run_stat == 1 and ld.node_obj.is_alive
-        for gen in self.generators:
-            gen.is_alive = gen.node_obj is not None and gen.run_stat == 1 and gen.node_obj.is_alive
-        for dev in [*self.branches, *self.zero_branches]:
-            dev.is_alive = (
-                dev.run_stat == 1
-                and dev.i_node_obj is not None
-                and dev.j_node_obj is not None
-                and dev.i_node_obj.is_alive
-                and dev.j_node_obj.is_alive
-            )
-        for sw in self.switches:
-            sw.is_alive = (
-                sw.run_stat == 1
-                and sw.status == 1
-                and sw.i_node_obj is not None
-                and sw.j_node_obj is not None
-                and sw.i_node_obj.is_alive
-                and sw.j_node_obj.is_alive
-            )
-        for conv in self.dcdc_converters:
-            conv.is_alive = (
-                conv.run_stat == 1
-                and conv.i_node_obj is not None
-                and conv.j_node_obj is not None
-                and conv.i_node_obj.is_alive
-                and conv.j_node_obj.is_alive
-            )
-
-    def print_isl_info(self):
-        for island in self.islands:
-            print(f"DC island {island.idx} is_alive = {island.is_alive}")
-            print(f"    nodes = {len(island.nodes)}")
-            print(f"    gens = {len(island.gens)}")
-            print(f"    loads = {len(island.loads)}")
-            print(f"    branches = {len(island.branches)}")
-            print(f"    switches = {len(island.switches)}")
-            print(f"    zero_branches = {len(island.zero_branches)}")
-            print(f"    dcdc_converters = {len(island.dcdc_converters)}")
-
-    def check_topo(self, extra_node_refs=None):
-        if not self.islands:
-            self.topo()
-        errors = []
-        warns = []
-        node_ref_count = {node.idx: 0 for node in self.nodes}
-        for node_idx, count in (extra_node_refs or {}).items():
-            if node_idx in node_ref_count:
-                node_ref_count[node_idx] += count
-
-        def check_node(node_idx, dev_type, dev):
-            if node_idx not in self.node_dict:
-                errors.append(f"设备 {dev_type}[{dev.idx}] {self._name(dev)} 引用的节点 {node_idx} 不存在")
-            elif self.node_dict[node_idx].run_stat == 1:
-                node_ref_count[node_idx] += 1
-
-        for br in self.branches:
-            if br.run_stat == 1:
-                check_node(br.i_node, "DCBranch", br)
-                check_node(br.j_node, "DCBranch", br)
-        for zbr in self.zero_branches:
-            if zbr.run_stat == 1:
-                check_node(zbr.i_node, "DCZeroBranch", zbr)
-                check_node(zbr.j_node, "DCZeroBranch", zbr)
-        for sw in self.switches:
-            if sw.run_stat == 1:
-                check_node(sw.i_node, "DCSwitch", sw)
-                check_node(sw.j_node, "DCSwitch", sw)
-        for ld in self.loads:
-            if ld.run_stat == 1:
-                check_node(ld.node, "DCLoad", ld)
-        for gen in self.generators:
-            if gen.run_stat == 1:
-                check_node(gen.node, "DCGenerator", gen)
-        for conv in self.dcdc_converters:
-            if conv.run_stat == 1:
-                check_node(conv.i_node, "DCDCConverter", conv)
-                check_node(conv.j_node, "DCDCConverter", conv)
-
-        for node in self.nodes:
-            if node.run_stat != 1:
-                continue
-            if node_ref_count[node.idx] == 0:
-                errors.append(f"节点 {node.idx} {self._name(node)} 未关联任何设备")
-            elif node_ref_count[node.idx] == 1:
-                warns.append(f"节点 {node.idx} {self._name(node)} 单端悬空，请检查！")
-
-        for island in self.islands:
-            vbase_set = {int(node.vbase * 1000) for node in island.nodes}
-            if len(vbase_set) > 1:
-                values = " ".join(f"{v / 1000.0:.2f}" for v in sorted(vbase_set))
-                errors.append(f"岛屿 {island.idx} 内节点电压基值不一致: {values}")
-            if len(island.slack_nodes) > 1:
-                names = " ".join(self._name(node) for node in island.slack_nodes)
-                errors.append(f"岛屿 {island.idx} 存在多个定V节点: {names}")
-            if len(island.v_dcdcs) > 1:
-                names = " ".join(self._name(conv) for conv in island.v_dcdcs)
-                errors.append(f"岛屿 {island.idx} 存在多个定V变流器: {names}")
-            if len(island.slack_nodes) + len(island.v_dcdcs) == 0:
-                errors.append(f"岛屿 {island.idx} , 内无电压控制源（定V节点或定V变流器）")
-
-        for node in self.nodes:
-            if len(node.v_gens) + len(node.v_dcdcs) > 1:
-                errors.append(f"松弛节点 {node.idx} 上的定V发电机与定V变流器数量之和超过1，请检查拓扑！")
-
-        return warns, errors
-
-
-class HybridIsland:
-    def __init__(self, idx: int):
-        self.idx = idx
-        self.is_alive = False
-        self.ac_islands = []
-        self.dc_islands = []
-        self.ac_nodes = []
-        self.dc_nodes = []
-        self.dcac_converters = []
-        self.dcdc_converters = []
-        self.acac_converters = []
-
-    def add_ac_island(self, island):
-        self.ac_islands.append(island)
-        island.hybrid_isl = self.idx
-        island.hybrid_isl_obj = self
-        self.ac_nodes.extend(island.nodes)
-        self.is_alive = self.is_alive or island.is_alive
-
-    def add_dc_island(self, island):
-        self.dc_islands.append(island)
-        island.hybrid_isl = self.idx
-        island.hybrid_isl_obj = self
-        self.dc_nodes.extend(island.nodes)
-        self.is_alive = self.is_alive or island.is_alive
-
-    def add_dcac_converter(self, conv):
-        self.dcac_converters.append(conv)
-        conv.hybrid_isl = self.idx
-        conv.hybrid_isl_obj = self
-
-    def add_dcdc_converter(self, conv):
-        self.dcdc_converters.append(conv)
-        conv.hybrid_isl = self.idx
-        conv.hybrid_isl_obj = self
-
-    def add_acac_converter(self, conv):
-        self.acac_converters.append(conv)
-        conv.hybrid_isl = self.idx
-        conv.hybrid_isl_obj = self
-
-
-@dataclass
-class HybridPowerNetwork:
-    ac: HybridACGrid
-    dc: HybridDCGrid
-    dcac_converters: List
-    acac_converters: List
-    hybrid_islands: List[HybridIsland] = field(default_factory=list)
-
-    @classmethod
-    def read_from_file(cls, file_name, *, use_array_ac: bool = True) -> "HybridPowerNetwork":
-        path = str(file_name)
-        if use_array_ac and _is_pure_ac_file(path):
-            from ac_array_model import build_ac_ppc_from_e_file
-
-            ppc = build_ac_ppc_from_e_file(path, use_cache=True, copy_arrays=False)
-            network = cls(
-                ac=_fast_ac_network_from_ppc(ppc),
-                dc=HybridDCGrid(SimpleNamespace(DCNode=[], DCBranch=[], DCGenerator=[], DCLoad=[], DCShuntCompensator=[], DCZeroBranch=[], DCSwitch=[], DCDCConverter=[], DCACConverter=[], ACACConverter=[])),
-                dcac_converters=[],
-                acac_converters=[],
-            )
-            network._ac_ppc = ppc
-            network._fast_ac_only = True
-            network.p_base = float(ppc["base"][0])
-            network.p_base_kW = float(ppc["base"][4])
-            network.u_scale = float(ppc["base"][1])
-            network.p_scale = float(ppc["base"][2])
-            network.i_scale = float(ppc["base"][3])
-            return network
-
-        model = efile_factory_from_file_cached(path)
-        normalize_model_named_units(model)
-        network = cls(
-            ac=HybridACGrid(model),
-            dc=HybridDCGrid(model),
-            dcac_converters=getattr(model, "DCACConverter", []),
-            acac_converters=getattr(model, "ACACConverter", []),
-        )
-        network.p_base = float(model.p_base)
-        network.p_base_kW = float(model.p_base_kW)
-        network.u_scale = float(model.u_scale)
-        network.p_scale = float(model.p_scale)
-        network.i_scale = float(model.i_scale)
-        network._fast_ac_only = False
-        return network
-
-    @property
-    def total_nodes(self) -> int:
-        return len(self.ac.nodes) + len(self.dc.nodes)
-
-    def topo(self):
-        """Run AC/DC topology separately, then merge them through live converters."""
-        if self.ac.nodes:
-            self.ac.topo()
-        if self.dc.nodes:
-            self.dc.topo()
-        self._build_hybrid_topo()
-
-    def _build_hybrid_topo(self):
-        """Union AC and DC islands connected by DCAC, DCDC or ACAC converters."""
-        ac_islands = self.ac.islands
-        dc_islands = self.dc.islands
-        n_ac_islands = len(ac_islands)
-        total_islands = n_ac_islands + len(dc_islands)
-        for pos, island in enumerate(ac_islands):
-            island._hybrid_pos = pos
-            island.hybrid_isl = 0
-            island.hybrid_isl_obj = None
-        for offset, island in enumerate(dc_islands, start=n_ac_islands):
-            island._hybrid_pos = offset
-            island.hybrid_isl = 0
-            island.hybrid_isl_obj = None
-        for conv in self.dc.dcdc_converters:
-            conv.hybrid_isl = 0
-            conv.hybrid_isl_obj = None
-        for conv in self.dcac_converters:
-            conv.hybrid_isl = 0
-            conv.hybrid_isl_obj = None
-        for conv in self.acac_converters:
-            conv.hybrid_isl = 0
-            conv.hybrid_isl_obj = None
-
-        parent = list(range(total_islands))
-
-        def find(pos):
-            # Path-compressed union-find keeps converter-driven island merging simple.
-            root = pos
-            while parent[root] != root:
-                root = parent[root]
-            while parent[pos] != pos:
-                pos, parent[pos] = parent[pos], root
-            return root
-
-        def union(left, right):
-            if left is None or right is None:
-                return
-            left_root = find(left._hybrid_pos)
-            right_root = find(right._hybrid_pos)
-            if left_root != right_root:
-                parent[right_root] = left_root
-
-        for conv in self.dcac_converters:
-            ac_node = self.ac.node_dict.get(conv.ac_node)
-            dc_node = self.dc.node_dict.get(conv.dc_node)
-            conv.ac_node_obj = ac_node
-            conv.dc_node_obj = dc_node
-            conv.ac_isl_obj = None if ac_node is None else ac_node.isl_obj
-            conv.dc_isl_obj = None if dc_node is None else dc_node.isl_obj
-            conv.is_alive = (
-                conv.run_stat == 1
-                and ac_node is not None
-                and dc_node is not None
-                and ac_node.is_alive
-                and dc_node.is_alive
-            )
-            if not conv.is_alive:
-                continue
-            union(conv.ac_isl_obj, conv.dc_isl_obj)
-
-        for conv in self.acac_converters:
-            i_node = self.ac.node_dict.get(conv.i_node)
-            j_node = self.ac.node_dict.get(conv.j_node)
-            conv.i_node_obj = i_node
-            conv.j_node_obj = j_node
-            conv.i_isl_obj = None if i_node is None else i_node.isl_obj
-            conv.j_isl_obj = None if j_node is None else j_node.isl_obj
-            conv.is_alive = (
-                conv.run_stat == 1
-                and i_node is not None
-                and j_node is not None
-                and i_node.is_alive
-                and j_node.is_alive
-            )
-            if not conv.is_alive:
-                continue
-            union(conv.i_isl_obj, conv.j_isl_obj)
-
-        for conv in self.dc.dcdc_converters:
-            if not getattr(conv, "is_alive", False):
-                continue
-            union(
-                None if getattr(conv, "i_node_obj", None) is None else conv.i_node_obj.isl_obj,
-                None if getattr(conv, "j_node_obj", None) is None else conv.j_node_obj.isl_obj,
-            )
-
-        grouped = {}
-        for island in ac_islands:
-            root = find(island._hybrid_pos)
-            grouped.setdefault(root, []).append((True, island))
-        for island in dc_islands:
-            root = find(island._hybrid_pos)
-            grouped.setdefault(root, []).append((False, island))
-
-        self.hybrid_islands = []
-        island_by_root = {}
-        for idx, (root, islands) in enumerate(grouped.items(), start=1):
-            hybrid_island = HybridIsland(idx)
-            self.hybrid_islands.append(hybrid_island)
-            island_by_root[root] = hybrid_island
-            for is_ac_island, island in islands:
-                if is_ac_island:
-                    hybrid_island.add_ac_island(island)
-                else:
-                    hybrid_island.add_dc_island(island)
-
-        for conv in self.dcac_converters:
-            if not getattr(conv, "is_alive", False):
-                continue
-            ac_island = getattr(conv, "ac_isl_obj", None)
-            dc_island = getattr(conv, "dc_isl_obj", None)
-            if ac_island is None or dc_island is None:
-                continue
-            hybrid_island = island_by_root[find(ac_island._hybrid_pos)]
-            hybrid_island.add_dcac_converter(conv)
-
-        for conv in self.dc.dcdc_converters:
-            if not getattr(conv, "is_alive", False) or conv.i_node_obj is None or conv.j_node_obj is None:
-                continue
-            if conv.i_node_obj.isl_obj is None or conv.j_node_obj.isl_obj is None:
-                continue
-            hybrid_island = island_by_root[find(conv.i_node_obj.isl_obj._hybrid_pos)]
-            hybrid_island.add_dcdc_converter(conv)
-
-        for conv in self.acac_converters:
-            if not getattr(conv, "is_alive", False):
-                continue
-            i_island = getattr(conv, "i_isl_obj", None)
-            j_island = getattr(conv, "j_isl_obj", None)
-            if i_island is None or j_island is None:
-                continue
-            hybrid_island = island_by_root[find(i_island._hybrid_pos)]
-            hybrid_island.add_acac_converter(conv)
-
-    def print_hybrid_isl_info(self):
-        for island in self.hybrid_islands:
-            print(f"Hybrid island {island.idx} is_alive = {island.is_alive}")
-            print(
-                f"    ac_islands={len(island.ac_islands)} "
-                f"dc_islands={len(island.dc_islands)} "
-                f"ac_nodes={len(island.ac_nodes)} "
-                f"dc_nodes={len(island.dc_nodes)}"
-            )
-            print(
-                f"    dcac_converters={len(island.dcac_converters)} "
-                f"dcdc_converters={len(island.dcdc_converters)} "
-                f"acac_converters={len(island.acac_converters)}"
-            )
-
-    @staticmethod
-    def _add_ref(refs, node_idx):
-        refs[node_idx] = refs.get(node_idx, 0) + 1
-
-    def _external_node_refs(self):
-        """Count converter terminals as node references for AC/DC topology checks."""
-        ac_refs = {}
-        dc_refs = {}
-        for conv in self.dcac_converters:
-            if not getattr(conv, "is_alive", False):
-                continue
-            self._add_ref(ac_refs, conv.ac_node)
-            self._add_ref(dc_refs, conv.dc_node)
-        for conv in self.acac_converters:
-            if not getattr(conv, "is_alive", False):
-                continue
-            self._add_ref(ac_refs, conv.i_node)
-            self._add_ref(ac_refs, conv.j_node)
-        return ac_refs, dc_refs
-
-    def prepare(self, verbose: bool = True) -> Tuple[List[str], List[str], List[str], List[str]]:
-        """Prepare topology and return AC/DC warnings and errors without running Newton."""
-        if getattr(self, "_fast_ac_only", False):
-            return [], [], [], []
-        self.topo()
-        if verbose and self.ac.nodes:
-            self.ac.print_isl_info()
-        if verbose and self.dc.nodes:
-            self.dc.print_isl_info()
-        if verbose:
-            self.print_hybrid_isl_info()
-        return [], [], [], []
-
-    def check_topology(self) -> Tuple[List[str], List[str], List[str], List[str]]:
-        """Run optional topology diagnostics outside the main power-flow path."""
-        if not self.hybrid_islands:
-            self.topo()
-        ac_refs, dc_refs = self._external_node_refs()
-        ac_warnings, ac_errors = self.ac.check_topo(ac_refs) if self.ac.nodes else ([], [])
-        dc_warnings, dc_errors = self.dc.check_topo(dc_refs) if self.dc.nodes else ([], [])
-        dc_errors.extend(self._check_dcac_topo())
-        dc_errors.extend(self._check_acac_topo())
-        return ac_warnings, ac_errors, dc_warnings, dc_errors
-
-    def _check_dcac_topo(self) -> List[str]:
-        errors = []
-        if not self.dcac_converters:
-            return errors
-        if not self.ac.nodes:
-            return ["存在 DCACConverter，但文件中没有 ACNode"]
-        if not self.dc.nodes:
-            return ["存在 DCACConverter，但文件中没有 DCNode"]
-
-        for conv in self.dcac_converters:
-            if conv.run_stat != 1:
-                continue
-            if conv.ac_node not in self.ac.node_dict:
-                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 AC 节点 {conv.ac_node} 不存在")
-            if conv.dc_node not in self.dc.node_dict:
-                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 DC 节点 {conv.dc_node} 不存在")
-            if conv.ac_node not in self.ac.node_dict or conv.dc_node not in self.dc.node_dict:
-                continue
-            if str(conv.control_type).upper() not in {"DCV", "ACV", "ACP"}:
-                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制模式 {conv.control_type} 不支持")
-        return errors
-
-    def _check_acac_topo(self) -> List[str]:
-        errors = []
-        if not self.acac_converters:
-            return errors
-        if not self.ac.nodes:
-            return ["存在 ACACConverter，但文件中没有 ACNode"]
-
-        for conv in self.acac_converters:
-            if conv.run_stat != 1:
-                continue
-            if conv.i_node not in self.ac.node_dict:
-                errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 AC 节点 {conv.i_node} 不存在")
-            if conv.j_node not in self.ac.node_dict:
-                errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 AC 节点 {conv.j_node} 不存在")
-            if conv.i_node not in self.ac.node_dict or conv.j_node not in self.ac.node_dict:
-                continue
-            if conv.i_node == conv.j_node:
-                errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 两端不能连接同一个 AC 节点")
-            if str(conv.control_type).upper() not in ACAC_CONTROL_TYPES:
-                errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制模式 {conv.control_type} 不支持")
-        return errors
 
 
 @dataclass
@@ -1336,10 +106,9 @@ class HybridPowerFlowCalc:
         self.verbose = verbose
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
-        self._ac_ppc_fast_path = bool(getattr(network, "_fast_ac_only", False) and hasattr(network, "_ac_ppc"))
         self.ac_calc = (
             ACPowerFlowCalc.from_ppc(network._ac_ppc, parameters=self.params)
-            if self._ac_ppc_fast_path
+            if self.has_ac and hasattr(network, "_ac_ppc")
             else ACPowerFlowCalc(network.ac, parameters=self.params) if self.has_ac else None
         )
         self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params) if self.has_dc else None
@@ -1376,6 +145,8 @@ class HybridPowerFlowCalc:
             self.ac_eq = self.ac_calc.total_eq
             parts.append(self.ac_calc.x.copy())
         if self.dc_calc is not None:
+            if not getattr(self.network.dc, "islands", None):
+                self.network.dc.topo()
             self.dc_G, dc_x = _run_with_optional_output(self.verbose, self.dc_calc.prepare)
             self.dc_size = self.dc_calc.total_vars
             self.dc_eq = self.dc_calc.total_eq
@@ -1427,12 +198,13 @@ class HybridPowerFlowCalc:
         if not self.has_ac or not self.has_dc:
             return
         for conv in self.network.dcac_converters:
-            if not getattr(conv, "is_alive", False):
+            conv.is_alive = False
+            if conv.run_stat != 1:
                 continue
             if conv.ac_node not in self.ac_calc.node_pos:
-                raise ValueError(f"DCACConverter[{conv.idx}] 引用的 AC 节点 {conv.ac_node} 不存在或不带电")
+                continue
             if conv.dc_node not in self.dc_calc.alive_node_dict:
-                raise ValueError(f"DCACConverter[{conv.idx}] 引用的 DC 节点 {conv.dc_node} 不存在或不带电")
+                continue
             ac_pos = self.ac_calc.node_pos[conv.ac_node]
             if self.ac_calc.node_type[ac_pos] != "PQ":
                 raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[ac_pos]}")
@@ -1440,6 +212,7 @@ class HybridPowerFlowCalc:
             ctrl = str(conv.control_type).upper()
             if ctrl not in {"DCV", "ACV", "ACP"}:
                 raise ValueError(f"未知 DCACConverter 控制模式: {conv.control_type}")
+            conv.is_alive = True
             self.dcac_converters.append((conv, ac_pos, dc_pos, ctrl))
         self.N_dcac = len(self.dcac_converters)
         self._cache_dcac_arrays()
@@ -1499,12 +272,13 @@ class HybridPowerFlowCalc:
         if not self.has_ac:
             return
         for conv in self.network.acac_converters:
-            if not getattr(conv, "is_alive", False):
+            conv.is_alive = False
+            if conv.run_stat != 1:
                 continue
             if conv.i_node not in self.ac_calc.node_pos:
-                raise ValueError(f"ACACConverter[{conv.idx}] 引用的 AC 节点 {conv.i_node} 不存在或不带电")
+                continue
             if conv.j_node not in self.ac_calc.node_pos:
-                raise ValueError(f"ACACConverter[{conv.idx}] 引用的 AC 节点 {conv.j_node} 不存在或不带电")
+                continue
             i_pos = self.ac_calc.node_pos[conv.i_node]
             j_pos = self.ac_calc.node_pos[conv.j_node]
             if i_pos == j_pos:
@@ -1516,6 +290,7 @@ class HybridPowerFlowCalc:
             ctrl = str(conv.control_type).upper()
             if ctrl not in ACAC_CONTROL_TYPES:
                 raise ValueError(f"未知 ACACConverter 控制模式: {conv.control_type}")
+            conv.is_alive = True
             self.acac_converters.append((conv, i_pos, j_pos, ctrl))
         self.N_acac = len(self.acac_converters)
         self._cache_acac_arrays()
@@ -1790,20 +565,26 @@ class HybridPowerFlowCalc:
     def get_jacobi(self, x):
         """Build the global sparse Jacobian from sub-solver blocks plus converter couplings."""
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
+        ac_j = self.ac_calc.get_jacobi(ac_x) if self.ac_calc is not None else None
+        dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x) if self.dc_calc is not None else None
+        return self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
+
+    def _assemble_jacobian(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None):
+        """Build the global sparse Jacobian from prepared sub-solver blocks."""
         row_parts = []
         col_parts = []
         data_parts = []
-        if self.ac_calc is not None:
-            ac_j = self.ac_calc.get_jacobi(ac_x).tocoo()
-            row_parts.append(ac_j.row)
-            col_parts.append(ac_j.col)
-            data_parts.append(ac_j.data)
+        if ac_j is not None:
+            ac_coo = ac_j.tocoo()
+            row_parts.append(ac_coo.row)
+            col_parts.append(ac_coo.col)
+            data_parts.append(ac_coo.data)
         target_shape = (self.total_eq, self.total_vars)
-        if self.dc_calc is not None:
-            dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x).tocoo()
-            row_parts.append(dc_j.row + self.ac_eq)
-            col_parts.append(dc_j.col + self.ac_size)
-            data_parts.append(dc_j.data)
+        if dc_j is not None:
+            dc_coo = dc_j.tocoo()
+            row_parts.append(dc_coo.row + self.ac_eq)
+            col_parts.append(dc_coo.col + self.ac_size)
+            data_parts.append(dc_coo.data)
 
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
@@ -1827,6 +608,91 @@ class HybridPowerFlowCalc:
             jac = coo_matrix(target_shape, dtype=np.float64).tocsr()
         self.last_jacobian_shape = jac.shape
         return jac
+
+    def _build_newton_system(self, x):
+        """Build residual and Jacobian together, reusing AC/DC sub-solver caches."""
+        ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
+        parts = []
+        ac_f = ac_j = None
+        dc_f = dc_j = None
+        if self.ac_calc is not None:
+            ac_f, ac_j = self.ac_calc._build_newton_system(ac_x)
+            parts.append(ac_f)
+        if self.dc_calc is not None:
+            dc_f, dc_j = self.dc_calc._build_newton_system(self.dc_G, dc_x)
+            parts.append(dc_f)
+
+        ac_V = dc_V = None
+        if self.N_dcac or self.N_acac:
+            _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+        if self.N_dcac:
+            dcac = dcac_x.reshape(self.N_dcac, 3)
+            dc_p = dcac[:, 0]
+            ac_p = dcac[:, 1]
+            ac_q = dcac[:, 2]
+            np.add.at(ac_f, self.dcac_ac_p_row, ac_p)
+            np.add.at(ac_f, self.dcac_ac_q_row, ac_q)
+            if self.dcac_dc_eq_mask.any():
+                np.add.at(dc_f, self.dcac_dc_eq[self.dcac_dc_eq_mask], dc_p[self.dcac_dc_eq_mask])
+
+            va = ac_V[self.dcac_ac_pos]
+            vd = dc_V[self.dcac_dc_pos]
+            va2 = va * va
+            vd2 = vd * vd
+            dcac_f = np.empty(self.N_dcac * 3, dtype=np.float64)
+            dcac_f[0::3] = (
+                vd2 * va2 * (dc_p + ac_p)
+                - self.dcac_r1 * dc_p * dc_p * va2
+                - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
+            )
+            f_ctrl = np.empty(self.N_dcac, dtype=np.float64)
+            f_ctrl[self.dcac_ctrl_dc_v_mask] = (
+                vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
+            )
+            f_ctrl[self.dcac_ctrl_ac_v_mask] = (
+                va[self.dcac_ctrl_ac_v_mask] - self.dcac_v_ac_set[self.dcac_ctrl_ac_v_mask]
+            )
+            f_ctrl[self.dcac_ctrl_ac_p_mask] = (
+                ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
+            )
+            dcac_f[1::3] = f_ctrl
+            dcac_f[2::3] = ac_q - self.dcac_q_ac_set
+            parts.append(dcac_f)
+        if self.N_acac:
+            acac = acac_x.reshape(self.N_acac, 4)
+            i_p = acac[:, 0]
+            i_q = acac[:, 1]
+            j_p = acac[:, 2]
+            j_q = acac[:, 3]
+            np.add.at(ac_f, self.acac_i_p_row, i_p)
+            np.add.at(ac_f, self.acac_i_q_row, i_q)
+            np.add.at(ac_f, self.acac_j_p_row, j_p)
+            np.add.at(ac_f, self.acac_j_q_row, j_q)
+
+            vi = ac_V[self.acac_i_pos]
+            vj = ac_V[self.acac_j_pos]
+            vi2 = vi * vi
+            vj2 = vj * vj
+            acac_f = np.empty(self.N_acac * 4, dtype=np.float64)
+            acac_f[0::4] = (
+                vi2 * vj2 * (i_p + j_p)
+                - self.acac_r1 * (i_p * i_p + i_q * i_q) * vj2
+                - self.acac_r2 * (j_p * j_p + j_q * j_q) * vi2
+            )
+            acac_f[1::4] = i_p - self.acac_p_set
+            f2 = np.empty(self.N_acac, dtype=np.float64)
+            f3 = np.empty(self.N_acac, dtype=np.float64)
+            f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
+            f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
+            f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
+            f3[self.acac_v_j_mask] = vj[self.acac_v_j_mask] - self.acac_j_v_set[self.acac_v_j_mask]
+            acac_f[2::4] = f2
+            acac_f[3::4] = f3
+            parts.append(acac_f)
+
+        F = np.concatenate(parts)
+        J = self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
+        return F, J
 
     def _append_dcac_jacobian_terms(self, row_parts, col_parts, data_parts, dcac_x, ac_V, dc_V):
         """Append DC/AC converter Jacobian entries to global COO buffers."""
@@ -1933,13 +799,11 @@ class HybridPowerFlowCalc:
         """Execute unified Newton iterations over the full hybrid state vector."""
         if self.x.size == 0:
             self.prepare()
-        if self._can_delegate_to_ac_solver():
-            return self._run_ac_only()
 
         self.converged = False
         x = self.x.copy()
         for it in range(self.max_iter):
-            F = self.get_f(x)
+            F, J = self._build_newton_system(x)
             self.iterations = it + 1
             self.normF = np.linalg.norm(F, np.inf)
 
@@ -1968,36 +832,12 @@ class HybridPowerFlowCalc:
                 self._write_back(x)
                 return 0
 
-            J = self.get_jacobi(x)
             delta = spsolve(J, -F)
             x += delta
 
         self.x = x
         self._write_back(x)
         return -1
-
-    def _can_delegate_to_ac_solver(self) -> bool:
-        """Return True when the hybrid wrapper contains only an uncoupled AC network."""
-        return (
-            self.ac_calc is not None
-            and self.dc_calc is None
-            and self.N_dcac == 0
-            and self.N_acac == 0
-        )
-
-    def _run_ac_only(self) -> int:
-        """Use the optimized AC load-flow loop for pure AC cases."""
-        rc = _run_with_optional_output(self.verbose, self.ac_calc.run)
-        self.converged = bool(self.ac_calc.converged)
-        self.iterations = int(self.ac_calc.iterations)
-        self.normF = float(self.ac_calc.normF)
-        self.x = self.ac_calc.x.copy()
-        self.total_vars = int(self.ac_calc.total_vars)
-        self.total_eq = int(self.ac_calc.total_eq)
-        self.last_jacobian_shape = (self.total_eq, self.total_vars)
-        if self._ac_ppc_fast_path:
-            self._write_ac_ppc_result_to_network()
-        return rc
 
     def _write_ac_ppc_result_to_network(self) -> None:
         """Copy array-mode AC results back to the hybrid AC object facade."""
@@ -2007,45 +847,41 @@ class HybridPowerFlowCalc:
         if not result:
             return
 
-        node_by_idx = {int(node.idx): node for node in self.network.ac.nodes}
-        for row in result["bus"]:
-            node = node_by_idx.get(int(row[BUS_COLS["idx"]]))
+        def iter_aligned(devices, rows, idx_col):
+            if len(devices) == len(rows) and all(int(dev.idx) == int(row[idx_col]) for dev, row in zip(devices, rows)):
+                return zip(devices, rows)
+            by_idx = {int(dev.idx): dev for dev in devices}
+            return ((by_idx.get(int(row[idx_col])), row) for row in rows)
+
+        for node, row in iter_aligned(self.network.ac.nodes, result["bus"], BUS_COLS["idx"]):
             if node is not None:
                 node.voltage = float(row[BUS_COLS["voltage"]])
                 node.angle = float(row[BUS_COLS["angle"]])
                 node.isl = int(row[BUS_COLS["isl"]])
                 node.is_alive = int(row[BUS_COLS["run_stat"]]) == 1
 
-        gen_by_idx = {int(gen.idx): gen for gen in self.network.ac.generators}
-        for row in result["gen"]:
-            gen = gen_by_idx.get(int(row[GEN_COLS["idx"]]))
+        for gen, row in iter_aligned(self.network.ac.generators, result["gen"], GEN_COLS["idx"]):
             if gen is not None:
                 gen.p = float(row[GEN_COLS["p"]])
                 gen.q = float(row[GEN_COLS["q"]])
                 gen.current = float(row[GEN_COLS["current"]])
                 gen.is_alive = int(row[GEN_COLS["run_stat"]]) == 1
 
-        load_by_idx = {int(load.idx): load for load in self.network.ac.loads}
-        for row in result["load"]:
-            load = load_by_idx.get(int(row[LOAD_COLS["idx"]]))
+        for load, row in iter_aligned(self.network.ac.loads, result["load"], LOAD_COLS["idx"]):
             if load is not None:
                 load.p = float(row[LOAD_COLS["p"]])
                 load.q = float(row[LOAD_COLS["q"]])
                 load.current = float(row[LOAD_COLS["current"]])
                 load.is_alive = int(row[LOAD_COLS["run_stat"]]) == 1
 
-        shunt_by_idx = {int(shunt.idx): shunt for shunt in self.network.ac.shunt_compensators}
-        for row in result["shunt"]:
-            shunt = shunt_by_idx.get(int(row[SHUNT_COLS["idx"]]))
+        for shunt, row in iter_aligned(self.network.ac.shunt_compensators, result["shunt"], SHUNT_COLS["idx"]):
             if shunt is not None:
                 shunt.p = float(row[SHUNT_COLS["p"]])
                 shunt.q = float(row[SHUNT_COLS["q"]])
                 shunt.current = float(row[SHUNT_COLS["current"]])
                 shunt.is_alive = int(row[SHUNT_COLS["run_stat"]]) == 1
 
-        branch_by_idx = {int(branch.idx): branch for branch in self.network.ac.branches}
-        for row in result["branch"]:
-            branch = branch_by_idx.get(int(row[BRANCH_COLS["idx"]]))
+        for branch, row in iter_aligned(self.network.ac.branches, result["branch"], BRANCH_COLS["idx"]):
             if branch is not None:
                 branch.i_p = float(row[BRANCH_COLS["i_p"]])
                 branch.i_q = float(row[BRANCH_COLS["i_q"]])
@@ -2055,9 +891,11 @@ class HybridPowerFlowCalc:
                 branch.j_c = float(row[BRANCH_COLS["j_c"]])
                 branch.is_alive = int(row[BRANCH_COLS["run_stat"]]) == 1
 
-        transformer_by_idx = {int(transformer.idx): transformer for transformer in self.network.ac.transformers}
-        for row in result["transformer"]:
-            transformer = transformer_by_idx.get(int(row[TRANSFORMER_COLS["idx"]]))
+        for transformer, row in iter_aligned(
+            self.network.ac.transformers,
+            result["transformer"],
+            TRANSFORMER_COLS["idx"],
+        ):
             if transformer is not None:
                 transformer.i_p = float(row[TRANSFORMER_COLS["i_p"]])
                 transformer.i_q = float(row[TRANSFORMER_COLS["i_q"]])
@@ -2074,6 +912,7 @@ class HybridPowerFlowCalc:
             self.ac_calc.x = ac_x
             self.ac_calc.converged = self.converged
             self.ac_calc._write_back()
+            self._write_ac_ppc_result_to_network()
         if self.dc_calc is not None:
             self.dc_calc.x = dc_x
             self.dc_calc.converged = self.converged
@@ -2141,20 +980,10 @@ def run_hybrid_power_flow(
 ) -> HybridPowerFlowResult:
     network = HybridPowerNetwork.read_from_file(file_name)
 
-    ac_warnings, ac_errors, dc_warnings, dc_errors = _run_with_optional_output(verbose, network.prepare, verbose)
-
-    for warn in ac_warnings:
-        if verbose:
-            print("  AC 警告:", warn)
-    for error in ac_errors:
-        if verbose:
-            print("  AC 错误:", error)
-    for warn in dc_warnings:
-        if verbose:
-            print("  DC 警告:", warn)
-    for error in dc_errors:
-        if verbose:
-            print("  DC 错误:", error)
+    # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
+    # topology diagnostics remain available through HybridPowerNetwork.prepare()
+    # and check_topology(), but the Newton path avoids that duplicate object scan.
+    ac_warnings, ac_errors, dc_warnings, dc_errors = [], [], [], []
 
     calc = HybridPowerFlowCalc(
         network,
