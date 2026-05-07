@@ -160,6 +160,44 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(100.0, ppc["base"]["p_base"])
         np.testing.assert_array_equal(ppc["bus_name"][:3], np.asarray(["nd_1", "nd_2", "nd_3"], dtype=object))
 
+    def test_build_dc_ppc_from_network_reflects_network_objects(self):
+        import numpy as np
+        from model.dc_array_model import BUS_COLS, DCPowerNetwork, build_dc_ppc_from_e_file, build_dc_ppc_from_network
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        expected = build_dc_ppc_from_e_file(e_file, use_cache=False, copy_arrays=True)
+        network = DCPowerNetwork()
+        network.read_from_file(e_file)
+
+        network.nodes[0].voltage = 0.987654
+        ppc = build_dc_ppc_from_network(network, copy_arrays=True)
+
+        for key in ("branch", "load", "gen", "zero_branch", "switch", "break", "dcdc"):
+            np.testing.assert_allclose(ppc[key], expected[key])
+        self.assertEqual(0.987654, ppc["bus"][0, BUS_COLS["voltage"]])
+        np.testing.assert_allclose(ppc["bus"][1:], expected["bus"][1:])
+        np.testing.assert_array_equal(ppc["bus_name"], expected["bus_name"])
+
+    def test_build_dc_ppc_from_e_file_delegates_through_network_model(self):
+        from model import dc_array_model
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        original = dc_array_model.build_dc_ppc_from_network
+        calls = []
+
+        def counted_builder(network, *args, **kwargs):
+            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
+            return original(network, *args, **kwargs)
+
+        dc_array_model.build_dc_ppc_from_network = counted_builder
+        try:
+            ppc = dc_array_model.build_dc_ppc_from_e_file(e_file, use_cache=False, copy_arrays=True)
+        finally:
+            dc_array_model.build_dc_ppc_from_network = original
+
+        self.assertEqual([("DCPowerNetwork", 30, False)], calls)
+        self.assertEqual("dc_ppc_v1", ppc["format"])
+
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc

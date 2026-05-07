@@ -215,6 +215,45 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertTrue(calc.array_mode)
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
 
+    def test_build_ac_ppc_from_network_reflects_network_objects(self):
+        from ac_array_model import BUS_COLS, build_ac_ppc_from_e_file, build_ac_ppc_from_network
+        from ac_model import ACPowerNetwork
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        expected = build_ac_ppc_from_e_file(case_path, use_cache=False, copy_arrays=True)
+        network = ACPowerNetwork()
+        with contextlib.redirect_stdout(io.StringIO()):
+            network.read_from_file(case_path)
+
+        network.nodes[0].voltage = 0.987654
+        ppc = build_ac_ppc_from_network(network, copy_arrays=True)
+
+        for key in ("branch", "transformer", "gen", "load", "shunt", "zero_branch", "switch", "break"):
+            np.testing.assert_allclose(ppc[key], expected[key])
+        self.assertEqual(0.987654, ppc["bus"][0, BUS_COLS["voltage"]])
+        np.testing.assert_allclose(ppc["bus"][1:], expected["bus"][1:])
+        np.testing.assert_array_equal(ppc["bus_name"], expected["bus_name"])
+
+    def test_build_ac_ppc_from_e_file_delegates_through_network_model(self):
+        import ac_array_model
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        original = ac_array_model.build_ac_ppc_from_network
+        calls = []
+
+        def counted_builder(network, *args, **kwargs):
+            calls.append((network.__class__.__name__, len(network.nodes), kwargs.get("copy_arrays")))
+            return original(network, *args, **kwargs)
+
+        ac_array_model.build_ac_ppc_from_network = counted_builder
+        try:
+            ppc = ac_array_model.build_ac_ppc_from_e_file(case_path, use_cache=False, copy_arrays=True)
+        finally:
+            ac_array_model.build_ac_ppc_from_network = original
+
+        self.assertEqual([("ACPowerNetwork", 300, False)], calls)
+        self.assertEqual("ac_ppc_v1", ppc["format"])
+
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
         source = (ROOT_DIR / "lfcore" / "ac_lf.py").read_text(encoding="utf-8")
         main_block = source.split('if __name__ == "__main__":', 1)[1]

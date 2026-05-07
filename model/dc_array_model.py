@@ -176,7 +176,7 @@ def _current_scale(power_base_kw: float, i_scale: float, raw_vbase_by_idx: Dict[
     return i_scale * dc_current_base_ka(power_base_kw, raw_vbase_by_idx[int(node_idx)])
 
 
-def build_dc_ppc_from_e_file(
+def _build_dc_ppc_from_e_file_direct(
     file_path,
     use_cache: bool = True,
     copy_arrays: bool = False,
@@ -379,6 +379,195 @@ def build_dc_ppc_from_e_file(
     return _copy_ppc(ppc) if copy_arrays else ppc
 
 
+def _value(obj, attr: str, default=0.0):
+    value = getattr(obj, attr, default)
+    return default if value in (None, "") else value
+
+
+def _float_value(obj, attr: str, default: float = 0.0) -> float:
+    return float(_value(obj, attr, default))
+
+
+def _int_value(obj, attr: str, default: int = 0) -> int:
+    return int(float(_value(obj, attr, default)))
+
+
+def _name_array(devices, prefix: str) -> np.ndarray:
+    return np.asarray(
+        [str(getattr(dev, "name", "") or f"{prefix}_{_int_value(dev, 'idx', pos)}") for pos, dev in enumerate(devices)],
+        dtype=object,
+    )
+
+
+def _code_value(value, mapping: Dict[str, int], default_label: str) -> int:
+    if value in (None, ""):
+        return mapping[default_label]
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return int(value)
+    return mapping.get(str(value).upper(), mapping[default_label])
+
+
+def build_dc_ppc_from_network(
+    network,
+    copy_arrays: bool = False,
+    include_device_names: bool = True,
+) -> Dict:
+    """Build a DC ppc dictionary from an already loaded DCPowerNetwork."""
+    nodes = list(getattr(network, "nodes", []))
+    branches = list(getattr(network, "branches", []))
+    loads = list(getattr(network, "loads", []))
+    generators = list(getattr(network, "generators", []))
+    zero_branches = list(getattr(network, "zero_branches", []))
+    switches = list(getattr(network, "switches", []))
+    breakers = list(getattr(network, "breakers", []))
+    dcdcs = list(getattr(network, "dcdc_converters", []))
+
+    p_base = float(getattr(network, "p_base", 1.0))
+    u_scale = float(getattr(network, "u_scale", 1.0))
+    p_scale = float(getattr(network, "p_scale", 1.0))
+    i_scale = float(getattr(network, "i_scale", 1.0))
+    p_base_kw = float(getattr(network, "p_base_kW", p_base / p_scale))
+
+    bus = np.zeros((len(nodes), len(BUS_COLS)), dtype=np.float64)
+    for row, node in enumerate(nodes):
+        bus[row, BUS_COLS["idx"]] = _int_value(node, "idx")
+        bus[row, BUS_COLS["vbase"]] = _float_value(node, "vbase")
+        bus[row, BUS_COLS["voltage"]] = _float_value(node, "voltage", 1.0)
+        bus[row, BUS_COLS["isl"]] = _float_value(node, "isl", 0.0)
+        bus[row, BUS_COLS["run_stat"]] = _float_value(node, "run_stat", 1.0)
+
+    branch = np.zeros((len(branches), len(BRANCH_COLS)), dtype=np.float64)
+    for row, dev in enumerate(branches):
+        branch[row, BRANCH_COLS["idx"]] = _int_value(dev, "idx")
+        branch[row, BRANCH_COLS["i_node"]] = _int_value(dev, "i_node")
+        branch[row, BRANCH_COLS["j_node"]] = _int_value(dev, "j_node")
+        branch[row, BRANCH_COLS["r"]] = _float_value(dev, "r")
+        branch[row, BRANCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        branch[row, BRANCH_COLS["i_p"]] = _float_value(dev, "i_p")
+        branch[row, BRANCH_COLS["j_p"]] = _float_value(dev, "j_p")
+        branch[row, BRANCH_COLS["current"]] = _float_value(dev, "current")
+
+    load = np.zeros((len(loads), len(LOAD_COLS)), dtype=np.float64)
+    for row, dev in enumerate(loads):
+        load[row, LOAD_COLS["idx"]] = _int_value(dev, "idx")
+        load[row, LOAD_COLS["node"]] = _int_value(dev, "node")
+        load[row, LOAD_COLS["pbase"]] = _float_value(dev, "pbase", 1.0)
+        load[row, LOAD_COLS["pv0"]] = _float_value(dev, "pv0")
+        load[row, LOAD_COLS["pv1"]] = _float_value(dev, "pv1")
+        load[row, LOAD_COLS["pv2"]] = _float_value(dev, "pv2")
+        load[row, LOAD_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        load[row, LOAD_COLS["p"]] = _float_value(dev, "p")
+        load[row, LOAD_COLS["current"]] = _float_value(dev, "current")
+
+    gen = np.zeros((len(generators), len(GEN_COLS)), dtype=np.float64)
+    for row, dev in enumerate(generators):
+        gen[row, GEN_COLS["idx"]] = _int_value(dev, "idx")
+        gen[row, GEN_COLS["node"]] = _int_value(dev, "node")
+        gen[row, GEN_COLS["control_type"]] = _code_value(_value(dev, "control_type", "P"), CTRL_CODE, "P")
+        gen[row, GEN_COLS["p_set"]] = _float_value(dev, "p_set")
+        gen[row, GEN_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
+        gen[row, GEN_COLS["i_set"]] = _float_value(dev, "i_set")
+        gen[row, GEN_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        gen[row, GEN_COLS["p"]] = _float_value(dev, "p")
+        gen[row, GEN_COLS["current"]] = _float_value(dev, "current")
+
+    zero_branch = np.zeros((len(zero_branches), len(ZERO_BRANCH_COLS)), dtype=np.float64)
+    for row, dev in enumerate(zero_branches):
+        zero_branch[row, ZERO_BRANCH_COLS["idx"]] = _int_value(dev, "idx")
+        zero_branch[row, ZERO_BRANCH_COLS["i_node"]] = _int_value(dev, "i_node")
+        zero_branch[row, ZERO_BRANCH_COLS["j_node"]] = _int_value(dev, "j_node")
+        zero_branch[row, ZERO_BRANCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        zero_branch[row, ZERO_BRANCH_COLS["p"]] = _float_value(dev, "p")
+        zero_branch[row, ZERO_BRANCH_COLS["current"]] = _float_value(dev, "current")
+
+    def build_switch_like(devices):
+        out = np.zeros((len(devices), len(SWITCH_COLS)), dtype=np.float64)
+        for row, dev in enumerate(devices):
+            out[row, SWITCH_COLS["idx"]] = _int_value(dev, "idx")
+            out[row, SWITCH_COLS["i_node"]] = _int_value(dev, "i_node")
+            out[row, SWITCH_COLS["j_node"]] = _int_value(dev, "j_node")
+            out[row, SWITCH_COLS["status"]] = _float_value(dev, "status", 1.0)
+            out[row, SWITCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+            out[row, SWITCH_COLS["p"]] = _float_value(dev, "p")
+            out[row, SWITCH_COLS["current"]] = _float_value(dev, "current")
+        return out
+
+    dcdc = np.zeros((len(dcdcs), len(DCDC_COLS)), dtype=np.float64)
+    for row, dev in enumerate(dcdcs):
+        dcdc[row, DCDC_COLS["idx"]] = _int_value(dev, "idx")
+        dcdc[row, DCDC_COLS["i_node"]] = _int_value(dev, "i_node")
+        dcdc[row, DCDC_COLS["j_node"]] = _int_value(dev, "j_node")
+        dcdc[row, DCDC_COLS["r1"]] = _float_value(dev, "r1")
+        dcdc[row, DCDC_COLS["r2"]] = _float_value(dev, "r2")
+        dcdc[row, DCDC_COLS["control_type"]] = _code_value(_value(dev, "control_type", "P"), CTRL_CODE, "P")
+        dcdc[row, DCDC_COLS["p_set"]] = _float_value(dev, "p_set")
+        dcdc[row, DCDC_COLS["i_set"]] = _float_value(dev, "i_set")
+        dcdc[row, DCDC_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
+        dcdc[row, DCDC_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        dcdc[row, DCDC_COLS["i_p"]] = _float_value(dev, "i_p")
+        dcdc[row, DCDC_COLS["j_p"]] = _float_value(dev, "j_p")
+        dcdc[row, DCDC_COLS["i_c"]] = _float_value(dev, "i_c")
+        dcdc[row, DCDC_COLS["j_c"]] = _float_value(dev, "j_c")
+
+    ppc = {
+        "format": "dc_ppc_v1",
+        "base": {
+            "p_base": p_base,
+            "u_scale": u_scale,
+            "p_scale": p_scale,
+            "i_scale": i_scale,
+            "p_base_kW": p_base_kw,
+        },
+        "bus": bus,
+        "branch": branch,
+        "load": load,
+        "gen": gen,
+        "zero_branch": zero_branch,
+        "switch": build_switch_like(switches),
+        "break": build_switch_like(breakers),
+        "dcdc": dcdc,
+        "node_pos": _node_maps(bus) if len(bus) else {},
+    }
+    if include_device_names:
+        ppc.update(
+            bus_name=_name_array(nodes, "bus"),
+            branch_name=_name_array(branches, "branch"),
+            load_name=_name_array(loads, "load"),
+            gen_name=_name_array(generators, "gen"),
+            zero_branch_name=_name_array(zero_branches, "zero_branch"),
+            switch_name=_name_array(switches, "switch"),
+            break_name=_name_array(breakers, "break"),
+            dcdc_name=_name_array(dcdcs, "dcdc"),
+        )
+    return _copy_ppc(ppc) if copy_arrays else ppc
+
+
+def build_dc_ppc_from_e_file(
+    file_path,
+    use_cache: bool = True,
+    copy_arrays: bool = False,
+    include_device_names: bool = True,
+) -> Dict:
+    """Build a DC ppc by loading the E file into DCPowerNetwork first."""
+    file_key = _file_cache_key(file_path)
+    if use_cache:
+        with _DC_PPC_CACHE_LOCK:
+            cached = _DC_PPC_CACHE.get((file_key[0], include_device_names))
+            if cached is not None and cached[0] == file_key:
+                return _copy_ppc(cached[1]) if copy_arrays else cached[1]
+
+    network = DCPowerNetwork()
+    network.read_from_file(file_key[0], use_cache=use_cache)
+    ppc = build_dc_ppc_from_network(network, copy_arrays=False, include_device_names=include_device_names)
+
+    if use_cache:
+        with _DC_PPC_CACHE_LOCK:
+            _DC_PPC_CACHE[(file_key[0], include_device_names)] = (file_key, ppc)
+    return _copy_ppc(ppc) if copy_arrays else ppc
+
+
 class DCIsl:
     def __init__(self, idx, is_alive):
         self.idx = idx
@@ -407,6 +596,7 @@ class DCPowerNetwork:
         self.generators = []
         self.zero_branches = []
         self.switches = []
+        self.breakers = []
         self.dcdc_converters = []
         self.buses = []
         self.islands = []
@@ -555,8 +745,8 @@ class DCPowerNetwork:
         self.dcdc_converters.append(conv)
         return conv
 
-    def read_from_file(self, file_name):
-        self.ppc = build_dc_ppc_from_e_file(file_name, use_cache=True, copy_arrays=True)
+    def read_from_file(self, file_name, use_cache: bool = True):
+        self.ppc = _build_dc_ppc_from_e_file_direct(file_name, use_cache=use_cache, copy_arrays=True)
         base = self.ppc["base"]
         self.p_base = float(base["p_base"])
         self.p_base_kW = float(base["p_base_kW"])

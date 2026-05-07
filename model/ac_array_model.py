@@ -227,7 +227,7 @@ def _empty(width: int) -> np.ndarray:
     return np.zeros((0, width), dtype=np.float64)
 
 
-def build_ac_ppc_from_e_file(
+def _build_ac_ppc_from_e_file_direct(
     file_path,
     use_cache: bool = True,
     copy_arrays: bool = False,
@@ -641,6 +641,238 @@ def build_ac_ppc_from_e_file(
                 "break_name": break_names,
             }
         )
+    if use_cache:
+        with _AC_PPC_CACHE_LOCK:
+            _AC_PPC_CACHE[(file_key[0], include_device_names)] = (file_key, ppc)
+    return _copy_ppc(ppc) if copy_arrays else ppc
+
+
+def _value(obj, attr: str, default=0.0):
+    value = getattr(obj, attr, default)
+    return default if value in (None, "") else value
+
+
+def _float_value(obj, attr: str, default: float = 0.0) -> float:
+    return float(_value(obj, attr, default))
+
+
+def _int_value(obj, attr: str, default: int = 0) -> int:
+    return int(float(_value(obj, attr, default)))
+
+
+def _name_array(devices, prefix: str) -> np.ndarray:
+    return np.asarray(
+        [str(getattr(dev, "name", "") or f"{prefix}_{_int_value(dev, 'idx', pos)}") for pos, dev in enumerate(devices)],
+        dtype=object,
+    )
+
+
+def _code_value(value, mapping: Dict[str, int], default_label: str) -> int:
+    if value in (None, ""):
+        return mapping[default_label]
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return int(value)
+    return mapping.get(str(value).upper(), mapping[default_label])
+
+
+def build_ac_ppc_from_network(
+    network,
+    copy_arrays: bool = False,
+    include_device_names: bool = True,
+) -> Dict:
+    """Build an AC ppc dictionary from an already loaded ACPowerNetwork."""
+    nodes = list(getattr(network, "nodes", []))
+    branches = list(getattr(network, "branches", []))
+    transformers = list(getattr(network, "transformers", []))
+    generators = list(getattr(network, "generators", []))
+    loads = list(getattr(network, "loads", []))
+    shunts = list(getattr(network, "shunt_compensators", []))
+    zero_branches = list(getattr(network, "zero_branches", []))
+    switches = list(getattr(network, "switches", []))
+    breakers = list(getattr(network, "breakers", []))
+
+    p_base = float(getattr(network, "p_base", 1.0))
+    u_scale = float(getattr(network, "u_scale", 1.0))
+    p_scale = float(getattr(network, "p_scale", 1.0))
+    i_scale = float(getattr(network, "i_scale", 1.0))
+
+    bus = np.zeros((len(nodes), len(BUS_COLS)), dtype=np.float64)
+    for row, node in enumerate(nodes):
+        bus[row, BUS_COLS["idx"]] = _int_value(node, "idx")
+        bus[row, BUS_COLS["vbase"]] = _float_value(node, "vbase")
+        bus[row, BUS_COLS["voltage"]] = _float_value(node, "voltage", 1.0)
+        bus[row, BUS_COLS["angle"]] = _float_value(node, "angle", 0.0)
+        bus[row, BUS_COLS["isl"]] = _float_value(node, "isl", 0.0)
+        bus[row, BUS_COLS["run_stat"]] = _float_value(node, "run_stat", 1.0)
+    bus_names = _name_array(nodes, "bus")
+
+    branch = np.zeros((len(branches), len(BRANCH_COLS)), dtype=np.float64)
+    for row, dev in enumerate(branches):
+        branch[row, BRANCH_COLS["idx"]] = _int_value(dev, "idx")
+        branch[row, BRANCH_COLS["i_node"]] = _int_value(dev, "i_node")
+        branch[row, BRANCH_COLS["j_node"]] = _int_value(dev, "j_node")
+        branch[row, BRANCH_COLS["r"]] = _float_value(dev, "r")
+        branch[row, BRANCH_COLS["x"]] = _float_value(dev, "x")
+        branch[row, BRANCH_COLS["b"]] = _float_value(dev, "b")
+        branch[row, BRANCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        branch[row, BRANCH_COLS["i_p"]] = _float_value(dev, "i_p")
+        branch[row, BRANCH_COLS["i_q"]] = _float_value(dev, "i_q")
+        branch[row, BRANCH_COLS["i_c"]] = _float_value(dev, "i_c")
+        branch[row, BRANCH_COLS["j_p"]] = _float_value(dev, "j_p")
+        branch[row, BRANCH_COLS["j_q"]] = _float_value(dev, "j_q")
+        branch[row, BRANCH_COLS["j_c"]] = _float_value(dev, "j_c")
+
+    transformer = np.zeros((len(transformers), len(TRANSFORMER_COLS)), dtype=np.float64)
+    for row, dev in enumerate(transformers):
+        transformer[row, TRANSFORMER_COLS["idx"]] = _int_value(dev, "idx")
+        transformer[row, TRANSFORMER_COLS["i_node"]] = _int_value(dev, "i_node")
+        transformer[row, TRANSFORMER_COLS["j_node"]] = _int_value(dev, "j_node")
+        transformer[row, TRANSFORMER_COLS["r"]] = _float_value(dev, "r")
+        transformer[row, TRANSFORMER_COLS["x"]] = _float_value(dev, "x")
+        transformer[row, TRANSFORMER_COLS["b"]] = _float_value(dev, "b")
+        transformer[row, TRANSFORMER_COLS["tap"]] = _float_value(dev, "tap", 1.0)
+        transformer[row, TRANSFORMER_COLS["shift"]] = _float_value(dev, "shift")
+        transformer[row, TRANSFORMER_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        transformer[row, TRANSFORMER_COLS["i_p"]] = _float_value(dev, "i_p")
+        transformer[row, TRANSFORMER_COLS["i_q"]] = _float_value(dev, "i_q")
+        transformer[row, TRANSFORMER_COLS["i_c"]] = _float_value(dev, "i_c")
+        transformer[row, TRANSFORMER_COLS["j_p"]] = _float_value(dev, "j_p")
+        transformer[row, TRANSFORMER_COLS["j_q"]] = _float_value(dev, "j_q")
+        transformer[row, TRANSFORMER_COLS["j_c"]] = _float_value(dev, "j_c")
+
+    gen = np.zeros((len(generators), len(GEN_COLS)), dtype=np.float64)
+    for row, dev in enumerate(generators):
+        gen[row, GEN_COLS["idx"]] = _int_value(dev, "idx")
+        gen[row, GEN_COLS["node"]] = _int_value(dev, "node")
+        gen[row, GEN_COLS["control_type"]] = _code_value(_value(dev, "control_type", "PQ"), CTRL_CODE, "PQ")
+        gen[row, GEN_COLS["p_set"]] = _float_value(dev, "p_set")
+        gen[row, GEN_COLS["q_set"]] = _float_value(dev, "q_set")
+        gen[row, GEN_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
+        gen[row, GEN_COLS["alpha"]] = _float_value(dev, "alpha", 1.0)
+        gen[row, GEN_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        gen[row, GEN_COLS["p"]] = _float_value(dev, "p")
+        gen[row, GEN_COLS["q"]] = _float_value(dev, "q")
+        gen[row, GEN_COLS["current"]] = _float_value(dev, "current")
+
+    load = np.zeros((len(loads), len(LOAD_COLS)), dtype=np.float64)
+    for row, dev in enumerate(loads):
+        load[row, LOAD_COLS["idx"]] = _int_value(dev, "idx")
+        load[row, LOAD_COLS["node"]] = _int_value(dev, "node")
+        load[row, LOAD_COLS["pbase"]] = _float_value(dev, "pbase", 1.0)
+        load[row, LOAD_COLS["pv0"]] = _float_value(dev, "pv0")
+        load[row, LOAD_COLS["pv1"]] = _float_value(dev, "pv1")
+        load[row, LOAD_COLS["pv2"]] = _float_value(dev, "pv2")
+        load[row, LOAD_COLS["qbase"]] = _float_value(dev, "qbase", 1.0)
+        load[row, LOAD_COLS["qv0"]] = _float_value(dev, "qv0")
+        load[row, LOAD_COLS["qv1"]] = _float_value(dev, "qv1")
+        load[row, LOAD_COLS["qv2"]] = _float_value(dev, "qv2")
+        load[row, LOAD_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        load[row, LOAD_COLS["p"]] = _float_value(dev, "p")
+        load[row, LOAD_COLS["q"]] = _float_value(dev, "q")
+        load[row, LOAD_COLS["current"]] = _float_value(dev, "current")
+
+    shunt = np.zeros((len(shunts), len(SHUNT_COLS)), dtype=np.float64)
+    for row, dev in enumerate(shunts):
+        shunt[row, SHUNT_COLS["idx"]] = _int_value(dev, "idx")
+        shunt[row, SHUNT_COLS["node"]] = _int_value(dev, "node")
+        shunt[row, SHUNT_COLS["control_type"]] = _code_value(_value(dev, "control_type", "Q"), SHUNT_CODE, "Q")
+        shunt[row, SHUNT_COLS["q_set"]] = _float_value(dev, "q_set")
+        shunt[row, SHUNT_COLS["g_set"]] = _float_value(dev, "g_set")
+        shunt[row, SHUNT_COLS["b_set"]] = _float_value(dev, "b_set")
+        shunt[row, SHUNT_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
+        shunt[row, SHUNT_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        shunt[row, SHUNT_COLS["p"]] = _float_value(dev, "p")
+        shunt[row, SHUNT_COLS["q"]] = _float_value(dev, "q")
+        shunt[row, SHUNT_COLS["current"]] = _float_value(dev, "current")
+
+    zero_branch = np.zeros((len(zero_branches), len(ZERO_BRANCH_COLS)), dtype=np.float64)
+    for row, dev in enumerate(zero_branches):
+        zero_branch[row, ZERO_BRANCH_COLS["idx"]] = _int_value(dev, "idx")
+        zero_branch[row, ZERO_BRANCH_COLS["i_node"]] = _int_value(dev, "i_node")
+        zero_branch[row, ZERO_BRANCH_COLS["j_node"]] = _int_value(dev, "j_node")
+        zero_branch[row, ZERO_BRANCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        zero_branch[row, ZERO_BRANCH_COLS["p"]] = _float_value(dev, "p")
+        zero_branch[row, ZERO_BRANCH_COLS["q"]] = _float_value(dev, "q")
+        zero_branch[row, ZERO_BRANCH_COLS["current"]] = _float_value(dev, "current")
+
+    def build_switch_like(devices):
+        out = np.zeros((len(devices), len(SWITCH_COLS)), dtype=np.float64)
+        for row, dev in enumerate(devices):
+            out[row, SWITCH_COLS["idx"]] = _int_value(dev, "idx")
+            out[row, SWITCH_COLS["i_node"]] = _int_value(dev, "i_node")
+            out[row, SWITCH_COLS["j_node"]] = _int_value(dev, "j_node")
+            out[row, SWITCH_COLS["status"]] = _float_value(dev, "status", 1.0)
+            out[row, SWITCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+            out[row, SWITCH_COLS["p"]] = _float_value(dev, "p")
+            out[row, SWITCH_COLS["q"]] = _float_value(dev, "q")
+            out[row, SWITCH_COLS["current"]] = _float_value(dev, "current")
+        return out
+
+    ppc = {
+        "format": "ac_ppc_v1",
+        "source": str(getattr(network, "source", getattr(network, "file_name", "<network>"))),
+        "base": np.asarray([p_base, u_scale, p_scale, i_scale, getattr(network, "p_base_kW", p_base / p_scale)], dtype=np.float64),
+        "bus": bus,
+        "branch": branch,
+        "transformer": transformer,
+        "gen": gen,
+        "load": load,
+        "shunt": shunt,
+        "zero_branch": zero_branch,
+        "switch": build_switch_like(switches),
+        "break": build_switch_like(breakers),
+        "bus_name": bus_names,
+        "bus_cols": BUS_COLS,
+        "branch_cols": BRANCH_COLS,
+        "transformer_cols": TRANSFORMER_COLS,
+        "gen_cols": GEN_COLS,
+        "load_cols": LOAD_COLS,
+        "shunt_cols": SHUNT_COLS,
+        "zero_branch_cols": ZERO_BRANCH_COLS,
+        "switch_cols": SWITCH_COLS,
+        "break_cols": BREAK_COLS,
+        "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
+        "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
+    }
+    if include_device_names:
+        ppc.update(
+            branch_name=_name_array(branches, "branch"),
+            transformer_name=_name_array(transformers, "transformer"),
+            gen_name=_name_array(generators, "gen"),
+            load_name=_name_array(loads, "load"),
+            shunt_name=_name_array(shunts, "shunt"),
+            zero_branch_name=_name_array(zero_branches, "zero_branch"),
+            switch_name=_name_array(switches, "switch"),
+            break_name=_name_array(breakers, "break"),
+        )
+    return _copy_ppc(ppc) if copy_arrays else ppc
+
+
+def build_ac_ppc_from_e_file(
+    file_path,
+    use_cache: bool = True,
+    copy_arrays: bool = False,
+    include_device_names: bool = True,
+) -> Dict:
+    """Build an AC ppc by loading the E file into ACPowerNetwork first."""
+    file_key = _file_cache_key(file_path)
+    if use_cache:
+        with _AC_PPC_CACHE_LOCK:
+            cached = _AC_PPC_CACHE.get((file_key[0], include_device_names))
+            if cached is not None and cached[0] == file_key:
+                return _copy_ppc(cached[1]) if copy_arrays else cached[1]
+
+    from ac_model import ACPowerNetwork
+
+    network = ACPowerNetwork()
+    network.source = str(file_key[0])
+    network.read_from_file(file_key[0])
+    network.source = str(file_key[0])
+    ppc = build_ac_ppc_from_network(network, copy_arrays=False, include_device_names=include_device_names)
+    ppc["source"] = str(file_key[0])
+
     if use_cache:
         with _AC_PPC_CACHE_LOCK:
             _AC_PPC_CACHE[(file_key[0], include_device_names)] = (file_key, ppc)
