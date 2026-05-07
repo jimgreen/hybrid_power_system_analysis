@@ -109,14 +109,14 @@ class HybridIsland:
         self.ac_islands.append(island)
         island.hybrid_isl = self.idx
         island.hybrid_isl_obj = self
-        self.ac_nodes.extend(island.nodes)
+        self.ac_nodes.extend(island.buses)
         self.is_alive = self.is_alive or island.is_alive
 
     def add_dc_island(self, island):
         self.dc_islands.append(island)
         island.hybrid_isl = self.idx
         island.hybrid_isl_obj = self
-        self.dc_nodes.extend(island.nodes)
+        self.dc_nodes.extend(island.buses)
         self.is_alive = self.is_alive or island.is_alive
 
     def add_dcac_converter(self, conv):

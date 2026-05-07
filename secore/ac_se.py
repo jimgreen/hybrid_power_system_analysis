@@ -125,6 +125,8 @@ class _ACArrayObject:
         "is_alive",
         "isl",
         "isl_obj",
+        "bus",
+        "bus_obj",
         "generators",
         "loads",
         "branches",
@@ -478,6 +480,8 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
     for node in nodes:
         node.isl = 0
         node.isl_obj = None
+        node.bus = None
+        node.bus_obj = None
         node.is_alive = False
         node.generators = []
         node.loads = []
@@ -489,26 +493,27 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
         node.shunt_compensators = []
         node.v_gens = []
 
-    running_ids = {node.idx for node in nodes if node.run_stat == 1}
+    running_nodes = [node for node in nodes if node.run_stat == 1]
+    running_ids = {node.idx for node in running_nodes}
     parent = {node_idx: node_idx for node_idx in running_ids}
 
-    def find(node_idx):
+    def find(parents, node_idx):
         root = node_idx
-        while parent[root] != root:
-            root = parent[root]
-        while parent[node_idx] != node_idx:
-            next_idx = parent[node_idx]
-            parent[node_idx] = root
+        while parents[root] != root:
+            root = parents[root]
+        while parents[node_idx] != node_idx:
+            next_idx = parents[node_idx]
+            parents[node_idx] = root
             node_idx = next_idx
         return root
 
-    def union(left, right):
-        left_root = find(left)
-        right_root = find(right)
+    def union(parents, left, right):
+        left_root = find(parents, left)
+        right_root = find(parents, right)
         if left_root != right_root:
-            parent[right_root] = left_root
+            parents[right_root] = left_root
 
-    def connect_device(dev, require_closed=False):
+    def live_terminal_pair(dev, require_closed=False):
         left = int(dev.i_node)
         right = int(dev.j_node)
         if (
@@ -518,30 +523,81 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
             and right in running_ids
             and left != right
         ):
-            union(left, right)
+            return left, right
+        return None
+
+    if network.switches:
+        for dev in network.switches:
+            pair = live_terminal_pair(dev, require_closed=True)
+            if pair is not None:
+                union(parent, pair[0], pair[1])
+
+    root_to_nodes = {}
+    for node in running_nodes:
+        root_to_nodes.setdefault(find(parent, node.idx), []).append(node)
+    network.buses = []
+    network.bus_dict = {}
+    network.node_to_bus = {}
+    for grouped_nodes in sorted(root_to_nodes.values(), key=lambda group: min(node.idx for node in group)):
+        grouped_nodes.sort(key=lambda item: item.idx)
+        ref = grouped_nodes[0]
+        bus = SimpleNamespace(
+            idx=ref.idx,
+            name=ref.name,
+            nodes=list(grouped_nodes),
+            vbase=ref.vbase,
+            voltage=ref.voltage,
+            angle=ref.angle,
+            run_stat=1,
+            isl=0,
+            isl_obj=None,
+            is_alive=False,
+            generators=[],
+            loads=[],
+            branches=[],
+            switches=[],
+            breakers=[],
+            zero_branches=[],
+            transformers=[],
+            shunt_compensators=[],
+            v_gens=[],
+        )
+        network.buses.append(bus)
+        network.bus_dict[bus.idx] = bus
+        for node in grouped_nodes:
+            node.bus = bus.idx
+            node.bus_obj = bus
+            network.node_to_bus[node.idx] = bus
+
+    bus_parent = {bus.idx: bus.idx for bus in network.buses}
+
+    def connect_bus_device(dev, require_closed=False):
+        pair = live_terminal_pair(dev, require_closed=require_closed)
+        if pair is None:
+            return
+        i_bus = network.node_to_bus.get(pair[0])
+        j_bus = network.node_to_bus.get(pair[1])
+        if i_bus is not None and j_bus is not None and i_bus.idx != j_bus.idx:
+            union(bus_parent, i_bus.idx, j_bus.idx)
 
     for dev in network.branches:
-        connect_device(dev)
+        connect_bus_device(dev)
     for dev in network.transformers:
-        connect_device(dev)
+        connect_bus_device(dev)
     for dev in network.zero_branches:
-        connect_device(dev)
+        connect_bus_device(dev)
     for dev in getattr(network, "breakers", []):
-        connect_device(dev, require_closed=True)
-    for dev in network.switches:
-        connect_device(dev, require_closed=True)
+        connect_bus_device(dev, require_closed=True)
 
     root_to_island = {}
-    for node in nodes:
-        if node.run_stat != 1:
-            continue
-        root = find(node.idx)
+    for bus in network.buses:
+        root = find(bus_parent, bus.idx)
         island = root_to_island.get(root)
         if island is None:
             island = SimpleNamespace(
                 idx=len(root_to_island) + 1,
                 is_alive=False,
-                nodes=[],
+                buses=[],
                 gens=[],
                 loads=[],
                 branches=[],
@@ -554,9 +610,12 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
                 v_gens=[],
             )
             root_to_island[root] = island
-        node.isl = island.idx
-        node.isl_obj = island
-        island.nodes.append(node)
+        bus.isl = island.idx
+        bus.isl_obj = island
+        island.buses.append(bus)
+        for node in bus.nodes:
+            node.isl = island.idx
+            node.isl_obj = island
     network.islands = list(root_to_island.values())
 
     for gen in network.generators:
@@ -572,11 +631,20 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
         if gen.control_type in ("V", "SLACK", "PH"):
             island.is_alive = True
             gen.node_obj.v_gens.append(gen)
+            if gen.node_obj.bus_obj is not None:
+                gen.node_obj.bus_obj.v_gens.append(gen)
             island.v_gens.append(gen)
-            island.slack_nodes.append(gen.node_obj)
+            slack_bus = gen.node_obj.bus_obj or gen.node_obj
+            if slack_bus not in island.slack_nodes:
+                island.slack_nodes.append(slack_bus)
         elif gen.control_type == "PV":
             gen.node_obj.v_gens.append(gen)
+            if gen.node_obj.bus_obj is not None:
+                gen.node_obj.bus_obj.v_gens.append(gen)
             island.v_gens.append(gen)
+
+    for bus in network.buses:
+        bus.is_alive = bus.run_stat == 1 and bus.isl_obj is not None and bus.isl_obj.is_alive
 
     for node in nodes:
         node.is_alive = node.run_stat == 1 and node.isl_obj is not None and node.isl_obj.is_alive
@@ -630,7 +698,8 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
     for dev in network.switches:
         finalize_branch_like(dev, "switches", require_closed=True)
 
-    network.alive_nodes = [node for node in nodes if node.is_alive]
+    network.alive_nodes = [bus for bus in network.buses if bus.is_alive]
+    network.alive_buses = network.alive_nodes
     network.alive_branch_by_name = {br.name: br for br in network.branches if br.is_alive}
     network.alive_transformer_by_name = {tr.name: tr for tr in network.transformers if tr.is_alive}
     network.alive_generator_by_name = {gen.name: gen for gen in network.generators if gen.is_alive}
@@ -866,8 +935,18 @@ class ACStateEstimator:
             dtype=np.float64,
         )
 
-        self.node_pos = {node.idx: pos for pos, node in enumerate(self.nodes)}
-        self.node_by_name = {node.name: node for node in self.nodes}
+        self.node_pos = {}
+        self.node_by_name = {}
+        self.node_by_idx = {}
+        for pos, bus in enumerate(self.nodes):
+            members = getattr(bus, "nodes", None) or [bus]
+            for node in members:
+                self.node_pos[node.idx] = pos
+                self.node_by_name[node.name] = bus
+                self.node_by_idx[node.idx] = bus
+            self.node_pos.setdefault(bus.idx, pos)
+            self.node_by_name.setdefault(bus.name, bus)
+            self.node_by_idx.setdefault(bus.idx, bus)
         if hasattr(self.network, "alive_branch_by_name"):
             self.branch_by_name = self.network.alive_branch_by_name
             self.transformer_by_name = self.network.alive_transformer_by_name
@@ -1469,7 +1548,7 @@ class ACStateEstimator:
                 voltage_scale_by_node[device.j_node],
                 current_scale_by_node[device.j_node],
             )
-            for name, device in self.break_by_name.items()
+            for name, device in getattr(self, "break_by_name", {}).items()
         }
         generator_node_scale_by_name = {
             name: (voltage_scale_by_node[gen.node], current_scale_by_node[gen.node])
@@ -2300,10 +2379,10 @@ class ACStateEstimator:
         )
         for devices in device_groups:
             for dev in devices:
-                if dev.i_node in degrees:
-                    degrees[dev.i_node] += 1
-                if dev.j_node in degrees:
-                    degrees[dev.j_node] += 1
+                if dev.i_node in self.node_pos:
+                    degrees[self.nodes[self.node_pos[dev.i_node]].idx] += 1
+                if dev.j_node in self.node_pos:
+                    degrees[self.nodes[self.node_pos[dev.j_node]].idx] += 1
         return degrees
 
     def _select_reference_nodes(self):
@@ -2314,7 +2393,7 @@ class ACStateEstimator:
                 continue
             candidates = [
                 node
-                for node in island.nodes
+                for node in island.buses
                 if node.idx in self.node_pos and node.idx in self.node_voltage_measurements
             ]
             if candidates:
@@ -2326,8 +2405,8 @@ class ACStateEstimator:
                 )
             elif island.slack_nodes:
                 references.append(sorted(island.slack_nodes, key=lambda item: item.idx)[0])
-            elif island.nodes:
-                references.append(sorted(island.nodes, key=lambda item: item.idx)[0])
+            elif island.buses:
+                references.append(sorted(island.buses, key=lambda item: item.idx)[0])
         return references
 
     def _reference_angle_offsets(self) -> Dict[int, float]:
@@ -2341,7 +2420,7 @@ class ACStateEstimator:
             if ref is None:
                 continue
             offset = float(getattr(ref, "angle", 0.0) or 0.0)
-            for node in island.nodes:
+            for node in island.buses:
                 if node.idx in self.node_pos:
                     offsets[self.node_pos[node.idx]] = offset
         return offsets
@@ -5742,6 +5821,9 @@ class ACStateEstimator:
         for pos, node in enumerate(self.nodes):
             node.angle = float(theta[pos])
             node.voltage = float(voltage[pos])
+            for member in getattr(node, "nodes", ()):
+                member.angle = node.angle
+                member.voltage = node.voltage
         for idx, gen in enumerate(self.generator_order):
             gen.p = float(x[self.base_gen_p + idx])
             gen.q = float(x[self.base_gen_q + idx])

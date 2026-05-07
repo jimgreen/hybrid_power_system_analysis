@@ -1,3 +1,5 @@
+from dataclasses import dataclass, field
+
 import numpy as np
 try:
     from scipy.sparse import coo_matrix, csr_matrix, diags, hstack, vstack
@@ -137,6 +139,25 @@ from ac_array_model import (
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
 )
+
+
+@dataclass
+class ACLFResult:
+    branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    transformers: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    zero_branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    breakers: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    generators: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    loads: Dict[str, SimpleNamespace] = field(default_factory=dict)
+
+
+ACLFReslt = ACLFResult
+DCLFReslt = ACLFResult
+
+
+def _device_key(device) -> str:
+    return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
 
 _SPARSE_SOLVER = None
 _SPARSE_SOLVER_NAME = None
@@ -1567,7 +1588,7 @@ class ACPowerFlowCalc:
             self.isl = SimpleNamespace(
                 idx=0,
                 is_alive=True,
-                nodes=[node for isl in self.calc_islands for node in isl.nodes],
+                buses=[bus for isl in self.calc_islands for bus in isl.buses],
                 gens=[gen for isl in self.calc_islands for gen in isl.gens],
                 loads=[load for isl in self.calc_islands for load in isl.loads],
                 branches=[br for isl in self.calc_islands for br in isl.branches],
@@ -1586,9 +1607,13 @@ class ACPowerFlowCalc:
             raise RuntimeError("无存活的拓扑岛，无法进行潮流计算")
 
         # 2. 提取节点基础信息
-        self.node_list = sorted(self.isl.nodes, key=lambda n: n.idx)
+        self.node_list = sorted(self.isl.buses, key=lambda n: n.idx)
         self.N = len(self.node_list)
-        self.node_pos = {node.idx: i for i, node in enumerate(self.node_list)}
+        self.node_pos = {}
+        for i, node in enumerate(self.node_list):
+            for member in getattr(node, "nodes", ()):
+                self.node_pos[int(member.idx)] = i
+            self.node_pos.setdefault(int(node.idx), i)
 
         # 3. 核心预处理流程
         self._build_y_matrix()
@@ -1644,18 +1669,24 @@ class ACPowerFlowCalc:
         for idx, zb in [(idx, zb) for idx, zb in enumerate(self.isl.zero_branches) if zb.is_alive]:
             a = self.node_pos[zb.i_node]
             b = self.node_pos[zb.j_node]
+            if a == b:
+                continue
             if self._is_redundant_slack_zero_edge(a, b):
                 continue
             self.zero_edges.append((idx, 0, a, b))
         for idx, brk in [(idx, brk) for idx, brk in enumerate(getattr(self.isl, "breakers", [])) if brk.is_alive]:
             a = self.node_pos[brk.i_node]
             b = self.node_pos[brk.j_node]
+            if a == b:
+                continue
             if self._is_redundant_slack_zero_edge(a, b):
                 continue
             self.zero_edges.append((idx, 2, a, b))
         for idx, sw in [(idx,sw) for idx, sw in enumerate(self.isl.switches) if sw.is_alive and sw.status == 1]:
             a = self.node_pos[sw.i_node]
             b = self.node_pos[sw.j_node]
+            if a == b:
+                continue
             if self._is_redundant_slack_zero_edge(a, b):
                 continue
             self.zero_edges.append((idx, 1, a, b))
@@ -2678,10 +2709,13 @@ class ACPowerFlowCalc:
         P_gen = S_y.real + P_zero + P_load
         Q_gen = S_y.imag + Q_zero + Q_load
 
-        for node in self.isl.nodes:
+        for node in self.isl.buses:
             pos = self.node_pos[node.idx]
             node.voltage = V[pos]
             node.angle = theta[pos]
+            for member in getattr(node, "nodes", ()):
+                member.voltage = node.voltage
+                member.angle = node.angle
 
         if self.live_gens:
             gen_p = self.gen_share * P_gen[self.gen_pos]
@@ -2776,6 +2810,138 @@ class ACPowerFlowCalc:
             dev.current = float(abs(current))
             dev.p = float(s_from.real)
             dev.q = float(s_from.imag)
+        self.lf_result = self._build_lf_result()
+
+    def _device_voltage(self, node_idx) -> float:
+        if int(node_idx) in getattr(self, "node_pos", {}):
+            pos = self.node_pos[int(node_idx)]
+            if hasattr(self, "x"):
+                _theta, voltage, _phi_re, _phi_im = self._extract_state_vars(self.x)
+                return float(voltage[pos])
+        node = getattr(self, "network", None)
+        return 0.0
+
+    def _build_lf_result(self) -> ACLFResult:
+        if self.array_mode and isinstance(getattr(self, "result", None), dict):
+            return self._build_lf_result_from_ppc()
+        result = ACLFResult()
+        model = self.net
+        for node in getattr(model, "nodes", []):
+            result.nodes[_device_key(node)] = SimpleNamespace(
+                volt=float(getattr(node, "voltage", 0.0) or 0.0),
+                angle=float(getattr(node, "angle", 0.0) or 0.0),
+            )
+        for br in getattr(model, "branches", []):
+            result.branches[_device_key(br)] = SimpleNamespace(
+                i_p=float(getattr(br, "i_p", 0.0) or 0.0),
+                i_q=float(getattr(br, "i_q", 0.0) or 0.0),
+                i_c=float(getattr(br, "i_c", 0.0) or 0.0),
+                i_v=self._device_voltage(getattr(br, "i_node", -1)),
+                j_p=float(getattr(br, "j_p", 0.0) or 0.0),
+                j_q=float(getattr(br, "j_q", 0.0) or 0.0),
+                j_c=float(getattr(br, "j_c", 0.0) or 0.0),
+                j_v=self._device_voltage(getattr(br, "j_node", -1)),
+            )
+        for tr in getattr(model, "transformers", []):
+            result.transformers[_device_key(tr)] = SimpleNamespace(
+                i_p=float(getattr(tr, "i_p", 0.0) or 0.0),
+                i_q=float(getattr(tr, "i_q", 0.0) or 0.0),
+                i_c=float(getattr(tr, "i_c", 0.0) or 0.0),
+                i_v=self._device_voltage(getattr(tr, "i_node", -1)),
+                j_p=float(getattr(tr, "j_p", 0.0) or 0.0),
+                j_q=float(getattr(tr, "j_q", 0.0) or 0.0),
+                j_c=float(getattr(tr, "j_c", 0.0) or 0.0),
+                j_v=self._device_voltage(getattr(tr, "j_node", -1)),
+            )
+        for zbr in getattr(model, "zero_branches", []):
+            result.zero_branches[_device_key(zbr)] = SimpleNamespace(
+                i_p=float(getattr(zbr, "p", 0.0) or 0.0),
+                i_q=float(getattr(zbr, "q", 0.0) or 0.0),
+                i_c=float(getattr(zbr, "current", 0.0) or 0.0),
+                i_v=self._device_voltage(getattr(zbr, "i_node", -1)),
+            )
+        for brk in getattr(model, "breakers", []):
+            result.breakers[_device_key(brk)] = SimpleNamespace(
+                i_p=float(getattr(brk, "p", 0.0) or 0.0),
+                i_q=float(getattr(brk, "q", 0.0) or 0.0),
+                i_c=float(getattr(brk, "current", 0.0) or 0.0),
+                i_v=self._device_voltage(getattr(brk, "i_node", -1)),
+            )
+        for gen in getattr(model, "generators", []):
+            result.generators[_device_key(gen)] = SimpleNamespace(
+                i_p=float(getattr(gen, "p", 0.0) or 0.0),
+                i_q=float(getattr(gen, "q", 0.0) or 0.0),
+                i_c=float(getattr(gen, "current", 0.0) or 0.0),
+                i_v=self._device_voltage(getattr(gen, "node", -1)),
+            )
+        for load in getattr(model, "loads", []):
+            result.loads[_device_key(load)] = SimpleNamespace(
+                i_p=float(getattr(load, "p", 0.0) or 0.0),
+                i_q=float(getattr(load, "q", 0.0) or 0.0),
+                i_c=float(getattr(load, "current", 0.0) or 0.0),
+                i_v=self._device_voltage(getattr(load, "node", -1)),
+            )
+        return result
+
+    def _build_lf_result_from_ppc(self) -> ACLFResult:
+        result = ACLFResult()
+        names = lambda key, n: self.ppc.get(key, np.asarray([str(i) for i in range(n)], dtype=object))
+        for row, name in zip(self.result.get("bus", []), names("bus_name", len(self.result.get("bus", [])))):
+            result.nodes[str(name)] = SimpleNamespace(
+                volt=float(row[BUS_COLS["voltage"]]),
+                angle=float(row[BUS_COLS["angle"]]),
+            )
+        for row, name in zip(self.result.get("branch", []), names("branch_name", len(self.result.get("branch", [])))):
+            result.branches[str(name)] = SimpleNamespace(
+                i_p=float(row[BRANCH_COLS["i_p"]]),
+                i_q=float(row[BRANCH_COLS["i_q"]]),
+                i_c=float(row[BRANCH_COLS["i_c"]]),
+                i_v=float(self.result["bus"][self.node_pos[int(row[BRANCH_COLS["i_node"]])], BUS_COLS["voltage"]]) if int(row[BRANCH_COLS["i_node"]]) in self.node_pos else 0.0,
+                j_p=float(row[BRANCH_COLS["j_p"]]),
+                j_q=float(row[BRANCH_COLS["j_q"]]),
+                j_c=float(row[BRANCH_COLS["j_c"]]),
+                j_v=float(self.result["bus"][self.node_pos[int(row[BRANCH_COLS["j_node"]])], BUS_COLS["voltage"]]) if int(row[BRANCH_COLS["j_node"]]) in self.node_pos else 0.0,
+            )
+        for row, name in zip(self.result.get("transformer", []), names("transformer_name", len(self.result.get("transformer", [])))):
+            result.transformers[str(name)] = SimpleNamespace(
+                i_p=float(row[TRANSFORMER_COLS["i_p"]]),
+                i_q=float(row[TRANSFORMER_COLS["i_q"]]),
+                i_c=float(row[TRANSFORMER_COLS["i_c"]]),
+                i_v=float(self.result["bus"][self.node_pos[int(row[TRANSFORMER_COLS["i_node"]])], BUS_COLS["voltage"]]) if int(row[TRANSFORMER_COLS["i_node"]]) in self.node_pos else 0.0,
+                j_p=float(row[TRANSFORMER_COLS["j_p"]]),
+                j_q=float(row[TRANSFORMER_COLS["j_q"]]),
+                j_c=float(row[TRANSFORMER_COLS["j_c"]]),
+                j_v=float(self.result["bus"][self.node_pos[int(row[TRANSFORMER_COLS["j_node"]])], BUS_COLS["voltage"]]) if int(row[TRANSFORMER_COLS["j_node"]]) in self.node_pos else 0.0,
+            )
+        for row, name in zip(self.result.get("zero_branch", []), names("zero_branch_name", len(self.result.get("zero_branch", [])))):
+            result.zero_branches[str(name)] = SimpleNamespace(
+                i_p=float(row[ZERO_BRANCH_COLS["p"]]),
+                i_q=float(row[ZERO_BRANCH_COLS["q"]]),
+                i_c=float(row[ZERO_BRANCH_COLS["current"]]),
+                i_v=float(self.result["bus"][self.node_pos[int(row[ZERO_BRANCH_COLS["i_node"]])], BUS_COLS["voltage"]]) if int(row[ZERO_BRANCH_COLS["i_node"]]) in self.node_pos else 0.0,
+            )
+        for row, name in zip(self.result.get("break", []), names("break_name", len(self.result.get("break", [])))):
+            result.breakers[str(name)] = SimpleNamespace(
+                i_p=float(row[SWITCH_COLS["p"]]),
+                i_q=float(row[SWITCH_COLS["q"]]),
+                i_c=float(row[SWITCH_COLS["current"]]),
+                i_v=float(self.result["bus"][self.node_pos[int(row[SWITCH_COLS["i_node"]])], BUS_COLS["voltage"]]) if int(row[SWITCH_COLS["i_node"]]) in self.node_pos else 0.0,
+            )
+        for row, name in zip(self.result.get("gen", []), names("gen_name", len(self.result.get("gen", [])))):
+            result.generators[str(name)] = SimpleNamespace(
+                i_p=float(row[GEN_COLS["p"]]),
+                i_q=float(row[GEN_COLS["q"]]),
+                i_c=float(row[GEN_COLS["current"]]),
+                i_v=float(self.result["bus"][self.node_pos[int(row[GEN_COLS["node"]])], BUS_COLS["voltage"]]) if int(row[GEN_COLS["node"]]) in self.node_pos else 0.0,
+            )
+        for row, name in zip(self.result.get("load", []), names("load_name", len(self.result.get("load", [])))):
+            result.loads[str(name)] = SimpleNamespace(
+                i_p=float(row[LOAD_COLS["p"]]),
+                i_q=float(row[LOAD_COLS["q"]]),
+                i_c=float(row[LOAD_COLS["current"]]),
+                i_v=float(self.result["bus"][self.node_pos[int(row[LOAD_COLS["node"]])], BUS_COLS["voltage"]]) if int(row[LOAD_COLS["node"]]) in self.node_pos else 0.0,
+            )
+        return result
 
     def _write_back_ppc(self):
         """Write array-mode results to self.result without mutating the input ppc."""
@@ -2917,6 +3083,7 @@ class ACPowerFlowCalc:
             "switch": switch,
             "break": breaker,
         }
+        self.lf_result = self._build_lf_result()
 
 if __name__ == "__main__":
     from hybrid_net_model import ACPowerNetwork

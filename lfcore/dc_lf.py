@@ -37,6 +37,10 @@
 """
 
 import importlib
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Dict
+
 import numpy as np
 try:
     from scipy.sparse import coo_matrix, csr_matrix
@@ -132,6 +136,24 @@ except Exception:
     DC_CTRL_P = 0
     DC_CTRL_V = 1
     DC_CTRL_I = 2
+
+
+@dataclass
+class DCLFResult:
+    branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    zero_branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    breakers: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    dcdc_converters: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    generators: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    loads: Dict[str, SimpleNamespace] = field(default_factory=dict)
+
+
+DCLFReslt = DCLFResult
+
+
+def _device_key(device) -> str:
+    return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
 
 
 _OPTIONAL_SPARSE_SOLVERS = {}
@@ -241,7 +263,8 @@ class DCPowerFlowCalc:
             return None
         max_node_id = int(np.max(self.alive_node_ids))
         lookup = np.full(max_node_id + 1, -1, dtype=np.int32)
-        lookup[self.alive_node_ids.astype(np.int64)] = np.arange(self.N, dtype=np.int32)
+        for node_id, pos in self.alive_node_dict.items():
+            lookup[int(node_id)] = int(pos)
         return lookup
 
     @staticmethod
@@ -262,6 +285,10 @@ class DCPowerFlowCalc:
         变量数与方程数严格相等。
         """
         self.alive_nodes = [
+            bus
+            for bus in getattr(self.model, "buses", [])
+            if getattr(bus, "isl_obj", None) is not None and bus.isl_obj.is_alive
+        ] or [
             node
             for node in self.model.nodes
             if node.isl_obj is not None and node.isl_obj.is_alive
@@ -271,8 +298,12 @@ class DCPowerFlowCalc:
         if self.N == 0:
             raise ValueError("电网中没有活节点")
 
-        self.alive_node_dict = {node.idx: idx for idx, node in enumerate(self.alive_nodes)}
-        self.alive_node_ids = np.asarray([node.idx for node in self.alive_nodes], dtype=np.int32)
+        self.alive_node_dict = {}
+        for idx, node in enumerate(self.alive_nodes):
+            for member in getattr(node, "nodes", ()):
+                self.alive_node_dict[int(member.idx)] = idx
+            self.alive_node_dict.setdefault(int(node.idx), idx)
+        self.alive_node_ids = np.asarray(list(self.alive_node_dict.keys()), dtype=np.int32)
 
         self.P_const = np.zeros(self.N, dtype=np.float64)   # 注入为正：P型发电机 - P型负荷
         self.I_shunt = np.zeros(self.N, dtype=np.float64)   # 消耗为正：负荷电流 - 发电电流
@@ -451,6 +482,7 @@ class DCPowerFlowCalc:
                     (zero_branch[:, DC_ZERO_BRANCH_COLS["run_stat"]] == 1)
                     & (zero_i_all >= 0)
                     & (zero_j_all >= 0)
+                    & (zero_i_all != zero_j_all)
                 )
                 if np.any(zero_mask):
                     zero_parts.extend(
@@ -471,6 +503,7 @@ class DCPowerFlowCalc:
                     & (switch[:, DC_SWITCH_COLS["status"]] == 1)
                     & (switch_i_all >= 0)
                     & (switch_j_all >= 0)
+                    & (switch_i_all != switch_j_all)
                 )
                 if np.any(switch_mask):
                     zero_parts.extend(
@@ -494,6 +527,7 @@ class DCPowerFlowCalc:
                     & (breaker[:, DC_BREAK_COLS["status"]] == 1)
                     & (break_i_all >= 0)
                     & (break_j_all >= 0)
+                    & (break_i_all != break_j_all)
                 )
                 if np.any(break_mask):
                     self.zero_edges.extend(
@@ -510,6 +544,7 @@ class DCPowerFlowCalc:
                 ('Z', zb_idx, self.alive_node_dict[zb.i_node], self.alive_node_dict[zb.j_node])
                 for zb_idx, zb in enumerate(self.model.zero_branches)
                 if zb.is_alive and zb.i_node in self.alive_node_dict and zb.j_node in self.alive_node_dict
+                and self.alive_node_dict[zb.i_node] != self.alive_node_dict[zb.j_node]
             ]
             for sw_idx, sw in enumerate(self.model.switches):
                 if (
@@ -518,6 +553,7 @@ class DCPowerFlowCalc:
                     and sw.run_stat == 1
                     and sw.i_node in self.alive_node_dict
                     and sw.j_node in self.alive_node_dict
+                    and self.alive_node_dict[sw.i_node] != self.alive_node_dict[sw.j_node]
                 ):
                     self.zero_edges.append(('S', sw_idx, self.alive_node_dict[sw.i_node], self.alive_node_dict[sw.j_node]))
             for brk_idx, brk in enumerate(getattr(self.model, "breakers", [])):
@@ -527,6 +563,7 @@ class DCPowerFlowCalc:
                     and brk.run_stat == 1
                     and brk.i_node in self.alive_node_dict
                     and brk.j_node in self.alive_node_dict
+                    and self.alive_node_dict[brk.i_node] != self.alive_node_dict[brk.j_node]
                 ):
                     self.zero_edges.append(('B', brk_idx, self.alive_node_dict[brk.i_node], self.alive_node_dict[brk.j_node]))
 
@@ -1058,6 +1095,8 @@ class DCPowerFlowCalc:
         for node in self.model.nodes:
             idx = self.alive_node_dict.get(node.idx, -1)
             node.voltage = 0.0 if idx < 0 else V_final[idx]
+        for idx, bus in enumerate(self.alive_nodes):
+            bus.voltage = float(V_final[idx])
 
 
         P_inj = np.zeros(self.N)  # 恒功率注入
@@ -1165,6 +1204,63 @@ class DCPowerFlowCalc:
             for gen in gens:
                 gen.p = share
                 gen.current = gen.p / V_final[node] if abs(V_final[node]) > self.runtime_params.min_voltage else 0.0
+        self.lf_result = self._build_lf_result()
+
+    def _node_voltage(self, node_idx) -> float:
+        pos = self.alive_node_dict.get(int(node_idx), -1)
+        if pos < 0 or not hasattr(self, "x"):
+            return 0.0
+        return float(self.x[int(pos)])
+
+    def _build_lf_result(self) -> DCLFResult:
+        result = DCLFResult()
+        for node in getattr(self.model, "nodes", []):
+            result.nodes[_device_key(node)] = SimpleNamespace(
+                volt=float(getattr(node, "voltage", 0.0) or 0.0),
+            )
+        for br in getattr(self.model, "branches", []):
+            result.branches[_device_key(br)] = SimpleNamespace(
+                i_p=float(getattr(br, "i_p", 0.0) or 0.0),
+                i_c=float(getattr(br, "current", 0.0) or 0.0),
+                i_v=self._node_voltage(getattr(br, "i_node", -1)),
+                j_p=float(getattr(br, "j_p", 0.0) or 0.0),
+                j_c=-float(getattr(br, "current", 0.0) or 0.0),
+                j_v=self._node_voltage(getattr(br, "j_node", -1)),
+            )
+        for zbr in getattr(self.model, "zero_branches", []):
+            result.zero_branches[_device_key(zbr)] = SimpleNamespace(
+                i_p=float(getattr(zbr, "p", 0.0) or 0.0),
+                i_c=float(getattr(zbr, "current", 0.0) or 0.0),
+                i_v=self._node_voltage(getattr(zbr, "i_node", -1)),
+            )
+        for brk in getattr(self.model, "breakers", []):
+            result.breakers[_device_key(brk)] = SimpleNamespace(
+                i_p=float(getattr(brk, "p", 0.0) or 0.0),
+                i_c=float(getattr(brk, "current", 0.0) or 0.0),
+                i_v=self._node_voltage(getattr(brk, "i_node", -1)),
+            )
+        for conv in getattr(self.model, "dcdc_converters", []):
+            result.dcdc_converters[_device_key(conv)] = SimpleNamespace(
+                i_p=float(getattr(conv, "i_p", 0.0) or 0.0),
+                i_c=float(getattr(conv, "i_c", 0.0) or 0.0),
+                i_v=self._node_voltage(getattr(conv, "i_node", -1)),
+                j_p=float(getattr(conv, "j_p", 0.0) or 0.0),
+                j_c=float(getattr(conv, "j_c", 0.0) or 0.0),
+                j_v=self._node_voltage(getattr(conv, "j_node", -1)),
+            )
+        for gen in getattr(self.model, "generators", []):
+            result.generators[_device_key(gen)] = SimpleNamespace(
+                i_p=float(getattr(gen, "p", 0.0) or 0.0),
+                i_c=float(getattr(gen, "current", 0.0) or 0.0),
+                i_v=self._node_voltage(getattr(gen, "node", -1)),
+            )
+        for load in getattr(self.model, "loads", []):
+            result.loads[_device_key(load)] = SimpleNamespace(
+                i_p=float(getattr(load, "p", 0.0) or 0.0),
+                i_c=float(getattr(load, "current", 0.0) or 0.0),
+                i_v=self._node_voltage(getattr(load, "node", -1)),
+            )
+        return result
 
     def _build_newton_system(self, G, x):
         """Compute residual and Jacobian together for one DC Newton iteration."""

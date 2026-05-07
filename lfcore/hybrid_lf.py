@@ -2,7 +2,7 @@
 import contextlib
 import io
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
@@ -21,8 +21,8 @@ MODEL_DIR = ROOT_DIR / "model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-from ac_lf import ACPowerFlowCalc
-from dc_lf import DCPowerFlowCalc
+from ac_lf import ACLFResult, ACPowerFlowCalc
+from dc_lf import DCLFResult, DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from model.hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
 from model.hybrid_array_model import (
@@ -304,6 +304,7 @@ class HybridPowerFlowResult:
     ac_errors: List[str]
     dc_warnings: List[str]
     dc_errors: List[str]
+    lf_result: Optional["HybridLFResult"] = None
 
     @property
     def total_nodes(self) -> int:
@@ -332,6 +333,24 @@ class HybridPowerFlowResult:
     @property
     def has_acac(self) -> bool:
         return len(self.network.acac_converters) > 0
+
+
+@dataclass
+class DCACLFResult:
+    dcac_converters: dict = field(default_factory=dict)
+
+
+@dataclass
+class ACACLFResult:
+    acac_converters: dict = field(default_factory=dict)
+
+
+@dataclass
+class HybridLFResult:
+    ac: Optional[ACLFResult] = None
+    dc: Optional[DCLFResult] = None
+    dcac: DCACLFResult = field(default_factory=DCACLFResult)
+    acac: ACACLFResult = field(default_factory=ACACLFResult)
 
 
 def _run_with_optional_output(verbose: bool, func, *args, **kwargs):
@@ -1170,6 +1189,49 @@ class HybridPowerFlowCalc:
                 conv.j_q = float(q_j)
                 conv.i_i = float(cur_i)
                 conv.j_i = float(cur_j)
+                conv.i_c = float(cur_i)
+                conv.j_c = float(cur_j)
+        self.lf_result = self._build_lf_result(ac_V, dc_V)
+
+    @staticmethod
+    def _device_key(device) -> str:
+        return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
+
+    def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
+        result = HybridLFResult(
+            ac=getattr(self.ac_calc, "lf_result", None),
+            dc=getattr(self.dc_calc, "lf_result", None),
+        )
+        for conv in getattr(self.network, "dcac_converters", []):
+            if getattr(conv, "run_stat", 1) != 1:
+                continue
+            dc_v = float(getattr(conv.dc_node_obj, "voltage", 0.0) or 0.0)
+            ac_v = float(getattr(conv.ac_node_obj, "voltage", 0.0) or 0.0)
+            result.dcac.dcac_converters[self._device_key(conv)] = SimpleNamespace(
+                i_p=float(getattr(conv, "dc_p", 0.0) or 0.0),
+                i_c=float(getattr(conv, "dc_i", 0.0) or 0.0),
+                i_v=dc_v,
+                j_p=float(getattr(conv, "ac_p", 0.0) or 0.0),
+                j_q=float(getattr(conv, "ac_q", 0.0) or 0.0),
+                j_c=float(getattr(conv, "ac_i", 0.0) or 0.0),
+                j_v=ac_v,
+            )
+        for conv in getattr(self.network, "acac_converters", []):
+            if getattr(conv, "run_stat", 1) != 1:
+                continue
+            i_v = float(getattr(conv.i_node_obj, "voltage", 0.0) or 0.0)
+            j_v = float(getattr(conv.j_node_obj, "voltage", 0.0) or 0.0)
+            result.acac.acac_converters[self._device_key(conv)] = SimpleNamespace(
+                i_p=float(getattr(conv, "i_p", 0.0) or 0.0),
+                i_q=float(getattr(conv, "i_q", 0.0) or 0.0),
+                i_c=float(getattr(conv, "i_c", getattr(conv, "i_i", 0.0)) or 0.0),
+                i_v=i_v,
+                j_p=float(getattr(conv, "j_p", 0.0) or 0.0),
+                j_q=float(getattr(conv, "j_q", 0.0) or 0.0),
+                j_c=float(getattr(conv, "j_c", getattr(conv, "j_i", 0.0)) or 0.0),
+                j_v=j_v,
+            )
+        return result
 
 
 def run_hybrid_power_flow(
@@ -1211,6 +1273,7 @@ def run_hybrid_power_flow(
             ac_errors=ac_errors,
             dc_warnings=dc_warnings,
             dc_errors=dc_errors,
+            lf_result=getattr(calc, "lf_result", None),
         )
 
     _run_with_optional_output(verbose, calc.prepare)
@@ -1228,6 +1291,7 @@ def run_hybrid_power_flow(
         ac_errors=ac_errors,
         dc_warnings=dc_warnings,
         dc_errors=dc_errors,
+        lf_result=getattr(calc, "lf_result", None),
     )
 
 

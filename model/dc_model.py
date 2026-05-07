@@ -2,7 +2,7 @@ class DCIsl:
     def __init__(self, idx, is_alive):
         self.idx = idx
         self.is_alive = is_alive
-        self.nodes = []
+        self.buses = []
         self.gens = []
         self.loads = []
         self.branches = []
@@ -26,6 +26,33 @@ class DCNode:
         self.v_gens = []
         self.v_dcdcs = []
         self.is_slack = False
+        self.bus = None
+        self.bus_obj = None
+
+
+class DCBus:
+    def __init__(self, idx, nodes=None):
+        self.idx = idx
+        self.nodes = list(nodes or [])
+        ref = self.nodes[0] if self.nodes else None
+        self.name = getattr(ref, "name", f"bus_{idx}")
+        self.vbase = getattr(ref, "vbase", 0.0)
+        self.voltage = getattr(ref, "voltage", 1.0)
+        self.run_stat = 1
+        self.isl = None
+        self.isl_obj = None
+        self.is_alive = False
+        self.v_set = 1.0
+        self.v_gens = []
+        self.v_dcdcs = []
+        self.is_slack = False
+        self.generators = []
+        self.loads = []
+        self.branches = []
+        self.switches = []
+        self.breakers = []
+        self.dcdc_converters = []
+        self.zero_branches = []
 
 class DCBranch:
     def __init__(self, idx, i_node, j_node, r, run_stat=1):
@@ -129,8 +156,11 @@ class DCPowerNetwork:
         self.switches = []
         self.breakers = []
         self.dcdc_converters = []
+        self.buses = []
 
         self.node_dict = {}
+        self.bus_dict = {}
+        self.node_to_bus = {}
         self.switch_dict = {}
         self.break_dict = {}
         self.load_dict = {}
@@ -197,6 +227,9 @@ class DCPowerNetwork:
             self._coerce_break(row)
             for row in getattr(self.model, 'DCBreak', [])
         ]
+        self.buses = []
+        self.bus_dict = {}
+        self.node_to_bus = {}
 
     @staticmethod
     def _coerce_break(row):
@@ -235,6 +268,8 @@ class DCPowerNetwork:
             node.breakers = []
             node.dcdc_converters = []
             node.zero_branches = []
+            node.bus = None
+            node.bus_obj = None
 
         # 建立设备到节点之间的连接关系。
         for gen in self.generators:
@@ -292,65 +327,102 @@ class DCPowerNetwork:
         if len(self.node_dict) == 0:
             self.format_assoc()
 
-        # 重置所有节点的拓扑岛号为0
+        # 重置所有节点的拓扑岛号和母线归属。
         for node in self.nodes:
             node.isl = 0
             node.isl_obj = None
+            node.bus = None
+            node.bus_obj = None
+            node.is_alive = False
 
-        # 构建邻接表，停运节点不生成拓扑岛。
         running_nodes = [node for node in self.nodes if node.run_stat == 1]
-        adj = {node: set() for node in running_nodes}
+        running_node_ids = {node.idx for node in running_nodes}
+        parent = {node.idx: node.idx for node in running_nodes}
 
-        def add_edge(dev):
+        def find(parents, node_idx):
+            root = node_idx
+            while parents[root] != root:
+                root = parents[root]
+            while parents[node_idx] != node_idx:
+                next_idx = parents[node_idx]
+                parents[node_idx] = root
+                node_idx = next_idx
+            return root
+
+        def union(parents, left, right):
+            root_l = find(parents, left)
+            root_r = find(parents, right)
+            if root_l != root_r:
+                parents[root_r] = root_l
+
+        def live_terminal_pair(dev, require_closed=False):
             if (
                 dev.run_stat == 1
-                and dev.i_node_obj in adj
-                and dev.j_node_obj in adj
-                and dev.i_node_obj != dev.j_node_obj
+                and (not require_closed or getattr(dev, "status", 1) == 1)
+                and dev.i_node in running_node_ids
+                and dev.j_node in running_node_ids
+                and dev.i_node != dev.j_node
             ):
-                adj[dev.i_node_obj].add(dev.j_node_obj)
-                adj[dev.j_node_obj].add(dev.i_node_obj)
+                return dev.i_node, dev.j_node
+            return None
 
-        # 添加普通支路（branches）
+        if self.switches:
+            for dev in self.switches:
+                pair = live_terminal_pair(dev, require_closed=True)
+                if pair is not None:
+                    union(parent, pair[0], pair[1])
+
+        root_to_nodes = {}
+        for node in running_nodes:
+            root_to_nodes.setdefault(find(parent, node.idx), []).append(node)
+        self.buses = []
+        self.bus_dict = {}
+        self.node_to_bus = {}
+        for nodes in sorted(root_to_nodes.values(), key=lambda group: min(node.idx for node in group)):
+            nodes.sort(key=lambda item: item.idx)
+            bus = DCBus(nodes[0].idx, nodes)
+            self.buses.append(bus)
+            self.bus_dict[bus.idx] = bus
+            for node in nodes:
+                node.bus = bus.idx
+                node.bus_obj = bus
+                self.node_to_bus[node.idx] = bus
+
+        bus_parent = {bus.idx: bus.idx for bus in self.buses}
+
+        def add_bus_edge(dev, require_closed=False):
+            pair = live_terminal_pair(dev, require_closed=require_closed)
+            if pair is None:
+                return
+            i_bus = self.node_to_bus.get(pair[0])
+            j_bus = self.node_to_bus.get(pair[1])
+            if i_bus is not None and j_bus is not None and i_bus.idx != j_bus.idx:
+                union(bus_parent, i_bus.idx, j_bus.idx)
+
         for dev in self.branches:
-            add_edge(dev)
-
-        # 添加零阻抗支路（zero_branches）
+            add_bus_edge(dev)
         for dev in self.zero_branches:
-            add_edge(dev)
-
-        # 添加断路器（breakers），按零阻抗支路处理，同时受 status 和 run_stat 控制
+            add_bus_edge(dev)
         for dev in self.breakers:
-            if dev.status == 1:
-                add_edge(dev)
-
-        # 添加开关（switches），仅考虑闭合状态（status == 1）
-        for dev in self.switches:
-            if dev.status == 1:
-                add_edge(dev)
+            add_bus_edge(dev, require_closed=True)
 
         self.islands = []
 
         island_idx = 0
-        # 深度优先遍历所有节点
-        for node in running_nodes:
-            if node.isl == 0:  # 未访问节点，开始新岛
+        root_to_island = {}
+        for bus in self.buses:
+            root = find(bus_parent, bus.idx)
+            island = root_to_island.get(root)
+            if island is None:
                 island_idx += 1
-                # 创建新的拓扑岛对象，默认is_alive为True（后续可根据岛内设备修正）
                 island = DCIsl(island_idx, True)
+                root_to_island[root] = island
                 self.islands.append(island)
-
-                # 使用栈进行DFS
-                stack = [node]
-                node.isl = island_idx
+            bus.isl = island.idx
+            bus.isl_obj = island
+            for node in bus.nodes:
+                node.isl = island.idx
                 node.isl_obj = island
-                while stack:
-                    cur_node = stack.pop()
-                    for next_node in adj[cur_node]:
-                        if next_node.isl == 0:
-                            next_node.isl = island_idx
-                            next_node.isl_obj = island
-                            stack.append(next_node)
 
         self.det_isl_alive_stat()
 
@@ -361,7 +433,7 @@ class DCPowerNetwork:
             isl.slack_nodes = []
             isl.v_gens = []
             isl.v_dcdcs = []
-            isl.nodes = []
+            isl.buses = []
             isl.gens = []
             isl.loads = []
             isl.branches = []
@@ -376,6 +448,18 @@ class DCPowerNetwork:
             node.v_dcdcs = []
             node.v_set = 0.0
             node.is_slack = False
+        for bus in self.buses:
+            bus.v_gens = []
+            bus.v_dcdcs = []
+            bus.v_set = 0.0
+            bus.is_slack = False
+            bus.generators = []
+            bus.loads = []
+            bus.branches = []
+            bus.switches = []
+            bus.breakers = []
+            bus.dcdc_converters = []
+            bus.zero_branches = []
 
         # 检查发电机
         for gen in self.generators:
@@ -387,6 +471,8 @@ class DCPowerNetwork:
             node.isl_obj.gens.append(gen)
             if gen.control_type == 'V':
                 node.v_gens.append(gen)
+                if node.bus_obj is not None:
+                    node.bus_obj.v_gens.append(gen)
                 node.isl_obj.v_gens.append(gen)
 
         # 检查 DC/DC 换流器
@@ -402,6 +488,8 @@ class DCPowerNetwork:
             dcdc.j_node_obj.isl_obj.dcdc_converters.append(dcdc)
             if dcdc.control_type == 'V':
                 node.v_dcdcs.append(dcdc)
+                if node.bus_obj is not None:
+                    node.bus_obj.v_dcdcs.append(dcdc)
                 node.isl_obj.v_dcdcs.append(dcdc)
 
 
@@ -444,20 +532,24 @@ class DCPowerNetwork:
             if brk.i_node_obj.isl_obj and brk.j_node_obj.isl_obj and brk.i_node_obj.isl_obj ==  brk.j_node_obj.isl_obj:
                 brk.i_node_obj.isl_obj.breakers.append(brk)
 
-        # 检查松弛节点
-        for node in self.nodes:
-            if node.isl_obj is None:
+        for bus in self.buses:
+            if bus.isl_obj is None:
                 continue
-            node.isl_obj.nodes.append(node)
-            if len(node.v_gens) + len(node.v_dcdcs) > 0:
-                node.isl_obj.slack_nodes.append(node)
+            bus.isl_obj.buses.append(bus)
+            if len(bus.v_gens) + len(bus.v_dcdcs) > 0:
+                bus.isl_obj.slack_nodes.append(bus)
 
         for isl in self.islands:
             if len(isl.slack_nodes) + len(isl.v_dcdcs) >= 1:
                 isl.is_alive = True
 
+        for bus in self.buses:
+            bus.is_alive = bus.run_stat == 1 and bus.isl_obj is not None and bus.isl_obj.is_alive
+
         for node in self.nodes:
             node.is_alive = node.run_stat == 1 and node.isl_obj is not None and node.isl_obj.is_alive
+
+        self.alive_buses = [bus for bus in self.buses if bus.is_alive]
 
         for load in self.loads:
             node = load.node_obj
@@ -510,8 +602,8 @@ class DCPowerNetwork:
     def print_isl_info(self):
         for isl in self.islands:
             print(f"isl {isl.idx} is_alive = {isl.is_alive}")
-            print(f"    node = {len(isl.nodes)}:")
-            for node in isl.nodes:
+            print(f"    buses = {len(isl.buses)}:")
+            for node in isl.buses:
                 print(f"        {node.idx} {node.name} vbase: {node.vbase}")
             print(f"    gens = {len(isl.gens)}:")
             for gen in isl.gens:
@@ -608,7 +700,7 @@ class DCPowerNetwork:
         # 检查每个岛屿
         for isl in self.islands:
             # 1. 电压基值一致性
-            vbase_set = {int(node.vbase*1000) for node in isl.nodes}
+            vbase_set = {int(bus.vbase*1000) for bus in isl.buses}
             if len(vbase_set) > 1:
                 str_info = f"岛屿 {isl.idx} 内节点电压基值不一致:"
                 for vbase in vbase_set:

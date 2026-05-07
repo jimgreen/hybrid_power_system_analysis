@@ -232,15 +232,26 @@ class DCStateEstimator:
         self._build_unit_scale_cache()
 
         self.nodes = sorted(
-            [node for node in self.network.nodes if getattr(node, "is_alive", False)],
+            getattr(self.network, "alive_buses", None)
+            or [bus for bus in getattr(self.network, "buses", []) if getattr(bus, "is_alive", False)]
+            or [node for node in self.network.nodes if getattr(node, "is_alive", False)],
             key=lambda item: item.idx,
         )
         if not self.nodes:
             raise RuntimeError("No alive DC nodes are available for state estimation")
 
-        self.node_pos = {node.idx: pos for pos, node in enumerate(self.nodes)}
-        self.node_by_name = {node.name: node for node in self.nodes}
-        self.node_by_idx = {node.idx: node for node in self.nodes}
+        self.node_pos = {}
+        self.node_by_name = {}
+        self.node_by_idx = {}
+        for pos, bus in enumerate(self.nodes):
+            members = getattr(bus, "nodes", None) or [bus]
+            for node in members:
+                self.node_pos[node.idx] = pos
+                self.node_by_name[node.name] = bus
+                self.node_by_idx[node.idx] = bus
+            self.node_pos.setdefault(bus.idx, pos)
+            self.node_by_name.setdefault(bus.name, bus)
+            self.node_by_idx.setdefault(bus.idx, bus)
         self.branch_by_name = {br.name: br for br in self.network.branches if getattr(br, "is_alive", False)}
         self.load_by_name = {load.name: load for load in self.network.loads if getattr(load, "is_alive", False)}
         self.generator_by_name = {gen.name: gen for gen in self.network.generators if getattr(gen, "is_alive", False)}
@@ -407,10 +418,10 @@ class DCStateEstimator:
         )
         for devices in device_groups:
             for dev in devices:
-                if dev.i_node in degrees:
-                    degrees[dev.i_node] += 1
-                if dev.j_node in degrees:
-                    degrees[dev.j_node] += 1
+                if dev.i_node in self.node_pos:
+                    degrees[self.nodes[self.node_pos[dev.i_node]].idx] += 1
+                if dev.j_node in self.node_pos:
+                    degrees[self.nodes[self.node_pos[dev.j_node]].idx] += 1
         return degrees
 
     def _select_reference_nodes(self) -> List[object]:
@@ -423,7 +434,7 @@ class DCStateEstimator:
                 continue
             candidates = [
                 node
-                for node in island.nodes
+                for node in island.buses
                 if node.idx in self.node_by_idx and node.idx in voltage_measurements
             ]
             if candidates:
@@ -435,8 +446,8 @@ class DCStateEstimator:
                 )
             elif island.slack_nodes:
                 references.append(sorted(island.slack_nodes, key=lambda item: item.idx)[0])
-            elif island.nodes:
-                references.append(sorted(island.nodes, key=lambda item: item.idx)[0])
+            elif island.buses:
+                references.append(sorted(island.buses, key=lambda item: item.idx)[0])
         return references
 
     def _build_zero_tie_voltage_layout(self) -> None:
@@ -585,8 +596,8 @@ class DCStateEstimator:
     def _build_measurement_plan_device_cache(self) -> None:
         """Cache per-device row-plan metadata shared by all measurement types."""
         self._node_plan_by_name = {
-            node.name: (self.node_pos[node.idx], int(self.voltage_col[self.node_pos[node.idx]]))
-            for node in self.node_by_name.values()
+            name: (self.node_pos[node.idx], int(self.voltage_col[self.node_pos[node.idx]]))
+            for name, node in self.node_by_name.items()
         }
         self._branch_plan_by_name = {}
         for br in self.branch_by_name.values():
@@ -740,8 +751,8 @@ class DCStateEstimator:
     def _build_measurement_scale_cache(self) -> None:
         """Cache file-unit scale factors used by the measurement normalization pass."""
         self._node_measurement_scale_by_name = {
-            node.name: self._voltage_file_base_by_idx[int(node.idx)]
-            for node in self.node_by_name.values()
+            name: self._voltage_file_base_by_idx[int(node.idx)]
+            for name, node in self.node_by_name.items()
         }
         self._branch_measurement_scale_by_name = {
             br.name: self._terminal_scale_tuple(br.i_node, br.j_node)
@@ -2235,6 +2246,8 @@ class DCStateEstimator:
 
         for pos, node in enumerate(self.nodes):
             node.voltage = float(voltage[pos])
+            for member in getattr(node, "nodes", ()):
+                member.voltage = node.voltage
 
         if self._apply_branch_devices:
             vi = voltage[self._apply_branch_i]

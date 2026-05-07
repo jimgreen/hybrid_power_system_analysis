@@ -10,6 +10,34 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class DCStateEstimationTest(unittest.TestCase):
+    def test_dc_topology_contracts_closed_switches_to_buses_before_islands(self):
+        from model.dc_model import DCPowerNetwork as ObjectDCPowerNetwork
+
+        network = ObjectDCPowerNetwork()
+        network.add_node(1, 100.0)
+        network.nodes[-1].name = "n1"
+        network.add_node(2, 100.0)
+        network.nodes[-1].name = "n2"
+        network.add_node(3, 100.0)
+        network.nodes[-1].name = "n3"
+        network.add_generator(1, 1, "V", 1.0, 1.0, 0.0)
+        network.generators[-1].name = "g1"
+        network.add_switch(1, 1, 2, 1)
+        network.switches[-1].name = "sw_1_2"
+        network.add_switch(2, 2, 3, 0)
+        network.switches[-1].name = "sw_2_3"
+        network.add_branch(1, 2, 3, 0.01)
+        network.branches[-1].name = "br_2_3"
+
+        network.topo()
+
+        self.assertEqual(2, len(network.buses))
+        self.assertEqual(["n1", "n2"], [node.name for node in network.node_dict[1].bus_obj.nodes])
+        self.assertIs(network.node_dict[1].bus_obj, network.node_dict[2].bus_obj)
+        self.assertIsNot(network.node_dict[2].bus_obj, network.node_dict[3].bus_obj)
+        self.assertEqual(1, len(network.islands))
+        self.assertEqual(2, len(network.islands[0].buses))
+
     def test_dc_break_is_parsed_as_distinct_zero_tie_device(self):
         from model.dc_array_model import SWITCH_COLS, build_dc_ppc_from_e_file
         from model.dc_model import DCBreak, DCPowerNetwork as ObjectDCPowerNetwork
@@ -173,7 +201,7 @@ class DCStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
-        expected_refs = ["nd_5", "nd_21", "nd_26"]
+        expected_refs = ["nd_11", "nd_21", "nd_26"]
 
         self.assertEqual(expected_refs, [node.name for node in estimator.references])
         voltage, _switch_current, _dcdc_power, _vgen_power = estimator._unpack_state(estimator.initial_state())

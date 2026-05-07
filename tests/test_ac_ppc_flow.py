@@ -17,6 +17,34 @@ sys.path.insert(0, str(ROOT_DIR / "lfcore"))
 
 
 class ACPPCFlowTest(unittest.TestCase):
+    def test_ac_topology_contracts_closed_switches_to_buses_before_islands(self):
+        from ac_model import ACPowerNetwork
+
+        network = ACPowerNetwork()
+        network.add_node(1, 110.0)
+        network.nodes[-1].name = "n1"
+        network.add_node(2, 110.0)
+        network.nodes[-1].name = "n2"
+        network.add_node(3, 110.0)
+        network.nodes[-1].name = "n3"
+        network.add_generator(1, 1, "SLACK", 1.0, 0.0, 1.0)
+        network.generators[-1].name = "g1"
+        network.add_switch(1, 1, 2, 1)
+        network.switches[-1].name = "sw_1_2"
+        network.add_switch(2, 2, 3, 0)
+        network.switches[-1].name = "sw_2_3"
+        network.add_branch(1, 2, 3, 0.01, 0.05, 0.0)
+        network.branches[-1].name = "br_2_3"
+
+        network.topo()
+
+        self.assertEqual(2, len(network.buses))
+        self.assertEqual(["n1", "n2"], [node.name for node in network.node_dict[1].bus_obj.nodes])
+        self.assertIs(network.node_dict[1].bus_obj, network.node_dict[2].bus_obj)
+        self.assertIsNot(network.node_dict[2].bus_obj, network.node_dict[3].bus_obj)
+        self.assertEqual(1, len(network.islands))
+        self.assertEqual(2, len(network.islands[0].buses))
+
     def test_ac_break_is_parsed_as_distinct_zero_tie_device(self):
         from ac_array_model import SWITCH_COLS, build_ac_ppc_from_e_file
         from ac_model import ACPowerNetwork, ACBreak

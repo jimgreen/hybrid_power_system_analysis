@@ -304,7 +304,11 @@ class HybridStateEstimator:
     def _attach_array_ac_object_island(ac_calc: ACPowerFlowCalc, ac_grid) -> None:
         """Expose object device lists expected by SE while AC math uses array PPC."""
         ac_calc.isl = SimpleNamespace(
-            nodes=[node for node in ac_grid.nodes if getattr(node, "is_alive", False)],
+            buses=[
+                bus
+                for bus in getattr(ac_grid, "buses", [])
+                if getattr(bus, "is_alive", False)
+            ] or [node for node in ac_grid.nodes if getattr(node, "is_alive", False)],
             gens=ac_grid.generators,
             loads=ac_grid.loads,
             branches=ac_grid.branches,
@@ -1172,7 +1176,7 @@ class HybridStateEstimator:
                 continue
             candidates = [
                 node
-                for node in island.nodes
+                for node in island.buses
                 if node.idx in self.ac_node_by_idx and node.idx in voltage_measurements
             ]
             if candidates:
@@ -1184,8 +1188,8 @@ class HybridStateEstimator:
                 )
             elif island.slack_nodes:
                 references.append(sorted(island.slack_nodes, key=lambda item: item.idx)[0])
-            elif island.nodes:
-                references.append(sorted(island.nodes, key=lambda item: item.idx)[0])
+            elif island.buses:
+                references.append(sorted(island.buses, key=lambda item: item.idx)[0])
         return references
 
     def _ac_reference_angle_offsets(self) -> Dict[int, float]:
@@ -1202,11 +1206,11 @@ class HybridStateEstimator:
         for island in self.network.ac.islands:
             if not getattr(island, "is_alive", False):
                 continue
-            ref = next((node for node in island.nodes if int(node.idx) in ref_by_node_idx), None)
+            ref = next((node for node in island.buses if int(node.idx) in ref_by_node_idx), None)
             if ref is None or ref.idx not in ac.node_pos:
                 continue
             offset = original_angle(ac.node_pos[ref.idx])
-            for node in island.nodes:
+            for node in island.buses:
                 if node.idx in ac.node_pos:
                     offsets[int(ac.node_pos[node.idx])] = offset
         return offsets
@@ -1297,7 +1301,7 @@ class HybridStateEstimator:
                 continue
             candidates = [
                 node
-                for node in island.nodes
+                for node in island.buses
                 if node.idx in self.dc_node_by_idx and node.idx in voltage_measurements
             ]
             if candidates:
@@ -1309,8 +1313,8 @@ class HybridStateEstimator:
                 )
             elif island.slack_nodes:
                 references.append(sorted(island.slack_nodes, key=lambda item: item.idx)[0])
-            elif island.nodes:
-                references.append(sorted(island.nodes, key=lambda item: item.idx)[0])
+            elif island.buses:
+                references.append(sorted(island.buses, key=lambda item: item.idx)[0])
         return references
 
     def _build_estimation_state_layout(self) -> None:
