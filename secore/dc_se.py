@@ -2,7 +2,6 @@ import argparse
 import contextlib
 import io
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -16,6 +15,22 @@ for path in (ROOT_DIR,):
 
 from lfcore.dc_lf import DCPowerFlowCalc
 from model.dc_array_model import DCPowerNetwork
+from model.meas_model import (
+    BadDataItem,
+    DEVICE_TYPE_CODES,
+    EstimateResult,
+    GEN_CONTROL_KIND,
+    GEN_MEASUREMENT_KIND,
+    LOAD_MEASUREMENT_KIND,
+    Measurement,
+    MeasurementList,
+    MeasurementTable,
+    ObservabilityResult,
+    TERMINAL_MEASUREMENT_KIND,
+    measurement_table_from_measurements,
+    print_iteration as _print_iteration,
+    print_iteration_header as _print_iteration_header,
+)
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook  # Retained for compatibility; measurement loading uses the direct parser below.
 from secore.se_math import (
@@ -34,92 +49,41 @@ DEFAULT_CASE = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
 DEFAULT_MEAS = ROOT_DIR / "data" / "dc" / "dc_net_30.meas"
 
 _MEASUREMENT_REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
-_TERMINAL_KIND = {"P_FROM": 0, "V_FROM": 1, "I_FROM": 2, "P_TO": 3, "V_TO": 4, "I_TO": 5}
-_LOAD_MEASUREMENT_KIND = {"P_LOAD": 0, "V_LOAD": 1, "I_LOAD": 2}
-_GEN_MEASUREMENT_KIND = {"P_GEN": 0, "V_GEN": 1, "I_GEN": 2}
-_GEN_CONTROL_KIND = {"V": 0, "P": 1, "I": 2}
+_TERMINAL_KIND = TERMINAL_MEASUREMENT_KIND
+_LOAD_MEASUREMENT_KIND = LOAD_MEASUREMENT_KIND
+_GEN_MEASUREMENT_KIND = GEN_MEASUREMENT_KIND
+_GEN_CONTROL_KIND = GEN_CONTROL_KIND
+_DEVICE_TYPE_CODES = DEVICE_TYPE_CODES
 
 
-@dataclass(slots=True)
-class Measurement:
-    idx: int
-    name: str
-    device_type: str
-    device_name: str
-    meas_type: str
-    weight: float
-    valid: bool
-    value: float
-
-    @property
-    def device(self) -> str:
-        return f"{self.device_type}:{self.device_name}"
-
-
-@dataclass
-class ObservabilityResult:
-    observable: bool
-    rank: int
-    state_count: int
-    measurement_count: int
-    deficiency: int
-    singular_values: np.ndarray
-    weak_states: List[Tuple[str, float]]
-
-
-@dataclass
-class EstimateResult:
-    converged: bool
-    iterations: int
-    objective: float
-    max_correction: float
-    residual_inf: float
-    x: np.ndarray
-    z_est: np.ndarray
-    residual: np.ndarray
-    H: np.ndarray
-    gain: np.ndarray
-    measurements: List[Measurement]
-    observability: ObservabilityResult
-
-
-@dataclass
-class BadDataItem:
-    measurement: Measurement
-    residual: float
-    normalized_residual: float
-    estimated_value: float
-    measured_value: float
-
-
-def _print_iteration_header() -> None:
-    print("Iteration process:")
-    print("  iter objective      max_dx      norm_res    step   status")
-
-
-def _print_iteration(
-    iteration: int,
-    objective: float,
-    residual_inf: float,
-    max_correction: float,
-    step_scale: Optional[float],
-    converged: bool,
-) -> None:
-    step = "-" if step_scale is None else f"{step_scale:.3f}"
-    status = "converged" if converged else ""
-    print(
-        f"  {iteration:4d} "
-        f"{objective:12.6e} "
-        f"{max_correction:10.3e} "
-        f"{residual_inf:10.3e} "
-        f"{step:>6s} "
-        f"{status}"
+def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) -> MeasurementTable:
+    return measurement_table_from_measurements(
+        measurements,
+        device_type_codes=_DEVICE_TYPE_CODES,
     )
 
 
-def _read_measurements_direct(meas_file: Path) -> List["Measurement"]:
+def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     """Read only the Measurement block without materializing a generic EBook dict."""
     measurements: List[Measurement] = []
+    idx_values = []
+    name_values = []
+    device_type_values = []
+    device_name_values = []
+    meas_type_values = []
+    weight_values = []
+    valid_values = []
+    value_values = []
+    device_type_code_values = []
+    append_idx = idx_values.append
+    append_name = name_values.append
+    append_device_type = device_type_values.append
+    append_device_name = device_name_values.append
+    append_meas_type = meas_type_values.append
+    append_weight = weight_values.append
+    append_valid = valid_values.append
+    append_value = value_values.append
+    append_device_type_code = device_type_code_values.append
     in_measurement = False
     found_measurement_block = False
     header = None
@@ -131,6 +95,7 @@ def _read_measurements_direct(meas_file: Path) -> List["Measurement"]:
     meas_type_cache: Dict[str, str] = {}
     device_type_cache_get = device_type_cache.get
     meas_type_cache_get = meas_type_cache.get
+    device_type_code_get = _DEVICE_TYPE_CODES.get
     idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
 
     with Path(meas_file).open("r", encoding="utf-8") as handle:
@@ -182,22 +147,50 @@ def _read_measurements_direct(meas_file: Path) -> List["Measurement"]:
                 meas_type = intern(raw_meas_type.upper())
                 meas_type_cache[raw_meas_type] = meas_type
 
+            idx = int(fields[idx_col])
+            name = fields[name_col]
+            device_name = fields[dev_name_col]
+            weight = float(fields[weight_col])
+            valid = bool(int(fields[valid_col]))
+            value = float(fields[value_col])
+
             meas = new_measurement(Measurement)
-            meas.idx = int(fields[idx_col])
-            meas.name = fields[name_col]
+            meas.idx = idx
+            meas.name = name
             meas.device_type = device_type
-            meas.device_name = fields[dev_name_col]
+            meas.device_name = device_name
             meas.meas_type = meas_type
-            meas.weight = float(fields[weight_col])
-            meas.valid = bool(int(fields[valid_col]))
-            meas.value = float(fields[value_col])
+            meas.weight = weight
+            meas.valid = valid
+            meas.value = value
             append_measurement(meas)
+            append_idx(idx)
+            append_name(name)
+            append_device_type(device_type)
+            append_device_name(device_name)
+            append_meas_type(meas_type)
+            append_weight(weight)
+            append_valid(valid)
+            append_value(value)
+            append_device_type_code(device_type_code_get(device_type, 0))
 
     if not found_measurement_block:
         raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
     if header is None:
         raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
-    return measurements
+    table = MeasurementTable(
+        idx=np.asarray(idx_values, dtype=np.int64),
+        name=np.asarray(name_values, dtype=object),
+        device_type=np.asarray(device_type_values, dtype=object),
+        device_name=np.asarray(device_name_values, dtype=object),
+        meas_type=np.asarray(meas_type_values, dtype=object),
+        weight=np.asarray(weight_values, dtype=np.float64),
+        valid=np.asarray(valid_values, dtype=bool),
+        value=np.asarray(value_values, dtype=np.float64),
+        device_type_code=np.asarray(device_type_code_values, dtype=np.int16),
+        angle_mask=np.zeros(len(measurements), dtype=bool),
+    )
+    return MeasurementList(measurements, table)
 
 
 class DCStateEstimator:
@@ -318,9 +311,35 @@ class DCStateEstimator:
 
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and the vectorized measurement plan."""
-        self.active_measurements = [m for m in self.measurements if m.valid and m.weight > 0.0]
-        self.active_z = np.fromiter((m.value for m in self.active_measurements), dtype=np.float64)
-        self.active_weight = np.fromiter((m.weight for m in self.active_measurements), dtype=np.float64)
+        table = _measurement_table_from_measurements(tuple(self.measurements))
+        try:
+            self.measurements.table = table
+        except AttributeError:
+            pass
+        active_source_rows = np.flatnonzero(table.valid & (table.weight > 0.0))
+        active_table = MeasurementTable(
+            idx=table.idx[active_source_rows],
+            name=table.name[active_source_rows],
+            device_type=table.device_type[active_source_rows],
+            device_name=table.device_name[active_source_rows],
+            meas_type=table.meas_type[active_source_rows],
+            weight=table.weight[active_source_rows],
+            valid=table.valid[active_source_rows],
+            value=table.value[active_source_rows],
+            device_type_code=table.device_type_code[active_source_rows],
+            angle_mask=table.angle_mask[active_source_rows],
+        )
+        measurements = self.measurements
+        self.measurement_table = table
+        self.active_measurements = MeasurementList(
+            [measurements[int(row)] for row in active_source_rows],
+            active_table,
+            normalized=getattr(measurements, "normalized", False),
+        )
+        self.active_measurement_rows = np.asarray(active_source_rows, dtype=np.int64)
+        self.active_measurement_table = active_table
+        self.active_z = np.asarray(active_table.value, dtype=np.float64)
+        self.active_weight = np.asarray(active_table.weight, dtype=np.float64)
         self._measurement_plan_cache = {}
         self._measurement_plan(self.active_measurements)
 
@@ -508,9 +527,9 @@ class DCStateEstimator:
 
         self._apply_load_devices = list(self.load_by_name.values())
         self._apply_load_pos = self._int_array([self.node_pos[load.node] for load in self._apply_load_devices])
-        self._apply_load_pv0 = np.asarray([load.pv0 for load in self._apply_load_devices], dtype=np.float64)
-        self._apply_load_pv1 = np.asarray([load.pv1 for load in self._apply_load_devices], dtype=np.float64)
-        self._apply_load_pv2 = np.asarray([load.pv2 for load in self._apply_load_devices], dtype=np.float64)
+        self._apply_load_pv0 = np.asarray([getattr(load, "pbase", 1.0) * load.pv0 for load in self._apply_load_devices], dtype=np.float64)
+        self._apply_load_pv1 = np.asarray([getattr(load, "pbase", 1.0) * load.pv1 for load in self._apply_load_devices], dtype=np.float64)
+        self._apply_load_pv2 = np.asarray([getattr(load, "pbase", 1.0) * load.pv2 for load in self._apply_load_devices], dtype=np.float64)
 
         gen_ctrl_map = {"V": 0, "P": 1, "I": 2}
         self._apply_generator_devices = list(self.generator_by_name.values())
@@ -574,9 +593,9 @@ class DCStateEstimator:
             self._load_plan_by_name[load.name] = (
                 pos,
                 int(self.voltage_col[pos]),
-                load.pv0,
-                load.pv1,
-                load.pv2,
+                getattr(load, "pbase", 1.0) * load.pv0,
+                getattr(load, "pbase", 1.0) * load.pv1,
+                getattr(load, "pbase", 1.0) * load.pv2,
             )
         self._generator_plan_by_name = {}
         for gen in self.generator_by_name.values():
@@ -670,7 +689,7 @@ class DCStateEstimator:
         return network
 
     @staticmethod
-    def _load_measurements(meas_file: Path) -> List[Measurement]:
+    def _load_measurements(meas_file: Path) -> MeasurementList:
         return _read_measurements_direct(meas_file)
 
     def _voltage_base(self, node_idx: int) -> float:
@@ -863,7 +882,7 @@ class DCStateEstimator:
             return float(p)
         node = getattr(load, "node_obj", None)
         voltage = float(getattr(node, "voltage", 1.0) or 1.0)
-        return float(load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage)
+        return float(getattr(load, "pbase", 1.0) * (load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage))
 
     def _add_pseudo_topology_measurements(self, next_idx: int) -> int:
         """Add weak priors for topology devices that have no usable measurement row."""
@@ -1149,7 +1168,7 @@ class DCStateEstimator:
 
     def _load_values(self, load, voltage: np.ndarray) -> Tuple[float, float, float]:
         v = voltage[self.node_pos[load.node]]
-        p = load.pv0 + load.pv1 * v + load.pv2 * v * v
+        p = getattr(load, "pbase", 1.0) * (load.pv0 + load.pv1 * v + load.pv2 * v * v)
         return p, v, self._safe_current(p, v, self.min_current_voltage)
 
     def _generator_values(
@@ -1851,11 +1870,11 @@ class DCStateEstimator:
                 i_state = int(self.voltage_col[i])
                 v = voltage[i]
                 if mtype == "P_LOAD":
-                    self._add_derivative(H, row, i_state, load.pv1 + 2.0 * load.pv2 * v)
+                    self._add_derivative(H, row, i_state, getattr(load, "pbase", 1.0) * (load.pv1 + 2.0 * load.pv2 * v))
                 elif mtype == "V_LOAD":
                     self._add_derivative(H, row, i_state, 1.0)
                 elif mtype == "I_LOAD":
-                    self._add_derivative(H, row, i_state, load.pv2 - load.pv0 / (v * v))
+                    self._add_derivative(H, row, i_state, getattr(load, "pbase", 1.0) * (load.pv2 - load.pv0 / (v * v)))
                 else:
                     raise RuntimeError(f"Unsupported DCLoad measurement type: {mtype}")
 

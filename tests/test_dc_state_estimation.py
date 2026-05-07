@@ -28,6 +28,7 @@ class DCStateEstimationTest(unittest.TestCase):
     def test_measurement_loader_bypasses_generic_ebook_parser(self):
         import secore.dc_se as dc_se
         from secore.dc_se import DCStateEstimator
+        from model.meas_model import MeasurementList
 
         original_ebook = dc_se.EBook
 
@@ -41,6 +42,9 @@ class DCStateEstimationTest(unittest.TestCase):
             dc_se.EBook = original_ebook
 
         self.assertGreater(len(measurements), 0)
+        self.assertIsInstance(measurements, MeasurementList)
+        self.assertIsNotNone(measurements.table)
+        self.assertEqual(len(measurements), len(measurements.table.idx))
         self.assertEqual("DCNode", measurements[0].device_type)
         self.assertEqual("V", measurements[0].meas_type)
 
@@ -421,6 +425,7 @@ class DCStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(dense, sparse.toarray(), atol=1e-10)
 
     def test_active_measurement_arrays_are_cached_for_estimation(self):
+        from model.meas_model import MeasurementList
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
@@ -428,15 +433,18 @@ class DCStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
         )
 
+        self.assertIsInstance(estimator.active_measurements, MeasurementList)
+        self.assertIsNotNone(estimator.active_measurement_table)
+        self.assertIs(estimator.active_measurements.table, estimator.active_measurement_table)
         self.assertTrue(hasattr(estimator, "active_z"))
         self.assertTrue(hasattr(estimator, "active_weight"))
         np.testing.assert_allclose(
             estimator.active_z,
-            np.asarray([meas.value for meas in estimator.active_measurements], dtype=np.float64),
+            np.asarray(estimator.active_measurement_table.value, dtype=np.float64),
         )
         np.testing.assert_allclose(
             estimator.active_weight,
-            np.asarray([meas.weight for meas in estimator.active_measurements], dtype=np.float64),
+            np.asarray(estimator.active_measurement_table.weight, dtype=np.float64),
         )
 
     def test_apply_state_batches_device_value_calculation(self):
