@@ -44,11 +44,39 @@ class WebMonitorServerTest(unittest.TestCase):
             self.assertGreaterEqual(len(section["summary"]), 4)
 
         self.assertIn("bars", payload["simu"]["charts"])
+        self.assertIn("daily", payload["simu"]["charts"])
+        self.assertIn("state", payload["simu"])
         self.assertIn("topology", payload["simu"])
         self.assertIn("columns", payload["scada"]["charts"])
         self.assertIn("stations", payload["scada"])
         self.assertIn("units", payload["agc"])
         self.assertIn("reserve", payload["agc"])
+
+    def test_simu_page_has_four_daily_curves_and_state(self):
+        payload = server.build_snapshot(force_reload=True)
+        simu = payload["simu"]
+
+        curve_names = {curve["name"] for curve in simu["charts"]["daily"]}
+        self.assertEqual(curve_names, {"风速", "温度", "太阳辐射", "负荷"})
+        self.assertGreaterEqual(len(simu["charts"]["daily"][0]["points"]), 24)
+        self.assertEqual(simu["state"]["status"], "STOPPED")
+        self.assertIn("cursor_hour", simu["state"])
+
+    def test_simu_control_actions_update_runtime_state(self):
+        controller = server.SimuRuntime()
+
+        controller.apply("start")
+        self.assertEqual(controller.snapshot()["status"], "RUNNING")
+        controller.apply("faster")
+        self.assertEqual(controller.snapshot()["speed"], 2.0)
+        controller.apply("slower")
+        self.assertEqual(controller.snapshot()["speed"], 1.0)
+        controller.apply("stop")
+        self.assertEqual(controller.snapshot()["status"], "STOPPED")
+        controller.apply("reset")
+        state = controller.snapshot()
+        self.assertEqual(state["status"], "STOPPED")
+        self.assertEqual(state["cursor_hour"], 0.0)
 
     def test_snapshot_reads_values_from_csv_files(self):
         payload = server.build_snapshot(force_reload=True)

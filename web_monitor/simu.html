@@ -7,9 +7,8 @@
   <style>
     :root {
       --bg: #07111f;
-      --panel: rgba(13, 28, 48, 0.86);
-      --panel-strong: #10243c;
-      --line: rgba(132, 178, 224, 0.2);
+      --panel: rgba(13, 28, 48, 0.88);
+      --line: rgba(132, 178, 224, 0.22);
       --text: #e8f2ff;
       --muted: #8fa6bf;
       --cyan: #36d7ff;
@@ -21,7 +20,6 @@
     }
 
     * { box-sizing: border-box; }
-
     body {
       margin: 0;
       min-height: 100vh;
@@ -34,240 +32,158 @@
     }
 
     a { color: inherit; text-decoration: none; }
-
-    .shell {
-      display: grid;
-      grid-template-columns: 232px minmax(0, 1fr);
-      min-height: 100vh;
-    }
-
-    .sidebar {
-      padding: 24px 18px;
-      border-right: 1px solid var(--line);
-      background: rgba(5, 13, 24, 0.76);
-      backdrop-filter: blur(18px);
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 28px;
-    }
-
-    .brand-mark {
-      width: 42px;
-      height: 42px;
-      display: grid;
-      place-items: center;
-      border: 1px solid rgba(54, 215, 255, 0.52);
-      border-radius: 8px;
-      background: linear-gradient(145deg, rgba(54, 215, 255, 0.2), rgba(65, 227, 155, 0.1));
-      color: var(--cyan);
-      font-weight: 800;
-    }
-
-    .brand strong { display: block; font-size: 15px; letter-spacing: 0; }
+    .shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { padding: 24px 18px; border-right: 1px solid var(--line); background: rgba(5, 13, 24, 0.76); backdrop-filter: blur(18px); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .brand-mark { width: 42px; height: 42px; display: grid; place-items: center; border: 1px solid rgba(54, 215, 255, 0.52); border-radius: 8px; background: linear-gradient(145deg, rgba(54, 215, 255, 0.2), rgba(65, 227, 155, 0.1)); color: var(--cyan); font-weight: 800; }
+    .brand strong { display: block; font-size: 15px; }
     .brand span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
-
-    .nav {
-      display: grid;
-      gap: 10px;
-    }
-
-    .nav a {
-      padding: 12px 13px;
-      border: 1px solid transparent;
-      border-radius: 8px;
-      color: #b9cbe0;
-      font-size: 14px;
-    }
-
-    .nav a.active,
-    .nav a:hover {
-      border-color: rgba(54, 215, 255, 0.3);
-      background: rgba(54, 215, 255, 0.1);
-      color: var(--text);
-    }
-
-    .side-status {
-      margin-top: 32px;
-      padding: 16px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(16, 36, 60, 0.56);
-    }
-
+    .nav { display: grid; gap: 10px; }
+    .nav a { padding: 12px 13px; border: 1px solid transparent; border-radius: 8px; color: #b9cbe0; font-size: 14px; }
+    .nav a.active, .nav a:hover { border-color: rgba(54, 215, 255, 0.3); background: rgba(54, 215, 255, 0.1); color: var(--text); }
+    .side-status { margin-top: 32px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: rgba(16, 36, 60, 0.56); }
     .side-status small { color: var(--muted); }
     .side-status strong { display: block; margin-top: 8px; color: var(--green); font-size: 24px; }
 
     main { padding: 22px; }
-
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      margin-bottom: 20px;
-    }
-
-    h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: 0; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 28px; font-weight: 800; }
     .subhead { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
-
-    .clock {
-      min-width: 232px;
-      padding: 12px 16px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(13, 28, 48, 0.7);
-      text-align: right;
-      box-shadow: var(--shadow);
-    }
-
+    .clock { min-width: 232px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: rgba(13, 28, 48, 0.7); text-align: right; box-shadow: var(--shadow); }
     .clock span { display: block; color: var(--muted); font-size: 12px; }
     .clock strong { display: block; margin-top: 4px; font-size: 18px; }
 
-    .grid {
+    .status-strip {
       display: grid;
-      grid-template-columns: repeat(12, 1fr);
-      gap: 16px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
     }
 
-    .card {
+    .status-card,
+    .control-bar,
+    .curve-card {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
       box-shadow: var(--shadow);
-      overflow: hidden;
     }
 
-    .metric { grid-column: span 3; padding: 18px; min-height: 134px; }
-    .metric .label { color: var(--muted); font-size: 13px; }
-    .metric .value { margin-top: 14px; font-size: 32px; font-weight: 800; }
-    .metric .unit { color: var(--muted); font-size: 14px; font-weight: 500; }
-    .metric .delta { margin-top: 12px; font-size: 13px; color: var(--green); }
+    .status-card { padding: 14px 16px; }
+    .status-card span { display: block; color: var(--muted); font-size: 12px; }
+    .status-card strong { display: block; margin-top: 7px; color: var(--cyan); font-size: 22px; }
+    .status-card strong.running { color: var(--green); }
+    .status-card strong.stopped { color: var(--yellow); }
 
-    .section-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-    }
+    .simu-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; }
+    .curves { display: grid; gap: 14px; }
 
-    .section-title h2 { margin: 0; font-size: 16px; }
-    .section-title span { color: var(--muted); font-size: 12px; }
+    .curve-card { min-height: 150px; overflow: hidden; }
+    .curve-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .curve-head h2 { margin: 0; font-size: 16px; }
+    .curve-head span { color: var(--muted); font-size: 12px; }
+    .curve-body { height: 116px; padding: 8px 12px 12px; }
+    .curve-svg { width: 100%; height: 100%; display: block; }
+    .axis { stroke: rgba(132, 178, 224, 0.18); stroke-width: 1; }
+    .curve-line { fill: none; stroke: var(--cyan); stroke-width: 3; filter: drop-shadow(0 0 7px rgba(54, 215, 255, 0.45)); }
+    .curve-area { fill: rgba(54, 215, 255, 0.08); }
+    .cursor-line { stroke: var(--yellow); stroke-width: 2; stroke-dasharray: 5 5; }
+    .cursor-dot { fill: var(--yellow); stroke: #061321; stroke-width: 2; }
+    .cursor-label { fill: var(--yellow); font-size: 12px; font-weight: 700; }
+    .tick-label { fill: var(--muted); font-size: 11px; }
 
-    .network { grid-column: span 7; min-height: 400px; }
-    .trend { grid-column: span 5; min-height: 400px; }
-    .table-card { grid-column: span 8; }
-    .control-card { grid-column: span 4; }
-
-    .network-map {
-      position: relative;
-      height: 326px;
-      background:
-        linear-gradient(rgba(132, 178, 224, 0.06) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(132, 178, 224, 0.06) 1px, transparent 1px);
-      background-size: 42px 42px;
-    }
-
-    .bus {
-      position: absolute;
-      width: 92px;
-      height: 44px;
-      display: grid;
-      place-items: center;
-      border: 1px solid rgba(54, 215, 255, 0.48);
-      border-radius: 8px;
-      background: rgba(10, 24, 42, 0.92);
-      color: #dff8ff;
-      font-size: 13px;
-      box-shadow: 0 0 26px rgba(54, 215, 255, 0.16);
-      z-index: 2;
-    }
-
-    .bus.ok { border-color: rgba(65, 227, 155, 0.56); }
-    .bus.warn { border-color: rgba(255, 209, 102, 0.7); color: var(--yellow); }
-
-    .line {
-      position: absolute;
-      height: 2px;
-      transform-origin: left center;
-      background: linear-gradient(90deg, transparent, var(--cyan), transparent);
-      opacity: 0.74;
-    }
-
-    .trend-body { padding: 18px; }
-
-    .bar-row {
-      display: grid;
-      grid-template-columns: 88px minmax(0, 1fr) 54px;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 18px;
-      color: #c7d8ea;
-      font-size: 13px;
-    }
-
-    .track {
-      height: 12px;
-      border-radius: 999px;
-      background: rgba(132, 178, 224, 0.13);
-      overflow: hidden;
-    }
-
-    .fill {
-      height: 100%;
-      border-radius: 999px;
-      background: linear-gradient(90deg, var(--blue), var(--cyan));
-    }
-
-    table {
+    .control-panel { display: grid; gap: 16px; align-content: start; }
+    .control-bar { padding: 16px; }
+    .control-bar h2 { margin: 0 0 14px; font-size: 16px; }
+    .buttons { display: grid; gap: 10px; }
+    .buttons button {
       width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
+      padding: 12px 14px;
+      border: 1px solid rgba(54, 215, 255, 0.36);
+      border-radius: 8px;
+      background: rgba(54, 215, 255, 0.1);
+      color: var(--text);
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: inset 0 0 18px rgba(54, 215, 255, 0.14);
     }
+    .buttons button:hover { border-color: rgba(65, 227, 155, 0.7); color: #ffffff; }
+    .buttons button.stop { border-color: rgba(255, 107, 107, 0.42); color: #ffd6d6; }
+    .buttons button.reset { border-color: rgba(255, 209, 102, 0.42); color: #fff0c0; }
 
-    th, td { padding: 13px 16px; border-bottom: 1px solid var(--line); text-align: left; }
-    th { color: var(--muted); font-weight: 600; background: rgba(8, 20, 36, 0.46); }
-    td { color: #dceaff; }
-
-    .tag {
-      display: inline-flex;
-      align-items: center;
-      min-width: 58px;
-      justify-content: center;
-      padding: 4px 8px;
-      border-radius: 999px;
-      border: 1px solid rgba(65, 227, 155, 0.38);
-      color: var(--green);
-      font-size: 12px;
-    }
-
+    .event-list { padding: 14px 16px; display: grid; gap: 12px; color: #dceaff; font-size: 13px; }
+    .event-row { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+    .event-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .event-row span { color: var(--muted); }
+    .tag { display: inline-flex; width: max-content; margin-top: 6px; padding: 3px 8px; border-radius: 999px; border: 1px solid rgba(65, 227, 155, 0.38); color: var(--green); font-size: 12px; }
     .tag.warn { border-color: rgba(255, 209, 102, 0.48); color: var(--yellow); }
 
-    .control-list { padding: 16px 18px 18px; display: grid; gap: 14px; }
-    .control-item { display: flex; justify-content: space-between; gap: 12px; color: #dceaff; font-size: 13px; }
-    .control-item span { color: var(--muted); }
-
-    @media (max-width: 980px) {
-      .shell { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
-      .nav { grid-template-columns: repeat(3, 1fr); }
-      .metric, .network, .trend, .table-card, .control-card { grid-column: span 12; }
-      .topbar { align-items: flex-start; flex-direction: column; }
-      .clock { width: 100%; text-align: left; }
+    @media (max-width: 1080px) {
+      .simu-layout { grid-template-columns: 1fr; }
+      .status-strip { grid-template-columns: repeat(2, 1fr); }
     }
 
-    @media (max-width: 640px) {
-      main { padding: 16px; }
+    @media (max-width: 760px) {
+      .shell { grid-template-columns: 1fr; }
       .nav { grid-template-columns: 1fr; }
-      .metric { min-height: 116px; }
-      .metric .value { font-size: 26px; }
-      .network-map { height: 280px; }
-      .bus { width: 76px; font-size: 12px; }
-      th, td { padding: 10px; }
+      .topbar { flex-direction: column; align-items: flex-start; }
+      .clock { width: 100%; text-align: left; }
+      .status-strip { grid-template-columns: 1fr; }
+      main { padding: 16px; }
+    }
+
+    body {
+      background: #030b18 url("assets/main-dashboard-bg.png") center / cover fixed no-repeat;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(90deg, rgba(2, 10, 22, 0.88), rgba(2, 10, 22, 0.44) 28%, rgba(2, 10, 22, 0.56)),
+        radial-gradient(circle at 50% 42%, rgba(0, 173, 255, 0.12), transparent 42%);
+      z-index: -1;
+    }
+    .sidebar,
+    .status-card,
+    .control-bar,
+    .curve-card,
+    .clock {
+      border-color: rgba(21, 211, 255, 0.52);
+      background: linear-gradient(135deg, rgba(3, 18, 39, 0.84), rgba(5, 34, 70, 0.58));
+      box-shadow: inset 0 0 18px rgba(24, 175, 255, 0.22), 0 0 26px rgba(0, 173, 255, 0.16);
+    }
+    .topbar {
+      padding: 12px 18px;
+      border: 1px solid rgba(21, 211, 255, 0.42);
+      border-radius: 8px;
+      background: rgba(3, 18, 39, 0.56);
+      box-shadow: inset 0 0 18px rgba(24, 175, 255, 0.18);
+    }
+    h1,
+    .curve-head h2,
+    .control-bar h2 {
+      text-shadow: 0 0 12px rgba(44, 183, 255, 0.74);
+    }
+    .nav a,
+    .buttons button {
+      border-color: rgba(21, 211, 255, 0.52);
+      background: linear-gradient(90deg, rgba(5, 34, 70, 0.74), rgba(4, 19, 42, 0.44));
+      box-shadow: inset 0 0 16px rgba(24, 175, 255, 0.24);
+      text-shadow: 0 0 10px rgba(44, 183, 255, 0.5);
+    }
+    .nav a.active,
+    .nav a:hover,
+    .buttons button:hover {
+      border-color: rgba(44, 230, 255, 0.92);
+      background: linear-gradient(90deg, rgba(7, 74, 130, 0.84), rgba(5, 32, 74, 0.62));
+      box-shadow: inset 0 0 22px rgba(24, 175, 255, 0.56), 0 0 30px rgba(0, 173, 255, 0.32);
+    }
+    .curve-head,
+    .event-row {
+      border-color: rgba(21, 211, 255, 0.28);
     }
   </style>
 </head>
@@ -276,10 +192,7 @@
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">P</div>
-        <div>
-          <strong>电力监视中心</strong>
-          <span>Hybrid Power Console</span>
-        </div>
+        <div><strong>电力监视中心</strong><span>Hybrid Power Console</span></div>
       </div>
       <nav class="nav">
         <a href="index.html">系统首页</a>
@@ -289,7 +202,7 @@
       </nav>
       <div class="side-status">
         <small>仿真引擎状态</small>
-        <strong>RUNNING</strong>
+        <strong id="side-status">STOPPED</strong>
       </div>
     </aside>
 
@@ -297,175 +210,142 @@
       <header class="topbar">
         <div>
           <h1>SIMU在线监视</h1>
-          <p class="subhead">仿真潮流、节点电压、线路负载和事件队列实时总览</p>
+          <p class="subhead">风速、温度、太阳辐射、负荷日曲线与仿真时刻游标</p>
         </div>
-        <div class="clock">
-          <span>系统时间</span>
-          <strong id="clock">--</strong>
-        </div>
+        <div class="clock"><span>系统时间</span><strong id="clock">--</strong></div>
       </header>
 
-      <section class="grid">
-        <article class="card metric">
-          <div class="label">仿真步长</div>
-          <div class="value" data-live="step">0.50 <span class="unit">s</span></div>
-          <div class="delta">实时推进中</div>
-        </article>
-        <article class="card metric">
-          <div class="label">总有功负荷</div>
-          <div class="value" data-live="load">486.2 <span class="unit">MW</span></div>
-          <div class="delta">较上周期 +1.8 MW</div>
-        </article>
-        <article class="card metric">
-          <div class="label">平均电压</div>
-          <div class="value" data-live="voltage">1.012 <span class="unit">p.u.</span></div>
-          <div class="delta">电压质量正常</div>
-        </article>
-        <article class="card metric">
-          <div class="label">事件队列</div>
-          <div class="value" data-live="events">7 <span class="unit">条</span></div>
-          <div class="delta">2 条待确认</div>
-        </article>
+      <section class="status-strip">
+        <article class="status-card"><span>当前仿真时间</span><strong id="sim-time">00:00</strong></article>
+        <article class="status-card"><span>仿真速度</span><strong id="sim-speed">1.0x</strong></article>
+        <article class="status-card"><span>仿真运行状态</span><strong id="sim-status" class="stopped">STOPPED</strong></article>
+        <article class="status-card"><span>游标定位</span><strong id="cursor-hour">0.00 h</strong></article>
+      </section>
 
-        <article class="card network">
-          <div class="section-title">
-            <h2>仿真网络拓扑</h2>
-            <span>IEEE hybrid demo</span>
-          </div>
-          <div class="network-map">
-            <div class="line" style="left:112px;top:91px;width:230px;transform:rotate(13deg)"></div>
-            <div class="line" style="left:331px;top:145px;width:205px;transform:rotate(32deg)"></div>
-            <div class="line" style="left:147px;top:210px;width:268px;transform:rotate(-18deg)"></div>
-            <div class="line" style="left:462px;top:87px;width:170px;transform:rotate(67deg)"></div>
-            <div class="bus ok" data-bus="BUS-101" style="left:54px;top:68px">BUS-101</div>
-            <div class="bus" data-bus="BUS-205" style="left:306px;top:120px">BUS-205</div>
-            <div class="bus warn" data-bus="BUS-309" style="left:430px;top:245px">BUS-309</div>
-            <div class="bus ok" data-bus="BUS-412" style="left:540px;top:78px">BUS-412</div>
-            <div class="bus" data-bus="BUS-518" style="left:150px;top:214px">BUS-518</div>
-          </div>
-        </article>
+      <section class="simu-layout">
+        <div class="curves" id="curve-stack"></div>
 
-        <article class="card trend">
-          <div class="section-title">
-            <h2>仿真关键量</h2>
-            <span>最近 15 分钟</span>
-          </div>
-          <div class="trend-body" id="simu-bars">
-            <div class="bar-row"><span>线路 L12</span><div class="track"><div class="fill" style="width:72%"></div></div><span>72%</span></div>
-            <div class="bar-row"><span>线路 L18</span><div class="track"><div class="fill" style="width:58%"></div></div><span>58%</span></div>
-            <div class="bar-row"><span>线路 L23</span><div class="track"><div class="fill" style="width:81%"></div></div><span>81%</span></div>
-            <div class="bar-row"><span>母线电压</span><div class="track"><div class="fill" style="width:64%"></div></div><span>1.01</span></div>
-            <div class="bar-row"><span>频率偏差</span><div class="track"><div class="fill" style="width:36%"></div></div><span>0.02</span></div>
-            <div class="bar-row"><span>收敛裕度</span><div class="track"><div class="fill" style="width:90%"></div></div><span>90%</span></div>
-          </div>
-        </article>
+        <aside class="control-panel">
+          <section class="control-bar">
+            <h2>控制栏</h2>
+            <div class="buttons">
+              <button data-action="start">启动</button>
+              <button data-action="faster">加速</button>
+              <button data-action="slower">减速</button>
+              <button class="stop" data-action="stop">停止</button>
+              <button class="reset" data-action="reset">归零</button>
+            </div>
+          </section>
 
-        <article class="card table-card">
-          <div class="section-title">
-            <h2>仿真事件</h2>
-            <span>自动刷新</span>
-          </div>
-          <table>
-            <thead><tr><th>时间</th><th>对象</th><th>事件</th><th>状态</th></tr></thead>
-            <tbody id="simu-alarms">
-              <tr><td>14:03:18</td><td>BUS-309</td><td>电压越限预警</td><td><span class="tag warn">关注</span></td></tr>
-              <tr><td>14:02:44</td><td>LINE-L23</td><td>负载率升高</td><td><span class="tag warn">关注</span></td></tr>
-              <tr><td>14:01:21</td><td>GEN-G02</td><td>出力指令更新</td><td><span class="tag">正常</span></td></tr>
-              <tr><td>14:00:08</td><td>CASE-01</td><td>潮流迭代收敛</td><td><span class="tag">正常</span></td></tr>
-            </tbody>
-          </table>
-        </article>
-
-        <article class="card control-card">
-          <div class="section-title">
-            <h2>运行摘要</h2>
-            <span>SIMU</span>
-          </div>
-          <div class="control-list" id="simu-summary">
-            <div class="control-item"><span>模型文件</span><strong>real.e</strong></div>
-            <div class="control-item"><span>计算模式</span><strong>AC/DC Hybrid</strong></div>
-            <div class="control-item"><span>当前断面</span><strong>Case-20260507</strong></div>
-            <div class="control-item"><span>刷新周期</span><strong>2 s</strong></div>
-            <div class="control-item"><span>收敛状态</span><strong style="color:var(--green)">正常</strong></div>
-          </div>
-        </article>
+          <section class="control-bar">
+            <h2>状态事件</h2>
+            <div class="event-list" id="simu-alarms"></div>
+          </section>
+        </aside>
       </section>
     </main>
   </div>
 
   <script>
     const clock = document.getElementById("clock");
-    const metricTargets = {
-      "仿真步长": '[data-live="step"]',
-      "总有功负荷": '[data-live="load"]',
-      "平均电压": '[data-live="voltage"]',
-      "事件队列": '[data-live="events"]'
+    const colors = {
+      "风速": "#36d7ff",
+      "温度": "#ffd166",
+      "太阳辐射": "#41e39b",
+      "负荷": "#4f8cff"
     };
 
-    function metricHtml(item) {
-      return item.value + ' <span class="unit">' + item.unit + '</span>';
+    function updateClock() {
+      clock.textContent = new Date().toLocaleString("zh-CN", { hour12: false });
     }
 
-    function renderMetrics(metrics) {
-      for (const item of metrics || []) {
-        const selector = metricTargets[item.label];
-        if (selector) document.querySelector(selector).innerHTML = metricHtml(item);
+    function pointValueAt(points, cursorHour) {
+      if (!points || points.length === 0) return "--";
+      let best = points[0];
+      for (const point of points) {
+        if (Math.abs(Number(point.hour) - cursorHour) < Math.abs(Number(best.hour) - cursorHour)) best = point;
       }
+      return best.value;
     }
 
-    function renderBars(items) {
-      const host = document.getElementById("simu-bars");
-      host.innerHTML = (items || []).map((item) => {
-        const width = item.unit === "%" ? Number(item.value) : Math.min(100, Number(item.value) * 64);
-        return '<div class="bar-row"><span>' + item.label + '</span><div class="track"><div class="fill" style="width:' + width + '%"></div></div><span>' + item.value + item.unit + '</span></div>';
-      }).join("");
+    function renderCurve(curve, state) {
+      const width = 900;
+      const height = 100;
+      const padX = 36;
+      const padY = 18;
+      const points = curve.points || [];
+      const values = points.map((p) => Number(p.value));
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = max - min || 1;
+      const xOf = (hour) => padX + (Number(hour) / 23) * (width - padX * 2);
+      const yOf = (value) => height - padY - ((Number(value) - min) / span) * (height - padY * 2);
+      const path = points.map((p, index) => (index ? "L" : "M") + xOf(p.hour).toFixed(1) + " " + yOf(p.value).toFixed(1)).join(" ");
+      const area = path + " L " + xOf(23).toFixed(1) + " " + (height - padY) + " L " + xOf(0).toFixed(1) + " " + (height - padY) + " Z";
+      const cursorX = padX + ((state.cursor_hour || 0) / 24) * (width - padX * 2);
+      const currentValue = pointValueAt(points, Number(state.cursor_hour || 0));
+      const currentY = yOf(currentValue);
+      const color = colors[curve.name] || "#36d7ff";
+
+      return '<article class="curve-card">' +
+        '<div class="curve-head"><h2>' + curve.name + '</h2><span>当前 ' + currentValue + ' ' + curve.unit + '</span></div>' +
+        '<div class="curve-body"><svg class="curve-svg" viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">' +
+        '<line class="axis" x1="' + padX + '" y1="' + (height - padY) + '" x2="' + (width - padX) + '" y2="' + (height - padY) + '"></line>' +
+        '<line class="axis" x1="' + padX + '" y1="' + padY + '" x2="' + padX + '" y2="' + (height - padY) + '"></line>' +
+        '<text class="tick-label" x="' + padX + '" y="96">0h</text><text class="tick-label" x="' + (width / 2 - 12) + '" y="96">12h</text><text class="tick-label" x="' + (width - padX - 24) + '" y="96">24h</text>' +
+        '<path class="curve-area" d="' + area + '" style="fill:' + color + '18"></path>' +
+        '<path class="curve-line" d="' + path + '" style="stroke:' + color + '"></path>' +
+        '<line class="cursor-line" x1="' + cursorX + '" y1="' + padY + '" x2="' + cursorX + '" y2="' + (height - padY) + '"></line>' +
+        '<circle class="cursor-dot" cx="' + cursorX + '" cy="' + currentY + '" r="5"></circle>' +
+        '<text class="cursor-label" x="' + Math.min(cursorX + 8, width - 72) + '" y="' + Math.max(currentY - 8, 14) + '">' + state.sim_time + '</text>' +
+        '</svg></div></article>';
+    }
+
+    function renderState(state) {
+      document.getElementById("sim-time").textContent = state.sim_time || "00:00";
+      document.getElementById("sim-speed").textContent = Number(state.speed || 1).toFixed(2) + "x";
+      document.getElementById("cursor-hour").textContent = Number(state.cursor_hour || 0).toFixed(2) + " h";
+      const status = document.getElementById("sim-status");
+      status.textContent = state.status || "STOPPED";
+      status.className = state.status === "RUNNING" ? "running" : "stopped";
+      document.getElementById("side-status").textContent = status.textContent;
     }
 
     function renderAlarms(items) {
       document.getElementById("simu-alarms").innerHTML = (items || []).map((item) => {
         const warn = item.status === "关注" ? " warn" : "";
-        return '<tr><td>' + item.time + '</td><td>' + item.object + '</td><td>' + item.message + '</td><td><span class="tag' + warn + '">' + item.status + '</span></td></tr>';
+        return '<div class="event-row"><span>' + item.time + '</span><div><strong>' + item.object + '</strong><br>' + item.message + '<br><span class="tag' + warn + '">' + item.status + '</span></div></div>';
       }).join("");
-    }
-
-    function renderSummary(items) {
-      document.getElementById("simu-summary").innerHTML = (items || []).map((item) => {
-        const color = item.value === "正常" ? ' style="color:var(--green)"' : "";
-        return '<div class="control-item"><span>' + item.label + '</span><strong' + color + '>' + item.value + '</strong></div>';
-      }).join("");
-    }
-
-    function renderTopology(items) {
-      for (const item of items || []) {
-        const node = document.querySelector('[data-bus="' + item.id + '"]');
-        if (!node) continue;
-        node.className = "bus " + (item.status === "ok" ? "ok" : item.status === "warn" ? "warn" : "");
-        node.textContent = item.id + " " + item.value;
-      }
     }
 
     async function loadBackendData() {
       const response = await fetch("/api/simu", { cache: "no-store" });
       if (!response.ok) throw new Error("SIMU API unavailable");
       const data = await response.json();
-      renderMetrics(data.metrics);
-      renderBars(data.charts && data.charts.bars);
+      const state = data.state || {};
+      renderState(state);
+      document.getElementById("curve-stack").innerHTML = ((data.charts && data.charts.daily) || []).map((curve) => renderCurve(curve, state)).join("");
       renderAlarms(data.alarms);
-      renderSummary(data.summary);
-      renderTopology(data.topology);
     }
-    function tick() {
-      const now = new Date();
-      clock.textContent = now.toLocaleString("zh-CN", { hour12: false });
-      loadBackendData().catch(() => {
-      const load = 482 + Math.random() * 10;
-      const voltage = 1.006 + Math.random() * 0.014;
-      const events = 5 + Math.floor(Math.random() * 5);
-      document.querySelector('[data-live="load"]').innerHTML = load.toFixed(1) + ' <span class="unit">MW</span>';
-      document.querySelector('[data-live="voltage"]').innerHTML = voltage.toFixed(3) + ' <span class="unit">p.u.</span>';
-      document.querySelector('[data-live="events"]').innerHTML = events + ' <span class="unit">条</span>';
+
+    async function sendAction(action) {
+      await fetch("/api/simu/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action })
       });
+      await loadBackendData();
     }
+
+    for (const button of document.querySelectorAll("[data-action]")) {
+      button.addEventListener("click", () => sendAction(button.dataset.action));
+    }
+
+    async function tick() {
+      updateClock();
+      await loadBackendData().catch(() => {});
+    }
+
     tick();
     setInterval(tick, 2000);
   </script>
