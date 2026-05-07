@@ -1,11 +1,50 @@
 import logging
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from agc import agc_ctrl
 
 
 class AGCControlTest(unittest.TestCase):
+    def test_export_control_results_writes_dev_ctrl_e(self):
+        output = Path("tmp_test/agc_unit_dev_ctrl.e")
+        output.parent.mkdir(exist_ok=True)
+        if output.exists():
+            output.unlink()
+        self.addCleanup(lambda: output.exists() and output.unlink())
+
+        model = SimpleNamespace(
+            wind_generator=[
+                SimpleNamespace(id=1, name="wind", p_ctrl=12.5),
+            ],
+            pv_generator=[
+                SimpleNamespace(id=2, name="pv", p_ctrl=7.5),
+            ],
+            estorage=[
+                SimpleNamespace(id=3, name="storage", p_ctrl=-4.0),
+            ],
+            diesel_generator=[
+                SimpleNamespace(id=4, name="diesel", p_ctrl=80.0),
+            ],
+            yt=[
+                SimpleNamespace(id=5, name="hydrogen", rtu=3, pnt=3, ctrl_value=6.0),
+            ],
+            agc_balance_mismatch=1.25,
+        )
+
+        agc_ctrl.export_control_results(model, output)
+
+        text = output.read_text(encoding="utf-8")
+        self.assertIn("<dev_ctrl>", text)
+        self.assertIn("# wind_generator 1 wind 12.500000", text)
+        self.assertIn("# pv_generator 2 pv 7.500000", text)
+        self.assertIn("# estorage 3 storage -4.000000", text)
+        self.assertIn("# diesel_generator 4 diesel 80.000000", text)
+        self.assertIn("<yt_ctrl>", text)
+        self.assertIn("# 5 hydrogen 3 3 6.000000", text)
+        self.assertIn("# agc_balance_mismatch 1.250000", text)
+
     def test_device_p_step_overrides_global_default(self):
         model = SimpleNamespace(para=[])
         device = SimpleNamespace(p_ctrl=0.0, p_cur=0.0, p_step=7.0)

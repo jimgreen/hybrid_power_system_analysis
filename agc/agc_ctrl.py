@@ -19,6 +19,7 @@ from efile_read import EBook, efile_factory
 
 DEFAULT_MODEL_FILE = AGC_DIR / "model_real.e"
 DEFAULT_LOG_DIR = ROOT_DIR / "log"
+DEFAULT_CTRL_OUTPUT_FILE = ROOT_DIR / "dev_ctrl.e"
 DEFAULT_CTRL_TRIGGER = 60
 DEFAULT_GATHER_TRIGGER = 10
 DEFAULT_BALANCE_DEADBAND = 1e-3
@@ -44,6 +45,7 @@ class SystemConfig:
         ctrl_trigger: int = DEFAULT_CTRL_TRIGGER,
         gather_trigger: int = DEFAULT_GATHER_TRIGGER,
         log_file: Optional[Path] = None,
+        ctrl_output_file: Optional[Path] = DEFAULT_CTRL_OUTPUT_FILE,
         fes_client: Optional[FesClient] = None,
     ):
         self.model = model
@@ -53,6 +55,7 @@ class SystemConfig:
         self.is_running = True
         self.control_count = 0
         self.gather_count = 0
+        self.ctrl_output_file = None if ctrl_output_file is None else Path(ctrl_output_file)
         self.logger = self._setup_logger(log_file or _default_log_file())
 
     @staticmethod
@@ -79,6 +82,7 @@ class SystemConfig:
         return logger
 
     def send_yt_cmd(self, yt, value: float) -> None:
+        yt.ctrl_value = float(value)
         self.logger.info("下发遥调指令 %s rtu=%s pnt=%s value=%s", yt.name, yt.rtu, yt.pnt, value)
 
 
@@ -164,13 +168,20 @@ def get_para_str(model, name: str, default: str) -> str:
 def initialize_system(
     emodel,
     log_file: Optional[Path] = None,
+    ctrl_output_file: Optional[Path] = DEFAULT_CTRL_OUTPUT_FILE,
     ctrl_trigger: Optional[int] = None,
     gather_trigger: Optional[int] = None,
 ) -> SystemConfig:
     """Initialize device links and runtime config."""
     ctrl = ctrl_trigger if ctrl_trigger is not None else get_para_int(emodel, "CTRL_TRIGGER", DEFAULT_CTRL_TRIGGER)
     gather = gather_trigger if gather_trigger is not None else get_para_int(emodel, "GATHER_TRIGGER", DEFAULT_GATHER_TRIGGER)
-    config = SystemConfig(emodel, ctrl_trigger=ctrl, gather_trigger=gather, log_file=log_file)
+    config = SystemConfig(
+        emodel,
+        ctrl_trigger=ctrl,
+        gather_trigger=gather,
+        log_file=log_file,
+        ctrl_output_file=ctrl_output_file,
+    )
     emodel.config = config
     yc_by_id = _build_id_map(getattr(emodel, "yc", []))
     yx_by_id = _build_id_map(getattr(emodel, "yx", []))
@@ -331,6 +342,70 @@ def _controlled_power_mismatch(model) -> float:
         + _sum_attr(getattr(model, "estorage", []), "p_ctrl")
     )
     return load - generation
+
+
+def _format_float(value) -> str:
+    return f"{_as_float(value):.6f}"
+
+
+def _dev_ctrl_rows(model) -> Iterable[Tuple[str, object]]:
+    for dev_type, devices in (
+        ("wind_generator", getattr(model, "wind_generator", [])),
+        ("pv_generator", getattr(model, "pv_generator", [])),
+        ("estorage", getattr(model, "estorage", [])),
+        ("diesel_generator", getattr(model, "diesel_generator", [])),
+    ):
+        for device in devices:
+            yield dev_type, device
+
+
+def export_control_results(model, output_file: Path) -> None:
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "<dev_ctrl>",
+        "@ dev_type id name p_ctrl",
+    ]
+    for dev_type, device in _dev_ctrl_rows(model):
+        lines.append(
+            "# "
+            f"{dev_type} "
+            f"{getattr(device, 'id', '')} "
+            f"{getattr(device, 'name', '')} "
+            f"{_format_float(getattr(device, 'p_ctrl', getattr(device, 'p_cur', 0.0)))}"
+        )
+    lines.extend(
+        [
+            "</dev_ctrl>",
+            "",
+            "<yt_ctrl>",
+            "@ id name rtu pnt value",
+        ]
+    )
+    for yt in getattr(model, "yt", []):
+        ctrl_value = getattr(yt, "ctrl_value", None)
+        if ctrl_value is None:
+            continue
+        lines.append(
+            "# "
+            f"{getattr(yt, 'id', '')} "
+            f"{getattr(yt, 'name', '')} "
+            f"{getattr(yt, 'rtu', '')} "
+            f"{getattr(yt, 'pnt', '')} "
+            f"{_format_float(ctrl_value)}"
+        )
+    lines.extend(
+        [
+            "</yt_ctrl>",
+            "",
+            "<agc_result>",
+            "@ name value",
+            f"# agc_balance_mismatch {_format_float(getattr(model, 'agc_balance_mismatch', 0.0))}",
+            "</agc_result>",
+            "",
+        ]
+    )
+    output_file.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _storage_soc_deadband(model, estore) -> float:
@@ -837,6 +912,9 @@ def agc_control_loop(config: SystemConfig, max_control_cycles: Optional[int] = N
                 config.logger.info("[控制周期 %s]", config.control_count)
                 do_one_ctrl(config.logger, config.model)
                 agc_ctrl_stg_check(config.logger, config.model)
+                if config.ctrl_output_file is not None:
+                    export_control_results(config.model, config.ctrl_output_file)
+                    config.logger.info("控制结果已输出: %s", config.ctrl_output_file)
                 config.control_count += 1
                 next_control += config.ctrl_trigger
                 config.logger.info("-" * 60)
@@ -861,6 +939,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AGC control loop for wind/solar/storage/diesel/load coordination.")
     parser.add_argument("--model", default=str(DEFAULT_MODEL_FILE), help="AGC model E file.")
     parser.add_argument("--log-file", default=None, help="Log file path.")
+    parser.add_argument("--ctrl-output", default=str(DEFAULT_CTRL_OUTPUT_FILE), help="Control result E file path. Use empty string to disable.")
     parser.add_argument("--ctrl-trigger", type=int, default=None, help="Control period in seconds. Default uses E file or 60.")
     parser.add_argument("--gather-trigger", type=int, default=None, help="Gather period in seconds. Default uses E file or 10.")
     parser.add_argument("--max-control-cycles", type=int, default=None, help="Stop after N control cycles; useful for tests.")
@@ -871,12 +950,14 @@ def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     model_file = Path(args.model)
     log_file = None if args.log_file is None else Path(args.log_file)
+    ctrl_output_file = None if args.ctrl_output == "" else Path(args.ctrl_output)
     print(f"日志文件: {log_file or _default_log_file()}")
     print("系统启动中...")
     model = load_model(model_file)
     config = initialize_system(
         model,
         log_file=log_file,
+        ctrl_output_file=ctrl_output_file,
         ctrl_trigger=args.ctrl_trigger,
         gather_trigger=args.gather_trigger,
     )

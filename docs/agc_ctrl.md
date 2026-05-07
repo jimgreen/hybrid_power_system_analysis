@@ -226,7 +226,39 @@ agc_balance_mismatch =
 
 若 `abs(agc_balance_mismatch)` 超过默认平衡死区，则策略校验输出告警。
 
-## 10. 当前实现边界
+## 10. 控制结果文件
+
+每个控制周期结束后，控制结果会输出到 E 文件。默认路径为仓库根目录下的 `dev_ctrl.e`，命令行可通过 `--ctrl-output` 指定其他路径；传入空字符串可关闭输出。
+
+输出文件包含三段：
+
+```text
+<dev_ctrl>
+@ dev_type id name p_ctrl
+# wind_generator ...
+# pv_generator ...
+# estorage ...
+# diesel_generator ...
+</dev_ctrl>
+
+<yt_ctrl>
+@ id name rtu pnt value
+# 制氢或燃料电池遥调指令
+</yt_ctrl>
+
+<agc_result>
+@ name value
+# agc_balance_mismatch ...
+</agc_result>
+```
+
+其中：
+
+- `dev_ctrl` 记录风机、光伏、储能、柴发的最终 `p_ctrl`。
+- `yt_ctrl` 记录本周期下发过的制氢或燃料电池遥调指令。
+- `agc_result` 记录最终功率不平衡量。
+
+## 11. 当前实现边界
 
 - 制氢和燃料电池通过名称关键字查找遥调点，不做容量约束建模。
 - 新能源弃电和恢复按设备顺序处理，不做风光内部二次比例分摊。
