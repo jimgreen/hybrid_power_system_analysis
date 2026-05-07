@@ -138,6 +138,7 @@ from ac_array_model import (
     SWITCH_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
+    build_ac_ppc_from_e_file,
 )
 
 
@@ -158,6 +159,22 @@ DCLFReslt = ACLFResult
 
 def _device_key(device) -> str:
     return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
+
+
+def load_ac_ppc_from_e_file(
+    file_name,
+    use_cache: bool = True,
+    copy_arrays: bool = True,
+    include_device_names: bool = True,
+) -> Dict:
+    """Read an AC E file via efile_read-backed array model loading."""
+    return build_ac_ppc_from_e_file(
+        file_name,
+        use_cache=use_cache,
+        copy_arrays=copy_arrays,
+        include_device_names=include_device_names,
+    )
+
 
 _SPARSE_SOLVER = None
 _SPARSE_SOLVER_NAME = None
@@ -521,6 +538,12 @@ class ACPowerFlowCalc:
     def from_ppc(cls, ppc: Dict, **kwargs):
         """Create a solver directly from an AC NumPy ppc dictionary."""
         return cls(ppc, **kwargs)
+
+    @classmethod
+    def from_e_file(cls, file_name, use_cache: bool = True, **kwargs):
+        """Create a solver from an AC E file through the shared efile reader path."""
+        ppc = load_ac_ppc_from_e_file(file_name, use_cache=use_cache, copy_arrays=True)
+        return cls.from_ppc(ppc, **kwargs)
 
     def _cache_node_type_masks(self):
         self._slack_mask = self.node_type == 'SLACK'

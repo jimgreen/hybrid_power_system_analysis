@@ -193,6 +193,28 @@ class ACPPCFlowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ACPowerFlowCalc.from_ppc(ppc, algorithm="bad")
 
+    def test_ac_power_flow_can_load_e_file_through_efile_reader_path(self):
+        import ac_lf
+        from ac_lf import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        original = ac_lf.build_ac_ppc_from_e_file
+        calls = []
+
+        def counted_loader(path, *args, **kwargs):
+            calls.append((Path(path).name, kwargs.get("copy_arrays")))
+            return original(path, *args, **kwargs)
+
+        ac_lf.build_ac_ppc_from_e_file = counted_loader
+        try:
+            calc = ACPowerFlowCalc.from_e_file(case_path, tol=1e-8, max_iter=50)
+        finally:
+            ac_lf.build_ac_ppc_from_e_file = original
+
+        self.assertEqual([("ieee300.e", True)], calls)
+        self.assertTrue(calc.array_mode)
+        self.assertEqual("ac_ppc_v1", calc.ppc["format"])
+
     def test_ac_lf_benchmark_accepts_algorithm_option(self):
         from lfcore import ac_lf_benchmark
 

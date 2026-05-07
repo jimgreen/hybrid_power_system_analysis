@@ -73,6 +73,28 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         np.testing.assert_array_equal(calc.branch_j[:3], np.asarray([1, 2, 3], dtype=np.int32))
         self.assertEqual(9, calc.N_dcdc)
 
+    def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
+        import lfcore.dc_lf as dc_lf
+        from lfcore.dc_lf import DCPowerFlowCalc
+
+        case_path = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        original = dc_lf.build_dc_ppc_from_e_file
+        calls = []
+
+        def counted_loader(path, *args, **kwargs):
+            calls.append((Path(path).name, kwargs.get("copy_arrays")))
+            return original(path, *args, **kwargs)
+
+        dc_lf.build_dc_ppc_from_e_file = counted_loader
+        try:
+            calc = DCPowerFlowCalc.from_e_file(case_path)
+        finally:
+            dc_lf.build_dc_ppc_from_e_file = original
+
+        self.assertEqual([("dc_net_30.e", True)], calls)
+        self.assertTrue(calc.array_mode)
+        self.assertEqual("dc_ppc_v1", calc.ppc["format"])
+
     def test_run_reuses_combined_dc_newton_system_builder(self):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import DCPowerNetwork

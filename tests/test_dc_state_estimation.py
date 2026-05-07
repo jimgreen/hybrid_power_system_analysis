@@ -125,6 +125,30 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual("model.dc_array_model", estimator.network.__class__.__module__)
         self.assertEqual("dc_ppc_v1", estimator.network.ppc["format"])
 
+    def test_dc_network_load_uses_dc_lf_efile_loader(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original = dc_se.load_dc_network_from_e_file
+        calls = []
+
+        def counted_loader(path, *args, **kwargs):
+            calls.append(Path(path).name)
+            return original(path, *args, **kwargs)
+
+        dc_se.load_dc_network_from_e_file = counted_loader
+        try:
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+            )
+        finally:
+            dc_se.load_dc_network_from_e_file = original
+
+        self.assertEqual(["dc_net_30.e"], calls)
+        self.assertEqual("dc_ppc_v1", estimator.network.ppc["format"])
+
     def test_estimator_load_network_skips_topology_check(self):
         import secore.dc_se as dc_se
         from secore.dc_se import DCStateEstimator

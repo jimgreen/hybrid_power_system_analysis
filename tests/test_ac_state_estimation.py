@@ -759,10 +759,9 @@ class ACStateEstimationTest(unittest.TestCase):
 
     def test_ac_network_load_uses_array_model_by_default(self):
         import secore.ac_se
-        import ac_array_model
         from secore.ac_se import ACStateEstimator
 
-        original = ac_array_model.build_ac_ppc_from_e_file
+        original = secore.ac_se.load_ac_ppc_from_e_file
         calls = 0
 
         def counted_factory(path, *args, **kwargs):
@@ -770,16 +769,14 @@ class ACStateEstimationTest(unittest.TestCase):
             calls += 1
             return original(path, *args, **kwargs)
 
-        ac_array_model.build_ac_ppc_from_e_file = counted_factory
-        secore.ac_se.build_ac_ppc_from_e_file = counted_factory
+        secore.ac_se.load_ac_ppc_from_e_file = counted_factory
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
                 meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
             )
         finally:
-            ac_array_model.build_ac_ppc_from_e_file = original
-            secore.ac_se.build_ac_ppc_from_e_file = original
+            secore.ac_se.load_ac_ppc_from_e_file = original
 
         self.assertEqual(1, calls)
         self.assertTrue(estimator.nodes)

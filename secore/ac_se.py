@@ -29,7 +29,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_lf import matpower_branch_stamp, matpower_branch_stamp_vectorized
+from ac_lf import load_ac_ppc_from_e_file, matpower_branch_stamp, matpower_branch_stamp_vectorized
 from ac_model import ACPowerNetwork
 from ac_array_model import (
     BRANCH_COLS,
@@ -49,7 +49,6 @@ from ac_array_model import (
     SWITCH_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
-    build_ac_ppc_from_e_file,
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook
@@ -715,7 +714,7 @@ def _fast_topo_network(network: ACPowerNetwork) -> None:
 
 
 def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
-    ppc = build_ac_ppc_from_e_file(e_file, use_cache=True, copy_arrays=False, include_device_names=True)
+    ppc = load_ac_ppc_from_e_file(e_file, use_cache=True, copy_arrays=False, include_device_names=True)
     network = ACPowerNetwork()
     base = ppc["base"]
     network.p_base = float(base[0])

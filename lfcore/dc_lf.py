@@ -129,10 +129,12 @@ try:
         BREAK_COLS as DC_BREAK_COLS,
         SWITCH_COLS as DC_SWITCH_COLS,
         ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+        build_dc_ppc_from_e_file,
     )
 except Exception:
     DC_BRANCH_COLS = DC_BUS_COLS = DC_DCDC_COLS = DC_GEN_COLS = DC_LOAD_COLS = None
     DC_BREAK_COLS = DC_SWITCH_COLS = DC_ZERO_BRANCH_COLS = None
+    build_dc_ppc_from_e_file = None
     DC_CTRL_P = 0
     DC_CTRL_V = 1
     DC_CTRL_I = 2
@@ -154,6 +156,24 @@ DCLFReslt = DCLFResult
 
 def _device_key(device) -> str:
     return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
+
+
+def load_dc_network_from_e_file(file_name, use_cache: bool = True, run_topo: bool = False):
+    """Read a DC E file via the efile_read-backed array model loader."""
+    from model.dc_array_model import DCPowerNetwork
+
+    network = DCPowerNetwork()
+    network.ppc = build_dc_ppc_from_e_file(file_name, use_cache=use_cache, copy_arrays=True)
+    base = network.ppc["base"]
+    network.p_base = float(base["p_base"])
+    network.p_base_kW = float(base["p_base_kW"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network._load_objects_from_ppc(network.ppc)
+    if run_topo:
+        network.topo()
+    return network
 
 
 _OPTIONAL_SPARSE_SOLVERS = {}
@@ -254,6 +274,12 @@ class DCPowerFlowCalc:
         self.iterations = 0
         self.normF = np.inf
         self.verbose = False
+
+    @classmethod
+    def from_e_file(cls, file_name, use_cache: bool = True, run_topo: bool = False, **kwargs):
+        """Create a solver from a DC E file through the shared efile reader path."""
+        network = load_dc_network_from_e_file(file_name, use_cache=use_cache, run_topo=run_topo)
+        return cls(network, **kwargs)
 
     def _alive_node_lookup_array(self):
         """Return a dense node-id to active solver-position lookup when possible."""

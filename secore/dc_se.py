@@ -13,7 +13,7 @@ for path in (ROOT_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from lfcore.dc_lf import DCPowerFlowCalc
+from lfcore.dc_lf import DCPowerFlowCalc, load_dc_network_from_e_file
 from model.dc_array_model import DCPowerNetwork
 from model.meas_model import (
     BadDataItem,
@@ -692,9 +692,7 @@ class DCStateEstimator:
     @staticmethod
     def _load_network(e_file: Path, params: StateEstimationParameters, run_power_flow: bool = True) -> DCPowerNetwork:
         """Read the DC case and optionally run load flow once to seed the estimator."""
-        network = DCPowerNetwork()
-        network.read_from_file(e_file)
-        network.topo()
+        network = load_dc_network_from_e_file(e_file, use_cache=True, run_topo=True)
         if not run_power_flow:
             return network
 
