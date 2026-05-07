@@ -1,4 +1,5 @@
 import hashlib
+import warnings
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -6,10 +7,12 @@ import numpy as np
 try:
     from scipy.sparse import coo_matrix as SP_COO_MATRIX
     from scipy.sparse import csc_matrix as SP_CSC_MATRIX
+    from scipy.sparse import csr_matrix as SP_CSR_MATRIX
     from scipy.sparse import issparse as SP_ISSPARSE
 except Exception:
     SP_COO_MATRIX = None
     SP_CSC_MATRIX = None
+    SP_CSR_MATRIX = None
     SP_ISSPARSE = None
 
 try:
@@ -18,9 +21,11 @@ except Exception:
     SP_STRUCTURAL_RANK = None
 
 try:
+    from scipy.sparse.linalg import MatrixRankWarning as SP_MATRIX_RANK_WARNING
     from scipy.sparse.linalg import splu as SP_SPLU
     from scipy.sparse.linalg import spsolve as SP_SPSOLVE
 except Exception:
+    SP_MATRIX_RANK_WARNING = None
     SP_SPLU = None
     SP_SPSOLVE = None
 
@@ -50,6 +55,12 @@ ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF
 _NORMAL_EQUATION_PATTERN_CACHE = {}
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
 _SPARSE_PATTERN_LINEAR_INDEX_CACHE = {}
+
+
+def _as_array_dtype(values, dtype):
+    if isinstance(values, np.ndarray) and values.dtype == dtype:
+        return values
+    return np.asarray(values, dtype=dtype)
 
 
 def angle_residual_mask(measurements: Sequence[object]) -> np.ndarray:
@@ -93,20 +104,82 @@ class SparseJacobianBuilder:
     def __init__(self, shape: Tuple[int, int]):
         self.shape = tuple(int(item) for item in shape)
         self.size = self.shape[0] * self.shape[1]
-        self.rows: List[int] = []
-        self.cols: List[int] = []
-        self.data: List[float] = []
-        self._row_chunks: List[np.ndarray] = []
-        self._col_chunks: List[np.ndarray] = []
-        self._data_chunks: List[np.ndarray] = []
+        self._cached_pattern_linear: Optional[np.ndarray] = None
+        self._cached_pattern_indptr: Optional[np.ndarray] = None
+        self._cached_pattern_indices: Optional[np.ndarray] = None
+        self._cached_slot_positions: Optional[np.ndarray] = None
+        self._cached_unique_slot_mask: Optional[np.ndarray] = None
+        self._cached_duplicate_slot_mask: Optional[np.ndarray] = None
+        self._cached_unique_slots: Optional[np.ndarray] = None
+        self._cached_unique_data_positions: Optional[np.ndarray] = None
+        self._cached_duplicate_slots: Optional[np.ndarray] = None
+        self._cached_duplicate_data_positions: Optional[np.ndarray] = None
+        self._cached_chunk_slices: Optional[List[Tuple[int, int]]] = None
+        self._cached_has_unique_slots = False
+        self._cached_has_duplicate_slots = False
+        self._cached_csr_data: Optional[np.ndarray] = None
+        self._data_buffer: Optional[np.ndarray] = None
+        self._assume_fixed_pattern = False
+        self.reset()
+
+    def _set_cached_slot_positions(self, slot: np.ndarray) -> None:
+        self._cached_slot_positions = slot
+        self._cached_chunk_slices = self._current_chunk_slices()
+        if slot.size == 0:
+            self._cached_unique_slot_mask = np.array([], dtype=bool)
+            self._cached_duplicate_slot_mask = np.array([], dtype=bool)
+            self._cached_unique_slots = np.array([], dtype=np.int64)
+            self._cached_unique_data_positions = np.array([], dtype=np.int64)
+            self._cached_duplicate_slots = np.array([], dtype=np.int64)
+            self._cached_duplicate_data_positions = np.array([], dtype=np.int64)
+            self._cached_has_unique_slots = False
+            self._cached_has_duplicate_slots = False
+            return
+        counts = np.bincount(slot, minlength=int(slot.max()) + 1)
+        self._cached_unique_slot_mask = counts[slot] == 1
+        self._cached_duplicate_slot_mask = ~self._cached_unique_slot_mask
+        self._cached_has_unique_slots = bool(np.any(self._cached_unique_slot_mask))
+        self._cached_has_duplicate_slots = bool(np.any(self._cached_duplicate_slot_mask))
+        if self._cached_has_unique_slots:
+            self._cached_unique_data_positions = np.nonzero(self._cached_unique_slot_mask)[0].astype(np.int64, copy=False)
+            self._cached_unique_slots = slot[self._cached_unique_data_positions]
+        else:
+            self._cached_unique_data_positions = np.array([], dtype=np.int64)
+            self._cached_unique_slots = np.array([], dtype=np.int64)
+        if self._cached_has_duplicate_slots:
+            self._cached_duplicate_data_positions = np.nonzero(self._cached_duplicate_slot_mask)[0].astype(
+                np.int64,
+                copy=False,
+            )
+            self._cached_duplicate_slots = slot[self._cached_duplicate_data_positions]
+        else:
+            self._cached_duplicate_data_positions = np.array([], dtype=np.int64)
+            self._cached_duplicate_slots = np.array([], dtype=np.int64)
+
+    def _current_chunk_slices(self) -> List[Tuple[int, int]]:
+        slices: List[Tuple[int, int]] = []
+        cursor = len(self.data)
+        for chunk in self._data_chunks:
+            size = int(chunk.size)
+            slices.append((cursor, cursor + size))
+            cursor += size
+        return slices
+
+    def reset(self) -> None:
+        self.rows = []
+        self.cols = []
+        self.data = []
+        self._row_chunks = []
+        self._col_chunks = []
+        self._data_chunks = []
 
     def _append_arrays(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray) -> None:
         """Keep vectorized writes as NumPy chunks until final COO/CSR construction."""
         if rows.size == 0:
             return
-        rows = np.asarray(rows, dtype=np.int32)
-        cols = np.asarray(cols, dtype=np.int32)
-        values = np.asarray(values, dtype=np.float64)
+        rows = _as_array_dtype(rows, np.int32)
+        cols = _as_array_dtype(cols, np.int32)
+        values = _as_array_dtype(values, np.float64)
         mask = cols >= 0
         if not mask.any():
             return
@@ -120,25 +193,88 @@ class SparseJacobianBuilder:
         self._data_chunks.append(values[mask].astype(np.float64, copy=False))
 
     def _coo_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        row_parts = []
-        col_parts = []
-        data_parts = []
-        if self.rows:
-            row_parts.append(np.asarray(self.rows, dtype=np.int32))
-            col_parts.append(np.asarray(self.cols, dtype=np.int32))
-            data_parts.append(np.asarray(self.data, dtype=np.float64))
-        row_parts.extend(self._row_chunks)
-        col_parts.extend(self._col_chunks)
-        data_parts.extend(self._data_chunks)
-        if not row_parts:
+        if not self.rows and not self._row_chunks:
             return (
                 np.array([], dtype=np.int32),
                 np.array([], dtype=np.int32),
                 np.array([], dtype=np.float64),
             )
-        if len(row_parts) == 1:
-            return row_parts[0], col_parts[0], data_parts[0]
-        return np.concatenate(row_parts), np.concatenate(col_parts), np.concatenate(data_parts)
+        scalar_count = len(self.rows)
+        chunk_sizes = [int(chunk.size) for chunk in self._row_chunks]
+        total_count = scalar_count + sum(chunk_sizes)
+        if total_count == 0:
+            return (
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.float64),
+            )
+        out_rows = np.empty(total_count, dtype=np.int32)
+        out_cols = np.empty(total_count, dtype=np.int32)
+        out_data = np.empty(total_count, dtype=np.float64)
+        cursor = 0
+        if scalar_count:
+            end = scalar_count
+            out_rows[:end] = np.asarray(self.rows, dtype=np.int32)
+            out_cols[:end] = np.asarray(self.cols, dtype=np.int32)
+            out_data[:end] = np.asarray(self.data, dtype=np.float64)
+            cursor = end
+        for rows, cols, data, size in zip(self._row_chunks, self._col_chunks, self._data_chunks, chunk_sizes):
+            if size == 0:
+                continue
+            end = cursor + size
+            out_rows[cursor:end] = rows
+            out_cols[cursor:end] = cols
+            out_data[cursor:end] = data
+            cursor = end
+        if cursor != total_count:
+            return out_rows[:cursor], out_cols[:cursor], out_data[:cursor]
+        return out_rows, out_cols, out_data
+
+    def _data_array(self) -> np.ndarray:
+        if not self.data and not self._data_chunks:
+            return np.array([], dtype=np.float64)
+        scalar_count = len(self.data)
+        chunk_sizes = [int(chunk.size) for chunk in self._data_chunks]
+        total_count = scalar_count + sum(chunk_sizes)
+        if self._data_buffer is None or self._data_buffer.size < total_count:
+            self._data_buffer = np.empty(total_count, dtype=np.float64)
+        out_data = self._data_buffer
+        cursor = 0
+        if scalar_count:
+            out_data[:scalar_count] = np.asarray(self.data, dtype=np.float64)
+            cursor = scalar_count
+        for data, size in zip(self._data_chunks, chunk_sizes):
+            if size == 0:
+                continue
+            end = cursor + size
+            out_data[cursor:end] = data
+            cursor = end
+        if cursor != total_count:
+            return out_data[:cursor]
+        return out_data[:total_count]
+
+    def _refresh_fixed_pattern_values(self, values: np.ndarray) -> None:
+        values.fill(0.0)
+        scalar_count = len(self.data)
+        if scalar_count:
+            scalar_values = np.asarray(self.data, dtype=np.float64)
+            np.add.at(values, self._cached_slot_positions[:scalar_count], scalar_values)
+        chunk_slices = self._cached_chunk_slices
+        if chunk_slices is None or len(chunk_slices) != len(self._data_chunks):
+            data = self._data_array()
+            unique_mask = self._cached_unique_slot_mask
+            if unique_mask is None or unique_mask.size != self._cached_slot_positions.size:
+                np.add.at(values, self._cached_slot_positions, data)
+                return
+            if self._cached_has_unique_slots:
+                values[self._cached_unique_slots] = data[self._cached_unique_data_positions]
+            if self._cached_has_duplicate_slots:
+                np.add.at(values, self._cached_duplicate_slots, data[self._cached_duplicate_data_positions])
+            return
+        for chunk, (start, end) in zip(self._data_chunks, chunk_slices):
+            if start == end:
+                continue
+            np.add.at(values, self._cached_slot_positions[start:end], chunk)
 
     def __getitem__(self, key):
         row_key, col_key = key
@@ -171,6 +307,14 @@ class SparseJacobianBuilder:
                 )
             return
 
+        if np.isscalar(row_key) and np.isscalar(col_key) and np.isscalar(value):
+            col = int(col_key)
+            if col >= 0:
+                self.rows.append(int(row_key))
+                self.cols.append(col)
+                self.data.append(float(value))
+            return
+
         rows = np.asarray(row_key)
         cols = np.asarray(col_key)
         values = np.asarray(value, dtype=np.float64)
@@ -189,9 +333,9 @@ class SparseJacobianBuilder:
             self.data.append(float(value))
 
     def add_many(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray, mask: np.ndarray = None) -> None:
-        rows = np.asarray(rows, dtype=np.int32)
-        cols = np.asarray(cols, dtype=np.int32)
-        values = np.asarray(values, dtype=np.float64)
+        rows = _as_array_dtype(rows, np.int32)
+        cols = _as_array_dtype(cols, np.int32)
+        values = _as_array_dtype(values, np.float64)
         if mask is None:
             mask = cols >= 0
         else:
@@ -207,13 +351,55 @@ class SparseJacobianBuilder:
             self._data_chunks.append(values[mask].astype(np.float64, copy=False))
 
     def to_csr(self):
+        if self._assume_fixed_pattern and self._cached_slot_positions is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
+            if self._cached_csr_data is None or self._cached_csr_data.size != self._cached_pattern_linear.size:
+                self._cached_csr_data = np.zeros(self._cached_pattern_linear.size, dtype=np.float64)
+            values = self._cached_csr_data
+            self._refresh_fixed_pattern_values(values)
+            return SP_CSR_MATRIX(
+                (values, self._cached_pattern_indices, self._cached_pattern_indptr),
+                shape=self.shape,
+                copy=False,
+            )
         rows, cols, data = self._coo_arrays()
         if SP_COO_MATRIX is None:
             dense = np.zeros(self.shape, dtype=np.float64)
             if rows.size:
                 np.add.at(dense, (rows, cols), data)
             return dense
-        return SP_COO_MATRIX((data, (rows, cols)), shape=self.shape).tocsr()
+        if self._cached_pattern_linear is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
+            n_cols = int(self.shape[1])
+            linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
+            slot = np.searchsorted(self._cached_pattern_linear, linear)
+            if slot.size and int(slot.max()) < self._cached_pattern_linear.size and np.array_equal(
+                self._cached_pattern_linear[slot],
+                linear,
+            ):
+                self._set_cached_slot_positions(slot)
+                values = np.zeros(self._cached_pattern_linear.size, dtype=np.float64)
+                np.add.at(values, slot, data)
+                return SP_CSR_MATRIX(
+                    (values, self._cached_pattern_indices, self._cached_pattern_indptr),
+                    shape=self.shape,
+                    copy=False,
+                )
+        csr = SP_COO_MATRIX((data, (rows, cols)), shape=self.shape).tocsr(copy=False)
+        if SP_CSR_MATRIX is not None:
+            indptr = csr.indptr.astype(np.int32, copy=True)
+            indices = csr.indices.astype(np.int32, copy=True)
+            pattern_rows = np.repeat(np.arange(self.shape[0], dtype=np.int64), np.diff(indptr).astype(np.int64, copy=False))
+            pattern_linear = pattern_rows * np.int64(self.shape[1]) + indices.astype(np.int64, copy=False)
+            self._cached_pattern_linear = pattern_linear
+            self._cached_pattern_indptr = indptr
+            self._cached_pattern_indices = indices
+            if self._assume_fixed_pattern:
+                n_cols = int(self.shape[1])
+                linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
+                slot = np.searchsorted(pattern_linear, linear)
+                if slot.size and int(slot.max()) < pattern_linear.size and np.array_equal(pattern_linear[slot], linear):
+                    self._set_cached_slot_positions(slot)
+                    self._cached_csr_data = csr.data
+        return csr
 
 
 def is_sparse_matrix(matrix) -> bool:
@@ -272,27 +458,27 @@ def _expand_sparse_matrix_to_pattern(matrix, pattern):
     ):
         return matrix_csc
 
-    matrix_digest = hashlib.blake2b(
-        matrix_csc.indptr.tobytes() + matrix_csc.indices.tobytes(),
-        digest_size=16,
-    ).digest()
-    key = (
-        id(pattern_csc),
-        int(matrix_csc.nnz),
-        matrix_digest,
-    )
-    target_positions = _SPARSE_PATTERN_EXPANSION_CACHE.get(key)
-    if target_positions is None:
+    pattern_key = id(pattern_csc)
+    cache = _SPARSE_PATTERN_EXPANSION_CACHE.get(pattern_key)
+    if (
+        cache is not None
+        and cache["shape"] == matrix_csc.shape
+        and cache["nnz"] == int(matrix_csc.nnz)
+        and np.array_equal(cache["indptr"], matrix_csc.indptr)
+        and np.array_equal(cache["indices"], matrix_csc.indices)
+    ):
+        target_positions = cache["target_positions"]
+    else:
         n_rows = int(pattern_csc.shape[0])
-        pattern_key = (id(pattern_csc), pattern_csc.shape, int(pattern_csc.nnz))
-        pattern_linear = _SPARSE_PATTERN_LINEAR_INDEX_CACHE.get(pattern_key)
+        pattern_cache_key = (id(pattern_csc), pattern_csc.shape, int(pattern_csc.nnz))
+        pattern_linear = _SPARSE_PATTERN_LINEAR_INDEX_CACHE.get(pattern_cache_key)
         if pattern_linear is None:
             pattern_counts = np.diff(pattern_csc.indptr).astype(np.int64, copy=False)
             pattern_cols = np.repeat(np.arange(int(pattern_csc.shape[1]), dtype=np.int64), pattern_counts)
             pattern_linear = pattern_cols * n_rows + pattern_csc.indices.astype(np.int64, copy=False)
             if len(_SPARSE_PATTERN_LINEAR_INDEX_CACHE) > 16:
                 _SPARSE_PATTERN_LINEAR_INDEX_CACHE.clear()
-            _SPARSE_PATTERN_LINEAR_INDEX_CACHE[pattern_key] = pattern_linear
+            _SPARSE_PATTERN_LINEAR_INDEX_CACHE[pattern_cache_key] = pattern_linear
         matrix_counts = np.diff(matrix_csc.indptr).astype(np.int64, copy=False)
         matrix_cols = np.repeat(np.arange(int(matrix_csc.shape[1]), dtype=np.int64), matrix_counts)
         matrix_linear = matrix_cols * n_rows + matrix_csc.indices.astype(np.int64, copy=False)
@@ -300,10 +486,13 @@ def _expand_sparse_matrix_to_pattern(matrix, pattern):
             np.int64,
             copy=False,
         )
-        if len(_SPARSE_PATTERN_EXPANSION_CACHE) > 32:
-            _SPARSE_PATTERN_EXPANSION_CACHE.clear()
-        _SPARSE_PATTERN_EXPANSION_CACHE[key] = target_positions
-
+        _SPARSE_PATTERN_EXPANSION_CACHE[pattern_key] = {
+            "shape": matrix_csc.shape,
+            "nnz": int(matrix_csc.nnz),
+            "indptr": matrix_csc.indptr.copy(),
+            "indices": matrix_csc.indices.copy(),
+            "target_positions": target_positions,
+        }
     data = np.zeros(int(pattern_csc.nnz), dtype=np.float64)
     data[target_positions] = matrix_csc.data
     return SP_CSC_MATRIX((data, pattern_csc.indices, pattern_csc.indptr), shape=pattern_csc.shape, copy=False)
@@ -540,10 +729,11 @@ def solve_normal_equations(gain: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 class NormalEquationSolver:
     """Solve repeated normal equations, reusing CHOLMOD symbolic analysis when available."""
 
-    def __init__(self):
+    def __init__(self, assume_fixed_pattern: bool = False):
         self._cholmod_factor = None
         self._cholmod_pattern = None
         self._cholmod_disabled = False
+        self.assume_fixed_pattern = bool(assume_fixed_pattern)
 
     @staticmethod
     def _sparse_pattern(matrix) -> Tuple[Tuple[int, int], int, np.ndarray, np.ndarray]:
@@ -570,9 +760,12 @@ class NormalEquationSolver:
 
     def _solve_sparse_cholmod(self, gain_csc, rhs: np.ndarray):
         if CHOLMOD_ANALYZE is not None:
-            if not self._same_sparse_pattern(self._cholmod_pattern, gain_csc):
+            if self._cholmod_factor is None or (
+                not self.assume_fixed_pattern and not self._same_sparse_pattern(self._cholmod_pattern, gain_csc)
+            ):
                 self._cholmod_factor = CHOLMOD_ANALYZE(gain_csc)
-                self._cholmod_pattern = self._sparse_pattern(gain_csc)
+                if not self.assume_fixed_pattern:
+                    self._cholmod_pattern = self._sparse_pattern(gain_csc)
             self._cholmod_factor.cholesky_inplace(gain_csc)
             return self._cholmod_factor(rhs), None
         if CHOLMOD_CHOLESKY is not None:
@@ -620,7 +813,13 @@ def _solve_normal_equations_no_cholmod(
             pass
     if SP_SPSOLVE is not None:
         try:
-            return SP_SPSOLVE(gain_csc, rhs), None
+            if SP_MATRIX_RANK_WARNING is None:
+                dx = SP_SPSOLVE(gain_csc, rhs)
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SP_MATRIX_RANK_WARNING)
+                    dx = SP_SPSOLVE(gain_csc, rhs)
+            return dx, None
         except Exception:
             pass
     return _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
@@ -671,6 +870,7 @@ def build_normal_equations(
     weights_are_uniform: Optional[bool] = None,
     weighted_residual: Optional[np.ndarray] = None,
     normal_pattern=None,
+    assume_normal_pattern_matches: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build WLS normal equations while avoiding WH allocation for uniform weights."""
     if is_sparse_matrix(H):
@@ -704,9 +904,12 @@ def build_normal_equations(
                 gain = H.T @ weighted_H
                 rhs = H.T @ weighted_residual
         if is_sparse_matrix(gain):
-            if normal_pattern is None:
-                normal_pattern = _normal_equation_structural_pattern(H)
-            gain = _expand_sparse_matrix_to_pattern(gain, normal_pattern)
+            if assume_normal_pattern_matches:
+                gain = gain.tocsc() if getattr(gain, "format", None) != "csc" else gain
+            else:
+                if normal_pattern is None:
+                    normal_pattern = _normal_equation_structural_pattern(H)
+                gain = _expand_sparse_matrix_to_pattern(gain, normal_pattern)
             gain = gain.toarray() if gain.shape[0] <= dense_gain_limit else gain.tocsc()
         return gain, np.asarray(rhs, dtype=np.float64).ravel()
 

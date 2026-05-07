@@ -184,8 +184,26 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
     idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
     measurements = []
     append_measurement = measurements.append
-    table_rows = []
-    append_table_row = table_rows.append
+    idx_values = []
+    name_values = []
+    device_type_values = []
+    device_name_values = []
+    meas_type_values = []
+    weight_values = []
+    valid_values = []
+    value_values = []
+    device_type_code_values = []
+    angle_mask_values = []
+    append_idx = idx_values.append
+    append_name = name_values.append
+    append_device_type = device_type_values.append
+    append_device_name = device_name_values.append
+    append_meas_type = meas_type_values.append
+    append_weight = weight_values.append
+    append_valid = valid_values.append
+    append_value = value_values.append
+    append_device_type_code = device_type_code_values.append
+    append_angle_mask = angle_mask_values.append
     new_measurement = measurement_cls.__new__
     int_cell = int
     float_cell = float
@@ -227,25 +245,34 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                 if header is None or column_index is None:
                     raise RuntimeError(f"{file_name} Measurement data appears before the header")
                 if standard_header:
-                    row = raw_line.split()
-                    if len(row) < header_len + 1:
+                    row = raw_line[1:].split(maxsplit=7)
+                    if len(row) < header_len:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
-                    idx_text = row[1]
-                    name = row[2]
-                    device_type = row[3]
-                    device_name = row[4]
-                    meas_type = row[5]
-                    weight_text = row[6]
-                    valid_text = row[7]
-                    value_text = row[8]
-                    if meas_type and "a" <= meas_type[0] <= "z":
-                        meas_type = meas_type.upper()
+                    idx_text = row[0]
+                    name = row[1]
+                    raw_device_type = row[2]
+                    device_type = device_type_cache.get(raw_device_type)
+                    if device_type is None:
+                        device_type = raw_device_type
+                        device_type_cache[raw_device_type] = device_type
+                    device_name = row[3]
+                    raw_meas_type = row[4]
+                    meas_type = measurement_type_cache.get(raw_meas_type)
+                    if meas_type is None:
+                        if raw_meas_type and "a" <= raw_meas_type[0] <= "z":
+                            meas_type = raw_meas_type.upper()
+                        else:
+                            meas_type = raw_meas_type
+                        measurement_type_cache[raw_meas_type] = meas_type
+                    weight_text = row[5]
+                    valid_text = row[6]
+                    value_text = row[7]
                     idx = int_cell(idx_text)
                     weight = float_cell(weight_text)
                     valid = valid_text == "1"
                     value = float_cell(value_text)
                 else:
-                    row = raw_line[1:].split()
+                    row = raw_line[1:].split(maxsplit=header_len - 1)
                     if len(row) < header_len:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
                     raw_device_type = row[dev_type_col]
@@ -284,20 +311,16 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                         else:
                             meas.value = normalized_value
                 append_measurement(meas)
-                append_table_row(
-                    (
-                        idx,
-                        name,
-                        device_type,
-                        device_name,
-                        meas_type,
-                        weight,
-                        meas.valid,
-                        meas.value if scale_context is not None else value,
-                        device_type_code_get(device_type, 0),
-                        meas_type in angle_types,
-                    )
-                )
+                append_idx(idx)
+                append_name(name)
+                append_device_type(device_type)
+                append_device_name(device_name)
+                append_meas_type(meas_type)
+                append_weight(weight)
+                append_valid(meas.valid)
+                append_value(meas.value if scale_context is not None else value)
+                append_device_type_code(device_type_code_get(device_type, 0))
+                append_angle_mask(meas_type in angle_types)
                 continue
             line = raw_line.strip()
             if not line:
@@ -310,22 +333,6 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
         raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
     if header is None:
         raise RuntimeError(f"{file_name} Measurement block does not contain a header")
-    if table_rows:
-        (
-            idx_values,
-            name_values,
-            device_type_values,
-            device_name_values,
-            meas_type_values,
-            weight_values,
-            valid_values,
-            value_values,
-            device_type_code_values,
-            angle_mask_values,
-        ) = zip(*table_rows)
-    else:
-        idx_values = name_values = device_type_values = device_name_values = meas_type_values = ()
-        weight_values = valid_values = value_values = device_type_code_values = angle_mask_values = ()
     table = MeasurementTable(
         idx=np.asarray(idx_values, dtype=np.int64),
         name=np.asarray(name_values, dtype=object),
@@ -1228,10 +1235,11 @@ class ACStateEstimator:
             active_rows_by_device_type_code[int(device_type_code)] = np.flatnonzero(active_codes == device_type_code)
         self.measurement_table = table
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
+        measurements = self.measurements
         self.active_measurements = MeasurementList(
-            (self.measurements[int(row)] for row in active_source_rows),
+            [measurements[int(row)] for row in active_source_rows],
             active_table,
-            normalized=getattr(self.measurements, "normalized", False),
+            normalized=getattr(measurements, "normalized", False),
         )
         self.active_measurement_rows = np.asarray(active_source_rows, dtype=np.int64)
         self.active_measurement_table = active_table
@@ -1277,6 +1285,9 @@ class ACStateEstimator:
             self.active_measurements,
             self._active_balance_measurement_plan,
         )
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._active_normal_pattern = None
         self.active_measurements_are_vectorized = bool(
             np.all(
                 self._active_branch_transformer_vector_plan["handled_mask"]
@@ -3899,6 +3910,10 @@ class ACStateEstimator:
         """Append several vectorized Jacobian write blocks with one sparse/dense scatter."""
         if not blocks:
             return
+        if hasattr(H, "add_many"):
+            for rows, cols, values in blocks:
+                H.add_many(rows, cols, values)
+            return
         row_parts = []
         col_parts = []
         value_parts = []
@@ -3910,10 +3925,6 @@ class ACStateEstimator:
             col_parts.append(np.asarray(cols))
             value_parts.append(np.asarray(values))
         if not row_parts:
-            return
-        if hasattr(H, "add_many"):
-            for rows, cols, values in zip(row_parts, col_parts, value_parts):
-                H.add_many(rows, cols, values)
             return
         if len(row_parts) == 1:
             self._add_indexed_values(H, row_parts[0], col_parts[0], value_parts[0])
@@ -5223,11 +5234,13 @@ class ACStateEstimator:
         theta, voltage = self._unpack_state(x)
         switch_current = self._switch_current_from_state(x)
         voltage_complex = self._complex_voltage(theta, voltage)
-        H = (
-            SparseJacobianBuilder((len(measurements), self.n_state))
-            if sparse
-            else np.zeros((len(measurements), self.n_state), dtype=np.float64)
-        )
+        if sparse and measurements is self.active_measurements:
+            H = self._jacobian_builder
+            H.shape = (len(measurements), self.n_state)
+            H.size = H.shape[0] * H.shape[1]
+            H.reset()
+        else:
+            H = SparseJacobianBuilder((len(measurements), self.n_state)) if sparse else np.zeros((len(measurements), self.n_state), dtype=np.float64)
         branch_power_derivative_cache = {}
         branch_current_derivative_cache = {}
         vectorized_branch_rows = self._fill_branch_transformer_jacobian_vectorized(
@@ -5617,8 +5630,8 @@ class ACStateEstimator:
         cached_z_est = None
         cached_residual = None
         cached_objective = None
-        normal_solver = NormalEquationSolver()
-        normal_pattern = None
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
+        normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
 
         if verbose:
             _print_iteration_header()
@@ -5643,6 +5656,8 @@ class ACStateEstimator:
             H = self._profile_call("solve.jacobian", self.jacobian_sparse, x, measurements)
             if normal_pattern is None and issparse(H):
                 normal_pattern = _normal_equation_structural_pattern(H)
+                if measurements is self.active_measurements:
+                    self._active_normal_pattern = normal_pattern
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
             gain, rhs = self._profile_call(
@@ -5655,6 +5670,7 @@ class ACStateEstimator:
                 weights_are_uniform=weights_are_uniform,
                 weighted_residual=weighted_residual,
                 normal_pattern=normal_pattern,
+                assume_normal_pattern_matches=measurements is self.active_measurements,
             )
             dx, normal_factor_diag = self._profile_call(
                 "solve.factor_solve",
