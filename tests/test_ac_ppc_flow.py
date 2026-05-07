@@ -215,6 +215,14 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertTrue(calc.array_mode)
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
 
+    def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
+        source = (ROOT_DIR / "lfcore" / "ac_lf.py").read_text(encoding="utf-8")
+        main_block = source.split('if __name__ == "__main__":', 1)[1]
+
+        self.assertIn("ACPowerFlowCalc.from_e_file", main_block)
+        self.assertNotIn("read_from_file", main_block)
+        self.assertNotIn("ACPowerNetwork", main_block)
+
     def test_ac_lf_benchmark_accepts_algorithm_option(self):
         from lfcore import ac_lf_benchmark
 

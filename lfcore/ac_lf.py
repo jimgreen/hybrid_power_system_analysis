@@ -3109,95 +3109,141 @@ class ACPowerFlowCalc:
         self.lf_result = self._build_lf_result()
 
 if __name__ == "__main__":
-    from hybrid_net_model import ACPowerNetwork
+    file_name = sys.argv[1] if len(sys.argv) > 1 else str(ROOT_DIR / "data" / "ac" / "ieee300.e")
 
-    # 加载电网数据
-    net = ACPowerNetwork()
-    file_name = sys.argv[1] if len(sys.argv) > 1 else "../../data/ac/ieee300.e"
-    net.read_from_file(file_name)
-
-    # 拓扑分析
-    net.topo()
-    net.print_isl_info()
-
-    # 潮流计算
-    calc = ACPowerFlowCalc(net)
+    # 数组化加载和潮流计算共用一次 E 文件解析。
+    calc = ACPowerFlowCalc.from_e_file(file_name)
     calc.prepare()
-    calc.run()
+    rc = calc.run()
     for isl in calc.skipped_islands:
         print(f"跳过岛屿 {isl.idx}: 无可用平衡节点或定电压源")
-    calcs = [calc]
+
+    def _names(key, count):
+        values = calc.ppc.get(key)
+        if values is None:
+            return np.asarray([str(i) for i in range(count)], dtype=object)
+        return values
 
     # 结果输出（精简）
     print("\n=== 潮流计算结果 ===")
 
-
     # 节点电压
     print("\n1. 节点电压 (pu):")
-    slack_node_ids = {
-        node.idx
-        for calc in calcs
-        for node in calc.node_list
-        if calc.node_type[calc.node_pos[node.idx]] == 'SLACK'
-    }
-    for node in net.nodes:
-        print(f"   节点 {node.idx}: {node.voltage:.6f}  {node.angle:.6f} {'(松弛节点)' if node.idx in slack_node_ids else ''}")
+    bus = calc.result["bus"]
+    bus_names = _names("bus_name", bus.shape[0])
+    slack_node_ids = set(calc.ppc_node_idx[calc.node_type == "SLACK"].tolist())
+    active_node_ids = set(calc.ppc_node_idx.tolist())
+    for row, name in zip(bus, bus_names):
+        node_idx = int(row[BUS_COLS["idx"]])
+        flags = []
+        if node_idx in slack_node_ids:
+            flags.append("松弛节点")
+        if node_idx not in active_node_ids:
+            flags.append("未参与计算")
+        suffix = f" ({', '.join(flags)})" if flags else ""
+        print(
+            f"   节点 {node_idx} {name}: "
+            f"{row[BUS_COLS['voltage']]:.6f}  {row[BUS_COLS['angle']]:.6f}{suffix}"
+        )
 
     # 支路信息
-    p_loss_br = 0.0
+    branch = calc.result["branch"]
+    branch_names = _names("branch_name", branch.shape[0])
+    p_loss_br = float(np.sum(branch[:, BRANCH_COLS["i_p"]] + branch[:, BRANCH_COLS["j_p"]])) if branch.size else 0.0
     print("\n2. 支路信息:")
-    for br in net.branches:
-        loss = br.i_p + br.j_p
-        p_loss_br += loss
-        print(f"   支路 {br.idx} ({br.i_node}->{br.j_node}):")
-        print(f"     送端功率: {br.i_p:.6f} + j {br.i_q:.6f} pu, 受端功率: {br.j_p:.6f} + j{br.j_q:.6f} pu")
+    for row, name in zip(branch, branch_names):
+        loss = row[BRANCH_COLS["i_p"]] + row[BRANCH_COLS["j_p"]]
+        print(f"   支路 {int(row[BRANCH_COLS['idx']])} {name} ({int(row[BRANCH_COLS['i_node']])}->{int(row[BRANCH_COLS['j_node']])}):")
+        print(
+            f"     送端功率: {row[BRANCH_COLS['i_p']]:.6f} + j {row[BRANCH_COLS['i_q']]:.6f} pu, "
+            f"受端功率: {row[BRANCH_COLS['j_p']]:.6f} + j{row[BRANCH_COLS['j_q']]:.6f} pu"
+        )
         print(f"     有功损耗: {loss:.6f} pu")
 
     # 变压器信息
-    p_loss_tr = 0.0
+    transformer = calc.result["transformer"]
+    transformer_names = _names("transformer_name", transformer.shape[0])
+    p_loss_tr = (
+        float(np.sum(transformer[:, TRANSFORMER_COLS["i_p"]] + transformer[:, TRANSFORMER_COLS["j_p"]]))
+        if transformer.size
+        else 0.0
+    )
     print("\n3. 变压器信息:")
-    for tr in net.transformers:
-        loss = tr.i_p + tr.j_p
-        p_loss_tr += loss
-        print(f"   变压器 {tr.idx} ({tr.i_node}->{tr.j_node}):")
-        print(f"     送端功率: {tr.i_p:.6f} + j {tr.i_q:.6f} pu, 受端功率: {tr.j_p:.6f} + j{tr.j_q:.6f} pu")
+    for row, name in zip(transformer, transformer_names):
+        loss = row[TRANSFORMER_COLS["i_p"]] + row[TRANSFORMER_COLS["j_p"]]
+        print(
+            f"   变压器 {int(row[TRANSFORMER_COLS['idx']])} {name} "
+            f"({int(row[TRANSFORMER_COLS['i_node']])}->{int(row[TRANSFORMER_COLS['j_node']])}):"
+        )
+        print(
+            f"     送端功率: {row[TRANSFORMER_COLS['i_p']]:.6f} + j {row[TRANSFORMER_COLS['i_q']]:.6f} pu, "
+            f"受端功率: {row[TRANSFORMER_COLS['j_p']]:.6f} + j{row[TRANSFORMER_COLS['j_q']]:.6f} pu"
+        )
         print(f"     有功损耗: {loss:.6f} pu")
 
     # 其他设备信息
+    zero_branch = calc.result["zero_branch"]
+    zero_names = _names("zero_branch_name", zero_branch.shape[0])
     print("\n4. 零阻抗支路信息:")
-    for zb in net.zero_branches:
-        print(f"   零阻抗支路 {zb.idx}: 电流={zb.current:.6f} pu, 功率={zb.p:.6f} + j {zb.q:.6f} pu")
+    for row, name in zip(zero_branch, zero_names):
+        print(
+            f"   零阻抗支路 {int(row[ZERO_BRANCH_COLS['idx']])} {name}: "
+            f"电流={row[ZERO_BRANCH_COLS['current']]:.6f} pu, "
+            f"功率={row[ZERO_BRANCH_COLS['p']]:.6f} + j {row[ZERO_BRANCH_COLS['q']]:.6f} pu"
+        )
 
+    switch = calc.result["switch"]
+    switch_names = _names("switch_name", switch.shape[0])
     print("\n5. 开关信息:")
-    for sw in net.switches:
-        print(f"   开关 {sw.idx} (状态:{'闭合' if sw.status == 1 else '断开'}): 电流={sw.current:.6f} pu")
+    for row, name in zip(switch, switch_names):
+        status = "闭合" if int(row[SWITCH_COLS["status"]]) == 1 else "断开"
+        print(
+            f"   开关 {int(row[SWITCH_COLS['idx']])} {name} "
+            f"(状态:{status}): 电流={row[SWITCH_COLS['current']]:.6f} pu"
+        )
 
+    breaker = calc.result["break"]
+    breaker_names = _names("break_name", breaker.shape[0])
+    if breaker.shape[0]:
+        print("\n5.1 刀闸信息:")
+        for row, name in zip(breaker, breaker_names):
+            status = "闭合" if int(row[SWITCH_COLS["status"]]) == 1 else "断开"
+            print(
+                f"   刀闸 {int(row[SWITCH_COLS['idx']])} {name} "
+                f"(状态:{status}): 电流={row[SWITCH_COLS['current']]:.6f} pu"
+            )
+
+    load = calc.result["load"]
+    load_names = _names("load_name", load.shape[0])
     print("\n6. 负荷信息:")
-    for load in net.loads:
-        print(f"   负荷 {load.idx}: 消耗功率={load.p:.6f} + j {load.q:.6f} pu")
+    for row, name in zip(load, load_names):
+        print(
+            f"   负荷 {int(row[LOAD_COLS['idx']])} {name}: "
+            f"消耗功率={row[LOAD_COLS['p']]:.6f} + j {row[LOAD_COLS['q']]:.6f} pu"
+        )
 
+    gen = calc.result["gen"]
+    gen_names = _names("gen_name", gen.shape[0])
     print("\n7. 发电机信息:")
-    for gen in net.generators:
-        print(f"   发电机 {gen.idx}: 送出功率={gen.p:.6f} + j {gen.q:.6f} pu")
+    for row, name in zip(gen, gen_names):
+        print(
+            f"   发电机 {int(row[GEN_COLS['idx']])} {name}: "
+            f"送出功率={row[GEN_COLS['p']]:.6f} + j {row[GEN_COLS['q']]:.6f} pu"
+        )
 
     # 收敛信息和功率平衡
     print("\n8. 计算收敛信息:")
-    for calc in calcs:
-        calc_scope = "全网" if calc.target_island is None else f"岛屿 {calc.isl.idx}"
-        if calc.target_island is None and calc.calc_islands:
-            calc_scope += f" (岛屿 {','.join(str(isl.idx) for isl in calc.calc_islands)})"
-        print(f"   {calc_scope}: {'✓ 已收敛' if calc.converged else '✗ 未收敛'}, "
-              f"迭代次数: {calc.iterations}, 最终残差: {calc.normF:.2e}")
-
-    total_gen_power = sum(gen.p for gen in net.generators)
-    total_load_power = sum(load.p for load in net.loads)
-    total_loss = total_gen_power - total_load_power
-    node_voltage = {node.idx: node.voltage for node in net.nodes}
-    p_loss_gs = sum(
-        sc.g_set * node_voltage.get(sc.node, 0.0) ** 2
-        for sc in net.shunt_compensators
-        if sc.is_alive
+    calc_scope = f"全网 (参与节点 {calc.N}/{bus.shape[0]})"
+    print(
+        f"   {calc_scope}: {'✓ 已收敛' if calc.converged else '✗ 未收敛'}, "
+        f"返回码: {rc}, 迭代次数: {calc.iterations}, 最终残差: {calc.normF:.2e}"
     )
+
+    total_gen_power = float(np.sum(gen[:, GEN_COLS["p"]])) if gen.size else 0.0
+    total_load_power = float(np.sum(load[:, LOAD_COLS["p"]])) if load.size else 0.0
+    total_loss = total_gen_power - total_load_power
+    shunt = calc.result["shunt"]
+    p_loss_gs = float(np.sum(shunt[:, SHUNT_COLS["p"]])) if shunt.size else 0.0
     print("\n9. 功率平衡校验:")
     print(f"   总发电功率: {total_gen_power:.6f} pu")
     print(f"   总负荷功率: {total_load_power:.6f} pu")
