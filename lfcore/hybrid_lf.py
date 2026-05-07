@@ -17,7 +17,7 @@ LFCORE_DIR = Path(__file__).resolve().parent
 if str(LFCORE_DIR) not in sys.path:
     sys.path.insert(0, str(LFCORE_DIR))
 
-from efile_read import efile_factory, read_efile_dict_cached
+from efile_read import efile_factory_from_file_cached
 from ac_lf import ACPowerFlowCalc
 from dc_lf import DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
@@ -118,55 +118,28 @@ class HybridACGrid(_GridBase):
         self.shunt_compensator_dict = {sc.idx: sc for sc in self.shunt_compensators}
 
         for node in self.nodes:
-            node.generators = []
-            node.loads = []
-            node.branches = []
-            node.switches = []
-            node.zero_branches = []
-            node.transformers = []
-            node.shunt_compensators = []
+            node.v_gens = []
             node.is_alive = False
 
+        node_get = self.node_dict.get
         for gen in self.generators:
-            gen.node_obj = self.node_dict.get(gen.node)
-            if gen.node_obj is not None:
-                gen.node_obj.generators.append(gen)
+            gen.node_obj = node_get(gen.node)
         for ld in self.loads:
-            ld.node_obj = self.node_dict.get(ld.node)
-            if ld.node_obj is not None:
-                ld.node_obj.loads.append(ld)
+            ld.node_obj = node_get(ld.node)
         for sc in self.shunt_compensators:
-            sc.node_obj = self.node_dict.get(sc.node)
-            if sc.node_obj is not None:
-                sc.node_obj.shunt_compensators.append(sc)
+            sc.node_obj = node_get(sc.node)
         for br in self.branches:
-            br.i_node_obj = self.node_dict.get(br.i_node)
-            br.j_node_obj = self.node_dict.get(br.j_node)
-            if br.i_node_obj is not None:
-                br.i_node_obj.branches.append(br)
-            if br.j_node_obj is not None:
-                br.j_node_obj.branches.append(br)
+            br.i_node_obj = node_get(br.i_node)
+            br.j_node_obj = node_get(br.j_node)
         for tr in self.transformers:
-            tr.i_node_obj = self.node_dict.get(tr.i_node)
-            tr.j_node_obj = self.node_dict.get(tr.j_node)
-            if tr.i_node_obj is not None:
-                tr.i_node_obj.transformers.append(tr)
-            if tr.j_node_obj is not None:
-                tr.j_node_obj.transformers.append(tr)
+            tr.i_node_obj = node_get(tr.i_node)
+            tr.j_node_obj = node_get(tr.j_node)
         for sw in self.switches:
-            sw.i_node_obj = self.node_dict.get(sw.i_node)
-            sw.j_node_obj = self.node_dict.get(sw.j_node)
-            if sw.i_node_obj is not None:
-                sw.i_node_obj.switches.append(sw)
-            if sw.j_node_obj is not None:
-                sw.j_node_obj.switches.append(sw)
+            sw.i_node_obj = node_get(sw.i_node)
+            sw.j_node_obj = node_get(sw.j_node)
         for zbr in self.zero_branches:
-            zbr.i_node_obj = self.node_dict.get(zbr.i_node)
-            zbr.j_node_obj = self.node_dict.get(zbr.j_node)
-            if zbr.i_node_obj is not None:
-                zbr.i_node_obj.zero_branches.append(zbr)
-            if zbr.j_node_obj is not None:
-                zbr.j_node_obj.zero_branches.append(zbr)
+            zbr.i_node_obj = node_get(zbr.i_node)
+            zbr.j_node_obj = node_get(zbr.j_node)
 
     def topo(self):
         """Find AC connectivity islands using running branches, transformers and closed switches."""
@@ -176,12 +149,12 @@ class HybridACGrid(_GridBase):
             node.isl = 0
             node.isl_obj = None
 
-        running_nodes = [node for node in self.nodes if self._is_running(node)]
+        running_nodes = [node for node in self.nodes if node.run_stat == 1]
         adj = {node: [] for node in running_nodes}
 
         def add_edge(dev):
             if (
-                self._is_running(dev)
+                dev.run_stat == 1
                 and dev.i_node_obj in adj
                 and dev.j_node_obj in adj
                 and dev.i_node_obj != dev.j_node_obj
@@ -230,7 +203,7 @@ class HybridACGrid(_GridBase):
                 node.isl_obj.nodes.append(node)
 
         for gen in self.generators:
-            if not self._is_running(gen) or gen.node_obj is None or gen.node_obj.isl_obj is None:
+            if gen.run_stat != 1 or gen.node_obj is None or gen.node_obj.isl_obj is None:
                 continue
             island = gen.node_obj.isl_obj
             island.gens.append(gen)
@@ -245,22 +218,22 @@ class HybridACGrid(_GridBase):
                 island.v_gens.append(gen)
 
         for ld in self.loads:
-            if self._is_running(ld) and ld.node_obj is not None and ld.node_obj.isl_obj is not None:
+            if ld.run_stat == 1 and ld.node_obj is not None and ld.node_obj.isl_obj is not None:
                 ld.node_obj.isl_obj.loads.append(ld)
         for sc in self.shunt_compensators:
-            if self._is_running(sc) and sc.node_obj is not None and sc.node_obj.isl_obj is not None:
+            if sc.run_stat == 1 and sc.node_obj is not None and sc.node_obj.isl_obj is not None:
                 sc.node_obj.isl_obj.shunt_compensators.append(sc)
         for sw in self.switches:
-            if self._is_running(sw) and sw.status == 1 and self._same_live_island(sw):
+            if sw.run_stat == 1 and sw.status == 1 and self._same_live_island(sw):
                 sw.i_node_obj.isl_obj.switches.append(sw)
         for br in self.branches:
-            if self._is_running(br) and self._same_live_island(br):
+            if br.run_stat == 1 and self._same_live_island(br):
                 br.i_node_obj.isl_obj.branches.append(br)
         for tr in self.transformers:
-            if self._is_running(tr) and self._same_live_island(tr):
+            if tr.run_stat == 1 and self._same_live_island(tr):
                 tr.i_node_obj.isl_obj.transformers.append(tr)
         for zbr in self.zero_branches:
-            if self._is_running(zbr) and self._same_live_island(zbr):
+            if zbr.run_stat == 1 and self._same_live_island(zbr):
                 zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
 
         for island in self.islands:
@@ -269,14 +242,14 @@ class HybridACGrid(_GridBase):
         for node in self.nodes:
             node.is_alive = node.isl_obj is not None and node.isl_obj.is_alive
         for ld in self.loads:
-            ld.is_alive = ld.node_obj is not None and self._is_running(ld) and ld.node_obj.is_alive
+            ld.is_alive = ld.node_obj is not None and ld.run_stat == 1 and ld.node_obj.is_alive
         for gen in self.generators:
-            gen.is_alive = gen.node_obj is not None and self._is_running(gen) and gen.node_obj.is_alive
+            gen.is_alive = gen.node_obj is not None and gen.run_stat == 1 and gen.node_obj.is_alive
         for sc in self.shunt_compensators:
-            sc.is_alive = sc.node_obj is not None and self._is_running(sc) and sc.node_obj.is_alive
+            sc.is_alive = sc.node_obj is not None and sc.run_stat == 1 and sc.node_obj.is_alive
         for dev in [*self.branches, *self.transformers, *self.zero_branches]:
             dev.is_alive = (
-                self._is_running(dev)
+                dev.run_stat == 1
                 and dev.i_node_obj is not None
                 and dev.j_node_obj is not None
                 and dev.i_node_obj.is_alive
@@ -284,7 +257,7 @@ class HybridACGrid(_GridBase):
             )
         for sw in self.switches:
             sw.is_alive = (
-                self._is_running(sw)
+                sw.run_stat == 1
                 and sw.status == 1
                 and sw.i_node_obj is not None
                 and sw.j_node_obj is not None
@@ -307,7 +280,7 @@ class HybridACGrid(_GridBase):
     def _slack_reference(self, node):
         """Return the fixed phasor imposed by the running slack generator on a node."""
         for gen in getattr(node, "v_gens", []):
-            if self._is_running(gen) and str(gen.control_type).upper() in {"V", "SLACK", "PH"}:
+            if gen.run_stat == 1 and str(gen.control_type).upper() in {"V", "SLACK", "PH"}:
                 return float(gen.v_set), float(getattr(node, "angle", 0.0) or 0.0)
         return float(getattr(node, "voltage", 1.0) or 1.0), float(getattr(node, "angle", 0.0) or 0.0)
 
@@ -341,10 +314,10 @@ class HybridACGrid(_GridBase):
                 parent[right_root] = left_root
 
         for dev in island.zero_branches:
-            if self._is_running(dev):
+            if dev.run_stat == 1:
                 union(dev.i_node, dev.j_node)
         for dev in island.switches:
-            if self._is_running(dev) and getattr(dev, "status", 0) == 1:
+            if dev.run_stat == 1 and getattr(dev, "status", 0) == 1:
                 union(dev.i_node, dev.j_node)
 
         first_root = find(slack_nodes[0].idx)
@@ -371,37 +344,37 @@ class HybridACGrid(_GridBase):
         def check_node(node_idx, dev_type, dev):
             if node_idx not in self.node_dict:
                 errors.append(f"设备 {dev_type}[{dev.idx}] {self._name(dev)} 引用的节点 {node_idx} 不存在")
-            elif self._is_running(self.node_dict[node_idx]):
+            elif self.node_dict[node_idx].run_stat == 1:
                 node_ref_count[node_idx] += 1
 
         for br in self.branches:
-            if self._is_running(br):
+            if br.run_stat == 1:
                 check_node(br.i_node, "ACBranch", br)
                 check_node(br.j_node, "ACBranch", br)
         for tr in self.transformers:
-            if self._is_running(tr):
+            if tr.run_stat == 1:
                 check_node(tr.i_node, "ACTransformer", tr)
                 check_node(tr.j_node, "ACTransformer", tr)
         for zbr in self.zero_branches:
-            if self._is_running(zbr):
+            if zbr.run_stat == 1:
                 check_node(zbr.i_node, "ACZeroBranch", zbr)
                 check_node(zbr.j_node, "ACZeroBranch", zbr)
         for sw in self.switches:
-            if self._is_running(sw):
+            if sw.run_stat == 1:
                 check_node(sw.i_node, "ACSwitch", sw)
                 check_node(sw.j_node, "ACSwitch", sw)
         for ld in self.loads:
-            if self._is_running(ld):
+            if ld.run_stat == 1:
                 check_node(ld.node, "ACLoad", ld)
         for gen in self.generators:
-            if self._is_running(gen):
+            if gen.run_stat == 1:
                 check_node(gen.node, "ACGenerator", gen)
         for sc in self.shunt_compensators:
-            if self._is_running(sc):
+            if sc.run_stat == 1:
                 check_node(sc.node, "ACShuntCompensator", sc)
 
         for node in self.nodes:
-            if not self._is_running(node):
+            if node.run_stat != 1:
                 continue
             if node_ref_count[node.idx] == 0:
                 errors.append(f"节点 {node.idx} {self._name(node)} 未关联任何设备")
@@ -414,11 +387,11 @@ class HybridACGrid(_GridBase):
             ("零阻抗支路", self.zero_branches),
         ):
             for dev in devices:
-                if not self._is_running(dev):
+                if dev.run_stat != 1:
                     continue
                 if dev.i_node_obj is None or dev.j_node_obj is None:
                     continue
-                if not self._is_running(dev.i_node_obj) or not self._is_running(dev.j_node_obj):
+                if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
                     continue
                 if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
                     errors.append(
@@ -469,54 +442,29 @@ class HybridDCGrid(_GridBase):
         self.dcdc_converter_dict = {conv.idx: conv for conv in self.dcdc_converters}
 
         for node in self.nodes:
-            node.generators = []
-            node.loads = []
-            node.branches = []
-            node.switches = []
-            node.zero_branches = []
-            node.dcdc_converters = []
             node.v_gens = []
             node.v_dcdcs = []
             node.v_set = 0.0
             node.is_slack = False
             node.is_alive = False
 
+        node_get = self.node_dict.get
         for gen in self.generators:
-            gen.node_obj = self.node_dict.get(gen.node)
-            if gen.node_obj is not None:
-                gen.node_obj.generators.append(gen)
+            gen.node_obj = node_get(gen.node)
         for ld in self.loads:
-            ld.node_obj = self.node_dict.get(ld.node)
-            if ld.node_obj is not None:
-                ld.node_obj.loads.append(ld)
+            ld.node_obj = node_get(ld.node)
         for br in self.branches:
-            br.i_node_obj = self.node_dict.get(br.i_node)
-            br.j_node_obj = self.node_dict.get(br.j_node)
-            if br.i_node_obj is not None:
-                br.i_node_obj.branches.append(br)
-            if br.j_node_obj is not None:
-                br.j_node_obj.branches.append(br)
+            br.i_node_obj = node_get(br.i_node)
+            br.j_node_obj = node_get(br.j_node)
         for sw in self.switches:
-            sw.i_node_obj = self.node_dict.get(sw.i_node)
-            sw.j_node_obj = self.node_dict.get(sw.j_node)
-            if sw.i_node_obj is not None:
-                sw.i_node_obj.switches.append(sw)
-            if sw.j_node_obj is not None:
-                sw.j_node_obj.switches.append(sw)
+            sw.i_node_obj = node_get(sw.i_node)
+            sw.j_node_obj = node_get(sw.j_node)
         for zbr in self.zero_branches:
-            zbr.i_node_obj = self.node_dict.get(zbr.i_node)
-            zbr.j_node_obj = self.node_dict.get(zbr.j_node)
-            if zbr.i_node_obj is not None:
-                zbr.i_node_obj.zero_branches.append(zbr)
-            if zbr.j_node_obj is not None:
-                zbr.j_node_obj.zero_branches.append(zbr)
+            zbr.i_node_obj = node_get(zbr.i_node)
+            zbr.j_node_obj = node_get(zbr.j_node)
         for conv in self.dcdc_converters:
-            conv.i_node_obj = self.node_dict.get(conv.i_node)
-            conv.j_node_obj = self.node_dict.get(conv.j_node)
-            if conv.i_node_obj is not None:
-                conv.i_node_obj.dcdc_converters.append(conv)
-            if conv.j_node_obj is not None:
-                conv.j_node_obj.dcdc_converters.append(conv)
+            conv.i_node_obj = node_get(conv.i_node)
+            conv.j_node_obj = node_get(conv.j_node)
 
     def topo(self):
         """Find DC connectivity islands using running resistive/zero branches and closed switches."""
@@ -526,12 +474,12 @@ class HybridDCGrid(_GridBase):
             node.isl = 0
             node.isl_obj = None
 
-        running_nodes = [node for node in self.nodes if self._is_running(node)]
+        running_nodes = [node for node in self.nodes if node.run_stat == 1]
         adj = {node: [] for node in running_nodes}
 
         def add_edge(dev):
             if (
-                self._is_running(dev)
+                dev.run_stat == 1
                 and dev.i_node_obj in adj
                 and dev.j_node_obj in adj
                 and dev.i_node_obj != dev.j_node_obj
@@ -579,7 +527,7 @@ class HybridDCGrid(_GridBase):
             node.is_slack = False
 
         for gen in self.generators:
-            if not self._is_running(gen) or gen.node_obj is None or gen.node_obj.isl_obj is None:
+            if gen.run_stat != 1 or gen.node_obj is None or gen.node_obj.isl_obj is None:
                 continue
             island = gen.node_obj.isl_obj
             island.gens.append(gen)
@@ -588,7 +536,7 @@ class HybridDCGrid(_GridBase):
                 island.v_gens.append(gen)
 
         for conv in self.dcdc_converters:
-            if not self._is_running(conv) or conv.i_node_obj is None or conv.j_node_obj is None:
+            if conv.run_stat != 1 or conv.i_node_obj is None or conv.j_node_obj is None:
                 continue
             if conv.i_node_obj.isl_obj is not None:
                 conv.i_node_obj.isl_obj.dcdc_converters.append(conv)
@@ -599,16 +547,16 @@ class HybridDCGrid(_GridBase):
                 conv.i_node_obj.isl_obj.v_dcdcs.append(conv)
 
         for ld in self.loads:
-            if self._is_running(ld) and ld.node_obj is not None and ld.node_obj.isl_obj is not None:
+            if ld.run_stat == 1 and ld.node_obj is not None and ld.node_obj.isl_obj is not None:
                 ld.node_obj.isl_obj.loads.append(ld)
         for sw in self.switches:
-            if self._is_running(sw) and sw.status == 1 and self._same_live_island(sw):
+            if sw.run_stat == 1 and sw.status == 1 and self._same_live_island(sw):
                 sw.i_node_obj.isl_obj.switches.append(sw)
         for br in self.branches:
-            if self._is_running(br) and self._same_live_island(br):
+            if br.run_stat == 1 and self._same_live_island(br):
                 br.i_node_obj.isl_obj.branches.append(br)
         for zbr in self.zero_branches:
-            if self._is_running(zbr) and self._same_live_island(zbr):
+            if zbr.run_stat == 1 and self._same_live_island(zbr):
                 zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
 
         for node in self.nodes:
@@ -626,12 +574,12 @@ class HybridDCGrid(_GridBase):
         for node in self.nodes:
             node.is_alive = node.isl_obj is not None and node.isl_obj.is_alive
         for ld in self.loads:
-            ld.is_alive = ld.node_obj is not None and self._is_running(ld) and ld.node_obj.is_alive
+            ld.is_alive = ld.node_obj is not None and ld.run_stat == 1 and ld.node_obj.is_alive
         for gen in self.generators:
-            gen.is_alive = gen.node_obj is not None and self._is_running(gen) and gen.node_obj.is_alive
+            gen.is_alive = gen.node_obj is not None and gen.run_stat == 1 and gen.node_obj.is_alive
         for dev in [*self.branches, *self.zero_branches]:
             dev.is_alive = (
-                self._is_running(dev)
+                dev.run_stat == 1
                 and dev.i_node_obj is not None
                 and dev.j_node_obj is not None
                 and dev.i_node_obj.is_alive
@@ -639,7 +587,7 @@ class HybridDCGrid(_GridBase):
             )
         for sw in self.switches:
             sw.is_alive = (
-                self._is_running(sw)
+                sw.run_stat == 1
                 and sw.status == 1
                 and sw.i_node_obj is not None
                 and sw.j_node_obj is not None
@@ -648,7 +596,7 @@ class HybridDCGrid(_GridBase):
             )
         for conv in self.dcdc_converters:
             conv.is_alive = (
-                self._is_running(conv)
+                conv.run_stat == 1
                 and conv.i_node_obj is not None
                 and conv.j_node_obj is not None
                 and conv.i_node_obj.is_alive
@@ -679,34 +627,34 @@ class HybridDCGrid(_GridBase):
         def check_node(node_idx, dev_type, dev):
             if node_idx not in self.node_dict:
                 errors.append(f"设备 {dev_type}[{dev.idx}] {self._name(dev)} 引用的节点 {node_idx} 不存在")
-            elif self._is_running(self.node_dict[node_idx]):
+            elif self.node_dict[node_idx].run_stat == 1:
                 node_ref_count[node_idx] += 1
 
         for br in self.branches:
-            if self._is_running(br):
+            if br.run_stat == 1:
                 check_node(br.i_node, "DCBranch", br)
                 check_node(br.j_node, "DCBranch", br)
         for zbr in self.zero_branches:
-            if self._is_running(zbr):
+            if zbr.run_stat == 1:
                 check_node(zbr.i_node, "DCZeroBranch", zbr)
                 check_node(zbr.j_node, "DCZeroBranch", zbr)
         for sw in self.switches:
-            if self._is_running(sw):
+            if sw.run_stat == 1:
                 check_node(sw.i_node, "DCSwitch", sw)
                 check_node(sw.j_node, "DCSwitch", sw)
         for ld in self.loads:
-            if self._is_running(ld):
+            if ld.run_stat == 1:
                 check_node(ld.node, "DCLoad", ld)
         for gen in self.generators:
-            if self._is_running(gen):
+            if gen.run_stat == 1:
                 check_node(gen.node, "DCGenerator", gen)
         for conv in self.dcdc_converters:
-            if self._is_running(conv):
+            if conv.run_stat == 1:
                 check_node(conv.i_node, "DCDCConverter", conv)
                 check_node(conv.j_node, "DCDCConverter", conv)
 
         for node in self.nodes:
-            if not self._is_running(node):
+            if node.run_stat != 1:
                 continue
             if node_ref_count[node.idx] == 0:
                 errors.append(f"节点 {node.idx} {self._name(node)} 未关联任何设备")
@@ -752,9 +700,6 @@ class HybridIsland:
         island.hybrid_isl_obj = self
         self.ac_nodes.extend(island.nodes)
         self.is_alive = self.is_alive or island.is_alive
-        for node in island.nodes:
-            node.hybrid_isl = self.idx
-            node.hybrid_isl_obj = self
 
     def add_dc_island(self, island):
         self.dc_islands.append(island)
@@ -762,9 +707,6 @@ class HybridIsland:
         island.hybrid_isl_obj = self
         self.dc_nodes.extend(island.nodes)
         self.is_alive = self.is_alive or island.is_alive
-        for node in island.nodes:
-            node.hybrid_isl = self.idx
-            node.hybrid_isl_obj = self
 
     def add_dcac_converter(self, conv):
         self.dcac_converters.append(conv)
@@ -793,7 +735,7 @@ class HybridPowerNetwork:
     @classmethod
     def read_from_file(cls, file_name) -> "HybridPowerNetwork":
         path = str(file_name)
-        model = efile_factory(read_efile_dict_cached(path))
+        model = efile_factory_from_file_cached(path)
         normalize_model_named_units(model)
         network = cls(
             ac=HybridACGrid(model),
@@ -822,17 +764,18 @@ class HybridPowerNetwork:
 
     def _build_hybrid_topo(self):
         """Union AC and DC islands connected by DCAC, DCDC or ACAC converters."""
-        sub_islands = [*self.ac.islands, *self.dc.islands]
-        ac_island_set = set(self.ac.islands)
-        for island in sub_islands:
+        ac_islands = self.ac.islands
+        dc_islands = self.dc.islands
+        n_ac_islands = len(ac_islands)
+        total_islands = n_ac_islands + len(dc_islands)
+        for pos, island in enumerate(ac_islands):
+            island._hybrid_pos = pos
             island.hybrid_isl = 0
             island.hybrid_isl_obj = None
-        for node in self.ac.nodes:
-            node.hybrid_isl = 0
-            node.hybrid_isl_obj = None
-        for node in self.dc.nodes:
-            node.hybrid_isl = 0
-            node.hybrid_isl_obj = None
+        for offset, island in enumerate(dc_islands, start=n_ac_islands):
+            island._hybrid_pos = offset
+            island.hybrid_isl = 0
+            island.hybrid_isl_obj = None
         for conv in self.dc.dcdc_converters:
             conv.hybrid_isl = 0
             conv.hybrid_isl_obj = None
@@ -843,23 +786,23 @@ class HybridPowerNetwork:
             conv.hybrid_isl = 0
             conv.hybrid_isl_obj = None
 
-        parent = {island: island for island in sub_islands}
+        parent = list(range(total_islands))
 
-        def find(island):
+        def find(pos):
             # Path-compressed union-find keeps converter-driven island merging simple.
-            root = island
-            while parent[root] is not root:
+            root = pos
+            while parent[root] != root:
                 root = parent[root]
-            while parent[island] is not island:
-                island, parent[island] = parent[island], root
+            while parent[pos] != pos:
+                pos, parent[pos] = parent[pos], root
             return root
 
         def union(left, right):
             if left is None or right is None:
                 return
-            left_root = find(left)
-            right_root = find(right)
-            if left_root is not right_root:
+            left_root = find(left._hybrid_pos)
+            right_root = find(right._hybrid_pos)
+            if left_root != right_root:
                 parent[right_root] = left_root
 
         for conv in self.dcac_converters:
@@ -907,9 +850,12 @@ class HybridPowerNetwork:
             )
 
         grouped = {}
-        for island in sub_islands:
-            root = find(island)
-            grouped.setdefault(root, []).append(island)
+        for island in ac_islands:
+            root = find(island._hybrid_pos)
+            grouped.setdefault(root, []).append((True, island))
+        for island in dc_islands:
+            root = find(island._hybrid_pos)
+            grouped.setdefault(root, []).append((False, island))
 
         self.hybrid_islands = []
         island_by_root = {}
@@ -917,8 +863,8 @@ class HybridPowerNetwork:
             hybrid_island = HybridIsland(idx)
             self.hybrid_islands.append(hybrid_island)
             island_by_root[root] = hybrid_island
-            for island in islands:
-                if island in ac_island_set:
+            for is_ac_island, island in islands:
+                if is_ac_island:
                     hybrid_island.add_ac_island(island)
                 else:
                     hybrid_island.add_dc_island(island)
@@ -930,7 +876,7 @@ class HybridPowerNetwork:
             dc_island = getattr(conv, "dc_isl_obj", None)
             if ac_island is None or dc_island is None:
                 continue
-            hybrid_island = island_by_root[find(ac_island)]
+            hybrid_island = island_by_root[find(ac_island._hybrid_pos)]
             hybrid_island.add_dcac_converter(conv)
 
         for conv in self.dc.dcdc_converters:
@@ -938,7 +884,7 @@ class HybridPowerNetwork:
                 continue
             if conv.i_node_obj.isl_obj is None or conv.j_node_obj.isl_obj is None:
                 continue
-            hybrid_island = island_by_root[find(conv.i_node_obj.isl_obj)]
+            hybrid_island = island_by_root[find(conv.i_node_obj.isl_obj._hybrid_pos)]
             hybrid_island.add_dcdc_converter(conv)
 
         for conv in self.acac_converters:
@@ -948,7 +894,7 @@ class HybridPowerNetwork:
             j_island = getattr(conv, "j_isl_obj", None)
             if i_island is None or j_island is None:
                 continue
-            hybrid_island = island_by_root[find(i_island)]
+            hybrid_island = island_by_root[find(i_island._hybrid_pos)]
             hybrid_island.add_acac_converter(conv)
 
     def print_hybrid_isl_info(self):
@@ -995,7 +941,12 @@ class HybridPowerNetwork:
             self.dc.print_isl_info()
         if verbose:
             self.print_hybrid_isl_info()
+        return [], [], [], []
 
+    def check_topology(self) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """Run optional topology diagnostics outside the main power-flow path."""
+        if not self.hybrid_islands:
+            self.topo()
         ac_refs, dc_refs = self._external_node_refs()
         ac_warnings, ac_errors = self.ac.check_topo(ac_refs) if self.ac.nodes else ([], [])
         dc_warnings, dc_errors = self.dc.check_topo(dc_refs) if self.dc.nodes else ([], [])
@@ -1525,12 +1476,15 @@ class HybridPowerFlowCalc:
                 - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
             )
             f_ctrl = np.empty(self.N_dcac, dtype=np.float64)
-            dc_v_mask = self.dcac_ctrl_code == 0
-            ac_v_mask = self.dcac_ctrl_code == 1
-            ac_p_mask = self.dcac_ctrl_code == 2
-            f_ctrl[dc_v_mask] = vd[dc_v_mask] - self.dcac_v_dc_set[dc_v_mask]
-            f_ctrl[ac_v_mask] = va[ac_v_mask] - self.dcac_v_ac_set[ac_v_mask]
-            f_ctrl[ac_p_mask] = ac_p[ac_p_mask] - self.dcac_p_ac_set[ac_p_mask]
+            f_ctrl[self.dcac_ctrl_dc_v_mask] = (
+                vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
+            )
+            f_ctrl[self.dcac_ctrl_ac_v_mask] = (
+                va[self.dcac_ctrl_ac_v_mask] - self.dcac_v_ac_set[self.dcac_ctrl_ac_v_mask]
+            )
+            f_ctrl[self.dcac_ctrl_ac_p_mask] = (
+                ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
+            )
             dcac_f[1::3] = f_ctrl
             dcac_f[2::3] = ac_q - self.dcac_q_ac_set
             parts.append(dcac_f)
@@ -1557,16 +1511,12 @@ class HybridPowerFlowCalc:
                 - self.acac_r2 * (j_p * j_p + j_q * j_q) * vi2
             )
             acac_f[1::4] = i_p - self.acac_p_set
-            q_i_mask = (self.acac_ctrl_code == 0) | (self.acac_ctrl_code == 2)
-            v_i_mask = ~q_i_mask
-            q_j_mask = (self.acac_ctrl_code == 0) | (self.acac_ctrl_code == 1)
-            v_j_mask = ~q_j_mask
             f2 = np.empty(self.N_acac, dtype=np.float64)
             f3 = np.empty(self.N_acac, dtype=np.float64)
-            f2[q_i_mask] = i_q[q_i_mask] - self.acac_i_q_set[q_i_mask]
-            f2[v_i_mask] = vi[v_i_mask] - self.acac_i_v_set[v_i_mask]
-            f3[q_j_mask] = j_q[q_j_mask] - self.acac_j_q_set[q_j_mask]
-            f3[v_j_mask] = vj[v_j_mask] - self.acac_j_v_set[v_j_mask]
+            f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
+            f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
+            f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
+            f3[self.acac_v_j_mask] = vj[self.acac_v_j_mask] - self.acac_j_v_set[self.acac_v_j_mask]
             acac_f[2::4] = f2
             acac_f[3::4] = f3
             parts.append(acac_f)
@@ -1659,7 +1609,7 @@ class HybridPowerFlowCalc:
             if np.any(mask):
                 row_parts.append(self.dcac_eq_ctrl_1[mask])
                 col_parts.append(ctrl_col[mask])
-                data_parts.append(np.ones(int(np.count_nonzero(mask)), dtype=np.float64))
+                data_parts.append(self.dcac_ones[mask])
 
     def _append_acac_jacobian_terms(self, row_parts, col_parts, data_parts, acac_x, ac_V):
         """Append AC/AC converter Jacobian entries to global COO buffers."""
@@ -1712,7 +1662,7 @@ class HybridPowerFlowCalc:
             if np.any(mask):
                 row_parts.append(rows_src[mask])
                 col_parts.append(cols_src[mask])
-                data_parts.append(np.ones(int(np.count_nonzero(mask)), dtype=np.float64))
+                data_parts.append(self.acac_ones[mask])
 
     def run(self):
         """Execute unified Newton iterations over the full hybrid state vector."""
@@ -1973,7 +1923,8 @@ def main() -> int:
         verbose=not args.quiet,
         parameter_file=args.para,
     )
-    print_hybrid_result(result)
+    if not args.quiet:
+        print_hybrid_result(result)
     return 0 if result.converged else 1
 
 

@@ -241,6 +241,28 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(ac_warnings, [])
         self.assertEqual(dc_warnings, [])
 
+    def test_main_hybrid_power_flow_skips_topology_diagnostics(self):
+        import hybrid_net_flow
+
+        original_ac_check_topo = hybrid_net_flow.HybridACGrid.check_topo
+        original_dc_check_topo = hybrid_net_flow.HybridDCGrid.check_topo
+
+        def reject_check_topo(*_args, **_kwargs):
+            raise AssertionError("main hybrid load-flow path should not call check_topo")
+
+        hybrid_net_flow.HybridACGrid.check_topo = reject_check_topo
+        hybrid_net_flow.HybridDCGrid.check_topo = reject_check_topo
+        try:
+            result = hybrid_net_flow.run_hybrid_power_flow(
+                ROOT / "data" / "hybrid" / "qinling.e",
+                verbose=False,
+            )
+        finally:
+            hybrid_net_flow.HybridACGrid.check_topo = original_ac_check_topo
+            hybrid_net_flow.HybridDCGrid.check_topo = original_dc_check_topo
+
+        self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
+
     def test_node_run_stat_zero_removes_attached_converter_from_solution(self):
         import hybrid_net_flow
 
