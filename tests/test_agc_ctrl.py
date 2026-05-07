@@ -37,12 +37,15 @@ class AGCControlTest(unittest.TestCase):
 
         text = output.read_text(encoding="utf-8")
         self.assertIn("<dev_ctrl>", text)
-        self.assertIn("# wind_generator 1 wind 12.500000", text)
-        self.assertIn("# pv_generator 2 pv 7.500000", text)
-        self.assertIn("# estorage 3 storage -4.000000", text)
-        self.assertIn("# diesel_generator 4 diesel 80.000000", text)
+        self.assertIn("@ dev_type         id     name       p_ctrl", text)
+        self.assertIn("# wind_generator   1      wind       12.500000", text)
+        self.assertIn("# pv_generator     2      pv         7.500000", text)
+        self.assertIn("# estorage         3      storage    -4.000000", text)
+        self.assertIn("# diesel_generator 4      diesel     80.000000", text)
         self.assertIn("<yt_ctrl>", text)
-        self.assertIn("# 5 hydrogen 3 3 6.000000", text)
+        self.assertIn("@ id     name       rtu    pnt    value", text)
+        self.assertIn("# 5      hydrogen   3      3      6.000000", text)
+        self.assertIn("@ name                 value", text)
         self.assertIn("# agc_balance_mismatch 1.250000", text)
 
     def test_device_p_step_overrides_global_default(self):

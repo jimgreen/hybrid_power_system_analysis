@@ -348,6 +348,12 @@ def _format_float(value) -> str:
     return f"{_as_float(value):.6f}"
 
 
+def _format_ctrl_value(value) -> str:
+    if isinstance(value, str):
+        return value
+    return _format_float(value)
+
+
 def _dev_ctrl_rows(model) -> Iterable[Tuple[str, object]]:
     for dev_type, devices in (
         ("wind_generator", getattr(model, "wind_generator", [])),
@@ -359,27 +365,41 @@ def _dev_ctrl_rows(model) -> Iterable[Tuple[str, object]]:
             yield dev_type, device
 
 
+def _format_dev_ctrl_row(prefix: str, dev_type, dev_id, name, value) -> str:
+    return f"{prefix} {str(dev_type):<16} {str(dev_id):<6} {str(name):<10} {_format_ctrl_value(value)}"
+
+
+def _format_yt_ctrl_row(prefix: str, yt_id, name, rtu, pnt, value) -> str:
+    return f"{prefix} {str(yt_id):<6} {str(name):<10} {str(rtu):<6} {str(pnt):<6} {_format_ctrl_value(value)}"
+
+
+def _format_result_row(prefix: str, name, value) -> str:
+    return f"{prefix} {str(name):<20} {_format_ctrl_value(value)}"
+
+
 def export_control_results(model, output_file: Path) -> None:
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "<dev_ctrl>",
-        "@ dev_type id name p_ctrl",
+        _format_dev_ctrl_row("@", "dev_type", "id", "name", "p_ctrl"),
     ]
     for dev_type, device in _dev_ctrl_rows(model):
         lines.append(
-            "# "
-            f"{dev_type} "
-            f"{getattr(device, 'id', '')} "
-            f"{getattr(device, 'name', '')} "
-            f"{_format_float(getattr(device, 'p_ctrl', getattr(device, 'p_cur', 0.0)))}"
+            _format_dev_ctrl_row(
+                "#",
+                dev_type,
+                getattr(device, "id", ""),
+                getattr(device, "name", ""),
+                getattr(device, "p_ctrl", getattr(device, "p_cur", 0.0)),
+            )
         )
     lines.extend(
         [
             "</dev_ctrl>",
             "",
             "<yt_ctrl>",
-            "@ id name rtu pnt value",
+            _format_yt_ctrl_row("@", "id", "name", "rtu", "pnt", "value"),
         ]
     )
     for yt in getattr(model, "yt", []):
@@ -387,20 +407,22 @@ def export_control_results(model, output_file: Path) -> None:
         if ctrl_value is None:
             continue
         lines.append(
-            "# "
-            f"{getattr(yt, 'id', '')} "
-            f"{getattr(yt, 'name', '')} "
-            f"{getattr(yt, 'rtu', '')} "
-            f"{getattr(yt, 'pnt', '')} "
-            f"{_format_float(ctrl_value)}"
+            _format_yt_ctrl_row(
+                "#",
+                getattr(yt, "id", ""),
+                getattr(yt, "name", ""),
+                getattr(yt, "rtu", ""),
+                getattr(yt, "pnt", ""),
+                ctrl_value,
+            )
         )
     lines.extend(
         [
             "</yt_ctrl>",
             "",
             "<agc_result>",
-            "@ name value",
-            f"# agc_balance_mismatch {_format_float(getattr(model, 'agc_balance_mismatch', 0.0))}",
+            _format_result_row("@", "name", "value"),
+            _format_result_row("#", "agc_balance_mismatch", getattr(model, "agc_balance_mismatch", 0.0)),
             "</agc_result>",
             "",
         ]
