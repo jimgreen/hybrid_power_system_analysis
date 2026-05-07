@@ -114,6 +114,69 @@ class SimulationLoopTest(unittest.TestCase):
         self.assertIn("100", real_text)
         self.assertEqual(real_text, scada_text)
 
+    def test_simulate_once_interface_reads_files_and_writes_outputs(self):
+        from simu.simu_loop import simulate_once
+
+        class FakeSnapshot:
+            def value(self, dev_type, dev_name, meas_type):
+                return 77.0
+
+        tmp = TMP_ROOT / "simulate_once_interface"
+        tmp.mkdir(parents=True, exist_ok=True)
+        model_path = tmp / "qinling.e"
+        meas_path = tmp / "meas.e"
+        weather_path = tmp / "weather.e"
+        dev_stat_path = tmp / "dev_stat.e"
+        yt_ctrl_path = tmp / "yt_ctrl.e"
+        real_path = tmp / "real.e"
+        scada_path = tmp / "scada.e"
+        model_path.write_text(
+            "\n".join(
+                [
+                    "<ACNode>",
+                    "@ idx name vbase voltage angle isl run_stat",
+                    "# 0 bus_1 345 345 0 0 1",
+                    "</ACNode>",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        meas_path.write_text(
+            "\n".join(
+                [
+                    "<Measurement>",
+                    "@ idx name dev_type dev_name meas_type weight valid value",
+                    "# 1 vm_bus_1 ACNode bus_1 V 4.0 1 0.0",
+                    "</Measurement>",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        weather_path.write_text("<Weather>\n@ name value\n</Weather>\n", encoding="utf-8")
+        dev_stat_path.write_text("<DeviceRunStatus>\n@ dev_type idx name run_stat\n</DeviceRunStatus>\n", encoding="utf-8")
+        yt_ctrl_path.write_text("<GeneratorSetpoint>\n@ dev_type idx name run_stat p_set q_set v_set\n</GeneratorSetpoint>\n", encoding="utf-8")
+
+        result = simulate_once(
+            model_file=model_path,
+            meas_file=meas_path,
+            weather_file=weather_path,
+            dev_stat_file=dev_stat_path,
+            yt_ctrl_file=yt_ctrl_path,
+            real_file=real_path,
+            scada_file=scada_path,
+            noise_std=0.0,
+            random_seed=123,
+            solver=lambda _path: (FakeSnapshot(), "fake"),
+        )
+
+        self.assertEqual(real_path, result.real_file)
+        self.assertEqual(scada_path, result.scada_file)
+        self.assertEqual(1, result.updated)
+        self.assertIn("77", real_path.read_text(encoding="utf-8"))
+        self.assertEqual(real_path.read_text(encoding="utf-8"), scada_path.read_text(encoding="utf-8"))
+
     def test_dev_stat_converter_setpoint_updates_dcac_pq_setpoints(self):
         from efile_read import EBook
         from simu.simu_loop import apply_dev_stat_file

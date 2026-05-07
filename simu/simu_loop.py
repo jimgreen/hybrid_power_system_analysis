@@ -620,6 +620,37 @@ def run_once(
     )
 
 
+def simulate_once(
+    model_file: Optional[Path] = None,
+    meas_file: Optional[Path] = None,
+    weather_file: Optional[Path] = None,
+    dev_stat_file: Optional[Path] = None,
+    yt_ctrl_file: Optional[Path] = None,
+    real_file: Optional[Path] = None,
+    scada_file: Optional[Path] = None,
+    period_seconds: float = DEFAULT_PERIOD_SECONDS,
+    noise_std: Optional[float] = None,
+    random_seed: Optional[int] = None,
+    solver: Callable[[Path], Tuple[object, str]] = solve_hybrid_snapshot,
+) -> SimulationResult:
+    defaults = default_config()
+    config = SimulationConfig(
+        model_file=Path(model_file or defaults.model_file).resolve(),
+        meas_file=Path(meas_file or defaults.meas_file).resolve(),
+        weather_file=Path(weather_file or defaults.weather_file).resolve(),
+        dev_stat_file=Path(dev_stat_file or defaults.dev_stat_file).resolve(),
+        yt_ctrl_file=Path(yt_ctrl_file or defaults.yt_ctrl_file).resolve(),
+        real_file=Path(real_file or defaults.real_file).resolve(),
+        scada_file=Path(scada_file or defaults.scada_file).resolve(),
+        period_seconds=period_seconds,
+        noise_std=noise_std,
+        random_seed=random_seed,
+        loop_count=1,
+        log_file=defaults.log_file,
+    )
+    return run_once(config, solver=solver)
+
+
 def _result_message(cycle: int, result: SimulationResult) -> str:
     return (
         f"第 {cycle} 轮仿真完成: updated={result.updated}, missing={result.missing}, "
