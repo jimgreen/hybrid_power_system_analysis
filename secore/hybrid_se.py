@@ -32,8 +32,10 @@ from model.meas_model import (
     print_iteration_header as _print_iteration_header,
 )
 from secore.ac_se import (
+    ACStateEstimator,
     _read_measurements_direct as _read_measurements_direct_shared,
 )
+from secore.dc_se import DCStateEstimator
 from secore.se_math import (
     ANGLE_MEASUREMENT_TYPES,
     SparseJacobianBuilder,
@@ -163,6 +165,11 @@ class HybridStateEstimator:
         self.acac_by_name = {
             conv.name: conv for conv in self.network.acac_converters if getattr(conv, "is_alive", False)
         }
+        self._sub_estimators_enabled = False
+        self._ac_sub_estimator = None
+        self._dc_sub_estimator = None
+        if self._init_uncoupled_sub_estimators():
+            return
 
         # Files store named values; all estimator math below uses pu and radians.
         self._disable_angle_measurements()
@@ -177,6 +184,220 @@ class HybridStateEstimator:
         self._refresh_active_measurement_state_layout()
         self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
 
+    def _init_uncoupled_sub_estimators(self) -> bool:
+        """Use AC/DC estimators as subsystem engines when no cross-domain devices exist.
+
+        HybridStateEstimator remains the public orchestrator.  In this first
+        composition path there are no converter coupling rows to assemble, so
+        the subsystem estimator owns the numerical WLS work directly.
+        """
+        has_cross_domain_coupling = bool(self.dcac_by_name or self.acac_by_name)
+        has_ac = bool(self.ac_nodes)
+        has_dc = bool(self.dc_nodes)
+        if has_ac and self._ac_sub_estimator is None:
+            self._ac_sub_estimator = ACStateEstimator(
+                e_file=self.e_file,
+                meas_file=self.meas_file,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                diff_step=self.diff_step,
+                flat_start=self.flat_start,
+                parameters=self.params,
+            )
+        if has_dc and self._dc_sub_estimator is None:
+            self._dc_sub_estimator = DCStateEstimator(
+                e_file=self.e_file,
+                meas_file=self.meas_file,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                diff_step=self.diff_step,
+                flat_start=self.flat_start,
+                parameters=self.params,
+            )
+
+        if has_cross_domain_coupling:
+            return False
+
+        if has_ac and has_dc:
+            # Block-combining independent AC and DC estimators is kept out of
+            # this slice; mixed networks with any DC side still use the legacy
+            # hybrid path until converter coupling is composed explicitly.
+            return False
+
+        if has_ac:
+            sub = self._ac_sub_estimator
+            self._ac_sub_estimator = sub
+            self._delegate_estimator = sub
+            self._sub_estimators_enabled = True
+            self.nodes = sub.nodes
+            self.ac_nodes = sub.nodes
+            self.dc_nodes = []
+            self.ac_node_by_name = sub.node_by_name
+            self.ac_branch_by_name = sub.branch_by_name
+            self.ac_transformer_by_name = sub.transformer_by_name
+            self.ac_generator_by_name = sub.generator_by_name
+            self.ac_load_by_name = sub.load_by_name
+            self.ac_switch_by_name = sub.switch_by_name
+            self.ac_break_by_name = sub.break_by_name
+            self.ac_zero_branch_by_name = sub.zero_branch_by_name
+            self._build_ac_state_adapter(sub)
+            self.measurements = sub.measurements
+            self.active_measurements = sub.active_measurements
+            self.active_z = sub.active_z
+            self.active_weight = sub.active_weight
+            self.active_angle_residual_mask = getattr(sub, "active_angle_residual_mask", angle_residual_mask(self.active_measurements))
+            self.state_labels = list(sub.state_labels)
+            self.n_state = int(sub.n_state)
+            self.voltage_cols = getattr(sub, "voltage_cols", np.array([], dtype=np.int32))
+            self.power_flow_state = sub._file_state().copy() if hasattr(sub, "_file_state") else sub.initial_state()
+            self.flat_state = sub.initial_state()
+            self.targeted_observability_pseudo_count = sub.targeted_observability_pseudo_count
+            return True
+
+        if has_dc:
+            sub = self._dc_sub_estimator
+            self._dc_sub_estimator = sub
+            self._delegate_estimator = sub
+            self._sub_estimators_enabled = True
+            self.nodes = sub.nodes
+            self.ac_nodes = []
+            self.dc_nodes = sub.nodes
+            self.dc_node_by_name = sub.node_by_name
+            self.dc_branch_by_name = sub.branch_by_name
+            self.dc_generator_by_name = sub.generator_by_name
+            self.dc_load_by_name = sub.load_by_name
+            self.dc_switch_by_name = sub.switch_by_name
+            self.dc_break_by_name = sub.break_by_name
+            self.dc_zero_branch_by_name = sub.zero_branch_by_name
+            self.dcdc_by_name = sub.dcdc_by_name
+            self.dc_reference_nodes = getattr(sub, "references", [])
+            self.dc_node_voltage_measurements = sub.node_voltage_measurements
+            self.dc_node_degrees = sub.node_degrees
+            dc_calc = self.calc.dc_calc
+            self.dc_voltage_state_col = np.full(dc_calc.N, -1, dtype=np.int32)
+            for node in sub.nodes:
+                h_node = self.dc_node_by_name.get(node.name)
+                if h_node is None or h_node.idx not in dc_calc.alive_node_dict or node.idx not in sub.node_pos:
+                    continue
+                h_pos = int(dc_calc.alive_node_dict[h_node.idx])
+                s_pos = int(sub.node_pos[node.idx])
+                self.dc_voltage_state_col[h_pos] = int(sub.voltage_col[s_pos])
+            self.measurements = sub.measurements
+            self.active_measurements = sub.active_measurements
+            self.active_z = sub.active_z
+            self.active_weight = sub.active_weight
+            self.active_angle_residual_mask = angle_residual_mask(self.active_measurements)
+            self.state_labels = sub.state_labels
+            self.n_state = sub.n_state
+            self.voltage_cols = getattr(sub, "voltage_cols", np.array([], dtype=np.int32))
+            self.power_flow_state = sub.initial_state()
+            self.flat_state = sub.initial_state()
+            self.targeted_observability_pseudo_count = sub.targeted_observability_pseudo_count
+            return True
+
+        return False
+
+    def _delegate(self):
+        return getattr(self, "_delegate_estimator", None) if getattr(self, "_sub_estimators_enabled", False) else None
+
+    def _build_ac_state_adapter(self, sub: ACStateEstimator) -> None:
+        """Reuse the canonical AC estimator layout for pure-AC delegation."""
+        self.ac_state_layout = sub.state_layout()
+        self.ac_node_by_idx = {node.idx: node for node in self.ac_nodes}
+        self.ac_node_voltage_measurements = self._ac_node_voltage_measurements()
+        self.ac_node_degrees = self._ac_node_incident_degrees()
+        self.ac_reference_nodes = self._select_ac_reference_nodes()
+        self.ac_reference_angle_by_pos = self._ac_reference_angle_offsets()
+        self.ac_theta_state_col, self.ac_voltage_state_col = sub.state_cols_for_nodes(self.ac_nodes)
+        self.ac_state_labels = list(sub.state_labels)
+        self.ac_n_state = int(sub.n_state)
+        self.ac_delegate_angle_delta_by_pos = self._build_ac_delegate_angle_delta(sub)
+
+    def _build_ac_delegate_angle_delta(self, sub: ACStateEstimator) -> Dict[int, float]:
+        """Map AC node positions from the delegate frame back to the hybrid reference frame."""
+        if self.calc.ac_calc is None:
+            return {}
+        ac = self.calc.ac_calc
+        theta, _voltage = sub._unpack_state(sub.initial_state())
+        delta_by_pos: Dict[int, float] = {}
+        for island in self.network.ac.islands:
+            if not getattr(island, "is_alive", False):
+                continue
+            candidate = next((node for node in island.buses if node.idx in self.ac_node_by_name), None)
+            if candidate is None:
+                continue
+            h_node = self.ac_node_by_name[candidate.name]
+            if h_node.idx not in ac.node_pos or candidate.idx not in sub.node_pos:
+                continue
+            h_pos = int(ac.node_pos[h_node.idx])
+            s_pos = int(sub.node_pos[candidate.idx])
+            delta = float(self.power_flow_x[int(ac.theta_idx[h_pos])]) - float(theta[s_pos])
+            for node in island.buses:
+                if node.idx in ac.node_pos:
+                    delta_by_pos[int(ac.node_pos[node.idx])] = delta
+        return delta_by_pos
+
+    @staticmethod
+    def _dc_sub_state_label_to_hybrid(label: str) -> str:
+        prefix, name = label.split(":", 1)
+        prefix_map = {
+            "V": "DC_V",
+            "I_ZERO": "DC_I",
+            "I_BREAK": "DC_I",
+            "P_DCDC_FROM": "DCDC_P_FROM",
+            "P_DCDC_TO": "DCDC_P_TO",
+            "P_VGEN": "DC_VGEN_P",
+        }
+        return f"{prefix_map.get(prefix, prefix)}:{name}"
+
+    @staticmethod
+    def _measurement_key(meas: Measurement) -> Tuple[str, str, str]:
+        return (meas.device_type, meas.device_name, meas.meas_type)
+
+    def _build_sub_estimator_composition_maps(self) -> None:
+        """Map reusable subsystem estimator rows/columns into the hybrid state space."""
+        self._dc_sub_to_hybrid_cols = np.array([], dtype=np.int32)
+        self._active_dc_sub_measurements: List[Measurement] = []
+        self._active_dc_sub_rows = np.array([], dtype=np.int32)
+        self._active_dc_hybrid_rows = np.array([], dtype=np.int32)
+        self._active_dc_delegated_row_mask = np.zeros(len(getattr(self, "active_measurements", [])), dtype=bool)
+        dc_sub = getattr(self, "_dc_sub_estimator", None)
+        if dc_sub is None or self._delegate() is not None:
+            return
+
+        hybrid_col_by_label = {label: idx for idx, label in enumerate(self.state_labels)}
+        mapped_cols = []
+        for label in dc_sub.state_labels:
+            mapped_cols.append(hybrid_col_by_label.get(self._dc_sub_state_label_to_hybrid(label), -1))
+        mapped_cols = np.asarray(mapped_cols, dtype=np.int32)
+        if mapped_cols.size != dc_sub.n_state or np.any(mapped_cols < 0):
+            return
+
+        sub_rows_by_key: Dict[Tuple[str, str, str], List[int]] = {}
+        for row, meas in enumerate(dc_sub.active_measurements):
+            sub_rows_by_key.setdefault(self._measurement_key(meas), []).append(row)
+
+        hybrid_rows: List[int] = []
+        sub_rows: List[int] = []
+        sub_measurements: List[Measurement] = []
+        for h_row, meas in enumerate(self.active_measurements):
+            rows = sub_rows_by_key.get(self._measurement_key(meas))
+            if not rows:
+                continue
+            sub_row = rows.pop(0)
+            hybrid_rows.append(h_row)
+            sub_rows.append(sub_row)
+            sub_measurements.append(dc_sub.active_measurements[sub_row])
+
+        if not hybrid_rows:
+            return
+        self._dc_sub_to_hybrid_cols = mapped_cols
+        self._active_dc_sub_measurements = sub_measurements
+        self._active_dc_sub_rows = np.asarray(sub_rows, dtype=np.int32)
+        self._active_dc_hybrid_rows = np.asarray(hybrid_rows, dtype=np.int32)
+        self._active_dc_delegated_row_mask = np.zeros(len(self.active_measurements), dtype=bool)
+        self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
+
     def _refresh_active_measurement_state_layout(self) -> None:
         """Rebuild active measurement arrays and all indexes that depend on them."""
         self.active_measurements = [m for m in self.measurements if m.valid and m.weight > 0.0]
@@ -186,6 +407,7 @@ class HybridStateEstimator:
         self.active_z = np.fromiter((m.value for m in self.active_measurements), dtype=np.float64)
         self.active_weight = np.fromiter((m.weight for m in self.active_measurements), dtype=np.float64)
         self.active_angle_residual_mask = angle_residual_mask(self.active_measurements)
+        self._build_sub_estimator_composition_maps()
         self._build_derivative_caches()
         self._build_static_jacobian_index()
         self._build_evaluation_index()
@@ -2866,7 +3088,14 @@ class HybridStateEstimator:
 
     def _evaluate_active_measurements(self, x: np.ndarray) -> np.ndarray:
         if self._active_eval_fast_supported:
-            return self._evaluate_active_measurements_fast(x)
+            values = self._evaluate_active_measurements_fast(x)
+            dc_sub_x = self._dc_sub_state_from_hybrid(x)
+            if dc_sub_x is not None and self._active_dc_hybrid_rows.size:
+                values[self._active_dc_hybrid_rows] = self._dc_sub_estimator.evaluate(
+                    dc_sub_x,
+                    self._active_dc_sub_measurements,
+                )
+            return values
         self._write_state(x)
         values = np.zeros(len(self.active_measurements), dtype=np.float64)
         fill = self._fill_values
@@ -3241,6 +3470,37 @@ class HybridStateEstimator:
 
     def _expand_state(self, x: np.ndarray) -> np.ndarray:
         """Expand WLS state variables back to the full hybrid Newton vector layout."""
+        delegate = self._delegate()
+        if delegate is not None:
+            full = self.power_flow_x.copy()
+            if delegate is self._ac_sub_estimator and self.calc.ac_calc is not None:
+                theta, voltage = delegate._unpack_state(np.asarray(x, dtype=np.float64))
+                ac = self.calc.ac_calc
+                for node in delegate.nodes:
+                    h_node = self.ac_node_by_name.get(node.name)
+                    if h_node is None or h_node.idx not in ac.node_pos or node.idx not in delegate.node_pos:
+                        continue
+                    h_pos = int(ac.node_pos[h_node.idx])
+                    s_pos = int(delegate.node_pos[node.idx])
+                    if h_pos in ac.theta_idx:
+                        full[int(ac.theta_idx[h_pos])] = theta[s_pos]
+                    if h_pos in ac.V_idx:
+                        full[int(ac.n_theta + ac.V_idx[h_pos])] = voltage[s_pos]
+                return full
+            if delegate is self._dc_sub_estimator and self.calc.dc_calc is not None:
+                state = np.asarray(x, dtype=np.float64)
+                dc = self.calc.dc_calc
+                dc_start = self.calc.ac_size
+                for node in delegate.nodes:
+                    h_node = self.dc_node_by_name.get(node.name)
+                    if h_node is None or h_node.idx not in dc.alive_node_dict or node.idx not in delegate.node_pos:
+                        continue
+                    h_pos = int(dc.alive_node_dict[h_node.idx])
+                    s_pos = int(delegate.node_pos[node.idx])
+                    col = int(delegate.voltage_col[s_pos]) if hasattr(delegate, "voltage_col") else s_pos
+                    if col >= 0:
+                        full[dc_start + h_pos] = state[col]
+                return full
         full = self.power_flow_x.copy()
         if self.mapped_state_cols.size:
             full[self.mapped_full_cols] = x[self.mapped_state_cols]
@@ -3275,6 +3535,9 @@ class HybridStateEstimator:
         Zero-branch currents are read directly from the compact estimator state, so
         the least-squares phi reconstruction in _expand_state would be wasted work.
         """
+        delegate = self._delegate()
+        if delegate is not None:
+            return self._expand_state(x)
         full = self.power_flow_x.copy()
         if self.mapped_state_cols.size:
             full[self.mapped_full_cols] = x[self.mapped_state_cols]
@@ -3286,7 +3549,33 @@ class HybridStateEstimator:
         self._apply_virtual_ac_specs(x)
         return full
 
+    def _dc_sub_state_from_hybrid(self, x: np.ndarray) -> Optional[np.ndarray]:
+        cols = getattr(self, "_dc_sub_to_hybrid_cols", np.array([], dtype=np.int32))
+        dc_sub = getattr(self, "_dc_sub_estimator", None)
+        if dc_sub is None or cols.size != dc_sub.n_state or np.any(cols < 0):
+            return None
+        return np.asarray(x, dtype=np.float64)[cols]
+
+    def _append_dc_sub_jacobian(self, H: SparseJacobianBuilder, x: np.ndarray) -> None:
+        """Append reusable DC subsystem rows from DCStateEstimator into hybrid H."""
+        if not getattr(self, "_active_dc_sub_measurements", None):
+            return
+        dc_sub_x = self._dc_sub_state_from_hybrid(x)
+        if dc_sub_x is None:
+            return
+        sub_h = self._dc_sub_estimator.jacobian_sparse(dc_sub_x, self._active_dc_sub_measurements).tocoo()
+        if sub_h.nnz == 0:
+            return
+        H._append_arrays(
+            self._active_dc_hybrid_rows[sub_h.row.astype(np.int32, copy=False)],
+            self._dc_sub_to_hybrid_cols[sub_h.col.astype(np.int32, copy=False)],
+            sub_h.data.astype(np.float64, copy=False),
+        )
+
     def initial_state(self) -> np.ndarray:
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.initial_state()
         return self.flat_state.copy() if self.flat_start else self.power_flow_state.copy()
 
     def _write_state(self, x: np.ndarray) -> None:
@@ -3406,6 +3695,7 @@ class HybridStateEstimator:
         ac_voltage: Optional[np.ndarray],
         ac_voltage_complex: Optional[np.ndarray],
         dc_voltage: Optional[np.ndarray],
+        delegated_row_mask: Optional[np.ndarray] = None,
     ) -> None:
         """Append vectorized dynamic Jacobian rows for simple DC/converter measurements."""
         if ac_theta is not None and ac_voltage is not None and self._jac_ac_branch_power_rows.size:
@@ -3565,34 +3855,75 @@ class HybridStateEstimator:
 
         if dc_voltage is not None and self._jac_dc_branch_power_rows.size:
             rows = self._jac_dc_branch_power_rows
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if not np.any(keep):
+                rows = rows[:0]
+            else:
+                rows = rows[keep]
             vi = dc_voltage[self._jac_dc_branch_power_i_pos]
             vj = dc_voltage[self._jac_dc_branch_power_j_pos]
             g = self._jac_dc_branch_power_g
             is_from = self._jac_dc_branch_power_from
+            if delegated_row_mask is not None and rows.size:
+                vi = vi[keep]
+                vj = vj[keep]
+                g = g[keep]
+                is_from = is_from[keep]
+                i_col = self._jac_dc_branch_power_i_col[keep]
+                j_col = self._jac_dc_branch_power_j_col[keep]
+            else:
+                i_col = self._jac_dc_branch_power_i_col
+                j_col = self._jac_dc_branch_power_j_col
             d_i = np.where(is_from, (2.0 * vi - vj) * g, -vj * g)
             d_j = np.where(is_from, -vi * g, (-vi + 2.0 * vj) * g)
             H._append_arrays(
                 np.repeat(rows, 2),
-                np.column_stack((self._jac_dc_branch_power_i_col, self._jac_dc_branch_power_j_col)).ravel(),
+                np.column_stack((i_col, j_col)).ravel(),
                 np.column_stack((d_i, d_j)).ravel(),
             )
 
         if dc_voltage is not None and self._jac_dc_zero_power_rows.size:
             rows = self._jac_dc_zero_power_rows
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if not np.any(keep):
+                rows = rows[:0]
+            else:
+                rows = rows[keep]
             sign = self._jac_dc_zero_power_sign
-            current = x[self._jac_dc_zero_power_i_col]
-            voltage = dc_voltage[self._jac_dc_zero_power_v_pos]
+            i_col = self._jac_dc_zero_power_i_col
+            v_pos = self._jac_dc_zero_power_v_pos
+            v_col = self._jac_dc_zero_power_v_col
+            if delegated_row_mask is not None and rows.size:
+                sign = sign[keep]
+                i_col = i_col[keep]
+                v_pos = v_pos[keep]
+                v_col = v_col[keep]
+            current = x[i_col]
+            voltage = dc_voltage[v_pos]
             H._append_arrays(
                 np.repeat(rows, 2),
-                np.column_stack((self._jac_dc_zero_power_v_col, self._jac_dc_zero_power_i_col)).ravel(),
+                np.column_stack((v_col, i_col)).ravel(),
                 np.column_stack((sign * current, sign * voltage)).ravel(),
             )
 
         if dc_voltage is not None and self._jac_dcdc_current_rows.size:
             rows = self._jac_dcdc_current_rows
-            p_col = self._jac_dcdc_current_p_col
-            v_col = self._jac_dcdc_current_v_col
-            voltage = dc_voltage[self._jac_dcdc_current_v_pos]
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if not np.any(keep):
+                rows = rows[:0]
+                p_col = self._jac_dcdc_current_p_col[:0]
+                v_col = self._jac_dcdc_current_v_col[:0]
+                v_pos = self._jac_dcdc_current_v_pos[:0]
+            elif delegated_row_mask is not None:
+                rows = rows[keep]
+                p_col = self._jac_dcdc_current_p_col[keep]
+                v_col = self._jac_dcdc_current_v_col[keep]
+                v_pos = self._jac_dcdc_current_v_pos[keep]
+            else:
+                p_col = self._jac_dcdc_current_p_col
+                v_col = self._jac_dcdc_current_v_col
+                v_pos = self._jac_dcdc_current_v_pos
+            voltage = dc_voltage[v_pos]
             valid = np.abs(voltage) > self.min_current_voltage
             if np.any(valid):
                 p = x[p_col[valid]]
@@ -3647,36 +3978,53 @@ class HybridStateEstimator:
 
         if dc_voltage is not None and self._jac_dc_load_rows.size:
             rows = self._jac_dc_load_rows
-            voltage = dc_voltage[self._jac_dc_load_v_pos]
-            values = np.where(
-                self._jac_dc_load_kind == 0,
-                self._jac_dc_load_pv1 + 2.0 * self._jac_dc_load_pv2 * voltage,
-                self._jac_dc_load_pv2 - self._jac_dc_load_pv0 / (voltage * voltage),
-            )
-            H.add_many(rows, self._jac_dc_load_v_col, values)
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                voltage = dc_voltage[self._jac_dc_load_v_pos[keep]]
+                kind = self._jac_dc_load_kind[keep]
+                v_col = self._jac_dc_load_v_col[keep]
+                pv0 = self._jac_dc_load_pv0[keep]
+                pv1 = self._jac_dc_load_pv1[keep]
+                pv2 = self._jac_dc_load_pv2[keep]
+                values = np.where(
+                    kind == 0,
+                    pv1 + 2.0 * pv2 * voltage,
+                    pv2 - pv0 / (voltage * voltage),
+                )
+                H.add_many(rows, v_col, values)
 
         if dc_voltage is not None and self._jac_dc_gen_i_v_rows.size:
             rows = self._jac_dc_gen_i_v_rows
-            p_col = self._jac_dc_gen_i_v_p_col
-            v_col = self._jac_dc_gen_i_v_v_col
-            voltage = dc_voltage[self._jac_dc_gen_i_v_v_pos]
-            valid = np.abs(voltage) > self.min_current_voltage
-            if np.any(valid):
-                p = x[p_col[valid]]
-                v = voltage[valid]
-                H._append_arrays(
-                    np.repeat(rows[valid], 2),
-                    np.column_stack((p_col[valid], v_col[valid])).ravel(),
-                    np.column_stack((1.0 / v, -p / (v * v))).ravel(),
-                )
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                rows = rows[keep]
+                p_col = self._jac_dc_gen_i_v_p_col[keep]
+                v_col = self._jac_dc_gen_i_v_v_col[keep]
+                voltage = dc_voltage[self._jac_dc_gen_i_v_v_pos[keep]]
+                valid = np.abs(voltage) > self.min_current_voltage
+                if np.any(valid):
+                    p = x[p_col[valid]]
+                    v = voltage[valid]
+                    H._append_arrays(
+                        np.repeat(rows[valid], 2),
+                        np.column_stack((p_col[valid], v_col[valid])).ravel(),
+                        np.column_stack((1.0 / v, -p / (v * v))).ravel(),
+                    )
 
         if dc_voltage is not None and self._jac_dc_gen_i_p_rows.size:
-            voltage = dc_voltage[self._jac_dc_gen_i_p_v_pos]
-            values = -self._jac_dc_gen_i_p_p / (voltage * voltage)
-            H.add_many(self._jac_dc_gen_i_p_rows, self._jac_dc_gen_i_p_v_col, values)
+            rows = self._jac_dc_gen_i_p_rows
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                voltage = dc_voltage[self._jac_dc_gen_i_p_v_pos[keep]]
+                values = -self._jac_dc_gen_i_p_p[keep] / (voltage * voltage)
+                H.add_many(rows[keep], self._jac_dc_gen_i_p_v_col[keep], values)
 
         if self._jac_dc_gen_p_i_rows.size:
-            H.add_many(self._jac_dc_gen_p_i_rows, self._jac_dc_gen_p_i_v_col, self._jac_dc_gen_p_i_i)
+            rows = self._jac_dc_gen_p_i_rows
+            keep = np.ones(rows.size, dtype=bool) if delegated_row_mask is None else ~delegated_row_mask[rows]
+            if np.any(keep):
+                H.add_many(rows[keep], self._jac_dc_gen_p_i_v_col[keep], self._jac_dc_gen_p_i_i[keep])
 
     @staticmethod
     def _append_sparse_rows_from_template(
@@ -4455,6 +4803,9 @@ class HybridStateEstimator:
 
     def evaluate(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
         """Evaluate h(x) for AC, DC and converter measurements in one pass."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.evaluate(x, measurements)
         if measurements is None:
             measurements = self.active_measurements
         elif measurements is not self.active_measurements:
@@ -4621,16 +4972,33 @@ class HybridStateEstimator:
             if sparse
             else np.zeros((len(measurements), self.n_state), dtype=np.float64)
         )
+        dc_delegated_mask = (
+            self._active_dc_delegated_row_mask
+            if active_sparse and getattr(self, "_active_dc_hybrid_rows", np.array([], dtype=np.int32)).size
+            else None
+        )
         static_skip = None
         if active_sparse:
-            static_skip = self._jacobian_static_skip
+            static_skip = self._jacobian_static_skip.copy() if dc_delegated_mask is not None else self._jacobian_static_skip
+            if dc_delegated_mask is not None:
+                static_skip[dc_delegated_mask] = True
             if self._jacobian_static_rows.size:
-                H._append_arrays(
-                    self._jacobian_static_rows,
-                    self._jacobian_static_cols,
-                    self._jacobian_static_data,
-                )
-            self._append_fast_dynamic_jacobian(H, x, ac_theta, ac_V, ac_Vc, dc_V)
+                if dc_delegated_mask is None:
+                    H._append_arrays(
+                        self._jacobian_static_rows,
+                        self._jacobian_static_cols,
+                        self._jacobian_static_data,
+                    )
+                else:
+                    keep_static = ~dc_delegated_mask[self._jacobian_static_rows]
+                    H._append_arrays(
+                        self._jacobian_static_rows[keep_static],
+                        self._jacobian_static_cols[keep_static],
+                        self._jacobian_static_data[keep_static],
+                    )
+            self._append_fast_dynamic_jacobian(H, x, ac_theta, ac_V, ac_Vc, dc_V, dc_delegated_mask)
+            if dc_delegated_mask is not None:
+                self._append_dc_sub_jacobian(H, x)
             if ac is not None and self._jac_ac_generator_items:
                 if ac_p_load_dv is None or ac_q_load_dv is None:
                     ac_p_load_dv, ac_q_load_dv = self._ac_load_power_derivatives(ac_V)
@@ -5092,10 +5460,16 @@ class HybridStateEstimator:
 
     def jacobian(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
         """Build the compact hybrid measurement Jacobian as a dense array."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.jacobian(x, measurements)
         return self._assemble_jacobian(x, measurements, sparse=False)
 
     def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None):
         """Build the compact hybrid measurement Jacobian directly as sparse CSR."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.jacobian_sparse(x, measurements)
         return self._assemble_jacobian(x, measurements, sparse=True)
 
     def observability_analysis(
@@ -5107,6 +5481,15 @@ class HybridStateEstimator:
         normal_factor_diag: Optional[np.ndarray] = None,
     ) -> ObservabilityResult:
         """Rank-test the hybrid measurement Jacobian and report weak state directions."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.observability_analysis(
+                x=x,
+                measurements=measurements,
+                H=H,
+                normal_matrix=normal_matrix,
+                normal_factor_diag=normal_factor_diag,
+            )
         x = self.initial_state() if x is None else x
         measurements = self.active_measurements if measurements is None else list(measurements)
         H = self.jacobian_sparse(x, measurements) if H is None else H
@@ -5147,6 +5530,14 @@ class HybridStateEstimator:
         verbose: bool = False,
     ) -> EstimateResult:
         """Run damped WLS on the compact hybrid state vector."""
+        delegate = self._delegate()
+        if delegate is not None:
+            try:
+                result = delegate.estimate(measurements=measurements, x0=x0, verbose=verbose, final_diagnostics=False)
+            except TypeError:
+                result = delegate.estimate(measurements=measurements, x0=x0, verbose=verbose)
+            self._sync_from_delegate()
+            return result
         measurements = self.active_measurements if measurements is None else list(measurements)
         if len(measurements) < self.n_state:
             raise RuntimeError(f"Not enough valid measurements: {len(measurements)} < {self.n_state}")
@@ -5293,8 +5684,28 @@ class HybridStateEstimator:
             observability=observability,
         )
 
+    def _sync_from_delegate(self) -> None:
+        delegate = self._delegate()
+        if delegate is None:
+            return
+        self.measurements = delegate.measurements
+        self.active_measurements = delegate.active_measurements
+        self.active_z = delegate.active_z
+        self.active_weight = delegate.active_weight
+        self.active_angle_residual_mask = getattr(delegate, "active_angle_residual_mask", angle_residual_mask(self.active_measurements))
+        self.state_labels = delegate.state_labels
+        self.n_state = delegate.n_state
+        self.voltage_cols = getattr(delegate, "voltage_cols", np.array([], dtype=np.int32))
+        if hasattr(delegate, "power_flow_state"):
+            self.power_flow_state = delegate.power_flow_state.copy()
+        if hasattr(delegate, "flat_state"):
+            self.flat_state = delegate.flat_state.copy()
+
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
         """Flag hybrid measurements with normalized residuals above threshold."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.identify_bad_data(result, threshold)
         threshold = self.params.bad_threshold if threshold is None else threshold
         weights = np.asarray([meas.weight for meas in result.measurements], dtype=np.float64)
         R_diag = 1.0 / weights
@@ -5327,6 +5738,9 @@ class HybridStateEstimator:
         max_remove: Optional[int] = None,
         verbose: bool = False,
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.estimate_with_bad_data_removal(threshold=threshold, max_remove=max_remove, verbose=verbose)
         threshold = self.params.bad_threshold if threshold is None else threshold
         max_remove = self.params.max_remove if max_remove is None else max_remove
         measurements = list(self.active_measurements)
@@ -5346,9 +5760,18 @@ class HybridStateEstimator:
         return result, removed
 
     def apply_state(self, x: np.ndarray) -> None:
+        delegate = self._delegate()
+        if delegate is not None:
+            delegate.apply_state(x)
+            self._sync_from_delegate()
+            return
         self._write_state(x)
 
     def print_state(self, x: np.ndarray, limit: int = 20) -> None:
+        delegate = self._delegate()
+        if delegate is not None:
+            delegate.print_state(x, limit=limit)
+            return
         self._write_state(x)
         print("Estimated AC node states:")
         for node in self.ac_nodes[:limit]:

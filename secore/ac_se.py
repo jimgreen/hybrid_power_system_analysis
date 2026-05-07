@@ -2681,6 +2681,28 @@ class ACStateEstimator:
         """Pack the E-file voltage/angle snapshot in the selected reference frame."""
         return self._pack_state(self.file_theta, self.file_voltage, rebase_angles=True)
 
+    def state_layout(self) -> Dict[str, object]:
+        """Expose the canonical AC state layout for reuse by hybrid orchestration."""
+        return {
+            "state_labels": self.state_labels,
+            "angle_col": self.angle_col,
+            "voltage_col": self.voltage_col,
+            "n_state": self.n_state,
+            "references": self.references,
+        }
+
+    def state_cols_for_nodes(self, nodes) -> Tuple[np.ndarray, np.ndarray]:
+        """Return theta/voltage state columns for the given AC nodes."""
+        theta_cols = np.full(len(nodes), -1, dtype=np.int32)
+        voltage_cols = np.full(len(nodes), -1, dtype=np.int32)
+        for idx, node in enumerate(nodes):
+            pos = self.node_pos.get(node.idx)
+            if pos is None:
+                continue
+            theta_cols[idx] = int(self.angle_col[int(pos)])
+            voltage_cols[idx] = int(self.voltage_col[int(pos)])
+        return theta_cols, voltage_cols
+
     def _pack_state(
         self,
         theta: np.ndarray,

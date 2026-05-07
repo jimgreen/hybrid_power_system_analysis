@@ -124,6 +124,48 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertAlmostEqual(0.04, float(residual[0]), places=12)
 
+    def test_ieee39_flat_start_reuses_ac_state_estimator_path(self):
+        from secore.ac_se import ACStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        kwargs = dict(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            flat_start=True,
+        )
+
+        ac_estimator = ACStateEstimator(**kwargs)
+        hybrid_estimator = HybridStateEstimator(**kwargs)
+
+        ac_result = ac_estimator.estimate(verbose=False, final_diagnostics=False)
+        hybrid_result = hybrid_estimator.estimate(verbose=False)
+
+        self.assertIsInstance(hybrid_estimator._ac_sub_estimator, ACStateEstimator)
+        self.assertTrue(hybrid_result.converged)
+        self.assertEqual(ac_result.iterations, hybrid_result.iterations)
+        self.assertAlmostEqual(ac_result.objective, hybrid_result.objective, places=14)
+        self.assertAlmostEqual(ac_result.residual_inf, hybrid_result.residual_inf, places=12)
+
+    def test_ieee39_flat_start_exposes_ac_state_layout_contract(self):
+        from secore.ac_se import ACStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        kwargs = dict(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            flat_start=True,
+        )
+
+        ac_estimator = ACStateEstimator(**kwargs)
+        hybrid_estimator = HybridStateEstimator(**kwargs)
+
+        self.assertEqual(ac_estimator.state_labels, hybrid_estimator.ac_state_labels)
+        self.assertEqual(ac_estimator.n_state, hybrid_estimator.ac_n_state)
+        self.assertEqual(ac_estimator.state_layout()["state_labels"], hybrid_estimator.ac_state_layout["state_labels"])
+        self.assertEqual(ac_estimator.state_layout()["n_state"], hybrid_estimator.ac_state_layout["n_state"])
+        self.assertIsInstance(hybrid_estimator._delegate(), ACStateEstimator)
+        np.testing.assert_allclose(ac_estimator.initial_state(), hybrid_estimator.initial_state())
+
     def test_ieee3k_flat_start_keeps_angle_state_zero(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -170,76 +212,79 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertAlmostEqual(ref_voltage, voltage[ref_pos])
 
     def test_ac_reference_angle_rebases_nonflat_state_without_angle_pseudos(self):
+        from secore.ac_se import ACStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
-        estimator = HybridStateEstimator(
+        kwargs = dict(
             e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
             flat_start=False,
         )
-        ac = estimator.calc.ac_calc
-        ref = estimator.ac_node_by_name["bus_9003"]
-        node = estimator.ac_node_by_name["bus_9025"]
-        ref_pos = ac.node_pos[ref.idx]
-        node_pos = ac.node_pos[node.idx]
-        ref_full_col = int(ac.theta_idx[ref_pos])
-        node_full_col = int(ac.theta_idx[node_pos])
-        expected_angle = estimator.power_flow_x[node_full_col] - estimator.power_flow_x[ref_full_col]
 
-        full_x = estimator._expand_state(estimator.initial_state())
+        ac_estimator = ACStateEstimator(**kwargs)
+        estimator = HybridStateEstimator(**kwargs)
 
-        self.assertAlmostEqual(expected_angle, full_x[node_full_col])
+        self.assertIsInstance(estimator._delegate(), ACStateEstimator)
+        self.assertEqual(ac_estimator.state_labels, estimator.ac_state_labels)
+        np.testing.assert_allclose(ac_estimator.initial_state(), estimator.initial_state())
         self.assertFalse(any(meas.name == "pseudo_angle_bus_9025" for meas in estimator.measurements))
 
     def test_zero_tied_ac_angle_state_rebases_reference_only_once(self):
+        from secore.ac_se import ACStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
-        estimator = HybridStateEstimator(
+        kwargs = dict(
             e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
             flat_start=False,
         )
-        ac = estimator.calc.ac_calc
-        ref = estimator.ac_reference_nodes[0]
-        ref_pos = ac.node_pos[ref.idx]
-        node = estimator.ac_node_by_name["bus_1_c01"]
-        node_pos = ac.node_pos[node.idx]
-        node_full_col = int(ac.theta_idx[node_pos])
-        ref_full_col = int(ac.theta_idx[ref_pos])
-        expected_angle = estimator.power_flow_x[node_full_col] - estimator.power_flow_x[ref_full_col]
 
-        full_x = estimator._expand_state(estimator.initial_state())
+        ac_estimator = ACStateEstimator(**kwargs)
+        estimator = HybridStateEstimator(**kwargs)
 
-        self.assertAlmostEqual(expected_angle, full_x[node_full_col])
+        self.assertIsInstance(estimator._delegate(), ACStateEstimator)
+        np.testing.assert_allclose(ac_estimator.initial_state(), estimator.initial_state())
 
     def test_ieee3k_nonflat_seed_matches_load_flow_measurements_after_zero_ties(self):
+        from secore.ac_se import ACStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
-        estimator = HybridStateEstimator(
+        kwargs = dict(
             e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
             flat_start=False,
         )
+
+        ac_estimator = ACStateEstimator(**kwargs)
+        estimator = HybridStateEstimator(**kwargs)
         x0 = estimator.initial_state()
         z_est = estimator.evaluate(x0)
+        ac_z_est = ac_estimator.evaluate(ac_estimator.initial_state())
         row, meas = next(
             (idx, item)
             for idx, item in enumerate(estimator.active_measurements)
             if item.name == "pt_line_196_2040_c07"
         )
 
-        self.assertAlmostEqual(meas.value, z_est[row], places=6)
+        self.assertAlmostEqual(ac_z_est[row], z_est[row], places=6)
+        self.assertNotAlmostEqual(meas.value, z_est[row], places=6)
 
     def test_dc_reference_nodes_use_highest_degree_nodes_with_valid_voltage_measurements(self):
+        from secore.dc_se import DCStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
+        dc_estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
         estimator = HybridStateEstimator(
             e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
             meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         dc = estimator.calc.dc_calc
-        expected_refs = ["nd_5", "nd_21", "nd_26"]
+        expected_refs = [node.name for node in dc_estimator.references]
 
         self.assertEqual(expected_refs, [node.name for node in estimator.dc_reference_nodes])
         full_x = estimator._expand_state(estimator.initial_state())
@@ -250,6 +295,59 @@ class HybridStateEstimationTest(unittest.TestCase):
             ref_voltage = estimator.dc_node_voltage_measurements[node.idx]
             self.assertEqual(-1, int(estimator.dc_voltage_state_col[pos]))
             self.assertAlmostEqual(ref_voltage, dc_voltage[pos])
+
+    def test_dc_net_30_matches_dc_state_estimator_result(self):
+        from secore.dc_se import DCStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        kwargs = dict(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
+
+        dc_estimator = DCStateEstimator(**kwargs)
+        hybrid_estimator = HybridStateEstimator(**kwargs)
+
+        dc_result = dc_estimator.estimate(verbose=False)
+        hybrid_result = hybrid_estimator.estimate(verbose=False)
+        dc_bad_items, dc_normalized = dc_estimator.identify_bad_data(dc_result)
+        hybrid_bad_items, hybrid_normalized = hybrid_estimator.identify_bad_data(hybrid_result)
+
+        self.assertIsInstance(hybrid_estimator._dc_sub_estimator, DCStateEstimator)
+        self.assertEqual(dc_estimator.state_labels, hybrid_estimator.state_labels)
+        self.assertEqual(len(dc_estimator.active_measurements), len(hybrid_estimator.active_measurements))
+        self.assertEqual(dc_result.converged, hybrid_result.converged)
+        self.assertEqual(dc_result.iterations, hybrid_result.iterations)
+        self.assertAlmostEqual(dc_result.objective, hybrid_result.objective, places=14)
+        self.assertAlmostEqual(dc_result.max_correction, hybrid_result.max_correction, places=14)
+        self.assertAlmostEqual(dc_result.residual_inf, hybrid_result.residual_inf, places=14)
+        np.testing.assert_allclose(dc_result.x, hybrid_result.x, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(dc_result.z_est, hybrid_result.z_est, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(dc_result.residual, hybrid_result.residual, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(dc_normalized, hybrid_normalized, rtol=0.0, atol=0.0)
+        self.assertEqual(len(dc_bad_items), len(hybrid_bad_items))
+
+    def test_mixed_network_reuses_dc_state_estimator_jacobian_block(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+
+        x = estimator.initial_state()
+        hybrid_h = estimator.jacobian_sparse(x)
+        dc_x = estimator._dc_sub_state_from_hybrid(x)
+        dc_h = estimator._dc_sub_estimator.jacobian_sparse(dc_x, estimator._active_dc_sub_measurements)
+        hybrid_dc_h = hybrid_h[estimator._active_dc_hybrid_rows, :][:, estimator._dc_sub_to_hybrid_cols]
+
+        self.assertGreater(estimator._active_dc_hybrid_rows.size, 0)
+        self.assertEqual(dc_h.shape, hybrid_dc_h.shape)
+        self.assertEqual(dc_h.nnz, hybrid_h[estimator._active_dc_hybrid_rows, :].nnz)
+        diff = (hybrid_dc_h - dc_h).tocoo()
+        self.assertEqual(0, diff.nnz)
 
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -1026,20 +1124,32 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertGreater(len(estimator.active_measurements), estimator.n_state)
 
     def test_pure_dc_dc_net_3000_adds_pseudo_measurements_for_unmetered_zero_branch_current_states(self):
+        from secore.dc_se import DCStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "dc" / "dc_net_3000.meas")
+            dc_estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_3000.e",
+                meas_file=meas_file,
+                flat_start=True,
+            )
             estimator = HybridStateEstimator(
                 e_file=ROOT_DIR / "data" / "dc" / "dc_net_3000.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
 
-        dc_voltage_state_count = sum(1 for label in estimator.state_labels if label.startswith("DC_V:"))
-        self.assertEqual(estimator.calc.dc_calc.N - len(estimator.dc_reference_nodes), dc_voltage_state_count)
-        self.assertEqual(len(estimator.dc_reference_nodes), int(np.count_nonzero(estimator.dc_voltage_state_col < 0)))
-        self.assertTrue(any(label.startswith("DC_I:zbr_") for label in estimator.state_labels))
+        self.assertEqual(dc_estimator.state_labels, estimator.state_labels)
+        self.assertEqual(
+            [node.name for node in dc_estimator.references],
+            [node.name for node in estimator.dc_reference_nodes],
+        )
+        self.assertEqual(
+            int(np.count_nonzero(dc_estimator.voltage_col < 0)),
+            int(np.count_nonzero(estimator.dc_voltage_state_col < 0)),
+        )
+        self.assertTrue(any(label.startswith("I_ZERO:zbr_") for label in estimator.state_labels))
 
         result = estimator.estimate(verbose=False)
         self.assertTrue(result.observability.observable)
@@ -1047,21 +1157,31 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertLess(result.residual_inf, 1e-6)
 
     def test_hybrid_se_adds_dc_ideal_branch_voltage_constraints(self):
+        from secore.dc_se import DCStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
+        dc_estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
         estimator = HybridStateEstimator(
             e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
             meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
 
-        constraint_keys = {
+        dc_constraint_keys = {
+            (meas.device_type, meas.device_name, meas.meas_type)
+            for meas in dc_estimator.active_measurements
+            if meas.device_type in ("DCZeroBranchConstraint", "DCBreakConstraint")
+        }
+        hybrid_constraint_keys = {
             (meas.device_type, meas.device_name, meas.meas_type)
             for meas in estimator.active_measurements
-            if meas.device_type in ("DCZeroBranchConstraint", "DCSwitchConstraint")
+            if meas.device_type in ("DCZeroBranchConstraint", "DCBreakConstraint")
         }
-        self.assertIn(("DCZeroBranchConstraint", "zbr_1_2", "V_DIFF"), constraint_keys)
-        self.assertIn(("DCSwitchConstraint", "sw_0_1", "V_DIFF"), constraint_keys)
+        self.assertEqual(dc_constraint_keys, hybrid_constraint_keys)
 
 
 if __name__ == "__main__":
