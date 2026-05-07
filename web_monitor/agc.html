@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AGC在线监视</title>
+  <style>
+    :root {
+      --panel: rgba(13, 28, 48, 0.88);
+      --line: rgba(132, 178, 224, 0.2);
+      --text: #e8f2ff;
+      --muted: #8fa6bf;
+      --cyan: #36d7ff;
+      --green: #41e39b;
+      --yellow: #ffd166;
+      --red: #ff6b6b;
+      --blue: #4f8cff;
+      --shadow: 0 20px 70px rgba(0, 0, 0, 0.34);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+      background:
+        radial-gradient(circle at 16% 15%, rgba(65, 227, 155, 0.16), transparent 25%),
+        radial-gradient(circle at 84% 18%, rgba(255, 209, 102, 0.1), transparent 22%),
+        linear-gradient(135deg, #05101c 0%, #0b1728 52%, #06131d 100%);
+    }
+    a { color: inherit; text-decoration: none; }
+    .shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { padding: 24px 18px; border-right: 1px solid var(--line); background: rgba(5, 13, 24, 0.76); backdrop-filter: blur(18px); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .brand-mark { width: 42px; height: 42px; display: grid; place-items: center; border: 1px solid rgba(65, 227, 155, 0.52); border-radius: 8px; background: linear-gradient(145deg, rgba(65, 227, 155, 0.2), rgba(54, 215, 255, 0.1)); color: var(--green); font-weight: 800; }
+    .brand strong { display: block; font-size: 15px; }
+    .brand span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .nav { display: grid; gap: 10px; }
+    .nav a { padding: 12px 13px; border: 1px solid transparent; border-radius: 8px; color: #b9cbe0; font-size: 14px; }
+    .nav a.active, .nav a:hover { border-color: rgba(65, 227, 155, 0.3); background: rgba(65, 227, 155, 0.1); color: var(--text); }
+    .side-status { margin-top: 32px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: rgba(16, 36, 60, 0.56); }
+    .side-status small { color: var(--muted); }
+    .side-status strong { display: block; margin-top: 8px; color: var(--green); font-size: 24px; }
+    main { padding: 22px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
+    h1 { margin: 0; font-size: 28px; font-weight: 800; }
+    .subhead { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+    .clock { min-width: 232px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: rgba(13, 28, 48, 0.7); text-align: right; box-shadow: var(--shadow); }
+    .clock span { display: block; color: var(--muted); font-size: 12px; }
+    .clock strong { display: block; margin-top: 4px; font-size: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); overflow: hidden; }
+    .metric { grid-column: span 3; padding: 18px; min-height: 134px; }
+    .metric .label { color: var(--muted); font-size: 13px; }
+    .metric .value { margin-top: 14px; font-size: 32px; font-weight: 800; }
+    .metric .unit { color: var(--muted); font-size: 14px; font-weight: 500; }
+    .metric .delta { margin-top: 12px; font-size: 13px; color: var(--green); }
+    .section-title { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+    .section-title h2 { margin: 0; font-size: 16px; }
+    .section-title span { color: var(--muted); font-size: 12px; }
+    .dispatch { grid-column: span 7; min-height: 400px; }
+    .reserve { grid-column: span 5; min-height: 400px; }
+    .table-card { grid-column: span 8; }
+    .control-card { grid-column: span 4; }
+    .dispatch-body { height: 326px; padding: 24px 22px; display: grid; gap: 16px; }
+    .unit-row { display: grid; grid-template-columns: 86px minmax(0, 1fr) 76px; align-items: center; gap: 14px; color: #dceaff; font-size: 13px; }
+    .unit-row strong { font-size: 14px; }
+    .track { height: 16px; border-radius: 999px; background: rgba(132, 178, 224, 0.13); overflow: hidden; }
+    .fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--green), var(--cyan)); }
+    .reserve-body { padding: 22px 18px; }
+    .gauge { width: min(250px, 100%); aspect-ratio: 1; margin: 8px auto 20px; border-radius: 50%; display: grid; place-items: center; background: conic-gradient(var(--green) 0 72%, rgba(132, 178, 224, 0.13) 72% 100%); position: relative; }
+    .gauge::after { content: ""; position: absolute; inset: 18px; border-radius: 50%; background: #0d1c30; border: 1px solid var(--line); }
+    .gauge strong { position: relative; z-index: 1; font-size: 34px; }
+    .gauge span { position: relative; z-index: 1; display: block; color: var(--muted); font-size: 13px; text-align: center; }
+    .reserve-list { display: grid; gap: 12px; }
+    .reserve-item { display: flex; justify-content: space-between; color: #dceaff; font-size: 13px; }
+    .reserve-item span { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 13px 16px; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--muted); font-weight: 600; background: rgba(8, 20, 36, 0.46); }
+    td { color: #dceaff; }
+    .tag { display: inline-flex; align-items: center; min-width: 58px; justify-content: center; padding: 4px 8px; border-radius: 999px; border: 1px solid rgba(65, 227, 155, 0.38); color: var(--green); font-size: 12px; }
+    .tag.warn { border-color: rgba(255, 209, 102, 0.48); color: var(--yellow); }
+    .control-list { padding: 16px 18px 18px; display: grid; gap: 14px; }
+    .control-item { display: flex; justify-content: space-between; gap: 12px; color: #dceaff; font-size: 13px; }
+    .control-item span { color: var(--muted); }
+    @media (max-width: 980px) {
+      .shell { grid-template-columns: 1fr; }
+      .nav { grid-template-columns: repeat(3, 1fr); }
+      .metric, .dispatch, .reserve, .table-card, .control-card { grid-column: span 12; }
+      .topbar { align-items: flex-start; flex-direction: column; }
+      .clock { width: 100%; text-align: left; }
+    }
+    @media (max-width: 640px) {
+      main { padding: 16px; }
+      .nav { grid-template-columns: 1fr; }
+      .metric .value { font-size: 26px; }
+      .unit-row { grid-template-columns: 70px minmax(0, 1fr) 58px; gap: 10px; }
+      th, td { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">P</div><div><strong>电力监视中心</strong><span>Hybrid Power Console</span></div></div>
+      <nav class="nav">
+        <a href="index.html">系统首页</a>
+        <a href="simu.html">SIMU在线监视</a>
+        <a href="scada.html">SCADA在线监视</a>
+        <a class="active" href="agc.html">AGC在线监视</a>
+      </nav>
+      <div class="side-status"><small>控制闭环状态</small><strong>CLOSED</strong></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><h1>AGC在线监视</h1><p class="subhead">区域控制偏差、调节容量、机组指令和闭环控制状态实时总览</p></div>
+        <div class="clock"><span>系统时间</span><strong id="clock">--</strong></div>
+      </header>
+      <section class="grid">
+        <article class="card metric"><div class="label">ACE</div><div class="value" data-live="ace">-12.6 <span class="unit">MW</span></div><div class="delta">处于允许范围</div></article>
+        <article class="card metric"><div class="label">系统频率</div><div class="value" data-live="freq">50.01 <span class="unit">Hz</span></div><div class="delta">频率偏差 +0.01 Hz</div></article>
+        <article class="card metric"><div class="label">可调容量</div><div class="value" data-live="reserve">284 <span class="unit">MW</span></div><div class="delta">备用充足</div></article>
+        <article class="card metric"><div class="label">执行机组</div><div class="value" data-live="units">6 <span class="unit">台</span></div><div class="delta">1 台限幅运行</div></article>
+        <article class="card dispatch">
+          <div class="section-title"><h2>机组调节指令</h2><span>AGC dispatch</span></div>
+          <div class="dispatch-body">
+            <div class="unit-row"><strong>GEN-01</strong><div class="track"><div class="fill" style="width:74%"></div></div><span>148 MW</span></div>
+            <div class="unit-row"><strong>GEN-02</strong><div class="track"><div class="fill" style="width:61%"></div></div><span>122 MW</span></div>
+            <div class="unit-row"><strong>GEN-03</strong><div class="track"><div class="fill" style="width:83%"></div></div><span>166 MW</span></div>
+            <div class="unit-row"><strong>GEN-04</strong><div class="track"><div class="fill" style="width:52%"></div></div><span>104 MW</span></div>
+            <div class="unit-row"><strong>GEN-05</strong><div class="track"><div class="fill" style="width:69%"></div></div><span>138 MW</span></div>
+            <div class="unit-row"><strong>GEN-06</strong><div class="track"><div class="fill" style="width:44%"></div></div><span>88 MW</span></div>
+          </div>
+        </article>
+        <article class="card reserve">
+          <div class="section-title"><h2>调节性能</h2><span>CPS1</span></div>
+          <div class="reserve-body">
+            <div class="gauge"><div><strong>97.4</strong><span>控制性能</span></div></div>
+            <div class="reserve-list">
+              <div class="reserve-item"><span>上调备用</span><strong>164 MW</strong></div>
+              <div class="reserve-item"><span>下调备用</span><strong>120 MW</strong></div>
+              <div class="reserve-item"><span>平均响应</span><strong>8.2 s</strong></div>
+              <div class="reserve-item"><span>闭环周期</span><strong>4 s</strong></div>
+            </div>
+          </div>
+        </article>
+        <article class="card table-card">
+          <div class="section-title"><h2>AGC指令记录</h2><span>自动刷新</span></div>
+          <table>
+            <thead><tr><th>时间</th><th>对象</th><th>指令</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr><td>14:03:48</td><td>GEN-03</td><td>上调 4.5 MW</td><td><span class="tag">已执行</span></td></tr>
+              <tr><td>14:03:12</td><td>GEN-06</td><td>下调 2.0 MW</td><td><span class="tag">已执行</span></td></tr>
+              <tr><td>14:02:39</td><td>GEN-04</td><td>达到调节限幅</td><td><span class="tag warn">关注</span></td></tr>
+              <tr><td>14:01:58</td><td>AREA-A</td><td>ACE 回归死区</td><td><span class="tag">正常</span></td></tr>
+            </tbody>
+          </table>
+        </article>
+        <article class="card control-card">
+          <div class="section-title"><h2>控制摘要</h2><span>AGC</span></div>
+          <div class="control-list">
+            <div class="control-item"><span>控制模式</span><strong>定频率偏差</strong></div>
+            <div class="control-item"><span>死区</span><strong>±20 MW</strong></div>
+            <div class="control-item"><span>分配策略</span><strong>按速率优先</strong></div>
+            <div class="control-item"><span>指令校验</span><strong style="color:var(--green)">通过</strong></div>
+            <div class="control-item"><span>闭环状态</span><strong style="color:var(--green)">投入</strong></div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+  <script>
+    const clock = document.getElementById("clock");
+    function tick() {
+      const now = new Date();
+      clock.textContent = now.toLocaleString("zh-CN", { hour12: false });
+      const ace = -18 + Math.random() * 28;
+      const freq = 49.98 + Math.random() * 0.05;
+      document.querySelector('[data-live="ace"]').innerHTML = ace.toFixed(1) + ' <span class="unit">MW</span>';
+      document.querySelector('[data-live="freq"]').innerHTML = freq.toFixed(2) + ' <span class="unit">Hz</span>';
+      document.querySelector('[data-live="reserve"]').innerHTML = (270 + Math.floor(Math.random() * 28)) + ' <span class="unit">MW</span>';
+      document.querySelector('[data-live="units"]').innerHTML = (5 + Math.floor(Math.random() * 3)) + ' <span class="unit">台</span>';
+    }
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>
