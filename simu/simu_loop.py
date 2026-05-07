@@ -31,7 +31,6 @@ from update_meas_from_lf import (  # noqa: E402
     Snapshot,
     format_number,
     parse_measurement_rows,
-    render_measurement_file,
 )
 from ac_lf import ACPowerFlowCalc  # noqa: E402
 from ac_model import ACPowerNetwork  # noqa: E402
@@ -583,10 +582,27 @@ def add_noise_to_rows(rows: Sequence[Sequence[str]], noise_std: Optional[float],
     return noisy_rows
 
 
+def render_measurement_snapshot_aligned(before: Sequence[str], rows: Sequence[Sequence[str]], after: Sequence[str]) -> str:
+    widths = [len(header) for header in MEAS_HEADER]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(str(cell)))
+
+    parts: List[str] = []
+    parts.extend(line + "\n" for line in before if line)
+    parts.append("<Measurement>\n")
+    parts.append("@ " + "  ".join(f"{MEAS_HEADER[idx]:<{widths[idx]}}" for idx in range(len(MEAS_HEADER))).rstrip() + "\n")
+    for row in rows:
+        parts.append("# " + "  ".join(f"{str(cell):<{widths[idx]}}" for idx, cell in enumerate(row)).rstrip() + "\n")
+    parts.append("</Measurement>\n")
+    parts.extend(line + "\n" for line in after if line)
+    return "".join(parts)
+
+
 def write_measurement_snapshot(path: Path, before: Sequence[str], rows: Sequence[Sequence[str]], after: Sequence[str]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_measurement_file(before, rows, after), encoding="utf-8")
+    path.write_text(render_measurement_snapshot_aligned(before, rows, after), encoding="utf-8")
 
 
 def run_once(

@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -113,6 +114,32 @@ class SimulationLoopTest(unittest.TestCase):
         self.assertEqual(0, result.missing)
         self.assertIn("100", real_text)
         self.assertEqual(real_text, scada_text)
+
+    def test_measurement_snapshot_columns_align_header_and_rows(self):
+        from simu.simu_loop import write_measurement_snapshot
+
+        tmp = TMP_ROOT / "measurement_alignment"
+        tmp.mkdir(parents=True, exist_ok=True)
+        output = tmp / "real.e"
+
+        write_measurement_snapshot(
+            output,
+            [],
+            [
+                ["0", "vm_short", "ACNode", "bus_1", "V", "3.0", "1", "100"],
+                ["12", "p_long_measurement", "ACGenerator", "diesel_300kw", "P_GEN", "10.0", "0", "-123.456"],
+            ],
+            [],
+        )
+
+        lines = output.read_text(encoding="utf-8").splitlines()
+        header = next(line for line in lines if line.startswith("@"))
+        row = next(line for line in lines if line.startswith("#"))
+        header_starts = [match.start() for match in re.finditer(r"\S+", header)][1:]
+        row_starts = [match.start() for match in re.finditer(r"\S+", row)][1:]
+
+        self.assertEqual(header_starts, row_starts)
+        self.assertNotIn("\t", output.read_text(encoding="utf-8"))
 
     def test_simulate_once_interface_reads_files_and_writes_outputs(self):
         from simu.simu_loop import simulate_once
