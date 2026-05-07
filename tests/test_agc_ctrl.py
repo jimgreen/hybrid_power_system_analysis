@@ -1,0 +1,313 @@
+import logging
+import unittest
+from types import SimpleNamespace
+
+from agc import agc_ctrl
+
+
+class AGCControlTest(unittest.TestCase):
+    def test_device_p_step_overrides_global_default(self):
+        model = SimpleNamespace(para=[])
+        device = SimpleNamespace(p_ctrl=0.0, p_cur=0.0, p_step=7.0)
+
+        before, after = agc_ctrl._set_p_ctrl(model, device, 100.0, "renew", 0.0, 100.0)
+
+        self.assertEqual(before, 0.0)
+        self.assertEqual(after, 7.0)
+        self.assertEqual(device.p_ctrl, 7.0)
+
+    def test_storage_device_soc_dead_controls_charge_limit(self):
+        model = SimpleNamespace(para=[])
+        storage = SimpleNamespace(
+            name="storage",
+            run_stat=1,
+            p_ctrl=0.0,
+            p_cur=0.0,
+            soc_cur=96.0,
+            soc_min=10.0,
+            soc_max=100.0,
+            soc_dead=5.0,
+            charge_p_max=30.0,
+            dis_charge_p_max=30.0,
+        )
+        model.estorage = [storage]
+
+        remaining = agc_ctrl._charge_storage(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 20.0)
+        self.assertEqual(storage.p_ctrl, 0.0)
+
+    def test_storage_charge_prefers_low_soc(self):
+        low = SimpleNamespace(
+            name="low",
+            run_stat=1,
+            p_ctrl=0.0,
+            p_cur=0.0,
+            soc_cur=20.0,
+            soc_min=0.0,
+            soc_max=100.0,
+            charge_p_max=30.0,
+            dis_charge_p_max=30.0,
+        )
+        high = SimpleNamespace(
+            name="high",
+            run_stat=1,
+            p_ctrl=0.0,
+            p_cur=0.0,
+            soc_cur=80.0,
+            soc_min=0.0,
+            soc_max=100.0,
+            charge_p_max=30.0,
+            dis_charge_p_max=30.0,
+        )
+        model = SimpleNamespace(para=[], estorage=[high, low])
+
+        remaining = agc_ctrl._charge_storage(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 0.0)
+        self.assertEqual(low.p_ctrl, -20.0)
+        self.assertEqual(high.p_ctrl, 0.0)
+
+    def test_storage_discharge_prefers_high_soc(self):
+        low = SimpleNamespace(
+            name="low",
+            run_stat=1,
+            p_ctrl=0.0,
+            p_cur=0.0,
+            soc_cur=20.0,
+            soc_min=0.0,
+            soc_max=100.0,
+            charge_p_max=30.0,
+            dis_charge_p_max=30.0,
+        )
+        high = SimpleNamespace(
+            name="high",
+            run_stat=1,
+            p_ctrl=0.0,
+            p_cur=0.0,
+            soc_cur=80.0,
+            soc_min=0.0,
+            soc_max=100.0,
+            charge_p_max=30.0,
+            dis_charge_p_max=30.0,
+        )
+        model = SimpleNamespace(para=[], estorage=[low, high])
+
+        remaining = agc_ctrl._discharge_storage(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 0.0)
+        self.assertEqual(high.p_ctrl, 20.0)
+        self.assertEqual(low.p_ctrl, 0.0)
+
+    def test_diesel_device_deadband_keeps_existing_storage_when_inside_band(self):
+        model = SimpleNamespace(
+            para=[],
+            energyconsumer=[SimpleNamespace(p_fur=80.0, p_cur=80.0, run_stat=1)],
+            wind_generator=[],
+            pv_generator=[],
+            estorage=[
+                SimpleNamespace(
+                    name="storage",
+                    run_stat=1,
+                    p_ctrl=5.0,
+                    p_cur=5.0,
+                    soc_cur=50.0,
+                    soc_min=10.0,
+                    soc_max=100.0,
+                    charge_p_max=30.0,
+                    dis_charge_p_max=30.0,
+                )
+            ],
+            diesel_generator=[
+                SimpleNamespace(
+                    name="diesel",
+                    run_stat=1,
+                    p_ctrl=75.0,
+                    p_cur=75.0,
+                    p_min=80.0,
+                    p_max=200.0,
+                    p_dead=10.0,
+                )
+            ],
+        )
+
+        agc_ctrl._apply_diesel_min_output_coordination(logging.getLogger("test"), model)
+
+        self.assertEqual(model.diesel_generator[0].p_ctrl, 75.0)
+        self.assertEqual(model.estorage[0].p_ctrl, 5.0)
+
+    def test_storage_above_max_minus_deadband_does_not_charge(self):
+        model = SimpleNamespace(
+            para=[SimpleNamespace(name="STORAGE_SOC_DEADBAND", value="5.0")],
+            estorage=[
+                SimpleNamespace(
+                    name="storage",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    soc_cur=96.0,
+                    soc_min=10.0,
+                    soc_max=100.0,
+                    charge_p_max=30.0,
+                    dis_charge_p_max=30.0,
+                )
+            ],
+        )
+
+        remaining = agc_ctrl._charge_storage(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 20.0)
+        self.assertEqual(model.estorage[0].p_ctrl, 0.0)
+
+    def test_storage_below_min_plus_deadband_does_not_discharge(self):
+        model = SimpleNamespace(
+            para=[SimpleNamespace(name="STORAGE_SOC_DEADBAND", value="5.0")],
+            estorage=[
+                SimpleNamespace(
+                    name="storage",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    soc_cur=14.0,
+                    soc_min=10.0,
+                    soc_max=100.0,
+                    charge_p_max=30.0,
+                    dis_charge_p_max=30.0,
+                )
+            ],
+        )
+
+        remaining = agc_ctrl._discharge_storage(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 20.0)
+        self.assertEqual(model.estorage[0].p_ctrl, 0.0)
+
+    def test_forced_storage_charge_respects_soc_deadband(self):
+        model = SimpleNamespace(
+            para=[SimpleNamespace(name="STORAGE_SOC_DEADBAND", value="5.0")],
+            estorage=[
+                SimpleNamespace(
+                    name="storage",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    soc_cur=95.0,
+                    soc_min=10.0,
+                    soc_max=100.0,
+                    charge_p_max=30.0,
+                    dis_charge_p_max=30.0,
+                )
+            ],
+        )
+
+        remaining = agc_ctrl._force_storage_charge(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 20.0)
+        self.assertEqual(model.estorage[0].p_ctrl, 0.0)
+
+    def test_forced_storage_discharge_respects_soc_deadband(self):
+        model = SimpleNamespace(
+            para=[SimpleNamespace(name="STORAGE_SOC_DEADBAND", value="5.0")],
+            estorage=[
+                SimpleNamespace(
+                    name="storage",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    soc_cur=15.0,
+                    soc_min=10.0,
+                    soc_max=100.0,
+                    charge_p_max=30.0,
+                    dis_charge_p_max=30.0,
+                )
+            ],
+        )
+
+        remaining = agc_ctrl._force_storage_discharge(logging.getLogger("test"), model, 20.0)
+
+        self.assertEqual(remaining, 20.0)
+        self.assertEqual(model.estorage[0].p_ctrl, 0.0)
+
+    def test_diesel_deadband_uses_renewable_and_storage_without_moving_diesel(self):
+        model = SimpleNamespace(
+            para=[SimpleNamespace(name="DIESEL_MIN_DEADBAND", value="1.0")],
+            energyconsumer=[SimpleNamespace(p_fur=180.0, p_cur=180.0, run_stat=1)],
+            wind_generator=[
+                SimpleNamespace(
+                    name="wind",
+                    run_stat=1,
+                    p_ctrl=50.0,
+                    p_cur=50.0,
+                    p_fur=70.0,
+                    p_min=0.0,
+                    p_max=100.0,
+                )
+            ],
+            pv_generator=[],
+            estorage=[
+                SimpleNamespace(
+                    name="storage",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    soc_cur=50.0,
+                    soc_min=0.0,
+                    soc_max=100.0,
+                    charge_p_max=40.0,
+                    dis_charge_p_max=40.0,
+                )
+            ],
+            diesel_generator=[
+                SimpleNamespace(
+                    name="diesel",
+                    run_stat=1,
+                    p_ctrl=80.0,
+                    p_cur=80.0,
+                    p_min=80.0,
+                    p_max=200.0,
+                )
+            ],
+        )
+
+        agc_ctrl._apply_diesel_min_output_coordination(logging.getLogger("test"), model)
+
+        self.assertEqual(model.diesel_generator[0].p_ctrl, 80.0)
+        self.assertEqual(model.wind_generator[0].p_ctrl, 70.0)
+        self.assertEqual(model.estorage[0].p_ctrl, 30.0)
+
+    def test_renewable_dispatch_is_proportional_to_available_output(self):
+        model = SimpleNamespace(
+            para=[],
+            wind_generator=[
+                SimpleNamespace(
+                    name="wind",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    p_fur=100.0,
+                    p_min=0.0,
+                    p_max=100.0,
+                )
+            ],
+            pv_generator=[
+                SimpleNamespace(
+                    name="pv",
+                    run_stat=1,
+                    p_ctrl=0.0,
+                    p_cur=0.0,
+                    p_fur=300.0,
+                    p_min=0.0,
+                    p_max=300.0,
+                )
+            ],
+        )
+
+        remaining = agc_ctrl._dispatch_renewable_priority(logging.getLogger("test"), model, 200.0)
+
+        self.assertEqual(remaining, 0.0)
+        self.assertEqual(model.wind_generator[0].p_ctrl, 50.0)
+        self.assertEqual(model.pv_generator[0].p_ctrl, 150.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
