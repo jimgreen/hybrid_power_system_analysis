@@ -919,6 +919,7 @@ class ACStateEstimator:
         network: Optional[ACPowerNetwork] = None,
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
+        defer_prepare_finalize: bool = False,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -948,6 +949,7 @@ class ACStateEstimator:
             network=network,
             measurements=measurements,
             prepare_active_measurements=prepare_active_measurements,
+            defer_prepare_finalize=defer_prepare_finalize,
         )
 
     def prepare(
@@ -956,6 +958,7 @@ class ACStateEstimator:
         network: Optional[ACPowerNetwork] = None,
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
+        defer_prepare_finalize: bool = False,
     ) -> "ACStateEstimator":
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
@@ -1040,11 +1043,29 @@ class ACStateEstimator:
         self.generator_pos_array = np.asarray([self.node_pos[gen.node] for gen in self.generator_order], dtype=np.int32)
         self.load_pos_array = np.asarray([self.node_pos[load.node] for load in self.load_order], dtype=np.int32)
         self.n_nodes = len(self.nodes)
+        self._defer_prepare_finalize_pending = bool(defer_prepare_finalize)
+        if defer_prepare_finalize:
+            self.power_flow_seed_converged = False
+            self.targeted_observability_pseudo_count = 0
+            return self
         # Reference-bus voltage values must be known before the compact state layout
         # is built, so real file measurements are normalized after the estimator maps exist.
-        stage_start = time.perf_counter()
-        self._convert_measurements_to_pu()
-        self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
+        self.finalize_prepare(prepare_active_measurements=prepare_active_measurements)
+        self._record_profile_time("init.total", time.perf_counter() - profile_start)
+        self._prepared = True
+        return self
+
+    def finalize_prepare(
+        self,
+        *,
+        prepare_active_measurements: bool = True,
+        measurements_already_normalized: bool = False,
+    ) -> "ACStateEstimator":
+        self._defer_prepare_finalize_pending = False
+        if not measurements_already_normalized:
+            stage_start = time.perf_counter()
+            self._convert_measurements_to_pu()
+            self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
         self.power_flow_seed_converged = False
         if not self.flat_start:
             seed_start = time.perf_counter()
@@ -1183,7 +1204,6 @@ class ACStateEstimator:
         self._record_profile_time("init.seed_power_states", time.perf_counter() - stage_start)
         self.targeted_observability_pseudo_count = 0
         if prepare_active_measurements:
-            # Add priors after unit conversion because model objects are already normalized.
             stage_start = time.perf_counter()
             self._add_pseudo_power_measurements()
             self._add_power_balance_constraint_measurements()
@@ -1219,7 +1239,6 @@ class ACStateEstimator:
             self._active_balance_measurement_plan = None
             self._active_normal_pattern = None
             self.active_measurements_are_vectorized = False
-        self._record_profile_time("init.total", time.perf_counter() - profile_start)
         self._prepared = True
         return self
 
@@ -1906,11 +1925,12 @@ class ACStateEstimator:
     @staticmethod
     def _run_power_flow_seed(network: ACPowerNetwork, params: StateEstimationParameters, e_file: Path) -> bool:
         """Run one AC load-flow solve so non-flat SE starts from a measured operating point."""
+        seed_tol = max(float(params.power_flow_tol), 1e-6)
         ppc = ACStateEstimator._power_flow_seed_ppc_from_network(network)
         if ppc is not None:
             calc = ACPowerFlowCalc(
                 ppc,
-                tol=params.power_flow_tol,
+                tol=seed_tol,
                 max_iter=params.power_flow_max_iter,
                 min_voltage=params.power_flow_min_voltage,
             )
@@ -1920,11 +1940,15 @@ class ACStateEstimator:
                     warnings.simplefilter("ignore")
                     with contextlib.redirect_stdout(io.StringIO()):
                         calc.prepare()
-                        rc = calc.run()
+                        try:
+                            rc = calc.run(result_mode="none")
+                        except TypeError as exc:
+                            if "result_mode" not in str(exc):
+                                raise
+                            rc = calc.run()
                 if rc != 0 or not calc.converged:
                     return False
-                result_ppc = ACStateEstimator._merge_power_flow_seed_result_ppc(ppc, getattr(calc, "result", None))
-                ACStateEstimator._apply_power_flow_seed_ppc_to_network(network, result_ppc)
+                ACStateEstimator._apply_power_flow_seed_calc_state_to_network(network, ppc, calc)
                 return True
             except Exception:
                 return False
@@ -1933,7 +1957,7 @@ class ACStateEstimator:
         calc_model = ppc if ppc is not None else network
         calc = ACPowerFlowCalc(
             calc_model,
-            tol=params.power_flow_tol,
+            tol=seed_tol,
             max_iter=params.power_flow_max_iter,
             min_voltage=params.power_flow_min_voltage,
         )
@@ -1955,14 +1979,24 @@ class ACStateEstimator:
 
     @staticmethod
     def _copy_ppc_for_power_flow_seed(ppc):
-        copied = {}
-        for key, value in ppc.items():
+        copied = dict(ppc)
+        for key in (
+            "bus",
+            "gen",
+            "load",
+            "shunt",
+            "branch",
+            "transformer",
+            "zero_branch",
+            "switch",
+            "break",
+        ):
+            value = ppc.get(key)
             if isinstance(value, np.ndarray):
                 copied[key] = value.copy()
-            elif isinstance(value, dict):
+        for key, value in ppc.items():
+            if isinstance(value, dict):
                 copied[key] = dict(value)
-            else:
-                copied[key] = value
         return copied
 
     @staticmethod
@@ -2155,16 +2189,24 @@ class ACStateEstimator:
         sync_devices(getattr(network, "breakers", []), "break", BREAK_COLS, switch_attrs)
 
     @staticmethod
-    def _merge_power_flow_seed_result_ppc(seed_ppc, result):
+    def _overlay_power_flow_seed_result_ppc(seed_ppc, result):
         if not isinstance(result, dict):
             return seed_ppc
-        merged = ACStateEstimator._copy_ppc_for_power_flow_seed(seed_ppc)
-        for key, value in result.items():
+        for key in (
+            "bus",
+            "gen",
+            "load",
+            "shunt",
+            "branch",
+            "transformer",
+            "zero_branch",
+            "switch",
+            "break",
+        ):
+            value = result.get(key)
             if isinstance(value, np.ndarray):
-                merged[key] = value.copy()
-            else:
-                merged[key] = value
-        return merged
+                seed_ppc[key] = value
+        return seed_ppc
 
     @staticmethod
     def _apply_power_flow_seed_ppc_to_network(network, ppc) -> None:
@@ -2222,6 +2264,19 @@ class ACStateEstimator:
         network.ppc = ppc
         if hasattr(network, "_array_model"):
             network._array_model = ppc
+
+    @staticmethod
+    def _apply_power_flow_seed_calc_state_to_network(network, ppc, calc) -> None:
+        if hasattr(calc, "x") and hasattr(calc, "_extract_state_vars"):
+            theta, voltage, _phi_re, _phi_im = calc._extract_state_vars(calc.x, update_cache=False)
+            bus = ppc.get("bus")
+            if isinstance(bus, np.ndarray) and bus.size:
+                bus[:, BUS_COLS["voltage"]] = np.asarray(voltage, dtype=np.float64)
+                bus[:, BUS_COLS["angle"]] = np.asarray(theta, dtype=np.float64)
+            ACStateEstimator._apply_power_flow_seed_ppc_to_network(network, ppc)
+            return
+        result_ppc = ACStateEstimator._overlay_power_flow_seed_result_ppc(ppc, getattr(calc, "result", None))
+        ACStateEstimator._apply_power_flow_seed_ppc_to_network(network, result_ppc)
 
     @staticmethod
     def _capture_power_flow_seed_snapshot(network):

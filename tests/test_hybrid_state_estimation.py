@@ -1063,6 +1063,55 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertGreater(len(estimator.ac_meas), 0)
         self.assertGreater(len(estimator.dc_meas), 0)
 
+    def test_mixed_network_sub_estimators_defer_unit_conversion_until_hybrid_stage(self):
+        from unittest.mock import patch
+
+        from secore.ac_se import ACStateEstimator
+        from secore.dc_se import DCStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        ac_states = []
+        dc_states = []
+        original_ac_convert = ACStateEstimator._convert_measurements_to_pu
+        original_dc_convert = DCStateEstimator._convert_measurements_to_pu
+
+        def wrapped_ac_convert(self):
+            ac_states.append(bool(getattr(self, "_defer_prepare_finalize_pending", False)))
+            return original_ac_convert(self)
+
+        def wrapped_dc_convert(self):
+            dc_states.append(bool(getattr(self, "_defer_prepare_finalize_pending", False)))
+            return original_dc_convert(self)
+
+        with patch.object(ACStateEstimator, "_convert_measurements_to_pu", wrapped_ac_convert), patch.object(
+            DCStateEstimator,
+            "_convert_measurements_to_pu",
+            wrapped_dc_convert,
+        ):
+            HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                flat_start=True,
+            )
+
+        self.assertEqual([True], ac_states)
+        self.assertEqual([True], dc_states)
+
+    def test_side_measurement_view_does_not_mark_side_preconverted(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = HybridStateEstimator._load_measurements(
+            ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+        )
+        estimator._sub_measurements_converted_by_side = {"ac": False, "dc": False}
+
+        estimator._measurements_for_sub_estimator("ac", share_measurements=False)
+        estimator._measurements_for_sub_estimator("dc", share_measurements=False)
+
+        self.assertFalse(estimator._sub_measurements_converted_by_side["ac"])
+        self.assertFalse(estimator._sub_measurements_converted_by_side["dc"])
+
     def test_mixed_network_includes_ac_sub_estimator_power_balance_rows(self):
         from secore.hybrid_se import HybridStateEstimator
 

@@ -64,6 +64,8 @@ from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
+    copy_measurement_view,
+    take_measurement_view,
 )
 from secore.se_result import SEResult
 from unit_system import dc_current_base_ka
@@ -231,6 +233,7 @@ class DCStateEstimator:
         network: Optional[DCPowerNetwork] = None,
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
+        defer_prepare_finalize: bool = False,
         profile: bool = False,
     ):
         self.profile_enabled = bool(profile)
@@ -261,6 +264,7 @@ class DCStateEstimator:
             network=network,
             measurements=measurements,
             prepare_active_measurements=prepare_active_measurements,
+            defer_prepare_finalize=defer_prepare_finalize,
         )
 
     def prepare(
@@ -269,6 +273,7 @@ class DCStateEstimator:
         network: Optional[DCPowerNetwork] = None,
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
+        defer_prepare_finalize: bool = False,
     ) -> "DCStateEstimator":
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
@@ -334,12 +339,31 @@ class DCStateEstimator:
         self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
         self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
         self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
+        self._defer_prepare_finalize_pending = bool(defer_prepare_finalize)
+        if defer_prepare_finalize:
+            self._build_measurement_scale_cache()
+            self.power_flow_seed_converged = False
+            self.targeted_observability_pseudo_count = 0
+            return self
         # Reference selection must see only active, unit-normalized real measurements.
-        stage_start = time.perf_counter()
-        self._disable_unavailable_measurements()
-        self._build_measurement_scale_cache()
-        self._convert_measurements_to_pu()
-        self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
+        self.finalize_prepare(prepare_active_measurements=prepare_active_measurements)
+        self._prepared = True
+        self._record_profile_time("init.total", time.perf_counter() - profile_start)
+        return self
+
+    def finalize_prepare(
+        self,
+        *,
+        prepare_active_measurements: bool = True,
+        measurements_already_normalized: bool = False,
+    ) -> "DCStateEstimator":
+        self._defer_prepare_finalize_pending = False
+        if not measurements_already_normalized:
+            stage_start = time.perf_counter()
+            self._disable_unavailable_measurements()
+            self._build_measurement_scale_cache()
+            self._convert_measurements_to_pu()
+            self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
         self.power_flow_seed_converged = False
         if not self.flat_start:
             seed_start = time.perf_counter()
@@ -408,7 +432,6 @@ class DCStateEstimator:
         self.targeted_observability_pseudo_count = 0
         self._observability_matrix_cache = None
         if prepare_active_measurements:
-            # Add priors after unit conversion because model objects are already normalized.
             stage_start = time.perf_counter()
             self._add_pseudo_power_measurements()
             self._record_profile_time("init.add_pseudo_measurements", time.perf_counter() - stage_start)
@@ -433,7 +456,6 @@ class DCStateEstimator:
             self._jacobian_builder._assume_fixed_pattern = True
             self._measurement_plan_cache = {}
         self._prepared = True
-        self._record_profile_time("init.total", time.perf_counter() - profile_start)
         return self
 
     def _record_profile_time(self, name: str, elapsed: float) -> None:
@@ -540,6 +562,65 @@ class DCStateEstimator:
             self._active_measurement_plan = self._merge_measurement_plan(previous_plan, appended_plan, len(active_table.idx))
             self._measurement_plan_cache = {id(self.active_measurements): (self.active_measurements, self._active_measurement_plan)}
         return True
+
+    def _shrink_active_measurement_plan(self, plan: Dict[str, np.ndarray], removed_pos: int) -> Dict[str, np.ndarray]:
+        removed_pos = int(removed_pos)
+
+        def shrink_rows(rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            row_array = np.asarray(rows, dtype=np.int64)
+            keep = row_array != removed_pos
+            kept = row_array[keep]
+            kept = kept - (kept > removed_pos)
+            return kept.astype(np.int64, copy=False), keep
+
+        merged: Dict[str, np.ndarray] = {}
+        merged["handled_mask"] = np.delete(np.asarray(plan["handled_mask"], dtype=bool), removed_pos)
+
+        for row_key, value_keys in (
+            ("node_rows", ("node_pos", "node_col")),
+            ("branch_rows", ("branch_kind", "branch_i", "branch_j", "branch_i_col", "branch_j_col", "branch_inv_r")),
+            ("load_rows", ("load_kind", "load_pos", "load_col", "load_pv0", "load_pv1", "load_pv2")),
+            ("gen_rows", ("gen_kind", "gen_ctrl", "gen_pos", "gen_col", "gen_p_col", "gen_vgen_pos", "gen_p_set", "gen_i_set")),
+            ("switch_rows", ("switch_kind", "switch_i", "switch_j", "switch_i_col", "switch_j_col", "switch_col", "switch_pos")),
+            ("constraint_rows", ("constraint_i", "constraint_j", "constraint_i_col", "constraint_j_col")),
+            ("dcdc_rows", ("dcdc_kind", "dcdc_i", "dcdc_j", "dcdc_i_col", "dcdc_j_col", "dcdc_p_col", "dcdc_q_col", "dcdc_pos")),
+        ):
+            shrunk_rows, keep = shrink_rows(plan[row_key])
+            merged[row_key] = shrunk_rows
+            for value_key in value_keys:
+                merged[value_key] = np.asarray(plan[value_key])[keep]
+        return merged
+
+    def _shrink_active_measurement_indexes(self, removed_pos: int) -> MeasurementList:
+        keep_rows = np.concatenate(
+            (
+                np.arange(int(removed_pos), dtype=np.int64),
+                np.arange(int(removed_pos) + 1, len(self.active_measurements), dtype=np.int64),
+            )
+        )
+        self.active_measurements = take_measurement_view(self.active_measurements, keep_rows)
+        self.active_measurement_table = self.active_measurements.table
+        self.active_measurement_rows = np.arange(len(self.active_measurements), dtype=np.int64)
+        self.measurement_table = self.active_measurement_table
+        self.active_z = np.asarray(self.active_measurement_table.value, dtype=np.float64)
+        self.active_weight = np.asarray(self.active_measurement_table.weight, dtype=np.float64)
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        if not hasattr(self, "n_state"):
+            return self.active_measurements
+        self._active_normal_pattern = None
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._observability_matrix_cache = None
+        if hasattr(self, "_active_measurement_plan"):
+            self._active_measurement_plan = self._shrink_active_measurement_plan(self._active_measurement_plan, removed_pos)
+            self._measurement_plan_cache = {
+                id(self.active_measurements): (self.active_measurements, self._active_measurement_plan)
+            }
+        else:
+            self._measurement_plan_cache = {}
+            self._active_measurement_plan = self._measurement_plan(self.active_measurements)
+        return self.active_measurements
 
     def _normalize_measurements(self, measurements: Optional[Sequence[Measurement]]) -> List[Measurement]:
         if measurements is None:
@@ -1033,6 +1114,7 @@ class DCStateEstimator:
     @staticmethod
     def _run_power_flow_seed(network: DCPowerNetwork, params: StateEstimationParameters, e_file: Path) -> bool:
         original_ppc = getattr(network, "ppc", None)
+        seed_tol = max(float(params.power_flow_tol), 1e-6)
         ppc = DCStateEstimator._power_flow_seed_ppc_from_network(network)
         if ppc is not None:
             network.ppc = ppc
@@ -1043,9 +1125,10 @@ class DCStateEstimator:
                     warnings.simplefilter("ignore")
                     with contextlib.redirect_stdout(io.StringIO()):
                         rc = calc.run(
-                            tol=params.power_flow_tol,
+                            tol=seed_tol,
                             max_iter=params.power_flow_max_iter,
                             min_voltage=params.power_flow_min_voltage,
+                            result_mode="none",
                         )
             except Exception:
                 if original_ppc is not None:
@@ -1055,7 +1138,7 @@ class DCStateEstimator:
                 if original_ppc is not None:
                     network.ppc = original_ppc
                 return False
-            network.ppc = ppc
+            DCStateEstimator._apply_power_flow_seed_calc_state_to_network(network, ppc, calc)
             return True
 
         snapshot = DCStateEstimator._capture_power_flow_seed_snapshot(network)
@@ -1066,7 +1149,7 @@ class DCStateEstimator:
                 warnings.simplefilter("ignore")
                 with contextlib.redirect_stdout(io.StringIO()):
                     rc = calc.run(
-                        tol=params.power_flow_tol,
+                        tol=seed_tol,
                         max_iter=params.power_flow_max_iter,
                         min_voltage=params.power_flow_min_voltage,
                     )
@@ -1081,14 +1164,23 @@ class DCStateEstimator:
 
     @staticmethod
     def _copy_ppc_for_power_flow_seed(ppc):
-        copied = {}
-        for key, value in ppc.items():
+        copied = dict(ppc)
+        for key in (
+            "bus",
+            "branch",
+            "load",
+            "gen",
+            "zero_branch",
+            "switch",
+            "break",
+            "dcdc",
+        ):
+            value = ppc.get(key)
             if isinstance(value, np.ndarray):
                 copied[key] = value.copy()
-            elif isinstance(value, dict):
+        for key, value in ppc.items():
+            if isinstance(value, dict):
                 copied[key] = dict(value)
-            else:
-                copied[key] = value
         return copied
 
     @staticmethod
@@ -1278,6 +1370,51 @@ class DCStateEstimator:
                 ("j_c", "j_c"),
             ),
         )
+
+    @staticmethod
+    def _overlay_power_flow_seed_result_ppc(seed_ppc, result):
+        if not isinstance(result, dict):
+            return seed_ppc
+        for key in (
+            "bus",
+            "branch",
+            "load",
+            "gen",
+            "zero_branch",
+            "switch",
+            "break",
+            "dcdc",
+        ):
+            value = result.get(key)
+            if isinstance(value, np.ndarray):
+                seed_ppc[key] = value
+        return seed_ppc
+
+    @staticmethod
+    def _apply_power_flow_seed_calc_state_to_network(network, ppc, calc) -> None:
+        bus = ppc.get("bus")
+        if hasattr(calc, "x") and hasattr(calc, "N"):
+            voltage = np.asarray(calc.x[: calc.N], dtype=np.float64)
+            if isinstance(bus, np.ndarray) and bus.size:
+                bus[:, DC_BUS_COLS["voltage"]] = voltage
+            network.ppc = ppc
+            if hasattr(network, "_array_model"):
+                network._array_model = ppc
+            row_by_idx = DCStateEstimator._row_by_idx
+            bus_rows = row_by_idx(bus, DC_BUS_COLS["idx"]) if isinstance(bus, np.ndarray) else {}
+            for node in getattr(network, "nodes", []) or []:
+                row = bus_rows.get(int(getattr(node, "idx", -1)))
+                if row is not None:
+                    node.voltage = float(bus[row, DC_BUS_COLS["voltage"]])
+            for bus_obj in getattr(network, "buses", []) or []:
+                members = getattr(bus_obj, "nodes", ()) or ()
+                if members:
+                    bus_obj.voltage = float(getattr(members[0], "voltage", 0.0) or 0.0)
+            return
+        for bus_obj in getattr(network, "buses", []) or []:
+            members = getattr(bus_obj, "nodes", ()) or ()
+            if members:
+                bus_obj.voltage = float(getattr(members[0], "voltage", 0.0) or 0.0)
 
     @staticmethod
     def _capture_power_flow_seed_snapshot(network):
@@ -1543,6 +1680,37 @@ class DCStateEstimator:
 
     def _convert_measurements_to_pu(self) -> None:
         """Normalize file measurement values to the internal state-estimation units."""
+        if getattr(self.measurements, "normalized", False):
+            seed_rows = []
+            for meas in self.measurements:
+                if not meas.valid or meas.weight <= 0.0:
+                    continue
+                mtype = meas.meas_type
+                if (
+                    (meas.device_type == "DCNode" and mtype == "V")
+                    or (meas.device_type == "DCGenerator" and mtype in ("P_GEN", "V_GEN", "I_GEN"))
+                    or (meas.device_type == "DCLoad" and mtype in ("P_LOAD", "V_LOAD", "I_LOAD"))
+                    or (
+                        meas.device_type == "DCDCConverter"
+                        and mtype
+                        in (
+                            "P_FROM",
+                            "P_DC",
+                            "P_IN",
+                            "P_TO",
+                            "P_OUT",
+                            "V_FROM",
+                            "V_TO",
+                            "I_FROM",
+                            "I_DC",
+                            "I_TO",
+                            "I_OUT",
+                        )
+                    )
+                ):
+                    seed_rows.append((meas.device_type, meas.device_name, mtype, float(meas.value)))
+            self._power_flow_seed_rows = seed_rows
+            return
         terminal_kind = _TERMINAL_KIND.get
         load_kind = _LOAD_MEASUREMENT_KIND.get
         gen_kind = _GEN_MEASUREMENT_KIND.get
@@ -3269,7 +3437,7 @@ class DCStateEstimator:
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
         threshold = self.params.bad_threshold if threshold is None else threshold
         max_remove = self.params.max_remove if max_remove is None else max_remove
-        measurements = list(self.active_measurements)
+        measurements = self.active_measurements
         removed: List[BadDataItem] = []
         x0 = self.initial_state()
         for round_idx in range(max_remove + 1):
@@ -3281,7 +3449,17 @@ class DCStateEstimator:
                 return result, removed
             worst = bad_items[0]
             removed.append(worst)
-            measurements = [meas for meas in measurements if meas.idx != worst.measurement.idx]
+            remove_pos = result.measurements.index(worst.measurement)
+            if measurements is self.active_measurements and result.measurements is self.active_measurements:
+                measurements = self._shrink_active_measurement_indexes(remove_pos)
+            else:
+                keep_rows = np.concatenate(
+                    (
+                        np.arange(remove_pos, dtype=np.int64),
+                        np.arange(remove_pos + 1, len(result.measurements), dtype=np.int64),
+                    )
+                )
+                measurements = take_measurement_view(result.measurements, keep_rows)
             x0 = result.x
         return result, removed
 

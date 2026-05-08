@@ -259,6 +259,7 @@ class HybridStateEstimator:
         self.measurements = self._load_measurements(self.meas_file)
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self._sub_measurements_converted_by_side = {"ac": False, "dc": False}
+        self._measurements_normalized = False
 
         self._sub_estimators_enabled = False
         self._delegate_estimator = None
@@ -282,6 +283,10 @@ class HybridStateEstimator:
         self._disable_unavailable_measurements()
         self._convert_measurements_to_pu()
         self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
+        self._finalize_sub_estimators_after_measurement_prepare()
+        self._build_device_maps()
+        self._record_profile_time("init.finalize_sub_estimators", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
         self._add_pseudo_power_measurements()
         self._record_profile_time("init.add_pseudo_measurements", time.perf_counter() - stage_start)
@@ -337,14 +342,18 @@ class HybridStateEstimator:
 
     def _measurements_for_sub_estimator(self, side: str, share_measurements: bool) -> List[Measurement]:
         if share_measurements and self._is_uncoupled_single_side(side):
-            self._sub_measurements_converted_by_side[side] = True
             return self.measurements
         sources = self._initial_measurement_sources_by_side().get(side, ())
         if share_measurements:
-            self._sub_measurements_converted_by_side[side] = True
             return copy_measurement_view(sources)
-        self._sub_measurements_converted_by_side[side] = True
         return copy_measurement_view(sources)
+
+    def _defer_sub_prepare_finalize(self) -> bool:
+        if self._is_uncoupled_single_side("ac") or self._is_uncoupled_single_side("dc"):
+            return False
+        has_ac = bool(getattr(getattr(self.network, "ac", None), "nodes", None))
+        has_dc = bool(getattr(getattr(self.network, "dc", None), "nodes", None))
+        return bool(has_ac and has_dc)
 
     def _is_uncoupled_single_side(self, side: str) -> bool:
         if getattr(self.network, "dcac_converters", None) or getattr(self.network, "acac_converters", None):
@@ -371,6 +380,7 @@ class HybridStateEstimator:
             return None
         reuse_loaded = True
         defer_active = reuse_loaded and self._defer_sub_active_measurement_preparation()
+        defer_finalize = reuse_loaded and self._defer_sub_prepare_finalize()
         share_measurements = defer_active or (reuse_loaded and self._is_uncoupled_single_side("ac"))
         try:
             return ACStateEstimator(
@@ -384,6 +394,7 @@ class HybridStateEstimator:
                 network=self.network.ac if reuse_loaded else None,
                 measurements=self._measurements_for_sub_estimator("ac", share_measurements) if reuse_loaded else None,
                 prepare_active_measurements=not defer_active,
+                defer_prepare_finalize=defer_finalize,
                 profile=self.profile_enabled,
             )
         except RuntimeError as exc:
@@ -396,6 +407,7 @@ class HybridStateEstimator:
             return None
         reuse_loaded = True
         defer_active = reuse_loaded and self._defer_sub_active_measurement_preparation()
+        defer_finalize = reuse_loaded and self._defer_sub_prepare_finalize()
         share_measurements = defer_active or (reuse_loaded and self._is_uncoupled_single_side("dc"))
         try:
             return DCStateEstimator(
@@ -409,6 +421,7 @@ class HybridStateEstimator:
                 network=self.network.dc if reuse_loaded else None,
                 measurements=self._measurements_for_sub_estimator("dc", share_measurements) if reuse_loaded else None,
                 prepare_active_measurements=not defer_active,
+                defer_prepare_finalize=defer_finalize,
                 profile=self.profile_enabled,
             )
         except RuntimeError as exc:
@@ -922,6 +935,11 @@ class HybridStateEstimator:
                 "_convert_measurements_to_pu",
                 refresh_summary=False,
             )
+            converted_by_sub["ac"] = True
+            if hasattr(sources["ac"], "normalized"):
+                sources["ac"].normalized = True
+            if self._ac_sub_estimator is not None and hasattr(self._ac_sub_estimator.measurements, "normalized"):
+                self._ac_sub_estimator.measurements.normalized = True
         if not converted_by_sub.get("dc", False):
             self._call_sub_with_measurements(
                 self._dc_sub_estimator,
@@ -929,9 +947,36 @@ class HybridStateEstimator:
                 "_convert_measurements_to_pu",
                 refresh_summary=False,
             )
+            converted_by_sub["dc"] = True
+            if hasattr(sources["dc"], "normalized"):
+                sources["dc"].normalized = True
+            if self._dc_sub_estimator is not None and hasattr(self._dc_sub_estimator.measurements, "normalized"):
+                self._dc_sub_estimator.measurements.normalized = True
         self._convert_hybrid_measurements_to_pu(sources["hybrid"])
         self._sync_measurement_table_from_objects()
+        if hasattr(self.measurements, "normalized"):
+            self.measurements.normalized = True
         self._measurements_normalized = True
+
+    def _finalize_sub_estimators_after_measurement_prepare(self) -> None:
+        if self._ac_sub_estimator is not None and getattr(
+            self._ac_sub_estimator,
+            "_defer_prepare_finalize_pending",
+            False,
+        ):
+            self._ac_sub_estimator.finalize_prepare(
+                prepare_active_measurements=False,
+                measurements_already_normalized=True,
+            )
+        if self._dc_sub_estimator is not None and getattr(
+            self._dc_sub_estimator,
+            "_defer_prepare_finalize_pending",
+            False,
+        ):
+            self._dc_sub_estimator.finalize_prepare(
+                prepare_active_measurements=False,
+                measurements_already_normalized=True,
+            )
 
     def _convert_hybrid_measurements_to_pu(self, measurements: Sequence[Measurement]) -> None:
         for meas in measurements:
