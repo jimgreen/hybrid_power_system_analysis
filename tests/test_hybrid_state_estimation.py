@@ -658,6 +658,55 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertGreater(calls["count"], 0)
 
+    def test_hybrid_seed_uses_measurement_plan_table(self):
+        import secore.hybrid_se as hybrid_se
+        from secore.hybrid_se import HybridStateEstimator
+        from secore.se_array_plan import build_measurement_plan_table as original_builder
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        calls = {"count": 0}
+
+        def counted_builder(*args, **kwargs):
+            calls["count"] += 1
+            return original_builder(*args, **kwargs)
+
+        previous_builder = getattr(hybrid_se, "build_measurement_plan_table", None)
+        hybrid_se.build_measurement_plan_table = counted_builder
+        try:
+            estimator._hybrid_seed_vector(flat=True)
+        finally:
+            if previous_builder is None:
+                del hybrid_se.build_measurement_plan_table
+            else:
+                hybrid_se.build_measurement_plan_table = previous_builder
+
+        self.assertGreater(calls["count"], 0)
+
+    def test_converter_pseudo_and_candidate_share_facade(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        calls = []
+        original = estimator._hybrid_converter_measurement_specs
+
+        def counted(*args, **kwargs):
+            calls.append((args, tuple(sorted(kwargs.items()))))
+            return original(*args, **kwargs)
+
+        estimator._hybrid_converter_measurement_specs = counted
+        estimator._add_hybrid_pseudo_measurements()
+        estimator._observability_pseudo_candidate_measurements()
+
+        self.assertGreaterEqual(len(calls), 2)
+
     def test_hybrid_estimator_drops_row_fallback_helpers(self):
         from secore.hybrid_se import HybridStateEstimator
 

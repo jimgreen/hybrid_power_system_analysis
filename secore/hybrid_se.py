@@ -184,6 +184,18 @@ class HybridStateEstimator:
         acac_from_v_default: np.ndarray
         acac_to_v_default: np.ndarray
 
+    @dataclass(frozen=True)
+    class _HybridSeedMeasurementPlan:
+        measurement_row: np.ndarray
+        state_col: np.ndarray
+
+    @dataclass(frozen=True)
+    class _HybridConverterMeasurementSpec:
+        device_type: str
+        device_name: str
+        meas_type: str
+        value: float
+
     def __init__(
         self,
         e_file: Path = DEFAULT_CASE,
@@ -1065,43 +1077,17 @@ class HybridStateEstimator:
             if meas.valid and meas.weight > 0.0:
                 measured_devices.add((meas.device_type, meas.device_name))
         next_idx = max_idx + 1
-        for conv in self.dcac_converters:
-            if ("DCACConverter", conv.name) in measured_devices:
+        for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
+            if (spec.device_type, spec.device_name) in measured_devices:
                 continue
-            for meas_type, value in (
-                ("P_DC", float(getattr(conv, "dc_p", 0.0) or 0.0)),
-                ("P_AC", float(getattr(conv, "ac_p", 0.0) or 0.0)),
-                ("Q_AC", float(getattr(conv, "ac_q", 0.0) or 0.0)),
-                ("V_DC", float(getattr(getattr(conv, "dc_node_obj", None), "voltage", 1.0) or 1.0)),
-                ("V_AC", float(getattr(getattr(conv, "ac_node_obj", None), "voltage", 1.0) or 1.0)),
-            ):
-                next_idx = self._append_pseudo_measurement(
-                    next_idx,
-                    f"pseudo_{meas_type.lower()}_{conv.name}",
-                    "DCACConverter",
-                    conv.name,
-                    meas_type,
-                    value,
-                )
-        for conv in self.acac_converters:
-            if ("ACACConverter", conv.name) in measured_devices:
-                continue
-            for meas_type, value in (
-                ("P_FROM", float(getattr(conv, "i_p", 0.0) or 0.0)),
-                ("Q_FROM", float(getattr(conv, "i_q", 0.0) or 0.0)),
-                ("P_TO", float(getattr(conv, "j_p", 0.0) or 0.0)),
-                ("Q_TO", float(getattr(conv, "j_q", 0.0) or 0.0)),
-                ("V_FROM", float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0)),
-                ("V_TO", float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0)),
-            ):
-                next_idx = self._append_pseudo_measurement(
-                    next_idx,
-                    f"pseudo_{meas_type.lower()}_{conv.name}",
-                    "ACACConverter",
-                    conv.name,
-                    meas_type,
-                    value,
-                )
+            next_idx = self._append_pseudo_measurement(
+                next_idx,
+                f"pseudo_{spec.meas_type.lower()}_{spec.device_name}",
+                spec.device_type,
+                spec.device_name,
+                spec.meas_type,
+                spec.value,
+            )
 
     @staticmethod
     def _ac_sub_state_label_to_hybrid(label: str) -> str:
@@ -1427,6 +1413,99 @@ class HybridStateEstimator:
         side_blocks = self._measurement_blocks_for(measurements) if blocks is None else blocks
         return self._build_hybrid_measurement_plan(side_blocks["hybrid"])
 
+    def _build_hybrid_seed_measurement_plan(
+        self,
+        measurements: Sequence[Measurement],
+    ) -> "HybridStateEstimator._HybridSeedMeasurementPlan":
+        dcac_code = int(DEVICE_TYPE_CODES["DCACConverter"])
+        acac_code = int(DEVICE_TYPE_CODES["ACACConverter"])
+        plan_table = build_measurement_plan_table(
+            measurements,
+            device_pos_by_type_code={
+                dcac_code: self.dcac_pos_by_name,
+                acac_code: self.acac_pos_by_name,
+            },
+            meas_kind_by_type_code={
+                dcac_code: {"P_DC": 0, "P_AC": 1, "Q_AC": 2},
+                acac_code: {"P_FROM": 0, "Q_FROM": 1, "P_TO": 2, "Q_TO": 3},
+            },
+            table_builder=_measurement_table_from_measurements,
+        )
+        active_mask = (
+            plan_table.handled
+            & np.asarray(plan_table.table.valid, dtype=bool)
+            & (np.asarray(plan_table.table.weight, dtype=np.float64) > 0.0)
+        )
+        dcac_mask = active_mask & (plan_table.device_type_code == dcac_code)
+        acac_mask = active_mask & (plan_table.device_type_code == acac_code)
+
+        dcac_rows = plan_table.row[dcac_mask].astype(np.int64, copy=False)
+        dcac_state_col = (
+            3 * plan_table.device_pos[dcac_mask].astype(np.int64, copy=False)
+            + plan_table.meas_kind[dcac_mask].astype(np.int64, copy=False)
+        )
+        acac_rows = plan_table.row[acac_mask].astype(np.int64, copy=False)
+        acac_state_col = (
+            3 * len(self.dcac_converters)
+            + 4 * plan_table.device_pos[acac_mask].astype(np.int64, copy=False)
+            + plan_table.meas_kind[acac_mask].astype(np.int64, copy=False)
+        )
+        return self._HybridSeedMeasurementPlan(
+            measurement_row=np.concatenate((dcac_rows, acac_rows)).astype(np.int64, copy=False),
+            state_col=np.concatenate((dcac_state_col, acac_state_col)).astype(np.int64, copy=False),
+        )
+
+    def _hybrid_converter_measurement_specs(
+        self,
+        source: str = "flow",
+    ) -> List["_HybridConverterMeasurementSpec"]:
+        specs: List[HybridStateEstimator._HybridConverterMeasurementSpec] = []
+        for conv in sorted(self.dcac_by_name.values(), key=lambda item: item.idx):
+            p_dc = float(getattr(conv, "dc_p", 0.0) or 0.0) if source == "pseudo" else float(getattr(conv, "i_p", 0.0) or 0.0)
+            p_ac = float(getattr(conv, "ac_p", 0.0) or 0.0) if source == "pseudo" else float(getattr(conv, "j_p", 0.0) or 0.0)
+            q_ac = float(getattr(conv, "ac_q", 0.0) or 0.0) if source == "pseudo" else float(getattr(conv, "j_q", 0.0) or 0.0)
+            specs.extend(
+                (
+                    self._HybridConverterMeasurementSpec("DCACConverter", conv.name, "P_DC", p_dc),
+                    self._HybridConverterMeasurementSpec("DCACConverter", conv.name, "P_AC", p_ac),
+                    self._HybridConverterMeasurementSpec("DCACConverter", conv.name, "Q_AC", q_ac),
+                    self._HybridConverterMeasurementSpec(
+                        "DCACConverter",
+                        conv.name,
+                        "V_DC",
+                        float(getattr(getattr(conv, "dc_node_obj", None), "voltage", 1.0) or 1.0),
+                    ),
+                    self._HybridConverterMeasurementSpec(
+                        "DCACConverter",
+                        conv.name,
+                        "V_AC",
+                        float(getattr(getattr(conv, "ac_node_obj", None), "voltage", 1.0) or 1.0),
+                    ),
+                )
+            )
+        for conv in sorted(self.acac_by_name.values(), key=lambda item: item.idx):
+            specs.extend(
+                (
+                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "P_FROM", float(getattr(conv, "i_p", 0.0) or 0.0)),
+                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "Q_FROM", float(getattr(conv, "i_q", 0.0) or 0.0)),
+                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "P_TO", float(getattr(conv, "j_p", 0.0) or 0.0)),
+                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "Q_TO", float(getattr(conv, "j_q", 0.0) or 0.0)),
+                    self._HybridConverterMeasurementSpec(
+                        "ACACConverter",
+                        conv.name,
+                        "V_FROM",
+                        float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0),
+                    ),
+                    self._HybridConverterMeasurementSpec(
+                        "ACACConverter",
+                        conv.name,
+                        "V_TO",
+                        float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0),
+                    ),
+                )
+            )
+        return specs
+
     def state_layout(self) -> Dict[str, object]:
         return {
             "state_labels": self.state_labels,
@@ -1462,27 +1541,17 @@ class HybridStateEstimator:
         return x
 
     def _seed_hybrid_power_states_from_measurements(self, x: np.ndarray) -> None:
-        for meas in self.measurements:
-            if not meas.valid or meas.weight <= 0.0:
-                continue
-            if meas.device_type == "DCACConverter" and meas.device_name in self.dcac_pos_by_name:
-                pos = 3 * self.dcac_pos_by_name[meas.device_name]
-                if meas.meas_type == "P_DC":
-                    x[pos] = float(meas.value)
-                elif meas.meas_type == "P_AC":
-                    x[pos + 1] = float(meas.value)
-                elif meas.meas_type == "Q_AC":
-                    x[pos + 2] = float(meas.value)
-            elif meas.device_type == "ACACConverter" and meas.device_name in self.acac_pos_by_name:
-                pos = 3 * len(self.dcac_converters) + 4 * self.acac_pos_by_name[meas.device_name]
-                if meas.meas_type == "P_FROM":
-                    x[pos] = float(meas.value)
-                elif meas.meas_type == "Q_FROM":
-                    x[pos + 1] = float(meas.value)
-                elif meas.meas_type == "P_TO":
-                    x[pos + 2] = float(meas.value)
-                elif meas.meas_type == "Q_TO":
-                    x[pos + 3] = float(meas.value)
+        seed_plan = self._build_hybrid_seed_measurement_plan(self.measurements)
+        if seed_plan.measurement_row.size == 0:
+            return
+        table = getattr(self.measurements, "table", None)
+        if table is None or len(table.idx) != len(self.measurements):
+            table = _measurement_table_from_measurements(self.measurements)
+            try:
+                self.measurements.table = table
+            except AttributeError:
+                pass
+        x[seed_plan.state_col] = np.asarray(table.value, dtype=np.float64)[seed_plan.measurement_row]
 
     def initial_state(self, flat: Optional[bool] = None) -> np.ndarray:
         delegate = self._delegate()
@@ -1747,19 +1816,8 @@ class HybridStateEstimator:
             add("DCBranch", branch.name, "P_FROM", float(getattr(branch, "i_p", 0.0) or 0.0))
             add("DCBranch", branch.name, "P_TO", float(getattr(branch, "j_p", 0.0) or 0.0))
 
-        for conv in sorted(self.dcac_by_name.values(), key=lambda item: item.idx):
-            add("DCACConverter", conv.name, "P_DC", float(getattr(conv, "i_p", 0.0) or 0.0))
-            add("DCACConverter", conv.name, "P_AC", float(getattr(conv, "j_p", 0.0) or 0.0))
-            add("DCACConverter", conv.name, "Q_AC", float(getattr(conv, "j_q", 0.0) or 0.0))
-            add("DCACConverter", conv.name, "V_DC", float(getattr(getattr(conv, "dc_node_obj", None), "voltage", 1.0) or 1.0))
-            add("DCACConverter", conv.name, "V_AC", float(getattr(getattr(conv, "ac_node_obj", None), "voltage", 1.0) or 1.0))
-        for conv in sorted(self.acac_by_name.values(), key=lambda item: item.idx):
-            add("ACACConverter", conv.name, "P_FROM", float(getattr(conv, "i_p", 0.0) or 0.0))
-            add("ACACConverter", conv.name, "Q_FROM", float(getattr(conv, "i_q", 0.0) or 0.0))
-            add("ACACConverter", conv.name, "P_TO", float(getattr(conv, "j_p", 0.0) or 0.0))
-            add("ACACConverter", conv.name, "Q_TO", float(getattr(conv, "j_q", 0.0) or 0.0))
-            add("ACACConverter", conv.name, "V_FROM", float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0))
-            add("ACACConverter", conv.name, "V_TO", float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0))
+        for spec in self._hybrid_converter_measurement_specs(source="flow"):
+            add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
 
         return candidates
 
