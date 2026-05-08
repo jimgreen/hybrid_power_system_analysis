@@ -2,6 +2,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -82,6 +83,29 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertIsInstance(network.breakers[0], ACBreak)
         self.assertEqual("brk_7_8", network.breakers[0].name)
         self.assertTrue(network.node_dict[7].isl_obj is network.node_dict[8].isl_obj)
+
+    def test_object_multi_island_flow_keeps_breaker_zero_ties(self):
+        from scipy.sparse.linalg import MatrixRankWarning, spsolve
+        from ac_lf import ACPowerFlowCalc
+        from ac_model import ACPowerNetwork
+
+        case_path = ROOT_DIR / "data" / "hybrid" / "qinling_100.e"
+        network = ACPowerNetwork()
+        with contextlib.redirect_stdout(io.StringIO()):
+            network.read_from_file(case_path)
+            network.topo()
+            calc = ACPowerFlowCalc(network, tol=1e-8, max_iter=50)
+            calc.prepare()
+            f = calc.get_f(calc.x)
+            j = calc.get_jacobi(calc.x)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            delta = spsolve(j, f)
+
+        self.assertGreater(calc.N_phi, 0)
+        self.assertFalse(any(item.category is MatrixRankWarning for item in caught))
+        self.assertTrue(np.isfinite(delta).all())
 
     def test_object_y_matrix_uses_vectorized_branch_stamps(self):
         import ac_lf
@@ -227,6 +251,40 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual([("ACPowerNetwork", 300)], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
+
+    def test_network_input_uses_array_kernel_and_writes_back_objects(self):
+        from ac_array_model import BUS_COLS, GEN_COLS
+        from ac_lf import ACPowerFlowCalc
+        from ac_model import ACPowerNetwork
+
+        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        network = ACPowerNetwork()
+        with contextlib.redirect_stdout(io.StringIO()):
+            network.read_from_file(case_path)
+
+        calc = ACPowerFlowCalc(network, tol=1e-8, max_iter=50)
+        self.assertTrue(calc.array_mode)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        bus_by_idx = {
+            int(row[BUS_COLS["idx"]]): row
+            for row in calc.result["bus"]
+        }
+        gen_by_idx = {
+            int(row[GEN_COLS["idx"]]): row
+            for row in calc.result["gen"]
+        }
+        first_node = network.nodes[0]
+        first_gen = network.generators[0]
+        self.assertAlmostEqual(bus_by_idx[first_node.idx][BUS_COLS["voltage"]], first_node.voltage)
+        self.assertAlmostEqual(bus_by_idx[first_node.idx][BUS_COLS["angle"]], first_node.angle)
+        self.assertAlmostEqual(gen_by_idx[first_gen.idx][GEN_COLS["p"]], first_gen.p)
+        self.assertAlmostEqual(gen_by_idx[first_gen.idx][GEN_COLS["q"]], first_gen.q)
 
     def test_build_ac_ppc_from_network_reflects_network_objects(self):
         from ac_array_model import BUS_COLS, build_ac_ppc_from_e_file, build_ac_ppc_from_network

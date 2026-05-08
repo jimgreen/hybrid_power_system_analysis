@@ -257,10 +257,19 @@ class ACPowerFlowCalc:
             max_iter=max_iter,
             min_voltage=min_voltage,
         )
-        self.ppc = network if isinstance(network, dict) and network.get("format") == "ac_ppc_v1" else None
+        self._network_writeback = None
+        if isinstance(network, dict) and network.get("format") == "ac_ppc_v1":
+            self.ppc = network
+        elif island is None and hasattr(network, "nodes"):
+            self._network_writeback = network
+            self.ppc = build_ac_ppc_from_network(network)
+            if hasattr(network, "source") and "source" not in self.ppc:
+                self.ppc["source"] = str(getattr(network, "source"))
+        else:
+            self.ppc = None
         self.array_mode = self.ppc is not None
         self.keep_node_objects = bool(keep_node_objects)
-        self.net = None if self.array_mode else network
+        self.net = self._network_writeback if self._network_writeback is not None else (None if self.array_mode else network)
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
@@ -639,6 +648,29 @@ class ACPowerFlowCalc:
             return node_ids.astype(np.int32)
         return np.fromiter((self._ppc_node_row_by_id[int(node_id)] for node_id in node_ids), dtype=np.int32, count=node_ids.size)
 
+    def _bind_ppc_nodes_to_network(self) -> None:
+        """Use original ACNode objects for network-input array solves."""
+        network = getattr(self, "_network_writeback", None)
+        if network is None or not self.keep_node_objects:
+            return
+        node_by_idx = {int(node.idx): node for node in getattr(network, "nodes", [])}
+        if not node_by_idx:
+            return
+        bound_nodes = []
+        for pos, node_idx in enumerate(self.ppc_node_idx):
+            node = node_by_idx.get(int(node_idx))
+            if node is None:
+                node = self.node_list[pos] if pos < len(self.node_list) else _PPCNode(
+                    int(node_idx),
+                    str(self.ppc_node_name[pos]) if pos < self.ppc_node_name.size else f"bus_{int(node_idx)}",
+                    float(self.ppc_node_vbase[pos]),
+                    float(self.ppc_node_voltage[pos]),
+                    float(self.ppc_node_angle[pos]),
+                )
+            bound_nodes.append(node)
+        self.node_list = bound_nodes
+        self.node_pos = {int(node_idx): pos for pos, node_idx in enumerate(self.ppc_node_idx)}
+
     def _prepare_from_ppc(self):
         """Prepare a Newton system from an already arrayized AC ppc dictionary."""
         ppc = self.ppc
@@ -647,6 +679,7 @@ class ACPowerFlowCalc:
             self._load_ppc_static(static)
             if self.algorithm == "pq" and self.pq_Bp is None:
                 self._cache_pq_decoupled_matrices()
+            self._bind_ppc_nodes_to_network()
             print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
             return
 
@@ -741,6 +774,7 @@ class ACPowerFlowCalc:
             self.ppc_node_name = np.empty(self.N, dtype=object)
             self.node_list = []
             self.node_pos = {}
+        self._bind_ppc_nodes_to_network()
 
         self.node_type = np.full(self.N, 'PQ', dtype='U5')
         self.V_spec = np.full(self.N, np.nan, dtype=np.float64)
@@ -1474,6 +1508,7 @@ class ACPowerFlowCalc:
                 transformers=[tr for isl in self.calc_islands for tr in isl.transformers],
                 zero_branches=[zbr for isl in self.calc_islands for zbr in isl.zero_branches],
                 switches=[sw for isl in self.calc_islands for sw in isl.switches],
+                breakers=[brk for isl in self.calc_islands for brk in getattr(isl, "breakers", [])],
                 shunt_compensators=[sc for isl in self.calc_islands for sc in isl.shunt_compensators],
                 slack_nodes=[node for isl in self.calc_islands for node in isl.slack_nodes],
                 v_gens=[gen for isl in self.calc_islands for gen in isl.v_gens],
@@ -2682,7 +2717,8 @@ class ACPowerFlowCalc:
             dev.current = float(abs(current))
             dev.p = float(s_from.real)
             dev.q = float(s_from.imag)
-        self.lf_result = self._build_lf_result()
+        if not getattr(self, "skip_lf_result", False):
+            self.lf_result = self._build_lf_result()
 
     def _device_voltage(self, node_idx) -> float:
         if int(node_idx) in getattr(self, "node_pos", {}):
@@ -2814,6 +2850,103 @@ class ACPowerFlowCalc:
                 i_v=float(self.result["bus"][self.node_pos[int(row[LOAD_COLS["node"]])], BUS_COLS["voltage"]]) if int(row[LOAD_COLS["node"]]) in self.node_pos else 0.0,
             )
         return result
+
+    def _write_ppc_result_to_network(self) -> None:
+        """Copy array-mode results back to the ACPowerNetwork passed by callers."""
+        network = getattr(self, "_network_writeback", None)
+        if network is None or not self.result:
+            return
+
+        def rows_by_idx(key, idx_col):
+            rows = self.result.get(key)
+            if rows is None or len(rows) == 0:
+                return {}
+            return {int(row[idx_col]): row for row in rows}
+
+        bus_by_idx = rows_by_idx("bus", BUS_COLS["idx"])
+        for node in getattr(network, "nodes", []):
+            row = bus_by_idx.get(int(getattr(node, "idx", -1)))
+            if row is None:
+                continue
+            node.voltage = float(row[BUS_COLS["voltage"]])
+            node.angle = float(row[BUS_COLS["angle"]])
+
+        for bus in getattr(network, "buses", []):
+            members = [node for node in getattr(bus, "nodes", []) if getattr(node, "voltage", None) is not None]
+            if not members:
+                row = bus_by_idx.get(int(getattr(bus, "idx", -1)))
+                if row is None:
+                    continue
+                bus.voltage = float(row[BUS_COLS["voltage"]])
+                bus.angle = float(row[BUS_COLS["angle"]])
+                continue
+            bus.voltage = float(getattr(members[0], "voltage", 0.0) or 0.0)
+            bus.angle = float(getattr(members[0], "angle", 0.0) or 0.0)
+
+        def copy_fields(devices, row_map, fields):
+            if not row_map:
+                return
+            for dev in devices:
+                row = row_map.get(int(getattr(dev, "idx", -1)))
+                if row is None:
+                    continue
+                for attr, col in fields:
+                    setattr(dev, attr, float(row[col]))
+
+        copy_fields(
+            getattr(network, "generators", []),
+            rows_by_idx("gen", GEN_COLS["idx"]),
+            (("p", GEN_COLS["p"]), ("q", GEN_COLS["q"]), ("current", GEN_COLS["current"])),
+        )
+        copy_fields(
+            getattr(network, "loads", []),
+            rows_by_idx("load", LOAD_COLS["idx"]),
+            (("p", LOAD_COLS["p"]), ("q", LOAD_COLS["q"]), ("current", LOAD_COLS["current"])),
+        )
+        copy_fields(
+            getattr(network, "shunt_compensators", []),
+            rows_by_idx("shunt", SHUNT_COLS["idx"]),
+            (("p", SHUNT_COLS["p"]), ("q", SHUNT_COLS["q"]), ("current", SHUNT_COLS["current"])),
+        )
+        copy_fields(
+            getattr(network, "branches", []),
+            rows_by_idx("branch", BRANCH_COLS["idx"]),
+            (
+                ("i_p", BRANCH_COLS["i_p"]),
+                ("i_q", BRANCH_COLS["i_q"]),
+                ("i_c", BRANCH_COLS["i_c"]),
+                ("j_p", BRANCH_COLS["j_p"]),
+                ("j_q", BRANCH_COLS["j_q"]),
+                ("j_c", BRANCH_COLS["j_c"]),
+            ),
+        )
+        copy_fields(
+            getattr(network, "transformers", []),
+            rows_by_idx("transformer", TRANSFORMER_COLS["idx"]),
+            (
+                ("i_p", TRANSFORMER_COLS["i_p"]),
+                ("i_q", TRANSFORMER_COLS["i_q"]),
+                ("i_c", TRANSFORMER_COLS["i_c"]),
+                ("j_p", TRANSFORMER_COLS["j_p"]),
+                ("j_q", TRANSFORMER_COLS["j_q"]),
+                ("j_c", TRANSFORMER_COLS["j_c"]),
+            ),
+        )
+        copy_fields(
+            getattr(network, "zero_branches", []),
+            rows_by_idx("zero_branch", ZERO_BRANCH_COLS["idx"]),
+            (("p", ZERO_BRANCH_COLS["p"]), ("q", ZERO_BRANCH_COLS["q"]), ("current", ZERO_BRANCH_COLS["current"])),
+        )
+        copy_fields(
+            getattr(network, "switches", []),
+            rows_by_idx("switch", SWITCH_COLS["idx"]),
+            (("p", SWITCH_COLS["p"]), ("q", SWITCH_COLS["q"]), ("current", SWITCH_COLS["current"])),
+        )
+        copy_fields(
+            getattr(network, "breakers", []),
+            rows_by_idx("break", SWITCH_COLS["idx"]),
+            (("p", SWITCH_COLS["p"]), ("q", SWITCH_COLS["q"]), ("current", SWITCH_COLS["current"])),
+        )
 
     def _write_back_ppc(self):
         """Write array-mode results to self.result without mutating the input ppc."""
@@ -2955,7 +3088,9 @@ class ACPowerFlowCalc:
             "switch": switch,
             "break": breaker,
         }
-        self.lf_result = self._build_lf_result()
+        self._write_ppc_result_to_network()
+        if not getattr(self, "skip_lf_result", False):
+            self.lf_result = self._build_lf_result()
 
 def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     for isl in calc.skipped_islands:
