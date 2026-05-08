@@ -37,7 +37,7 @@ def _write_tight_calmt(path: Path) -> None:
 
 
 def test_hybrid_ca_writes_risk_result_efile(tmp_path):
-    from ca.hybrid_ca import run_hybrid_ca
+    from cacore.hybrid_ca import run_hybrid_ca
     from efile_read import EBook
 
     n0_file = tmp_path / "hybrid_net_40.ca.n0rslt"
@@ -81,7 +81,7 @@ def test_hybrid_ca_writes_risk_result_efile(tmp_path):
 
 
 def test_hybrid_ca_n1_scan_includes_ac_units_and_loads():
-    from ca.hybrid_ca import _contingency_rows
+    from cacore.hybrid_ca import _contingency_rows
 
     contingencies = set(_contingency_rows(ROOT / "data" / "hybrid" / "qinling.e"))
 
@@ -91,7 +91,7 @@ def test_hybrid_ca_n1_scan_includes_ac_units_and_loads():
 
 
 def test_ca_efile_output_columns_are_aligned(tmp_path):
-    from ca.hybrid_ca import CARisk, append_calc_info, write_risk_result
+    from cacore.hybrid_ca import CARisk, append_calc_info, write_risk_result
 
     risk_file = tmp_path / "risk.e"
     write_risk_result(
