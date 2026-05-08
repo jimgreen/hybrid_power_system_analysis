@@ -708,25 +708,24 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual([], [name for name in obsolete_names if hasattr(ac_model, name)])
 
-    def test_ac_network_load_builds_ppc_from_loaded_network(self):
+    def test_ac_network_load_uses_ppc_file_loader(self):
         import secore.ac_se
-        from ac_array_model import build_ac_ppc_from_network as original_builder
+        from ac_array_model import build_ac_ppc_from_e_file as original_loader
         from secore.ac_se import ACStateEstimator
 
         previous_builder = getattr(secore.ac_se, "build_ac_ppc_from_network", None)
-        previous_file_loader = getattr(secore.ac_se, "load_ac_ppc_from_e_file", None)
+        previous_file_loader = getattr(secore.ac_se, "build_ac_ppc_from_e_file", None)
         calls = []
 
-        def counted_builder(network):
-            calls.append((network.__class__.__name__, len(network.nodes)))
-            return original_builder(network)
+        def counted_file_loader(path):
+            calls.append(Path(path).name)
+            return original_loader(path)
 
-        def reject_file_loader(*_args, **_kwargs):
-            raise AssertionError("AC SE should build ppc from an already loaded ACPowerNetwork")
+        def reject_builder(*_args, **_kwargs):
+            raise AssertionError("AC SE should load the ppc directly from the E file")
 
-        secore.ac_se.build_ac_ppc_from_network = counted_builder
-        if previous_file_loader is not None:
-            secore.ac_se.load_ac_ppc_from_e_file = reject_file_loader
+        secore.ac_se.build_ac_ppc_from_network = reject_builder
+        secore.ac_se.build_ac_ppc_from_e_file = counted_file_loader
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
@@ -738,11 +737,131 @@ class ACStateEstimationTest(unittest.TestCase):
             else:
                 secore.ac_se.build_ac_ppc_from_network = previous_builder
             if previous_file_loader is not None:
-                secore.ac_se.load_ac_ppc_from_e_file = previous_file_loader
+                secore.ac_se.build_ac_ppc_from_e_file = previous_file_loader
+            else:
+                del secore.ac_se.build_ac_ppc_from_e_file
 
-        self.assertEqual([("ACPowerNetwork", 39)], calls)
+        self.assertEqual(["ieee39.e"], calls)
         self.assertTrue(estimator.nodes)
         self.assertTrue(hasattr(estimator.network, "_array_model"))
+
+    def test_refresh_active_measurements_reuses_all_active_measurement_table(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator
+
+        measurements = MeasurementList(
+            [
+                Measurement(1, "m1", "ACNode", "n1", "V", 1.0, True, 1.0),
+                Measurement(2, "m2", "ACLoad", "l1", "P_LOAD", 1.0, True, 0.2),
+            ]
+        )
+        measurements.table = measurement_table_from_measurements(measurements)
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.measurements = measurements
+        estimator.n_state = 1
+        estimator._branch_transformer_vector_plan_cache = {}
+        estimator._simple_jacobian_plan_cache = {}
+        estimator._zero_current_vector_plan_cache = {}
+        estimator._generator_measurement_plan_cache = {}
+        estimator._balance_measurement_plan_cache = {}
+
+        def empty_plan(active_measurements):
+            return {"handled_mask": np.zeros(len(active_measurements), dtype=bool)}
+
+        def full_plan(active_measurements):
+            return {"handled_mask": np.ones(len(active_measurements), dtype=bool)}
+
+        estimator._branch_transformer_vector_plan = empty_plan
+        estimator._simple_jacobian_plan = full_plan
+        estimator._zero_current_vector_plan = empty_plan
+        estimator._generator_measurement_plan = empty_plan
+        estimator._balance_measurement_plan = empty_plan
+
+        estimator._refresh_active_measurement_indexes()
+
+        self.assertIs(estimator.active_measurements, measurements)
+        self.assertIs(estimator.active_measurement_table, measurements.table)
+        np.testing.assert_allclose(estimator.active_z, measurements.table.value)
+
+    def test_prepare_preserves_provided_measurement_list_cache(self):
+        from secore.ac_se import ACStateEstimator
+
+        loader = ACStateEstimator.__new__(ACStateEstimator)
+        network = loader._load_network(ROOT_DIR / "data" / "ac" / "ieee39.e")
+        measurements = ACStateEstimator._load_measurements(ROOT_DIR / "data" / "ac" / "ieee39.meas")
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            network=network,
+            measurements=measurements,
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+
+        self.assertIs(estimator.measurements, measurements)
+        self.assertIsNotNone(estimator.measurements.table)
+
+    def test_active_balance_plan_uses_type_index(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator
+
+        node = type("Node", (), {"idx": 1, "name": "n1"})()
+        measurements = MeasurementList(
+            [
+                Measurement(1, "bad", "ACPowerBalance", "missing", "P_BALANCE", 1.0, True, 0.0),
+                Measurement(2, "good", "ACPowerBalance", "n1", "P_BALANCE", 1.0, True, 0.0),
+            ]
+        )
+        measurements.table = measurement_table_from_measurements(measurements)
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.active_measurements = measurements
+        estimator.active_measurement_table = measurements.table
+        estimator.node_by_name = {"n1": node}
+        estimator.node_pos = {1: 0}
+        estimator.nodes = [node]
+        estimator._y_row_nodes = [np.array([], dtype=np.int32)]
+        estimator._y_row_y_conj = [np.array([], dtype=np.complex128)]
+        estimator._active_measurement_rows_for_types = lambda device_types: np.array([1], dtype=np.int64)
+
+        plan = estimator._build_balance_measurement_plan(measurements)
+
+        np.testing.assert_array_equal(plan["rows"], np.array([1]))
+
+    def test_active_balance_plan_avoids_small_full_allocations(self):
+        import secore.ac_se as ac_se
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator
+
+        node = type("Node", (), {"idx": 1, "name": "n1"})()
+        measurements = MeasurementList(
+            [
+                Measurement(1, "p", "ACPowerBalance", "n1", "P_BALANCE", 1.0, True, 0.0),
+                Measurement(2, "q", "ACPowerBalance", "n1", "Q_BALANCE", 1.0, True, 0.0),
+            ]
+        )
+        measurements.table = measurement_table_from_measurements(measurements)
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.active_measurements = measurements
+        estimator.active_measurement_table = measurements.table
+        estimator.node_by_name = {"n1": node}
+        estimator.node_pos = {1: 0}
+        estimator.nodes = [node]
+        estimator._y_row_nodes = [np.array([0, 1], dtype=np.int32)]
+        estimator._y_row_y_conj = [np.array([1.0 + 0.0j, 2.0 + 0.0j], dtype=np.complex128)]
+        estimator._active_measurement_rows_for_types = lambda device_types: np.array([0, 1], dtype=np.int64)
+
+        original_full = ac_se.np.full
+
+        def reject_full(*_args, **_kwargs):
+            raise AssertionError("active balance plan should batch y-term allocation")
+
+        ac_se.np.full = reject_full
+        try:
+            plan = estimator._build_balance_measurement_plan(measurements)
+        finally:
+            ac_se.np.full = original_full
+
+        np.testing.assert_array_equal(plan["y_balance"], np.array([0, 0, 1, 1], dtype=np.int32))
 
     def test_ac_state_estimator_does_not_use_profile_call_wrapper(self):
         source = (ROOT_DIR / "secore" / "ac_se.py").read_text(encoding="utf-8")
@@ -1125,7 +1244,11 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         original_calc = ac_se.ACPowerFlowCalc
+        original_sync = ACStateEstimator._sync_ac_network_to_ppc
         calls = []
+
+        def reject_full_sync(*_args, **_kwargs):
+            raise AssertionError("cached seed rows should update seed ppc without full network sync")
 
         class FakePowerFlowCalc:
             def __init__(self, model, **_kwargs):
@@ -1144,6 +1267,10 @@ class ACStateEstimationTest(unittest.TestCase):
                 )
 
             def run(self):
+                self.testcase.assertTrue(
+                    getattr(self, "skip_lf_result", False),
+                    "SE LF seed should skip detailed LFResult construction",
+                )
                 self.converged = True
                 self.iterations = 1
                 self.result = {
@@ -1157,6 +1284,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
         FakePowerFlowCalc.testcase = self
         ac_se.ACPowerFlowCalc = FakePowerFlowCalc
+        ACStateEstimator._sync_ac_network_to_ppc = staticmethod(reject_full_sync)
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
@@ -1165,11 +1293,85 @@ class ACStateEstimationTest(unittest.TestCase):
             )
         finally:
             ac_se.ACPowerFlowCalc = original_calc
+            ACStateEstimator._sync_ac_network_to_ppc = staticmethod(original_sync)
 
         self.assertEqual([True], calls)
         self.assertTrue(estimator.power_flow_seed_converged)
         _theta, voltage = estimator._unpack_state(estimator.initial_state())
         np.testing.assert_allclose(voltage[estimator.voltage_state_pos], 1.12)
+
+    def test_power_flow_seed_uses_cached_seed_rows(self):
+        from secore.ac_se import ACStateEstimator
+
+        class Device:
+            pass
+
+        class FailingMeasurements(list):
+            def __iter__(self):
+                raise AssertionError("power-flow seed should not rescan all measurements")
+
+        node = Device()
+        node.idx = 1
+        node.name = "n1"
+        node.voltage = 1.0
+        node.angle = 0.0
+        gen = Device()
+        gen.node = 1
+        gen.p_set = 0.0
+        gen.q_set = 0.0
+        gen.p = 0.0
+        gen.q = 0.0
+        load = Device()
+        load.node = 1
+        load.pbase = 1.0
+        load.qbase = 1.0
+        load.pv0 = 0.0
+        load.pv1 = 0.0
+        load.pv2 = 0.0
+        load.qv0 = 0.0
+        load.qv1 = 0.0
+        load.qv2 = 0.0
+        load.p = 0.0
+        load.q = 0.0
+
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.voltage_floor = 0.1
+        estimator.node_by_name = {"n1": node}
+        estimator.node_by_idx = {1: node}
+        estimator.generator_by_name = {"g1": gen}
+        estimator.load_by_name = {"l1": load}
+        estimator.network = type("Network", (), {"node_dict": {1: node}, "nodes": [node]})()
+        estimator.measurements = FailingMeasurements()
+        estimator._power_flow_seed_rows = [
+            ("ACNode", "n1", "V", 1.05),
+            ("ACGenerator", "g1", "P_GEN", 0.7),
+            ("ACGenerator", "g1", "Q_GEN", 0.2),
+            ("ACLoad", "l1", "P_LOAD", 0.3),
+            ("ACLoad", "l1", "Q_LOAD", 0.1),
+        ]
+
+        estimator._apply_measurement_seed_to_network()
+
+        self.assertAlmostEqual(1.05, node.voltage)
+        self.assertAlmostEqual(0.7, gen.p_set)
+        self.assertAlmostEqual(0.2, gen.q_set)
+        self.assertAlmostEqual(0.3, load.pv0)
+        self.assertAlmostEqual(0.1, load.qv0)
+
+    def test_array_power_flow_seed_defers_object_seed_application(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.network = type("Network", (), {"_array_model": {"format": "ac_ppc_v1"}})()
+        estimator.measurements = []
+        estimator._power_flow_seed_rows = [("ACNode", "n1", "V", 1.05)]
+        estimator._apply_power_flow_seed_row = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("array-mode seed should be applied to ppc, not object network")
+        )
+
+        estimator._apply_measurement_seed_to_network()
+
+        self.assertEqual(tuple(estimator._power_flow_seed_rows), estimator.network._se_power_flow_seed_rows)
 
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
         from secore.ac_se import ACStateEstimator
@@ -1961,6 +2163,52 @@ class ACStateEstimationTest(unittest.TestCase):
 
             self.assertIs(expected_plan, plan)
 
+    def test_active_measurement_plans_use_measurement_plan_table(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+        from secore.se_array_plan import build_measurement_plan_table as original_builder
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            flat_start=True,
+        )
+        for attr in (
+            "_active_branch_transformer_vector_plan",
+            "_active_simple_jacobian_plan",
+            "_active_zero_current_vector_plan",
+            "_active_generator_measurement_plan",
+            "_active_balance_measurement_plan",
+        ):
+            setattr(estimator, attr, None)
+        estimator._branch_transformer_vector_plan_cache = {}
+        estimator._simple_jacobian_plan_cache = {}
+        estimator._zero_current_vector_plan_cache = {}
+        estimator._generator_measurement_plan_cache = {}
+        estimator._balance_measurement_plan_cache = {}
+
+        calls = []
+
+        def counted_builder(*args, **kwargs):
+            calls.append(1)
+            return original_builder(*args, **kwargs)
+
+        previous_builder = getattr(ac_se, "build_measurement_plan_table", None)
+        ac_se.build_measurement_plan_table = counted_builder
+        try:
+            estimator._branch_transformer_vector_plan(estimator.active_measurements)
+            estimator._simple_jacobian_plan(estimator.active_measurements)
+            estimator._zero_current_vector_plan(estimator.active_measurements)
+            estimator._generator_measurement_plan(estimator.active_measurements)
+            estimator._balance_measurement_plan(estimator.active_measurements)
+        finally:
+            if previous_builder is None:
+                del ac_se.build_measurement_plan_table
+            else:
+                ac_se.build_measurement_plan_table = previous_builder
+
+        self.assertGreaterEqual(len(calls), 5)
+
     def test_active_measurement_plans_are_estimator_local(self):
         from secore.ac_se import ACStateEstimator
 
@@ -2204,6 +2452,37 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(["observability", "estimate"], events[-2:])
         self.assertEqual(1, output.getvalue().count("Observability:"))
         self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
+
+    def test_main_does_not_build_seresult_without_output_file(self):
+        import contextlib
+        import io
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original_build = ACStateEstimator.build_se_result
+
+        def reject_build(*_args, **_kwargs):
+            raise AssertionError("SEResult details should be built only when --se-result is requested")
+
+        ACStateEstimator.build_se_result = reject_build
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = ac_se.main(
+                    [
+                        "--case",
+                        str(ROOT_DIR / "data" / "ac" / "ieee39.e"),
+                        "--meas",
+                        str(ROOT_DIR / "data" / "ac" / "ieee39.meas"),
+                        "--para",
+                        str(ROOT_DIR / "se.para"),
+                        "--flat-start",
+                        "--quiet",
+                    ]
+                )
+        finally:
+            ACStateEstimator.build_se_result = original_build
+
+        self.assertEqual(0, rc)
 
     def test_estimate_can_skip_final_diagnostic_jacobian_and_gain(self):
         from secore.ac_se import ACStateEstimator

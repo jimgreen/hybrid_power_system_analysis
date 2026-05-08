@@ -615,6 +615,159 @@ class DCStateEstimationTest(unittest.TestCase):
             np.asarray(estimator.active_measurement_table.weight, dtype=np.float64),
         )
 
+    def test_active_measurement_plan_uses_table_without_iterating_measurements(self):
+        from model.meas_model import Measurement, MeasurementTable
+        from secore.dc_se import DCStateEstimator
+
+        class TableBackedSequence:
+            def __init__(self, table):
+                self.table = table
+
+            def __len__(self):
+                return len(self.table.idx)
+
+            def __iter__(self):
+                raise AssertionError("active DC measurement plan should use the cached table")
+
+        table = MeasurementTable(
+            idx=np.array([1], dtype=np.int64),
+            name=np.array(["m1"], dtype=object),
+            device_type=np.array(["DCNode"], dtype=object),
+            device_name=np.array(["n1"], dtype=object),
+            meas_type=np.array(["V"], dtype=object),
+            weight=np.array([1.0], dtype=np.float64),
+            valid=np.array([True], dtype=bool),
+            value=np.array([1.0], dtype=np.float64),
+            device_type_code=np.array([11], dtype=np.int16),
+            angle_mask=np.array([False], dtype=bool),
+        )
+        measurements = TableBackedSequence(table)
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.active_measurements = measurements
+        estimator.active_measurement_table = table
+        estimator._measurement_plan_cache = {}
+        estimator._node_plan_by_name = {"n1": (0, 0)}
+        estimator._branch_plan_by_name = {}
+        estimator._load_plan_by_name = {}
+        estimator._generator_plan_by_name = {}
+        estimator._zero_branch_plan_by_name = {}
+        estimator._break_plan_by_name = {}
+        estimator._constraint_plan_by_name = {}
+        estimator._dcdc_plan_by_name = {}
+
+        plan = estimator._measurement_plan(measurements)
+
+        np.testing.assert_array_equal(plan["node_rows"], np.array([0]))
+
+    def test_measurement_plan_ignores_rows_without_device_position(self):
+        from model.meas_model import MeasurementTable
+        from secore.dc_se import DCStateEstimator
+
+        class TableBackedSequence:
+            def __init__(self, table):
+                self.table = table
+
+            def __len__(self):
+                return len(self.table.idx)
+
+            def __iter__(self):
+                raise AssertionError("active DC measurement plan should use the cached table")
+
+        table = MeasurementTable(
+            idx=np.array([1], dtype=np.int64),
+            name=np.array(["m1"], dtype=object),
+            device_type=np.array(["DCNode"], dtype=object),
+            device_name=np.array(["missing"], dtype=object),
+            meas_type=np.array(["V"], dtype=object),
+            weight=np.array([1.0], dtype=np.float64),
+            valid=np.array([True], dtype=bool),
+            value=np.array([1.0], dtype=np.float64),
+            device_type_code=np.array([11], dtype=np.int16),
+            angle_mask=np.array([False], dtype=bool),
+        )
+        measurements = TableBackedSequence(table)
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator._measurement_plan_cache = {}
+        estimator._node_plan_by_name = {}
+        estimator._branch_plan_by_name = {}
+        estimator._load_plan_by_name = {}
+        estimator._generator_plan_by_name = {}
+        estimator._zero_branch_plan_by_name = {}
+        estimator._break_plan_by_name = {}
+        estimator._constraint_plan_by_name = {}
+        estimator._dcdc_plan_by_name = {}
+
+        plan = estimator._measurement_plan(measurements)
+
+        self.assertEqual(0, plan["node_rows"].size)
+        np.testing.assert_array_equal(plan["handled_mask"], np.array([False], dtype=bool))
+
+    def test_refresh_active_measurements_reuses_all_active_measurement_table(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.dc_se import DCStateEstimator
+
+        measurements = MeasurementList(
+            [
+                Measurement(1, "m1", "DCNode", "n1", "V", 1.0, True, 1.0),
+                Measurement(2, "m2", "DCLoad", "l1", "P_LOAD", 1.0, True, 0.2),
+            ]
+        )
+        measurements.table = measurement_table_from_measurements(measurements)
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.measurements = measurements
+        estimator.n_state = 1
+        estimator._measurement_plan = lambda active_measurements: {}
+
+        estimator._refresh_active_measurement_indexes()
+
+        self.assertIs(estimator.active_measurements, measurements)
+        self.assertIs(estimator.active_measurement_table, measurements.table)
+        np.testing.assert_allclose(estimator.active_z, measurements.table.value)
+
+    def test_disable_unavailable_measurements_updates_cached_table(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.dc_se import DCStateEstimator
+
+        measurements = MeasurementList(
+            [Measurement(1, "m1", "DCNode", "missing", "V", 1.0, True, 1.0)]
+        )
+        measurements.table = measurement_table_from_measurements(measurements)
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.measurements = measurements
+        estimator.node_by_name = {}
+        estimator.branch_by_name = {}
+        estimator.break_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {}
+        estimator.dcdc_by_name = {}
+        estimator.n_state = 1
+        estimator._measurement_plan = lambda active_measurements: {}
+
+        estimator._disable_unavailable_measurements()
+        estimator._refresh_active_measurement_indexes()
+
+        self.assertFalse(measurements[0].valid)
+        self.assertFalse(bool(measurements.table.valid[0]))
+        self.assertEqual(0, len(estimator.active_measurements))
+
+    def test_prepare_preserves_provided_measurement_list_cache(self):
+        from secore.dc_se import DCStateEstimator
+
+        network = DCStateEstimator._load_network(ROOT_DIR / "data" / "dc" / "dc_net_30.e")
+        measurements = DCStateEstimator._load_measurements(ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            network=network,
+            measurements=measurements,
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+
+        self.assertIs(estimator.measurements, measurements)
+        self.assertIsNotNone(estimator.measurements.table)
+
     def test_apply_state_batches_device_value_calculation(self):
         from secore.dc_se import DCStateEstimator
 
@@ -842,7 +995,11 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         original_calc = dc_se.DCPowerFlowCalc
+        original_sync = DCStateEstimator._sync_dc_network_to_ppc
         calls = []
+
+        def reject_full_sync(*_args, **_kwargs):
+            raise AssertionError("cached seed rows should update seed ppc without full network sync")
 
         class FakePowerFlowCalc:
             def __init__(self, model):
@@ -854,6 +1011,10 @@ class DCStateEstimationTest(unittest.TestCase):
                 calls.append(isinstance(self.ppc, dict))
 
             def run(self, **_kwargs):
+                self.testcase.assertTrue(
+                    getattr(self, "skip_lf_result", False),
+                    "SE LF seed should skip detailed LFResult construction",
+                )
                 self.testcase.assertAlmostEqual(
                     1.6,
                     float(self.ppc["bus"][0, dc_se.DC_BUS_COLS["voltage"]]),
@@ -867,6 +1028,7 @@ class DCStateEstimationTest(unittest.TestCase):
 
         FakePowerFlowCalc.testcase = self
         dc_se.DCPowerFlowCalc = FakePowerFlowCalc
+        DCStateEstimator._sync_dc_network_to_ppc = staticmethod(reject_full_sync)
         try:
             estimator = DCStateEstimator(
                 e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
@@ -875,11 +1037,74 @@ class DCStateEstimationTest(unittest.TestCase):
             )
         finally:
             dc_se.DCPowerFlowCalc = original_calc
+            DCStateEstimator._sync_dc_network_to_ppc = staticmethod(original_sync)
 
         self.assertEqual([True], calls)
         self.assertTrue(estimator.power_flow_seed_converged)
         voltage, _switch_current, _dcdc_power, _vgen_power = estimator._unpack_state(estimator.initial_state())
         np.testing.assert_allclose(voltage[estimator.voltage_state_pos], 1.24)
+
+    def test_power_flow_seed_uses_cached_seed_rows(self):
+        from secore.dc_se import DCStateEstimator
+
+        class Device:
+            pass
+
+        class FailingMeasurements(list):
+            def __iter__(self):
+                raise AssertionError("power-flow seed should not rescan all measurements")
+
+        node = Device()
+        node.idx = 1
+        node.name = "n1"
+        node.voltage = 1.0
+        gen = Device()
+        gen.node = 1
+        gen.p_set = 0.0
+        gen.p = 0.0
+        load = Device()
+        load.node = 1
+        load.pbase = 1.0
+        load.pv0 = 0.0
+        load.pv1 = 0.0
+        load.pv2 = 0.0
+        load.p = 0.0
+
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.voltage_floor = 0.1
+        estimator.node_by_name = {"n1": node}
+        estimator.node_by_idx = {1: node}
+        estimator.generator_by_name = {"g1": gen}
+        estimator.load_by_name = {"l1": load}
+        estimator.dcdc_by_name = {}
+        estimator.network = type("Network", (), {"node_dict": {1: node}, "nodes": [node]})()
+        estimator.measurements = FailingMeasurements()
+        estimator._power_flow_seed_rows = [
+            ("DCNode", "n1", "V", 1.05),
+            ("DCGenerator", "g1", "P_GEN", 0.7),
+            ("DCLoad", "l1", "P_LOAD", 0.3),
+        ]
+
+        estimator._apply_measurement_seed_to_network()
+
+        self.assertAlmostEqual(1.05, node.voltage)
+        self.assertAlmostEqual(0.7, gen.p_set)
+        self.assertAlmostEqual(0.3, load.pv0)
+
+    def test_array_power_flow_seed_defers_object_seed_application(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.network = type("Network", (), {"ppc": {"format": "dc_ppc_v1"}})()
+        estimator.measurements = []
+        estimator._power_flow_seed_rows = [("DCNode", "n1", "V", 1.05)]
+        estimator._apply_power_flow_seed_row = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("array-mode seed should be applied to ppc, not object network")
+        )
+
+        estimator._apply_measurement_seed_to_network()
+
+        self.assertEqual(tuple(estimator._power_flow_seed_rows), estimator.network._se_power_flow_seed_rows)
 
     def test_estimate_uses_precomputed_observability_without_reanalysis(self):
         import secore.dc_se as dc_se
@@ -1035,6 +1260,34 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual(["observability", "estimate"], events[-2:])
         self.assertEqual(1, output.getvalue().count("Observability:"))
         self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
+
+    def test_cli_does_not_build_seresult_without_output_file(self):
+        import contextlib
+        import io
+        import secore.dc_se as dc_se
+
+        original_build = dc_se.DCStateEstimator.build_se_result
+
+        def reject_build(*_args, **_kwargs):
+            raise AssertionError("SEResult details should be built only when --se-result is requested")
+
+        dc_se.DCStateEstimator.build_se_result = reject_build
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = dc_se.main(
+                    [
+                        "--case",
+                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        "--meas",
+                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        "--flat-start",
+                        "--quiet",
+                    ]
+                )
+        finally:
+            dc_se.DCStateEstimator.build_se_result = original_build
+
+        self.assertEqual(0, code)
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator
