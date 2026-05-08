@@ -89,6 +89,47 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(before_count, len(estimator.measurements))
 
+    def test_hybrid_pseudo_measurements_use_measurement_summary_helper(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        calls = {"count": 0}
+        original = estimator._measurement_activity_summary
+
+        def counted():
+            calls["count"] += 1
+            return original()
+
+        estimator._measurement_activity_summary = counted
+        estimator._add_hybrid_pseudo_measurements()
+
+        self.assertGreater(calls["count"], 0)
+
+    def test_active_measurement_keys_use_measurement_summary_helper(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        calls = {"count": 0}
+        original = estimator._measurement_activity_summary
+
+        def counted():
+            calls["count"] += 1
+            return original()
+
+        estimator._measurement_activity_summary = counted
+        keys = estimator._active_measurement_keys()
+
+        self.assertGreater(calls["count"], 0)
+        self.assertTrue(keys)
+
     def test_hybrid_measurement_loader_reuses_table_backed_parser(self):
         from model.meas_model import MeasurementList
         from secore.hybrid_se import HybridStateEstimator
@@ -707,6 +748,27 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(calls), 2)
 
+    def test_side_candidates_share_facade(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        calls = []
+        original = estimator._side_observability_pseudo_specs
+
+        def counted(*args, **kwargs):
+            calls.append((args, tuple(sorted(kwargs.items()))))
+            return original(*args, **kwargs)
+
+        estimator._side_observability_pseudo_specs = counted
+        candidates = estimator._observability_pseudo_candidate_measurements()
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(candidates)
+
     def test_hybrid_estimator_drops_row_fallback_helpers(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -1173,6 +1235,37 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(1, dc_added)
         self.assertIn(("ACNode", "wt02_src", "V"), existing_keys)
         self.assertIn(("DCNode", "wt01_dc_sw", "V"), existing_keys)
+
+    def test_targeted_converter_states_use_shared_converter_facade(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        next_idx = max(meas.idx for meas in estimator.measurements) + 1
+        existing_keys = set()
+        existing_names = set()
+        calls = []
+        original = estimator._hybrid_converter_measurement_specs
+
+        def counted(*args, **kwargs):
+            calls.append((args, tuple(sorted(kwargs.items()))))
+            return original(*args, **kwargs)
+
+        estimator._hybrid_converter_measurement_specs = counted
+        _, added = estimator._append_targeted_observability_pseudo(
+            next_idx,
+            f"DCAC_P_DC:{estimator.dcac_converters[0].name}",
+            existing_keys,
+            existing_names,
+            1,
+        )
+
+        self.assertEqual(1, added)
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertIn(("DCACConverter", estimator.dcac_converters[0].name, "P_DC"), existing_keys)
 
     def test_sparse_jacobian_matches_dense_jacobian(self):
         from scipy.sparse import issparse

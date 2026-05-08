@@ -196,6 +196,12 @@ class HybridStateEstimator:
         meas_type: str
         value: float
 
+    @dataclass(frozen=True)
+    class _MeasurementActivitySummary:
+        max_idx: int
+        measured_devices: set
+        active_keys: set
+
     def __init__(
         self,
         e_file: Path = DEFAULT_CASE,
@@ -1069,14 +1075,9 @@ class HybridStateEstimator:
                 load.p = dc._load_pseudo_power(load)
 
     def _add_hybrid_pseudo_measurements(self) -> None:
-        measured_devices = set()
-        max_idx = 0
-        for meas in self.measurements:
-            if meas.idx > max_idx:
-                max_idx = int(meas.idx)
-            if meas.valid and meas.weight > 0.0:
-                measured_devices.add((meas.device_type, meas.device_name))
-        next_idx = max_idx + 1
+        summary = self._measurement_activity_summary()
+        next_idx = int(summary.max_idx) + 1
+        measured_devices = summary.measured_devices
         for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
             if (spec.device_type, spec.device_name) in measured_devices:
                 continue
@@ -1651,14 +1652,66 @@ class HybridStateEstimator:
         return names
 
     def _active_measurement_keys(self) -> set:
-        return {
-            (meas.device_type, meas.device_name, meas.meas_type)
-            for meas in self.measurements
-            if meas.valid and meas.weight > 0.0
-        }
+        return set(self._measurement_activity_summary().active_keys)
+
+    def _measurement_activity_summary(self) -> "_MeasurementActivitySummary":
+        table = getattr(self.measurements, "table", None)
+        if table is None or len(table.idx) != len(self.measurements):
+            table = _measurement_table_from_measurements(self.measurements)
+            try:
+                self.measurements.table = table
+            except AttributeError:
+                pass
+        idx = np.asarray(table.idx, dtype=np.int64)
+        valid = np.asarray(table.valid, dtype=bool)
+        weight = np.asarray(table.weight, dtype=np.float64)
+        active_mask = valid & (weight > 0.0)
+        max_idx = int(idx.max()) if idx.size else 0
+        measured_devices = set(
+            zip(
+                np.asarray(table.device_type, dtype=object)[active_mask].tolist(),
+                np.asarray(table.device_name, dtype=object)[active_mask].tolist(),
+            )
+        )
+        active_keys = set(
+            zip(
+                np.asarray(table.device_type, dtype=object)[active_mask].tolist(),
+                np.asarray(table.device_name, dtype=object)[active_mask].tolist(),
+                np.asarray(table.meas_type, dtype=object)[active_mask].tolist(),
+            )
+        )
+        return self._MeasurementActivitySummary(max_idx=max_idx, measured_devices=measured_devices, active_keys=active_keys)
 
     def _next_measurement_idx(self) -> int:
-        return max((int(meas.idx) for meas in self.measurements), default=0) + 1
+        return int(self._measurement_activity_summary().max_idx) + 1
+
+    @staticmethod
+    def _converter_meas_type_for_state_prefix(prefix: str) -> Optional[str]:
+        mapping = {
+            "DCAC_P_DC": "P_DC",
+            "DCAC_P_AC": "P_AC",
+            "DCAC_Q_AC": "Q_AC",
+            "ACAC_P_FROM": "P_FROM",
+            "ACAC_Q_FROM": "Q_FROM",
+            "ACAC_P_TO": "P_TO",
+            "ACAC_Q_TO": "Q_TO",
+        }
+        return mapping.get(prefix)
+
+    def _targeted_converter_specs_for_state(
+        self,
+        prefix: str,
+        name: str,
+        source: str = "flow",
+    ) -> List["_HybridConverterMeasurementSpec"]:
+        meas_type = self._converter_meas_type_for_state_prefix(prefix)
+        if meas_type is None:
+            return []
+        return [
+            spec
+            for spec in self._hybrid_converter_measurement_specs(source=source)
+            if spec.device_name == name and spec.meas_type == meas_type
+        ]
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch hybrid rank deficiencies and optional post-observability redundancy."""
@@ -1774,47 +1827,10 @@ class HybridStateEstimator:
             existing_keys.add(key)
             existing_names.add(pseudo_name)
 
-        for node in sorted(self.ac_node_by_name.values(), key=lambda item: item.idx):
-            add("ACNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
-        for node in sorted(self.dc_node_by_name.values(), key=lambda item: item.idx):
-            add("DCNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
-
-        for load in sorted(self.ac_load_by_name.values(), key=lambda item: item.idx):
-            p, q = self._ac_sub_estimator._load_pseudo_power(load) if self._ac_sub_estimator is not None else (0.0, 0.0)
-            voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
-            add("ACLoad", load.name, "P_LOAD", p)
-            add("ACLoad", load.name, "Q_LOAD", q)
-            add("ACLoad", load.name, "V_LOAD", voltage)
-        for load in sorted(self.dc_load_by_name.values(), key=lambda item: item.idx):
-            p = self._dc_sub_estimator._load_pseudo_power(load) if self._dc_sub_estimator is not None else 0.0
-            voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
-            add("DCLoad", load.name, "P_LOAD", p)
-            add("DCLoad", load.name, "V_LOAD", voltage)
-
-        for gen in sorted(self.ac_generator_by_name.values(), key=lambda item: item.idx):
-            p, q = self._ac_sub_estimator._generator_pseudo_power(gen) if self._ac_sub_estimator is not None else (0.0, 0.0)
-            voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
-            add("ACGenerator", gen.name, "P_GEN", p)
-            add("ACGenerator", gen.name, "Q_GEN", q)
-            add("ACGenerator", gen.name, "V_GEN", voltage)
-        for gen in sorted(self.dc_generator_by_name.values(), key=lambda item: item.idx):
-            p = self._dc_sub_estimator._generator_pseudo_power(gen) if self._dc_sub_estimator is not None else 0.0
-            voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
-            add("DCGenerator", gen.name, "P_GEN", p)
-            add("DCGenerator", gen.name, "V_GEN", voltage)
-
-        for device_type, devices in (
-            ("ACBranch", self.ac_branch_by_name),
-            ("ACTransformer", self.ac_transformer_by_name),
-        ):
-            for dev in sorted(devices.values(), key=lambda item: item.idx):
-                add(device_type, dev.name, "P_FROM", float(getattr(dev, "i_p", 0.0) or 0.0))
-                add(device_type, dev.name, "Q_FROM", float(getattr(dev, "i_q", 0.0) or 0.0))
-                add(device_type, dev.name, "P_TO", float(getattr(dev, "j_p", 0.0) or 0.0))
-                add(device_type, dev.name, "Q_TO", float(getattr(dev, "j_q", 0.0) or 0.0))
-        for branch in sorted(self.dc_branch_by_name.values(), key=lambda item: item.idx):
-            add("DCBranch", branch.name, "P_FROM", float(getattr(branch, "i_p", 0.0) or 0.0))
-            add("DCBranch", branch.name, "P_TO", float(getattr(branch, "j_p", 0.0) or 0.0))
+        for spec in self._side_observability_pseudo_specs("ac"):
+            add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
+        for spec in self._side_observability_pseudo_specs("dc"):
+            add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
 
         for spec in self._hybrid_converter_measurement_specs(source="flow"):
             add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
@@ -1843,6 +1859,76 @@ class HybridStateEstimator:
         order = np.argsort(-scores, kind="stable")
         selected = [candidates[int(pos)] for pos in order[:max_add] if scores[int(pos)] > 0.0]
         return selected or list(candidates[:max_add])
+
+    def _side_observability_pseudo_specs(
+        self,
+        side: str,
+    ) -> List["_HybridConverterMeasurementSpec"]:
+        specs: List[HybridStateEstimator._HybridConverterMeasurementSpec] = []
+        if side == "ac":
+            for node in sorted(self.ac_node_by_name.values(), key=lambda item: item.idx):
+                specs.append(self._HybridConverterMeasurementSpec("ACNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0)))
+            for load in sorted(self.ac_load_by_name.values(), key=lambda item: item.idx):
+                p, q = self._ac_sub_estimator._load_pseudo_power(load) if self._ac_sub_estimator is not None else (0.0, 0.0)
+                voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
+                specs.extend(
+                    (
+                        self._HybridConverterMeasurementSpec("ACLoad", load.name, "P_LOAD", p),
+                        self._HybridConverterMeasurementSpec("ACLoad", load.name, "Q_LOAD", q),
+                        self._HybridConverterMeasurementSpec("ACLoad", load.name, "V_LOAD", voltage),
+                    )
+                )
+            for gen in sorted(self.ac_generator_by_name.values(), key=lambda item: item.idx):
+                p, q = self._ac_sub_estimator._generator_pseudo_power(gen) if self._ac_sub_estimator is not None else (0.0, 0.0)
+                voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
+                specs.extend(
+                    (
+                        self._HybridConverterMeasurementSpec("ACGenerator", gen.name, "P_GEN", p),
+                        self._HybridConverterMeasurementSpec("ACGenerator", gen.name, "Q_GEN", q),
+                        self._HybridConverterMeasurementSpec("ACGenerator", gen.name, "V_GEN", voltage),
+                    )
+                )
+            for device_type, devices in (("ACBranch", self.ac_branch_by_name), ("ACTransformer", self.ac_transformer_by_name)):
+                for dev in sorted(devices.values(), key=lambda item: item.idx):
+                    specs.extend(
+                        (
+                            self._HybridConverterMeasurementSpec(device_type, dev.name, "P_FROM", float(getattr(dev, "i_p", 0.0) or 0.0)),
+                            self._HybridConverterMeasurementSpec(device_type, dev.name, "Q_FROM", float(getattr(dev, "i_q", 0.0) or 0.0)),
+                            self._HybridConverterMeasurementSpec(device_type, dev.name, "P_TO", float(getattr(dev, "j_p", 0.0) or 0.0)),
+                            self._HybridConverterMeasurementSpec(device_type, dev.name, "Q_TO", float(getattr(dev, "j_q", 0.0) or 0.0)),
+                        )
+                    )
+            return specs
+        if side == "dc":
+            for node in sorted(self.dc_node_by_name.values(), key=lambda item: item.idx):
+                specs.append(self._HybridConverterMeasurementSpec("DCNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0)))
+            for load in sorted(self.dc_load_by_name.values(), key=lambda item: item.idx):
+                p = self._dc_sub_estimator._load_pseudo_power(load) if self._dc_sub_estimator is not None else 0.0
+                voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
+                specs.extend(
+                    (
+                        self._HybridConverterMeasurementSpec("DCLoad", load.name, "P_LOAD", p),
+                        self._HybridConverterMeasurementSpec("DCLoad", load.name, "V_LOAD", voltage),
+                    )
+                )
+            for gen in sorted(self.dc_generator_by_name.values(), key=lambda item: item.idx):
+                p = self._dc_sub_estimator._generator_pseudo_power(gen) if self._dc_sub_estimator is not None else 0.0
+                voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
+                specs.extend(
+                    (
+                        self._HybridConverterMeasurementSpec("DCGenerator", gen.name, "P_GEN", p),
+                        self._HybridConverterMeasurementSpec("DCGenerator", gen.name, "V_GEN", voltage),
+                    )
+                )
+            for branch in sorted(self.dc_branch_by_name.values(), key=lambda item: item.idx):
+                specs.extend(
+                    (
+                        self._HybridConverterMeasurementSpec("DCBranch", branch.name, "P_FROM", float(getattr(branch, "i_p", 0.0) or 0.0)),
+                        self._HybridConverterMeasurementSpec("DCBranch", branch.name, "P_TO", float(getattr(branch, "j_p", 0.0) or 0.0)),
+                    )
+                )
+            return specs
+        return specs
 
     def _append_targeted_observability_pseudo(
         self,
@@ -1879,6 +1965,11 @@ class HybridStateEstimator:
         if prefix == "DC_V" and name in self.dc_node_by_name:
             node = self.dc_node_by_name[name]
             add("DCNode", "V", float(getattr(node, "voltage", 1.0) or 1.0))
+            return next_idx, added
+        converter_specs = self._targeted_converter_specs_for_state(prefix, name, source="flow")
+        if converter_specs:
+            for spec in converter_specs:
+                add(spec.device_type, spec.meas_type, spec.value)
             return next_idx, added
 
         if prefix in ("AC_I_RE", "AC_I_IM"):

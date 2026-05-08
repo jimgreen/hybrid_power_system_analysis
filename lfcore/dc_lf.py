@@ -193,13 +193,16 @@ class DCPowerFlowCalc:
         algorithm: str = "nr",
         keep_node_objects: bool = True,
         linear_solver: str = "scipy",
+        writeback_network=None,
     ):
         algorithm = str(algorithm).strip().lower()
         if algorithm not in {"nr"}:
             raise ValueError(f"Unsupported DC power-flow algorithm: {algorithm!r}")
-        self.model = model
-        self.ppc = getattr(model, "ppc", None)
+        self._direct_ppc_mode = isinstance(model, dict) and model.get("format") == "dc_ppc_v1"
+        self.model = writeback_network if self._direct_ppc_mode else model
+        self.ppc = model if self._direct_ppc_mode else getattr(model, "ppc", None)
         self.array_mode = isinstance(self.ppc, dict) and self.ppc.get("format") == "dc_ppc_v1"
+        self._network_writeback = writeback_network if self._direct_ppc_mode else (model if self.array_mode else None)
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -218,6 +221,7 @@ class DCPowerFlowCalc:
         self.iterations = 0
         self.normF = np.inf
         self.verbose = False
+        self.result: Dict = {}
 
     def _alive_node_lookup_array(self):
         """Return a dense node-id to active solver-position lookup when possible."""
@@ -241,6 +245,180 @@ class DCPowerFlowCalc:
         mapped[valid] = lookup[node_ids[valid]]
         return mapped
 
+    @staticmethod
+    def _find_parent(parent, item):
+        root = item
+        while parent[root] != root:
+            root = parent[root]
+        while parent[item] != item:
+            item, parent[item] = parent[item], root
+        return root
+
+    @classmethod
+    def _union_parent(cls, parent, left, right):
+        left_root = cls._find_parent(parent, left)
+        right_root = cls._find_parent(parent, right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    def _live_ppc_terminal_pair(self, row, i_col, j_col, run_col, running_node_ids, status_col=None):
+        if row[run_col] != 1:
+            return None
+        if status_col is not None and row[status_col] != 1:
+            return None
+        i_node = int(row[i_col])
+        j_node = int(row[j_col])
+        if i_node == j_node or i_node not in running_node_ids or j_node not in running_node_ids:
+            return None
+        return i_node, j_node
+
+    def _prepare_direct_ppc_topology(self):
+        """Build active DC solver-node mapping directly from dc_ppc_v1 arrays."""
+        ppc = self.ppc
+        bus = ppc["bus"]
+        running_mask = bus[:, DC_BUS_COLS["run_stat"]] == 1
+        running_rows = np.nonzero(running_mask)[0].astype(np.int32)
+        running_node_ids = bus[running_rows, DC_BUS_COLS["idx"]].astype(np.int64)
+        running_node_set = {int(node_id) for node_id in running_node_ids}
+        if not running_node_set:
+            self.alive_nodes = []
+            self.alive_node_dict = {}
+            self.alive_node_ids = np.array([], dtype=np.int32)
+            self.N = 0
+            return
+
+        node_parent = {int(node_id): int(node_id) for node_id in running_node_ids}
+        switch = ppc["switch"]
+        if switch.size:
+            for row in switch:
+                pair = self._live_ppc_terminal_pair(
+                    row,
+                    DC_SWITCH_COLS["i_node"],
+                    DC_SWITCH_COLS["j_node"],
+                    DC_SWITCH_COLS["run_stat"],
+                    running_node_set,
+                    status_col=DC_SWITCH_COLS["status"],
+                )
+                if pair is not None:
+                    self._union_parent(node_parent, pair[0], pair[1])
+
+        root_to_nodes = {}
+        for node_id in running_node_ids:
+            root_to_nodes.setdefault(self._find_parent(node_parent, int(node_id)), []).append(int(node_id))
+        bus_groups = sorted((sorted(nodes) for nodes in root_to_nodes.values()), key=lambda nodes: nodes[0])
+        node_to_bus_group = {
+            node_id: group_pos
+            for group_pos, nodes in enumerate(bus_groups)
+            for node_id in nodes
+        }
+
+        group_parent = list(range(len(bus_groups)))
+
+        def union_groups(pair):
+            if pair is None:
+                return
+            left = node_to_bus_group.get(pair[0])
+            right = node_to_bus_group.get(pair[1])
+            if left is None or right is None or left == right:
+                return
+            self._union_parent(group_parent, left, right)
+
+        for rows, cols, require_closed in (
+            (ppc["branch"], DC_BRANCH_COLS, False),
+            (ppc["zero_branch"], DC_ZERO_BRANCH_COLS, False),
+            (ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)), DC_BREAK_COLS, True),
+        ):
+            if not rows.size:
+                continue
+            status_col = cols["status"] if require_closed else None
+            for row in rows:
+                union_groups(
+                    self._live_ppc_terminal_pair(
+                        row,
+                        cols["i_node"],
+                        cols["j_node"],
+                        cols["run_stat"],
+                        running_node_set,
+                        status_col=status_col,
+                    )
+                )
+
+        alive_roots = set()
+        gen = ppc["gen"]
+        if gen.size:
+            for row in gen:
+                if row[DC_GEN_COLS["run_stat"]] != 1 or row[DC_GEN_COLS["control_type"]] != DC_CTRL_V:
+                    continue
+                node_id = int(row[DC_GEN_COLS["node"]])
+                group = node_to_bus_group.get(node_id)
+                if group is not None:
+                    alive_roots.add(self._find_parent(group_parent, group))
+
+        dcdc = ppc["dcdc"]
+        if dcdc.size:
+            for row in dcdc:
+                pair = self._live_ppc_terminal_pair(
+                    row,
+                    DC_DCDC_COLS["i_node"],
+                    DC_DCDC_COLS["j_node"],
+                    DC_DCDC_COLS["run_stat"],
+                    running_node_set,
+                )
+                if pair is None or row[DC_DCDC_COLS["control_type"]] != DC_CTRL_V:
+                    continue
+                group = node_to_bus_group.get(pair[0])
+                if group is not None:
+                    alive_roots.add(self._find_parent(group_parent, group))
+
+        if self.keep_node_objects:
+            solver_groups = [
+                [int(node_id)]
+                for node_id in running_node_ids
+                if self._find_parent(group_parent, node_to_bus_group[int(node_id)]) in alive_roots
+            ]
+        else:
+            solver_groups = [
+                nodes
+                for group_pos, nodes in enumerate(bus_groups)
+                if self._find_parent(group_parent, group_pos) in alive_roots
+            ]
+
+        self.alive_node_dict = {
+            int(node_id): pos
+            for pos, nodes in enumerate(solver_groups)
+            for node_id in nodes
+        }
+        self.alive_node_ids = np.asarray(list(self.alive_node_dict.keys()), dtype=np.int32)
+        self.N = len(solver_groups)
+
+        bus_names = ppc.get("bus_name", np.asarray([f"nd_{int(row[DC_BUS_COLS['idx']])}" for row in bus], dtype=object))
+        node_meta = {
+            int(row[DC_BUS_COLS["idx"]]): (
+                str(bus_names[row_pos]),
+                float(row[DC_BUS_COLS["vbase"]]),
+                float(row[DC_BUS_COLS["voltage"]]),
+            )
+            for row_pos, row in enumerate(bus)
+        }
+        self.alive_nodes = []
+        for nodes in solver_groups:
+            idx = int(nodes[0])
+            name, vbase, voltage = node_meta.get(idx, (f"nd_{idx}", 0.0, 1.0))
+            members = [SimpleNamespace(idx=int(node_id)) for node_id in nodes]
+            self.alive_nodes.append(
+                SimpleNamespace(
+                    idx=idx,
+                    name=name,
+                    nodes=members,
+                    vbase=vbase,
+                    voltage=voltage,
+                    run_stat=1,
+                    is_alive=True,
+                    is_slack=False,
+                    v_set=1.0,
+                )
+            )
+
     def prepare(self):
         """
         运行潮流计算（修正版，采用节点电位法处理零阻抗支路）
@@ -248,27 +426,30 @@ class DCPowerFlowCalc:
         方程：功率平衡（除松弛节点外各节点） + 松弛节点电压方程 + 零阻抗电压约束（树支） + φ参考固定 + DC-DC方程
         变量数与方程数严格相等。
         """
-        bus_nodes = [] if self.keep_node_objects else [
-            bus
-            for bus in getattr(self.model, "buses", [])
-            if getattr(bus, "isl_obj", None) is not None and bus.isl_obj.is_alive
-        ]
-        self.alive_nodes = bus_nodes or [
-            node
-            for node in self.model.nodes
-            if node.isl_obj is not None and node.isl_obj.is_alive
-        ]
+        if self.array_mode and self._direct_ppc_mode:
+            self._prepare_direct_ppc_topology()
+        else:
+            bus_nodes = [] if self.keep_node_objects else [
+                bus
+                for bus in getattr(self.model, "buses", [])
+                if getattr(bus, "isl_obj", None) is not None and bus.isl_obj.is_alive
+            ]
+            self.alive_nodes = bus_nodes or [
+                node
+                for node in self.model.nodes
+                if node.isl_obj is not None and node.isl_obj.is_alive
+            ]
 
-        self.N = len(self.alive_nodes)
+            self.N = len(self.alive_nodes)
+            self.alive_node_dict = {}
+            for idx, node in enumerate(self.alive_nodes):
+                for member in getattr(node, "nodes", ()):
+                    self.alive_node_dict[int(member.idx)] = idx
+                self.alive_node_dict.setdefault(int(node.idx), idx)
+            self.alive_node_ids = np.asarray(list(self.alive_node_dict.keys()), dtype=np.int32)
+
         if self.N == 0:
             raise ValueError("电网中没有活节点")
-
-        self.alive_node_dict = {}
-        for idx, node in enumerate(self.alive_nodes):
-            for member in getattr(node, "nodes", ()):
-                self.alive_node_dict[int(member.idx)] = idx
-            self.alive_node_dict.setdefault(int(node.idx), idx)
-        self.alive_node_ids = np.asarray(list(self.alive_node_dict.keys()), dtype=np.int32)
 
         self.P_const = np.zeros(self.N, dtype=np.float64)   # 注入为正：P型发电机 - P型负荷
         self.I_shunt = np.zeros(self.N, dtype=np.float64)   # 消耗为正：负荷电流 - 发电电流
@@ -299,10 +480,14 @@ class DCPowerFlowCalc:
             if np.any(self.branch_r <= 0.0):
                 bad = int(np.where(self.branch_r <= 0.0)[0][0])
                 raise ValueError(f"支路电阻必须为正数: r={self.branch_r[bad]}")
-            self._lf_branch_devices = [self.model.branches[int(idx)] for idx in self.branch_idx]
-            self._lf_inactive_branch_devices = [
-                self.model.branches[int(idx)] for idx in np.nonzero(~branch_mask)[0]
-            ]
+            if self.model is not None and hasattr(self.model, "branches"):
+                self._lf_branch_devices = [self.model.branches[int(idx)] for idx in self.branch_idx]
+                self._lf_inactive_branch_devices = [
+                    self.model.branches[int(idx)] for idx in np.nonzero(~branch_mask)[0]
+                ]
+            else:
+                self._lf_branch_devices = []
+                self._lf_inactive_branch_devices = []
 
             load = ppc["load"]
             if load.size:
@@ -339,7 +524,8 @@ class DCPowerFlowCalc:
                     np.add.at(self.I_shunt, gen_pos[i_mask], -gen_active[i_mask, DC_GEN_COLS["i_set"]])
                 if np.any(v_mask):
                     for row_idx, node in zip(gen_rows[v_mask], gen_pos[v_mask]):
-                        self.slack_gen_info.setdefault(int(node), []).append(self.model.generators[int(row_idx)])
+                        slack_ref = int(row_idx) if self._direct_ppc_mode else self.model.generators[int(row_idx)]
+                        self.slack_gen_info.setdefault(int(node), []).append(slack_ref)
                 bad_ctrl = ~(p_mask | i_mask | v_mask)
                 if np.any(bad_ctrl):
                     raise ValueError(f"未知发电机控制类型: {gen_ctrl[int(np.where(bad_ctrl)[0][0])]}")
@@ -684,7 +870,14 @@ class DCPowerFlowCalc:
                 self.dcdc_r1 = self.dcdc_r2 = np.array([], dtype=np.float64)
 
         # ---------- 4. 确定松弛节点 ----------
-        self.slack_nodes = {node: gens[0].v_set for node, gens in self.slack_gen_info.items()}
+        if self.array_mode and self._direct_ppc_mode:
+            gen = self.ppc["gen"]
+            self.slack_nodes = {
+                node: float(gen[int(gens[0]), DC_GEN_COLS["v_set"]])
+                for node, gens in self.slack_gen_info.items()
+            }
+        else:
+            self.slack_nodes = {node: gens[0].v_set for node, gens in self.slack_gen_info.items()}
         self.slack_node_arr = np.fromiter(self.slack_nodes.keys(), dtype=np.int32, count=len(self.slack_nodes))
         self.slack_value_arr = np.fromiter(self.slack_nodes.values(), dtype=np.float64, count=len(self.slack_nodes))
 
@@ -1049,8 +1242,332 @@ class DCPowerFlowCalc:
         terms = self._eval_newton_terms(self.G, x) if terms is None else terms
         return self._get_f_from_terms(x, terms)
 
+    def _write_back_ppc(self, x):
+        """Write array-mode DC LF results to self.result without object topology."""
+        ppc = self.ppc
+        V_final = x[:self.N]
+        phi_final = x[self.N:self.N + self.N_phi] if self.N_phi > 0 else np.array([])
+        Pdc_final = x[self.N + self.N_phi:self.N + self.N_phi + self.N_dcdc * 2] if self.N_dcdc > 0 else np.array([])
+        node_lookup = self._alive_node_lookup_array()
+
+        bus = ppc["bus"].copy()
+        branch = ppc["branch"].copy()
+        load = ppc["load"].copy()
+        gen = ppc["gen"].copy()
+        zero_branch = ppc["zero_branch"].copy()
+        switch = ppc["switch"].copy()
+        breaker = ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)).copy()
+        dcdc = ppc["dcdc"].copy()
+
+        if bus.size:
+            bus_pos = self._map_nodes_with_lookup(bus[:, DC_BUS_COLS["idx"]], node_lookup)
+            bus[:, DC_BUS_COLS["voltage"]] = 0.0
+            active_bus = bus_pos >= 0
+            bus[active_bus, DC_BUS_COLS["voltage"]] = V_final[bus_pos[active_bus]]
+
+        P_inj = np.zeros(self.N, dtype=np.float64)
+
+        if branch.size:
+            branch[:, [DC_BRANCH_COLS["i_p"], DC_BRANCH_COLS["j_p"], DC_BRANCH_COLS["current"]]] = 0.0
+        if self.branch_idx.size:
+            vi = V_final[self.branch_i]
+            vj = V_final[self.branch_j]
+            current = (vi - vj) / self.branch_r
+            i_p = vi * current
+            j_p = -vj * current
+            branch[self.branch_idx, DC_BRANCH_COLS["current"]] = current
+            branch[self.branch_idx, DC_BRANCH_COLS["i_p"]] = i_p
+            branch[self.branch_idx, DC_BRANCH_COLS["j_p"]] = j_p
+            np.add.at(P_inj, self.branch_i, i_p)
+            np.add.at(P_inj, self.branch_j, j_p)
+
+        if zero_branch.size:
+            zero_branch[:, [DC_ZERO_BRANCH_COLS["p"], DC_ZERO_BRANCH_COLS["current"]]] = 0.0
+        if switch.size:
+            switch[:, [DC_SWITCH_COLS["p"], DC_SWITCH_COLS["current"]]] = 0.0
+        if breaker.size:
+            breaker[:, [DC_BREAK_COLS["p"], DC_BREAK_COLS["current"]]] = 0.0
+        for tp, dev_idx, i_node, j_node, phi_a, phi_b in self.zero_branch_info:
+            current = phi_final[phi_a] - phi_final[phi_b]
+            p_from = V_final[i_node] * current
+            if tp == 'Z':
+                zero_branch[int(dev_idx), DC_ZERO_BRANCH_COLS["p"]] = p_from
+                zero_branch[int(dev_idx), DC_ZERO_BRANCH_COLS["current"]] = current
+            elif tp == 'S':
+                switch[int(dev_idx), DC_SWITCH_COLS["p"]] = p_from
+                switch[int(dev_idx), DC_SWITCH_COLS["current"]] = current
+            elif tp == 'B':
+                breaker[int(dev_idx), DC_BREAK_COLS["p"]] = p_from
+                breaker[int(dev_idx), DC_BREAK_COLS["current"]] = current
+            P_inj[i_node] += p_from
+            P_inj[j_node] -= V_final[j_node] * current
+
+        if load.size:
+            load[:, [DC_LOAD_COLS["p"], DC_LOAD_COLS["current"]]] = 0.0
+            load_pos_all = self._map_nodes_with_lookup(load[:, DC_LOAD_COLS["node"]], node_lookup)
+            load_mask = (load[:, DC_LOAD_COLS["run_stat"]] == 1) & (load_pos_all >= 0)
+            if np.any(load_mask):
+                load_pos = load_pos_all[load_mask]
+                v = V_final[load_pos]
+                p = load[load_mask, DC_LOAD_COLS["pbase"]] * (
+                    load[load_mask, DC_LOAD_COLS["pv0"]]
+                    + load[load_mask, DC_LOAD_COLS["pv1"]] * v
+                    + load[load_mask, DC_LOAD_COLS["pv2"]] * v * v
+                )
+                current = np.divide(
+                    p,
+                    v,
+                    out=np.zeros_like(p),
+                    where=np.abs(v) > self.runtime_params.min_voltage,
+                )
+                load[load_mask, DC_LOAD_COLS["p"]] = p
+                load[load_mask, DC_LOAD_COLS["current"]] = current
+                np.add.at(P_inj, load_pos, p)
+
+        if gen.size:
+            gen[:, [DC_GEN_COLS["p"], DC_GEN_COLS["current"]]] = 0.0
+            gen_pos_all = self._map_nodes_with_lookup(gen[:, DC_GEN_COLS["node"]], node_lookup)
+            gen_mask = (gen[:, DC_GEN_COLS["run_stat"]] == 1) & (gen_pos_all >= 0)
+            if np.any(gen_mask):
+                gen_pos = gen_pos_all[gen_mask]
+                ctrl = gen[gen_mask, DC_GEN_COLS["control_type"]].astype(np.int8, copy=False)
+                v = V_final[gen_pos]
+                p_mask = ctrl == DC_CTRL_P
+                i_mask = ctrl == DC_CTRL_I
+                p_values = np.zeros(gen_pos.size, dtype=np.float64)
+                p_values[p_mask] = gen[gen_mask, DC_GEN_COLS["p_set"]][p_mask]
+                p_values[i_mask] = gen[gen_mask, DC_GEN_COLS["i_set"]][i_mask] * v[i_mask]
+                current = np.divide(
+                    p_values,
+                    v,
+                    out=np.zeros_like(p_values),
+                    where=np.abs(v) > self.runtime_params.min_voltage,
+                )
+                active_rows = np.nonzero(gen_mask)[0]
+                non_slack = p_mask | i_mask
+                gen[active_rows[non_slack], DC_GEN_COLS["p"]] = p_values[non_slack]
+                gen[active_rows[non_slack], DC_GEN_COLS["current"]] = current[non_slack]
+                np.add.at(P_inj, gen_pos[non_slack], -p_values[non_slack])
+
+        if dcdc.size:
+            dcdc[:, [DC_DCDC_COLS["i_p"], DC_DCDC_COLS["j_p"], DC_DCDC_COLS["i_c"], DC_DCDC_COLS["j_c"]]] = 0.0
+        if self.N_dcdc:
+            dcdc_i_p = Pdc_final[0::2]
+            dcdc_j_p = Pdc_final[1::2]
+            dcdc_vi = V_final[self.dcdc_i]
+            dcdc_vj = V_final[self.dcdc_j]
+            dcdc_i_c = np.divide(
+                dcdc_i_p,
+                dcdc_vi,
+                out=np.zeros_like(dcdc_i_p),
+                where=np.abs(dcdc_vi) > self.runtime_params.min_voltage,
+            )
+            dcdc_j_c = np.divide(
+                dcdc_j_p,
+                dcdc_vj,
+                out=np.zeros_like(dcdc_j_p),
+                where=np.abs(dcdc_vj) > self.runtime_params.min_voltage,
+            )
+            dcdc[self.dcdc_idx, DC_DCDC_COLS["i_p"]] = dcdc_i_p
+            dcdc[self.dcdc_idx, DC_DCDC_COLS["j_p"]] = dcdc_j_p
+            dcdc[self.dcdc_idx, DC_DCDC_COLS["i_c"]] = dcdc_i_c
+            dcdc[self.dcdc_idx, DC_DCDC_COLS["j_c"]] = dcdc_j_c
+            np.add.at(P_inj, self.dcdc_i, dcdc_i_p)
+            np.add.at(P_inj, self.dcdc_j, dcdc_j_p)
+
+        for node, gens in self.slack_gen_info.items():
+            if not gens:
+                continue
+            share = P_inj[node] / len(gens)
+            v = V_final[node]
+            current = share / v if abs(v) > self.runtime_params.min_voltage else 0.0
+            for gen_ref in gens:
+                if isinstance(gen_ref, (int, np.integer)):
+                    gen[int(gen_ref), DC_GEN_COLS["p"]] = share
+                    gen[int(gen_ref), DC_GEN_COLS["current"]] = current
+
+        self.result = {
+            "bus": bus,
+            "branch": branch,
+            "load": load,
+            "gen": gen,
+            "zero_branch": zero_branch,
+            "switch": switch,
+            "break": breaker,
+            "dcdc": dcdc,
+        }
+        self._write_ppc_result_to_network()
+
+    def _write_ppc_result_to_network(self) -> None:
+        """Copy ppc results back to an optional DCPowerNetwork object facade."""
+        network = getattr(self, "_network_writeback", None)
+        if network is None or not self.result:
+            return
+
+        def rows_by_idx(key, idx_col):
+            rows = self.result.get(key)
+            if rows is None or len(rows) == 0:
+                return {}
+            return {int(row[idx_col]): row for row in rows}
+
+        bus_by_idx = rows_by_idx("bus", DC_BUS_COLS["idx"])
+        slack_node_ids = {
+            int(node_id)
+            for node_id, pos in self.alive_node_dict.items()
+            if int(pos) in self.slack_nodes
+        }
+        for node in getattr(network, "nodes", []):
+            row = bus_by_idx.get(int(getattr(node, "idx", -1)))
+            node.voltage = 0.0 if row is None else float(row[DC_BUS_COLS["voltage"]])
+            node.is_alive = int(getattr(node, "idx", -1)) in self.alive_node_dict
+            node.is_slack = int(getattr(node, "idx", -1)) in slack_node_ids
+
+        def assign_devices(devices, key, idx_col, attrs):
+            row_by_idx = rows_by_idx(key, idx_col)
+            for dev in devices:
+                row = row_by_idx.get(int(getattr(dev, "idx", -1)))
+                if row is None:
+                    for attr, _col in attrs:
+                        setattr(dev, attr, 0.0)
+                    dev.is_alive = False
+                    continue
+                for attr, col in attrs:
+                    setattr(dev, attr, float(row[col]))
+                run_stat = int(getattr(dev, "run_stat", 1)) == 1
+                status_ok = int(getattr(dev, "status", 1)) == 1
+                i_node = getattr(dev, "i_node", getattr(dev, "node", None))
+                j_node = getattr(dev, "j_node", i_node)
+                dev.is_alive = (
+                    run_stat
+                    and status_ok
+                    and int(i_node) in self.alive_node_dict
+                    and int(j_node) in self.alive_node_dict
+                )
+
+        assign_devices(
+            getattr(network, "branches", []),
+            "branch",
+            DC_BRANCH_COLS["idx"],
+            (("i_p", DC_BRANCH_COLS["i_p"]), ("j_p", DC_BRANCH_COLS["j_p"]), ("current", DC_BRANCH_COLS["current"])),
+        )
+        assign_devices(
+            getattr(network, "zero_branches", []),
+            "zero_branch",
+            DC_ZERO_BRANCH_COLS["idx"],
+            (("p", DC_ZERO_BRANCH_COLS["p"]), ("current", DC_ZERO_BRANCH_COLS["current"])),
+        )
+        assign_devices(
+            getattr(network, "switches", []),
+            "switch",
+            DC_SWITCH_COLS["idx"],
+            (("p", DC_SWITCH_COLS["p"]), ("current", DC_SWITCH_COLS["current"])),
+        )
+        assign_devices(
+            getattr(network, "breakers", []),
+            "break",
+            DC_BREAK_COLS["idx"],
+            (("p", DC_BREAK_COLS["p"]), ("current", DC_BREAK_COLS["current"])),
+        )
+        assign_devices(
+            getattr(network, "loads", []),
+            "load",
+            DC_LOAD_COLS["idx"],
+            (("p", DC_LOAD_COLS["p"]), ("current", DC_LOAD_COLS["current"])),
+        )
+        assign_devices(
+            getattr(network, "generators", []),
+            "gen",
+            DC_GEN_COLS["idx"],
+            (("p", DC_GEN_COLS["p"]), ("current", DC_GEN_COLS["current"])),
+        )
+        assign_devices(
+            getattr(network, "dcdc_converters", []),
+            "dcdc",
+            DC_DCDC_COLS["idx"],
+            (
+                ("i_p", DC_DCDC_COLS["i_p"]),
+                ("j_p", DC_DCDC_COLS["j_p"]),
+                ("i_c", DC_DCDC_COLS["i_c"]),
+                ("j_c", DC_DCDC_COLS["j_c"]),
+            ),
+        )
+
+    def _result_node_voltage(self, node_idx) -> float:
+        rows = self.result.get("bus") if isinstance(getattr(self, "result", None), dict) else None
+        if rows is None or len(rows) == 0:
+            return 0.0
+        node_idx = int(node_idx)
+        for row in rows:
+            if int(row[DC_BUS_COLS["idx"]]) == node_idx:
+                return float(row[DC_BUS_COLS["voltage"]])
+        return 0.0
+
+    def _build_lf_result_from_ppc(self) -> DCLFResult:
+        result = DCLFResult()
+        names = lambda key, n: self.ppc.get(key, np.asarray([str(i) for i in range(n)], dtype=object))
+        bus_rows = self.result.get("bus", [])
+        voltage_by_node = {
+            int(row[DC_BUS_COLS["idx"]]): float(row[DC_BUS_COLS["voltage"]])
+            for row in bus_rows
+        }
+
+        def node_voltage(node_idx):
+            return voltage_by_node.get(int(node_idx), 0.0)
+
+        for row, name in zip(bus_rows, names("bus_name", len(bus_rows))):
+            result.nodes[str(name)] = SimpleNamespace(volt=float(row[DC_BUS_COLS["voltage"]]))
+        for row, name in zip(self.result.get("branch", []), names("branch_name", len(self.result.get("branch", [])))):
+            result.branches[str(name)] = SimpleNamespace(
+                i_p=float(row[DC_BRANCH_COLS["i_p"]]),
+                i_c=float(row[DC_BRANCH_COLS["current"]]),
+                i_v=node_voltage(row[DC_BRANCH_COLS["i_node"]]),
+                j_p=float(row[DC_BRANCH_COLS["j_p"]]),
+                j_c=-float(row[DC_BRANCH_COLS["current"]]),
+                j_v=node_voltage(row[DC_BRANCH_COLS["j_node"]]),
+            )
+        for row, name in zip(self.result.get("zero_branch", []), names("zero_branch_name", len(self.result.get("zero_branch", [])))):
+            result.zero_branches[str(name)] = SimpleNamespace(
+                i_p=float(row[DC_ZERO_BRANCH_COLS["p"]]),
+                i_c=float(row[DC_ZERO_BRANCH_COLS["current"]]),
+                i_v=node_voltage(row[DC_ZERO_BRANCH_COLS["i_node"]]),
+            )
+        for row, name in zip(self.result.get("break", []), names("break_name", len(self.result.get("break", [])))):
+            result.breakers[str(name)] = SimpleNamespace(
+                i_p=float(row[DC_BREAK_COLS["p"]]),
+                i_c=float(row[DC_BREAK_COLS["current"]]),
+                i_v=node_voltage(row[DC_BREAK_COLS["i_node"]]),
+            )
+        for row, name in zip(self.result.get("dcdc", []), names("dcdc_name", len(self.result.get("dcdc", [])))):
+            result.dcdc_converters[str(name)] = SimpleNamespace(
+                i_p=float(row[DC_DCDC_COLS["i_p"]]),
+                i_c=float(row[DC_DCDC_COLS["i_c"]]),
+                i_v=node_voltage(row[DC_DCDC_COLS["i_node"]]),
+                j_p=float(row[DC_DCDC_COLS["j_p"]]),
+                j_c=float(row[DC_DCDC_COLS["j_c"]]),
+                j_v=node_voltage(row[DC_DCDC_COLS["j_node"]]),
+            )
+        for row, name in zip(self.result.get("gen", []), names("gen_name", len(self.result.get("gen", [])))):
+            result.generators[str(name)] = SimpleNamespace(
+                i_p=float(row[DC_GEN_COLS["p"]]),
+                i_c=float(row[DC_GEN_COLS["current"]]),
+                i_v=node_voltage(row[DC_GEN_COLS["node"]]),
+            )
+        for row, name in zip(self.result.get("load", []), names("load_name", len(self.result.get("load", [])))):
+            result.loads[str(name)] = SimpleNamespace(
+                i_p=float(row[DC_LOAD_COLS["p"]]),
+                i_c=float(row[DC_LOAD_COLS["current"]]),
+                i_v=node_voltage(row[DC_LOAD_COLS["node"]]),
+            )
+        return result
+
     def update_lf_info(self, x):
         """将求解后的电压、电流和功率写回 DC 模型对象。"""
+        if self.array_mode and self._direct_ppc_mode:
+            self._write_back_ppc(x)
+            if not getattr(self, "skip_lf_result", False):
+                self.lf_result = self._build_lf_result()
+            return
+
         # ---------- 9. 结果回填 ----------
         V_final = x[:self.N]
         phi_final = x[self.N:self.N + self.N_phi] if self.N_phi > 0 else np.array([])
@@ -1179,6 +1696,8 @@ class DCPowerFlowCalc:
         return float(self.x[int(pos)])
 
     def _build_lf_result(self) -> DCLFResult:
+        if self.array_mode and isinstance(getattr(self, "result", None), dict) and self.result:
+            return self._build_lf_result_from_ppc()
         result = DCLFResult()
         voltage_by_node = {
             int(getattr(node, "idx", -1)): float(getattr(node, "voltage", 0.0) or 0.0)
@@ -1326,10 +1845,107 @@ class DCPowerFlowCalc:
         return -1
 
 def print_dc_result(calc: DCPowerFlowCalc) -> None:
-    net = calc.model
-
     # 9. 输出详细结果
     print("\n===输出直流电网潮流计算结果===")
+
+    if calc.array_mode and calc.result:
+        def _names(key, count):
+            values = calc.ppc.get(key)
+            if values is None:
+                return np.asarray([str(i) for i in range(count)], dtype=object)
+            return values
+
+        bus = calc.result["bus"]
+        bus_names = _names("bus_name", bus.shape[0])
+        slack_node_ids = {
+            int(node_id)
+            for node_id, pos in calc.alive_node_dict.items()
+            if int(pos) in calc.slack_nodes
+        }
+
+        print("\n1. 节点电压 (pu):")
+        for row, name in zip(bus, bus_names):
+            node_idx = int(row[DC_BUS_COLS["idx"]])
+            flag = " (松弛节点)" if node_idx in slack_node_ids else ""
+            print(f"   节点 {node_idx} {name}: {row[DC_BUS_COLS['voltage']]:.6f}{flag}")
+
+        branch = calc.result["branch"]
+        branch_names = _names("branch_name", branch.shape[0])
+        print("\n2. 普通电阻支路信息:")
+        for row, name in zip(branch, branch_names):
+            loss = row[DC_BRANCH_COLS["i_p"]] + row[DC_BRANCH_COLS["j_p"]]
+            print(
+                f"   支路 {int(row[DC_BRANCH_COLS['idx']])} {name} "
+                f"({int(row[DC_BRANCH_COLS['i_node']])}->{int(row[DC_BRANCH_COLS['j_node']])}, "
+                f"r={row[DC_BRANCH_COLS['r']]}pu):"
+            )
+            print(f"     电流: {row[DC_BRANCH_COLS['current']]:.6f} pu")
+            print(f"     送端功率: {row[DC_BRANCH_COLS['i_p']]:.6f} pu, 受端功率: {row[DC_BRANCH_COLS['j_p']]:.6f} pu")
+            print(f"     损耗功率: {loss:.6f} pu")
+
+        zero_branch = calc.result["zero_branch"]
+        zero_names = _names("zero_branch_name", zero_branch.shape[0])
+        print("\n3. 零阻抗支路信息:")
+        for row, name in zip(zero_branch, zero_names):
+            print(
+                f"   零阻抗支路 {int(row[DC_ZERO_BRANCH_COLS['idx']])} {name} "
+                f"({int(row[DC_ZERO_BRANCH_COLS['i_node']])}->{int(row[DC_ZERO_BRANCH_COLS['j_node']])}):"
+            )
+            print(f"     电流: {row[DC_ZERO_BRANCH_COLS['current']]:.6f} pu, 功率: {row[DC_ZERO_BRANCH_COLS['p']]:.6f} pu")
+
+        switch = calc.result["switch"]
+        switch_names = _names("switch_name", switch.shape[0])
+        print("\n4. 开关信息:")
+        for row, name in zip(switch, switch_names):
+            status = "闭合" if int(row[DC_SWITCH_COLS["status"]]) == 1 else "断开"
+            i_node = int(row[DC_SWITCH_COLS["i_node"]])
+            j_node = int(row[DC_SWITCH_COLS["j_node"]])
+            print(
+                f"   开关 {int(row[DC_SWITCH_COLS['idx']])} {name} "
+                f"({i_node}->{j_node}, 状态:{status}):"
+            )
+            print(f"     电流: {row[DC_SWITCH_COLS['current']]:.6f} pu, 功率: {row[DC_SWITCH_COLS['p']]:.6f} pu")
+
+        dcdc = calc.result["dcdc"]
+        dcdc_names = _names("dcdc_name", dcdc.shape[0])
+        print("\n5. DC-DC变流器信息:")
+        for row, name in zip(dcdc, dcdc_names):
+            print(
+                f"   变流器 {int(row[DC_DCDC_COLS['idx']])} {name} "
+                f"({int(row[DC_DCDC_COLS['i_node']])}->{int(row[DC_DCDC_COLS['j_node']])}):"
+            )
+            print(f"     送端功率: {row[DC_DCDC_COLS['i_p']]:.6f} pu, 送端电流: {row[DC_DCDC_COLS['i_c']]:.6f} pu")
+            print(f"     受端功率: {row[DC_DCDC_COLS['j_p']]:.6f} pu, 受端电流: {row[DC_DCDC_COLS['j_c']]:.6f} pu")
+            print(f"     损耗功率: {row[DC_DCDC_COLS['i_p']] + row[DC_DCDC_COLS['j_p']]:.6f} pu")
+
+        load = calc.result["load"]
+        load_names = _names("load_name", load.shape[0])
+        print("\n6. 负荷信息:")
+        for row, name in zip(load, load_names):
+            print(f"   负荷 {int(row[DC_LOAD_COLS['idx']])} {name} (节点{int(row[DC_LOAD_COLS['node']])}):")
+            print(f"     消耗功率: {row[DC_LOAD_COLS['p']]:.6f} pu, 电流: {row[DC_LOAD_COLS['current']]:.6f} pu")
+
+        gen = calc.result["gen"]
+        gen_names = _names("gen_name", gen.shape[0])
+        print("\n7. 发电机信息:")
+        for row, name in zip(gen, gen_names):
+            print(f"   发电机 {int(row[DC_GEN_COLS['idx']])} {name} (节点{int(row[DC_GEN_COLS['node']])}):")
+            print(f"     出力功率: {row[DC_GEN_COLS['p']]:.6f} pu, 电流: {row[DC_GEN_COLS['current']]:.6f} pu")
+
+        print("\n8. 计算收敛信息:")
+        print(f"   收敛状态: {'✓ 已收敛' if calc.converged else '✗ 未收敛'}")
+        print(f"   迭代次数: {calc.iterations}")
+        print(f"   最终残差: {calc.normF:.2e}")
+
+        total_gen_power = float(np.sum(gen[:, DC_GEN_COLS["p"]])) if gen.size else 0.0
+        total_load_power = float(np.sum(load[:, DC_LOAD_COLS["p"]])) if load.size else 0.0
+        print("\n9. 功率平衡校验:")
+        print(f"   总发电功率: {total_gen_power:.6f} pu")
+        print(f"   总负荷功率: {total_load_power:.6f} pu")
+        print(f"   网损: {total_gen_power - total_load_power:.6f} pu")
+        return
+
+    net = calc.model
 
     print("\n1. 节点电压 (pu):")
     for node in net.nodes:
@@ -1403,9 +2019,9 @@ def main(argv=None) -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
-    network = _dc_network_from_ppc(load_dc_ppc_from_e_file(args.file))
+    ppc = load_dc_ppc_from_e_file(args.file)
     calc = DCPowerFlowCalc(
-        network,
+        ppc,
         parameter_file=args.para,
         tol=args.tol,
         max_iter=args.max_iter,
@@ -1413,7 +2029,6 @@ def main(argv=None) -> int:
         linear_solver=args.linear_solver,
     )
     if not args.quiet:
-        calc.model.print_isl_info()
         print("=== 开始直流电网潮流计算===")
     rc = _run_with_optional_output(not args.quiet, calc.run, verbose=not args.quiet)
     if not args.quiet:
