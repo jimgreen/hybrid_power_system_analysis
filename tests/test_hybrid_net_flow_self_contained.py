@@ -109,6 +109,33 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(issparse(jac))
         self.assertEqual(jac.shape, (calc.total_eq, calc.total_vars))
 
+    def test_hybrid_jacobian_reuses_precomputed_global_csr_pattern(self):
+        import numpy as np
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(
+            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+        )
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        expected = calc.get_jacobi(calc.x).toarray()
+        self.assertGreater(calc.global_jac_csr_indices.size, 0)
+
+        original_coo_matrix = hybrid_lf.coo_matrix
+
+        def reject_coo_matrix(*_args, **_kwargs):
+            raise AssertionError("Hybrid Jacobian should refresh precomputed global CSR data")
+
+        hybrid_lf.coo_matrix = reject_coo_matrix
+        try:
+            actual = calc.get_jacobi(calc.x).toarray()
+        finally:
+            hybrid_lf.coo_matrix = original_coo_matrix
+
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
     def test_hybrid_newton_uses_shared_sparse_solver(self):
         import lfcore.hybrid_lf as hybrid_lf
 
@@ -368,6 +395,37 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsNone(calc.lf_result)
         self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
         self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
+
+    def test_result_mode_skips_full_hybrid_result_backfill(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
+
+        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+
+        def reject_full_backfill(_x):
+            raise AssertionError("result_mode='none' should skip full hybrid result backfill")
+
+        calc._write_back = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertIsNone(calc.lf_result)
+        self.assertTrue(hasattr(calc, "x"))
+
+        summary_calc = HybridPowerFlowCalc(network, verbose=False, result_mode="summary")
+        summary_calc._write_back = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = summary_calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(summary_calc.converged)
+        self.assertEqual(
+            {"ac", "dc", "hybrid"},
+            set(summary_calc.lf_result),
+        )
+        self.assertEqual(summary_calc.iterations, summary_calc.lf_result["hybrid"]["iterations"])
 
     def test_hybrid_power_flow_uses_dc_ppc_without_dc_object_topo(self):
         import lfcore.hybrid_lf as hybrid_lf

@@ -247,6 +247,7 @@ class ACPowerFlowCalc:
         algorithm: str = "nr",
         keep_node_objects: bool = True,
         linear_solver: str = "scipy",
+        result_mode: str = "full",
     ):
         # 基础配置
         algorithm = str(algorithm).strip().lower()
@@ -276,6 +277,7 @@ class ACPowerFlowCalc:
         self.algorithm = algorithm
         self.used_algorithm = algorithm
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self.result_mode = self._normalize_result_mode(result_mode)
         self.target_island = island
         self.skipped_islands: List = []
         self.calc_islands: List = []
@@ -348,6 +350,24 @@ class ACPowerFlowCalc:
         self.zero_b = np.array([], dtype=np.int32)
         self.zero_phi_a = np.array([], dtype=np.int32)
         self.zero_phi_b = np.array([], dtype=np.int32)
+        self.zero_top_left_rows = np.array([], dtype=np.int32)
+        self.zero_top_left_cols = np.array([], dtype=np.int32)
+        self.zero_top_left_edge = np.array([], dtype=np.intp)
+        self.zero_top_left_kind = np.array([], dtype=np.int8)
+        self.zero_top_left_data = np.array([], dtype=np.float64)
+        self.zero_top_right_rows = np.array([], dtype=np.int32)
+        self.zero_top_right_cols = np.array([], dtype=np.int32)
+        self.zero_top_right_edge = np.array([], dtype=np.intp)
+        self.zero_top_right_kind = np.array([], dtype=np.int8)
+        self.zero_top_right_data = np.array([], dtype=np.float64)
+        self.zero_bottom_left_rows = np.array([], dtype=np.int32)
+        self.zero_bottom_left_cols = np.array([], dtype=np.int32)
+        self.zero_bottom_left_node = np.array([], dtype=np.int32)
+        self.zero_bottom_left_kind = np.array([], dtype=np.int8)
+        self.zero_bottom_left_data = np.array([], dtype=np.float64)
+        self.zero_bottom_right_rows = np.array([], dtype=np.int32)
+        self.zero_bottom_right_cols = np.array([], dtype=np.int32)
+        self.zero_bottom_right_data = np.array([], dtype=np.float64)
         self.pq_theta_rows = np.array([], dtype=np.int32)
         self.pq_v_cols = np.array([], dtype=np.int32)
         self.Y_diag = np.array([], dtype=np.complex128)
@@ -367,6 +387,16 @@ class ACPowerFlowCalc:
         self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
         self.standard_jac_csr_order = np.array([], dtype=np.intp)
         self.standard_jac_csr_data = np.array([], dtype=np.float64)
+        self.full_jac_raw_data = np.array([], dtype=np.float64)
+        self.full_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
+        self.full_jac_csr_indices = np.array([], dtype=np.int32)
+        self.full_jac_csr_indptr = np.array([], dtype=np.int32)
+        self.full_jac_csr_data = np.array([], dtype=np.float64)
+        self.full_jac_standard_slice = slice(0, 0)
+        self.full_jac_zero_top_left_slice = slice(0, 0)
+        self.full_jac_zero_top_right_slice = slice(0, 0)
+        self.full_jac_zero_bottom_left_slice = slice(0, 0)
+        self.full_jac_zero_bottom_right_slice = slice(0, 0)
         self.std_jac_load_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_p_pos = np.array([], dtype=np.intp)
@@ -434,6 +464,24 @@ class ACPowerFlowCalc:
         self._residual_work = np.array([], dtype=np.float64)
         self.result: Dict = {}
 
+    @staticmethod
+    def _normalize_result_mode(result_mode: str) -> str:
+        mode = str(result_mode or "full").strip().lower()
+        aliases = {
+            "all": "full",
+            "full": "full",
+            "complete": "full",
+            "summary": "summary",
+            "brief": "summary",
+            "minimal": "summary",
+            "none": "none",
+            "skip": "none",
+            "raw": "none",
+        }
+        if mode not in aliases:
+            raise ValueError(f"Unsupported AC result_mode: {result_mode!r}")
+        return aliases[mode]
+
     def _cache_node_type_masks(self):
         self._slack_mask = self.node_type == 'SLACK'
         self._fixed_voltage_mask = self._slack_mask | (self.node_type == 'PV')
@@ -483,6 +531,7 @@ class ACPowerFlowCalc:
             count=self.V_unknown.size,
         )
         self.pq_v_cols = np.arange(self.V_unknown.size, dtype=np.int32)
+        self._cache_zero_jacobian_pattern()
 
         self.gen_pos = np.asarray([self.node_pos[gen.node] for gen in self.live_gens], dtype=np.int32)
         self.gen_share = np.ones(len(self.live_gens), dtype=np.float64)
@@ -788,6 +837,7 @@ class ACPowerFlowCalc:
         self._prepare_ppc_y_matrix(branch, transformer, shunt)
         self._prepare_ppc_zero_edges(zero_branch, switch, active_bus, breaker)
         self._finalize_prepared_arrays()
+        self._store_ppc_static()
         print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
 
     def _store_ppc_static(self):
@@ -842,6 +892,24 @@ class ACPowerFlowCalc:
             "zero_b": self.zero_b,
             "zero_phi_a": self.zero_phi_a,
             "zero_phi_b": self.zero_phi_b,
+            "zero_top_left_rows": self.zero_top_left_rows,
+            "zero_top_left_cols": self.zero_top_left_cols,
+            "zero_top_left_edge": self.zero_top_left_edge,
+            "zero_top_left_kind": self.zero_top_left_kind,
+            "zero_top_left_data": self.zero_top_left_data,
+            "zero_top_right_rows": self.zero_top_right_rows,
+            "zero_top_right_cols": self.zero_top_right_cols,
+            "zero_top_right_edge": self.zero_top_right_edge,
+            "zero_top_right_kind": self.zero_top_right_kind,
+            "zero_top_right_data": self.zero_top_right_data,
+            "zero_bottom_left_rows": self.zero_bottom_left_rows,
+            "zero_bottom_left_cols": self.zero_bottom_left_cols,
+            "zero_bottom_left_node": self.zero_bottom_left_node,
+            "zero_bottom_left_kind": self.zero_bottom_left_kind,
+            "zero_bottom_left_data": self.zero_bottom_left_data,
+            "zero_bottom_right_rows": self.zero_bottom_right_rows,
+            "zero_bottom_right_cols": self.zero_bottom_right_cols,
+            "zero_bottom_right_data": self.zero_bottom_right_data,
             "pq_theta_rows": self.pq_theta_rows,
             "pq_v_cols": self.pq_v_cols,
             "theta_col_by_node": self.theta_col_by_node,
@@ -875,6 +943,16 @@ class ACPowerFlowCalc:
             "standard_jac_csr_indptr": self.standard_jac_csr_indptr,
             "standard_jac_csr_order": self.standard_jac_csr_order,
             "standard_jac_csr_data": self.standard_jac_csr_data,
+            "full_jac_raw_data": self.full_jac_raw_data,
+            "full_jac_raw_to_csr_pos": self.full_jac_raw_to_csr_pos,
+            "full_jac_csr_indices": self.full_jac_csr_indices,
+            "full_jac_csr_indptr": self.full_jac_csr_indptr,
+            "full_jac_csr_data": self.full_jac_csr_data,
+            "full_jac_standard_slice": self.full_jac_standard_slice,
+            "full_jac_zero_top_left_slice": self.full_jac_zero_top_left_slice,
+            "full_jac_zero_top_right_slice": self.full_jac_zero_top_right_slice,
+            "full_jac_zero_bottom_left_slice": self.full_jac_zero_bottom_left_slice,
+            "full_jac_zero_bottom_right_slice": self.full_jac_zero_bottom_right_slice,
             "std_jac_load_nodes": self.std_jac_load_nodes,
             "std_jac_load_extra_nodes": self.std_jac_load_extra_nodes,
             "std_jac_load_p_pos": self.std_jac_load_p_pos,
@@ -963,7 +1041,13 @@ class ACPowerFlowCalc:
             "theta_idx", "V_idx", "n_theta", "n_V", "base_phi_re", "base_phi_im",
             "total_vars", "total_eq", "load_pos", "load_pv0", "load_pv1", "load_pv2",
             "load_qv0", "load_qv1", "load_qv2", "zero_idx", "zero_type", "zero_a",
-            "zero_b", "zero_phi_a", "zero_phi_b", "pq_theta_rows", "pq_v_cols",
+            "zero_b", "zero_phi_a", "zero_phi_b", "zero_top_left_rows",
+            "zero_top_left_cols", "zero_top_left_edge", "zero_top_left_kind",
+            "zero_top_left_data", "zero_top_right_rows", "zero_top_right_cols",
+            "zero_top_right_edge", "zero_top_right_kind", "zero_top_right_data",
+            "zero_bottom_left_rows", "zero_bottom_left_cols", "zero_bottom_left_node",
+            "zero_bottom_left_kind", "zero_bottom_left_data", "zero_bottom_right_rows",
+            "zero_bottom_right_cols", "zero_bottom_right_data", "pq_theta_rows", "pq_v_cols",
             "theta_col_by_node", "v_col_by_node", "p_row_by_node", "q_row_by_node",
             "Y_jac_rows", "Y_jac_cols", "Y_jac_data", "Y_jac_g", "Y_jac_b", "Y_jac_diag",
             "Y_jac_diag_idx", "Y_jac_diag_nodes", "Y_jac_diag_g", "Y_jac_diag_b",
@@ -972,7 +1056,11 @@ class ACPowerFlowCalc:
             "std_jac_q_vm_idx", "std_jac_p_theta_slice", "std_jac_p_vm_slice",
             "std_jac_q_theta_slice", "std_jac_q_vm_slice", "std_jac_load_p_slice",
             "std_jac_load_q_slice", "standard_jac_csr_indices", "standard_jac_csr_indptr",
-            "standard_jac_csr_order", "standard_jac_csr_data", "std_jac_load_nodes",
+            "standard_jac_csr_order", "standard_jac_csr_data", "full_jac_raw_data",
+            "full_jac_raw_to_csr_pos", "full_jac_csr_indices", "full_jac_csr_indptr",
+            "full_jac_csr_data", "full_jac_standard_slice", "full_jac_zero_top_left_slice",
+            "full_jac_zero_top_right_slice", "full_jac_zero_bottom_left_slice",
+            "full_jac_zero_bottom_right_slice", "std_jac_load_nodes",
             "std_jac_load_extra_nodes", "std_jac_load_p_pos", "std_jac_load_q_pos", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
             "_jac_delta", "_jac_cos_delta", "_jac_sin_delta", "_jac_vivj", "_jac_common_p", "_jac_common_q", "_jac_tmp",
             "_load_p_work", "_load_q_work", "_load_dp_work", "_load_dq_work",
@@ -987,6 +1075,12 @@ class ACPowerFlowCalc:
             setattr(self, name, static[name])
         self.x = static["x0"].copy()
         self.standard_jac_data = static["standard_jac_data"].copy()
+        self.zero_top_left_data = static["zero_top_left_data"].copy()
+        self.zero_top_right_data = static["zero_top_right_data"].copy()
+        self.zero_bottom_left_data = static["zero_bottom_left_data"].copy()
+        self.zero_bottom_right_data = static["zero_bottom_right_data"].copy()
+        self.full_jac_raw_data = static["full_jac_raw_data"].copy()
+        self.full_jac_csr_data = static["full_jac_csr_data"].copy()
         self._state_x_obj = None
         self._power_x_obj = None
         self._last_Ibus = None
@@ -1287,6 +1381,8 @@ class ACPowerFlowCalc:
         self.Y_jac_diag_g = self.Y_jac_diag[self.Y_jac_diag_nodes].real
         self.Y_jac_diag_b = self.Y_jac_diag[self.Y_jac_diag_nodes].imag
         self._cache_standard_jacobian_pattern()
+        self._cache_zero_jacobian_pattern()
+        self._cache_full_jacobian_pattern()
         self.Y_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices = []
         self.Y_offdiag_data = []
@@ -1391,6 +1487,242 @@ class ACPowerFlowCalc:
             self._jac_common_p = np.empty(y_nnz, dtype=np.float64)
             self._jac_common_q = np.empty(y_nnz, dtype=np.float64)
             self._jac_tmp = np.empty(y_nnz, dtype=np.float64)
+
+    def _cache_zero_jacobian_pattern(self):
+        """Cache fixed zero-impedance Jacobian coordinates for Newton iterations."""
+        self.zero_top_left_rows = np.array([], dtype=np.int32)
+        self.zero_top_left_cols = np.array([], dtype=np.int32)
+        self.zero_top_left_edge = np.array([], dtype=np.intp)
+        self.zero_top_left_kind = np.array([], dtype=np.int8)
+        self.zero_top_left_data = np.array([], dtype=np.float64)
+        self.zero_top_right_rows = np.array([], dtype=np.int32)
+        self.zero_top_right_cols = np.array([], dtype=np.int32)
+        self.zero_top_right_edge = np.array([], dtype=np.intp)
+        self.zero_top_right_kind = np.array([], dtype=np.int8)
+        self.zero_top_right_data = np.array([], dtype=np.float64)
+        self.zero_bottom_left_rows = np.array([], dtype=np.int32)
+        self.zero_bottom_left_cols = np.array([], dtype=np.int32)
+        self.zero_bottom_left_node = np.array([], dtype=np.int32)
+        self.zero_bottom_left_kind = np.array([], dtype=np.int8)
+        self.zero_bottom_left_data = np.array([], dtype=np.float64)
+        self.zero_bottom_right_rows = np.array([], dtype=np.int32)
+        self.zero_bottom_right_cols = np.array([], dtype=np.int32)
+        self.zero_bottom_right_data = np.array([], dtype=np.float64)
+
+        if self.N_phi <= 0:
+            return
+
+        top_left_rows, top_left_cols, top_left_edge, top_left_kind = [], [], [], []
+        top_right_rows, top_right_cols, top_right_edge, top_right_kind = [], [], [], []
+        for edge_pos, (a_raw, b_raw, phi_a_raw, phi_b_raw) in enumerate(
+            zip(self.zero_a, self.zero_b, self.zero_phi_a, self.zero_phi_b)
+        ):
+            a = int(a_raw)
+            b = int(b_raw)
+            phi_a = int(phi_a_raw)
+            phi_b = int(phi_b_raw)
+            phi_cols = (phi_a, self.N_phi + phi_a, phi_b, self.N_phi + phi_b)
+
+            if self.node_type[a] != 'SLACK':
+                eq_a = self.theta_idx[a]
+                top_left_rows.append(eq_a)
+                top_left_cols.append(eq_a)
+                top_left_edge.append(edge_pos)
+                top_left_kind.append(0)
+                if self.node_type[a] == 'PQ':
+                    top_left_rows.append(eq_a)
+                    top_left_cols.append(self.n_theta + self.V_idx[a])
+                    top_left_edge.append(edge_pos)
+                    top_left_kind.append(1)
+                top_right_rows.extend([eq_a] * 4)
+                top_right_cols.extend(phi_cols)
+                top_right_edge.extend([edge_pos] * 4)
+                top_right_kind.extend([0, 1, 2, 3])
+
+            if self.node_type[a] == 'PQ':
+                eq_a = self.n_theta + self.V_idx[a]
+                top_left_rows.extend([eq_a, eq_a])
+                top_left_cols.extend([self.theta_idx[a], self.n_theta + self.V_idx[a]])
+                top_left_edge.extend([edge_pos, edge_pos])
+                top_left_kind.extend([2, 3])
+                top_right_rows.extend([eq_a] * 4)
+                top_right_cols.extend(phi_cols)
+                top_right_edge.extend([edge_pos] * 4)
+                top_right_kind.extend([4, 5, 6, 7])
+
+            if self.node_type[b] != 'SLACK':
+                eq_b = self.theta_idx[b]
+                top_left_rows.append(eq_b)
+                top_left_cols.append(eq_b)
+                top_left_edge.append(edge_pos)
+                top_left_kind.append(4)
+                if self.node_type[b] == 'PQ':
+                    top_left_rows.append(eq_b)
+                    top_left_cols.append(self.n_theta + self.V_idx[b])
+                    top_left_edge.append(edge_pos)
+                    top_left_kind.append(5)
+                top_right_rows.extend([eq_b] * 4)
+                top_right_cols.extend(phi_cols)
+                top_right_edge.extend([edge_pos] * 4)
+                top_right_kind.extend([8, 9, 10, 11])
+
+            if self.node_type[b] == 'PQ':
+                eq_b = self.n_theta + self.V_idx[b]
+                top_left_rows.extend([eq_b, eq_b])
+                top_left_cols.extend([self.theta_idx[b], self.n_theta + self.V_idx[b]])
+                top_left_edge.extend([edge_pos, edge_pos])
+                top_left_kind.extend([6, 7])
+                top_right_rows.extend([eq_b] * 4)
+                top_right_cols.extend(phi_cols)
+                top_right_edge.extend([edge_pos] * 4)
+                top_right_kind.extend([12, 13, 14, 15])
+
+        self.zero_top_left_rows = np.asarray(top_left_rows, dtype=np.int32)
+        self.zero_top_left_cols = np.asarray(top_left_cols, dtype=np.int32)
+        self.zero_top_left_edge = np.asarray(top_left_edge, dtype=np.intp)
+        self.zero_top_left_kind = np.asarray(top_left_kind, dtype=np.int8)
+        self.zero_top_left_data = np.empty(self.zero_top_left_rows.size, dtype=np.float64)
+        self.zero_top_right_rows = np.asarray(top_right_rows, dtype=np.int32)
+        self.zero_top_right_cols = np.asarray(top_right_cols, dtype=np.int32)
+        self.zero_top_right_edge = np.asarray(top_right_edge, dtype=np.intp)
+        self.zero_top_right_kind = np.asarray(top_right_kind, dtype=np.int8)
+        self.zero_top_right_data = np.empty(self.zero_top_right_rows.size, dtype=np.float64)
+
+        bottom_left_rows, bottom_left_cols, bottom_left_node, bottom_left_kind = [], [], [], []
+        eq_idx = 0
+        for edges in self.comp_tree_edges:
+            for edge_idx in edges:
+                _, _, a, b = self.zero_edges[edge_idx]
+                a = int(a)
+                b = int(b)
+                if self.node_type[a] != 'SLACK':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.theta_idx[a])
+                    bottom_left_node.append(a)
+                    bottom_left_kind.append(0)
+                if self.node_type[a] == 'PQ':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.n_theta + self.V_idx[a])
+                    bottom_left_node.append(a)
+                    bottom_left_kind.append(1)
+                if self.node_type[b] != 'SLACK':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.theta_idx[b])
+                    bottom_left_node.append(b)
+                    bottom_left_kind.append(2)
+                if self.node_type[b] == 'PQ':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.n_theta + self.V_idx[b])
+                    bottom_left_node.append(b)
+                    bottom_left_kind.append(3)
+                eq_idx += 1
+
+                if self.node_type[a] != 'SLACK':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.theta_idx[a])
+                    bottom_left_node.append(a)
+                    bottom_left_kind.append(4)
+                if self.node_type[a] == 'PQ':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.n_theta + self.V_idx[a])
+                    bottom_left_node.append(a)
+                    bottom_left_kind.append(5)
+                if self.node_type[b] != 'SLACK':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.theta_idx[b])
+                    bottom_left_node.append(b)
+                    bottom_left_kind.append(6)
+                if self.node_type[b] == 'PQ':
+                    bottom_left_rows.append(eq_idx)
+                    bottom_left_cols.append(self.n_theta + self.V_idx[b])
+                    bottom_left_node.append(b)
+                    bottom_left_kind.append(7)
+                eq_idx += 1
+
+        self.zero_bottom_left_rows = np.asarray(bottom_left_rows, dtype=np.int32)
+        self.zero_bottom_left_cols = np.asarray(bottom_left_cols, dtype=np.int32)
+        self.zero_bottom_left_node = np.asarray(bottom_left_node, dtype=np.int32)
+        self.zero_bottom_left_kind = np.asarray(bottom_left_kind, dtype=np.int8)
+        self.zero_bottom_left_data = np.empty(self.zero_bottom_left_rows.size, dtype=np.float64)
+
+        bottom_right_rows, bottom_right_cols = [], []
+        for c, idx_phi in enumerate(self.ref_phi_idx):
+            bottom_right_rows.append(eq_idx + 2 * c)
+            bottom_right_cols.append(int(idx_phi))
+            bottom_right_rows.append(eq_idx + 2 * c + 1)
+            bottom_right_cols.append(self.N_phi + int(idx_phi))
+        self.zero_bottom_right_rows = np.asarray(bottom_right_rows, dtype=np.int32)
+        self.zero_bottom_right_cols = np.asarray(bottom_right_cols, dtype=np.int32)
+        self.zero_bottom_right_data = np.ones(len(bottom_right_rows), dtype=np.float64)
+
+    def _cache_full_jacobian_pattern(self):
+        """Precompute the full AC Jacobian CSR pattern for standard and zero-branch blocks."""
+        self.full_jac_raw_data = np.array([], dtype=np.float64)
+        self.full_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
+        self.full_jac_csr_indices = np.array([], dtype=np.int32)
+        self.full_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
+        self.full_jac_csr_data = np.array([], dtype=np.float64)
+        self.full_jac_standard_slice = slice(0, 0)
+        self.full_jac_zero_top_left_slice = slice(0, 0)
+        self.full_jac_zero_top_right_slice = slice(0, 0)
+        self.full_jac_zero_bottom_left_slice = slice(0, 0)
+        self.full_jac_zero_bottom_right_slice = slice(0, 0)
+
+        if self.total_eq == 0 or self.total_vars == 0 or self.standard_jac_rows.size == 0:
+            return
+
+        rows_parts = []
+        cols_parts = []
+        raw_count = 0
+
+        def add_part(name, rows, cols):
+            nonlocal raw_count
+            rows = np.asarray(rows, dtype=np.int32)
+            cols = np.asarray(cols, dtype=np.int32)
+            if rows.size != cols.size:
+                raise ValueError(f"AC Jacobian pattern part {name!r} has mismatched row/column lengths")
+            part_slice = slice(raw_count, raw_count + rows.size)
+            setattr(self, f"full_jac_{name}_slice", part_slice)
+            raw_count += rows.size
+            if rows.size:
+                rows_parts.append(rows)
+                cols_parts.append(cols)
+
+        std_eq = self.n_theta + self.n_V
+        std_vars = std_eq
+        add_part("standard", self.standard_jac_rows, self.standard_jac_cols)
+        if self.N_phi:
+            add_part("zero_top_left", self.zero_top_left_rows, self.zero_top_left_cols)
+            add_part("zero_top_right", self.zero_top_right_rows, self.zero_top_right_cols + std_vars)
+            add_part("zero_bottom_left", self.zero_bottom_left_rows + std_eq, self.zero_bottom_left_cols)
+            add_part("zero_bottom_right", self.zero_bottom_right_rows + std_eq, self.zero_bottom_right_cols + std_vars)
+
+        self.full_jac_raw_data = np.empty(raw_count, dtype=np.float64)
+        if raw_count == 0:
+            return
+
+        raw_rows = np.concatenate(rows_parts)
+        raw_cols = np.concatenate(cols_parts)
+        pattern = coo_matrix(
+            (np.ones(raw_count, dtype=np.float64), (raw_rows, raw_cols)),
+            shape=(self.total_eq, self.total_vars),
+        ).tocsr()
+        pattern.sum_duplicates()
+        self.full_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
+        self.full_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
+        self.full_jac_csr_data = np.empty(self.full_jac_csr_indices.size, dtype=np.float64)
+
+        positions = {}
+        for row in range(self.total_eq):
+            start = int(self.full_jac_csr_indptr[row])
+            end = int(self.full_jac_csr_indptr[row + 1])
+            for pos in range(start, end):
+                positions[(row, int(self.full_jac_csr_indices[pos]))] = pos
+        self.full_jac_raw_to_csr_pos = np.fromiter(
+            (positions[(int(row), int(col))] for row, col in zip(raw_rows, raw_cols)),
+            dtype=np.intp,
+            count=raw_count,
+        )
 
     def _cache_pq_decoupled_matrices(self):
         """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
@@ -2194,8 +2526,8 @@ class ACPowerFlowCalc:
 
         return vstack((hstack((J11, J12), format='csr'), hstack((J21, J22), format='csr')), format='csr')
 
-    def _get_standard_jacobi_direct(self, V: np.ndarray, Sbus=None):
-        """Build the standard P/Q Jacobian directly from Y nonzeros."""
+    def _fill_standard_jacobian_data(self, V: np.ndarray, Sbus=None):
+        """Refresh the standard P/Q Jacobian raw data in the cached coordinate order."""
         theta = self._cache['theta']
         Vc = self._cache['Vc']
         if Sbus is not None:
@@ -2283,6 +2615,11 @@ class ACPowerFlowCalc:
                 data[self.std_jac_load_p_slice] = dPload_dV[self.std_jac_load_extra_nodes]
                 data[self.std_jac_load_q_slice] = dQload_dV[self.std_jac_load_extra_nodes]
 
+        return data
+
+    def _get_standard_jacobi_direct(self, V: np.ndarray, Sbus=None):
+        """Build the standard P/Q Jacobian directly from Y nonzeros."""
+        data = self._fill_standard_jacobian_data(V, Sbus=Sbus)
         if self.standard_jac_csr_order.size:
             self.standard_jac_csr_data[:] = data[self.standard_jac_csr_order]
             return csr_matrix(
@@ -2295,6 +2632,93 @@ class ACPowerFlowCalc:
             shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
         ).tocsr()
 
+    @staticmethod
+    def _fill_indexed_kind_data(out, kind, source_index, sources):
+        for code, values in enumerate(sources):
+            mask = kind == code
+            if np.any(mask):
+                out[mask] = values[source_index[mask]]
+
+    def _fill_zero_top_jacobian_data(self, V, phi_re, phi_im, cos_theta, sin_theta):
+        if not self.zero_a.size:
+            return
+        I_re = phi_re[self.zero_phi_a] - phi_re[self.zero_phi_b]
+        I_im = phi_im[self.zero_phi_a] - phi_im[self.zero_phi_b]
+        Va = V[self.zero_a]
+        Vb = V[self.zero_b]
+        cos_a = cos_theta[self.zero_a]
+        sin_a = sin_theta[self.zero_a]
+        cos_b = cos_theta[self.zero_b]
+        sin_b = sin_theta[self.zero_b]
+        a_pv = cos_a * I_re + sin_a * I_im
+        a_pt = -sin_a * I_re + cos_a * I_im
+        b_pv = cos_b * I_re + sin_b * I_im
+        b_pt = sin_b * I_re - cos_b * I_im
+
+        if self.zero_top_left_data.size:
+            self._fill_indexed_kind_data(
+                self.zero_top_left_data,
+                self.zero_top_left_kind,
+                self.zero_top_left_edge,
+                (
+                    Va * a_pt,
+                    a_pv,
+                    Va * a_pv,
+                    -a_pt,
+                    Vb * b_pt,
+                    -b_pv,
+                    -Vb * b_pv,
+                    -b_pt,
+                ),
+            )
+        if self.zero_top_right_data.size:
+            Va_cos = Va * cos_a
+            Va_sin = Va * sin_a
+            Vb_cos = Vb * cos_b
+            Vb_sin = Vb * sin_b
+            self._fill_indexed_kind_data(
+                self.zero_top_right_data,
+                self.zero_top_right_kind,
+                self.zero_top_right_edge,
+                (
+                    Va_cos,
+                    Va_sin,
+                    -Va_cos,
+                    -Va_sin,
+                    Va_sin,
+                    -Va_cos,
+                    -Va_sin,
+                    Va_cos,
+                    -Vb_cos,
+                    -Vb_sin,
+                    Vb_cos,
+                    Vb_sin,
+                    -Vb_sin,
+                    Vb_cos,
+                    Vb_sin,
+                    -Vb_cos,
+                ),
+            )
+
+    def _fill_zero_bottom_jacobian_data(self, V, cos_theta, sin_theta):
+        if not self.zero_bottom_left_data.size:
+            return
+        self._fill_indexed_kind_data(
+            self.zero_bottom_left_data,
+            self.zero_bottom_left_kind,
+            self.zero_bottom_left_node,
+            (
+                -V * sin_theta,
+                cos_theta,
+                V * sin_theta,
+                -cos_theta,
+                V * cos_theta,
+                sin_theta,
+                -V * cos_theta,
+                -sin_theta,
+            ),
+        )
+
     def get_jacobi(self, x: np.ndarray) -> csr_matrix:
         """计算雅可比矩阵。标准AC部分使用稀疏矩阵批量公式，零阻抗扩展按块追加。"""
         if self._state_x_obj is x:
@@ -2306,9 +2730,35 @@ class ACPowerFlowCalc:
             theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
         return self._get_jacobi_from_cached_state(theta, V, phi_re, phi_im)
 
+    def _get_jacobi_from_precomputed_pattern(self, V, phi_re, phi_im, cos_theta, sin_theta, Sbus=None):
+        if self.full_jac_raw_data.size == 0:
+            return None
+
+        raw = self.full_jac_raw_data
+        raw[self.full_jac_standard_slice] = self._fill_standard_jacobian_data(V, Sbus=Sbus)
+        if self.N_phi:
+            self._fill_zero_top_jacobian_data(V, phi_re, phi_im, cos_theta, sin_theta)
+            self._fill_zero_bottom_jacobian_data(V, cos_theta, sin_theta)
+            raw[self.full_jac_zero_top_left_slice] = self.zero_top_left_data
+            raw[self.full_jac_zero_top_right_slice] = self.zero_top_right_data
+            raw[self.full_jac_zero_bottom_left_slice] = self.zero_bottom_left_data
+            raw[self.full_jac_zero_bottom_right_slice] = self.zero_bottom_right_data
+
+        self.full_jac_csr_data.fill(0.0)
+        np.add.at(self.full_jac_csr_data, self.full_jac_raw_to_csr_pos, raw)
+        return csr_matrix(
+            (self.full_jac_csr_data, self.full_jac_csr_indices, self.full_jac_csr_indptr),
+            shape=(self.total_eq, self.total_vars),
+            copy=False,
+        )
+
     def _get_jacobi_from_cached_state(self, theta, V, phi_re, phi_im, Sbus=None) -> csr_matrix:
         """Build Jacobian using state arrays already extracted for the current Newton step."""
         cos_theta, sin_theta = self._cache['cos_theta'], self._cache['sin_theta']
+
+        precomputed = self._get_jacobi_from_precomputed_pattern(V, phi_re, phi_im, cos_theta, sin_theta, Sbus=Sbus)
+        if precomputed is not None:
+            return precomputed
 
         J_standard = self._get_standard_jacobi_sparse(V, Sbus=Sbus)
         if self.N_phi == 0:
@@ -2320,147 +2770,25 @@ class ACPowerFlowCalc:
         std_vars = std_eq
         zero_eq = self.total_eq - std_eq
         phi_vars = 2 * self.N_phi
-        left_rows, left_cols, left_data = [], [], []
-        right_rows, right_cols, right_data = [], [], []
 
-        if self.N_phi > 0 and self.zero_a.size:
-            I_re = phi_re[self.zero_phi_a] - phi_re[self.zero_phi_b]
-            I_im = phi_im[self.zero_phi_a] - phi_im[self.zero_phi_b]
-            Va = V[self.zero_a]
-            Vb = V[self.zero_b]
-            cos_a = cos_theta[self.zero_a]
-            sin_a = sin_theta[self.zero_a]
-            cos_b = cos_theta[self.zero_b]
-            sin_b = sin_theta[self.zero_b]
-
-            for idx in range(len(self.zero_a)):
-                a, b = self.zero_a[idx], self.zero_b[idx]
-                phi_a, phi_b = self.zero_phi_a[idx], self.zero_phi_b[idx]
-                phi_cols = [
-                    phi_a,
-                    self.N_phi + phi_a,
-                    phi_b,
-                    self.N_phi + phi_b,
-                ]
-
-                if self.node_type[a] != 'SLACK':
-                    eq_a = self.theta_idx[a]
-                    left_rows.append(eq_a)
-                    left_cols.append(self.theta_idx[a])
-                    left_data.append(Va[idx] * (-sin_a[idx] * I_re[idx] + cos_a[idx] * I_im[idx]))
-                    if self.node_type[a] == 'PQ':
-                        left_rows.append(eq_a)
-                        left_cols.append(self.n_theta + self.V_idx[a])
-                        left_data.append(cos_a[idx] * I_re[idx] + sin_a[idx] * I_im[idx])
-                    right_rows.extend([eq_a] * 4)
-                    right_cols.extend(phi_cols)
-                    right_data.extend([Va[idx] * cos_a[idx], Va[idx] * sin_a[idx], -Va[idx] * cos_a[idx], -Va[idx] * sin_a[idx]])
-
-                if self.node_type[a] == 'PQ':
-                    eq_a = self.n_theta + self.V_idx[a]
-                    left_rows.extend([eq_a, eq_a])
-                    left_cols.extend([self.theta_idx[a], self.n_theta + self.V_idx[a]])
-                    left_data.extend([
-                        Va[idx] * (cos_a[idx] * I_re[idx] + sin_a[idx] * I_im[idx]),
-                        sin_a[idx] * I_re[idx] - cos_a[idx] * I_im[idx],
-                    ])
-                    right_rows.extend([eq_a] * 4)
-                    right_cols.extend(phi_cols)
-                    right_data.extend([Va[idx] * sin_a[idx], -Va[idx] * cos_a[idx], -Va[idx] * sin_a[idx], Va[idx] * cos_a[idx]])
-
-                if self.node_type[b] != 'SLACK':
-                    eq_b = self.theta_idx[b]
-                    left_rows.append(eq_b)
-                    left_cols.append(self.theta_idx[b])
-                    left_data.append(Vb[idx] * (sin_b[idx] * I_re[idx] - cos_b[idx] * I_im[idx]))
-                    if self.node_type[b] == 'PQ':
-                        left_rows.append(eq_b)
-                        left_cols.append(self.n_theta + self.V_idx[b])
-                        left_data.append(-cos_b[idx] * I_re[idx] - sin_b[idx] * I_im[idx])
-                    right_rows.extend([eq_b] * 4)
-                    right_cols.extend(phi_cols)
-                    right_data.extend([-Vb[idx] * cos_b[idx], -Vb[idx] * sin_b[idx], Vb[idx] * cos_b[idx], Vb[idx] * sin_b[idx]])
-
-                if self.node_type[b] == 'PQ':
-                    eq_b = self.n_theta + self.V_idx[b]
-                    left_rows.extend([eq_b, eq_b])
-                    left_cols.extend([self.theta_idx[b], self.n_theta + self.V_idx[b]])
-                    left_data.extend([
-                        -Vb[idx] * (cos_b[idx] * I_re[idx] + sin_b[idx] * I_im[idx]),
-                        -sin_b[idx] * I_re[idx] + cos_b[idx] * I_im[idx],
-                    ])
-                    right_rows.extend([eq_b] * 4)
-                    right_cols.extend(phi_cols)
-                    right_data.extend([-Vb[idx] * sin_b[idx], Vb[idx] * cos_b[idx], Vb[idx] * sin_b[idx], -Vb[idx] * cos_b[idx]])
-
-        if left_rows:
+        self._fill_zero_top_jacobian_data(V, phi_re, phi_im, cos_theta, sin_theta)
+        if self.zero_top_left_rows.size:
             J_standard = J_standard + coo_matrix(
-                (np.asarray(left_data), (np.asarray(left_rows, dtype=np.int32), np.asarray(left_cols, dtype=np.int32))),
+                (self.zero_top_left_data, (self.zero_top_left_rows, self.zero_top_left_cols)),
                 shape=(std_eq, std_vars),
             ).tocsr()
         J_phi_top = coo_matrix(
-            (np.asarray(right_data), (np.asarray(right_rows, dtype=np.int32), np.asarray(right_cols, dtype=np.int32))),
+            (self.zero_top_right_data, (self.zero_top_right_rows, self.zero_top_right_cols)),
             shape=(std_eq, phi_vars),
         ).tocsr()
 
-        bottom_left_rows, bottom_left_cols, bottom_left_data = [], [], []
-        bottom_right_rows, bottom_right_cols, bottom_right_data = [], [], []
-        eq_idx = 0
-        for c in range(len(self.comp_nodes)):
-            for edge_idx in self.comp_tree_edges[c]:
-                index, type, a, b = self.zero_edges[edge_idx]
-
-                if self.node_type[a] != 'SLACK':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[a])
-                    bottom_left_data.append(-V[a] * sin_theta[a])
-                if self.node_type[a] == 'PQ':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[a])
-                    bottom_left_data.append(cos_theta[a])
-                if self.node_type[b] != 'SLACK':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[b])
-                    bottom_left_data.append(V[b] * sin_theta[b])
-                if self.node_type[b] == 'PQ':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[b])
-                    bottom_left_data.append(-cos_theta[b])
-                eq_idx += 1
-
-                if self.node_type[a] != 'SLACK':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[a])
-                    bottom_left_data.append(V[a] * cos_theta[a])
-                if self.node_type[a] == 'PQ':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[a])
-                    bottom_left_data.append(sin_theta[a])
-                if self.node_type[b] != 'SLACK':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[b])
-                    bottom_left_data.append(-V[b] * cos_theta[b])
-                if self.node_type[b] == 'PQ':
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[b])
-                    bottom_left_data.append(-sin_theta[b])
-                eq_idx += 1
-
-        for c in range(len(self.comp_nodes)):
-            idx_phi = self.ref_phi_idx[c]
-            bottom_right_rows.append(eq_idx + 2 * c)
-            bottom_right_cols.append(idx_phi)
-            bottom_right_data.append(1.0)
-            bottom_right_rows.append(eq_idx + 2 * c + 1)
-            bottom_right_cols.append(self.N_phi + idx_phi)
-            bottom_right_data.append(1.0)
-
+        self._fill_zero_bottom_jacobian_data(V, cos_theta, sin_theta)
         J_zero_left = coo_matrix(
-            (np.asarray(bottom_left_data), (np.asarray(bottom_left_rows, dtype=np.int32), np.asarray(bottom_left_cols, dtype=np.int32))),
+            (self.zero_bottom_left_data, (self.zero_bottom_left_rows, self.zero_bottom_left_cols)),
             shape=(zero_eq, std_vars),
         ).tocsr()
         J_zero_right = coo_matrix(
-            (np.asarray(bottom_right_data), (np.asarray(bottom_right_rows, dtype=np.int32), np.asarray(bottom_right_cols, dtype=np.int32))),
+            (self.zero_bottom_right_data, (self.zero_bottom_right_rows, self.zero_bottom_right_cols)),
             shape=(zero_eq, phi_vars),
         ).tocsr()
         return vstack(
@@ -2482,8 +2810,10 @@ class ACPowerFlowCalc:
     # --------------------------------------------------------------------------
     # 迭代求解
     # --------------------------------------------------------------------------
-    def run(self) -> int:
+    def run(self, result_mode=None) -> int:
         """执行所选潮流算法。"""
+        if result_mode is not None:
+            self.result_mode = self._normalize_result_mode(result_mode)
         if self.algorithm == "pq" and self.N_phi == 0 and self.pq_Bp is not None and self.pq_Bpp is not None:
             return self._run_pq_decoupled()
         if self.algorithm == "pq":
@@ -2581,8 +2911,38 @@ class ACPowerFlowCalc:
         self.x = x0
         return self._run_newton_raphson(used_label="pq->nr")
 
+    def _summary_node_ids(self):
+        if self.ppc_node_idx.size == self.N:
+            return self.ppc_node_idx.copy()
+        if self.node_list:
+            return np.asarray([int(getattr(node, "idx", pos)) for pos, node in enumerate(self.node_list)], dtype=np.int64)
+        return np.arange(self.N, dtype=np.int64)
+
+    def _write_summary_result(self):
+        theta, V, _phi_re, _phi_im = self._extract_state_vars(self.x)
+        self.result = {
+            "node_id": self._summary_node_ids(),
+            "voltage": V.copy(),
+            "angle": theta.copy(),
+            "summary": {
+                "converged": bool(self.converged),
+                "iterations": int(self.iterations),
+                "normF": float(self.normF),
+                "used_algorithm": self.used_algorithm,
+            },
+        }
+        self.lf_result = None
+
     def _write_back(self):
         """结果回填；数值计算批量完成，Python 循环只负责对象属性赋值。"""
+        if self.result_mode == "none":
+            self.result = {}
+            self.lf_result = None
+            return
+        if self.result_mode == "summary":
+            self._write_summary_result()
+            return
+
         if self.array_mode:
             self._write_back_ppc()
             return
@@ -3244,6 +3604,7 @@ def main(argv=None) -> int:
     parser.add_argument("--min-voltage", type=float, default=None)
     parser.add_argument("--algorithm", choices=("nr", "pq"), default="nr")
     parser.add_argument("--linear-solver", default="scipy")
+    parser.add_argument("--result-mode", choices=("full", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -3256,12 +3617,15 @@ def main(argv=None) -> int:
         min_voltage=args.min_voltage,
         algorithm=args.algorithm,
         linear_solver=args.linear_solver,
+        result_mode=args.result_mode,
     )
     verbose = not args.quiet
     _run_with_optional_output(verbose, calc.prepare)
     rc = _run_with_optional_output(verbose, calc.run)
-    if not args.quiet:
+    if not args.quiet and calc.result_mode == "full":
         print_ac_result(calc, rc)
+    elif not args.quiet:
+        print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
     return 0 if rc == 0 else 1
 
 

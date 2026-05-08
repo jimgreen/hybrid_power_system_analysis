@@ -455,6 +455,109 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_array_equal(first.indices, second.indices)
         np.testing.assert_allclose(first.data, second.data, atol=1e-12)
 
+    def test_ppc_zero_branch_jacobian_caches_coordinate_pattern(self):
+        from hybrid_array_model import build_hybrid_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        self.assertGreater(calc.N_phi, 0)
+        for name in (
+            "zero_top_left_rows",
+            "zero_top_left_cols",
+            "zero_top_right_rows",
+            "zero_top_right_cols",
+            "zero_bottom_left_rows",
+            "zero_bottom_left_cols",
+            "zero_bottom_right_rows",
+            "zero_bottom_right_cols",
+        ):
+            self.assertIsInstance(getattr(calc, name), np.ndarray)
+        self.assertGreater(calc.zero_top_right_rows.size, 0)
+        self.assertGreater(calc.zero_bottom_right_rows.size, 0)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            first = calc.get_jacobi(calc.x)
+            second = calc.get_jacobi(calc.x)
+
+        np.testing.assert_array_equal(first.indptr, second.indptr)
+        np.testing.assert_array_equal(first.indices, second.indices)
+        np.testing.assert_allclose(first.data, second.data, atol=1e-12)
+
+    def test_ppc_zero_branch_jacobian_reuses_precomputed_csr_pattern(self):
+        import ac_lf
+        from hybrid_array_model import build_hybrid_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        self.assertGreater(calc.N_phi, 0)
+        expected = calc.get_jacobi(calc.x).toarray()
+        self.assertGreater(calc.full_jac_csr_indices.size, 0)
+
+        original_coo_matrix = ac_lf.coo_matrix
+        original_hstack = ac_lf.hstack
+        original_vstack = ac_lf.vstack
+
+        def reject_sparse_rebuild(*_args, **_kwargs):
+            raise AssertionError("AC zero-branch Jacobian should refresh precomputed CSR data")
+
+        ac_lf.coo_matrix = reject_sparse_rebuild
+        ac_lf.hstack = reject_sparse_rebuild
+        ac_lf.vstack = reject_sparse_rebuild
+        try:
+            actual = calc.get_jacobi(calc.x).toarray()
+        finally:
+            ac_lf.coo_matrix = original_coo_matrix
+            ac_lf.hstack = original_hstack
+            ac_lf.vstack = original_vstack
+
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+    def test_result_mode_skips_full_ac_result_backfill(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "ac" / "ieee300.e")
+        ppc.pop("_pf_static", None)
+
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="none")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        def reject_full_backfill():
+            raise AssertionError("result_mode='none' should skip full AC result backfill")
+
+        calc._write_back_ppc = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual({}, calc.result)
+        self.assertIsNone(getattr(calc, "lf_result", None))
+        self.assertTrue(hasattr(calc, "x"))
+
+        summary_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="summary")
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary_calc.prepare()
+        summary_calc._write_back_ppc = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = summary_calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(summary_calc.converged)
+        self.assertEqual({"node_id", "voltage", "angle", "summary"}, set(summary_calc.result))
+        self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
+        self.assertEqual(summary_calc.N, summary_calc.result["angle"].size)
+        self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)
+
     def test_ppc_prepare_uses_sparse_connected_components(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file
@@ -462,6 +565,7 @@ class ACPPCFlowTest(unittest.TestCase):
 
         case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
+        ppc.pop("_pf_static", None)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
 
         original_connected_components = ac_lf.connected_components
@@ -480,6 +584,35 @@ class ACPPCFlowTest(unittest.TestCase):
 
         self.assertEqual([(ppc["bus"].shape[0], ppc["bus"].shape[0])], calls)
         self.assertGreater(calc.N, 0)
+
+    def test_ppc_prepare_reuses_static_cache_for_second_calc(self):
+        import ac_lf
+        from ac_lf import ACPowerFlowCalc
+        from hybrid_array_model import build_hybrid_ppc_from_e_file
+
+        _, hybrid_ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        ppc = hybrid_ppc["ac"]
+        first = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            first.prepare()
+
+        self.assertIn("_pf_static", ppc)
+
+        original_connected_components = ac_lf.connected_components
+
+        def reject_connected_components(*_args, **_kwargs):
+            raise AssertionError("second PPC prepare should reuse cached static data")
+
+        ac_lf.connected_components = reject_connected_components
+        try:
+            second = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+            with contextlib.redirect_stdout(io.StringIO()):
+                second.prepare()
+        finally:
+            ac_lf.connected_components = original_connected_components
+
+        self.assertEqual(first.total_vars, second.total_vars)
+        self.assertEqual(first.total_eq, second.total_eq)
 
     def test_efile_factory_from_file_returns_fresh_model_without_cache(self):
         from efile_read import efile_factory_from_file

@@ -19,7 +19,7 @@ MODEL_DIR = ROOT_DIR / "model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, coo_matrix, solve_sparse_system
+from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, coo_matrix, csr_matrix, solve_sparse_system
 from dc_lf import DCLFResult, DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
@@ -209,6 +209,7 @@ class HybridPowerFlowCalc:
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
         linear_solver: str = "scipy",
+        result_mode: str = "full",
     ):
         self.network = network
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
@@ -220,12 +221,13 @@ class HybridPowerFlowCalc:
         self.max_iter = self.params.max_iter
         self.verbose = verbose
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
         self.ac_calc = (
-            ACPowerFlowCalc(network._ac_ppc, parameters=self.params, linear_solver=self.linear_solver)
+            ACPowerFlowCalc(network._ac_ppc, parameters=self.params, linear_solver=self.linear_solver, result_mode=self.result_mode)
             if self.has_ac and hasattr(network, "_ac_ppc")
-            else ACPowerFlowCalc(network.ac, parameters=self.params, linear_solver=self.linear_solver) if self.has_ac else None
+            else ACPowerFlowCalc(network.ac, parameters=self.params, linear_solver=self.linear_solver, result_mode=self.result_mode) if self.has_ac else None
         )
         if self.has_dc and hasattr(network, "_dc_ppc"):
             self.dc_calc = DCPowerFlowCalc(
@@ -233,9 +235,10 @@ class HybridPowerFlowCalc:
                 parameters=self.params,
                 linear_solver=self.linear_solver,
                 writeback_network=network.dc,
+                result_mode=self.result_mode,
             )
         else:
-            self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver) if self.has_dc else None
+            self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver, result_mode=self.result_mode) if self.has_dc else None
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -261,7 +264,26 @@ class HybridPowerFlowCalc:
         self._clear_dcac_arrays()
         self._clear_acac_arrays()
         self._clear_converter_jacobian_structure()
+        self._clear_global_jacobian_pattern()
         self.lf_result = None
+
+    @staticmethod
+    def _normalize_result_mode(result_mode: str) -> str:
+        mode = str(result_mode or "full").strip().lower()
+        aliases = {
+            "all": "full",
+            "full": "full",
+            "complete": "full",
+            "summary": "summary",
+            "brief": "summary",
+            "minimal": "summary",
+            "none": "none",
+            "skip": "none",
+            "raw": "none",
+        }
+        if mode not in aliases:
+            raise ValueError(f"Unsupported Hybrid result_mode: {result_mode!r}")
+        return aliases[mode]
 
     def prepare(self):
         """Build the global hybrid state vector and block equation layout."""
@@ -296,6 +318,7 @@ class HybridPowerFlowCalc:
         # Variable/equation order is block diagonal first, then converter coupling rows.
         self.last_jacobian_shape = (self.total_eq, self.total_vars)
         self._cache_converter_jacobian_structure()
+        self._cache_global_jacobian_pattern()
         if self.verbose:
             print(
                 "Hybrid prepare:",
@@ -477,6 +500,33 @@ class HybridPowerFlowCalc:
         self.acac_v_j_mask = np.array([], dtype=bool)
         self.acac_ones = np.array([], dtype=np.float64)
 
+    def _clear_global_jacobian_pattern(self):
+        self.global_jac_raw_data = np.array([], dtype=np.float64)
+        self.global_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
+        self.global_jac_csr_indices = np.array([], dtype=np.int32)
+        self.global_jac_csr_indptr = np.array([], dtype=np.int32)
+        self.global_jac_csr_data = np.array([], dtype=np.float64)
+        self.global_jac_ac_slice = slice(0, 0)
+        self.global_jac_dc_slice = slice(0, 0)
+        self.global_jac_dcac_ac_p_slice = slice(0, 0)
+        self.global_jac_dcac_ac_q_slice = slice(0, 0)
+        self.global_jac_dcac_dc_eq_slice = slice(0, 0)
+        self.global_jac_dcac_loss_slice = slice(0, 0)
+        self.global_jac_dcac_ctrl_q_slice = slice(0, 0)
+        self.global_jac_dcac_ctrl_dcv_slice = slice(0, 0)
+        self.global_jac_dcac_ctrl_acv_slice = slice(0, 0)
+        self.global_jac_dcac_ctrl_acp_slice = slice(0, 0)
+        self.global_jac_acac_i_p_slice = slice(0, 0)
+        self.global_jac_acac_i_q_slice = slice(0, 0)
+        self.global_jac_acac_j_p_slice = slice(0, 0)
+        self.global_jac_acac_j_q_slice = slice(0, 0)
+        self.global_jac_acac_loss_slice = slice(0, 0)
+        self.global_jac_acac_ctrl_p_slice = slice(0, 0)
+        self.global_jac_acac_ctrl_q_i_slice = slice(0, 0)
+        self.global_jac_acac_ctrl_v_i_slice = slice(0, 0)
+        self.global_jac_acac_ctrl_q_j_slice = slice(0, 0)
+        self.global_jac_acac_ctrl_v_j_slice = slice(0, 0)
+
     def _cache_converter_jacobian_structure(self):
         """Precompute converter Jacobian row/column indices once per prepared case."""
         self._clear_converter_jacobian_structure()
@@ -531,6 +581,112 @@ class HybridPowerFlowCalc:
             self.acac_q_j_mask = (self.acac_ctrl_code == 0) | (self.acac_ctrl_code == 1)
             self.acac_v_j_mask = ~self.acac_q_j_mask
             self.acac_ones = np.ones(self.N_acac, dtype=np.float64)
+
+    @staticmethod
+    def _rows_from_csr_indptr(indptr):
+        return np.repeat(np.arange(len(indptr) - 1, dtype=np.int32), np.diff(indptr))
+
+    def _sub_jacobian_pattern(self, calc, is_dc=False):
+        if calc is None or getattr(calc, "total_eq", 0) == 0 or getattr(calc, "total_vars", 0) == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        if is_dc and hasattr(calc, "_dc_jac_csr_indices") and calc._dc_jac_csr_indices.size:
+            return (
+                self._rows_from_csr_indptr(calc._dc_jac_csr_indptr),
+                calc._dc_jac_csr_indices.astype(np.int32, copy=True),
+            )
+        if hasattr(calc, "full_jac_csr_indices") and calc.full_jac_csr_indices.size:
+            return (
+                self._rows_from_csr_indptr(calc.full_jac_csr_indptr),
+                calc.full_jac_csr_indices.astype(np.int32, copy=True),
+            )
+        if hasattr(calc, "standard_jac_csr_indices") and calc.standard_jac_csr_indices.size:
+            return (
+                self._rows_from_csr_indptr(calc.standard_jac_csr_indptr),
+                calc.standard_jac_csr_indices.astype(np.int32, copy=True),
+            )
+        jac = calc.get_jacobi(calc.x) if not is_dc else calc.get_jacobi(self.dc_G, calc.x)
+        jac = jac.tocsr()
+        return self._rows_from_csr_indptr(jac.indptr), jac.indices.astype(np.int32, copy=True)
+
+    def _cache_global_jacobian_pattern(self):
+        """Precompute global hybrid Jacobian CSR pattern for repeated Newton iterations."""
+        self._clear_global_jacobian_pattern()
+        if self.total_eq == 0 or self.total_vars == 0:
+            return
+
+        rows_parts = []
+        cols_parts = []
+        raw_count = 0
+
+        def add_part(name, rows, cols):
+            nonlocal raw_count
+            rows = np.asarray(rows, dtype=np.int32)
+            cols = np.asarray(cols, dtype=np.int32)
+            if rows.size != cols.size:
+                raise ValueError(f"Hybrid Jacobian pattern part {name!r} has mismatched row/column lengths")
+            part_slice = slice(raw_count, raw_count + rows.size)
+            setattr(self, f"global_jac_{name}_slice", part_slice)
+            raw_count += rows.size
+            if rows.size:
+                rows_parts.append(rows)
+                cols_parts.append(cols)
+
+        if self.ac_calc is not None:
+            ac_rows, ac_cols = self._sub_jacobian_pattern(self.ac_calc, is_dc=False)
+            add_part("ac", ac_rows, ac_cols)
+        if self.dc_calc is not None:
+            dc_rows, dc_cols = self._sub_jacobian_pattern(self.dc_calc, is_dc=True)
+            add_part("dc", dc_rows + self.ac_eq, dc_cols + self.ac_size)
+
+        if self.N_dcac:
+            add_part("dcac_ac_p", self.dcac_ac_p_row, self.dcac_ac_p_col)
+            add_part("dcac_ac_q", self.dcac_ac_q_row, self.dcac_ac_q_col)
+            add_part("dcac_dc_eq", self.dcac_dc_eq_rows, self.dcac_dc_eq_cols)
+            add_part("dcac_loss", self.dcac_loss_rows, self.dcac_loss_cols)
+            add_part("dcac_ctrl_q", self.dcac_eq_ctrl_2, self.dcac_ac_q_col)
+            add_part("dcac_ctrl_dcv", self.dcac_eq_ctrl_1[self.dcac_ctrl_dc_v_mask], self.dcac_dc_v_col[self.dcac_ctrl_dc_v_mask])
+            add_part("dcac_ctrl_acv", self.dcac_eq_ctrl_1[self.dcac_ctrl_ac_v_mask], self.dcac_ac_v_col[self.dcac_ctrl_ac_v_mask])
+            add_part("dcac_ctrl_acp", self.dcac_eq_ctrl_1[self.dcac_ctrl_ac_p_mask], self.dcac_ac_p_col[self.dcac_ctrl_ac_p_mask])
+
+        if self.N_acac:
+            add_part("acac_i_p", self.acac_i_p_row, self.acac_i_p_col)
+            add_part("acac_i_q", self.acac_i_q_row, self.acac_i_q_col)
+            add_part("acac_j_p", self.acac_j_p_row, self.acac_j_p_col)
+            add_part("acac_j_q", self.acac_j_q_row, self.acac_j_q_col)
+            add_part("acac_loss", self.acac_loss_rows, self.acac_loss_cols)
+            add_part("acac_ctrl_p", self.acac_eq_ctrl_1, self.acac_i_p_col)
+            add_part("acac_ctrl_q_i", self.acac_eq_ctrl_2[self.acac_q_i_mask], self.acac_i_q_col[self.acac_q_i_mask])
+            add_part("acac_ctrl_v_i", self.acac_eq_ctrl_2[self.acac_v_i_mask], self.acac_i_v_col[self.acac_v_i_mask])
+            add_part("acac_ctrl_q_j", self.acac_eq_ctrl_3[self.acac_q_j_mask], self.acac_j_q_col[self.acac_q_j_mask])
+            add_part("acac_ctrl_v_j", self.acac_eq_ctrl_3[self.acac_v_j_mask], self.acac_j_v_col[self.acac_v_j_mask])
+
+        self.global_jac_raw_data = np.empty(raw_count, dtype=np.float64)
+        if raw_count == 0:
+            self.global_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
+            return
+
+        raw_rows = np.concatenate(rows_parts)
+        raw_cols = np.concatenate(cols_parts)
+        pattern = coo_matrix(
+            (np.ones(raw_count, dtype=np.float64), (raw_rows, raw_cols)),
+            shape=(self.total_eq, self.total_vars),
+        ).tocsr()
+        pattern.sum_duplicates()
+        self.global_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
+        self.global_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
+        self.global_jac_csr_data = np.empty(self.global_jac_csr_indices.size, dtype=np.float64)
+
+        positions = {}
+        for row in range(self.total_eq):
+            start = int(self.global_jac_csr_indptr[row])
+            end = int(self.global_jac_csr_indptr[row + 1])
+            for pos in range(start, end):
+                positions[(row, int(self.global_jac_csr_indices[pos]))] = pos
+        self.global_jac_raw_to_csr_pos = np.fromiter(
+            (positions[(int(row), int(col))] for row, col in zip(raw_rows, raw_cols)),
+            dtype=np.intp,
+            count=raw_count,
+        )
 
     def _cache_acac_arrays(self):
         """Cache ACAC converter metadata as arrays for residual/Jacobian assembly."""
@@ -700,8 +856,119 @@ class HybridPowerFlowCalc:
         dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x) if self.dc_calc is not None else None
         return self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
 
+    @staticmethod
+    def _slice_len(part_slice):
+        return int(part_slice.stop - part_slice.start)
+
+    def _fill_dcac_global_jacobian_data(self, raw, dcac_x, ac_V, dc_V):
+        if not self.N_dcac:
+            return
+        dcac = dcac_x.reshape(self.N_dcac, 3)
+        dc_p = dcac[:, 0]
+        ac_p = dcac[:, 1]
+        ac_q = dcac[:, 2]
+
+        for part_slice in (
+            self.global_jac_dcac_ac_p_slice,
+            self.global_jac_dcac_ac_q_slice,
+            self.global_jac_dcac_dc_eq_slice,
+            self.global_jac_dcac_ctrl_q_slice,
+            self.global_jac_dcac_ctrl_dcv_slice,
+            self.global_jac_dcac_ctrl_acv_slice,
+            self.global_jac_dcac_ctrl_acp_slice,
+        ):
+            if self._slice_len(part_slice):
+                raw[part_slice] = 1.0
+
+        va = ac_V[self.dcac_ac_pos]
+        vd = dc_V[self.dcac_dc_pos]
+        va2 = va * va
+        vd2 = vd * vd
+        dc_p2 = dc_p * dc_p
+        ac_i2_num = ac_p * ac_p + ac_q * ac_q
+        data = raw[self.global_jac_dcac_loss_slice]
+        data[0::5] = vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2
+        data[1::5] = vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2
+        data[2::5] = -2.0 * self.dcac_r2 * ac_q * vd2
+        data[3::5] = 2.0 * va * vd2 * (dc_p + ac_p) - 2.0 * self.dcac_r1 * dc_p2 * va
+        data[4::5] = 2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd
+
+    def _fill_acac_global_jacobian_data(self, raw, acac_x, ac_V):
+        if not self.N_acac:
+            return
+        acac = acac_x.reshape(self.N_acac, 4)
+        i_p = acac[:, 0]
+        i_q = acac[:, 1]
+        j_p = acac[:, 2]
+        j_q = acac[:, 3]
+
+        for part_slice in (
+            self.global_jac_acac_i_p_slice,
+            self.global_jac_acac_i_q_slice,
+            self.global_jac_acac_j_p_slice,
+            self.global_jac_acac_j_q_slice,
+            self.global_jac_acac_ctrl_p_slice,
+            self.global_jac_acac_ctrl_q_i_slice,
+            self.global_jac_acac_ctrl_v_i_slice,
+            self.global_jac_acac_ctrl_q_j_slice,
+            self.global_jac_acac_ctrl_v_j_slice,
+        ):
+            if self._slice_len(part_slice):
+                raw[part_slice] = 1.0
+
+        vi = ac_V[self.acac_i_pos]
+        vj = ac_V[self.acac_j_pos]
+        vi2 = vi * vi
+        vj2 = vj * vj
+        i_s2 = i_p * i_p + i_q * i_q
+        j_s2 = j_p * j_p + j_q * j_q
+        data = raw[self.global_jac_acac_loss_slice]
+        data[0::6] = vi2 * vj2 - 2.0 * self.acac_r1 * i_p * vj2
+        data[1::6] = -2.0 * self.acac_r1 * i_q * vj2
+        data[2::6] = vi2 * vj2 - 2.0 * self.acac_r2 * j_p * vi2
+        data[3::6] = -2.0 * self.acac_r2 * j_q * vi2
+        data[4::6] = 2.0 * vi * vj2 * (i_p + j_p) - 2.0 * self.acac_r2 * j_s2 * vi
+        data[5::6] = 2.0 * vj * vi2 * (i_p + j_p) - 2.0 * self.acac_r1 * i_s2 * vj
+
+    def _assemble_jacobian_from_precomputed_pattern(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None, ac_V=None, dc_V=None):
+        if self.global_jac_raw_data.size == 0:
+            return None
+        raw = self.global_jac_raw_data
+        if ac_j is not None and self._slice_len(self.global_jac_ac_slice):
+            raw[self.global_jac_ac_slice] = ac_j.data
+        if dc_j is not None and self._slice_len(self.global_jac_dc_slice):
+            raw[self.global_jac_dc_slice] = dc_j.data
+
+        if (self.N_dcac or self.N_acac) and (ac_V is None or (self.N_dcac and dc_V is None)):
+            _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+        self._fill_dcac_global_jacobian_data(raw, dcac_x, ac_V, dc_V)
+        self._fill_acac_global_jacobian_data(raw, acac_x, ac_V)
+
+        self.global_jac_csr_data.fill(0.0)
+        np.add.at(self.global_jac_csr_data, self.global_jac_raw_to_csr_pos, raw)
+        jac = csr_matrix(
+            (self.global_jac_csr_data, self.global_jac_csr_indices, self.global_jac_csr_indptr),
+            shape=(self.total_eq, self.total_vars),
+            copy=False,
+        )
+        self.last_jacobian_shape = jac.shape
+        return jac
+
     def _assemble_jacobian(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None, ac_V=None, dc_V=None):
         """Build the global sparse Jacobian from prepared sub-solver blocks."""
+        precomputed = self._assemble_jacobian_from_precomputed_pattern(
+            ac_x,
+            dc_x,
+            dcac_x,
+            acac_x,
+            ac_j=ac_j,
+            dc_j=dc_j,
+            ac_V=ac_V,
+            dc_V=dc_V,
+        )
+        if precomputed is not None:
+            return precomputed
+
         row_parts = []
         col_parts = []
         data_parts = []
@@ -862,8 +1129,10 @@ class HybridPowerFlowCalc:
                 col_parts.append(cols_src[mask])
                 data_parts.append(self.acac_ones[mask])
 
-    def run(self):
+    def run(self, result_mode=None):
         """Execute unified Newton iterations over the full hybrid state vector."""
+        if result_mode is not None:
+            self.result_mode = self._normalize_result_mode(result_mode)
         if self.x.size == 0:
             self.prepare()
 
@@ -896,15 +1165,65 @@ class HybridPowerFlowCalc:
             if self.normF < self.tol:
                 self.converged = True
                 self.x = x
-                self._write_back(x)
+                self._finish_result(x)
                 return 0
 
             delta = solve_sparse_system(J, -F, self.linear_solver)
             x += delta
 
         self.x = x
-        self._write_back(x)
+        self._finish_result(x)
         return -1
+
+    def _finish_result(self, x):
+        if self.result_mode == "full":
+            self._write_back(x)
+        elif self.result_mode == "summary":
+            self._write_summary_result(x)
+        else:
+            self._write_none_result(x)
+
+    def _write_none_result(self, x):
+        ac_x, dc_x, _dcac_x, _acac_x = self._split_x(x)
+        if self.ac_calc is not None:
+            self.ac_calc.x = ac_x
+            self.ac_calc.converged = self.converged
+            self.ac_calc.result = {}
+            self.ac_calc.lf_result = None
+        if self.dc_calc is not None:
+            self.dc_calc.x = dc_x
+            self.dc_calc.converged = self.converged
+            self.dc_calc.result = {}
+            self.dc_calc.lf_result = None
+        self.lf_result = None
+
+    def _write_summary_result(self, x):
+        ac_x, dc_x, _dcac_x, _acac_x = self._split_x(x)
+        ac_result = None
+        dc_result = None
+        if self.ac_calc is not None:
+            self.ac_calc.x = ac_x
+            self.ac_calc.converged = self.converged
+            self.ac_calc.iterations = self.iterations
+            self.ac_calc._write_summary_result()
+            ac_result = self.ac_calc.result
+        if self.dc_calc is not None:
+            self.dc_calc.x = dc_x
+            self.dc_calc.converged = self.converged
+            self.dc_calc.iterations = self.iterations
+            self.dc_calc._write_summary_result(dc_x)
+            dc_result = self.dc_calc.result
+        self.lf_result = {
+            "ac": ac_result,
+            "dc": dc_result,
+            "hybrid": {
+                "converged": bool(self.converged),
+                "iterations": int(self.iterations),
+                "normF": float(self.normF),
+                "total_vars": int(self.total_vars),
+                "total_eq": int(self.total_eq),
+            },
+        }
 
     def _write_ac_ppc_result_to_network(self) -> None:
         """Copy array-mode AC results back to the hybrid AC object facade."""
@@ -1102,7 +1421,23 @@ def _hybrid_result_from_calc(
     dc_errors=None,
 ) -> HybridLFResult:
     result = getattr(calc, "lf_result", None)
+    if isinstance(result, dict):
+        return result
     if result is None:
+        if getattr(calc, "result_mode", "full") != "full":
+            return HybridLFResult(
+                network=calc.network,
+                ac_network=calc.network.ac,
+                dc_network=calc.network.dc,
+                calc=calc,
+                ac_calc=getattr(calc, "ac_calc", None),
+                dc_calc=getattr(calc, "dc_calc", None),
+                rc=rc,
+                ac_warnings=list(ac_warnings or []),
+                ac_errors=list(ac_errors or []),
+                dc_warnings=list(dc_warnings or []),
+                dc_errors=list(dc_errors or []),
+            )
         result = calc._build_lf_result()
     network = getattr(calc, "network", None)
     if network is not None:
@@ -1129,6 +1464,7 @@ def run_hybrid_power_flow(
     parameter_file=DEFAULT_LF_PARAMETER_FILE,
     parameters: Optional[PowerFlowParameters] = None,
     linear_solver: str = "scipy",
+    result_mode: str = "full",
 ) -> HybridLFResult:
     # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
     # topology diagnostics remain available through HybridPowerNetwork.prepare()
@@ -1145,6 +1481,7 @@ def run_hybrid_power_flow(
         parameter_file=parameter_file,
         parameters=parameters,
         linear_solver=linear_solver,
+        result_mode=result_mode,
     )
 
     if ac_errors or dc_errors:
@@ -1227,6 +1564,7 @@ def main(argv=None) -> int:
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
     parser.add_argument("--linear-solver", default="scipy", help="Sparse linear solver name shared with AC/DC LF.")
+    parser.add_argument("--result-mode", choices=("full", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1240,13 +1578,17 @@ def main(argv=None) -> int:
         verbose=verbose,
         parameter_file=args.para,
         linear_solver=args.linear_solver,
+        result_mode=args.result_mode,
     )
     _run_with_optional_output(verbose, calc.prepare)
     rc = _run_with_optional_output(verbose, calc.run)
     result = _hybrid_result_from_calc(calc, rc)
-    if not args.quiet:
+    if not args.quiet and isinstance(result, HybridLFResult):
         print_hybrid_result(result)
-    return 0 if result.converged else 1
+    elif not args.quiet:
+        print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
+    converged = result.converged if isinstance(result, HybridLFResult) else calc.converged
+    return 0 if converged else 1
 
 
 if __name__ == "__main__":
