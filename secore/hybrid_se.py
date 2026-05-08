@@ -905,6 +905,7 @@ class HybridStateEstimator:
 
     def _convert_measurements_to_pu(self) -> None:
         """Delegate AC/DC normalization and normalize only converter rows locally."""
+        self._invalidate_measurement_activity_summary()
         if getattr(self, "_measurements_normalized", False):
             return
         sources = self._initial_measurement_sources_by_side()
@@ -1017,6 +1018,7 @@ class HybridStateEstimator:
         measurement.valid = True
         measurement.value = float(value)
         self.measurements.append(measurement)
+        self._invalidate_measurement_activity_summary()
         return next_idx + 1
 
     def _add_pseudo_power_measurements(self) -> None:
@@ -1218,6 +1220,7 @@ class HybridStateEstimator:
         self._partition_state_variables()
 
     def _refresh_active_measurement_state_layout(self) -> None:
+        self._invalidate_measurement_activity_summary()
         active_view = build_active_measurement_view(
             self.measurements,
             table_builder=_measurement_table_from_measurements,
@@ -1654,7 +1657,14 @@ class HybridStateEstimator:
     def _active_measurement_keys(self) -> set:
         return set(self._measurement_activity_summary().active_keys)
 
+    def _invalidate_measurement_activity_summary(self) -> None:
+        if hasattr(self, "_measurement_activity_summary_cache"):
+            delattr(self, "_measurement_activity_summary_cache")
+
     def _measurement_activity_summary(self) -> "_MeasurementActivitySummary":
+        cache = getattr(self, "_measurement_activity_summary_cache", None)
+        if cache is not None:
+            return cache
         table = getattr(self.measurements, "table", None)
         if table is None or len(table.idx) != len(self.measurements):
             table = _measurement_table_from_measurements(self.measurements)
@@ -1680,7 +1690,9 @@ class HybridStateEstimator:
                 np.asarray(table.meas_type, dtype=object)[active_mask].tolist(),
             )
         )
-        return self._MeasurementActivitySummary(max_idx=max_idx, measured_devices=measured_devices, active_keys=active_keys)
+        cache = self._MeasurementActivitySummary(max_idx=max_idx, measured_devices=measured_devices, active_keys=active_keys)
+        self._measurement_activity_summary_cache = cache
+        return cache
 
     def _next_measurement_idx(self) -> int:
         return int(self._measurement_activity_summary().max_idx) + 1
@@ -1793,6 +1805,7 @@ class HybridStateEstimator:
             candidate.idx = next_idx
             next_idx += 1
             self.measurements.append(candidate)
+        self._invalidate_measurement_activity_summary()
         if refresh:
             self._refresh_active_measurement_state_layout()
         return len(selected)
@@ -1851,7 +1864,15 @@ class HybridStateEstimator:
         direction = observability_weak_direction(H, self.state_labels, observability.weak_states)
         if direction.size != self.n_state or not np.any(direction):
             return list(candidates[:max_add])
-        candidate_h = self.jacobian_sparse(x, candidates)
+        candidate_h = None
+        if cache is not None:
+            candidate_cache = cache.setdefault("candidate_jacobians", {})
+            signature = self._measurement_signature(candidates)
+            candidate_h = candidate_cache.get(signature)
+        if candidate_h is None:
+            candidate_h = self.jacobian_sparse(x, candidates)
+            if cache is not None:
+                candidate_cache[signature] = candidate_h
         scores = np.abs(candidate_h @ direction)
         scores = np.asarray(scores, dtype=np.float64).reshape(-1)
         if scores.size != len(candidates) or not np.any(scores > 0.0):
@@ -1930,6 +1951,41 @@ class HybridStateEstimator:
             return specs
         return specs
 
+    def _targeted_side_specs_for_state(
+        self,
+        prefix: str,
+        name: str,
+        existing_keys: set,
+    ) -> List["_HybridConverterMeasurementSpec"]:
+        if prefix in ("AC_I_RE", "AC_I_IM"):
+            if name in self.ac_zero_branch_by_name:
+                dev_type = "ACZeroBranch"
+                dev = self.ac_zero_branch_by_name[name]
+            elif name in self.ac_break_by_name:
+                dev_type = "ACBreak"
+                dev = self.ac_break_by_name[name]
+            else:
+                return []
+            p = float(getattr(dev, "p", 0.0) or 0.0)
+            q = float(getattr(dev, "q", 0.0) or 0.0)
+            p_type = "P_TO" if (dev_type, name, "P_FROM") in existing_keys else "P_FROM"
+            q_type = "Q_TO" if (dev_type, name, "Q_FROM") in existing_keys else "Q_FROM"
+            return [
+                self._HybridConverterMeasurementSpec(dev_type, name, p_type, -p if p_type == "P_TO" else p),
+                self._HybridConverterMeasurementSpec(dev_type, name, q_type, -q if q_type == "Q_TO" else q),
+            ]
+        if prefix == "DC_I":
+            if name in self.dc_zero_branch_by_name:
+                dev_type = "DCZeroBranch"
+                dev = self.dc_zero_branch_by_name[name]
+            elif name in self.dc_break_by_name:
+                dev_type = "DCBreak"
+                dev = self.dc_break_by_name[name]
+            else:
+                return []
+            return [self._HybridConverterMeasurementSpec(dev_type, name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))]
+        return []
+
     def _append_targeted_observability_pseudo(
         self,
         next_idx: int,
@@ -1971,33 +2027,10 @@ class HybridStateEstimator:
             for spec in converter_specs:
                 add(spec.device_type, spec.meas_type, spec.value)
             return next_idx, added
-
-        if prefix in ("AC_I_RE", "AC_I_IM"):
-            if name in self.ac_zero_branch_by_name:
-                dev_type = "ACZeroBranch"
-                dev = self.ac_zero_branch_by_name[name]
-            elif name in self.ac_break_by_name:
-                dev_type = "ACBreak"
-                dev = self.ac_break_by_name[name]
-            else:
-                return next_idx, 0
-            p = float(getattr(dev, "p", 0.0) or 0.0)
-            q = float(getattr(dev, "q", 0.0) or 0.0)
-            p_type = "P_TO" if (dev_type, name, "P_FROM") in existing_keys else "P_FROM"
-            q_type = "Q_TO" if (dev_type, name, "Q_FROM") in existing_keys else "Q_FROM"
-            add(dev_type, p_type, -p if p_type == "P_TO" else p)
-            add(dev_type, q_type, -q if q_type == "Q_TO" else q)
-            return next_idx, added
-        if prefix == "DC_I":
-            if name in self.dc_zero_branch_by_name:
-                dev_type = "DCZeroBranch"
-                dev = self.dc_zero_branch_by_name[name]
-            elif name in self.dc_break_by_name:
-                dev_type = "DCBreak"
-                dev = self.dc_break_by_name[name]
-            else:
-                return next_idx, 0
-            add(dev_type, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
+        side_specs = self._targeted_side_specs_for_state(prefix, name, existing_keys)
+        if side_specs:
+            for spec in side_specs:
+                add(spec.device_type, spec.meas_type, spec.value)
         return next_idx, added
 
     def _normalize_measurements(self, measurements: Optional[Sequence[Measurement]]) -> List[Measurement]:
@@ -2013,6 +2046,20 @@ class HybridStateEstimator:
         return (
             np.asarray([meas.value for meas in measurements], dtype=np.float64),
             np.asarray([meas.weight for meas in measurements], dtype=np.float64),
+        )
+
+    @staticmethod
+    def _measurement_signature(measurements: Sequence[Measurement]) -> Tuple[Tuple[str, str, str, float, float, bool], ...]:
+        return tuple(
+            (
+                str(meas.device_type),
+                str(meas.device_name),
+                str(meas.meas_type),
+                float(meas.value),
+                float(meas.weight),
+                bool(meas.valid),
+            )
+            for meas in measurements
         )
 
     @staticmethod
@@ -2035,6 +2082,7 @@ class HybridStateEstimator:
             "x": np.asarray(x, dtype=np.float64).copy(),
             "H": H,
             "normal_pattern": None,
+            "candidate_jacobians": {},
         }
 
     def _observability_matrix_cache_for(

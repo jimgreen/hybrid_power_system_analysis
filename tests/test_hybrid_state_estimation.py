@@ -130,6 +130,28 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertGreater(calls["count"], 0)
         self.assertTrue(keys)
 
+    def test_measurement_activity_summary_uses_cache_until_invalidated(self):
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        self.assertFalse(hasattr(estimator, "_measurement_activity_summary_cache"))
+
+        summary1 = estimator._measurement_activity_summary()
+        summary2 = estimator._measurement_activity_summary()
+        self.assertIs(summary1, summary2)
+
+        next_idx = max(meas.idx for meas in estimator.measurements) + 1
+        estimator.measurements.append(Measurement(next_idx, "tmp_cache_invalidate", "ACNode", "wt02_src", "V", 1.0, True, 1.0))
+        estimator._invalidate_measurement_activity_summary()
+        summary3 = estimator._measurement_activity_summary()
+
+        self.assertIsNot(summary1, summary3)
+        self.assertIn(("ACNode", "wt02_src", "V"), summary3.active_keys)
+
     def test_hybrid_measurement_loader_reuses_table_backed_parser(self):
         from model.meas_model import MeasurementList
         from secore.hybrid_se import HybridStateEstimator
@@ -1204,6 +1226,37 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertIn(("ACZeroBranch", device_name, "P_TO"), existing_keys)
         self.assertIn(("ACZeroBranch", device_name, "Q_TO"), existing_keys)
 
+    def test_targeted_zero_branch_and_break_states_use_side_facade(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            flat_start=True,
+        )
+        device_name = next(iter(estimator.ac_zero_branch_by_name))
+        next_idx = max(meas.idx for meas in estimator.measurements) + 1
+        existing_keys = set()
+        existing_names = set()
+        calls = []
+        original = estimator._targeted_side_specs_for_state
+
+        def counted(*args, **kwargs):
+            calls.append((args, tuple(sorted(kwargs.items()))))
+            return original(*args, **kwargs)
+
+        estimator._targeted_side_specs_for_state = counted
+        _, added = estimator._append_targeted_observability_pseudo(
+            next_idx,
+            f"AC_I_RE:{device_name}",
+            existing_keys,
+            existing_names,
+            2,
+        )
+
+        self.assertEqual(2, added)
+        self.assertGreaterEqual(len(calls), 1)
+
     def test_targeted_node_voltage_states_add_pseudo_measurements(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -1671,6 +1724,35 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(result.converged)
         self.assertTrue(normal_pattern_seen)
+
+    def test_weak_direction_selection_reuses_candidate_jacobian_cache(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+        )
+        observability = estimator.observability_analysis()
+        candidates = estimator._observability_pseudo_candidate_measurements()
+        original_jacobian = estimator.jacobian_sparse
+        candidate_calls = 0
+
+        def counted_jacobian(x, measurements=None):
+            nonlocal candidate_calls
+            if measurements is candidates:
+                candidate_calls += 1
+            return original_jacobian(x, measurements)
+
+        estimator.jacobian_sparse = counted_jacobian
+        try:
+            first = estimator._select_weak_direction_pseudo_candidates(observability, candidates, 5)
+            second = estimator._select_weak_direction_pseudo_candidates(observability, candidates, 5)
+        finally:
+            estimator.jacobian_sparse = original_jacobian
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(1, candidate_calls)
 
     def test_estimate_passes_file_weights_to_normal_equation_builder(self):
         import secore.hybrid_se as hybrid_se
