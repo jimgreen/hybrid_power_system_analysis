@@ -1937,6 +1937,82 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(initial_active_count + 1, len(estimator.active_measurements))
         self.assertEqual("pseudo_obs_v_wt02_src", estimator.active_measurements[-1].name)
 
+    def test_weak_direction_candidate_small_batch_avoids_full_active_refresh(self):
+        from model.meas_model import ObservabilityResult
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        initial_active_count = len(estimator.active_measurements)
+        observable_result = ObservabilityResult(
+            observable=True,
+            rank=estimator.n_state,
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=0,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[],
+        )
+        candidate = Measurement(
+            0,
+            "pseudo_obs_v_wt02_src",
+            "ACNode",
+            "wt02_src",
+            "V",
+            estimator.pseudo_measurement_weight,
+            True,
+            1.0,
+        )
+        estimator._observability_pseudo_candidate_measurements = lambda: [candidate]
+        estimator._select_weak_direction_pseudo_candidates = lambda observability, candidates, max_add: candidates[:max_add]
+        estimator._refresh_active_measurement_state_layout = lambda: (_ for _ in ()).throw(
+            AssertionError("weak-direction candidate append should update active layout incrementally")
+        )
+
+        added = estimator._add_weak_direction_observability_pseudo_measurements(observable_result, 1)
+
+        self.assertEqual(1, added)
+        self.assertEqual(initial_active_count + 1, len(estimator.active_measurements))
+        self.assertEqual("pseudo_obs_v_wt02_src", estimator.active_measurements[-1].name)
+
+    def test_incremental_updater_reuses_shared_se_array_plan_helpers(self):
+        import secore.hybrid_se as hybrid_se
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        additions = [Measurement(500000, "ac_v2", "ACNode", "wt02_src", "V", 5.0, True, 1.01)]
+        estimator.measurements.extend(additions)
+        calls = {"active": 0, "partitions": 0}
+        original_active = hybrid_se.append_active_measurement_view
+        original_partitions = hybrid_se.extend_measurement_partitions
+
+        def counted_active(*args, **kwargs):
+            calls["active"] += 1
+            return original_active(*args, **kwargs)
+
+        def counted_partitions(*args, **kwargs):
+            calls["partitions"] += 1
+            return original_partitions(*args, **kwargs)
+
+        hybrid_se.append_active_measurement_view = counted_active
+        hybrid_se.extend_measurement_partitions = counted_partitions
+        try:
+            refreshed = estimator._incremental_update_active_measurement_state_layout(additions)
+        finally:
+            hybrid_se.append_active_measurement_view = original_active
+            hybrid_se.extend_measurement_partitions = original_partitions
+
+        self.assertTrue(refreshed)
+        self.assertEqual(1, calls["active"])
+        self.assertEqual(1, calls["partitions"])
+
     def test_estimate_passes_file_weights_to_normal_equation_builder(self):
         import secore.hybrid_se as hybrid_se
         from secore.hybrid_se import HybridStateEstimator

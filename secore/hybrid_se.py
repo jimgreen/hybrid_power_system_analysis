@@ -25,7 +25,6 @@ from model.meas_model import (
     EstimateResult,
     Measurement,
     MeasurementList,
-    MeasurementTable,
     ObservabilityResult,
     measurement_table_from_measurements,
     print_iteration as _print_iteration,
@@ -34,9 +33,13 @@ from model.meas_model import (
 from secore.ac_se import ACStateEstimator, _read_measurements_direct as _read_table_measurements_direct
 from secore.dc_se import DCStateEstimator
 from secore.se_array_plan import (
+    MeasurementPartitions,
+    append_active_measurement_view,
     build_active_measurement_view,
     build_measurement_plan_table,
+    concat_measurement_tables,
     copy_measurement_view,
+    extend_measurement_partitions,
     partition_measurements_by_code,
 )
 from secore.se_math import (
@@ -73,21 +76,6 @@ def _measurement_table_from_measurements(measurements: Sequence[Measurement]):
         measurements,
         device_type_codes=DEVICE_TYPE_CODES,
         angle_measurement_types=ANGLE_MEASUREMENT_TYPES,
-    )
-
-
-def _concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) -> MeasurementTable:
-    return MeasurementTable(
-        idx=np.concatenate((head.idx, tail.idx)),
-        name=np.concatenate((head.name, tail.name)),
-        device_type=np.concatenate((head.device_type, tail.device_type)),
-        device_name=np.concatenate((head.device_name, tail.device_name)),
-        meas_type=np.concatenate((head.meas_type, tail.meas_type)),
-        weight=np.concatenate((head.weight, tail.weight)),
-        valid=np.concatenate((head.valid, tail.valid)),
-        value=np.concatenate((head.value, tail.value)),
-        device_type_code=np.concatenate((head.device_type_code, tail.device_type_code)),
-        angle_mask=np.concatenate((head.angle_mask, tail.angle_mask)),
     )
 
 
@@ -1317,48 +1305,31 @@ class HybridStateEstimator:
             _measurement_table_from_measurements(appended_measurements),
             normalized=getattr(self.measurements, "normalized", False),
         )
-        self.measurements.table = _concat_measurement_tables(master_table, appended_list.table)
+        self.measurements.table = concat_measurement_tables(master_table, appended_list.table)
 
+        active_view = append_active_measurement_view(
+            build_active_measurement_view(self.active_measurements, table_builder=_measurement_table_from_measurements),
+            appended_list,
+            source_row_start=len(master_table.idx),
+            table_builder=_measurement_table_from_measurements,
+        )
         active_start = len(self.active_measurements)
-        self.active_measurements.extend(appended_list)
-        self.active_measurements.table = _concat_measurement_tables(active_table, appended_list.table)
-
-        appended_rows = np.arange(active_start, active_start + len(appended_list), dtype=np.int32)
-        appended_codes = np.asarray(appended_list.table.device_type_code, dtype=np.int16)
-        side_rows = {"ac": [], "dc": [], "hybrid": []}
-        side_measurements = {"ac": [], "dc": [], "hybrid": []}
-        for row, code in zip(appended_rows.tolist(), appended_codes.tolist()):
-            side = self._MEASUREMENT_SIDE_BY_DEVICE_TYPE_CODE.get(int(code))
-            if side in side_measurements:
-                side_rows[side].append(row)
-                side_measurements[side].append(self.active_measurements[int(row)])
-
-        def extend_view(current: MeasurementList, additions: Sequence[Measurement]) -> MeasurementList:
-            if not additions:
-                return current
-            addition_list = MeasurementList(
-                list(additions),
-                _measurement_table_from_measurements(additions),
-                normalized=getattr(current, "normalized", False),
-            )
-            current.extend(addition_list)
-            current.table = _concat_measurement_tables(current.table, addition_list.table)
-            return current
-
-        self.ac_meas_rows = np.concatenate((self.ac_meas_rows, np.asarray(side_rows["ac"], dtype=np.int32))).astype(
-            np.int32,
-            copy=False,
+        self.active_measurements = active_view.measurements
+        partitions = extend_measurement_partitions(
+            self._active_measurement_blocks_as_partitions(),
+            list(appended_list),
+            self._MEASUREMENT_SIDE_BY_DEVICE_TYPE_CODE,
+            row_offset=active_start,
+            side_by_device_type=self._MEASUREMENT_SIDE_BY_DEVICE_TYPE,
+            table_builder=_measurement_table_from_measurements,
+            sides=("ac", "dc", "hybrid"),
         )
-        self.dc_meas_rows = np.concatenate((self.dc_meas_rows, np.asarray(side_rows["dc"], dtype=np.int32))).astype(
-            np.int32,
-            copy=False,
-        )
-        self.hybrid_meas_rows = np.concatenate(
-            (self.hybrid_meas_rows, np.asarray(side_rows["hybrid"], dtype=np.int32))
-        ).astype(np.int32, copy=False)
-        self.ac_meas = extend_view(self.ac_meas, side_measurements["ac"])
-        self.dc_meas = extend_view(self.dc_meas, side_measurements["dc"])
-        self.hybrid_meas = extend_view(self.hybrid_meas, side_measurements["hybrid"])
+        self.ac_meas_rows = np.asarray(partitions.rows["ac"], dtype=np.int32)
+        self.dc_meas_rows = np.asarray(partitions.rows["dc"], dtype=np.int32)
+        self.hybrid_meas_rows = np.asarray(partitions.rows["hybrid"], dtype=np.int32)
+        self.ac_meas = partitions.measurements["ac"]
+        self.dc_meas = partitions.measurements["dc"]
+        self.hybrid_meas = partitions.measurements["hybrid"]
         self._active_ac_hybrid_rows = self.ac_meas_rows.copy()
         self._active_dc_hybrid_rows = self.dc_meas_rows.copy()
         self._active_ac_sub_measurements = copy_measurement_view(self.ac_meas)
@@ -1391,6 +1362,16 @@ class HybridStateEstimator:
         self._observability_matrix_cache = None
         self._invalidate_measurement_activity_summary()
         return True
+
+    def _active_measurement_blocks_as_partitions(self):
+        return MeasurementPartitions(
+            measurements={"ac": self.ac_meas, "dc": self.dc_meas, "hybrid": self.hybrid_meas},
+            rows={
+                "ac": np.asarray(self.ac_meas_rows, dtype=np.int64),
+                "dc": np.asarray(self.dc_meas_rows, dtype=np.int64),
+                "hybrid": np.asarray(self.hybrid_meas_rows, dtype=np.int64),
+            },
+        )
 
     def _build_hybrid_measurement_plan(
         self,
@@ -1923,13 +1904,18 @@ class HybridStateEstimator:
         if not selected:
             return 0
         next_idx = self._next_measurement_idx()
+        measurement_count_before = len(self.measurements)
         for candidate in selected:
             candidate.idx = next_idx
             next_idx += 1
             self.measurements.append(candidate)
         self._invalidate_measurement_activity_summary()
         if refresh:
-            self._refresh_active_measurement_state_layout()
+            refreshed = self._incremental_update_active_measurement_state_layout(
+                self.measurements[measurement_count_before:]
+            )
+            if not refreshed:
+                self._refresh_active_measurement_state_layout()
         return len(selected)
 
     def _add_redundant_observability_pseudo_measurements(self, max_add: int) -> int:

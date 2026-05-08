@@ -152,6 +152,58 @@ class SEArrayPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(plan.device_pos, np.array([3, 5, -1, -1], dtype=np.int64))
         np.testing.assert_array_equal(plan.handled, np.array([True, True, False, False], dtype=bool))
 
+    def test_append_active_measurement_view_extends_active_table_and_rows(self):
+        from secore.se_array_plan import append_active_measurement_view, build_active_measurement_view
+
+        measurements = self._measurements()
+        view = build_active_measurement_view(measurements)
+        additions = [
+            Measurement(5, "ac_v2", "ACNode", "ac_bus_2", "V", 5.0, True, 1.01),
+            Measurement(6, "dc_skip", "DCNode", "dc_bus_2", "V", 0.0, True, 0.99),
+        ]
+
+        updated = append_active_measurement_view(view, additions)
+
+        self.assertEqual(["ac_v", "conv_p", "ac_v2"], [meas.name for meas in updated.measurements])
+        np.testing.assert_array_equal(updated.source_rows, np.array([0, 2, 4], dtype=np.int64))
+        np.testing.assert_array_equal(updated.table.idx, np.array([1, 3, 5], dtype=np.int64))
+        np.testing.assert_allclose(updated.z, np.array([1.02, 3.0, 1.01]))
+        np.testing.assert_allclose(updated.weight, np.array([1.0, 2.0, 5.0]))
+
+    def test_extend_measurement_partitions_appends_side_rows_and_tables(self):
+        from secore.se_array_plan import build_active_measurement_view, extend_measurement_partitions, partition_measurements_by_code
+
+        measurements = self._measurements()
+        view = build_active_measurement_view(measurements)
+        side_by_code = {
+            DEVICE_TYPE_CODES["ACNode"]: "ac",
+            DEVICE_TYPE_CODES["DCNode"]: "dc",
+            DEVICE_TYPE_CODES["DCACConverter"]: "hybrid",
+        }
+        partitions = partition_measurements_by_code(
+            view.measurements,
+            side_by_code,
+            sides=("ac", "dc", "hybrid"),
+        )
+        additions = [
+            Measurement(5, "ac_v2", "ACNode", "ac_bus_2", "V", 5.0, True, 1.01),
+            Measurement(6, "hyb_p2", "DCACConverter", "conv_2", "P_AC", 6.0, True, 4.0),
+        ]
+
+        updated = extend_measurement_partitions(
+            partitions,
+            additions,
+            side_by_code,
+            sides=("ac", "dc", "hybrid"),
+        )
+
+        self.assertEqual(["ac_v", "ac_v2"], [meas.name for meas in updated.measurements["ac"]])
+        self.assertEqual(["conv_p", "hyb_p2"], [meas.name for meas in updated.measurements["hybrid"]])
+        np.testing.assert_array_equal(updated.rows["ac"], np.array([0, 2], dtype=np.int64))
+        np.testing.assert_array_equal(updated.rows["hybrid"], np.array([1, 3], dtype=np.int64))
+        np.testing.assert_array_equal(updated.measurements["ac"].table.idx, np.array([1, 5], dtype=np.int64))
+        np.testing.assert_array_equal(updated.measurements["hybrid"].table.idx, np.array([3, 6], dtype=np.int64))
+
 
 if __name__ == "__main__":
     unittest.main()

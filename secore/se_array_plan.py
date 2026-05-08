@@ -35,6 +35,21 @@ class MeasurementPlanTable:
     handled: np.ndarray
 
 
+def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) -> MeasurementTable:
+    return MeasurementTable(
+        idx=np.concatenate((head.idx, tail.idx)),
+        name=np.concatenate((head.name, tail.name)),
+        device_type=np.concatenate((head.device_type, tail.device_type)),
+        device_name=np.concatenate((head.device_name, tail.device_name)),
+        meas_type=np.concatenate((head.meas_type, tail.meas_type)),
+        weight=np.concatenate((head.weight, tail.weight)),
+        valid=np.concatenate((head.valid, tail.valid)),
+        value=np.concatenate((head.value, tail.value)),
+        device_type_code=np.concatenate((head.device_type_code, tail.device_type_code)),
+        angle_mask=np.concatenate((head.angle_mask, tail.angle_mask)),
+    )
+
+
 def measurement_table_take(table: MeasurementTable, rows: Sequence[int]) -> MeasurementTable:
     row_idx = np.asarray(rows, dtype=np.int64)
     return MeasurementTable(
@@ -167,6 +182,67 @@ def build_active_measurement_view(
     )
 
 
+def append_active_measurement_view(
+    view: ActiveMeasurementView,
+    additions: Sequence[Measurement],
+    *,
+    source_row_start: Optional[int] = None,
+    table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
+) -> ActiveMeasurementView:
+    if not additions:
+        return view
+    additions_table = measurement_table_for(additions, table_builder)
+    try:
+        additions.table = additions_table
+    except AttributeError:
+        pass
+    source_start = int(len(view.source_table.idx) if source_row_start is None else source_row_start)
+    active_mask = np.asarray(additions_table.valid, dtype=bool) & (np.asarray(additions_table.weight, dtype=np.float64) > 0.0)
+    active_rows_in_additions = np.flatnonzero(active_mask)
+    source_table = concat_measurement_tables(view.source_table, additions_table)
+    if active_rows_in_additions.size == 0:
+        measurements = MeasurementList(
+            list(view.measurements),
+            view.table,
+            normalized=getattr(view.measurements, "normalized", False),
+        )
+        measurements.table = view.table
+        return ActiveMeasurementView(
+            source_table=source_table,
+            measurements=measurements,
+            table=view.table,
+            source_rows=view.source_rows,
+            z=view.z,
+            weight=view.weight,
+            angle_mask=view.angle_mask,
+            all_active=False,
+            rows_by_device_type_code=view.rows_by_device_type_code,
+        )
+    active_additions = MeasurementList(
+        [additions[int(row)] for row in active_rows_in_additions],
+        measurement_table_take(additions_table, active_rows_in_additions),
+        normalized=getattr(view.measurements, "normalized", False),
+    )
+    measurements = MeasurementList(
+        list(view.measurements) + list(active_additions),
+        normalized=getattr(view.measurements, "normalized", False),
+    )
+    active_table = concat_measurement_tables(view.table, active_additions.table)
+    measurements.table = active_table
+    source_rows = np.concatenate((view.source_rows, source_start + active_rows_in_additions.astype(np.int64, copy=False)))
+    return ActiveMeasurementView(
+        source_table=source_table,
+        measurements=measurements,
+        table=active_table,
+        source_rows=source_rows.astype(np.int64, copy=False),
+        z=np.asarray(active_table.value, dtype=np.float64),
+        weight=np.asarray(active_table.weight, dtype=np.float64),
+        angle_mask=np.asarray(active_table.angle_mask, dtype=bool),
+        all_active=bool(source_rows.size == source_table.idx.size and np.all(source_rows == np.arange(source_rows.size))),
+        rows_by_device_type_code=rows_by_device_type_code(active_table),
+    )
+
+
 def partition_measurements_by_code(
     measurements: Sequence[Measurement],
     side_by_device_type_code: Mapping[int, str],
@@ -207,4 +283,64 @@ def partition_measurements_by_code(
             measurement_table_take(table, row_array),
             normalized=normalized,
         )
+    return MeasurementPartitions(measurements=measurement_views, rows=row_arrays)
+
+
+def extend_measurement_partitions(
+    partitions: MeasurementPartitions,
+    additions: Sequence[Measurement],
+    side_by_device_type_code: Mapping[int, str],
+    *,
+    row_offset: Optional[int] = None,
+    side_by_device_type: Optional[Mapping[str, str]] = None,
+    table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
+    sides: Tuple[str, ...],
+) -> MeasurementPartitions:
+    if not additions:
+        return partitions
+    additions_table = measurement_table_for(additions, table_builder)
+    try:
+        additions.table = additions_table
+    except AttributeError:
+        pass
+    rows: Dict[str, list] = {side: list(np.asarray(partitions.rows[side], dtype=np.int64).tolist()) for side in sides}
+    if row_offset is None:
+        existing_sizes = [max(row_values) + 1 for row_values in rows.values() if row_values]
+        offset = int(max(existing_sizes) if existing_sizes else 0)
+    else:
+        offset = int(row_offset)
+    fallback = side_by_device_type or {}
+    side_additions: Dict[str, list] = {side: [] for side in sides}
+    for local_row, code in enumerate(np.asarray(additions_table.device_type_code, dtype=np.int16)):
+        side = side_by_device_type_code.get(int(code))
+        if side is None and fallback:
+            side = fallback.get(str(additions_table.device_type[local_row]))
+        if side in rows:
+            rows[side].append(offset + local_row)
+            side_additions[side].append(additions[local_row])
+    normalized = getattr(additions, "normalized", False)
+    measurement_views: Dict[str, MeasurementList] = {}
+    row_arrays: Dict[str, np.ndarray] = {}
+    for side in sides:
+        row_arrays[side] = np.asarray(rows[side], dtype=np.int64)
+        current = partitions.measurements[side]
+        if side_additions[side]:
+            addition_list = MeasurementList(
+                list(side_additions[side]),
+                measurement_table_for(side_additions[side], table_builder),
+                normalized=getattr(current, "normalized", normalized),
+            )
+            merged = MeasurementList(
+                list(current) + list(addition_list),
+                normalized=getattr(current, "normalized", normalized),
+            )
+            merged.table = concat_measurement_tables(current.table, addition_list.table)
+            measurement_views[side] = merged
+        else:
+            measurement_views[side] = MeasurementList(
+                list(current),
+                current.table,
+                normalized=getattr(current, "normalized", normalized),
+            )
+            measurement_views[side].table = current.table
     return MeasurementPartitions(measurements=measurement_views, rows=row_arrays)
