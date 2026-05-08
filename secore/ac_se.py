@@ -1347,17 +1347,37 @@ class ACStateEstimator:
                 for row in rows:
                     yield row, active_measurements[int(row)]
                 return
-        table = getattr(measurements, "table", None)
-        if table is not None and len(table.device_type) == len(measurements):
-            device_type_set = set(device_types)
-            for row, dtype in enumerate(table.device_type):
-                if dtype in device_type_set:
-                    yield row, measurements[row]
+        row_indexes = self._measurement_row_indexes_for_types(measurements, device_types)
+        if row_indexes is not None:
+            for row in row_indexes:
+                yield int(row), measurements[int(row)]
             return
         device_type_set = set(device_types)
         for row, meas in enumerate(measurements):
             if meas.device_type in device_type_set:
                 yield row, meas
+
+    def _measurement_row_indexes_for_types(
+        self,
+        measurements: Sequence[Measurement],
+        device_types: Tuple[str, ...],
+    ) -> Optional[np.ndarray]:
+        if measurements is self.active_measurements:
+            return self._active_measurement_rows_for_types(device_types)
+        table = getattr(measurements, "table", None)
+        if table is None or len(table.device_type_code) != len(measurements):
+            return None
+        codes = [int(_DEVICE_TYPE_CODES.get(device_type, 0)) for device_type in device_types]
+        codes = [code for code in codes if code > 0]
+        if not codes:
+            return np.empty(0, dtype=np.int64)
+        if len(codes) == 1:
+            return np.flatnonzero(np.asarray(table.device_type_code, dtype=np.int16) == codes[0]).astype(
+                np.int64,
+                copy=False,
+            )
+        code_array = np.asarray(table.device_type_code, dtype=np.int16)
+        return np.flatnonzero(np.isin(code_array, np.asarray(codes, dtype=np.int16))).astype(np.int64, copy=False)
 
     def _active_measurement_rows_for_types(self, device_types: Tuple[str, ...]) -> np.ndarray:
         rows_by_device_type_code = getattr(self, "_active_rows_by_device_type_code", None)
