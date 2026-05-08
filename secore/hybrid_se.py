@@ -25,6 +25,7 @@ from model.meas_model import (
     EstimateResult,
     Measurement,
     MeasurementList,
+    MeasurementTable,
     ObservabilityResult,
     measurement_table_from_measurements,
     print_iteration as _print_iteration,
@@ -72,6 +73,21 @@ def _measurement_table_from_measurements(measurements: Sequence[Measurement]):
         measurements,
         device_type_codes=DEVICE_TYPE_CODES,
         angle_measurement_types=ANGLE_MEASUREMENT_TYPES,
+    )
+
+
+def _concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) -> MeasurementTable:
+    return MeasurementTable(
+        idx=np.concatenate((head.idx, tail.idx)),
+        name=np.concatenate((head.name, tail.name)),
+        device_type=np.concatenate((head.device_type, tail.device_type)),
+        device_name=np.concatenate((head.device_name, tail.device_name)),
+        meas_type=np.concatenate((head.meas_type, tail.meas_type)),
+        weight=np.concatenate((head.weight, tail.weight)),
+        valid=np.concatenate((head.valid, tail.valid)),
+        value=np.concatenate((head.value, tail.value)),
+        device_type_code=np.concatenate((head.device_type_code, tail.device_type_code)),
+        angle_mask=np.concatenate((head.angle_mask, tail.angle_mask)),
     )
 
 
@@ -1277,6 +1293,105 @@ class HybridStateEstimator:
         self.power_flow_state = self.initial_state(flat=False)
         self.flat_state = self.initial_state(flat=True)
 
+    def _incremental_update_active_measurement_state_layout(
+        self,
+        appended_measurements: Sequence[Measurement],
+    ) -> bool:
+        if not appended_measurements:
+            return True
+        if not hasattr(self, "active_measurements"):
+            return False
+        if any((not meas.valid) or float(meas.weight) <= 0.0 for meas in appended_measurements):
+            return False
+        master_table = getattr(self.measurements, "table", None)
+        active_table = getattr(self.active_measurements, "table", None)
+        if master_table is None or active_table is None:
+            return False
+        if len(master_table.idx) != len(self.measurements) - len(appended_measurements):
+            return False
+        if len(active_table.idx) != len(self.active_measurements):
+            return False
+
+        appended_list = MeasurementList(
+            list(appended_measurements),
+            _measurement_table_from_measurements(appended_measurements),
+            normalized=getattr(self.measurements, "normalized", False),
+        )
+        self.measurements.table = _concat_measurement_tables(master_table, appended_list.table)
+
+        active_start = len(self.active_measurements)
+        self.active_measurements.extend(appended_list)
+        self.active_measurements.table = _concat_measurement_tables(active_table, appended_list.table)
+
+        appended_rows = np.arange(active_start, active_start + len(appended_list), dtype=np.int32)
+        appended_codes = np.asarray(appended_list.table.device_type_code, dtype=np.int16)
+        side_rows = {"ac": [], "dc": [], "hybrid": []}
+        side_measurements = {"ac": [], "dc": [], "hybrid": []}
+        for row, code in zip(appended_rows.tolist(), appended_codes.tolist()):
+            side = self._MEASUREMENT_SIDE_BY_DEVICE_TYPE_CODE.get(int(code))
+            if side in side_measurements:
+                side_rows[side].append(row)
+                side_measurements[side].append(self.active_measurements[int(row)])
+
+        def extend_view(current: MeasurementList, additions: Sequence[Measurement]) -> MeasurementList:
+            if not additions:
+                return current
+            addition_list = MeasurementList(
+                list(additions),
+                _measurement_table_from_measurements(additions),
+                normalized=getattr(current, "normalized", False),
+            )
+            current.extend(addition_list)
+            current.table = _concat_measurement_tables(current.table, addition_list.table)
+            return current
+
+        self.ac_meas_rows = np.concatenate((self.ac_meas_rows, np.asarray(side_rows["ac"], dtype=np.int32))).astype(
+            np.int32,
+            copy=False,
+        )
+        self.dc_meas_rows = np.concatenate((self.dc_meas_rows, np.asarray(side_rows["dc"], dtype=np.int32))).astype(
+            np.int32,
+            copy=False,
+        )
+        self.hybrid_meas_rows = np.concatenate(
+            (self.hybrid_meas_rows, np.asarray(side_rows["hybrid"], dtype=np.int32))
+        ).astype(np.int32, copy=False)
+        self.ac_meas = extend_view(self.ac_meas, side_measurements["ac"])
+        self.dc_meas = extend_view(self.dc_meas, side_measurements["dc"])
+        self.hybrid_meas = extend_view(self.hybrid_meas, side_measurements["hybrid"])
+        self._active_ac_hybrid_rows = self.ac_meas_rows.copy()
+        self._active_dc_hybrid_rows = self.dc_meas_rows.copy()
+        self._active_ac_sub_measurements = copy_measurement_view(self.ac_meas)
+        self._active_dc_sub_measurements = copy_measurement_view(self.dc_meas)
+        self._active_ac_sub_rows = np.arange(len(self.ac_meas), dtype=np.int32)
+        self._active_dc_sub_rows = np.arange(len(self.dc_meas), dtype=np.int32)
+        self._active_ac_delegated_row_mask = np.zeros(len(self.active_measurements), dtype=bool)
+        self._active_dc_delegated_row_mask = np.zeros(len(self.active_measurements), dtype=bool)
+        if self._active_ac_hybrid_rows.size:
+            self._active_ac_delegated_row_mask[self._active_ac_hybrid_rows] = True
+        if self._active_dc_hybrid_rows.size:
+            self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
+        self._jacobian_static_skip = np.zeros(len(self.active_measurements), dtype=bool)
+        self._active_measurement_blocks = {
+            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
+            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
+        }
+        self._active_hybrid_measurement_plan = self._build_hybrid_measurement_plan(
+            self._active_measurement_blocks["hybrid"],
+        )
+        self.active_z = np.asarray(self.active_measurements.table.value, dtype=np.float64)
+        self.active_weight = np.asarray(self.active_measurements.table.weight, dtype=np.float64)
+        self.active_angle_residual_mask = np.asarray(self.active_measurements.table.angle_mask, dtype=bool)
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_normal_pattern = None
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._initial_observability_cache = None
+        self._observability_matrix_cache = None
+        self._invalidate_measurement_activity_summary()
+        return True
+
     def _build_hybrid_measurement_plan(
         self,
         block: "HybridStateEstimator._MeasurementSideBlock",
@@ -1660,6 +1775,8 @@ class HybridStateEstimator:
     def _invalidate_measurement_activity_summary(self) -> None:
         if hasattr(self, "_measurement_activity_summary_cache"):
             delattr(self, "_measurement_activity_summary_cache")
+        if hasattr(self, "_observability_pseudo_candidate_cache"):
+            delattr(self, "_observability_pseudo_candidate_cache")
 
     def _measurement_activity_summary(self) -> "_MeasurementActivitySummary":
         cache = getattr(self, "_measurement_activity_summary_cache", None)
@@ -1760,6 +1877,7 @@ class HybridStateEstimator:
             existing_names = {meas.name for meas in self.measurements}
             added = 0
             refreshed = False
+            measurement_count_before = len(self.measurements)
             remaining = batch_limit
             for label, _score in observability.weak_states:
                 if added >= remaining:
@@ -1778,6 +1896,10 @@ class HybridStateEstimator:
             if added == 0:
                 break
             total_added += added
+            if not refreshed:
+                refreshed = self._incremental_update_active_measurement_state_layout(
+                    self.measurements[measurement_count_before:]
+                )
             if not refreshed:
                 self._refresh_active_measurement_state_layout()
             observability = None
@@ -1816,6 +1938,9 @@ class HybridStateEstimator:
 
     def _observability_pseudo_candidate_measurements(self) -> List[Measurement]:
         """Build low-weight candidate pseudo rows for weak-direction observability repair."""
+        cache = getattr(self, "_observability_pseudo_candidate_cache", None)
+        if cache is not None:
+            return cache
         existing_keys = self._active_measurement_keys()
         existing_names = {meas.name for meas in self.measurements}
         candidates: List[Measurement] = []
@@ -1848,6 +1973,7 @@ class HybridStateEstimator:
         for spec in self._hybrid_converter_measurement_specs(source="flow"):
             add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
 
+        self._observability_pseudo_candidate_cache = candidates
         return candidates
 
     def _select_weak_direction_pseudo_candidates(
@@ -2040,13 +2166,20 @@ class HybridStateEstimator:
             return measurements
         return list(measurements)
 
+    def _measurement_table(self, measurements: Sequence[Measurement]):
+        table = getattr(measurements, "table", None)
+        if table is not None and len(table.idx) == len(measurements):
+            return table
+        table = _measurement_table_from_measurements(measurements)
+        if isinstance(measurements, MeasurementList):
+            measurements.table = table
+        return table
+
     def _measurement_vectors(self, measurements: Sequence[Measurement]) -> Tuple[np.ndarray, np.ndarray]:
         if measurements is self.active_measurements:
             return self.active_z, self.active_weight
-        return (
-            np.asarray([meas.value for meas in measurements], dtype=np.float64),
-            np.asarray([meas.weight for meas in measurements], dtype=np.float64),
-        )
+        table = self._measurement_table(measurements)
+        return np.asarray(table.value, dtype=np.float64), np.asarray(table.weight, dtype=np.float64)
 
     @staticmethod
     def _measurement_signature(measurements: Sequence[Measurement]) -> Tuple[Tuple[str, str, str, float, float, bool], ...]:
@@ -2106,8 +2239,14 @@ class HybridStateEstimator:
     def _weighted_objective(weight: np.ndarray, residual: np.ndarray) -> float:
         return 0.5 * float(np.einsum("i,i,i->", weight, residual, residual, optimize=False))
 
+    def _angle_residual_mask(self, measurements: Sequence[Measurement]) -> np.ndarray:
+        if measurements is self.active_measurements:
+            return self.active_angle_residual_mask
+        table = self._measurement_table(measurements)
+        return np.asarray(table.angle_mask, dtype=bool)
+
     def _measurement_residual(self, z: np.ndarray, z_est: np.ndarray, measurements: Sequence[Measurement]) -> np.ndarray:
-        angle_mask = self.active_angle_residual_mask if measurements is self.active_measurements else angle_residual_mask(measurements)
+        angle_mask = self._angle_residual_mask(measurements)
         return build_measurement_residual(z, z_est, angle_mask)
 
     def _safe_current(self, p: np.ndarray, q: Optional[np.ndarray], v: np.ndarray) -> np.ndarray:
@@ -2705,7 +2844,7 @@ class HybridStateEstimator:
             residual=residual,
             H=H,
             gain=gain,
-            measurements=list(measurements),
+            measurements=measurements if isinstance(measurements, MeasurementList) else list(measurements),
             observability=observability,
         )
 
@@ -2718,7 +2857,7 @@ class HybridStateEstimator:
         if delegate is not None:
             return delegate.identify_bad_data(result, threshold)
         threshold = self.params.bad_threshold if threshold is None else threshold
-        weights = np.asarray([meas.weight for meas in result.measurements], dtype=np.float64)
+        _z, weights = self._measurement_vectors(result.measurements)
         H = result.H if result.H is not None else self.jacobian_sparse(result.x, result.measurements)
         gain = result.gain
         if gain is None:

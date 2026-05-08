@@ -187,6 +187,100 @@ class HybridStateEstimationTest(unittest.TestCase):
         ac_for_sub.append(Measurement(-1, "pseudo_probe", "ACNode", "n", "V", 1.0, True, 1.0))
         self.assertEqual(before_count, len(sources["ac"]))
 
+    def test_measurement_vectors_use_table_slice_for_non_active_subset(self):
+        from model.meas_model import MeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        measurements = [
+            Measurement(1, "m1", "ACNode", "bus_1", "V", 2.0, True, 10.0),
+            Measurement(2, "m2", "DCNode", "bus_2", "V", 3.0, True, 20.0),
+        ]
+        subset = MeasurementList(
+            measurements,
+            measurement_table_from_measurements(measurements),
+        )
+        measurements[0].value = 101.0
+        measurements[0].weight = 201.0
+        measurements[1].value = 102.0
+        measurements[1].weight = 202.0
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.active_measurements = []
+        estimator.active_z = np.array([], dtype=np.float64)
+        estimator.active_weight = np.array([], dtype=np.float64)
+
+        z, weight = estimator._measurement_vectors(subset)
+
+        np.testing.assert_allclose(z, np.array([10.0, 20.0]))
+        np.testing.assert_allclose(weight, np.array([2.0, 3.0]))
+
+    def test_measurement_residual_uses_table_angle_mask_for_non_active_subset(self):
+        from model.meas_model import MeasurementList
+        import secore.hybrid_se as hybrid_se_module
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        measurements = [Measurement(1, "m1", "ACNode", "bus_1", "ANGLE", 1.0, True, 2.0 * np.pi - 0.1)]
+        subset = MeasurementList(
+            measurements,
+            hybrid_se_module._measurement_table_from_measurements(measurements),
+        )
+        measurements[0].meas_type = "P"
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.active_measurements = []
+        estimator.active_angle_residual_mask = np.array([], dtype=bool)
+
+        original = hybrid_se_module.angle_residual_mask
+        hybrid_se_module.angle_residual_mask = lambda _measurements: (_ for _ in ()).throw(
+            AssertionError("non-active residual path should reuse table angle mask")
+        )
+        try:
+            residual = estimator._measurement_residual(
+                np.array([2.0 * np.pi - 0.1], dtype=np.float64),
+                np.array([0.0], dtype=np.float64),
+                subset,
+            )
+        finally:
+            hybrid_se_module.angle_residual_mask = original
+
+        np.testing.assert_allclose(residual, np.array([-0.1]))
+
+    def test_identify_bad_data_uses_table_slice_weights_for_non_active_subset(self):
+        from model.meas_model import EstimateResult, MeasurementList, ObservabilityResult, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        measurements = [Measurement(1, "m1", "ACNode", "bus_1", "V", 4.0, True, 1.0)]
+        subset = MeasurementList(
+            measurements,
+            measurement_table_from_measurements(measurements),
+        )
+        measurements[0].weight = 1.0
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.params = SimpleNamespace(bad_threshold=0.0)
+        estimator.active_measurements = []
+        estimator.active_z = np.array([], dtype=np.float64)
+        estimator.active_weight = np.array([], dtype=np.float64)
+        result = EstimateResult(
+            converged=True,
+            iterations=1,
+            objective=0.0,
+            max_correction=0.0,
+            residual_inf=1.0,
+            x=np.array([0.0], dtype=np.float64),
+            z_est=np.array([0.0], dtype=np.float64),
+            residual=np.array([1.0], dtype=np.float64),
+            H=np.array([[1.0]], dtype=np.float64),
+            gain=np.array([[0.0]], dtype=np.float64),
+            measurements=subset,
+            observability=ObservabilityResult(True, 1, 1, 1, 0, np.array([1.0], dtype=np.float64), []),
+        )
+
+        bad_items, normalized = estimator.identify_bad_data(result)
+
+        np.testing.assert_allclose(normalized, np.array([2.0]))
+        self.assertEqual(1, len(bad_items))
+
     def test_ieee3k_flat_start_does_not_add_angle_pseudos(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -790,6 +884,48 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(calls), 2)
         self.assertTrue(candidates)
+
+    def test_observability_pseudo_candidates_use_cache_until_invalidated(self):
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        side_calls = 0
+        converter_calls = 0
+        original_side = estimator._side_observability_pseudo_specs
+        original_converter = estimator._hybrid_converter_measurement_specs
+
+        def counted_side(*args, **kwargs):
+            nonlocal side_calls
+            side_calls += 1
+            return original_side(*args, **kwargs)
+
+        def counted_converter(*args, **kwargs):
+            nonlocal converter_calls
+            converter_calls += 1
+            return original_converter(*args, **kwargs)
+
+        estimator._side_observability_pseudo_specs = counted_side
+        estimator._hybrid_converter_measurement_specs = counted_converter
+
+        first = estimator._observability_pseudo_candidate_measurements()
+        second = estimator._observability_pseudo_candidate_measurements()
+
+        self.assertIs(first, second)
+        self.assertEqual(2, side_calls)
+        self.assertEqual(1, converter_calls)
+
+        next_idx = max(meas.idx for meas in estimator.measurements) + 1
+        estimator.measurements.append(Measurement(next_idx, "tmp_obs_cache", "ACNode", "wt02_src", "V", 1.0, True, 1.0))
+        estimator._invalidate_measurement_activity_summary()
+        third = estimator._observability_pseudo_candidate_measurements()
+
+        self.assertIsNot(first, third)
+        self.assertEqual(4, side_calls)
+        self.assertEqual(2, converter_calls)
 
     def test_hybrid_estimator_drops_row_fallback_helpers(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -1753,6 +1889,53 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertTrue(first)
         self.assertTrue(second)
         self.assertEqual(1, candidate_calls)
+
+    def test_targeted_pseudo_small_batch_avoids_full_active_refresh(self):
+        from model.meas_model import ObservabilityResult
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        initial_active_count = len(estimator.active_measurements)
+        observable_result = ObservabilityResult(
+            observable=True,
+            rank=estimator.n_state,
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=0,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[],
+        )
+        non_observable_result = ObservabilityResult(
+            observable=False,
+            rank=max(estimator.n_state - 1, 0),
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=1,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[("AC_V:wt02_src", 1.0)],
+        )
+        results = [non_observable_result, observable_result]
+
+        def fake_observability():
+            return results.pop(0) if results else observable_result
+
+        estimator.observability_analysis = fake_observability
+        estimator.targeted_pseudo_measurement_max = 1
+        estimator.targeted_pseudo_measurement_step = 1
+        estimator.targeted_pseudo_measurement_redundancy_ratio = 0.0
+        estimator._refresh_active_measurement_state_layout = lambda: (_ for _ in ()).throw(
+            AssertionError("targeted pseudo append should update active layout incrementally")
+        )
+
+        added = estimator._add_targeted_observability_pseudo_measurements()
+
+        self.assertEqual(1, added)
+        self.assertEqual(initial_active_count + 1, len(estimator.active_measurements))
+        self.assertEqual("pseudo_obs_v_wt02_src", estimator.active_measurements[-1].name)
 
     def test_estimate_passes_file_weights_to_normal_equation_builder(self):
         import secore.hybrid_se as hybrid_se
