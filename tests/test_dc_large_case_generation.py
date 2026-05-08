@@ -90,6 +90,40 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertIn("bus", calc.result)
         self.assertEqual(ppc["bus"].shape, calc.result["bus"].shape)
 
+    def test_dc_ppc_prepare_reuses_static_cache_for_second_calc(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc.pop("_dc_pf_static", None)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            cold_G, cold_x = DCPowerFlowCalc(ppc).prepare()
+        self.assertIn("_dc_pf_static", ppc)
+
+        original_topology = DCPowerFlowCalc._prepare_direct_ppc_topology
+
+        def reject_topology(*_args, **_kwargs):
+            raise AssertionError("warm DC ppc prepare should reuse cached static topology")
+
+        DCPowerFlowCalc._prepare_direct_ppc_topology = reject_topology
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                warm_calc = DCPowerFlowCalc(ppc)
+                warm_G, warm_x = warm_calc.prepare()
+        finally:
+            DCPowerFlowCalc._prepare_direct_ppc_topology = original_topology
+
+        self.assertEqual(cold_G.shape, warm_G.shape)
+        self.assertEqual(cold_x.shape, warm_x.shape)
+        self.assertTrue(warm_calc.array_mode)
+        self.assertEqual(cold_x.tolist(), warm_x.tolist())
+
+        cold_x[0] = 123.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            _again_G, again_x = DCPowerFlowCalc(ppc).prepare()
+        self.assertNotEqual(123.0, again_x[0])
+
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc

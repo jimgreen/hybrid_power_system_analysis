@@ -46,6 +46,7 @@ from typing import Dict, Optional
 
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import spsolve
 from collections import deque
 from pathlib import Path
@@ -181,6 +182,120 @@ def find_spanning_tree_edges(edges, n_nodes):
 class DCPowerFlowCalc:
     """直流潮流计算器，使用节点电压、零阻抗 phi 和 DCDC 端口功率统一求解。"""
 
+    _DIRECT_PPC_STATIC_ATTRS = (
+        "alive_nodes",
+        "alive_node_dict",
+        "alive_node_ids",
+        "_alive_node_lookup",
+        "N",
+        "P_const",
+        "I_shunt",
+        "slack_gen_info",
+        "branch_idx",
+        "branch_i",
+        "branch_j",
+        "branch_r",
+        "alive_loads",
+        "alive_generators",
+        "G",
+        "zero_edges",
+        "comp_nodes",
+        "comp_tree_edges",
+        "N_phi",
+        "ref_phi_idx",
+        "zero_branch_info",
+        "zero_type",
+        "zero_dev_idx",
+        "zero_i",
+        "zero_j",
+        "zero_phi_a",
+        "zero_phi_b",
+        "zero_con_i",
+        "zero_con_j",
+        "dcdc_idx",
+        "dcdc_i",
+        "dcdc_j",
+        "dcdc_ctrl_code",
+        "dcdc_p_set",
+        "dcdc_i_set",
+        "dcdc_v_set",
+        "dcdc_r1",
+        "dcdc_r2",
+        "N_dcdc",
+        "dcdc_ctrl",
+        "alive_dcdc_tuples",
+        "slack_nodes",
+        "slack_node_arr",
+        "slack_value_arr",
+        "total_vars",
+        "unknown_nodes",
+        "n_unknown",
+        "n_known",
+        "node_eq",
+        "n_zero_constraint",
+        "n_phi_fix",
+        "n_dcdc",
+        "total_eq",
+        "eq_unknown_start",
+        "eq_known_start",
+        "eq_zero_start",
+        "eq_phi_start",
+        "eq_dcdc_start",
+        "unknown_map",
+        "zero_con_rows",
+        "phi_fix_rows",
+        "dcdc_seq",
+        "dcdc_p_col",
+        "dcdc_q_col",
+        "dcdc_eq_ctrl",
+        "dcdc_eq_loss",
+        "dcdc_ctrl_p_mask",
+        "dcdc_ctrl_v_mask",
+        "dcdc_ctrl_i_mask",
+        "dcdc_ones",
+        "zero_i_eq",
+        "zero_j_eq",
+        "zero_i_unknown_mask",
+        "zero_j_unknown_mask",
+        "zero_i_unknown_count",
+        "zero_j_unknown_count",
+        "zero_i_rows_jac",
+        "zero_i_cols_jac",
+        "zero_j_rows_jac",
+        "zero_j_cols_jac",
+        "known_rows_jac",
+        "known_cols_jac",
+        "known_data_jac",
+        "zero_con_rows_jac",
+        "zero_con_cols_jac",
+        "zero_con_data_jac",
+        "phi_fix_cols_jac",
+        "phi_fix_data_jac",
+        "dcdc_i_eq",
+        "dcdc_j_eq",
+        "dcdc_i_unknown_mask",
+        "dcdc_j_unknown_mask",
+        "dcdc_i_unknown_idx",
+        "dcdc_j_unknown_idx",
+        "dcdc_i_eq_rows_jac",
+        "dcdc_j_eq_rows_jac",
+        "dcdc_i_eq_cols_jac",
+        "dcdc_j_eq_cols_jac",
+        "dcdc_i_eq_data_jac",
+        "dcdc_j_eq_data_jac",
+        "dcdc_ctrl_p_count",
+        "dcdc_ctrl_v_count",
+        "dcdc_ctrl_i_count",
+        "dcdc_ctrl_p_data_jac",
+        "dcdc_ctrl_v_data_jac",
+        "dcdc_ctrl_i_rows_jac",
+        "dcdc_ctrl_i_cols_jac",
+        "dcdc_ctrl_i_data_jac",
+        "dcdc_loss_rows_jac",
+        "dcdc_loss_cols_jac",
+    )
+    _DIRECT_PPC_SHAPE_KEYS = ("bus", "branch", "load", "gen", "zero_branch", "switch", "break", "dcdc")
+
     def __init__(
         self,
         model,
@@ -223,16 +338,79 @@ class DCPowerFlowCalc:
         self.verbose = False
         self.result: Dict = {}
 
+    @staticmethod
+    def _clone_static_value(value):
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, list):
+            return list(value)
+        return value
+
+    def _direct_ppc_shape_signature(self):
+        return {
+            key: tuple(self.ppc[key].shape)
+            for key in self._DIRECT_PPC_SHAPE_KEYS
+            if key in self.ppc
+        }
+
+    def _direct_ppc_array_id_signature(self):
+        return {
+            key: id(self.ppc[key])
+            for key in self._DIRECT_PPC_SHAPE_KEYS
+            if key in self.ppc
+        }
+
+    def _load_direct_ppc_static(self):
+        static = self.ppc.get("_dc_pf_static")
+        if not isinstance(static, dict):
+            return None
+        if static.get("format") != "dc_pf_static_v1":
+            return None
+        if static.get("keep_node_objects") != self.keep_node_objects:
+            return None
+        if static.get("shapes") != self._direct_ppc_shape_signature():
+            return None
+        if static.get("array_ids") != self._direct_ppc_array_id_signature():
+            return None
+
+        for name, value in static["attrs"].items():
+            setattr(self, name, self._clone_static_value(value))
+        self._lf_branch_devices = []
+        self._lf_inactive_branch_devices = []
+        return self.G, static["x"].copy()
+
+    def _store_direct_ppc_static(self, x):
+        attrs = {
+            name: self._clone_static_value(getattr(self, name))
+            for name in self._DIRECT_PPC_STATIC_ATTRS
+            if hasattr(self, name)
+        }
+        self.ppc["_dc_pf_static"] = {
+            "format": "dc_pf_static_v1",
+            "keep_node_objects": self.keep_node_objects,
+            "shapes": self._direct_ppc_shape_signature(),
+            "array_ids": self._direct_ppc_array_id_signature(),
+            "attrs": attrs,
+            "x": x.copy(),
+        }
+
     def _alive_node_lookup_array(self):
         """Return a dense node-id to active solver-position lookup when possible."""
+        cached = getattr(self, "_alive_node_lookup", None)
+        if cached is not None:
+            return cached
         if self.alive_node_ids.size == 0:
-            return np.array([], dtype=np.int32)
+            self._alive_node_lookup = np.array([], dtype=np.int32)
+            return self._alive_node_lookup
         if np.any(self.alive_node_ids < 0):
             return None
         max_node_id = int(np.max(self.alive_node_ids))
         lookup = np.full(max_node_id + 1, -1, dtype=np.int32)
         for node_id, pos in self.alive_node_dict.items():
             lookup[int(node_id)] = int(pos)
+        self._alive_node_lookup = lookup
         return lookup
 
     @staticmethod
@@ -272,152 +450,180 @@ class DCPowerFlowCalc:
             return None
         return i_node, j_node
 
+    @staticmethod
+    def _direct_node_position_lookup(node_ids):
+        if node_ids.size == 0:
+            return None, {}
+        node_ids = node_ids.astype(np.int64, copy=False)
+        min_id = int(node_ids.min())
+        max_id = int(node_ids.max())
+        if min_id >= 0 and max_id <= max(1_000_000, int(node_ids.size) * 8):
+            lookup = np.full(max_id + 1, -1, dtype=np.int32)
+            lookup[node_ids.astype(np.intp)] = np.arange(node_ids.size, dtype=np.int32)
+            return lookup, None
+        return None, {int(node_id): int(pos) for pos, node_id in enumerate(node_ids)}
+
+    @staticmethod
+    def _map_direct_node_positions(node_values, dense_lookup, dict_lookup):
+        node_values = np.asarray(node_values, dtype=np.int64)
+        pos = np.full(node_values.shape, -1, dtype=np.int32)
+        if dense_lookup is not None:
+            valid = (node_values >= 0) & (node_values < dense_lookup.size)
+            if np.any(valid):
+                pos[valid] = dense_lookup[node_values[valid].astype(np.intp)]
+            return pos
+        return np.fromiter(
+            (dict_lookup.get(int(node_id), -1) for node_id in node_values),
+            dtype=np.int32,
+            count=node_values.size,
+        )
+
+    def _direct_ppc_pair_positions(self, rows, cols, dense_lookup, dict_lookup, status_col=None):
+        if rows is None or rows.size == 0:
+            empty = np.array([], dtype=np.int32)
+            return empty, empty
+        i_pos = self._map_direct_node_positions(rows[:, cols["i_node"]], dense_lookup, dict_lookup)
+        j_pos = self._map_direct_node_positions(rows[:, cols["j_node"]], dense_lookup, dict_lookup)
+        mask = (rows[:, cols["run_stat"]] == 1) & (i_pos >= 0) & (j_pos >= 0) & (i_pos != j_pos)
+        if status_col is not None:
+            mask &= rows[:, status_col] == 1
+        return i_pos[mask].astype(np.int32, copy=False), j_pos[mask].astype(np.int32, copy=False)
+
+    @staticmethod
+    def _component_labels_from_edges(n_nodes, edge_parts):
+        edge_parts = [(left, right) for left, right in edge_parts if left.size]
+        if not edge_parts:
+            return np.arange(n_nodes, dtype=np.int32)
+        left = np.concatenate([part[0] for part in edge_parts])
+        right = np.concatenate([part[1] for part in edge_parts])
+        rows = np.concatenate((left, right))
+        cols = np.concatenate((right, left))
+        data = np.ones(rows.size, dtype=np.int8)
+        graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+        _n_comp, labels = connected_components(graph, directed=False, return_labels=True)
+        return labels.astype(np.int32, copy=False)
+
     def _prepare_direct_ppc_topology(self):
         """Build active DC solver-node mapping directly from dc_ppc_v1 arrays."""
         ppc = self.ppc
         bus = ppc["bus"]
         running_mask = bus[:, DC_BUS_COLS["run_stat"]] == 1
-        running_rows = np.nonzero(running_mask)[0].astype(np.int32)
-        running_node_ids = bus[running_rows, DC_BUS_COLS["idx"]].astype(np.int64)
-        running_node_set = {int(node_id) for node_id in running_node_ids}
-        if not running_node_set:
+        running_node_ids = bus[running_mask, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)
+        n_running = int(running_node_ids.size)
+        if n_running == 0:
             self.alive_nodes = []
             self.alive_node_dict = {}
             self.alive_node_ids = np.array([], dtype=np.int32)
             self.N = 0
             return
 
-        node_parent = {int(node_id): int(node_id) for node_id in running_node_ids}
-        switch = ppc["switch"]
-        if switch.size:
-            for row in switch:
-                pair = self._live_ppc_terminal_pair(
-                    row,
-                    DC_SWITCH_COLS["i_node"],
-                    DC_SWITCH_COLS["j_node"],
-                    DC_SWITCH_COLS["run_stat"],
-                    running_node_set,
-                    status_col=DC_SWITCH_COLS["status"],
-                )
-                if pair is not None:
-                    self._union_parent(node_parent, pair[0], pair[1])
+        dense_lookup, dict_lookup = self._direct_node_position_lookup(running_node_ids)
+        switch_i, switch_j = self._direct_ppc_pair_positions(
+            ppc["switch"],
+            DC_SWITCH_COLS,
+            dense_lookup,
+            dict_lookup,
+            status_col=DC_SWITCH_COLS["status"],
+        )
+        branch_i, branch_j = self._direct_ppc_pair_positions(
+            ppc["branch"],
+            DC_BRANCH_COLS,
+            dense_lookup,
+            dict_lookup,
+        )
+        zero_i, zero_j = self._direct_ppc_pair_positions(
+            ppc["zero_branch"],
+            DC_ZERO_BRANCH_COLS,
+            dense_lookup,
+            dict_lookup,
+        )
+        break_i, break_j = self._direct_ppc_pair_positions(
+            ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)),
+            DC_BREAK_COLS,
+            dense_lookup,
+            dict_lookup,
+            status_col=DC_BREAK_COLS["status"],
+        )
 
-        root_to_nodes = {}
-        for node_id in running_node_ids:
-            root_to_nodes.setdefault(self._find_parent(node_parent, int(node_id)), []).append(int(node_id))
-        bus_groups = sorted((sorted(nodes) for nodes in root_to_nodes.values()), key=lambda nodes: nodes[0])
-        node_to_bus_group = {
-            node_id: group_pos
-            for group_pos, nodes in enumerate(bus_groups)
-            for node_id in nodes
-        }
+        switch_labels = self._component_labels_from_edges(n_running, ((switch_i, switch_j),))
+        full_labels = self._component_labels_from_edges(
+            n_running,
+            ((switch_i, switch_j), (branch_i, branch_j), (zero_i, zero_j), (break_i, break_j)),
+        )
 
-        group_parent = list(range(len(bus_groups)))
-
-        def union_groups(pair):
-            if pair is None:
-                return
-            left = node_to_bus_group.get(pair[0])
-            right = node_to_bus_group.get(pair[1])
-            if left is None or right is None or left == right:
-                return
-            self._union_parent(group_parent, left, right)
-
-        for rows, cols, require_closed in (
-            (ppc["branch"], DC_BRANCH_COLS, False),
-            (ppc["zero_branch"], DC_ZERO_BRANCH_COLS, False),
-            (ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)), DC_BREAK_COLS, True),
-        ):
-            if not rows.size:
-                continue
-            status_col = cols["status"] if require_closed else None
-            for row in rows:
-                union_groups(
-                    self._live_ppc_terminal_pair(
-                        row,
-                        cols["i_node"],
-                        cols["j_node"],
-                        cols["run_stat"],
-                        running_node_set,
-                        status_col=status_col,
-                    )
-                )
-
-        alive_roots = set()
+        alive_components = np.zeros(int(full_labels.max()) + 1, dtype=bool)
         gen = ppc["gen"]
         if gen.size:
-            for row in gen:
-                if row[DC_GEN_COLS["run_stat"]] != 1 or row[DC_GEN_COLS["control_type"]] != DC_CTRL_V:
-                    continue
-                node_id = int(row[DC_GEN_COLS["node"]])
-                group = node_to_bus_group.get(node_id)
-                if group is not None:
-                    alive_roots.add(self._find_parent(group_parent, group))
+            gen_pos = self._map_direct_node_positions(gen[:, DC_GEN_COLS["node"]], dense_lookup, dict_lookup)
+            v_mask = (
+                (gen[:, DC_GEN_COLS["run_stat"]] == 1)
+                & (gen[:, DC_GEN_COLS["control_type"]] == DC_CTRL_V)
+                & (gen_pos >= 0)
+            )
+            if np.any(v_mask):
+                alive_components[full_labels[gen_pos[v_mask]]] = True
 
         dcdc = ppc["dcdc"]
         if dcdc.size:
-            for row in dcdc:
-                pair = self._live_ppc_terminal_pair(
-                    row,
-                    DC_DCDC_COLS["i_node"],
-                    DC_DCDC_COLS["j_node"],
-                    DC_DCDC_COLS["run_stat"],
-                    running_node_set,
-                )
-                if pair is None or row[DC_DCDC_COLS["control_type"]] != DC_CTRL_V:
-                    continue
-                group = node_to_bus_group.get(pair[0])
-                if group is not None:
-                    alive_roots.add(self._find_parent(group_parent, group))
+            dcdc_i_pos = self._map_direct_node_positions(dcdc[:, DC_DCDC_COLS["i_node"]], dense_lookup, dict_lookup)
+            dcdc_j_pos = self._map_direct_node_positions(dcdc[:, DC_DCDC_COLS["j_node"]], dense_lookup, dict_lookup)
+            dcdc_v_mask = (
+                (dcdc[:, DC_DCDC_COLS["run_stat"]] == 1)
+                & (dcdc[:, DC_DCDC_COLS["control_type"]] == DC_CTRL_V)
+                & (dcdc_i_pos >= 0)
+                & (dcdc_j_pos >= 0)
+                & (dcdc_i_pos != dcdc_j_pos)
+            )
+            if np.any(dcdc_v_mask):
+                alive_components[full_labels[dcdc_i_pos[dcdc_v_mask]]] = True
 
+        alive_pos_mask = alive_components[full_labels]
         if self.keep_node_objects:
-            solver_groups = [
-                [int(node_id)]
-                for node_id in running_node_ids
-                if self._find_parent(group_parent, node_to_bus_group[int(node_id)]) in alive_roots
-            ]
+            solver_node_ids = running_node_ids[alive_pos_mask].astype(np.int32, copy=False)
+            self.alive_node_dict = {int(node_id): int(pos) for pos, node_id in enumerate(solver_node_ids)}
+            self.alive_node_ids = solver_node_ids.copy()
+            self.N = int(solver_node_ids.size)
+            if solver_node_ids.size and np.all(solver_node_ids >= 0):
+                self._alive_node_lookup = np.full(int(solver_node_ids.max()) + 1, -1, dtype=np.int32)
+                self._alive_node_lookup[solver_node_ids.astype(np.intp)] = np.arange(self.N, dtype=np.int32)
+            else:
+                self._alive_node_lookup = np.array([], dtype=np.int32)
         else:
-            solver_groups = [
-                nodes
-                for group_pos, nodes in enumerate(bus_groups)
-                if self._find_parent(group_parent, group_pos) in alive_roots
-            ]
+            active_pos = np.nonzero(alive_pos_mask)[0].astype(np.int32)
+            active_labels = switch_labels[active_pos]
+            active_node_ids = running_node_ids[active_pos]
+            order = np.lexsort((active_node_ids, active_labels))
+            labels_sorted = active_labels[order]
+            nodes_sorted = active_node_ids[order].astype(np.int32, copy=False)
+            if labels_sorted.size:
+                starts = np.r_[0, np.flatnonzero(labels_sorted[1:] != labels_sorted[:-1]) + 1]
+                ends = np.r_[starts[1:], labels_sorted.size]
+                group_order = np.argsort(nodes_sorted[starts], kind="stable")
+                self.alive_node_dict = {}
+                alive_ids = []
+                alive_pos_values = []
+                for solver_pos, group_idx in enumerate(group_order):
+                    group_nodes = nodes_sorted[starts[group_idx]:ends[group_idx]]
+                    alive_ids.extend(int(node_id) for node_id in group_nodes)
+                    alive_pos_values.extend([int(solver_pos)] * int(group_nodes.size))
+                    for node_id in group_nodes:
+                        self.alive_node_dict[int(node_id)] = int(solver_pos)
+                self.alive_node_ids = np.asarray(alive_ids, dtype=np.int32)
+                self.N = int(group_order.size)
+                if self.alive_node_ids.size and np.all(self.alive_node_ids >= 0):
+                    self._alive_node_lookup = np.full(int(self.alive_node_ids.max()) + 1, -1, dtype=np.int32)
+                    self._alive_node_lookup[self.alive_node_ids.astype(np.intp)] = np.asarray(alive_pos_values, dtype=np.int32)
+                else:
+                    self._alive_node_lookup = np.array([], dtype=np.int32)
+            else:
+                self.alive_node_dict = {}
+                self.alive_node_ids = np.array([], dtype=np.int32)
+                self.N = 0
+                self._alive_node_lookup = np.array([], dtype=np.int32)
 
-        self.alive_node_dict = {
-            int(node_id): pos
-            for pos, nodes in enumerate(solver_groups)
-            for node_id in nodes
-        }
-        self.alive_node_ids = np.asarray(list(self.alive_node_dict.keys()), dtype=np.int32)
-        self.N = len(solver_groups)
-
-        bus_names = ppc.get("bus_name", np.asarray([f"nd_{int(row[DC_BUS_COLS['idx']])}" for row in bus], dtype=object))
-        node_meta = {
-            int(row[DC_BUS_COLS["idx"]]): (
-                str(bus_names[row_pos]),
-                float(row[DC_BUS_COLS["vbase"]]),
-                float(row[DC_BUS_COLS["voltage"]]),
-            )
-            for row_pos, row in enumerate(bus)
-        }
+        # Direct ppc result/writeback paths use alive_node_dict and result arrays; constructing
+        # SimpleNamespace node facades here is pure cold-start overhead for large ppc cases.
         self.alive_nodes = []
-        for nodes in solver_groups:
-            idx = int(nodes[0])
-            name, vbase, voltage = node_meta.get(idx, (f"nd_{idx}", 0.0, 1.0))
-            members = [SimpleNamespace(idx=int(node_id)) for node_id in nodes]
-            self.alive_nodes.append(
-                SimpleNamespace(
-                    idx=idx,
-                    name=name,
-                    nodes=members,
-                    vbase=vbase,
-                    voltage=voltage,
-                    run_stat=1,
-                    is_alive=True,
-                    is_slack=False,
-                    v_set=1.0,
-                )
-            )
 
     def prepare(self):
         """
@@ -427,6 +633,9 @@ class DCPowerFlowCalc:
         变量数与方程数严格相等。
         """
         if self.array_mode and self._direct_ppc_mode:
+            cached = self._load_direct_ppc_static()
+            if cached is not None:
+                return cached
             self._prepare_direct_ppc_topology()
         else:
             bus_nodes = [] if self.keep_node_objects else [
@@ -938,6 +1147,8 @@ class DCPowerFlowCalc:
         self.dcdc_ctrl_i_mask = self.dcdc_ctrl_code == 2
         self.dcdc_ones = np.ones(self.N_dcdc, dtype=np.float64)
         self._prepare_static_jacobian_indices()
+        if self.array_mode and self._direct_ppc_mode:
+            self._store_direct_ppc_static(x)
 
         return G, x
 

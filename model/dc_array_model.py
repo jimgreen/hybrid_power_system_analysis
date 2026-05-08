@@ -183,6 +183,28 @@ def _code_value(value, mapping: Dict[str, int], default_label: str) -> int:
     return mapping.get(str(value).upper(), mapping[default_label])
 
 
+_VALUE_FLOAT = 0
+_VALUE_INT = 1
+_VALUE_CTRL = 2
+
+
+def _device_array(devices, width: int, specs) -> np.ndarray:
+    out = np.zeros((len(devices), width), dtype=np.float64)
+    for row, dev in enumerate(devices):
+        values = getattr(dev, "__dict__", {})
+        for col, attr, default, kind in specs:
+            value = values[attr] if attr in values else getattr(dev, attr, default)
+            if value is None or value == "":
+                value = default
+            if kind == _VALUE_INT:
+                out[row, col] = int(float(value))
+            elif kind == _VALUE_CTRL:
+                out[row, col] = _code_value(value, CTRL_CODE, default)
+            else:
+                out[row, col] = float(value)
+    return out
+
+
 def build_dc_ppc_from_network(network) -> Dict:
     """Build a DC ppc dictionary from an already loaded DCPowerNetwork."""
     nodes = list(getattr(network, "nodes", []))
@@ -200,86 +222,113 @@ def build_dc_ppc_from_network(network) -> Dict:
     i_scale = float(getattr(network, "i_scale", 1.0))
     p_base_kw = float(getattr(network, "p_base_kW", p_base / p_scale))
 
-    bus = np.zeros((len(nodes), len(BUS_COLS)), dtype=np.float64)
-    for row, node in enumerate(nodes):
-        bus[row, BUS_COLS["idx"]] = _int_value(node, "idx")
-        bus[row, BUS_COLS["vbase"]] = _float_value(node, "vbase")
-        bus[row, BUS_COLS["voltage"]] = _float_value(node, "voltage", 1.0)
-        bus[row, BUS_COLS["isl"]] = _float_value(node, "isl", 0.0)
-        bus[row, BUS_COLS["run_stat"]] = _float_value(node, "run_stat", 1.0)
+    bus = _device_array(
+        nodes,
+        len(BUS_COLS),
+        (
+            (BUS_COLS["idx"], "idx", 0, _VALUE_INT),
+            (BUS_COLS["vbase"], "vbase", 0.0, _VALUE_FLOAT),
+            (BUS_COLS["voltage"], "voltage", 1.0, _VALUE_FLOAT),
+            (BUS_COLS["isl"], "isl", 0.0, _VALUE_FLOAT),
+            (BUS_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+        ),
+    )
 
-    branch = np.zeros((len(branches), len(BRANCH_COLS)), dtype=np.float64)
-    for row, dev in enumerate(branches):
-        branch[row, BRANCH_COLS["idx"]] = _int_value(dev, "idx")
-        branch[row, BRANCH_COLS["i_node"]] = _int_value(dev, "i_node")
-        branch[row, BRANCH_COLS["j_node"]] = _int_value(dev, "j_node")
-        branch[row, BRANCH_COLS["r"]] = _float_value(dev, "r")
-        branch[row, BRANCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-        branch[row, BRANCH_COLS["i_p"]] = _float_value(dev, "i_p")
-        branch[row, BRANCH_COLS["j_p"]] = _float_value(dev, "j_p")
-        branch[row, BRANCH_COLS["current"]] = _float_value(dev, "current")
+    branch = _device_array(
+        branches,
+        len(BRANCH_COLS),
+        (
+            (BRANCH_COLS["idx"], "idx", 0, _VALUE_INT),
+            (BRANCH_COLS["i_node"], "i_node", 0, _VALUE_INT),
+            (BRANCH_COLS["j_node"], "j_node", 0, _VALUE_INT),
+            (BRANCH_COLS["r"], "r", 0.0, _VALUE_FLOAT),
+            (BRANCH_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+            (BRANCH_COLS["i_p"], "i_p", 0.0, _VALUE_FLOAT),
+            (BRANCH_COLS["j_p"], "j_p", 0.0, _VALUE_FLOAT),
+            (BRANCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
+        ),
+    )
 
-    load = np.zeros((len(loads), len(LOAD_COLS)), dtype=np.float64)
-    for row, dev in enumerate(loads):
-        load[row, LOAD_COLS["idx"]] = _int_value(dev, "idx")
-        load[row, LOAD_COLS["node"]] = _int_value(dev, "node")
-        load[row, LOAD_COLS["pbase"]] = _float_value(dev, "pbase", 1.0)
-        load[row, LOAD_COLS["pv0"]] = _float_value(dev, "pv0")
-        load[row, LOAD_COLS["pv1"]] = _float_value(dev, "pv1")
-        load[row, LOAD_COLS["pv2"]] = _float_value(dev, "pv2")
-        load[row, LOAD_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-        load[row, LOAD_COLS["p"]] = _float_value(dev, "p")
-        load[row, LOAD_COLS["current"]] = _float_value(dev, "current")
+    load = _device_array(
+        loads,
+        len(LOAD_COLS),
+        (
+            (LOAD_COLS["idx"], "idx", 0, _VALUE_INT),
+            (LOAD_COLS["node"], "node", 0, _VALUE_INT),
+            (LOAD_COLS["pbase"], "pbase", 1.0, _VALUE_FLOAT),
+            (LOAD_COLS["pv0"], "pv0", 0.0, _VALUE_FLOAT),
+            (LOAD_COLS["pv1"], "pv1", 0.0, _VALUE_FLOAT),
+            (LOAD_COLS["pv2"], "pv2", 0.0, _VALUE_FLOAT),
+            (LOAD_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+            (LOAD_COLS["p"], "p", 0.0, _VALUE_FLOAT),
+            (LOAD_COLS["current"], "current", 0.0, _VALUE_FLOAT),
+        ),
+    )
 
-    gen = np.zeros((len(generators), len(GEN_COLS)), dtype=np.float64)
-    for row, dev in enumerate(generators):
-        gen[row, GEN_COLS["idx"]] = _int_value(dev, "idx")
-        gen[row, GEN_COLS["node"]] = _int_value(dev, "node")
-        gen[row, GEN_COLS["control_type"]] = _code_value(_value(dev, "control_type", "P"), CTRL_CODE, "P")
-        gen[row, GEN_COLS["p_set"]] = _float_value(dev, "p_set")
-        gen[row, GEN_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
-        gen[row, GEN_COLS["i_set"]] = _float_value(dev, "i_set")
-        gen[row, GEN_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-        gen[row, GEN_COLS["p"]] = _float_value(dev, "p")
-        gen[row, GEN_COLS["current"]] = _float_value(dev, "current")
+    gen = _device_array(
+        generators,
+        len(GEN_COLS),
+        (
+            (GEN_COLS["idx"], "idx", 0, _VALUE_INT),
+            (GEN_COLS["node"], "node", 0, _VALUE_INT),
+            (GEN_COLS["control_type"], "control_type", "P", _VALUE_CTRL),
+            (GEN_COLS["p_set"], "p_set", 0.0, _VALUE_FLOAT),
+            (GEN_COLS["v_set"], "v_set", 1.0, _VALUE_FLOAT),
+            (GEN_COLS["i_set"], "i_set", 0.0, _VALUE_FLOAT),
+            (GEN_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+            (GEN_COLS["p"], "p", 0.0, _VALUE_FLOAT),
+            (GEN_COLS["current"], "current", 0.0, _VALUE_FLOAT),
+        ),
+    )
 
-    zero_branch = np.zeros((len(zero_branches), len(ZERO_BRANCH_COLS)), dtype=np.float64)
-    for row, dev in enumerate(zero_branches):
-        zero_branch[row, ZERO_BRANCH_COLS["idx"]] = _int_value(dev, "idx")
-        zero_branch[row, ZERO_BRANCH_COLS["i_node"]] = _int_value(dev, "i_node")
-        zero_branch[row, ZERO_BRANCH_COLS["j_node"]] = _int_value(dev, "j_node")
-        zero_branch[row, ZERO_BRANCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-        zero_branch[row, ZERO_BRANCH_COLS["p"]] = _float_value(dev, "p")
-        zero_branch[row, ZERO_BRANCH_COLS["current"]] = _float_value(dev, "current")
+    zero_branch = _device_array(
+        zero_branches,
+        len(ZERO_BRANCH_COLS),
+        (
+            (ZERO_BRANCH_COLS["idx"], "idx", 0, _VALUE_INT),
+            (ZERO_BRANCH_COLS["i_node"], "i_node", 0, _VALUE_INT),
+            (ZERO_BRANCH_COLS["j_node"], "j_node", 0, _VALUE_INT),
+            (ZERO_BRANCH_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+            (ZERO_BRANCH_COLS["p"], "p", 0.0, _VALUE_FLOAT),
+            (ZERO_BRANCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
+        ),
+    )
 
     def build_switch_like(devices):
-        out = np.zeros((len(devices), len(SWITCH_COLS)), dtype=np.float64)
-        for row, dev in enumerate(devices):
-            out[row, SWITCH_COLS["idx"]] = _int_value(dev, "idx")
-            out[row, SWITCH_COLS["i_node"]] = _int_value(dev, "i_node")
-            out[row, SWITCH_COLS["j_node"]] = _int_value(dev, "j_node")
-            out[row, SWITCH_COLS["status"]] = _float_value(dev, "status", 1.0)
-            out[row, SWITCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-            out[row, SWITCH_COLS["p"]] = _float_value(dev, "p")
-            out[row, SWITCH_COLS["current"]] = _float_value(dev, "current")
-        return out
+        return _device_array(
+            devices,
+            len(SWITCH_COLS),
+            (
+                (SWITCH_COLS["idx"], "idx", 0, _VALUE_INT),
+                (SWITCH_COLS["i_node"], "i_node", 0, _VALUE_INT),
+                (SWITCH_COLS["j_node"], "j_node", 0, _VALUE_INT),
+                (SWITCH_COLS["status"], "status", 1.0, _VALUE_FLOAT),
+                (SWITCH_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+                (SWITCH_COLS["p"], "p", 0.0, _VALUE_FLOAT),
+                (SWITCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
+            ),
+        )
 
-    dcdc = np.zeros((len(dcdcs), len(DCDC_COLS)), dtype=np.float64)
-    for row, dev in enumerate(dcdcs):
-        dcdc[row, DCDC_COLS["idx"]] = _int_value(dev, "idx")
-        dcdc[row, DCDC_COLS["i_node"]] = _int_value(dev, "i_node")
-        dcdc[row, DCDC_COLS["j_node"]] = _int_value(dev, "j_node")
-        dcdc[row, DCDC_COLS["r1"]] = _float_value(dev, "r1")
-        dcdc[row, DCDC_COLS["r2"]] = _float_value(dev, "r2")
-        dcdc[row, DCDC_COLS["control_type"]] = _code_value(_value(dev, "control_type", "P"), CTRL_CODE, "P")
-        dcdc[row, DCDC_COLS["p_set"]] = _float_value(dev, "p_set")
-        dcdc[row, DCDC_COLS["i_set"]] = _float_value(dev, "i_set")
-        dcdc[row, DCDC_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
-        dcdc[row, DCDC_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-        dcdc[row, DCDC_COLS["i_p"]] = _float_value(dev, "i_p")
-        dcdc[row, DCDC_COLS["j_p"]] = _float_value(dev, "j_p")
-        dcdc[row, DCDC_COLS["i_c"]] = _float_value(dev, "i_c")
-        dcdc[row, DCDC_COLS["j_c"]] = _float_value(dev, "j_c")
+    dcdc = _device_array(
+        dcdcs,
+        len(DCDC_COLS),
+        (
+            (DCDC_COLS["idx"], "idx", 0, _VALUE_INT),
+            (DCDC_COLS["i_node"], "i_node", 0, _VALUE_INT),
+            (DCDC_COLS["j_node"], "j_node", 0, _VALUE_INT),
+            (DCDC_COLS["r1"], "r1", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["r2"], "r2", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["control_type"], "control_type", "P", _VALUE_CTRL),
+            (DCDC_COLS["p_set"], "p_set", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["i_set"], "i_set", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["v_set"], "v_set", 1.0, _VALUE_FLOAT),
+            (DCDC_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+            (DCDC_COLS["i_p"], "i_p", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["j_p"], "j_p", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["i_c"], "i_c", 0.0, _VALUE_FLOAT),
+            (DCDC_COLS["j_c"], "j_c", 0.0, _VALUE_FLOAT),
+        ),
+    )
 
     ppc = {
         "format": "dc_ppc_v1",
