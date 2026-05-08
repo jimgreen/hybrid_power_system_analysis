@@ -227,7 +227,15 @@ class HybridPowerFlowCalc:
             if self.has_ac and hasattr(network, "_ac_ppc")
             else ACPowerFlowCalc(network.ac, parameters=self.params, linear_solver=self.linear_solver) if self.has_ac else None
         )
-        self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver) if self.has_dc else None
+        if self.has_dc and hasattr(network, "_dc_ppc"):
+            self.dc_calc = DCPowerFlowCalc(
+                network._dc_ppc,
+                parameters=self.params,
+                linear_solver=self.linear_solver,
+                writeback_network=network.dc,
+            )
+        else:
+            self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver) if self.has_dc else None
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -248,6 +256,8 @@ class HybridPowerFlowCalc:
         self.total_eq = 0
         self.dc_G = None
         self.last_jacobian_shape = (0, 0)
+        self._ac_node_obj_by_idx = {int(node.idx): node for node in getattr(network.ac, "nodes", [])}
+        self._dc_node_obj_by_idx = {int(node.idx): node for node in getattr(network.dc, "nodes", [])}
         self._clear_dcac_arrays()
         self._clear_acac_arrays()
         self._clear_converter_jacobian_structure()
@@ -262,8 +272,6 @@ class HybridPowerFlowCalc:
             self.ac_eq = self.ac_calc.total_eq
             parts.append(self.ac_calc.x.copy())
         if self.dc_calc is not None:
-            if not getattr(self.network.dc, "islands", None):
-                self.network.dc.topo()
             self.dc_G, dc_x = _run_with_optional_output(self.verbose, self.dc_calc.prepare)
             self.dc_size = self.dc_calc.total_vars
             self.dc_eq = self.dc_calc.total_eq
@@ -322,6 +330,8 @@ class HybridPowerFlowCalc:
                 continue
             if conv.dc_node not in self.dc_calc.alive_node_dict:
                 continue
+            conv.ac_node_obj = self._ac_node_obj_by_idx.get(int(conv.ac_node))
+            conv.dc_node_obj = self._dc_node_obj_by_idx.get(int(conv.dc_node))
             ac_pos = self.ac_calc.node_pos[conv.ac_node]
             if self.ac_calc.node_type[ac_pos] != "PQ":
                 raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[ac_pos]}")
@@ -396,6 +406,8 @@ class HybridPowerFlowCalc:
                 continue
             if conv.j_node not in self.ac_calc.node_pos:
                 continue
+            conv.i_node_obj = self._ac_node_obj_by_idx.get(int(conv.i_node))
+            conv.j_node_obj = self._ac_node_obj_by_idx.get(int(conv.j_node))
             i_pos = self.ac_calc.node_pos[conv.i_node]
             j_pos = self.ac_calc.node_pos[conv.j_node]
             if i_pos == j_pos:

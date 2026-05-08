@@ -127,8 +127,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             return {"format": "dc_ppc_v1"}
 
         def fake_network_builder(ppc):
-            calls.append(("network", ppc["format"]))
-            return "dc-network"
+            raise AssertionError("dc_lf CLI should pass dc_ppc_v1 directly to DCPowerFlowCalc")
 
         dc_lf.load_dc_ppc_from_e_file = fake_loader
         dc_lf._dc_network_from_ppc = fake_network_builder
@@ -142,7 +141,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
         self.assertEqual(0, rc)
         self.assertEqual(
-            [("load", "dc_net_30.e"), ("network", "dc_ppc_v1"), ("calc", "dc-network", "custom_lf.para"), "run"],
+            [("load", "dc_net_30.e"), ("calc", {"format": "dc_ppc_v1"}, "custom_lf.para"), "run"],
             calls,
         )
 

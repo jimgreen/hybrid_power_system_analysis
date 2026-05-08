@@ -73,6 +73,23 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         np.testing.assert_array_equal(calc.branch_j[:3], np.asarray([1, 2, 3], dtype=np.int32))
         self.assertEqual(9, calc.N_dcdc)
 
+    def test_dc_solver_accepts_ppc_without_network_topology(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        calc = DCPowerFlowCalc(ppc)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.array_mode)
+        self.assertTrue(calc.converged)
+        self.assertEqual("dc_ppc_v1", calc.ppc["format"])
+        self.assertIn("bus", calc.result)
+        self.assertEqual(ppc["bus"].shape, calc.result["bus"].shape)
+
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc

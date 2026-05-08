@@ -369,6 +369,29 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
         self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
 
+    def test_hybrid_power_flow_uses_dc_ppc_without_dc_object_topo(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        dc_network_class = network.dc.__class__
+        original_topo = dc_network_class.topo
+
+        def reject_topo(*_args, **_kwargs):
+            raise AssertionError("Hybrid LF DC path should prepare directly from dc_ppc_v1")
+
+        dc_network_class.topo = reject_topo
+        try:
+            calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
+            calc.skip_lf_result = True
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = calc.run()
+        finally:
+            dc_network_class.topo = original_topo
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.dc_calc.array_mode)
+        self.assertEqual("dc_ppc_v1", calc.dc_calc.ppc["format"])
+
     def test_hybrid_topology_builds_hybrid_islands(self):
         import hybrid_net_flow
 
