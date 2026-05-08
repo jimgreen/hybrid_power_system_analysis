@@ -8,9 +8,11 @@
 # max_remove                      10
 # pseudo_measurement_weight       1e-4
 # targeted_pseudo_measurement_max 2000
+# targeted_pseudo_measurement_redundancy_ratio 0
+# targeted_pseudo_measurement_step 10
 # voltage_floor                   0.05
 # min_current_voltage             0.01
 # power_flow_tol                  1e-8
-# power_flow_max_iter             50
+# power_flow_max_iter             200
 # power_flow_min_voltage          0.01
 </StateEstimationParameter>

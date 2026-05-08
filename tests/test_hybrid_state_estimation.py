@@ -864,7 +864,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertIn(("ACZeroBranch", device_name, "P_TO"), existing_keys)
         self.assertIn(("ACZeroBranch", device_name, "Q_TO"), existing_keys)
 
-    def test_targeted_node_voltage_states_do_not_add_pseudo_measurements(self):
+    def test_targeted_node_voltage_states_add_pseudo_measurements(self):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
@@ -891,10 +891,10 @@ class HybridStateEstimationTest(unittest.TestCase):
             1,
         )
 
-        self.assertEqual(0, ac_added)
-        self.assertEqual(0, dc_added)
-        self.assertNotIn(("ACNode", "wt02_src", "V"), existing_keys)
-        self.assertNotIn(("DCNode", "wt01_dc_sw", "V"), existing_keys)
+        self.assertEqual(1, ac_added)
+        self.assertEqual(1, dc_added)
+        self.assertIn(("ACNode", "wt02_src", "V"), existing_keys)
+        self.assertIn(("DCNode", "wt01_dc_sw", "V"), existing_keys)
 
     def test_sparse_jacobian_matches_dense_jacobian(self):
         from scipy.sparse import issparse
@@ -1110,6 +1110,29 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(["observability", "estimate"], events[-2:])
         self.assertEqual(1, output.getvalue().count("Observability:"))
         self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
+
+    def test_main_returns_failure_when_estimation_does_not_converge(self):
+        import contextlib
+        import io
+        import secore.hybrid_se as hybrid_se
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = hybrid_se.main(
+                [
+                    "--case",
+                    str(ROOT_DIR / "data" / "hybrid" / "qinling.e"),
+                    "--meas",
+                    str(ROOT_DIR / "data" / "hybrid" / "qinling.meas"),
+                    "--flat-start",
+                    "--quiet",
+                    "--max-iter",
+                    "0",
+                ]
+            )
+
+        self.assertEqual(1, rc)
+        self.assertIn("converged=False", output.getvalue())
 
     def test_mixed_estimate_reuses_fixed_pattern_normal_equation_solver(self):
         import secore.hybrid_se as hybrid_se
@@ -1509,16 +1532,29 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertIn(("ACGenerator", "diesel_300kw", "P_GEN"), pseudo_keys)
         self.assertIn(("ACGenerator", "diesel_300kw", "Q_GEN"), pseudo_keys)
-        self.assertIn(("ACLoad", "load_ac_1", "P_LOAD"), pseudo_keys)
-        self.assertIn(("ACLoad", "load_ac_1", "Q_LOAD"), pseudo_keys)
         self.assertIn(("DCGenerator", "dc_bus_vctrl", "P_GEN"), pseudo_keys)
         self.assertTrue(all(0.0 < meas.weight < 1.0 for meas in pseudo))
 
+        selected_ac_loads = {
+            load.name
+            for load in estimator.ac_load_by_name.values()
+        }
+        pseudo_ac_loads = [
+            meas
+            for meas in pseudo
+            if meas.device_type == "ACLoad"
+        ]
+        self.assertEqual(
+            selected_ac_loads,
+            {meas.device_name for meas in pseudo_ac_loads},
+        )
+        self.assertEqual(3 * len(selected_ac_loads), len(pseudo_ac_loads))
+        selected_load_name = sorted(selected_ac_loads)[0]
         ac_load_p = next(
             meas
             for meas in pseudo
             if meas.device_type == "ACLoad"
-            and meas.device_name == "load_ac_1"
+            and meas.device_name == selected_load_name
             and meas.meas_type == "P_LOAD"
         )
         dc_gen_p = next(
@@ -1528,7 +1564,7 @@ class HybridStateEstimationTest(unittest.TestCase):
             and meas.device_name == "dc_bus_vctrl"
             and meas.meas_type == "P_GEN"
         )
-        self.assertAlmostEqual(ac_load_p.value, estimator.ac_load_by_name["load_ac_1"].p)
+        self.assertAlmostEqual(ac_load_p.value, estimator.ac_load_by_name[selected_load_name].p)
         self.assertAlmostEqual(dc_gen_p.value, estimator.dc_generator_by_name["dc_bus_vctrl"].p)
 
     def test_hybrid_observability_pseudo_preparation_does_not_emit_runtime_warnings(self):

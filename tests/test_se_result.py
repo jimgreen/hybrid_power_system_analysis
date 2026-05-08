@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+import tempfile
 
 import numpy as np
 
@@ -239,6 +240,95 @@ class SEResultTest(unittest.TestCase):
 
         self.assertEqual(1, estimator._add_targeted_observability_pseudo_measurements())
         self.assertEqual(2, len(observability_calls))
+
+    def test_se_result_writes_new_e_file_with_result_blocks(self):
+        from secore.se_result import SEResult
+
+        result = SEResult()
+        result.statistics = SEResult.StatisticsTable(
+            converged=True,
+            iterations=2,
+            objective=0.5,
+            max_correction=1e-8,
+            residual_inf=0.01,
+            observable=True,
+            rank=3,
+            state_count=3,
+            measurement_count=4,
+            deficiency=0,
+            prefiltered_measurement_count=1,
+            pseudo_measurement_count=1,
+            bad_data_count=1,
+            normal_measurement_count=1,
+        )
+        result.prefiltered_measurements.append(
+            Measurement(1, "filtered", "DCNode", "n0", "V", 1.0, False, 0.0),
+            reason="zero weight",
+            source="prefiltered",
+        )
+        result.pseudo_measurements.append(
+            Measurement(2, "pseudo_v", "DCNode", "n1", "V", 1e-4, True, 1.0),
+            estimated_value=1.0,
+            residual=0.0,
+            normalized_residual=0.0,
+            source="pseudo",
+        )
+        result.bad_data.append(
+            Measurement(3, "bad_v", "DCNode", "n2", "V", 1.0, True, 1.2),
+            estimated_value=1.0,
+            residual=0.2,
+            normalized_residual=4.0,
+            source="bad_data",
+        )
+        result.normal_measurements.append(
+            Measurement(4, "good_v", "DCNode", "n3", "V", 1.0, True, 1.0),
+            estimated_value=1.0,
+            residual=0.0,
+            normalized_residual=0.0,
+            source="normal",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "se_result.e"
+            result.write_e_file(output)
+            text = output.read_text(encoding="utf-8")
+
+        self.assertIn("<SEResultStatistics>", text)
+        self.assertIn("</SEResultStatistics>", text)
+        self.assertIn("<SEResultPrefilteredMeasurement>", text)
+        self.assertIn("<SEResultPseudoMeasurement>", text)
+        self.assertIn("<SEResultBadData>", text)
+        self.assertIn("<SEResultNormalMeasurement>", text)
+        self.assertIn("zero_weight", text)
+        self.assertIn("# 1 2 0.5", text)
+        self.assertIn("# 4 good_v DCNode n3 V 1 1 1 1 0 0 - normal", text)
+
+    def test_dc_main_writes_se_result_to_new_e_file(self):
+        import contextlib
+        import io
+        import secore.dc_se as dc_se
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "dc_se_result.e"
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = dc_se.main(
+                    [
+                        "--case",
+                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        "--meas",
+                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        "--flat-start",
+                        "--quiet",
+                        "--se-result",
+                        str(output),
+                    ]
+                )
+            text = output.read_text(encoding="utf-8")
+
+        self.assertEqual(0, rc)
+        self.assertIn("<SEResultStatistics>", text)
+        self.assertIn("<SEResultNormalMeasurement>", text)
+        self.assertIn("</SEResultNormalMeasurement>", text)
 
 
 if __name__ == "__main__":

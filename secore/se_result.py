@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -141,6 +142,38 @@ class SEResult:
     bad_data: BadDataTable = field(default_factory=lambda: SEResult.BadDataTable())
     normal_measurements: NormalMeasurementTable = field(default_factory=lambda: SEResult.NormalMeasurementTable())
 
+    _STATISTICS_COLUMNS = (
+        "converged",
+        "iterations",
+        "objective",
+        "max_correction",
+        "residual_inf",
+        "observable",
+        "rank",
+        "state_count",
+        "measurement_count",
+        "deficiency",
+        "prefiltered_measurement_count",
+        "pseudo_measurement_count",
+        "bad_data_count",
+        "normal_measurement_count",
+    )
+    _MEASUREMENT_COLUMNS = (
+        "idx",
+        "name",
+        "device_type",
+        "device_name",
+        "meas_type",
+        "weight",
+        "valid",
+        "value",
+        "estimated_value",
+        "residual",
+        "normalized_residual",
+        "reason",
+        "source",
+    )
+
     @staticmethod
     def _is_pseudo_measurement(measurement: Measurement) -> bool:
         return str(measurement.name).startswith("pseudo_")
@@ -259,3 +292,55 @@ class SEResult:
         if pos >= len(values):
             return None
         return float(values[pos])
+
+    def to_e_text(self) -> str:
+        blocks = [
+            self._statistics_block_to_e(),
+            self._measurement_block_to_e("SEResultPrefilteredMeasurement", self.prefiltered_measurements),
+            self._measurement_block_to_e("SEResultPseudoMeasurement", self.pseudo_measurements),
+            self._measurement_block_to_e("SEResultBadData", self.bad_data),
+            self._measurement_block_to_e("SEResultNormalMeasurement", self.normal_measurements),
+        ]
+        return "\n\n".join(blocks) + "\n"
+
+    def write_e_file(self, file_path: Path) -> None:
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_e_text(), encoding="utf-8")
+
+    def _statistics_block_to_e(self) -> str:
+        columns = self._STATISTICS_COLUMNS
+        values = [getattr(self.statistics, name) for name in columns]
+        return self._block_to_e("SEResultStatistics", columns, [values])
+
+    def _measurement_block_to_e(self, block_name: str, table: _MeasurementResultTable) -> str:
+        rows = [
+            [getattr(row, name) for name in self._MEASUREMENT_COLUMNS]
+            for row in table
+        ]
+        return self._block_to_e(block_name, self._MEASUREMENT_COLUMNS, rows)
+
+    @classmethod
+    def _block_to_e(cls, block_name: str, columns: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
+        lines = [f"<{block_name}>", "@ " + " ".join(columns)]
+        for row in rows:
+            lines.append("# " + " ".join(cls._e_cell(value) for value in row))
+        lines.append(f"</{block_name}>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _e_cell(value) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (np.bool_,)):
+            return "1" if bool(value) else "0"
+        if isinstance(value, (int, np.integer)):
+            return str(int(value))
+        if isinstance(value, (float, np.floating)):
+            return format(float(value), ".12g")
+        text = str(value)
+        if not text:
+            return "-"
+        return "_".join(text.split())

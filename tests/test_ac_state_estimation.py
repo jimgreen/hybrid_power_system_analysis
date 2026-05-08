@@ -1132,7 +1132,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn(("ACZeroBranch", device_name, "P_TO"), existing_keys)
         self.assertIn(("ACZeroBranch", device_name, "Q_TO"), existing_keys)
 
-    def test_targeted_node_voltage_state_does_not_add_pseudo_measurement(self):
+    def test_targeted_node_voltage_state_adds_pseudo_measurement(self):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -1152,8 +1152,8 @@ class ACStateEstimationTest(unittest.TestCase):
             1,
         )
 
-        self.assertEqual(0, added)
-        self.assertNotIn(("ACNode", "nd_2", "V"), existing_keys)
+        self.assertEqual(1, added)
+        self.assertIn(("ACNode", "nd_2", "V"), existing_keys)
 
     def test_ieee3w_adds_rank_restoring_pseudos_without_node_voltage_or_angles(self):
         from secore.ac_se import ACStateEstimator
@@ -1237,8 +1237,6 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertIn(("ACGenerator", "gen_30_0", "P_GEN"), pseudo_keys)
         self.assertIn(("ACGenerator", "gen_30_0", "Q_GEN"), pseudo_keys)
-        self.assertIn(("ACLoad", "load_1", "P_LOAD"), pseudo_keys)
-        self.assertIn(("ACLoad", "load_1", "Q_LOAD"), pseudo_keys)
         self.assertTrue(all(0.0 < meas.weight < 1.0 for meas in pseudo))
 
         gen_p = next(
@@ -1248,15 +1246,140 @@ class ACStateEstimationTest(unittest.TestCase):
             and meas.device_name == "gen_30_0"
             and meas.meas_type == "P_GEN"
         )
-        load_p = next(
-            meas
-            for meas in pseudo
-            if meas.device_type == "ACLoad"
-            and meas.device_name == "load_1"
-            and meas.meas_type == "P_LOAD"
-        )
         self.assertAlmostEqual(gen_p.value, 2.5)
-        self.assertAlmostEqual(load_p.value, 0.976)
+
+    def test_ac_unmetered_load_pseudo_measurements_cover_all_unmetered_loads(self):
+        from secore.ac_se import ACStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "voltage_only.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 vm_bus_1 ACNode bus_1 V 1.0 1 358.587342",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=meas_file,
+            )
+
+        selected_loads = {
+            load.name
+            for load in estimator.load_by_name.values()
+        }
+        pseudo_loads = [
+            meas
+            for meas in estimator.active_measurements
+            if meas.device_type == "ACLoad"
+            and meas.name.startswith(("pseudo_p_", "pseudo_q_", "pseudo_v_"))
+        ]
+        pseudo_load_devices = {meas.device_name for meas in pseudo_loads}
+        pseudo_load_keys = {(meas.device_name, meas.meas_type) for meas in pseudo_loads}
+
+        self.assertEqual(selected_loads, pseudo_load_devices)
+        self.assertEqual(3 * len(selected_loads), len(pseudo_loads))
+        for load_name in selected_loads:
+            self.assertIn((load_name, "P_LOAD"), pseudo_load_keys)
+            self.assertIn((load_name, "Q_LOAD"), pseudo_load_keys)
+            self.assertIn((load_name, "V_LOAD"), pseudo_load_keys)
+
+    def test_ac_targeted_pseudo_uses_ratio_target_and_step_between_reanalysis(self):
+        from model.meas_model import Measurement
+        from secore.ac_se import ACStateEstimator, ObservabilityResult
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "voltage_only.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 vm_nd0 ACNode nd_0 V 1.0 1 1.06",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ac_net_10.e",
+                meas_file=meas_file,
+            )
+
+        base_count = len(estimator.active_measurements)
+        target_redundancy = base_count - estimator.n_state + 5
+        estimator.targeted_pseudo_measurement_redundancy_ratio = target_redundancy / estimator.n_state
+        estimator.targeted_pseudo_measurement_step = 2
+        batches = []
+
+        def observable_now():
+            return ObservabilityResult(
+                True,
+                estimator.n_state,
+                estimator.n_state,
+                len(estimator.active_measurements),
+                0,
+                np.array([]),
+                [],
+            )
+
+        def add_batch(_observability, max_add):
+            batches.append(max_add)
+            next_idx = max((meas.idx for meas in estimator.measurements), default=0) + 1
+            for offset in range(max_add):
+                estimator.measurements.append(
+                    Measurement(
+                        next_idx + offset,
+                        f"pseudo_extra_test_{next_idx + offset}",
+                        "ACNode",
+                        "nd_0",
+                        "V",
+                        estimator.pseudo_measurement_weight,
+                        True,
+                        1.0,
+                    )
+                )
+            estimator._refresh_active_measurement_indexes()
+            return max_add
+
+        estimator.observability_analysis = observable_now
+        estimator._add_weak_direction_observability_pseudo_measurements = add_batch
+        added = estimator._add_targeted_observability_pseudo_measurements()
+
+        self.assertEqual(5, added)
+        self.assertEqual([2, 2, 1], batches)
+        self.assertEqual(base_count + 5, len(estimator.active_measurements))
+        self.assertGreaterEqual(
+            len(estimator.active_measurements),
+            estimator.n_state + target_redundancy,
+        )
+
+    def test_ac_weak_direction_candidates_include_voltage_and_branch_power_rows(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            flat_start=True,
+        )
+
+        keys = {
+            (meas.device_type, meas.meas_type)
+            for meas in estimator._observability_pseudo_candidate_measurements()
+        }
+
+        self.assertIn(("ACLoad", "V_LOAD"), keys)
+        self.assertIn(("ACNode", "V"), keys)
+        self.assertIn(("ACBranch", "P_FROM"), keys)
+        self.assertIn(("ACBranch", "Q_FROM"), keys)
 
     def test_does_not_duplicate_existing_generator_or_load_power_measurements(self):
         from secore.ac_se import ACStateEstimator
@@ -2157,6 +2280,22 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertGreater(deficiency, 0)
         self.assertEqual(0, singular_values.size)
         self.assertTrue(weak_states)
+
+    def test_observability_rank_cannot_exceed_measurement_row_count(self):
+        from scipy.sparse import csr_matrix
+        from secore.se_math import observability_rank_details
+
+        H = csr_matrix([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]])
+
+        rank, deficiency, _singular_values, _weak_states = observability_rank_details(
+            H,
+            ["x0", "x1", "x2"],
+            normal_factor_diag=np.ones(3),
+        )
+
+        self.assertLessEqual(rank, H.shape[0])
+        self.assertEqual(2, rank)
+        self.assertEqual(1, deficiency)
 
     def test_observability_uses_lapack_cholesky_when_available(self):
         import secore.se_math as se_math

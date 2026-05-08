@@ -41,6 +41,8 @@ from secore.se_math import (
     measurement_leverage,
     measurement_residual as build_measurement_residual,
     observability_rank_details,
+    observability_weak_direction,
+    targeted_redundancy_count,
 )
 from secore.se_result import SEResult
 from unit_system import ac_current_base_ka, dc_current_base_ka
@@ -241,6 +243,10 @@ class HybridStateEstimator:
         self.flat_start = self.params.flat_start
         self.pseudo_measurement_weight = self.params.pseudo_measurement_weight
         self.targeted_pseudo_measurement_max = self.params.targeted_pseudo_measurement_max
+        self.targeted_pseudo_measurement_redundancy_ratio = (
+            self.params.targeted_pseudo_measurement_redundancy_ratio
+        )
+        self.targeted_pseudo_measurement_step = self.params.targeted_pseudo_measurement_step
         self.voltage_floor = self.params.voltage_floor
         self.min_current_voltage = self.params.min_current_voltage
 
@@ -1406,22 +1412,41 @@ class HybridStateEstimator:
         return max((int(meas.idx) for meas in self.measurements), default=0) + 1
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
-        """Patch remaining hybrid rank deficiencies until observable or the configured cap is reached."""
+        """Patch hybrid rank deficiencies and optional post-observability redundancy."""
         delegate = self._delegate()
         if delegate is not None:
             return int(getattr(delegate, "targeted_observability_pseudo_count", 0))
         total_added = 0
         max_count = max(0, int(self.targeted_pseudo_measurement_max))
+        step = max(1, int(getattr(self, "targeted_pseudo_measurement_step", 10)))
+        redundancy_target = targeted_redundancy_count(
+            getattr(self, "n_state", 0),
+            getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
+        )
         observability = None
         while total_added < max_count:
             observability = self.observability_analysis()
+            batch_limit = min(max_count - total_added, step)
             if observability.observable:
-                break
+                redundancy = max(0, int(observability.measurement_count) - int(observability.state_count))
+                missing = redundancy_target - redundancy
+                if missing <= 0:
+                    break
+                added = self._add_weak_direction_observability_pseudo_measurements(
+                    observability,
+                    min(batch_limit, missing),
+                )
+                if added == 0:
+                    break
+                total_added += added
+                observability = None
+                continue
             next_idx = self._next_measurement_idx()
             existing_keys = self._active_measurement_keys()
             existing_names = {meas.name for meas in self.measurements}
             added = 0
-            remaining = max_count - total_added
+            refreshed = False
+            remaining = batch_limit
             for label, _score in observability.weak_states:
                 if added >= remaining:
                     break
@@ -1434,13 +1459,152 @@ class HybridStateEstimator:
                 )
                 added += added_count
             if added == 0:
+                added = self._add_weak_direction_observability_pseudo_measurements(observability, remaining)
+                refreshed = added > 0
+            if added == 0:
                 break
             total_added += added
-            self._refresh_active_measurement_state_layout()
+            if not refreshed:
+                self._refresh_active_measurement_state_layout()
             observability = None
         if observability is None and total_added < max_count:
             observability = self.observability_analysis()
         return total_added
+
+    def _add_weak_direction_observability_pseudo_measurements(
+        self,
+        observability: ObservabilityResult,
+        max_add: int,
+        refresh: bool = True,
+    ) -> int:
+        """Add the candidate pseudo rows that best observe the current weak direction."""
+        if max_add <= 0:
+            return 0
+        candidates = self._observability_pseudo_candidate_measurements()
+        if not candidates:
+            return 0
+        selected = self._select_weak_direction_pseudo_candidates(observability, candidates, max_add)
+        if not selected:
+            return 0
+        next_idx = self._next_measurement_idx()
+        for candidate in selected:
+            candidate.idx = next_idx
+            next_idx += 1
+            self.measurements.append(candidate)
+        if refresh:
+            self._refresh_active_measurement_state_layout()
+        return len(selected)
+
+    def _add_redundant_observability_pseudo_measurements(self, max_add: int) -> int:
+        observability = self.observability_analysis()
+        return self._add_weak_direction_observability_pseudo_measurements(observability, max_add)
+
+    def _observability_pseudo_candidate_measurements(self) -> List[Measurement]:
+        """Build low-weight candidate pseudo rows for weak-direction observability repair."""
+        existing_keys = self._active_measurement_keys()
+        existing_names = {meas.name for meas in self.measurements}
+        candidates: List[Measurement] = []
+
+        def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
+            key = (device_type, device_name, meas_type)
+            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+            if key in existing_keys or pseudo_name in existing_names:
+                return
+            candidates.append(
+                Measurement(
+                    0,
+                    pseudo_name,
+                    device_type,
+                    device_name,
+                    meas_type,
+                    self.pseudo_measurement_weight,
+                    True,
+                    float(value),
+                )
+            )
+            existing_keys.add(key)
+            existing_names.add(pseudo_name)
+
+        for node in sorted(self.ac_node_by_name.values(), key=lambda item: item.idx):
+            add("ACNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
+        for node in sorted(self.dc_node_by_name.values(), key=lambda item: item.idx):
+            add("DCNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
+
+        for load in sorted(self.ac_load_by_name.values(), key=lambda item: item.idx):
+            p, q = self._ac_sub_estimator._load_pseudo_power(load) if self._ac_sub_estimator is not None else (0.0, 0.0)
+            voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
+            add("ACLoad", load.name, "P_LOAD", p)
+            add("ACLoad", load.name, "Q_LOAD", q)
+            add("ACLoad", load.name, "V_LOAD", voltage)
+        for load in sorted(self.dc_load_by_name.values(), key=lambda item: item.idx):
+            p = self._dc_sub_estimator._load_pseudo_power(load) if self._dc_sub_estimator is not None else 0.0
+            voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
+            add("DCLoad", load.name, "P_LOAD", p)
+            add("DCLoad", load.name, "V_LOAD", voltage)
+
+        for gen in sorted(self.ac_generator_by_name.values(), key=lambda item: item.idx):
+            p, q = self._ac_sub_estimator._generator_pseudo_power(gen) if self._ac_sub_estimator is not None else (0.0, 0.0)
+            voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
+            add("ACGenerator", gen.name, "P_GEN", p)
+            add("ACGenerator", gen.name, "Q_GEN", q)
+            add("ACGenerator", gen.name, "V_GEN", voltage)
+        for gen in sorted(self.dc_generator_by_name.values(), key=lambda item: item.idx):
+            p = self._dc_sub_estimator._generator_pseudo_power(gen) if self._dc_sub_estimator is not None else 0.0
+            voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
+            add("DCGenerator", gen.name, "P_GEN", p)
+            add("DCGenerator", gen.name, "V_GEN", voltage)
+
+        for device_type, devices in (
+            ("ACBranch", self.ac_branch_by_name),
+            ("ACTransformer", self.ac_transformer_by_name),
+        ):
+            for dev in sorted(devices.values(), key=lambda item: item.idx):
+                add(device_type, dev.name, "P_FROM", float(getattr(dev, "i_p", 0.0) or 0.0))
+                add(device_type, dev.name, "Q_FROM", float(getattr(dev, "i_q", 0.0) or 0.0))
+                add(device_type, dev.name, "P_TO", float(getattr(dev, "j_p", 0.0) or 0.0))
+                add(device_type, dev.name, "Q_TO", float(getattr(dev, "j_q", 0.0) or 0.0))
+        for branch in sorted(self.dc_branch_by_name.values(), key=lambda item: item.idx):
+            add("DCBranch", branch.name, "P_FROM", float(getattr(branch, "i_p", 0.0) or 0.0))
+            add("DCBranch", branch.name, "P_TO", float(getattr(branch, "j_p", 0.0) or 0.0))
+
+        for conv in sorted(self.dcac_by_name.values(), key=lambda item: item.idx):
+            add("DCACConverter", conv.name, "P_DC", float(getattr(conv, "i_p", 0.0) or 0.0))
+            add("DCACConverter", conv.name, "P_AC", float(getattr(conv, "j_p", 0.0) or 0.0))
+            add("DCACConverter", conv.name, "Q_AC", float(getattr(conv, "j_q", 0.0) or 0.0))
+            add("DCACConverter", conv.name, "V_DC", float(getattr(getattr(conv, "dc_node_obj", None), "voltage", 1.0) or 1.0))
+            add("DCACConverter", conv.name, "V_AC", float(getattr(getattr(conv, "ac_node_obj", None), "voltage", 1.0) or 1.0))
+        for conv in sorted(self.acac_by_name.values(), key=lambda item: item.idx):
+            add("ACACConverter", conv.name, "P_FROM", float(getattr(conv, "i_p", 0.0) or 0.0))
+            add("ACACConverter", conv.name, "Q_FROM", float(getattr(conv, "i_q", 0.0) or 0.0))
+            add("ACACConverter", conv.name, "P_TO", float(getattr(conv, "j_p", 0.0) or 0.0))
+            add("ACACConverter", conv.name, "Q_TO", float(getattr(conv, "j_q", 0.0) or 0.0))
+            add("ACACConverter", conv.name, "V_FROM", float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0))
+            add("ACACConverter", conv.name, "V_TO", float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0))
+
+        return candidates
+
+    def _select_weak_direction_pseudo_candidates(
+        self,
+        observability: ObservabilityResult,
+        candidates: Sequence[Measurement],
+        max_add: int,
+    ) -> List[Measurement]:
+        if max_add <= 0 or not candidates:
+            return []
+        x = self.initial_state()
+        cache = self._observability_matrix_cache_for(observability, self.active_measurements, x)
+        H = cache.get("H") if cache is not None else self.jacobian_sparse(x, self.active_measurements)
+        direction = observability_weak_direction(H, self.state_labels, observability.weak_states)
+        if direction.size != self.n_state or not np.any(direction):
+            return list(candidates[:max_add])
+        candidate_h = self.jacobian_sparse(x, candidates)
+        scores = np.abs(candidate_h @ direction)
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        if scores.size != len(candidates) or not np.any(scores > 0.0):
+            return list(candidates[:max_add])
+        order = np.argsort(-scores, kind="stable")
+        selected = [candidates[int(pos)] for pos in order[:max_add] if scores[int(pos)] > 0.0]
+        return selected or list(candidates[:max_add])
 
     def _append_targeted_observability_pseudo(
         self,
@@ -1453,7 +1617,7 @@ class HybridStateEstimator:
         if ":" not in state_label or max_add <= 0:
             return next_idx, 0
         prefix, name = state_label.split(":", 1)
-        if prefix in ("AC_THETA", "AC_V", "DC_V"):
+        if prefix == "AC_THETA":
             return next_idx, 0
         added = 0
 
@@ -1469,6 +1633,15 @@ class HybridStateEstimator:
             existing_keys.add(key)
             existing_names.add(pseudo_name)
             added += 1
+
+        if prefix == "AC_V" and name in self.ac_node_by_name:
+            node = self.ac_node_by_name[name]
+            add("ACNode", "V", float(getattr(node, "voltage", 1.0) or 1.0))
+            return next_idx, added
+        if prefix == "DC_V" and name in self.dc_node_by_name:
+            node = self.dc_node_by_name[name]
+            add("DCNode", "V", float(getattr(node, "voltage", 1.0) or 1.0))
+            return next_idx, added
 
         if prefix in ("AC_I_RE", "AC_I_IM"):
             if name in self.ac_zero_branch_by_name:
@@ -2444,6 +2617,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--remove-bad-data", action="store_true", help="Iteratively remove the largest bad datum.")
     parser.add_argument("--print-state", action="store_true", help="Print estimated states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
+    parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
     estimator = HybridStateEstimator(
@@ -2472,7 +2646,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = estimator.estimate(verbose=not args.quiet, observability=initial_observability)
 
     bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
-    estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
+    se_result = estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
     print(
         "State estimation: "
         f"converged={result.converged}, iterations={result.iterations}, "
@@ -2480,9 +2654,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"residual_inf={result.residual_inf:.3e}"
     )
     _print_bad_data(bad_items, normalized, bad_threshold)
+    if args.se_result:
+        se_result.write_e_file(Path(args.se_result))
     if args.print_state:
         estimator.print_state(result.x)
-    return 0
+    return 0 if result.converged and result.observability.observable else 1
 
 
 if __name__ == "__main__":

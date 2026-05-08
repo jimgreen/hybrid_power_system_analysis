@@ -29,6 +29,8 @@ def _write_se_para(
     max_iter: str = "3",
     pseudo_weight: str = "0.002",
     pseudo_obs_max: str = "17",
+    pseudo_obs_redundancy_ratio: str = "0.05",
+    pseudo_obs_step: str = "5",
 ) -> None:
     path.write_text(
         "\n".join(
@@ -43,6 +45,8 @@ def _write_se_para(
                 "# max_remove 4",
                 f"# pseudo_measurement_weight {pseudo_weight}",
                 f"# targeted_pseudo_measurement_max {pseudo_obs_max}",
+                f"# targeted_pseudo_measurement_redundancy_ratio {pseudo_obs_redundancy_ratio}",
+                f"# targeted_pseudo_measurement_step {pseudo_obs_step}",
                 "# voltage_floor 0.07",
                 "# min_current_voltage 0.02",
                 "# power_flow_tol 1e-6",
@@ -236,6 +240,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
             params = load_se_parameters(para_file)
             self.assertEqual(17, params.targeted_pseudo_measurement_max)
+            self.assertEqual(0.05, params.targeted_pseudo_measurement_redundancy_ratio)
+            self.assertEqual(5, params.targeted_pseudo_measurement_step)
 
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "ac" / "ac_net_10.e",
@@ -249,6 +255,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             self.assertTrue(estimator.flat_start)
             self.assertEqual(0.002, estimator.pseudo_measurement_weight)
             self.assertEqual(17, estimator.targeted_pseudo_measurement_max)
+            self.assertEqual(0.05, estimator.targeted_pseudo_measurement_redundancy_ratio)
+            self.assertEqual(5, estimator.targeted_pseudo_measurement_step)
             self.assertEqual(0.07, estimator.voltage_floor)
             self.assertEqual(0.02, estimator.min_current_voltage)
 

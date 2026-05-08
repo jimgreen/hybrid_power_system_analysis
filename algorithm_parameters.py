@@ -72,6 +72,8 @@ class StateEstimationParameters:
     max_remove: int
     pseudo_measurement_weight: float
     targeted_pseudo_measurement_max: int
+    targeted_pseudo_measurement_redundancy_ratio: float
+    targeted_pseudo_measurement_step: int
     voltage_floor: float
     min_current_voltage: float
     power_flow_tol: float
@@ -87,6 +89,8 @@ class StateEstimationParameters:
         bad_threshold: Optional[float] = None,
         max_remove: Optional[int] = None,
         targeted_pseudo_measurement_max: Optional[int] = None,
+        targeted_pseudo_measurement_redundancy_ratio: Optional[float] = None,
+        targeted_pseudo_measurement_step: Optional[int] = None,
     ) -> "StateEstimationParameters":
         return replace(
             self,
@@ -98,6 +102,15 @@ class StateEstimationParameters:
             max_remove=int(_override_value(self.max_remove, max_remove)),
             targeted_pseudo_measurement_max=int(
                 _override_value(self.targeted_pseudo_measurement_max, targeted_pseudo_measurement_max)
+            ),
+            targeted_pseudo_measurement_redundancy_ratio=float(
+                _override_value(
+                    self.targeted_pseudo_measurement_redundancy_ratio,
+                    targeted_pseudo_measurement_redundancy_ratio,
+                )
+            ),
+            targeted_pseudo_measurement_step=int(
+                _override_value(self.targeted_pseudo_measurement_step, targeted_pseudo_measurement_step)
             ),
         )
 
@@ -125,6 +138,10 @@ def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters
         max_remove=int(_require(values, "max_remove")),
         pseudo_measurement_weight=float(_require(values, "pseudo_measurement_weight")),
         targeted_pseudo_measurement_max=int(_require(values, "targeted_pseudo_measurement_max")),
+        targeted_pseudo_measurement_redundancy_ratio=float(
+            values.get("targeted_pseudo_measurement_redundancy_ratio", "0")
+        ),
+        targeted_pseudo_measurement_step=int(values.get("targeted_pseudo_measurement_step", "10")),
         voltage_floor=float(_require(values, "voltage_floor")),
         min_current_voltage=float(_require(values, "min_current_voltage")),
         power_flow_tol=float(_require(values, "power_flow_tol")),

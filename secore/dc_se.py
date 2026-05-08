@@ -43,6 +43,8 @@ from secore.se_math import (
     matrix_is_empty,
     measurement_leverage,
     observability_rank_details,
+    observability_weak_direction,
+    targeted_redundancy_count,
 )
 from secore.se_result import SEResult
 from unit_system import dc_current_base_ka
@@ -225,6 +227,10 @@ class DCStateEstimator:
         self.flat_start = self.params.flat_start
         self.pseudo_measurement_weight = self.params.pseudo_measurement_weight
         self.targeted_pseudo_measurement_max = self.params.targeted_pseudo_measurement_max
+        self.targeted_pseudo_measurement_redundancy_ratio = (
+            self.params.targeted_pseudo_measurement_redundancy_ratio
+        )
+        self.targeted_pseudo_measurement_step = self.params.targeted_pseudo_measurement_step
         self.voltage_floor = self.params.voltage_floor
         self.min_current_voltage = self.params.min_current_voltage
 
@@ -1151,18 +1157,36 @@ class DCStateEstimator:
             )
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
-        """Patch remaining DC rank deficiencies until observable or the configured cap is reached."""
+        """Patch DC rank deficiencies and optional post-observability redundancy."""
         total_added = 0
         max_count = max(0, int(self.targeted_pseudo_measurement_max))
+        step = max(1, int(getattr(self, "targeted_pseudo_measurement_step", 10)))
+        redundancy_target = targeted_redundancy_count(
+            getattr(self, "n_state", 0),
+            getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
+        )
         while total_added < max_count:
             observability = self.observability_analysis()
+            batch_limit = min(max_count - total_added, step)
             if observability.observable:
-                break
+                redundancy = max(0, int(observability.measurement_count) - int(observability.state_count))
+                missing = redundancy_target - redundancy
+                if missing <= 0:
+                    break
+                added = self._add_weak_direction_observability_pseudo_measurements(
+                    observability,
+                    min(batch_limit, missing),
+                )
+                if added == 0:
+                    break
+                total_added += added
+                continue
             next_idx = max((meas.idx for meas in self.measurements), default=0) + 1
             existing_keys = self._active_measurement_keys()
             existing_names = {meas.name for meas in self.measurements}
             added = 0
-            remaining = max_count - total_added
+            refreshed = False
+            remaining = batch_limit
             for label, _score in observability.weak_states:
                 if added >= remaining:
                     break
@@ -1175,10 +1199,110 @@ class DCStateEstimator:
                 )
                 added += added_count
             if added == 0:
+                added = self._add_weak_direction_observability_pseudo_measurements(observability, remaining)
+                refreshed = added > 0
+            if added == 0:
                 break
             total_added += added
-            self._refresh_active_measurement_indexes()
+            if not refreshed:
+                self._refresh_active_measurement_indexes()
         return total_added
+
+    def _add_weak_direction_observability_pseudo_measurements(
+        self,
+        observability: ObservabilityResult,
+        max_add: int,
+        refresh: bool = True,
+    ) -> int:
+        """Add the candidate pseudo rows that best observe the current weak direction."""
+        if max_add <= 0:
+            return 0
+        candidates = self._observability_pseudo_candidate_measurements()
+        if not candidates:
+            return 0
+        selected = self._select_weak_direction_pseudo_candidates(observability, candidates, max_add)
+        if not selected:
+            return 0
+        next_idx = self._next_measurement_idx()
+        for candidate in selected:
+            candidate.idx = next_idx
+            next_idx += 1
+            self.measurements.append(candidate)
+        if refresh:
+            self._refresh_active_measurement_indexes()
+        return len(selected)
+
+    def _add_redundant_observability_pseudo_measurements(self, max_add: int, refresh: bool = True) -> int:
+        observability = self.observability_analysis()
+        return self._add_weak_direction_observability_pseudo_measurements(observability, max_add, refresh)
+
+    def _observability_pseudo_candidate_measurements(self) -> List[Measurement]:
+        """Build low-weight candidate pseudo rows for weak-direction observability repair."""
+        existing_keys = self._active_measurement_keys()
+        existing_names = {meas.name for meas in self.measurements}
+        candidates: List[Measurement] = []
+
+        def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
+            key = (device_type, device_name, meas_type)
+            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+            if key in existing_keys or pseudo_name in existing_names:
+                return
+            candidates.append(
+                Measurement(
+                    0,
+                    pseudo_name,
+                    device_type,
+                    device_name,
+                    meas_type,
+                    self.pseudo_measurement_weight,
+                    True,
+                    float(value),
+                )
+            )
+            existing_keys.add(key)
+            existing_names.add(pseudo_name)
+
+        for node in sorted(self.node_by_name.values(), key=lambda item: item.idx):
+            add("DCNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
+
+        for load in sorted(self.load_by_name.values(), key=lambda item: item.idx):
+            voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
+            add("DCLoad", load.name, "P_LOAD", self._load_pseudo_power(load))
+            add("DCLoad", load.name, "V_LOAD", voltage)
+
+        for gen in sorted(self.generator_by_name.values(), key=lambda item: item.idx):
+            voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
+            add("DCGenerator", gen.name, "P_GEN", self._generator_pseudo_power(gen))
+            add("DCGenerator", gen.name, "V_GEN", voltage)
+
+        for branch in sorted(self.branch_by_name.values(), key=lambda item: item.idx):
+            add("DCBranch", branch.name, "P_FROM", float(getattr(branch, "i_p", 0.0) or 0.0))
+            add("DCBranch", branch.name, "P_TO", float(getattr(branch, "j_p", 0.0) or 0.0))
+
+        return candidates
+
+    def _select_weak_direction_pseudo_candidates(
+        self,
+        observability: ObservabilityResult,
+        candidates: Sequence[Measurement],
+        max_add: int,
+    ) -> List[Measurement]:
+        if max_add <= 0 or not candidates:
+            return []
+        x = self.initial_state()
+        cache = self._observability_matrix_cache_for(observability, self.active_measurements, x)
+        H = cache.get("H") if cache is not None else self.jacobian_sparse(x, self.active_measurements)
+        direction = observability_weak_direction(H, self.state_labels, observability.weak_states)
+        if direction.size != self.n_state or not np.any(direction):
+            return list(candidates[:max_add])
+        candidate_h = self.jacobian_sparse(x, candidates)
+        scores = np.abs(candidate_h @ direction)
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        if scores.size != len(candidates) or not np.any(scores > 0.0):
+            return list(candidates[:max_add])
+        order = np.argsort(-scores, kind="stable")
+        selected = [candidates[int(pos)] for pos in order[:max_add] if scores[int(pos)] > 0.0]
+        return selected or list(candidates[:max_add])
 
     def _append_targeted_observability_pseudo(
         self,
@@ -1216,7 +1340,8 @@ class DCStateEstimator:
             return new_idx, 1
 
         if prefix == "V" and name in self.node_by_name:
-            return next_idx, 0
+            node = self.node_by_name[name]
+            return add("DCNode", name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
         if prefix == "I_ZERO" and name in self.zero_branch_by_name:
             dev = self.zero_branch_by_name[name]
             return add("DCZeroBranch", name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
@@ -2606,6 +2731,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--remove-bad-data", action="store_true", help="Iteratively remove the largest bad datum.")
     parser.add_argument("--print-state", action="store_true", help="Print estimated DC states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
+    parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
     estimator = DCStateEstimator(
@@ -2636,7 +2762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
     bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
-    estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
+    se_result = estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
     print(
         "State estimation: "
         f"converged={result.converged}, "
@@ -2646,6 +2772,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"norm_res={result.residual_inf:.3e}"
     )
     _print_bad_data(bad_items, normalized, bad_threshold)
+    if args.se_result:
+        se_result.write_e_file(Path(args.se_result))
 
     if args.print_state:
         estimator.print_state(result.x)

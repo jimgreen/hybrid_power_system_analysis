@@ -1,4 +1,5 @@
 import hashlib
+import math
 import warnings
 from typing import List, Optional, Sequence, Tuple
 
@@ -14,6 +15,7 @@ from scipy.sparse import csr_matrix as SP_CSR_MATRIX
 from scipy.sparse import issparse as SP_ISSPARSE
 from scipy.sparse.csgraph import structural_rank as SP_STRUCTURAL_RANK
 from scipy.sparse.linalg import MatrixRankWarning as SP_MATRIX_RANK_WARNING
+from scipy.sparse.linalg import eigsh as SP_EIGSH
 from scipy.sparse.linalg import splu as SP_SPLU
 from scipy.sparse.linalg import spsolve as SP_SPSOLVE
 
@@ -29,6 +31,73 @@ ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF
 _NORMAL_EQUATION_PATTERN_CACHE = {}
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
 _SPARSE_PATTERN_LINEAR_INDEX_CACHE = {}
+
+def targeted_redundancy_count(state_count: int, ratio: float) -> int:
+    """Return the configured pseudo-measurement redundancy target as a row count."""
+    return max(0, int(math.ceil(max(0.0, float(ratio)) * max(0, int(state_count)))))
+
+
+def observability_weak_direction(
+    H,
+    state_labels: Sequence[str],
+    weak_states: Sequence[Tuple[str, float]] = (),
+    dense_svd_limit: int = 2000,
+) -> np.ndarray:
+    """Return a normalized state-space direction that is currently weakest."""
+    state_count = len(state_labels)
+    if state_count <= 0:
+        return np.array([], dtype=np.float64)
+
+    direction = np.zeros(state_count, dtype=np.float64)
+    if weak_states:
+        label_to_pos = {label: pos for pos, label in enumerate(state_labels)}
+        for label, score in weak_states:
+            pos = label_to_pos.get(label)
+            if pos is not None:
+                direction[pos] = max(abs(float(score)), direction[pos])
+        norm = float(np.linalg.norm(direction))
+        if norm > 0.0:
+            return direction / norm
+
+    if H is None or H.shape[0] == 0:
+        direction[0] = 1.0
+        return direction
+
+    try:
+        if state_count <= dense_svd_limit:
+            H_arr = H.toarray() if is_sparse_matrix(H) else np.asarray(H, dtype=np.float64)
+            if H_arr.size:
+                _u, _s, vh = np.linalg.svd(H_arr, full_matrices=False)
+                if vh.size:
+                    direction = np.asarray(vh[-1, :], dtype=np.float64)
+                    norm = float(np.linalg.norm(direction))
+                    if norm > 0.0:
+                        return direction / norm
+        gram = H.T @ H
+        if is_sparse_matrix(gram):
+            values, vectors = SP_EIGSH(gram.tocsc(), k=1, which="SM", tol=1e-6, maxiter=500)
+            if values.size and vectors.size:
+                direction = np.asarray(vectors[:, 0], dtype=np.float64)
+                norm = float(np.linalg.norm(direction))
+                if norm > 0.0:
+                    return direction / norm
+        else:
+            values, vectors = np.linalg.eigh(np.asarray(gram, dtype=np.float64))
+            if values.size and vectors.size:
+                direction = np.asarray(vectors[:, int(np.argmin(values))], dtype=np.float64)
+                norm = float(np.linalg.norm(direction))
+                if norm > 0.0:
+                    return direction / norm
+    except Exception:
+        pass
+
+    gram = H.T @ H
+    diag = np.asarray(gram.diagonal() if is_sparse_matrix(gram) else np.diag(gram), dtype=np.float64)
+    if diag.size:
+        direction[int(np.argmin(diag))] = 1.0
+    else:
+        direction[0] = 1.0
+    return direction
 
 
 def _as_array_dtype(values, dtype):
@@ -517,6 +586,9 @@ def observability_rank_details(
     available.
     """
     state_count = len(state_labels)
+    measurement_count = int(H.shape[0])
+    min_deficiency = max(0, state_count - measurement_count)
+    full_column_rank_possible = measurement_count >= state_count
     gram = H.T @ H if normal_matrix is None else normal_matrix
     weak_states: List[Tuple[str, float]] = []
 
@@ -526,17 +598,17 @@ def observability_rank_details(
         diag_values = np.diag(gram) if gram.size else np.array([], dtype=np.float64)
     scale = float(np.sqrt(np.max(diag_values))) if diag_values.size else 1.0
     tol = max(H.shape) * np.finfo(float).eps * max(scale, 1.0)
-    if normal_factor_diag is not None:
+    if full_column_rank_possible and normal_factor_diag is not None:
         diag = np.asarray(normal_factor_diag, dtype=np.float64)
         if diag.size == state_count and float(np.min(diag)) > tol:
             return state_count, 0, np.array([], dtype=np.float64), weak_states
-    elif is_sparse_matrix(gram) and CHOLMOD_CHOLESKY is not None:
+    elif full_column_rank_possible and is_sparse_matrix(gram) and CHOLMOD_CHOLESKY is not None:
         try:
             CHOLMOD_CHOLESKY(gram.tocsc())
             return state_count, 0, np.array([], dtype=np.float64), weak_states
         except Exception:
             pass
-    if normal_factor_diag is None and is_sparse_matrix(gram):
+    if full_column_rank_possible and normal_factor_diag is None and is_sparse_matrix(gram):
         gram_csc = gram.tocsc()
         try:
             lu = SP_SPLU(gram_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
@@ -552,7 +624,7 @@ def observability_rank_details(
                 return state_count, 0, np.array([], dtype=np.float64), weak_states
         except Exception:
             pass
-    elif normal_factor_diag is None:
+    elif full_column_rank_possible and normal_factor_diag is None:
         chol, info = DPOTRF(gram, lower=True, clean=False, overwrite_a=False)
         if info == 0:
             diag = np.diag(chol)
@@ -573,7 +645,7 @@ def observability_rank_details(
             weak_idx = np.argsort(diag_values)[:weak_count]
             weak_states = [(state_labels[int(idx)], float(diag_values[int(idx)])) for idx in weak_idx]
             near_zero = int(np.count_nonzero(diag_values <= max(tol * tol, 1e-24)))
-            deficiency = max(1, near_zero)
+            deficiency = max(1, near_zero, min_deficiency)
         else:
             deficiency = state_count
         return max(0, state_count - deficiency), deficiency, np.array([], dtype=np.float64), weak_states
