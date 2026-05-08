@@ -4,6 +4,7 @@ import io
 import math
 import sys
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -19,7 +20,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_lf import matpower_branch_stamp, matpower_branch_stamp_vectorized
+from ac_lf import ACPowerFlowCalc, matpower_branch_stamp, matpower_branch_stamp_vectorized
 from ac_model import ACPowerNetwork
 from ac_array_model import (
     BRANCH_COLS,
@@ -1002,16 +1003,16 @@ class ACStateEstimator:
             self.load_order = sorted(self.load_by_name.values(), key=lambda item: item.idx)
         self.generator_pos_array = np.asarray([self.node_pos[gen.node] for gen in self.generator_order], dtype=np.int32)
         self.load_pos_array = np.asarray([self.node_pos[load.node] for load in self.load_order], dtype=np.int32)
-        self.load_pv0_array = np.asarray([getattr(load, "pbase", 1.0) * load.pv0 for load in self.load_order], dtype=np.float64)
-        self.load_pv1_array = np.asarray([getattr(load, "pbase", 1.0) * load.pv1 for load in self.load_order], dtype=np.float64)
-        self.load_pv2_array = np.asarray([getattr(load, "pbase", 1.0) * load.pv2 for load in self.load_order], dtype=np.float64)
-        self.load_qv0_array = np.asarray([getattr(load, "qbase", 1.0) * load.qv0 for load in self.load_order], dtype=np.float64)
-        self.load_qv1_array = np.asarray([getattr(load, "qbase", 1.0) * load.qv1 for load in self.load_order], dtype=np.float64)
-        self.load_qv2_array = np.asarray([getattr(load, "qbase", 1.0) * load.qv2 for load in self.load_order], dtype=np.float64)
         self.n_nodes = len(self.nodes)
         # Reference-bus voltage values must be known before the compact state layout
         # is built, so real file measurements are normalized after the estimator maps exist.
         self._convert_measurements_to_pu()
+        self.power_flow_seed_converged = False
+        if not self.flat_start:
+            self._apply_measurement_seed_to_network()
+            self.power_flow_seed_converged = bool(self._run_power_flow_seed(self.network, self.params, self.e_file))
+            self._refresh_file_state_from_network()
+        self._refresh_load_parameter_arrays()
         self.node_voltage_measurements = self._node_voltage_measurements()
         self.node_degrees = self._node_incident_degrees()
         self.references = self._select_reference_nodes()
@@ -1465,6 +1466,449 @@ class ACStateEstimator:
             network.read_from_file(e_file)
             _fast_topo_network(network)
             return network
+
+    @staticmethod
+    def _run_power_flow_seed(network: ACPowerNetwork, params: StateEstimationParameters, e_file: Path) -> bool:
+        """Run one AC load-flow solve so non-flat SE starts from a measured operating point."""
+        ppc = ACStateEstimator._power_flow_seed_ppc_from_network(network)
+        if ppc is not None:
+            calc = ACPowerFlowCalc(
+                ppc,
+                tol=params.power_flow_tol,
+                max_iter=params.power_flow_max_iter,
+                min_voltage=params.power_flow_min_voltage,
+            )
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        calc.prepare()
+                        rc = calc.run()
+                if rc != 0 or not calc.converged:
+                    return False
+                result_ppc = ACStateEstimator._merge_power_flow_seed_result_ppc(ppc, getattr(calc, "result", None))
+                ACStateEstimator._apply_power_flow_seed_ppc_to_network(network, result_ppc)
+                return True
+            except Exception:
+                return False
+
+        snapshot = ACStateEstimator._capture_power_flow_seed_snapshot(network)
+        calc_model = ppc if ppc is not None else network
+        calc = ACPowerFlowCalc(
+            calc_model,
+            tol=params.power_flow_tol,
+            max_iter=params.power_flow_max_iter,
+            min_voltage=params.power_flow_min_voltage,
+        )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    calc.prepare()
+                    rc = calc.run()
+        except Exception:
+            ACStateEstimator._restore_power_flow_seed_snapshot(snapshot)
+            return False
+        ok = bool(rc == 0 and calc.converged)
+        if not ok:
+            ACStateEstimator._restore_power_flow_seed_snapshot(snapshot)
+            return False
+        return ok
+
+    @staticmethod
+    def _copy_ppc_for_power_flow_seed(ppc):
+        copied = {}
+        for key, value in ppc.items():
+            if isinstance(value, np.ndarray):
+                copied[key] = value.copy()
+            elif isinstance(value, dict):
+                copied[key] = dict(value)
+            else:
+                copied[key] = value
+        return copied
+
+    @staticmethod
+    def _power_flow_seed_ppc_from_network(network):
+        source = getattr(network, "_array_model", None)
+        if not (isinstance(source, dict) and source.get("format") == "ac_ppc_v1"):
+            source = getattr(network, "ppc", None)
+        if not (isinstance(source, dict) and source.get("format") == "ac_ppc_v1"):
+            return None
+        ppc = ACStateEstimator._copy_ppc_for_power_flow_seed(source)
+        ACStateEstimator._sync_ac_network_to_ppc(network, ppc)
+        return ppc
+
+    @staticmethod
+    def _row_by_idx(array: np.ndarray, idx_col: int) -> Dict[int, int]:
+        if array is None or array.size == 0:
+            return {}
+        return {int(row[idx_col]): pos for pos, row in enumerate(array)}
+
+    @staticmethod
+    def _sync_ac_network_to_ppc(network, ppc) -> None:
+        row_by_idx = ACStateEstimator._row_by_idx
+        bus = ppc["bus"]
+        bus_rows = row_by_idx(bus, BUS_COLS["idx"])
+        for node in getattr(network, "nodes", []) or []:
+            row = bus_rows.get(int(getattr(node, "idx", -1)))
+            if row is None:
+                continue
+            bus[row, BUS_COLS["voltage"]] = float(getattr(node, "voltage", 1.0) or 1.0)
+            bus[row, BUS_COLS["angle"]] = float(getattr(node, "angle", 0.0) or 0.0)
+            bus[row, BUS_COLS["run_stat"]] = int(getattr(node, "run_stat", 1))
+
+        def sync_devices(devices, key, cols, attrs):
+            array = ppc.get(key)
+            if array is None or array.size == 0:
+                return
+            rows = row_by_idx(array, cols["idx"])
+            for dev in devices or []:
+                row = rows.get(int(getattr(dev, "idx", -1)))
+                if row is None:
+                    continue
+                for attr, col_name in attrs:
+                    if col_name in cols and hasattr(dev, attr):
+                        value = getattr(dev, attr)
+                        if value is not None:
+                            array[row, cols[col_name]] = value
+
+        terminal_attrs = (
+            ("run_stat", "run_stat"),
+            ("i_p", "i_p"),
+            ("i_q", "i_q"),
+            ("i_c", "i_c"),
+            ("j_p", "j_p"),
+            ("j_q", "j_q"),
+            ("j_c", "j_c"),
+        )
+        sync_devices(getattr(network, "branches", []), "branch", BRANCH_COLS, terminal_attrs)
+        sync_devices(getattr(network, "transformers", []), "transformer", TRANSFORMER_COLS, terminal_attrs)
+        sync_devices(
+            getattr(network, "generators", []),
+            "gen",
+            GEN_COLS,
+            (
+                ("p_set", "p_set"),
+                ("q_set", "q_set"),
+                ("v_set", "v_set"),
+                ("run_stat", "run_stat"),
+                ("p", "p"),
+                ("q", "q"),
+                ("current", "current"),
+            ),
+        )
+        sync_devices(
+            getattr(network, "loads", []),
+            "load",
+            LOAD_COLS,
+            (
+                ("pbase", "pbase"),
+                ("pv0", "pv0"),
+                ("pv1", "pv1"),
+                ("pv2", "pv2"),
+                ("qbase", "qbase"),
+                ("qv0", "qv0"),
+                ("qv1", "qv1"),
+                ("qv2", "qv2"),
+                ("run_stat", "run_stat"),
+                ("p", "p"),
+                ("q", "q"),
+                ("current", "current"),
+            ),
+        )
+        sync_devices(
+            getattr(network, "shunt_compensators", []),
+            "shunt",
+            SHUNT_COLS,
+            (
+                ("q_set", "q_set"),
+                ("g_set", "g_set"),
+                ("b_set", "b_set"),
+                ("v_set", "v_set"),
+                ("run_stat", "run_stat"),
+                ("p", "p"),
+                ("q", "q"),
+                ("current", "current"),
+            ),
+        )
+        zero_attrs = (("run_stat", "run_stat"), ("p", "p"), ("q", "q"), ("current", "current"))
+        sync_devices(getattr(network, "zero_branches", []), "zero_branch", ZERO_BRANCH_COLS, zero_attrs)
+        switch_attrs = (
+            ("status", "status"),
+            ("run_stat", "run_stat"),
+            ("p", "p"),
+            ("q", "q"),
+            ("current", "current"),
+        )
+        sync_devices(getattr(network, "switches", []), "switch", SWITCH_COLS, switch_attrs)
+        sync_devices(getattr(network, "breakers", []), "break", BREAK_COLS, switch_attrs)
+
+    @staticmethod
+    def _merge_power_flow_seed_result_ppc(seed_ppc, result):
+        if not isinstance(result, dict):
+            return seed_ppc
+        merged = ACStateEstimator._copy_ppc_for_power_flow_seed(seed_ppc)
+        for key, value in result.items():
+            if isinstance(value, np.ndarray):
+                merged[key] = value.copy()
+            else:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _apply_power_flow_seed_ppc_to_network(network, ppc) -> None:
+        row_by_idx = ACStateEstimator._row_by_idx
+        bus = ppc["bus"]
+        bus_rows = row_by_idx(bus, BUS_COLS["idx"])
+        for node in getattr(network, "nodes", []) or []:
+            row = bus_rows.get(int(getattr(node, "idx", -1)))
+            if row is None:
+                continue
+            node.voltage = float(bus[row, BUS_COLS["voltage"]])
+            node.angle = float(bus[row, BUS_COLS["angle"]])
+        for bus_obj in getattr(network, "buses", []) or []:
+            members = getattr(bus_obj, "nodes", ()) or ()
+            if members:
+                ref = members[0]
+                bus_obj.voltage = float(getattr(ref, "voltage", 1.0) or 1.0)
+                bus_obj.angle = float(getattr(ref, "angle", 0.0) or 0.0)
+
+        def apply_devices(devices, key, cols, attrs):
+            array = ppc.get(key)
+            if array is None or array.size == 0:
+                return
+            rows = row_by_idx(array, cols["idx"])
+            for dev in devices or []:
+                row = rows.get(int(getattr(dev, "idx", -1)))
+                if row is None:
+                    continue
+                for attr, col_name in attrs:
+                    if col_name in cols and hasattr(dev, attr):
+                        setattr(dev, attr, float(array[row, cols[col_name]]))
+
+        terminal_attrs = (
+            ("i_p", "i_p"),
+            ("i_q", "i_q"),
+            ("i_c", "i_c"),
+            ("j_p", "j_p"),
+            ("j_q", "j_q"),
+            ("j_c", "j_c"),
+        )
+        apply_devices(getattr(network, "branches", []), "branch", BRANCH_COLS, terminal_attrs)
+        apply_devices(getattr(network, "transformers", []), "transformer", TRANSFORMER_COLS, terminal_attrs)
+        apply_devices(getattr(network, "generators", []), "gen", GEN_COLS, (("p", "p"), ("q", "q"), ("current", "current")))
+        apply_devices(getattr(network, "loads", []), "load", LOAD_COLS, (("p", "p"), ("q", "q"), ("current", "current")))
+        apply_devices(
+            getattr(network, "shunt_compensators", []),
+            "shunt",
+            SHUNT_COLS,
+            (("p", "p"), ("q", "q"), ("current", "current")),
+        )
+        zero_attrs = (("p", "p"), ("q", "q"), ("current", "current"))
+        apply_devices(getattr(network, "zero_branches", []), "zero_branch", ZERO_BRANCH_COLS, zero_attrs)
+        apply_devices(getattr(network, "switches", []), "switch", SWITCH_COLS, zero_attrs)
+        apply_devices(getattr(network, "breakers", []), "break", BREAK_COLS, zero_attrs)
+        network.ppc = ppc
+        if hasattr(network, "_array_model"):
+            network._array_model = ppc
+
+    @staticmethod
+    def _capture_power_flow_seed_snapshot(network):
+        attrs = (
+            "voltage",
+            "angle",
+            "p",
+            "q",
+            "current",
+            "i_p",
+            "i_q",
+            "i_c",
+            "j_p",
+            "j_q",
+            "j_c",
+            "p_set",
+            "q_set",
+            "v_set",
+            "pbase",
+            "pv0",
+            "pv1",
+            "pv2",
+            "qbase",
+            "qv0",
+            "qv1",
+            "qv2",
+        )
+        snapshot = []
+        collections = (
+            "nodes",
+            "buses",
+            "branches",
+            "transformers",
+            "zero_branches",
+            "switches",
+            "breakers",
+            "generators",
+            "loads",
+            "shunt_compensators",
+        )
+        seen = set()
+        for collection in collections:
+            for obj in getattr(network, collection, []) or []:
+                if id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                state = {attr: getattr(obj, attr) for attr in attrs if hasattr(obj, attr)}
+                if state:
+                    snapshot.append((obj, state))
+        return snapshot
+
+    @staticmethod
+    def _restore_power_flow_seed_snapshot(snapshot) -> None:
+        for obj, state in snapshot:
+            for attr, value in state.items():
+                setattr(obj, attr, value)
+
+    def _refresh_load_parameter_arrays(self) -> None:
+        self.load_pv0_array = np.asarray(
+            [getattr(load, "pbase", 1.0) * load.pv0 for load in self.load_order],
+            dtype=np.float64,
+        )
+        self.load_pv1_array = np.asarray(
+            [getattr(load, "pbase", 1.0) * load.pv1 for load in self.load_order],
+            dtype=np.float64,
+        )
+        self.load_pv2_array = np.asarray(
+            [getattr(load, "pbase", 1.0) * load.pv2 for load in self.load_order],
+            dtype=np.float64,
+        )
+        self.load_qv0_array = np.asarray(
+            [getattr(load, "qbase", 1.0) * load.qv0 for load in self.load_order],
+            dtype=np.float64,
+        )
+        self.load_qv1_array = np.asarray(
+            [getattr(load, "qbase", 1.0) * load.qv1 for load in self.load_order],
+            dtype=np.float64,
+        )
+        self.load_qv2_array = np.asarray(
+            [getattr(load, "qbase", 1.0) * load.qv2 for load in self.load_order],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _set_existing_attr(obj, attr: str, value) -> None:
+        if hasattr(obj, attr):
+            setattr(obj, attr, value)
+
+    def _set_node_voltage_object(self, node, value: float) -> None:
+        voltage = max(float(value), self.voltage_floor)
+        if node is None:
+            return
+        if hasattr(node, "voltage"):
+            node.voltage = voltage
+        for member in getattr(node, "nodes", ()) or ():
+            if hasattr(member, "voltage"):
+                member.voltage = voltage
+
+    def _set_node_voltage_by_idx(self, node_idx: int, value: float) -> None:
+        targets = []
+        bus = self.node_by_idx.get(int(node_idx))
+        if bus is not None:
+            targets.append(bus)
+        raw = getattr(self.network, "node_dict", {}).get(int(node_idx))
+        if raw is not None:
+            targets.append(raw)
+        seen = set()
+        for target in targets:
+            if id(target) in seen:
+                continue
+            seen.add(id(target))
+            self._set_node_voltage_object(target, value)
+
+    def _set_node_voltage_by_name(self, node_name: str, value: float) -> None:
+        bus = self.node_by_name.get(node_name)
+        if bus is not None:
+            self._set_node_voltage_object(bus, value)
+            return
+        for node in getattr(self.network, "nodes", []):
+            if getattr(node, "name", None) == node_name:
+                self._set_node_voltage_object(node, value)
+                bus_obj = getattr(node, "bus_obj", None)
+                if bus_obj is not None:
+                    self._set_node_voltage_object(bus_obj, value)
+                return
+
+    def _sync_bus_state_from_members(self) -> None:
+        for bus in self.nodes:
+            members = getattr(bus, "nodes", ()) or ()
+            if not members:
+                continue
+            member = next((node for node in members if getattr(node, "voltage", None) is not None), None)
+            if member is None:
+                continue
+            if hasattr(bus, "voltage"):
+                bus.voltage = float(getattr(member, "voltage", 1.0) or 1.0)
+            if hasattr(bus, "angle") and hasattr(member, "angle"):
+                bus.angle = float(getattr(member, "angle", 0.0) or 0.0)
+
+    def _refresh_file_state_from_network(self) -> None:
+        self._sync_bus_state_from_members()
+        self.file_theta = np.asarray(
+            [float(getattr(node, "angle", 0.0) or 0.0) for node in self.nodes],
+            dtype=np.float64,
+        )
+        self.file_voltage = np.asarray(
+            [max(float(getattr(node, "voltage", 1.0) or 1.0), self.voltage_floor) for node in self.nodes],
+            dtype=np.float64,
+        )
+
+    def _apply_measurement_seed_to_network(self) -> None:
+        """Apply valid normalized measurements to network fields used by the LF seed."""
+        for meas in self.measurements:
+            if not meas.valid or meas.weight <= 0.0:
+                continue
+            value = float(meas.value)
+            if meas.device_type == "ACNode":
+                if meas.meas_type == "V":
+                    self._set_node_voltage_by_name(meas.device_name, value)
+                continue
+            if meas.device_type == "ACGenerator":
+                gen = self.generator_by_name.get(meas.device_name)
+                if gen is None:
+                    continue
+                if meas.meas_type == "P_GEN":
+                    self._set_existing_attr(gen, "p_set", value)
+                    self._set_existing_attr(gen, "p", value)
+                elif meas.meas_type == "Q_GEN":
+                    self._set_existing_attr(gen, "q_set", value)
+                    self._set_existing_attr(gen, "q", value)
+                elif meas.meas_type == "V_GEN":
+                    voltage = max(value, self.voltage_floor)
+                    self._set_existing_attr(gen, "v_set", voltage)
+                    self._set_node_voltage_by_idx(gen.node, voltage)
+                elif meas.meas_type == "I_GEN":
+                    self._set_existing_attr(gen, "i_set", value)
+                    self._set_existing_attr(gen, "current", value)
+                continue
+            if meas.device_type == "ACLoad":
+                load = self.load_by_name.get(meas.device_name)
+                if load is None:
+                    continue
+                if meas.meas_type == "P_LOAD":
+                    self._set_existing_attr(load, "pbase", 1.0)
+                    self._set_existing_attr(load, "pv0", value)
+                    self._set_existing_attr(load, "pv1", 0.0)
+                    self._set_existing_attr(load, "pv2", 0.0)
+                    self._set_existing_attr(load, "p", value)
+                elif meas.meas_type == "Q_LOAD":
+                    self._set_existing_attr(load, "qbase", 1.0)
+                    self._set_existing_attr(load, "qv0", value)
+                    self._set_existing_attr(load, "qv1", 0.0)
+                    self._set_existing_attr(load, "qv2", 0.0)
+                    self._set_existing_attr(load, "q", value)
+                elif meas.meas_type == "V_LOAD":
+                    self._set_node_voltage_by_idx(load.node, value)
+                elif meas.meas_type == "I_LOAD":
+                    self._set_existing_attr(load, "current", value)
 
     @staticmethod
     def _load_measurements(meas_file: Path, scale_context=None) -> List[Measurement]:

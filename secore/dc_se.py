@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import io
 import sys
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -14,7 +15,18 @@ for path in (ROOT_DIR,):
         sys.path.insert(0, str(path))
 
 from lfcore.dc_lf import DCPowerFlowCalc, load_dc_ppc_from_e_file
-from model.dc_array_model import DCPowerNetwork, build_dc_network_from_ppc
+from model.dc_array_model import (
+    BRANCH_COLS as DC_BRANCH_COLS,
+    BREAK_COLS as DC_BREAK_COLS,
+    BUS_COLS as DC_BUS_COLS,
+    DCDC_COLS as DC_DCDC_COLS,
+    GEN_COLS as DC_GEN_COLS,
+    LOAD_COLS as DC_LOAD_COLS,
+    SWITCH_COLS as DC_SWITCH_COLS,
+    ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    DCPowerNetwork,
+    build_dc_network_from_ppc,
+)
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -249,11 +261,9 @@ class DCStateEstimator:
         prepare_active_measurements: bool = True,
     ) -> "DCStateEstimator":
         if network is None:
-            self.network = self._load_network(self.e_file, self.params, run_power_flow=not self.flat_start)
+            self.network = self._load_network(self.e_file)
         else:
             self.network = network
-            if not self.flat_start:
-                self._run_power_flow_seed(self.network, self.params, self.e_file)
         self.measurements = list(measurements) if measurements is not None else self._load_measurements(self.meas_file)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
@@ -306,6 +316,11 @@ class DCStateEstimator:
         self._disable_unavailable_measurements()
         self._build_measurement_scale_cache()
         self._convert_measurements_to_pu()
+        self.power_flow_seed_converged = False
+        if not self.flat_start:
+            self._apply_measurement_seed_to_network()
+            self.power_flow_seed_converged = bool(self._run_power_flow_seed(self.network, self.params, self.e_file))
+            self._sync_bus_state_from_members()
         self.node_voltage_measurements = self._node_voltage_measurements()
         self.node_degrees = self._node_incident_degrees()
         self.references = self._select_reference_nodes()
@@ -794,30 +809,333 @@ class DCStateEstimator:
             )
 
     @staticmethod
-    def _load_network(e_file: Path, params: StateEstimationParameters, run_power_flow: bool = True) -> DCPowerNetwork:
-        """Read the DC case and optionally run load flow once to seed the estimator."""
+    def _load_network(e_file: Path) -> DCPowerNetwork:
+        """Read the DC case and build topology references used by measurements."""
         network = build_dc_network_from_ppc(load_dc_ppc_from_e_file(e_file))
         network.topo()
-        if not run_power_flow:
-            return network
-
-        DCStateEstimator._run_power_flow_seed(network, params, e_file)
         return network
 
     @staticmethod
-    def _run_power_flow_seed(network: DCPowerNetwork, params: StateEstimationParameters, e_file: Path) -> None:
+    def _run_power_flow_seed(network: DCPowerNetwork, params: StateEstimationParameters, e_file: Path) -> bool:
+        original_ppc = getattr(network, "ppc", None)
+        ppc = DCStateEstimator._power_flow_seed_ppc_from_network(network)
+        if ppc is not None:
+            network.ppc = ppc
+            calc = DCPowerFlowCalc(network)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc = calc.run(
+                            tol=params.power_flow_tol,
+                            max_iter=params.power_flow_max_iter,
+                            min_voltage=params.power_flow_min_voltage,
+                        )
+            except Exception:
+                if original_ppc is not None:
+                    network.ppc = original_ppc
+                return False
+            if rc != 0 or not calc.converged:
+                if original_ppc is not None:
+                    network.ppc = original_ppc
+                return False
+            DCStateEstimator._sync_dc_network_to_ppc(network, ppc)
+            network.ppc = ppc
+            return True
+
+        snapshot = DCStateEstimator._capture_power_flow_seed_snapshot(network)
         calc = DCPowerFlowCalc(network)
-        with contextlib.redirect_stdout(io.StringIO()):
-            rc = calc.run(
-                tol=params.power_flow_tol,
-                max_iter=params.power_flow_max_iter,
-                min_voltage=params.power_flow_min_voltage,
-            )
-        if rc != 0 or not calc.converged:
-            raise RuntimeError(
-                f"DC power flow failed for {e_file}: rc={rc}, "
-                f"iter={calc.iterations}, normF={calc.normF:.3e}"
-            )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = calc.run(
+                        tol=params.power_flow_tol,
+                        max_iter=params.power_flow_max_iter,
+                        min_voltage=params.power_flow_min_voltage,
+                    )
+        except Exception:
+            DCStateEstimator._restore_power_flow_seed_snapshot(snapshot)
+            return False
+        ok = bool(rc == 0 and calc.converged)
+        if not ok:
+            DCStateEstimator._restore_power_flow_seed_snapshot(snapshot)
+            return False
+        return ok
+
+    @staticmethod
+    def _copy_ppc_for_power_flow_seed(ppc):
+        copied = {}
+        for key, value in ppc.items():
+            if isinstance(value, np.ndarray):
+                copied[key] = value.copy()
+            elif isinstance(value, dict):
+                copied[key] = dict(value)
+            else:
+                copied[key] = value
+        return copied
+
+    @staticmethod
+    def _power_flow_seed_ppc_from_network(network):
+        source = getattr(network, "ppc", None)
+        if not (isinstance(source, dict) and source.get("format") == "dc_ppc_v1"):
+            source = getattr(network, "_array_model", None)
+        if not (isinstance(source, dict) and source.get("format") == "dc_ppc_v1"):
+            return None
+        ppc = DCStateEstimator._copy_ppc_for_power_flow_seed(source)
+        DCStateEstimator._sync_dc_network_to_ppc(network, ppc)
+        return ppc
+
+    @staticmethod
+    def _row_by_idx(array: np.ndarray, idx_col: int) -> Dict[int, int]:
+        if array is None or array.size == 0:
+            return {}
+        return {int(row[idx_col]): pos for pos, row in enumerate(array)}
+
+    @staticmethod
+    def _sync_dc_network_to_ppc(network, ppc) -> None:
+        row_by_idx = DCStateEstimator._row_by_idx
+        bus = ppc["bus"]
+        bus_rows = row_by_idx(bus, DC_BUS_COLS["idx"])
+        for node in getattr(network, "nodes", []) or []:
+            row = bus_rows.get(int(getattr(node, "idx", -1)))
+            if row is None:
+                continue
+            bus[row, DC_BUS_COLS["voltage"]] = float(getattr(node, "voltage", 1.0) or 1.0)
+            bus[row, DC_BUS_COLS["run_stat"]] = int(getattr(node, "run_stat", 1))
+
+        def sync_devices(devices, key, cols, attrs):
+            array = ppc.get(key)
+            if array is None or array.size == 0:
+                return
+            rows = row_by_idx(array, cols["idx"])
+            for dev in devices or []:
+                row = rows.get(int(getattr(dev, "idx", -1)))
+                if row is None:
+                    continue
+                for attr, col_name in attrs:
+                    if col_name in cols and hasattr(dev, attr):
+                        value = getattr(dev, attr)
+                        if value is not None:
+                            array[row, cols[col_name]] = value
+
+        sync_devices(
+            getattr(network, "branches", []),
+            "branch",
+            DC_BRANCH_COLS,
+            (("run_stat", "run_stat"), ("i_p", "i_p"), ("j_p", "j_p"), ("current", "current")),
+        )
+        sync_devices(
+            getattr(network, "loads", []),
+            "load",
+            DC_LOAD_COLS,
+            (
+                ("pbase", "pbase"),
+                ("pv0", "pv0"),
+                ("pv1", "pv1"),
+                ("pv2", "pv2"),
+                ("run_stat", "run_stat"),
+                ("p", "p"),
+                ("current", "current"),
+            ),
+        )
+        sync_devices(
+            getattr(network, "generators", []),
+            "gen",
+            DC_GEN_COLS,
+            (
+                ("p_set", "p_set"),
+                ("v_set", "v_set"),
+                ("i_set", "i_set"),
+                ("run_stat", "run_stat"),
+                ("p", "p"),
+                ("current", "current"),
+            ),
+        )
+        sync_devices(
+            getattr(network, "zero_branches", []),
+            "zero_branch",
+            DC_ZERO_BRANCH_COLS,
+            (("run_stat", "run_stat"), ("p", "p"), ("current", "current")),
+        )
+        switch_attrs = (("status", "status"), ("run_stat", "run_stat"), ("p", "p"), ("current", "current"))
+        sync_devices(getattr(network, "switches", []), "switch", DC_SWITCH_COLS, switch_attrs)
+        sync_devices(getattr(network, "breakers", []), "break", DC_BREAK_COLS, switch_attrs)
+        sync_devices(
+            getattr(network, "dcdc_converters", []),
+            "dcdc",
+            DC_DCDC_COLS,
+            (
+                ("p_set", "p_set"),
+                ("i_set", "i_set"),
+                ("v_set", "v_set"),
+                ("run_stat", "run_stat"),
+                ("i_p", "i_p"),
+                ("j_p", "j_p"),
+                ("i_c", "i_c"),
+                ("j_c", "j_c"),
+            ),
+        )
+
+    @staticmethod
+    def _capture_power_flow_seed_snapshot(network):
+        attrs = (
+            "voltage",
+            "p",
+            "current",
+            "i_p",
+            "i_c",
+            "j_p",
+            "j_c",
+            "p_set",
+            "v_set",
+            "i_set",
+            "pbase",
+            "pv0",
+            "pv1",
+            "pv2",
+        )
+        snapshot = []
+        collections = (
+            "nodes",
+            "buses",
+            "branches",
+            "zero_branches",
+            "switches",
+            "breakers",
+            "generators",
+            "loads",
+            "dcdc_converters",
+        )
+        seen = set()
+        for collection in collections:
+            for obj in getattr(network, collection, []) or []:
+                if id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                state = {attr: getattr(obj, attr) for attr in attrs if hasattr(obj, attr)}
+                if state:
+                    snapshot.append((obj, state))
+        return snapshot
+
+    @staticmethod
+    def _restore_power_flow_seed_snapshot(snapshot) -> None:
+        for obj, state in snapshot:
+            for attr, value in state.items():
+                setattr(obj, attr, value)
+
+    @staticmethod
+    def _set_existing_attr(obj, attr: str, value) -> None:
+        if hasattr(obj, attr):
+            setattr(obj, attr, value)
+
+    def _set_node_voltage_object(self, node, value: float) -> None:
+        voltage = max(float(value), self.voltage_floor)
+        if node is None:
+            return
+        if hasattr(node, "voltage"):
+            node.voltage = voltage
+        for member in getattr(node, "nodes", ()) or ():
+            if hasattr(member, "voltage"):
+                member.voltage = voltage
+
+    def _set_node_voltage_by_idx(self, node_idx: int, value: float) -> None:
+        targets = []
+        bus = self.node_by_idx.get(int(node_idx))
+        if bus is not None:
+            targets.append(bus)
+        raw = getattr(self.network, "node_dict", {}).get(int(node_idx))
+        if raw is not None:
+            targets.append(raw)
+        seen = set()
+        for target in targets:
+            if id(target) in seen:
+                continue
+            seen.add(id(target))
+            self._set_node_voltage_object(target, value)
+
+    def _set_node_voltage_by_name(self, node_name: str, value: float) -> None:
+        bus = self.node_by_name.get(node_name)
+        if bus is not None:
+            self._set_node_voltage_object(bus, value)
+            return
+        for node in getattr(self.network, "nodes", []):
+            if getattr(node, "name", None) == node_name:
+                self._set_node_voltage_object(node, value)
+                bus_obj = getattr(node, "bus_obj", None)
+                if bus_obj is not None:
+                    self._set_node_voltage_object(bus_obj, value)
+                return
+
+    def _sync_bus_state_from_members(self) -> None:
+        for bus in self.nodes:
+            members = getattr(bus, "nodes", ()) or ()
+            if not members:
+                continue
+            member = next((node for node in members if getattr(node, "voltage", None) is not None), None)
+            if member is None:
+                continue
+            if hasattr(bus, "voltage"):
+                bus.voltage = float(getattr(member, "voltage", 1.0) or 1.0)
+
+    def _apply_measurement_seed_to_network(self) -> None:
+        """Apply valid normalized measurements to network fields used by the LF seed."""
+        for meas in self.measurements:
+            if not meas.valid or meas.weight <= 0.0:
+                continue
+            value = float(meas.value)
+            if meas.device_type == "DCNode":
+                if meas.meas_type == "V":
+                    self._set_node_voltage_by_name(meas.device_name, value)
+                continue
+            if meas.device_type == "DCGenerator":
+                gen = self.generator_by_name.get(meas.device_name)
+                if gen is None:
+                    continue
+                if meas.meas_type == "P_GEN":
+                    self._set_existing_attr(gen, "p_set", value)
+                    self._set_existing_attr(gen, "p", value)
+                elif meas.meas_type == "V_GEN":
+                    voltage = max(value, self.voltage_floor)
+                    self._set_existing_attr(gen, "v_set", voltage)
+                    self._set_node_voltage_by_idx(gen.node, voltage)
+                elif meas.meas_type == "I_GEN":
+                    self._set_existing_attr(gen, "i_set", value)
+                    self._set_existing_attr(gen, "current", value)
+                continue
+            if meas.device_type == "DCLoad":
+                load = self.load_by_name.get(meas.device_name)
+                if load is None:
+                    continue
+                if meas.meas_type == "P_LOAD":
+                    self._set_existing_attr(load, "pbase", 1.0)
+                    self._set_existing_attr(load, "pv0", value)
+                    self._set_existing_attr(load, "pv1", 0.0)
+                    self._set_existing_attr(load, "pv2", 0.0)
+                    self._set_existing_attr(load, "p", value)
+                elif meas.meas_type == "V_LOAD":
+                    self._set_node_voltage_by_idx(load.node, value)
+                elif meas.meas_type == "I_LOAD":
+                    self._set_existing_attr(load, "current", value)
+                continue
+            if meas.device_type == "DCDCConverter":
+                conv = self.dcdc_by_name.get(meas.device_name)
+                if conv is None:
+                    continue
+                if meas.meas_type in ("P_FROM", "P_DC", "P_IN"):
+                    self._set_existing_attr(conv, "p_set", value)
+                    self._set_existing_attr(conv, "i_p", value)
+                elif meas.meas_type in ("P_TO", "P_OUT"):
+                    self._set_existing_attr(conv, "j_p", value)
+                elif meas.meas_type == "V_FROM":
+                    self._set_node_voltage_by_idx(conv.i_node, value)
+                elif meas.meas_type == "V_TO":
+                    self._set_node_voltage_by_idx(conv.j_node, value)
+                elif meas.meas_type in ("I_FROM", "I_DC"):
+                    self._set_existing_attr(conv, "i_set", value)
+                    self._set_existing_attr(conv, "i_c", value)
+                elif meas.meas_type in ("I_TO", "I_OUT"):
+                    self._set_existing_attr(conv, "j_c", value)
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> MeasurementList:

@@ -1086,23 +1086,90 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, theta[ref_pos])
         self.assertAlmostEqual(ref_voltage, voltage[ref_pos])
 
-    def test_reference_angle_rebases_nonflat_state_without_angle_pseudos(self):
+    def test_nonflat_start_runs_measurement_seeded_power_flow(self):
+        import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
-        estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
-            flat_start=False,
-        )
-        ref_angle = float(getattr(estimator.references[0], "angle", 0.0) or 0.0)
-        node = estimator.node_by_name["bus_9025"]
-        node_pos = estimator.node_pos[node.idx]
+        original_seed = getattr(ac_se.ACStateEstimator, "_run_power_flow_seed", None)
+        calls = []
 
-        theta, _voltage = estimator._unpack_state(estimator.initial_state())
+        def fake_seed(network, _params, _e_file):
+            bus_2 = network.node_dict[1]
+            self.assertAlmostEqual(119.0641444 / 115.0, float(bus_2.voltage))
+            calls.append(True)
+            for node in network.nodes:
+                if getattr(node, "is_alive", False):
+                    node.voltage = 1.11
+                    node.angle = 0.05
 
-        expected_angle = float(getattr(node, "angle", 0.0) or 0.0) - ref_angle
-        self.assertAlmostEqual(expected_angle, theta[node_pos])
+        ac_se.ACStateEstimator._run_power_flow_seed = staticmethod(fake_seed)
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+                flat_start=False,
+            )
+        finally:
+            if original_seed is not None:
+                ac_se.ACStateEstimator._run_power_flow_seed = staticmethod(original_seed)
+
+        self.assertFalse(estimator.flat_start)
+        self.assertTrue(calls)
+        _theta, voltage = estimator._unpack_state(estimator.initial_state())
+        voltage_state = voltage[estimator.voltage_state_pos]
+        np.testing.assert_allclose(voltage_state, 1.11)
         self.assertFalse(any(meas.name == "pseudo_angle_bus_9025" for meas in estimator.measurements))
+
+    def test_nonflat_start_uses_array_mode_power_flow_seed_when_ppc_is_available(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original_calc = ac_se.ACPowerFlowCalc
+        calls = []
+
+        class FakePowerFlowCalc:
+            def __init__(self, model, **_kwargs):
+                self.model = model
+                self.ppc = model if isinstance(model, dict) else getattr(model, "ppc", None)
+                self.converged = False
+                self.iterations = 0
+                self.normF = 0.0
+                calls.append(isinstance(model, dict))
+
+            def prepare(self):
+                bus_2_row = 1
+                self.testcase.assertAlmostEqual(
+                    119.0641444 / 115.0,
+                    float(self.ppc["bus"][bus_2_row, ac_se.BUS_COLS["voltage"]]),
+                )
+
+            def run(self):
+                self.converged = True
+                self.iterations = 1
+                self.result = {
+                    key: value.copy()
+                    for key, value in self.ppc.items()
+                    if isinstance(value, np.ndarray)
+                }
+                self.result["bus"][:, ac_se.BUS_COLS["voltage"]] = 1.12
+                self.result["bus"][:, ac_se.BUS_COLS["angle"]] = 0.06
+                return 0
+
+        FakePowerFlowCalc.testcase = self
+        ac_se.ACPowerFlowCalc = FakePowerFlowCalc
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+                flat_start=False,
+            )
+        finally:
+            ac_se.ACPowerFlowCalc = original_calc
+
+        self.assertEqual([True], calls)
+        self.assertTrue(estimator.power_flow_seed_converged)
+        _theta, voltage = estimator._unpack_state(estimator.initial_state())
+        np.testing.assert_allclose(voltage[estimator.voltage_state_pos], 1.12)
 
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
         from secore.ac_se import ACStateEstimator
@@ -1527,6 +1594,7 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            flat_start=True,
         )
         x = estimator.initial_state()
         dense = estimator.jacobian(x)
@@ -1767,6 +1835,7 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            flat_start=True,
         )
         x = estimator.initial_state()
         load_measurements = [
@@ -2850,6 +2919,7 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
             meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            flat_start=True,
         )
 
         x = estimator.initial_state()

@@ -269,7 +269,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, theta[ref_pos])
         self.assertAlmostEqual(ref_voltage, voltage[ref_pos])
 
-    def test_ac_reference_angle_rebases_nonflat_state_without_angle_pseudos(self):
+    def test_nonflat_start_reuses_ac_measurement_seeded_power_flow(self):
         from secore.ac_se import ACStateEstimator
         from secore.hybrid_se import HybridStateEstimator
 
@@ -283,6 +283,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         estimator = HybridStateEstimator(**kwargs)
 
         self.assertIsInstance(estimator._delegate(), ACStateEstimator)
+        self.assertFalse(estimator.flat_start)
+        self.assertFalse(ac_estimator.flat_start)
         self.assertEqual(ac_estimator.state_labels, estimator.ac_state_labels)
         np.testing.assert_allclose(ac_estimator.initial_state(), estimator.initial_state())
         self.assertFalse(any(meas.name == "pseudo_angle_bus_9025" for meas in estimator.measurements))
@@ -325,7 +327,87 @@ class HybridStateEstimationTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(ac_z_est[row], z_est[row], places=6)
-        self.assertNotAlmostEqual(meas.value, z_est[row], places=6)
+        self.assertAlmostEqual(meas.value, z_est[row], places=6)
+
+    def test_dc_nonflat_start_runs_measurement_seeded_power_flow(self):
+        import secore.dc_se as dc_se
+        from secore.hybrid_se import HybridStateEstimator
+
+        original_seed = getattr(dc_se.DCStateEstimator, "_run_power_flow_seed", None)
+        calls = []
+
+        def fake_seed(network, _params, _e_file):
+            nd_1 = network.node_dict[0]
+            self.assertAlmostEqual(1.6, float(nd_1.voltage))
+            calls.append(True)
+            for node in network.nodes:
+                if getattr(node, "is_alive", False):
+                    node.voltage = 1.23
+
+        dc_se.DCStateEstimator._run_power_flow_seed = staticmethod(fake_seed)
+        try:
+            estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=False,
+            )
+        finally:
+            if original_seed is not None:
+                dc_se.DCStateEstimator._run_power_flow_seed = staticmethod(original_seed)
+
+        self.assertFalse(estimator.flat_start)
+        self.assertTrue(calls)
+        self.assertIsInstance(estimator._delegate(), dc_se.DCStateEstimator)
+
+    def test_nonflat_ac_delegate_uses_array_mode_power_flow_seed(self):
+        import secore.ac_se as ac_se
+        from secore.hybrid_se import HybridStateEstimator
+
+        original_calc = ac_se.ACPowerFlowCalc
+        calls = []
+
+        class FakePowerFlowCalc:
+            def __init__(self, model, **_kwargs):
+                self.model = model
+                self.ppc = model if isinstance(model, dict) else getattr(model, "ppc", None)
+                self.converged = False
+                self.iterations = 0
+                self.normF = 0.0
+                calls.append(isinstance(model, dict))
+
+            def prepare(self):
+                self.testcase.assertAlmostEqual(
+                    119.0641444 / 115.0,
+                    float(self.ppc["bus"][1, ac_se.BUS_COLS["voltage"]]),
+                )
+
+            def run(self):
+                self.converged = True
+                self.iterations = 1
+                self.result = {
+                    key: value.copy()
+                    for key, value in self.ppc.items()
+                    if isinstance(value, np.ndarray)
+                }
+                self.result["bus"][:, ac_se.BUS_COLS["voltage"]] = 1.13
+                self.result["bus"][:, ac_se.BUS_COLS["angle"]] = 0.07
+                return 0
+
+        FakePowerFlowCalc.testcase = self
+        ac_se.ACPowerFlowCalc = FakePowerFlowCalc
+        try:
+            estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+                flat_start=False,
+            )
+        finally:
+            ac_se.ACPowerFlowCalc = original_calc
+
+        self.assertEqual([True], calls)
+        self.assertIsInstance(estimator._delegate(), ac_se.ACStateEstimator)
+        _theta, voltage = estimator._delegate()._unpack_state(estimator.initial_state())
+        np.testing.assert_allclose(voltage[estimator._delegate().voltage_state_pos], 1.13)
 
     def test_dc_reference_nodes_use_highest_degree_nodes_with_valid_voltage_measurements(self):
         from secore.dc_se import DCStateEstimator

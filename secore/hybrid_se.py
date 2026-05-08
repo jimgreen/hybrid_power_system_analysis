@@ -330,6 +330,7 @@ class HybridStateEstimator:
         if share_measurements:
             self._sub_measurements_converted_by_side[side] = True
             return list(sources)
+        self._sub_measurements_converted_by_side[side] = True
         return list(sources)
 
     def _is_uncoupled_single_side(self, side: str) -> bool:
@@ -355,7 +356,7 @@ class HybridStateEstimator:
     def _build_ac_sub_estimator(self) -> Optional[ACStateEstimator]:
         if not getattr(self.network.ac, "nodes", None):
             return None
-        reuse_loaded = bool(self.flat_start)
+        reuse_loaded = True
         defer_active = reuse_loaded and self._defer_sub_active_measurement_preparation()
         share_measurements = defer_active or (reuse_loaded and self._is_uncoupled_single_side("ac"))
         try:
@@ -379,7 +380,7 @@ class HybridStateEstimator:
     def _build_dc_sub_estimator(self) -> Optional[DCStateEstimator]:
         if not getattr(self.network.dc, "nodes", None):
             return None
-        reuse_loaded = bool(self.flat_start)
+        reuse_loaded = True
         defer_active = reuse_loaded and self._defer_sub_active_measurement_preparation()
         share_measurements = defer_active or (reuse_loaded and self._is_uncoupled_single_side("dc"))
         try:

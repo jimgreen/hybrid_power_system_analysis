@@ -805,6 +805,82 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertTrue(estimator.flat_start)
         self.assertEqual(0, call_count)
 
+    def test_nonflat_start_runs_measurement_seeded_power_flow(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original_seed = getattr(dc_se.DCStateEstimator, "_run_power_flow_seed", None)
+        calls = []
+
+        def fake_seed(network, _params, _e_file):
+            nd_1 = network.node_dict[0]
+            self.assertAlmostEqual(1.6, float(nd_1.voltage))
+            calls.append(True)
+            for node in network.nodes:
+                if getattr(node, "is_alive", False):
+                    node.voltage = 1.23
+
+        dc_se.DCStateEstimator._run_power_flow_seed = staticmethod(fake_seed)
+        try:
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=False,
+            )
+        finally:
+            if original_seed is not None:
+                dc_se.DCStateEstimator._run_power_flow_seed = staticmethod(original_seed)
+
+        self.assertFalse(estimator.flat_start)
+        self.assertTrue(calls)
+        voltage, _switch_current, _dcdc_power, _vgen_power = estimator._unpack_state(estimator.initial_state())
+        voltage_state = voltage[estimator.voltage_state_pos]
+        np.testing.assert_allclose(voltage_state, 1.23)
+
+    def test_nonflat_start_syncs_measurement_seed_to_array_power_flow_ppc(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original_calc = dc_se.DCPowerFlowCalc
+        calls = []
+
+        class FakePowerFlowCalc:
+            def __init__(self, model):
+                self.model = model
+                self.ppc = getattr(model, "ppc", None)
+                self.converged = False
+                self.iterations = 0
+                self.normF = 0.0
+                calls.append(isinstance(self.ppc, dict))
+
+            def run(self, **_kwargs):
+                self.testcase.assertAlmostEqual(
+                    1.6,
+                    float(self.ppc["bus"][0, dc_se.DC_BUS_COLS["voltage"]]),
+                )
+                self.converged = True
+                self.iterations = 1
+                for node in self.model.nodes:
+                    if getattr(node, "is_alive", False):
+                        node.voltage = 1.24
+                return 0
+
+        FakePowerFlowCalc.testcase = self
+        dc_se.DCPowerFlowCalc = FakePowerFlowCalc
+        try:
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=False,
+            )
+        finally:
+            dc_se.DCPowerFlowCalc = original_calc
+
+        self.assertEqual([True], calls)
+        self.assertTrue(estimator.power_flow_seed_converged)
+        voltage, _switch_current, _dcdc_power, _vgen_power = estimator._unpack_state(estimator.initial_state())
+        np.testing.assert_allclose(voltage[estimator.voltage_state_pos], 1.24)
+
     def test_estimate_uses_precomputed_observability_without_reanalysis(self):
         import secore.dc_se as dc_se
         from secore.dc_se import DCStateEstimator
