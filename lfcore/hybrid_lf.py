@@ -1,6 +1,4 @@
 ﻿import argparse
-import contextlib
-import io
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -185,14 +183,6 @@ class HybridLFResult:
     def has_acac(self) -> bool:
         return self.network is not None and len(self.network.acac_converters) > 0
 
-
-def _run_with_optional_output(verbose: bool, func, *args, **kwargs):
-    if verbose:
-        return func(*args, **kwargs)
-    with contextlib.redirect_stdout(io.StringIO()):
-        return func(*args, **kwargs)
-
-
 class HybridPowerFlowCalc:
     """统一交直流 Newton 求解器。
 
@@ -225,9 +215,21 @@ class HybridPowerFlowCalc:
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
         self.ac_calc = (
-            ACPowerFlowCalc(network._ac_ppc, parameters=self.params, linear_solver=self.linear_solver, result_mode=self.result_mode)
+            ACPowerFlowCalc(
+                network._ac_ppc,
+                parameters=self.params,
+                linear_solver=self.linear_solver,
+                result_mode=self.result_mode,
+                verbose=self.verbose,
+            )
             if self.has_ac and hasattr(network, "_ac_ppc")
-            else ACPowerFlowCalc(network.ac, parameters=self.params, linear_solver=self.linear_solver, result_mode=self.result_mode) if self.has_ac else None
+            else ACPowerFlowCalc(
+                network.ac,
+                parameters=self.params,
+                linear_solver=self.linear_solver,
+                result_mode=self.result_mode,
+                verbose=self.verbose,
+            ) if self.has_ac else None
         )
         if self.has_dc and hasattr(network, "_dc_ppc"):
             self.dc_calc = DCPowerFlowCalc(
@@ -259,6 +261,7 @@ class HybridPowerFlowCalc:
         self.total_eq = 0
         self.dc_G = None
         self.last_jacobian_shape = (0, 0)
+        self._residual_work = np.array([], dtype=np.float64)
         self._ac_node_obj_by_idx = {int(node.idx): node for node in getattr(network.ac, "nodes", [])}
         self._dc_node_obj_by_idx = {int(node.idx): node for node in getattr(network.dc, "nodes", [])}
         self._clear_dcac_arrays()
@@ -289,12 +292,13 @@ class HybridPowerFlowCalc:
         """Build the global hybrid state vector and block equation layout."""
         parts = []
         if self.ac_calc is not None:
-            _run_with_optional_output(self.verbose, self.ac_calc.prepare)
+            self.ac_calc.verbose = self.verbose
+            self.ac_calc.prepare()
             self.ac_size = self.ac_calc.total_vars
             self.ac_eq = self.ac_calc.total_eq
             parts.append(self.ac_calc.x.copy())
         if self.dc_calc is not None:
-            self.dc_G, dc_x = _run_with_optional_output(self.verbose, self.dc_calc.prepare)
+            self.dc_G, dc_x = self.dc_calc.prepare()
             self.dc_size = self.dc_calc.total_vars
             self.dc_eq = self.dc_calc.total_eq
             parts.append(dc_x.copy())
@@ -317,6 +321,7 @@ class HybridPowerFlowCalc:
         self.total_eq = self.acac_eq_start + self.N_acac * 4
         # Variable/equation order is block diagonal first, then converter coupling rows.
         self.last_jacobian_shape = (self.total_eq, self.total_vars)
+        self._residual_work = np.empty(self.total_eq, dtype=np.float64)
         self._cache_converter_jacobian_structure()
         self._cache_global_jacobian_pattern()
         if self.verbose:
@@ -760,7 +765,7 @@ class HybridPowerFlowCalc:
         if self.N_acac:
             parts.append(self._append_acac_residuals(ac_f, acac_x, ac_V))
 
-    def _append_dcac_residuals(self, ac_f, dc_f, dcac_x, ac_V, dc_V):
+    def _append_dcac_residuals(self, ac_f, dc_f, dcac_x, ac_V, dc_V, out=None):
         """Mutate AC/DC nodal residuals and return DC/AC converter residual rows."""
         dcac = dcac_x.reshape(self.N_dcac, 3)
         dc_p = dcac[:, 0]
@@ -776,14 +781,14 @@ class HybridPowerFlowCalc:
         vd = dc_V[self.dcac_dc_pos]
         va2 = va * va
         vd2 = vd * vd
-        dcac_f = np.empty(self.N_dcac * 3, dtype=np.float64)
+        dcac_f = out if out is not None else np.empty(self.N_dcac * 3, dtype=np.float64)
         # r1+r2 converter loss equation in per-unit power/voltage variables.
         dcac_f[0::3] = (
             vd2 * va2 * (dc_p + ac_p)
             - self.dcac_r1 * dc_p * dc_p * va2
             - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
         )
-        f_ctrl = np.empty(self.N_dcac, dtype=np.float64)
+        f_ctrl = dcac_f[1::3]
         f_ctrl[self.dcac_ctrl_dc_v_mask] = (
             vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
         )
@@ -797,7 +802,7 @@ class HybridPowerFlowCalc:
         dcac_f[2::3] = ac_q - self.dcac_q_ac_set
         return dcac_f
 
-    def _append_acac_residuals(self, ac_f, acac_x, ac_V):
+    def _append_acac_residuals(self, ac_f, acac_x, ac_V, out=None):
         """Mutate AC nodal residuals and return AC/AC converter residual rows."""
         acac = acac_x.reshape(self.N_acac, 4)
         i_p = acac[:, 0]
@@ -814,15 +819,15 @@ class HybridPowerFlowCalc:
         vj = ac_V[self.acac_j_pos]
         vi2 = vi * vi
         vj2 = vj * vj
-        acac_f = np.empty(self.N_acac * 4, dtype=np.float64)
+        acac_f = out if out is not None else np.empty(self.N_acac * 4, dtype=np.float64)
         acac_f[0::4] = (
             vi2 * vj2 * (i_p + j_p)
             - self.acac_r1 * (i_p * i_p + i_q * i_q) * vj2
             - self.acac_r2 * (j_p * j_p + j_q * j_q) * vi2
         )
         acac_f[1::4] = i_p - self.acac_p_set
-        f2 = np.empty(self.N_acac, dtype=np.float64)
-        f3 = np.empty(self.N_acac, dtype=np.float64)
+        f2 = acac_f[2::4]
+        f3 = acac_f[3::4]
         f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
         f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
         f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
@@ -831,23 +836,40 @@ class HybridPowerFlowCalc:
         acac_f[3::4] = f3
         return acac_f
 
+    def _fill_residual_work(self, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V):
+        """Fill the preallocated global residual vector and return it."""
+        if self._residual_work.size != self.total_eq:
+            self._residual_work = np.empty(self.total_eq, dtype=np.float64)
+        F = self._residual_work
+        ac_view = None
+        dc_view = None
+        if self.ac_eq:
+            ac_view = F[:self.ac_eq]
+            ac_view[:] = ac_f
+        if self.dc_eq:
+            dc_view = F[self.ac_eq:self.ac_eq + self.dc_eq]
+            dc_view[:] = dc_f
+        if self.N_dcac:
+            dcac_view = F[self.dcac_eq_start:self.acac_eq_start]
+            self._append_dcac_residuals(ac_view, dc_view, dcac_x, ac_V, dc_V, out=dcac_view)
+        if self.N_acac:
+            acac_view = F[self.acac_eq_start:self.total_eq]
+            self._append_acac_residuals(ac_view, acac_x, ac_V, out=acac_view)
+        return F
+
     def get_f(self, x):
         """Assemble global residuals for AC, DC, DCAC and ACAC equations."""
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
-        parts = []
         ac_f = None
         dc_f = None
         if self.ac_calc is not None:
             ac_f = self.ac_calc.get_f(ac_x)
-            parts.append(ac_f)
         if self.dc_calc is not None:
             dc_f = self.dc_calc.get_f(dc_x)
-            parts.append(dc_f)
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
-        self._append_converter_residuals(parts, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
-        return np.concatenate(parts)
+        return self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
 
     def get_jacobi(self, x):
         """Build the global sparse Jacobian from sub-solver blocks plus converter couplings."""
@@ -1009,22 +1031,18 @@ class HybridPowerFlowCalc:
     def _build_newton_system(self, x):
         """Build residual and Jacobian together, reusing AC/DC sub-solver caches."""
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
-        parts = []
         ac_f = ac_j = None
         dc_f = dc_j = None
         if self.ac_calc is not None:
             ac_f, ac_j = self.ac_calc._build_newton_system(ac_x)
-            parts.append(ac_f)
         if self.dc_calc is not None:
             dc_f, dc_j = self.dc_calc._build_newton_system(self.dc_G, dc_x)
-            parts.append(dc_f)
 
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
-        self._append_converter_residuals(parts, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
 
-        F = np.concatenate(parts)
+        F = self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
         J = self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j, ac_V, dc_V)
         return F, J
 
@@ -1487,8 +1505,8 @@ def run_hybrid_power_flow(
     if ac_errors or dc_errors:
         return _hybrid_result_from_calc(calc, -1, ac_warnings, ac_errors, dc_warnings, dc_errors)
 
-    _run_with_optional_output(verbose, calc.prepare)
-    rc = _run_with_optional_output(verbose, calc.run)
+    calc.prepare()
+    rc = calc.run()
     return _hybrid_result_from_calc(calc, rc, ac_warnings, ac_errors, dc_warnings, dc_errors)
 
 
@@ -1580,8 +1598,8 @@ def main(argv=None) -> int:
         linear_solver=args.linear_solver,
         result_mode=args.result_mode,
     )
-    _run_with_optional_output(verbose, calc.prepare)
-    rc = _run_with_optional_output(verbose, calc.run)
+    calc.prepare()
+    rc = calc.run()
     result = _hybrid_result_from_calc(calc, rc)
     if not args.quiet and isinstance(result, HybridLFResult):
         print_hybrid_result(result)

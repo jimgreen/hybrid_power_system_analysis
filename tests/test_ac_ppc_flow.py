@@ -332,6 +332,10 @@ class ACPPCFlowTest(unittest.TestCase):
 
         self.assertIn("load_ac_ppc_from_e_file(args.file)", main_block)
         self.assertIn("ACPowerFlowCalc(", main_block)
+        self.assertIn("verbose=not args.quiet", main_block)
+        self.assertIn("calc.prepare()", main_block)
+        self.assertIn("calc.run()", main_block)
+        self.assertNotIn("_run_with_optional_output", main_block)
         self.assertNotIn("ACPowerFlowCalc.from_e_file", main_block)
         self.assertNotIn("read_from_file", main_block)
         self.assertNotIn("ACPowerNetwork", main_block)
@@ -519,6 +523,41 @@ class ACPPCFlowTest(unittest.TestCase):
             ac_lf.vstack = original_vstack
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+    def test_ppc_zero_branch_jacobian_uses_precomputed_kind_groups(self):
+        from hybrid_array_model import build_hybrid_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        self.assertGreater(calc.N_phi, 0)
+        expected = calc.get_jacobi(calc.x).toarray()
+
+        def reject_kind_mask_dispatch(*_args, **_kwargs):
+            raise AssertionError("zero-branch Jacobian should use precomputed kind groups")
+
+        calc._fill_indexed_kind_data = reject_kind_mask_dispatch
+        actual = calc.get_jacobi(calc.x).toarray()
+
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+    def test_verbose_false_suppresses_ac_prepare_and_iteration_output(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "ac" / "ieee300.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="none", verbose=False)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            calc.prepare()
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertEqual("", captured.getvalue())
 
     def test_result_mode_skips_full_ac_result_backfill(self):
         from ac_array_model import build_ac_ppc_from_e_file

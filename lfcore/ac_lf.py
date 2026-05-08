@@ -1,6 +1,4 @@
 import argparse
-import contextlib
-import io
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -248,6 +246,7 @@ class ACPowerFlowCalc:
         keep_node_objects: bool = True,
         linear_solver: str = "scipy",
         result_mode: str = "full",
+        verbose: bool = False,
     ):
         # 基础配置
         algorithm = str(algorithm).strip().lower()
@@ -278,6 +277,7 @@ class ACPowerFlowCalc:
         self.used_algorithm = algorithm
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self.result_mode = self._normalize_result_mode(result_mode)
+        self.verbose = bool(verbose)
         self.target_island = island
         self.skipped_islands: List = []
         self.calc_islands: List = []
@@ -368,6 +368,29 @@ class ACPowerFlowCalc:
         self.zero_bottom_right_rows = np.array([], dtype=np.int32)
         self.zero_bottom_right_cols = np.array([], dtype=np.int32)
         self.zero_bottom_right_data = np.array([], dtype=np.float64)
+        self.zero_top_left_pos_by_kind = ()
+        self.zero_top_left_edge_by_kind = ()
+        self.zero_top_right_pos_by_kind = ()
+        self.zero_top_right_edge_by_kind = ()
+        self.zero_bottom_left_pos_by_kind = ()
+        self.zero_bottom_left_node_by_kind = ()
+        self._zero_I_re = np.array([], dtype=np.float64)
+        self._zero_I_im = np.array([], dtype=np.float64)
+        self._zero_Va = np.array([], dtype=np.float64)
+        self._zero_Vb = np.array([], dtype=np.float64)
+        self._zero_cos_a = np.array([], dtype=np.float64)
+        self._zero_sin_a = np.array([], dtype=np.float64)
+        self._zero_cos_b = np.array([], dtype=np.float64)
+        self._zero_sin_b = np.array([], dtype=np.float64)
+        self._zero_a_pv = np.array([], dtype=np.float64)
+        self._zero_a_pt = np.array([], dtype=np.float64)
+        self._zero_b_pv = np.array([], dtype=np.float64)
+        self._zero_b_pt = np.array([], dtype=np.float64)
+        self._zero_va_cos = np.array([], dtype=np.float64)
+        self._zero_va_sin = np.array([], dtype=np.float64)
+        self._zero_vb_cos = np.array([], dtype=np.float64)
+        self._zero_vb_sin = np.array([], dtype=np.float64)
+        self._zero_tmp = np.array([], dtype=np.float64)
         self.pq_theta_rows = np.array([], dtype=np.int32)
         self.pq_v_cols = np.array([], dtype=np.int32)
         self.Y_diag = np.array([], dtype=np.complex128)
@@ -729,7 +752,8 @@ class ACPowerFlowCalc:
             if self.algorithm == "pq" and self.pq_Bp is None:
                 self._cache_pq_decoupled_matrices()
             self._bind_ppc_nodes_to_network()
-            print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
+            if self.verbose:
+                print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
             return
 
         bus = np.asarray(ppc["bus"], dtype=np.float64)
@@ -838,7 +862,8 @@ class ACPowerFlowCalc:
         self._prepare_ppc_zero_edges(zero_branch, switch, active_bus, breaker)
         self._finalize_prepared_arrays()
         self._store_ppc_static()
-        print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
+        if self.verbose:
+            print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
 
     def _store_ppc_static(self):
         """Cache immutable ppc preparation artifacts on the ppc for repeated solves."""
@@ -1081,6 +1106,7 @@ class ACPowerFlowCalc:
         self.zero_bottom_right_data = static["zero_bottom_right_data"].copy()
         self.full_jac_raw_data = static["full_jac_raw_data"].copy()
         self.full_jac_csr_data = static["full_jac_csr_data"].copy()
+        self._cache_zero_jacobian_runtime_arrays()
         self._state_x_obj = None
         self._power_x_obj = None
         self._last_Ibus = None
@@ -1488,6 +1514,80 @@ class ACPowerFlowCalc:
             self._jac_common_q = np.empty(y_nnz, dtype=np.float64)
             self._jac_tmp = np.empty(y_nnz, dtype=np.float64)
 
+    @staticmethod
+    def _group_indices_by_kind(kind, source_index, n_kind):
+        """Group data positions and source indices once, avoiding per-iteration masks."""
+        empty_groups = tuple(np.array([], dtype=np.intp) for _ in range(n_kind))
+        if kind.size == 0:
+            return empty_groups, empty_groups
+        pos_groups = []
+        index_groups = []
+        for code in range(n_kind):
+            pos = np.flatnonzero(kind == code).astype(np.intp, copy=False)
+            pos_groups.append(pos)
+            if pos.size:
+                index_groups.append(source_index[pos].astype(np.intp, copy=False))
+            else:
+                index_groups.append(np.array([], dtype=np.intp))
+        return tuple(pos_groups), tuple(index_groups)
+
+    def _cache_zero_jacobian_runtime_arrays(self):
+        """Cache runtime grouping and work arrays for zero-impedance Jacobian refresh."""
+        self.zero_top_left_pos_by_kind, self.zero_top_left_edge_by_kind = self._group_indices_by_kind(
+            self.zero_top_left_kind,
+            self.zero_top_left_edge,
+            8,
+        )
+        self.zero_top_right_pos_by_kind, self.zero_top_right_edge_by_kind = self._group_indices_by_kind(
+            self.zero_top_right_kind,
+            self.zero_top_right_edge,
+            16,
+        )
+        self.zero_bottom_left_pos_by_kind, self.zero_bottom_left_node_by_kind = self._group_indices_by_kind(
+            self.zero_bottom_left_kind,
+            self.zero_bottom_left_node,
+            8,
+        )
+
+        n_edge = int(self.zero_a.size)
+        if n_edge == 0:
+            self._zero_I_re = np.array([], dtype=np.float64)
+            self._zero_I_im = np.array([], dtype=np.float64)
+            self._zero_Va = np.array([], dtype=np.float64)
+            self._zero_Vb = np.array([], dtype=np.float64)
+            self._zero_cos_a = np.array([], dtype=np.float64)
+            self._zero_sin_a = np.array([], dtype=np.float64)
+            self._zero_cos_b = np.array([], dtype=np.float64)
+            self._zero_sin_b = np.array([], dtype=np.float64)
+            self._zero_a_pv = np.array([], dtype=np.float64)
+            self._zero_a_pt = np.array([], dtype=np.float64)
+            self._zero_b_pv = np.array([], dtype=np.float64)
+            self._zero_b_pt = np.array([], dtype=np.float64)
+            self._zero_va_cos = np.array([], dtype=np.float64)
+            self._zero_va_sin = np.array([], dtype=np.float64)
+            self._zero_vb_cos = np.array([], dtype=np.float64)
+            self._zero_vb_sin = np.array([], dtype=np.float64)
+            self._zero_tmp = np.array([], dtype=np.float64)
+            return
+
+        self._zero_I_re = np.empty(n_edge, dtype=np.float64)
+        self._zero_I_im = np.empty(n_edge, dtype=np.float64)
+        self._zero_Va = np.empty(n_edge, dtype=np.float64)
+        self._zero_Vb = np.empty(n_edge, dtype=np.float64)
+        self._zero_cos_a = np.empty(n_edge, dtype=np.float64)
+        self._zero_sin_a = np.empty(n_edge, dtype=np.float64)
+        self._zero_cos_b = np.empty(n_edge, dtype=np.float64)
+        self._zero_sin_b = np.empty(n_edge, dtype=np.float64)
+        self._zero_a_pv = np.empty(n_edge, dtype=np.float64)
+        self._zero_a_pt = np.empty(n_edge, dtype=np.float64)
+        self._zero_b_pv = np.empty(n_edge, dtype=np.float64)
+        self._zero_b_pt = np.empty(n_edge, dtype=np.float64)
+        self._zero_va_cos = np.empty(n_edge, dtype=np.float64)
+        self._zero_va_sin = np.empty(n_edge, dtype=np.float64)
+        self._zero_vb_cos = np.empty(n_edge, dtype=np.float64)
+        self._zero_vb_sin = np.empty(n_edge, dtype=np.float64)
+        self._zero_tmp = np.empty(n_edge, dtype=np.float64)
+
     def _cache_zero_jacobian_pattern(self):
         """Cache fixed zero-impedance Jacobian coordinates for Newton iterations."""
         self.zero_top_left_rows = np.array([], dtype=np.int32)
@@ -1508,6 +1608,7 @@ class ACPowerFlowCalc:
         self.zero_bottom_right_rows = np.array([], dtype=np.int32)
         self.zero_bottom_right_cols = np.array([], dtype=np.int32)
         self.zero_bottom_right_data = np.array([], dtype=np.float64)
+        self._cache_zero_jacobian_runtime_arrays()
 
         if self.N_phi <= 0:
             return
@@ -1654,6 +1755,7 @@ class ACPowerFlowCalc:
         self.zero_bottom_right_rows = np.asarray(bottom_right_rows, dtype=np.int32)
         self.zero_bottom_right_cols = np.asarray(bottom_right_cols, dtype=np.int32)
         self.zero_bottom_right_data = np.ones(len(bottom_right_rows), dtype=np.float64)
+        self._cache_zero_jacobian_runtime_arrays()
 
     def _cache_full_jacobian_pattern(self):
         """Precompute the full AC Jacobian CSR pattern for standard and zero-branch blocks."""
@@ -1904,7 +2006,8 @@ class ACPowerFlowCalc:
         self._cache_pq_decoupled_matrices()
 
         # 维度校验
-        print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
+        if self.verbose:
+            print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
         if self.total_vars != self.total_eq:
             warnings.warn(f"变量数({self.total_vars})与方程数({self.total_eq})不匹配！")
 
@@ -2632,92 +2735,151 @@ class ACPowerFlowCalc:
             shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
         ).tocsr()
 
-    @staticmethod
-    def _fill_indexed_kind_data(out, kind, source_index, sources):
-        for code, values in enumerate(sources):
-            mask = kind == code
-            if np.any(mask):
-                out[mask] = values[source_index[mask]]
+    def _refresh_zero_edge_jacobian_work(self, V, phi_re, phi_im, cos_theta, sin_theta):
+        """Refresh zero-edge workspace arrays shared by top-left and top-right blocks."""
+        if not self.zero_a.size:
+            return
+        I_re = self._zero_I_re
+        I_im = self._zero_I_im
+        tmp = self._zero_tmp
+
+        np.take(phi_re, self.zero_phi_a, out=I_re)
+        np.take(phi_re, self.zero_phi_b, out=tmp)
+        I_re -= tmp
+        np.take(phi_im, self.zero_phi_a, out=I_im)
+        np.take(phi_im, self.zero_phi_b, out=tmp)
+        I_im -= tmp
+
+        Va = self._zero_Va
+        Vb = self._zero_Vb
+        cos_a = self._zero_cos_a
+        sin_a = self._zero_sin_a
+        cos_b = self._zero_cos_b
+        sin_b = self._zero_sin_b
+        np.take(V, self.zero_a, out=Va)
+        np.take(V, self.zero_b, out=Vb)
+        np.take(cos_theta, self.zero_a, out=cos_a)
+        np.take(sin_theta, self.zero_a, out=sin_a)
+        np.take(cos_theta, self.zero_b, out=cos_b)
+        np.take(sin_theta, self.zero_b, out=sin_b)
+
+        a_pv = self._zero_a_pv
+        a_pt = self._zero_a_pt
+        b_pv = self._zero_b_pv
+        b_pt = self._zero_b_pt
+        np.multiply(cos_a, I_re, out=a_pv)
+        np.multiply(sin_a, I_im, out=tmp)
+        a_pv += tmp
+        np.multiply(sin_a, I_re, out=a_pt)
+        a_pt *= -1.0
+        np.multiply(cos_a, I_im, out=tmp)
+        a_pt += tmp
+        np.multiply(cos_b, I_re, out=b_pv)
+        np.multiply(sin_b, I_im, out=tmp)
+        b_pv += tmp
+        np.multiply(sin_b, I_re, out=b_pt)
+        np.multiply(cos_b, I_im, out=tmp)
+        b_pt -= tmp
+
+        np.multiply(Va, cos_a, out=self._zero_va_cos)
+        np.multiply(Va, sin_a, out=self._zero_va_sin)
+        np.multiply(Vb, cos_b, out=self._zero_vb_cos)
+        np.multiply(Vb, sin_b, out=self._zero_vb_sin)
 
     def _fill_zero_top_jacobian_data(self, V, phi_re, phi_im, cos_theta, sin_theta):
         if not self.zero_a.size:
             return
-        I_re = phi_re[self.zero_phi_a] - phi_re[self.zero_phi_b]
-        I_im = phi_im[self.zero_phi_a] - phi_im[self.zero_phi_b]
-        Va = V[self.zero_a]
-        Vb = V[self.zero_b]
-        cos_a = cos_theta[self.zero_a]
-        sin_a = sin_theta[self.zero_a]
-        cos_b = cos_theta[self.zero_b]
-        sin_b = sin_theta[self.zero_b]
-        a_pv = cos_a * I_re + sin_a * I_im
-        a_pt = -sin_a * I_re + cos_a * I_im
-        b_pv = cos_b * I_re + sin_b * I_im
-        b_pt = sin_b * I_re - cos_b * I_im
+        self._refresh_zero_edge_jacobian_work(V, phi_re, phi_im, cos_theta, sin_theta)
+        Va = self._zero_Va
+        Vb = self._zero_Vb
+        a_pv = self._zero_a_pv
+        a_pt = self._zero_a_pt
+        b_pv = self._zero_b_pv
+        b_pt = self._zero_b_pt
 
         if self.zero_top_left_data.size:
-            self._fill_indexed_kind_data(
-                self.zero_top_left_data,
-                self.zero_top_left_kind,
-                self.zero_top_left_edge,
-                (
-                    Va * a_pt,
-                    a_pv,
-                    Va * a_pv,
-                    -a_pt,
-                    Vb * b_pt,
-                    -b_pv,
-                    -Vb * b_pv,
-                    -b_pt,
-                ),
-            )
+            data = self.zero_top_left_data
+            pos = self.zero_top_left_pos_by_kind
+            edge = self.zero_top_left_edge_by_kind
+            if pos[0].size:
+                data[pos[0]] = Va[edge[0]] * a_pt[edge[0]]
+            if pos[1].size:
+                data[pos[1]] = a_pv[edge[1]]
+            if pos[2].size:
+                data[pos[2]] = Va[edge[2]] * a_pv[edge[2]]
+            if pos[3].size:
+                data[pos[3]] = -a_pt[edge[3]]
+            if pos[4].size:
+                data[pos[4]] = Vb[edge[4]] * b_pt[edge[4]]
+            if pos[5].size:
+                data[pos[5]] = -b_pv[edge[5]]
+            if pos[6].size:
+                data[pos[6]] = -Vb[edge[6]] * b_pv[edge[6]]
+            if pos[7].size:
+                data[pos[7]] = -b_pt[edge[7]]
         if self.zero_top_right_data.size:
-            Va_cos = Va * cos_a
-            Va_sin = Va * sin_a
-            Vb_cos = Vb * cos_b
-            Vb_sin = Vb * sin_b
-            self._fill_indexed_kind_data(
-                self.zero_top_right_data,
-                self.zero_top_right_kind,
-                self.zero_top_right_edge,
-                (
-                    Va_cos,
-                    Va_sin,
-                    -Va_cos,
-                    -Va_sin,
-                    Va_sin,
-                    -Va_cos,
-                    -Va_sin,
-                    Va_cos,
-                    -Vb_cos,
-                    -Vb_sin,
-                    Vb_cos,
-                    Vb_sin,
-                    -Vb_sin,
-                    Vb_cos,
-                    Vb_sin,
-                    -Vb_cos,
-                ),
-            )
+            data = self.zero_top_right_data
+            pos = self.zero_top_right_pos_by_kind
+            edge = self.zero_top_right_edge_by_kind
+            Va_cos = self._zero_va_cos
+            Va_sin = self._zero_va_sin
+            Vb_cos = self._zero_vb_cos
+            Vb_sin = self._zero_vb_sin
+            if pos[0].size:
+                data[pos[0]] = Va_cos[edge[0]]
+            if pos[1].size:
+                data[pos[1]] = Va_sin[edge[1]]
+            if pos[2].size:
+                data[pos[2]] = -Va_cos[edge[2]]
+            if pos[3].size:
+                data[pos[3]] = -Va_sin[edge[3]]
+            if pos[4].size:
+                data[pos[4]] = Va_sin[edge[4]]
+            if pos[5].size:
+                data[pos[5]] = -Va_cos[edge[5]]
+            if pos[6].size:
+                data[pos[6]] = -Va_sin[edge[6]]
+            if pos[7].size:
+                data[pos[7]] = Va_cos[edge[7]]
+            if pos[8].size:
+                data[pos[8]] = -Vb_cos[edge[8]]
+            if pos[9].size:
+                data[pos[9]] = -Vb_sin[edge[9]]
+            if pos[10].size:
+                data[pos[10]] = Vb_cos[edge[10]]
+            if pos[11].size:
+                data[pos[11]] = Vb_sin[edge[11]]
+            if pos[12].size:
+                data[pos[12]] = -Vb_sin[edge[12]]
+            if pos[13].size:
+                data[pos[13]] = Vb_cos[edge[13]]
+            if pos[14].size:
+                data[pos[14]] = Vb_sin[edge[14]]
+            if pos[15].size:
+                data[pos[15]] = -Vb_cos[edge[15]]
 
     def _fill_zero_bottom_jacobian_data(self, V, cos_theta, sin_theta):
         if not self.zero_bottom_left_data.size:
             return
-        self._fill_indexed_kind_data(
-            self.zero_bottom_left_data,
-            self.zero_bottom_left_kind,
-            self.zero_bottom_left_node,
-            (
-                -V * sin_theta,
-                cos_theta,
-                V * sin_theta,
-                -cos_theta,
-                V * cos_theta,
-                sin_theta,
-                -V * cos_theta,
-                -sin_theta,
-            ),
-        )
+        data = self.zero_bottom_left_data
+        pos = self.zero_bottom_left_pos_by_kind
+        node = self.zero_bottom_left_node_by_kind
+        if pos[0].size:
+            data[pos[0]] = -V[node[0]] * sin_theta[node[0]]
+        if pos[1].size:
+            data[pos[1]] = cos_theta[node[1]]
+        if pos[2].size:
+            data[pos[2]] = V[node[2]] * sin_theta[node[2]]
+        if pos[3].size:
+            data[pos[3]] = -cos_theta[node[3]]
+        if pos[4].size:
+            data[pos[4]] = V[node[4]] * cos_theta[node[4]]
+        if pos[5].size:
+            data[pos[5]] = sin_theta[node[5]]
+        if pos[6].size:
+            data[pos[6]] = -V[node[6]] * cos_theta[node[6]]
+        if pos[7].size:
+            data[pos[7]] = -sin_theta[node[7]]
 
     def get_jacobi(self, x: np.ndarray) -> csr_matrix:
         """计算雅可比矩阵。标准AC部分使用稀疏矩阵批量公式，零阻抗扩展按块追加。"""
@@ -2817,7 +2979,8 @@ class ACPowerFlowCalc:
         if self.algorithm == "pq" and self.N_phi == 0 and self.pq_Bp is not None and self.pq_Bpp is not None:
             return self._run_pq_decoupled()
         if self.algorithm == "pq":
-            print("PQ分解法不支持当前零阻抗扩展模型，自动回退到N-R法")
+            if self.verbose:
+                print("PQ分解法不支持当前零阻抗扩展模型，自动回退到N-R法")
             return self._run_newton_raphson(used_label="pq->nr")
         return self._run_newton_raphson()
 
@@ -2834,11 +2997,13 @@ class ACPowerFlowCalc:
             # 单轮内合并残差和 Jacobian 数值块计算，复用 YV/Sbus 等中间量。
             F, J = self._build_newton_system(x)
             self.normF = np.linalg.norm(F, np.inf)
-            print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
+            if self.verbose:
+                print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
 
             # 收敛判断
             if self.normF < self.tol:
-                print(f"收敛于第 {it + 1} 次迭代")
+                if self.verbose:
+                    print(f"收敛于第 {it + 1} 次迭代")
                 self.converged = True
                 self.x = x
                 self._write_back()
@@ -2849,7 +3014,8 @@ class ACPowerFlowCalc:
             x -= delta
 
         # 未收敛
-        print(f"达到最大迭代次数 {self.max_iter}，未收敛")
+        if self.verbose:
+            print(f"达到最大迭代次数 {self.max_iter}，未收敛")
         self.x = x
         self._write_back()
         return -1
@@ -2874,10 +3040,12 @@ class ACPowerFlowCalc:
                 float(np.linalg.norm(p_mis, np.inf)) if p_mis.size else 0.0,
                 float(np.linalg.norm(q_mis, np.inf)) if q_mis.size else 0.0,
             )
-            print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
+            if self.verbose:
+                print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
 
             if self.normF < self.tol:
-                print(f"PQ分解法收敛于第 {it + 1} 次迭代")
+                if self.verbose:
+                    print(f"PQ分解法收敛于第 {it + 1} 次迭代")
                 self.converged = True
                 self.x = x
                 self._write_back()
@@ -2907,7 +3075,8 @@ class ACPowerFlowCalc:
                 x[v_slice] -= dV
                 np.maximum(x[v_slice], self.min_voltage, out=x[v_slice])
 
-        print(f"PQ分解法达到最大迭代次数 {self.max_iter}，未收敛，改用N-R法")
+        if self.verbose:
+            print(f"PQ分解法达到最大迭代次数 {self.max_iter}，未收敛，改用N-R法")
         self.x = x0
         return self._run_newton_raphson(used_label="pq->nr")
 
@@ -3588,13 +3757,6 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     print(f"   总网损: {total_loss:.6f} pu (支路: {p_loss_br:.6f} pu, 变压器: {p_loss_tr:.6f} pu, 并联电导: {p_loss_gs:.6f} pu)")
 
 
-def _run_with_optional_output(emit_output: bool, func, *args, **kwargs):
-    if emit_output:
-        return func(*args, **kwargs)
-    with contextlib.redirect_stdout(io.StringIO()):
-        return func(*args, **kwargs)
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="AC power flow")
     parser.add_argument("file", nargs="?", default=str(ROOT_DIR / "data" / "ac" / "ieee300.e"), help="AC E file path")
@@ -3618,10 +3780,11 @@ def main(argv=None) -> int:
         algorithm=args.algorithm,
         linear_solver=args.linear_solver,
         result_mode=args.result_mode,
+        verbose=not args.quiet,
     )
     verbose = not args.quiet
-    _run_with_optional_output(verbose, calc.prepare)
-    rc = _run_with_optional_output(verbose, calc.run)
+    calc.prepare()
+    rc = calc.run()
     if not args.quiet and calc.result_mode == "full":
         print_ac_result(calc, rc)
     elif not args.quiet:

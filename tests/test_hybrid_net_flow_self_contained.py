@@ -136,6 +136,65 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
 
+    def test_hybrid_residual_reuses_preallocated_work_array(self):
+        import numpy as np
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(
+            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+        )
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        expected_f = calc.get_f(calc.x).copy()
+        self.assertEqual(calc.total_eq, expected_f.size)
+
+        original_concatenate = hybrid_lf.np.concatenate
+
+        def reject_concatenate(*_args, **_kwargs):
+            raise AssertionError("Hybrid residual should reuse preallocated F workspace")
+
+        hybrid_lf.np.concatenate = reject_concatenate
+        try:
+            actual_f = calc.get_f(calc.x)
+            combined_f, jac = calc._build_newton_system(calc.x)
+        finally:
+            hybrid_lf.np.concatenate = original_concatenate
+
+        self.assertIs(actual_f, calc._residual_work)
+        self.assertIs(combined_f, calc._residual_work)
+        np.testing.assert_allclose(actual_f, expected_f, atol=1e-12)
+        np.testing.assert_allclose(combined_f, expected_f, atol=1e-12)
+        self.assertEqual(jac.shape, (calc.total_eq, calc.total_vars))
+
+    def test_hybrid_verbose_false_avoids_stdout_redirect_wrappers(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(
+            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+        )
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+
+        original_runner = getattr(hybrid_lf, "_run_with_optional_output", None)
+
+        def reject_output_wrapper(*_args, **_kwargs):
+            raise AssertionError("Hybrid quiet path should call quiet sub-solvers directly")
+
+        if original_runner is not None:
+            hybrid_lf._run_with_optional_output = reject_output_wrapper
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                calc.prepare()
+                rc = calc.run()
+        finally:
+            if original_runner is not None:
+                hybrid_lf._run_with_optional_output = original_runner
+
+        self.assertEqual(0, rc)
+        self.assertEqual("", captured.getvalue())
+
     def test_hybrid_newton_uses_shared_sparse_solver(self):
         import lfcore.hybrid_lf as hybrid_lf
 
