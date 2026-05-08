@@ -1,0 +1,261 @@
+from dataclasses import asdict, dataclass, field
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from model.meas_model import BadDataItem, EstimateResult, Measurement
+
+
+class _MeasurementResultTable:
+    __slots__ = ("rows",)
+
+    def __init__(self, rows: Optional[Iterable["SEResult.MeasurementRow"]] = None) -> None:
+        self.rows = list(rows or ())
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __getitem__(self, index: int):
+        return self.rows[index]
+
+    def append(
+        self,
+        measurement: Measurement,
+        *,
+        estimated_value: Optional[float] = None,
+        residual: Optional[float] = None,
+        normalized_residual: Optional[float] = None,
+        reason: str = "",
+        source: str = "",
+    ) -> None:
+        self.rows.append(
+            SEResult.MeasurementRow.from_measurement(
+                measurement,
+                estimated_value=estimated_value,
+                residual=residual,
+                normalized_residual=normalized_residual,
+                reason=reason,
+                source=source,
+            )
+        )
+
+    def append_row(self, row: "SEResult.MeasurementRow") -> None:
+        self.rows.append(row)
+
+    def extend(self, rows: Iterable["SEResult.MeasurementRow"]) -> None:
+        self.rows.extend(rows)
+
+    def to_dicts(self) -> List[dict]:
+        return [asdict(row) for row in self.rows]
+
+
+@dataclass
+class SEResult:
+    @dataclass
+    class StatisticsTable:
+        converged: bool = False
+        iterations: int = 0
+        objective: float = 0.0
+        max_correction: float = 0.0
+        residual_inf: float = 0.0
+        observable: bool = False
+        rank: int = 0
+        state_count: int = 0
+        measurement_count: int = 0
+        deficiency: int = 0
+        prefiltered_measurement_count: int = 0
+        pseudo_measurement_count: int = 0
+        bad_data_count: int = 0
+        normal_measurement_count: int = 0
+
+    @dataclass
+    class MeasurementRow:
+        idx: int
+        name: str
+        device_type: str
+        device_name: str
+        meas_type: str
+        weight: float
+        valid: bool
+        value: float
+        estimated_value: Optional[float] = None
+        residual: Optional[float] = None
+        normalized_residual: Optional[float] = None
+        reason: str = ""
+        source: str = ""
+
+        @classmethod
+        def from_measurement(
+            cls,
+            measurement: Measurement,
+            *,
+            estimated_value: Optional[float] = None,
+            residual: Optional[float] = None,
+            normalized_residual: Optional[float] = None,
+            reason: str = "",
+            source: str = "",
+        ) -> "SEResult.MeasurementRow":
+            return cls(
+                idx=int(measurement.idx),
+                name=str(measurement.name),
+                device_type=str(measurement.device_type),
+                device_name=str(measurement.device_name),
+                meas_type=str(measurement.meas_type),
+                weight=float(measurement.weight),
+                valid=bool(measurement.valid),
+                value=float(measurement.value),
+                estimated_value=None if estimated_value is None else float(estimated_value),
+                residual=None if residual is None else float(residual),
+                normalized_residual=None if normalized_residual is None else float(normalized_residual),
+                reason=str(reason),
+                source=str(source),
+            )
+
+    class PrefilteredMeasurementTable(_MeasurementResultTable):
+        pass
+
+    class PseudoMeasurementTable(_MeasurementResultTable):
+        pass
+
+    class BadDataTable(_MeasurementResultTable):
+        def append_bad_data_item(self, item: BadDataItem) -> None:
+            self.append(
+                item.measurement,
+                estimated_value=item.estimated_value,
+                residual=item.residual,
+                normalized_residual=item.normalized_residual,
+                source="bad_data",
+            )
+
+    class NormalMeasurementTable(_MeasurementResultTable):
+        pass
+
+    statistics: StatisticsTable = field(default_factory=lambda: SEResult.StatisticsTable())
+    prefiltered_measurements: PrefilteredMeasurementTable = field(
+        default_factory=lambda: SEResult.PrefilteredMeasurementTable()
+    )
+    pseudo_measurements: PseudoMeasurementTable = field(default_factory=lambda: SEResult.PseudoMeasurementTable())
+    bad_data: BadDataTable = field(default_factory=lambda: SEResult.BadDataTable())
+    normal_measurements: NormalMeasurementTable = field(default_factory=lambda: SEResult.NormalMeasurementTable())
+
+    @staticmethod
+    def _is_pseudo_measurement(measurement: Measurement) -> bool:
+        return str(measurement.name).startswith("pseudo_")
+
+    @staticmethod
+    def _prefiltered_reason(measurement: Measurement) -> str:
+        if not bool(measurement.valid):
+            return "invalid"
+        if float(measurement.weight) <= 0.0:
+            return "zero weight"
+        return ""
+
+    @classmethod
+    def from_estimate_result(
+        cls,
+        result: EstimateResult,
+        *,
+        bad_items: Optional[Sequence[BadDataItem]] = None,
+        normalized_residual: Optional[Sequence[float]] = None,
+        prefiltered_measurements: Optional[Iterable[object]] = None,
+        all_measurements: Optional[Iterable[Measurement]] = None,
+    ) -> "SEResult":
+        se_result = cls()
+        bad_items = list(bad_items or ())
+        normalized = np.asarray(normalized_residual, dtype=np.float64) if normalized_residual is not None else None
+        measurement_ids = {id(meas) for meas in result.measurements}
+        bad_ids = {id(item.measurement) for item in bad_items}
+        bad_indexes = {int(item.measurement.idx) for item in bad_items}
+
+        prefiltered_rows = cls._normalize_prefiltered_rows(
+            prefiltered_measurements,
+            all_measurements,
+            measurement_ids,
+        )
+        for measurement, reason in prefiltered_rows:
+            se_result.prefiltered_measurements.append(measurement, reason=reason, source="prefiltered")
+
+        for pos, measurement in enumerate(result.measurements):
+            estimated = cls._array_value(result.z_est, pos)
+            residual = cls._array_value(result.residual, pos)
+            normalized_value = cls._array_value(normalized, pos)
+            if cls._is_pseudo_measurement(measurement):
+                se_result.pseudo_measurements.append(
+                    measurement,
+                    estimated_value=estimated,
+                    residual=residual,
+                    normalized_residual=normalized_value,
+                    source="pseudo",
+                )
+                continue
+            if id(measurement) in bad_ids or int(measurement.idx) in bad_indexes:
+                continue
+            se_result.normal_measurements.append(
+                measurement,
+                estimated_value=estimated,
+                residual=residual,
+                normalized_residual=normalized_value,
+                source="normal",
+            )
+
+        for item in bad_items:
+            se_result.bad_data.append_bad_data_item(item)
+
+        obs = result.observability
+        se_result.statistics = cls.StatisticsTable(
+            converged=bool(result.converged),
+            iterations=int(result.iterations),
+            objective=float(result.objective),
+            max_correction=float(result.max_correction),
+            residual_inf=float(result.residual_inf),
+            observable=bool(obs.observable),
+            rank=int(obs.rank),
+            state_count=int(obs.state_count),
+            measurement_count=int(obs.measurement_count),
+            deficiency=int(obs.deficiency),
+            prefiltered_measurement_count=len(se_result.prefiltered_measurements),
+            pseudo_measurement_count=len(se_result.pseudo_measurements),
+            bad_data_count=len(se_result.bad_data),
+            normal_measurement_count=len(se_result.normal_measurements),
+        )
+        return se_result
+
+    @classmethod
+    def _normalize_prefiltered_rows(
+        cls,
+        prefiltered_measurements: Optional[Iterable[object]],
+        all_measurements: Optional[Iterable[Measurement]],
+        active_measurement_ids: set,
+    ) -> List[Tuple[Measurement, str]]:
+        if prefiltered_measurements is not None:
+            rows = []
+            for item in prefiltered_measurements:
+                if isinstance(item, tuple):
+                    measurement, reason = item
+                else:
+                    measurement = item
+                    reason = cls._prefiltered_reason(measurement)
+                rows.append((measurement, str(reason)))
+            return rows
+
+        if all_measurements is None:
+            return []
+        rows = []
+        for measurement in all_measurements:
+            if id(measurement) in active_measurement_ids:
+                continue
+            reason = cls._prefiltered_reason(measurement)
+            if reason:
+                rows.append((measurement, reason))
+        return rows
+
+    @staticmethod
+    def _array_value(values, pos: int) -> Optional[float]:
+        if values is None:
+            return None
+        if pos >= len(values):
+            return None
+        return float(values[pos])

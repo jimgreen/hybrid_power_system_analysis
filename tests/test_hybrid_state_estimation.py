@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -45,6 +46,60 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
         self.assertLessEqual(call_count, 1)
+
+    def test_hybrid_dc_pseudo_and_constraints_share_summary_scan(self):
+        from secore.dc_se import DCStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        original_refresh = DCStateEstimator._refresh_measurement_summary_cache
+        call_count = 0
+
+        def counted_refresh(self):
+            nonlocal call_count
+            call_count += 1
+            return original_refresh(self)
+
+        DCStateEstimator._refresh_measurement_summary_cache = counted_refresh
+        try:
+            HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                flat_start=True,
+            )
+        finally:
+            DCStateEstimator._refresh_measurement_summary_cache = original_refresh
+
+        self.assertEqual(1, call_count)
+
+    def test_hybrid_converter_pseudo_summary_is_single_pass(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        before_count = len(estimator.measurements)
+
+        def fail_redundant_scan(*_args, **_kwargs):
+            raise AssertionError("hybrid converter pseudo preparation should use one summary scan")
+
+        estimator._active_device_keys = fail_redundant_scan
+        estimator._add_hybrid_pseudo_measurements()
+
+        self.assertEqual(before_count, len(estimator.measurements))
+
+    def test_hybrid_measurement_loader_skips_unused_table_materialization(self):
+        from model.meas_model import MeasurementList
+        from secore.hybrid_se import HybridStateEstimator
+
+        measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+
+        self.assertIsInstance(measurements, list)
+        self.assertNotIsInstance(measurements, MeasurementList)
+        self.assertGreater(len(measurements), 0)
+        self.assertEqual("ACNode", measurements[0].device_type)
+        self.assertEqual("V", measurements[0].meas_type)
 
     def test_ieee3k_flat_start_does_not_add_angle_pseudos(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -377,6 +432,183 @@ class HybridStateEstimationTest(unittest.TestCase):
         diff = (hybrid_ac_h - ac_h).tocoo()
         self.assertEqual(0, diff.nnz)
 
+    def test_active_evaluate_and_jacobian_reuse_cached_measurement_partition(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        x = estimator.initial_state()
+
+        def fail_if_repartitioned(_measurements):
+            raise AssertionError("active measurement partition should be cached")
+
+        estimator._partition_measurement_list = fail_if_repartitioned
+
+        z_est = estimator.evaluate(x)
+        H = estimator.jacobian_sparse(x)
+
+        self.assertEqual(len(estimator.active_measurements), z_est.size)
+        self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
+
+    def test_active_hybrid_converter_rows_use_vectorized_path(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+        )
+        x = estimator.initial_state()
+
+        def fail_evaluate(*_args, **_kwargs):
+            raise AssertionError("active hybrid evaluation should be vectorized")
+
+        def fail_jacobian(*_args, **_kwargs):
+            raise AssertionError("active hybrid Jacobian should be vectorized")
+
+        estimator._evaluate_hybrid_measurement = fail_evaluate
+        estimator._append_hybrid_jacobian_entries = fail_jacobian
+
+        z_est = estimator.evaluate(x)
+        H = estimator.jacobian_sparse(x)
+
+        self.assertEqual(len(estimator.active_measurements), z_est.size)
+        self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
+        self.assertGreater(estimator.hybrid_meas_rows.size, 0)
+
+    def test_mixed_network_sub_estimators_reuse_loaded_network_and_measurements(self):
+        from unittest.mock import patch
+
+        from secore.ac_se import ACStateEstimator
+        from secore.dc_se import DCStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        def fail_load(*_args, **_kwargs):
+            raise AssertionError("sub-estimator should reuse hybrid-loaded data")
+
+        with patch.object(ACStateEstimator, "_load_network", side_effect=fail_load), patch.object(
+            ACStateEstimator,
+            "_load_measurements",
+            side_effect=fail_load,
+        ), patch.object(DCStateEstimator, "_load_network", side_effect=fail_load), patch.object(
+            DCStateEstimator,
+            "_load_measurements",
+            side_effect=fail_load,
+        ):
+            estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                flat_start=True,
+            )
+
+        self.assertIsNotNone(estimator._ac_sub_estimator)
+        self.assertIsNotNone(estimator._dc_sub_estimator)
+        self.assertGreater(len(estimator.ac_meas), 0)
+        self.assertGreater(len(estimator.dc_meas), 0)
+        self.assertEqual(len(estimator.network.ac.alive_buses), len(estimator._ac_sub_estimator.nodes))
+
+    def test_pure_single_side_delegate_does_not_copy_measurement_objects(self):
+        from unittest.mock import patch
+
+        from secore.hybrid_se import HybridStateEstimator
+
+        ac_measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "ac" / "ieee39.meas")
+        with patch.object(HybridStateEstimator, "_load_measurements", return_value=ac_measurements):
+            ac_estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+
+        dc_measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+        with patch.object(HybridStateEstimator, "_load_measurements", return_value=dc_measurements):
+            dc_estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+            )
+
+        self.assertIsNotNone(ac_estimator._delegate())
+        self.assertIsNotNone(dc_estimator._delegate())
+        self.assertIn(id(ac_measurements[0]), {id(meas) for meas in ac_estimator.measurements})
+        self.assertIn(id(dc_measurements[0]), {id(meas) for meas in dc_estimator.measurements})
+
+    def test_pure_single_side_delegate_skips_generic_active_measurement_partition(self):
+        from unittest.mock import patch
+
+        from secore.hybrid_se import HybridStateEstimator
+
+        def reject_partition(self, _measurements):
+            raise AssertionError("pure single-side delegation should assign rows directly")
+
+        with patch.object(HybridStateEstimator, "_partition_measurement_list", reject_partition):
+            ac_estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+            dc_estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+            )
+
+        self.assertEqual(len(ac_estimator.active_measurements), ac_estimator.ac_meas_rows.size)
+        self.assertEqual(0, ac_estimator.dc_meas_rows.size)
+        self.assertEqual(len(dc_estimator.active_measurements), dc_estimator.dc_meas_rows.size)
+        self.assertEqual(0, dc_estimator.ac_meas_rows.size)
+
+    def test_pure_single_side_delegate_passes_loaded_measurements_without_side_partition_scan(self):
+        from unittest.mock import patch
+
+        from secore.hybrid_se import HybridStateEstimator
+
+        def reject_side_partition(self):
+            raise AssertionError("pure single-side delegation should pass loaded measurements directly")
+
+        with patch.object(HybridStateEstimator, "_initial_measurement_sources_by_side", reject_side_partition):
+            ac_estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+            dc_estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+            )
+
+        self.assertIsNotNone(ac_estimator._delegate())
+        self.assertIsNotNone(dc_estimator._delegate())
+
+    def test_mixed_network_sub_estimators_defer_own_active_measurement_preparation(self):
+        from unittest.mock import patch
+
+        from secore.ac_se import ACStateEstimator
+        from secore.dc_se import DCStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        def fail_refresh(*_args, **_kwargs):
+            raise AssertionError("hybrid mixed path should own active measurement preparation")
+
+        with patch.object(ACStateEstimator, "_refresh_active_measurement_indexes", side_effect=fail_refresh), patch.object(
+            DCStateEstimator,
+            "_refresh_active_measurement_indexes",
+            side_effect=fail_refresh,
+        ):
+            estimator = HybridStateEstimator(
+                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                flat_start=True,
+            )
+
+        self.assertGreater(len(estimator.active_measurements), 0)
+        self.assertGreater(len(estimator.ac_meas), 0)
+        self.assertGreater(len(estimator.dc_meas), 0)
+
     def test_mixed_network_includes_ac_sub_estimator_power_balance_rows(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -393,9 +625,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         ]
         coupled_ac_nodes = estimator._converter_coupled_ac_node_names()
         expected_balance_count = sum(
-            1
-            for meas in estimator._ac_sub_estimator.active_measurements
-            if meas.device_type == "ACPowerBalance" and meas.device_name not in coupled_ac_nodes
+            2 for node in estimator._ac_sub_estimator.nodes if node.name not in coupled_ac_nodes
         )
         delegated_rows = set(int(row) for row in estimator._active_ac_hybrid_rows)
 
@@ -444,6 +674,90 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual("dc", HybridStateEstimator._measurement_side(dc_named_like_ac))
         self.assertEqual("ac", HybridStateEstimator._measurement_side(ac_named_like_dc))
         self.assertEqual("hybrid", HybridStateEstimator._measurement_side(hybrid_named_like_dc))
+
+    def test_measurement_pu_conversion_delegates_ac_dc_and_keeps_hybrid_local(self):
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        calls = []
+
+        class FakeSubEstimator:
+            def __init__(self, side):
+                self.side = side
+                self.measurements = []
+
+            def _convert_measurements_to_pu(self):
+                calls.append((self.side, tuple(meas.device_type for meas in self.measurements)))
+                for meas in self.measurements:
+                    meas.value += 10.0 if self.side == "ac" else 20.0
+
+            def _refresh_measurement_summary_cache(self):
+                raise AssertionError("unit conversion should not refresh sub measurement summary")
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator._ac_sub_estimator = FakeSubEstimator("ac")
+        estimator._dc_sub_estimator = FakeSubEstimator("dc")
+        estimator._measurements_normalized = False
+        estimator.p_base = 100.0
+        estimator.p_base_kW = 100.0
+        estimator.u_scale = 1.0
+        estimator.i_scale = 1.0
+        estimator.dcac_by_name = {
+            "conv": SimpleNamespace(name="conv", dc_node=1, ac_node=2),
+        }
+        estimator.acac_by_name = {}
+        estimator.network = SimpleNamespace(
+            ac=SimpleNamespace(node_dict={2: SimpleNamespace(vbase=10.0)}),
+            dc=SimpleNamespace(node_dict={1: SimpleNamespace(vbase=1.0)}),
+        )
+        estimator.measurements = [
+            Measurement(1, "ac_v", "ACNode", "ac_bus", "V", 1.0, True, 1.0),
+            Measurement(2, "dc_v", "DCNode", "dc_bus", "V", 1.0, True, 2.0),
+            Measurement(3, "conv_p", "DCACConverter", "conv", "P_AC", 1.0, True, 50.0),
+        ]
+
+        estimator._convert_measurements_to_pu()
+
+        self.assertEqual([("ac", ("ACNode",)), ("dc", ("DCNode",))], calls)
+        self.assertAlmostEqual(estimator.measurements[0].value, 11.0)
+        self.assertAlmostEqual(estimator.measurements[1].value, 22.0)
+        self.assertAlmostEqual(estimator.measurements[2].value, 0.5)
+        self.assertFalse(hasattr(HybridStateEstimator, "_add_dc_zero_branch_constraint_measurements"))
+
+    def test_measurement_pu_conversion_skips_sides_already_converted_by_sub_estimators(self):
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class FakeSubEstimator:
+            def _convert_measurements_to_pu(self):
+                raise AssertionError("already converted side measurements should not be converted again")
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator._ac_sub_estimator = FakeSubEstimator()
+        estimator._dc_sub_estimator = FakeSubEstimator()
+        estimator._measurements_normalized = False
+        estimator._sub_measurements_converted_by_side = {"ac": True, "dc": True}
+        estimator.p_base = 100.0
+        estimator.p_base_kW = 100.0
+        estimator.u_scale = 1.0
+        estimator.i_scale = 1.0
+        estimator.dcac_by_name = {
+            "conv": SimpleNamespace(name="conv", dc_node=1, ac_node=2),
+        }
+        estimator.acac_by_name = {}
+        estimator.network = SimpleNamespace(
+            ac=SimpleNamespace(node_dict={2: SimpleNamespace(vbase=10.0)}),
+            dc=SimpleNamespace(node_dict={1: SimpleNamespace(vbase=1.0)}),
+        )
+        estimator.measurements = [
+            Measurement(1, "ac_v", "ACNode", "ac_bus", "V", 1.0, True, 1.0),
+            Measurement(2, "dc_v", "DCNode", "dc_bus", "V", 1.0, True, 2.0),
+            Measurement(3, "conv_p", "DCACConverter", "conv", "P_AC", 1.0, True, 50.0),
+        ]
+
+        estimator._convert_measurements_to_pu()
+
+        self.assertAlmostEqual(estimator.measurements[0].value, 1.0)
+        self.assertAlmostEqual(estimator.measurements[1].value, 2.0)
+        self.assertAlmostEqual(estimator.measurements[2].value, 0.5)
 
     def test_mixed_network_partitions_state_variables_into_ac_dc_and_hybrid_blocks(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -501,7 +815,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         np.testing.assert_array_equal(expected_dc_cols, estimator.dc_state_cols)
         np.testing.assert_array_equal(expected_hybrid_cols, estimator.hybrid_state_cols)
 
-    def test_dc_sub_delegation_excludes_hybrid_only_voltage_states(self):
+    def test_dc_side_measurements_are_delegated_by_device_ownership(self):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
@@ -520,7 +834,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         ]
 
         self.assertEqual(1, len(hybrid_only_rows))
-        self.assertNotIn(hybrid_only_rows[0], delegated_rows)
+        self.assertIn(hybrid_only_rows[0], delegated_rows)
 
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -750,6 +1064,130 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertTrue(issparse(result.H))
         self.assertEqual(result.iterations, call_count)
 
+    def test_main_runs_observability_before_estimation_and_does_not_repeat_it(self):
+        import contextlib
+        import io
+        import secore.hybrid_se as hybrid_se
+        from secore.hybrid_se import HybridStateEstimator
+
+        events = []
+        original_observability = HybridStateEstimator.observability_analysis
+        original_estimate = HybridStateEstimator.estimate
+        test_case = self
+
+        def counted_observability(self, *args, **kwargs):
+            events.append("observability")
+            return original_observability(self, *args, **kwargs)
+
+        def counted_estimate(self, *args, **kwargs):
+            events.append("estimate")
+            test_case.assertIsNotNone(kwargs.get("observability"))
+            observability_calls = events.count("observability")
+            result = original_estimate(self, *args, **kwargs)
+            test_case.assertEqual(observability_calls, events.count("observability"))
+            return result
+
+        output = io.StringIO()
+        HybridStateEstimator.observability_analysis = counted_observability
+        HybridStateEstimator.estimate = counted_estimate
+        try:
+            with contextlib.redirect_stdout(output):
+                rc = hybrid_se.main(
+                    [
+                        "--case",
+                        str(ROOT_DIR / "data" / "hybrid" / "qinling.e"),
+                        "--meas",
+                        str(ROOT_DIR / "data" / "hybrid" / "qinling.meas"),
+                        "--flat-start",
+                        "--quiet",
+                    ]
+                )
+        finally:
+            HybridStateEstimator.observability_analysis = original_observability
+            HybridStateEstimator.estimate = original_estimate
+
+        self.assertEqual(0, rc)
+        self.assertEqual(["observability", "estimate"], events[-2:])
+        self.assertEqual(1, output.getvalue().count("Observability:"))
+        self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
+
+    def test_mixed_estimate_reuses_fixed_pattern_normal_equation_solver(self):
+        import secore.hybrid_se as hybrid_se
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+            max_iter=5,
+        )
+
+        solver_instances = []
+
+        class SpyNormalSolver:
+            def __init__(self, assume_fixed_pattern=False):
+                self.assume_fixed_pattern = bool(assume_fixed_pattern)
+                self.solve_calls = 0
+                solver_instances.append(self)
+
+            def solve(self, gain, rhs, return_factor_diag=True):
+                self.solve_calls += 1
+                return np.zeros_like(rhs), np.ones_like(rhs)
+
+        self.assertTrue(hasattr(hybrid_se, "NormalEquationSolver"))
+        original_solver = hybrid_se.NormalEquationSolver
+        hybrid_se.NormalEquationSolver = SpyNormalSolver
+        try:
+            result = estimator.estimate()
+        finally:
+            hybrid_se.NormalEquationSolver = original_solver
+
+        self.assertTrue(result.converged)
+        self.assertEqual(1, len(solver_instances))
+        self.assertTrue(solver_instances[0].assume_fixed_pattern)
+        self.assertEqual(1, solver_instances[0].solve_calls)
+
+    def test_mixed_estimate_reuses_normal_equation_structural_pattern(self):
+        import secore.hybrid_se as hybrid_se
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            flat_start=True,
+            max_iter=5,
+        )
+
+        original_builder = hybrid_se.build_normal_equations
+        builder_calls = []
+
+        def counted_builder(H, residual, weight, **kwargs):
+            builder_calls.append(kwargs)
+            return original_builder(H, residual, weight, **kwargs)
+
+        class ZeroStepSolver:
+            def __init__(self, assume_fixed_pattern=False):
+                pass
+
+            def solve(self, gain, rhs, return_factor_diag=True):
+                return np.zeros_like(rhs), np.ones_like(rhs)
+
+        self.assertTrue(hasattr(hybrid_se, "NormalEquationSolver"))
+        original_solver = hybrid_se.NormalEquationSolver
+        hybrid_se.build_normal_equations = counted_builder
+        hybrid_se.NormalEquationSolver = ZeroStepSolver
+        try:
+            result = estimator.estimate()
+        finally:
+            hybrid_se.build_normal_equations = original_builder
+            hybrid_se.NormalEquationSolver = original_solver
+
+        self.assertTrue(result.converged)
+        self.assertTrue(builder_calls)
+        self.assertIsNotNone(builder_calls[0].get("normal_pattern"))
+        self.assertTrue(builder_calls[0].get("assume_normal_pattern_matches"))
+        self.assertIn("weighted_residual", builder_calls[0])
+
     def test_estimate_rejects_nonfinite_line_search_candidates(self):
         import secore.hybrid_se as hybrid_se
         from secore.hybrid_se import HybridStateEstimator
@@ -770,23 +1208,26 @@ class HybridStateEstimationTest(unittest.TestCase):
             measurements = estimator.active_measurements if measurements is None else list(measurements)
             return np.full(len(measurements), np.nan)
 
-        original_solver = hybrid_se.solve_normal_equations_with_factor
+        class FiniteStepSolver:
+            def __init__(self, assume_fixed_pattern=False):
+                pass
 
-        def finite_test_step(gain, rhs):
-            return np.full(estimator.n_state, 1e-3), np.ones(estimator.n_state)
+            def solve(self, gain, rhs, return_factor_diag=True):
+                return np.full(estimator.n_state, 1e-3), np.ones(estimator.n_state)
 
+        original_solver = hybrid_se.NormalEquationSolver
         estimator.evaluate = nonfinite_candidate_evaluate
-        hybrid_se.solve_normal_equations_with_factor = finite_test_step
+        hybrid_se.NormalEquationSolver = FiniteStepSolver
         try:
             result = estimator.estimate()
         finally:
-            hybrid_se.solve_normal_equations_with_factor = original_solver
+            hybrid_se.NormalEquationSolver = original_solver
 
         self.assertFalse(result.converged)
         self.assertLessEqual(evaluate_count, 10)
         self.assertTrue(np.isfinite(result.residual_inf))
 
-    def test_estimate_reuses_gain_matrix_for_observability(self):
+    def test_estimate_uses_precomputed_observability_without_reanalysis(self):
         import secore.hybrid_se as hybrid_se
         from secore.hybrid_se import HybridStateEstimator
 
@@ -794,55 +1235,48 @@ class HybridStateEstimationTest(unittest.TestCase):
             e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
             meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
         )
+        observability = estimator.observability_analysis()
 
         original = hybrid_se.observability_rank_details
-        normal_matrix_seen = False
 
         def counted_rank_details(*args, **kwargs):
-            nonlocal normal_matrix_seen
-            normal_matrix_seen = kwargs.get("normal_matrix") is not None
-            return original(*args, **kwargs)
+            raise AssertionError("estimate should reuse precomputed observability and not re-run rank analysis")
 
         hybrid_se.observability_rank_details = counted_rank_details
         try:
-            result = estimator.estimate()
+            result = estimator.estimate(observability=observability)
         finally:
             hybrid_se.observability_rank_details = original
 
         self.assertTrue(result.converged)
-        self.assertTrue(normal_matrix_seen)
+        self.assertIs(observability, result.observability)
 
-    def test_estimate_reuses_cholesky_factor_for_observability(self):
+    def test_estimate_reuses_observability_normal_pattern_cache(self):
         import secore.hybrid_se as hybrid_se
-        import secore.se_math as se_math
         from secore.hybrid_se import HybridStateEstimator
 
-        if se_math.CHO_FACTOR is None or se_math.CHO_SOLVE is None:
-            self.skipTest("SciPy Cholesky solver is not available")
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+        )
+        observability = estimator.observability_analysis()
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
-            estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-                meas_file=meas_file,
-            )
+        original_builder = hybrid_se.build_normal_equations
+        normal_pattern_seen = False
 
-            original = hybrid_se.observability_rank_details
-            factor_seen = False
+        def counted_builder(H, residual, weight, **kwargs):
+            nonlocal normal_pattern_seen
+            normal_pattern_seen = kwargs.get("normal_pattern") is not None
+            return original_builder(H, residual, weight, **kwargs)
 
-            def counted_rank_details(*args, **kwargs):
-                nonlocal factor_seen
-                factor_seen = kwargs.get("normal_factor_diag") is not None
-                return original(*args, **kwargs)
-
-            hybrid_se.observability_rank_details = counted_rank_details
-            try:
-                result = estimator.estimate()
-            finally:
-                hybrid_se.observability_rank_details = original
+        hybrid_se.build_normal_equations = counted_builder
+        try:
+            result = estimator.estimate(observability=observability)
+        finally:
+            hybrid_se.build_normal_equations = original_builder
 
         self.assertTrue(result.converged)
-        self.assertTrue(factor_seen)
+        self.assertTrue(normal_pattern_seen)
 
     def test_estimate_passes_file_weights_to_normal_equation_builder(self):
         import secore.hybrid_se as hybrid_se
@@ -857,10 +1291,10 @@ class HybridStateEstimationTest(unittest.TestCase):
         original = hybrid_se.build_normal_equations
         non_unit_weight_seen = False
 
-        def counted_builder(H, residual, weight):
+        def counted_builder(H, residual, weight, **kwargs):
             nonlocal non_unit_weight_seen
             non_unit_weight_seen = bool(np.any(weight != 1.0))
-            return original(H, residual, weight)
+            return original(H, residual, weight, **kwargs)
 
         hybrid_se.build_normal_equations = counted_builder
         try:
@@ -976,8 +1410,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         estimator._ac_branch_current_derivatives = counted_current
         estimator.jacobian(estimator.initial_state(), measurements)
 
-        self.assertEqual(2, power_calls)
-        self.assertEqual(2, current_calls)
+        self.assertEqual(0, power_calls)
+        self.assertEqual(0, current_calls)
 
     def test_ac_generator_sparse_jacobian_batches_row_appends(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -1014,10 +1448,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         wanted = {
             ("ACBranch", "P_FROM"),
             ("ACBranch", "I_TO"),
-            ("ACSwitch", "P_FROM"),
             ("ACGenerator", "I_GEN"),
             ("DCBranch", "P_FROM"),
-            ("DCSwitch", "I_FROM"),
             ("DCGenerator", "I_GEN"),
             ("DCDCConverter", "I_TO"),
             ("DCACConverter", "I_AC"),
@@ -1098,6 +1530,33 @@ class HybridStateEstimationTest(unittest.TestCase):
         )
         self.assertAlmostEqual(ac_load_p.value, estimator.ac_load_by_name["load_ac_1"].p)
         self.assertAlmostEqual(dc_gen_p.value, estimator.dc_generator_by_name["dc_bus_vctrl"].p)
+
+    def test_hybrid_observability_pseudo_preparation_does_not_emit_runtime_warnings(self):
+        import warnings
+
+        from secore.hybrid_se import HybridStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "voltage_only.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 vm_ac_bus ACNode ac_bus V 1.0 1 380",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                HybridStateEstimator(
+                    e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                    meas_file=meas_file,
+                )
 
     def test_pseudo_measurements_are_device_level_for_hybrid_converters(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -1255,8 +1714,8 @@ class HybridStateEstimationTest(unittest.TestCase):
             "DCNode",
             "ACBranch",
             "DCBranch",
-            "ACSwitch",
-            "DCSwitch",
+            "ACBreak",
+            "DCBreak",
             "ACGenerator",
             "DCGenerator",
             "ACLoad",

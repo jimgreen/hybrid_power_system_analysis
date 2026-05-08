@@ -71,6 +71,7 @@ from secore.se_math import (
     sparse_structural_rank,
     unanchored_angle_state_labels,
 )
+from secore.se_result import SEResult
 from unit_system import ac_current_base_ka
 
 
@@ -885,6 +886,9 @@ class ACStateEstimator:
         parameter_file: Path = DEFAULT_SE_PARAMETER_FILE,
         parameters: Optional[StateEstimationParameters] = None,
         profile: bool = False,
+        network: Optional[ACPowerNetwork] = None,
+        measurements: Optional[Sequence[Measurement]] = None,
+        prepare_active_measurements: bool = True,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -905,21 +909,36 @@ class ACStateEstimator:
         self.voltage_floor = self.params.voltage_floor
         self.min_current_voltage = self.params.min_current_voltage
 
+        self._prepared = False
+        self.prepare(
+            network=network,
+            measurements=measurements,
+            prepare_active_measurements=prepare_active_measurements,
+        )
+
+    def prepare(
+        self,
+        *,
+        network: Optional[ACPowerNetwork] = None,
+        measurements: Optional[Sequence[Measurement]] = None,
+        prepare_active_measurements: bool = True,
+    ) -> "ACStateEstimator":
         profile_start = time.perf_counter()
-        self.network = self._load_network(self.e_file)
-        self.measurements = self._load_measurements(self.meas_file)
+        self.network = network if network is not None else self._load_network(self.e_file)
+        self.measurements = list(measurements) if measurements is not None else self._load_measurements(self.meas_file)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
         self.u_scale = float(self.network.u_scale)
         self.p_scale = float(self.network.p_scale)
         self.i_scale = float(self.network.i_scale)
 
-        self.nodes = getattr(self.network, "alive_nodes", None)
-        if self.nodes is None:
-            self.nodes = sorted(
-                [node for node in self.network.nodes if getattr(node, "is_alive", False)],
-                key=lambda item: item.idx,
-            )
+        self.nodes = (
+            getattr(self.network, "alive_nodes", None)
+            or getattr(self.network, "alive_buses", None)
+            or [bus for bus in getattr(self.network, "buses", []) if getattr(bus, "is_alive", False)]
+            or [node for node in self.network.nodes if getattr(node, "is_alive", False)]
+        )
+        self.nodes = sorted(self.nodes, key=lambda item: item.idx)
         if not self.nodes:
             raise RuntimeError("No alive AC nodes are available for state estimation")
         self.file_theta = np.asarray(
@@ -1092,14 +1111,43 @@ class ACStateEstimator:
         self.generators_at_pos = self._group_generators()
         self.generator_share_by_name = self._generator_shares()
         self._initial_observability_cache = None
-        # Add priors after unit conversion because model objects are already normalized.
-        self._add_pseudo_power_measurements()
+        self._observability_matrix_cache = None
         self._seed_power_state_arrays_from_measurements()
-        self._add_power_balance_constraint_measurements()
         self.targeted_observability_pseudo_count = 0
-        self._refresh_active_measurement_indexes()
-        self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
+        if prepare_active_measurements:
+            # Add priors after unit conversion because model objects are already normalized.
+            self._add_pseudo_power_measurements()
+            self._add_power_balance_constraint_measurements()
+            self._refresh_active_measurement_indexes()
+            self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
+        else:
+            self.active_measurements = MeasurementList(
+                [],
+                normalized=getattr(self.measurements, "normalized", False),
+            )
+            self.active_measurement_rows = np.array([], dtype=np.int64)
+            self.active_z = np.array([], dtype=np.float64)
+            self.active_weight = np.array([], dtype=np.float64)
+            self.active_angle_residual_mask = np.array([], dtype=bool)
+            self.active_has_angle_residuals = False
+            self.active_uniform_weight = None
+            self.active_weights_are_uniform = False
+            self._active_rows_by_device_type_code = {}
+            self._branch_transformer_vector_plan_cache = {}
+            self._simple_jacobian_plan_cache = {}
+            self._zero_current_vector_plan_cache = {}
+            self._generator_measurement_plan_cache = {}
+            self._balance_measurement_plan_cache = {}
+            self._active_branch_transformer_vector_plan = None
+            self._active_simple_jacobian_plan = None
+            self._active_zero_current_vector_plan = None
+            self._active_generator_measurement_plan = None
+            self._active_balance_measurement_plan = None
+            self._active_normal_pattern = None
+            self.active_measurements_are_vectorized = False
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
+        self._prepared = True
+        return self
 
     def _record_profile_time(self, name: str, elapsed: float) -> None:
         if self.profile_enabled:
@@ -1115,6 +1163,38 @@ class ACStateEstimator:
             int(self._max_measurement_idx),
             int(self.n_state),
         )
+
+    def _cache_observability_matrix(
+        self,
+        result: ObservabilityResult,
+        x: np.ndarray,
+        measurements: Sequence[Measurement],
+        H,
+    ) -> None:
+        self._observability_matrix_cache = {
+            "result": result,
+            "measurements": measurements,
+            "x": np.asarray(x, dtype=np.float64).copy(),
+            "H": H,
+            "normal_pattern": None,
+        }
+
+    def _observability_matrix_cache_for(
+        self,
+        result: Optional[ObservabilityResult],
+        measurements: Sequence[Measurement],
+        x: np.ndarray,
+    ):
+        cache = getattr(self, "_observability_matrix_cache", None)
+        if cache is None or cache.get("result") is not result:
+            return None
+        if cache.get("measurements") is not measurements:
+            return None
+        cached_x = cache.get("x")
+        x_array = np.asarray(x, dtype=np.float64)
+        if cached_x is None or cached_x.shape != x_array.shape or not np.array_equal(cached_x, x_array):
+            return None
+        return cache
 
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and vectorized measurement plans."""
@@ -1192,6 +1272,7 @@ class ACStateEstimator:
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
         self._jacobian_builder._assume_fixed_pattern = True
         self._active_normal_pattern = None
+        self._observability_matrix_cache = None
         self.active_measurements_are_vectorized = bool(
             np.all(
                 self._active_branch_transformer_vector_plan["handled_mask"]
@@ -5497,6 +5578,7 @@ class ACStateEstimator:
                 _OBSERVABILITY_RESULT_CACHE.clear()
             _OBSERVABILITY_RESULT_CACHE[self._default_observability_cache_key()] = result
             self._initial_observability_cache = result
+        self._cache_observability_matrix(result, x, measurements, H)
         return result
 
     def _has_structural_observability_certificate(self, H) -> bool:
@@ -5512,6 +5594,7 @@ class ACStateEstimator:
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
         final_diagnostics: bool = True,
+        observability: Optional[ObservabilityResult] = None,
     ) -> EstimateResult:
         """Run weighted least squares with simple damping to avoid voltage divergence."""
         solve_profile_start = time.perf_counter() if self.profile_enabled else None
@@ -5520,10 +5603,13 @@ class ACStateEstimator:
             raise RuntimeError(f"Not enough valid measurements: {len(measurements)} < {self.n_state}")
 
         x = self.initial_state() if x0 is None else x0.copy()
-        if measurements is self.active_measurements and x0 is None:
-            observability = self.observability_analysis()
-        else:
-            observability = self.observability_analysis(x, measurements)
+        if observability is None:
+            if measurements is self.active_measurements and x0 is None:
+                observability = self.observability_analysis()
+            else:
+                observability = self.observability_analysis(x, measurements)
+        observability_cache = self._observability_matrix_cache_for(observability, measurements, x)
+        cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
         z, weight = self._measurement_vectors(measurements)
         uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
         weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
@@ -5541,6 +5627,8 @@ class ACStateEstimator:
         cached_objective = None
         normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
         normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
+        if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
+            normal_pattern = observability_cache["normal_pattern"]
 
         if verbose:
             _print_iteration_header()
@@ -5562,11 +5650,17 @@ class ACStateEstimator:
                 objective = cached_objective
                 cached_z_est = cached_residual = cached_objective = None
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            H = self.jacobian_sparse(x, measurements)
+            if iteration == 1 and cached_initial_H is not None:
+                H = cached_initial_H
+                cached_initial_H = None
+            else:
+                H = self.jacobian_sparse(x, measurements)
             if normal_pattern is None and issparse(H):
                 normal_pattern = _normal_equation_structural_pattern(H)
                 if measurements is self.active_measurements:
                     self._active_normal_pattern = normal_pattern
+                if observability_cache is not None:
+                    observability_cache["normal_pattern"] = normal_pattern
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
             gain, rhs = build_normal_equations(
@@ -5667,6 +5761,7 @@ class ACStateEstimator:
                 x0=self._file_state(),
                 verbose=verbose,
                 final_diagnostics=final_diagnostics,
+                observability=observability,
             )
             restart_result.iterations += iteration
             return restart_result
@@ -5751,6 +5846,28 @@ class ACStateEstimator:
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
         return bad_items, normalized
+
+    def build_se_result(
+        self,
+        result: EstimateResult,
+        bad_items: Optional[Sequence[BadDataItem]] = None,
+        normalized_residual: Optional[Sequence[float]] = None,
+        threshold: Optional[float] = None,
+    ) -> SEResult:
+        """Build the structured state-estimation result snapshot after WLS."""
+        if bad_items is None or normalized_residual is None:
+            computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
+            if bad_items is None:
+                bad_items = computed_bad_items
+            if normalized_residual is None:
+                normalized_residual = computed_normalized
+        self.se_result = SEResult.from_estimate_result(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized_residual,
+            all_measurements=self.measurements,
+        )
+        return self.se_result
 
     def estimate_with_bad_data_removal(
         self,
@@ -5869,7 +5986,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for item in removed:
                 print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
     else:
-        result = estimator.estimate(verbose=not args.quiet, final_diagnostics=not args.skip_bad_data)
+        result = estimator.estimate(
+            verbose=not args.quiet,
+            final_diagnostics=not args.skip_bad_data,
+            observability=initial_observability,
+        )
 
     print(
         "State estimation: "
@@ -5879,11 +6000,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"max_dx={result.max_correction:.3e}, "
         f"norm_res={result.residual_inf:.3e}"
     )
-    _print_observability(result.observability)
     if not args.skip_bad_data:
         bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
         bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
+        estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
         _print_bad_data(bad_items, normalized, bad_threshold)
+    else:
+        estimator.build_se_result(result, bad_items=[], normalized_residual=np.array([], dtype=np.float64))
 
     if args.print_state:
         estimator.print_state(result.x)

@@ -1964,6 +1964,55 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(0, rc)
 
+    def test_main_runs_observability_before_estimation_and_does_not_repeat_it(self):
+        import contextlib
+        import io
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        events = []
+        original_observability = ACStateEstimator.observability_analysis
+        original_estimate = ACStateEstimator.estimate
+        test_case = self
+
+        def counted_observability(self, *args, **kwargs):
+            events.append("observability")
+            return original_observability(self, *args, **kwargs)
+
+        def counted_estimate(self, *args, **kwargs):
+            events.append("estimate")
+            test_case.assertIsNotNone(kwargs.get("observability"))
+            observability_calls = events.count("observability")
+            result = original_estimate(self, *args, **kwargs)
+            test_case.assertEqual(observability_calls, events.count("observability"))
+            return result
+
+        output = io.StringIO()
+        ACStateEstimator.observability_analysis = counted_observability
+        ACStateEstimator.estimate = counted_estimate
+        try:
+            with contextlib.redirect_stdout(output):
+                rc = ac_se.main(
+                    [
+                        "--case",
+                        str(ROOT_DIR / "data" / "ac" / "ieee39.e"),
+                        "--meas",
+                        str(ROOT_DIR / "data" / "ac" / "ieee39.meas"),
+                        "--para",
+                        str(ROOT_DIR / "se.para"),
+                        "--flat-start",
+                        "--quiet",
+                    ]
+                )
+        finally:
+            ACStateEstimator.observability_analysis = original_observability
+            ACStateEstimator.estimate = original_estimate
+
+        self.assertEqual(0, rc)
+        self.assertEqual(["observability", "estimate"], events[-2:])
+        self.assertEqual(1, output.getvalue().count("Observability:"))
+        self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
+
     def test_estimate_can_skip_final_diagnostic_jacobian_and_gain(self):
         from secore.ac_se import ACStateEstimator
 

@@ -305,6 +305,53 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertIn(("DCDCConverter", "conv_2", "V_FROM"), pseudo_keys)
         self.assertIn(("DCDCConverter", "conv_2", "V_TO"), pseudo_keys)
 
+    def test_dc_pseudo_measurements_reuse_measurement_summary_cache(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+
+        def fail_redundant_scan(*_args, **_kwargs):
+            raise AssertionError("pseudo measurement preparation should use one summary scan")
+
+        estimator._active_device_keys = fail_redundant_scan
+        estimator._active_measurement_keys = fail_redundant_scan
+        estimator._add_pseudo_power_measurements()
+
+        pseudo_keys = {
+            (meas.device_type, meas.device_name, meas.meas_type)
+            for meas in estimator.measurements
+            if meas.name.startswith("pseudo_")
+        }
+        self.assertIn(("DCBreak", "sw_0_1", "V_FROM"), pseudo_keys)
+        self.assertTrue(hasattr(estimator, "_active_device_key_cache"))
+        self.assertTrue(hasattr(estimator, "_active_measurement_key_cache"))
+
+    def test_dc_constraint_measurements_update_measurement_summary_cache(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+        estimator._refresh_measurement_summary_cache()
+        estimator._add_zero_branch_constraint_measurements()
+
+        self.assertIn(
+            ("DCBreakConstraint", "sw_0_1", "V_DIFF"),
+            estimator._active_measurement_key_cache,
+        )
+        self.assertEqual(
+            max(int(meas.idx) for meas in estimator.measurements),
+            estimator._max_measurement_idx,
+        )
+
     def test_adds_low_weight_pseudo_measurements_for_unmetered_nodes_breaks_and_zero_branches(self):
         from secore.dc_se import DCStateEstimator
 
@@ -582,6 +629,125 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertTrue(issparse(result.H))
         self.assertEqual(result.iterations, call_count)
 
+    def test_estimate_reuses_observability_jacobian_for_first_wls_iteration(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            max_iter=20,
+        )
+
+        observability = estimator.observability_analysis()
+        original_jacobian = estimator.jacobian_sparse
+        call_count = 0
+
+        def counted_jacobian(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_jacobian(*args, **kwargs)
+
+        estimator.jacobian_sparse = counted_jacobian
+        result = estimator.estimate(observability=observability)
+
+        self.assertTrue(result.converged)
+        self.assertIs(observability, result.observability)
+        self.assertEqual(result.iterations - 1, call_count)
+
+    def test_active_sparse_jacobian_reuses_fixed_pattern_builder(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+        )
+
+        self.assertTrue(hasattr(estimator, "_jacobian_builder"))
+        self.assertTrue(estimator._jacobian_builder._assume_fixed_pattern)
+
+        x = estimator.initial_state()
+        first = estimator.jacobian_sparse(x)
+        second = estimator.jacobian_sparse(x)
+
+        np.testing.assert_array_equal(first.indptr, second.indptr)
+        np.testing.assert_array_equal(first.indices, second.indices)
+        np.testing.assert_allclose(first.data, second.data)
+
+    def test_estimate_reuses_fixed_pattern_normal_equation_solver(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            max_iter=5,
+        )
+
+        solver_instances = []
+
+        class SpyNormalSolver:
+            def __init__(self, assume_fixed_pattern=False):
+                self.assume_fixed_pattern = bool(assume_fixed_pattern)
+                self.solve_calls = 0
+                solver_instances.append(self)
+
+            def solve(self, gain, rhs, return_factor_diag=True):
+                self.solve_calls += 1
+                return np.zeros_like(rhs), np.ones_like(rhs)
+
+        self.assertTrue(hasattr(dc_se, "NormalEquationSolver"))
+        original_solver = dc_se.NormalEquationSolver
+        dc_se.NormalEquationSolver = SpyNormalSolver
+        try:
+            result = estimator.estimate()
+        finally:
+            dc_se.NormalEquationSolver = original_solver
+
+        self.assertTrue(result.converged)
+        self.assertEqual(1, len(solver_instances))
+        self.assertTrue(solver_instances[0].assume_fixed_pattern)
+        self.assertEqual(1, solver_instances[0].solve_calls)
+
+    def test_estimate_reuses_normal_equation_structural_pattern(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            max_iter=5,
+        )
+
+        original_builder = dc_se.build_normal_equations
+        builder_calls = []
+
+        def counted_builder(H, residual, weight, **kwargs):
+            builder_calls.append(kwargs)
+            return original_builder(H, residual, weight, **kwargs)
+
+        class ZeroStepSolver:
+            def __init__(self, assume_fixed_pattern=False):
+                pass
+
+            def solve(self, gain, rhs, return_factor_diag=True):
+                return np.zeros_like(rhs), np.ones_like(rhs)
+
+        self.assertTrue(hasattr(dc_se, "NormalEquationSolver"))
+        original_solver = dc_se.NormalEquationSolver
+        dc_se.build_normal_equations = counted_builder
+        dc_se.NormalEquationSolver = ZeroStepSolver
+        try:
+            result = estimator.estimate()
+        finally:
+            dc_se.build_normal_equations = original_builder
+            dc_se.NormalEquationSolver = original_solver
+
+        self.assertTrue(result.converged)
+        self.assertTrue(builder_calls)
+        self.assertIsNotNone(builder_calls[0].get("normal_pattern"))
+        self.assertTrue(builder_calls[0].get("assume_normal_pattern_matches"))
+        self.assertIn("weighted_residual", builder_calls[0])
+
     def test_flat_start_does_not_run_power_flow_seed(self):
         import secore.dc_se as dc_se
         from secore.dc_se import DCStateEstimator
@@ -607,7 +773,7 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertTrue(estimator.flat_start)
         self.assertEqual(0, call_count)
 
-    def test_estimate_reuses_gain_matrix_for_observability(self):
+    def test_estimate_uses_precomputed_observability_without_reanalysis(self):
         import secore.dc_se as dc_se
         from secore.dc_se import DCStateEstimator
 
@@ -615,55 +781,48 @@ class DCStateEstimationTest(unittest.TestCase):
             e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
             meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
         )
+        observability = estimator.observability_analysis()
 
         original = dc_se.observability_rank_details
-        normal_matrix_seen = False
 
         def counted_rank_details(*args, **kwargs):
-            nonlocal normal_matrix_seen
-            normal_matrix_seen = kwargs.get("normal_matrix") is not None
-            return original(*args, **kwargs)
+            raise AssertionError("estimate should reuse precomputed observability and not re-run rank analysis")
 
         dc_se.observability_rank_details = counted_rank_details
         try:
-            result = estimator.estimate()
+            result = estimator.estimate(observability=observability)
         finally:
             dc_se.observability_rank_details = original
 
         self.assertTrue(result.converged)
-        self.assertTrue(normal_matrix_seen)
+        self.assertIs(observability, result.observability)
 
-    def test_estimate_reuses_cholesky_factor_for_observability(self):
+    def test_estimate_reuses_observability_normal_pattern_cache(self):
         import secore.dc_se as dc_se
-        import secore.se_math as se_math
         from secore.dc_se import DCStateEstimator
 
-        if se_math.CHO_FACTOR is None or se_math.CHO_SOLVE is None:
-            self.skipTest("SciPy Cholesky solver is not available")
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+        )
+        observability = estimator.observability_analysis()
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
-            estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=meas_file,
-            )
+        original_builder = dc_se.build_normal_equations
+        normal_pattern_seen = False
 
-            original = dc_se.observability_rank_details
-            factor_seen = False
+        def counted_builder(H, residual, weight, **kwargs):
+            nonlocal normal_pattern_seen
+            normal_pattern_seen = kwargs.get("normal_pattern") is not None
+            return original_builder(H, residual, weight, **kwargs)
 
-            def counted_rank_details(*args, **kwargs):
-                nonlocal factor_seen
-                factor_seen = kwargs.get("normal_factor_diag") is not None
-                return original(*args, **kwargs)
-
-            dc_se.observability_rank_details = counted_rank_details
-            try:
-                result = estimator.estimate()
-            finally:
-                dc_se.observability_rank_details = original
+        dc_se.build_normal_equations = counted_builder
+        try:
+            result = estimator.estimate(observability=observability)
+        finally:
+            dc_se.build_normal_equations = original_builder
 
         self.assertTrue(result.converged)
-        self.assertTrue(factor_seen)
+        self.assertTrue(normal_pattern_seen)
 
     def test_estimate_passes_file_weights_to_normal_equation_builder(self):
         import secore.dc_se as dc_se
@@ -678,10 +837,10 @@ class DCStateEstimationTest(unittest.TestCase):
         original = dc_se.build_normal_equations
         non_unit_weight_seen = False
 
-        def counted_builder(H, residual, weight):
+        def counted_builder(H, residual, weight, **kwargs):
             nonlocal non_unit_weight_seen
             non_unit_weight_seen = bool(np.any(weight != 1.0))
-            return original(H, residual, weight)
+            return original(H, residual, weight, **kwargs)
 
         dc_se.build_normal_equations = counted_builder
         try:
@@ -722,6 +881,52 @@ class DCStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(result.converged)
         self.assertEqual(0, call_count)
+
+    def test_cli_runs_observability_before_estimation_and_does_not_repeat_it(self):
+        import contextlib
+        import io
+        import secore.dc_se as dc_se
+
+        events = []
+        original_observability = dc_se.DCStateEstimator.observability_analysis
+        original_estimate = dc_se.DCStateEstimator.estimate
+        test_case = self
+
+        def counted_observability(self, *args, **kwargs):
+            events.append("observability")
+            return original_observability(self, *args, **kwargs)
+
+        def counted_estimate(self, *args, **kwargs):
+            events.append("estimate")
+            test_case.assertIsNotNone(kwargs.get("observability"))
+            observability_calls = events.count("observability")
+            result = original_estimate(self, *args, **kwargs)
+            test_case.assertEqual(observability_calls, events.count("observability"))
+            return result
+
+        output = io.StringIO()
+        dc_se.DCStateEstimator.observability_analysis = counted_observability
+        dc_se.DCStateEstimator.estimate = counted_estimate
+        try:
+            with contextlib.redirect_stdout(output):
+                code = dc_se.main(
+                    [
+                        "--case",
+                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        "--meas",
+                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        "--flat-start",
+                        "--quiet",
+                    ]
+                )
+        finally:
+            dc_se.DCStateEstimator.observability_analysis = original_observability
+            dc_se.DCStateEstimator.estimate = original_estimate
+
+        self.assertEqual(0, code)
+        self.assertEqual(["observability", "estimate"], events[-2:])
+        self.assertEqual(1, output.getvalue().count("Observability:"))
+        self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator

@@ -34,14 +34,17 @@ from model.meas_model import (
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook  # Retained for compatibility; measurement loading uses the direct parser below.
 from secore.se_math import (
+    NormalEquationSolver,
     SparseJacobianBuilder,
+    _normal_equation_structural_pattern,
     build_normal_equations,
+    is_sparse_matrix,
     inverse_gain_for_bad_data,
     matrix_is_empty,
     measurement_leverage,
     observability_rank_details,
-    solve_normal_equations_with_factor,
 )
+from secore.se_result import SEResult
 from unit_system import dc_current_base_ka
 
 
@@ -204,6 +207,9 @@ class DCStateEstimator:
         flat_start: Optional[bool] = None,
         parameter_file: Path = DEFAULT_SE_PARAMETER_FILE,
         parameters: Optional[StateEstimationParameters] = None,
+        network: Optional[DCPowerNetwork] = None,
+        measurements: Optional[Sequence[Measurement]] = None,
+        prepare_active_measurements: bool = True,
     ):
         self.params = (parameters or load_se_parameters(parameter_file)).with_overrides(
             tol=tol,
@@ -222,8 +228,27 @@ class DCStateEstimator:
         self.voltage_floor = self.params.voltage_floor
         self.min_current_voltage = self.params.min_current_voltage
 
-        self.network = self._load_network(self.e_file, self.params, run_power_flow=not self.flat_start)
-        self.measurements = self._load_measurements(self.meas_file)
+        self._prepared = False
+        self.prepare(
+            network=network,
+            measurements=measurements,
+            prepare_active_measurements=prepare_active_measurements,
+        )
+
+    def prepare(
+        self,
+        *,
+        network: Optional[DCPowerNetwork] = None,
+        measurements: Optional[Sequence[Measurement]] = None,
+        prepare_active_measurements: bool = True,
+    ) -> "DCStateEstimator":
+        if network is None:
+            self.network = self._load_network(self.e_file, self.params, run_power_flow=not self.flat_start)
+        else:
+            self.network = network
+            if not self.flat_start:
+                self._run_power_flow_seed(self.network, self.params, self.e_file)
+        self.measurements = list(measurements) if measurements is not None else self._load_measurements(self.meas_file)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
         self.u_scale = float(self.network.u_scale)
@@ -317,11 +342,29 @@ class DCStateEstimator:
         self.state_labels.extend(f"P_VGEN:{gen.name}" for gen in self.v_generators)
         self._build_apply_state_index()
         self._build_measurement_plan_device_cache()
-        # Add priors after unit conversion because model objects are already normalized.
-        self._add_pseudo_power_measurements()
         self.targeted_observability_pseudo_count = 0
-        self._refresh_active_measurement_indexes()
-        self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
+        self._observability_matrix_cache = None
+        if prepare_active_measurements:
+            # Add priors after unit conversion because model objects are already normalized.
+            self._add_pseudo_power_measurements()
+            self._refresh_active_measurement_indexes()
+            self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
+        else:
+            self.active_measurements = MeasurementList(
+                [],
+                normalized=getattr(self.measurements, "normalized", False),
+            )
+            self.active_measurement_rows = np.array([], dtype=np.int64)
+            self.active_z = np.array([], dtype=np.float64)
+            self.active_weight = np.array([], dtype=np.float64)
+            self.active_uniform_weight = None
+            self.active_weights_are_uniform = False
+            self._active_normal_pattern = None
+            self._jacobian_builder = SparseJacobianBuilder((0, self.n_state))
+            self._jacobian_builder._assume_fixed_pattern = True
+            self._measurement_plan_cache = {}
+        self._prepared = True
+        return self
 
     def _refresh_active_measurement_indexes(self) -> None:
         """Rebuild active measurement arrays and the vectorized measurement plan."""
@@ -354,6 +397,12 @@ class DCStateEstimator:
         self.active_measurement_table = active_table
         self.active_z = np.asarray(active_table.value, dtype=np.float64)
         self.active_weight = np.asarray(active_table.weight, dtype=np.float64)
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_normal_pattern = None
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._observability_matrix_cache = None
         self._measurement_plan_cache = {}
         self._measurement_plan(self.active_measurements)
 
@@ -363,6 +412,55 @@ class DCStateEstimator:
         if isinstance(measurements, list):
             return measurements
         return list(measurements)
+
+    def _measurement_vectors(self, measurements: Sequence[Measurement]) -> Tuple[np.ndarray, np.ndarray]:
+        if measurements is self.active_measurements:
+            return self.active_z, self.active_weight
+        table = getattr(measurements, "table", None)
+        if table is not None and len(table.value) == len(measurements):
+            return np.asarray(table.value, dtype=np.float64), np.asarray(table.weight, dtype=np.float64)
+        return (
+            np.asarray([meas.value for meas in measurements], dtype=np.float64),
+            np.asarray([meas.weight for meas in measurements], dtype=np.float64),
+        )
+
+    @staticmethod
+    def _uniform_weight(weight: np.ndarray) -> Optional[float]:
+        if weight.size == 0:
+            return None
+        first_weight = float(weight[0])
+        return first_weight if bool(np.all(weight == first_weight)) else None
+
+    def _cache_observability_matrix(
+        self,
+        result: ObservabilityResult,
+        x: np.ndarray,
+        measurements: Sequence[Measurement],
+        H,
+    ) -> None:
+        self._observability_matrix_cache = {
+            "result": result,
+            "measurements": measurements,
+            "x": np.asarray(x, dtype=np.float64).copy(),
+            "H": H,
+            "normal_pattern": None,
+        }
+
+    def _observability_matrix_cache_for(
+        self,
+        result: Optional[ObservabilityResult],
+        measurements: Sequence[Measurement],
+        x: np.ndarray,
+    ):
+        cache = getattr(self, "_observability_matrix_cache", None)
+        if cache is None or cache.get("result") is not result:
+            return None
+        if cache.get("measurements") is not measurements:
+            return None
+        cached_x = cache.get("x")
+        if cached_x is None or cached_x.shape != np.asarray(x).shape or not np.array_equal(cached_x, x):
+            return None
+        return cache
 
     def _disable_unavailable_measurements(self) -> None:
         """Keep invalid/off-topology measurement rows out of unit conversion and WLS."""
@@ -697,6 +795,11 @@ class DCStateEstimator:
         if not run_power_flow:
             return network
 
+        DCStateEstimator._run_power_flow_seed(network, params, e_file)
+        return network
+
+    @staticmethod
+    def _run_power_flow_seed(network: DCPowerNetwork, params: StateEstimationParameters, e_file: Path) -> None:
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run(
@@ -709,7 +812,6 @@ class DCStateEstimator:
                 f"DC power flow failed for {e_file}: rc={rc}, "
                 f"iter={calc.iterations}, normF={calc.normF:.3e}"
             )
-        return network
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> MeasurementList:
@@ -847,19 +949,44 @@ class DCStateEstimator:
 
     def _active_device_keys(self) -> set:
         """Return devices that already have at least one usable real measurement."""
-        return {
-            (meas.device_type, meas.device_name)
-            for meas in self.measurements
-            if meas.valid and meas.weight > 0.0
-        }
+        if not hasattr(self, "_active_device_key_cache"):
+            self._refresh_measurement_summary_cache()
+        return set(self._active_device_key_cache)
 
     def _active_measurement_keys(self) -> set:
         """Return usable measurement keys at device and measurement-type granularity."""
-        return {
-            (meas.device_type, meas.device_name, meas.meas_type)
-            for meas in self.measurements
-            if meas.valid and meas.weight > 0.0
-        }
+        if not hasattr(self, "_active_measurement_key_cache"):
+            self._refresh_measurement_summary_cache()
+        return set(self._active_measurement_key_cache)
+
+    def _next_measurement_idx(self) -> int:
+        if not hasattr(self, "_max_measurement_idx"):
+            self._refresh_measurement_summary_cache()
+        return int(self._max_measurement_idx) + 1
+
+    def _refresh_measurement_summary_cache(self) -> None:
+        """Cache active measurement key sets and max row id for initialization scans."""
+        active_device_keys = set()
+        active_measurement_keys = set()
+        max_idx = 0
+        for meas in self.measurements:
+            if meas.idx > max_idx:
+                max_idx = int(meas.idx)
+            if meas.valid and meas.weight > 0.0:
+                active_device_keys.add((meas.device_type, meas.device_name))
+                active_measurement_keys.add((meas.device_type, meas.device_name, meas.meas_type))
+        self._active_device_key_cache = active_device_keys
+        self._active_measurement_key_cache = active_measurement_keys
+        self._max_measurement_idx = max_idx
+
+    def _record_measurement_summary(self, meas: Measurement) -> None:
+        if not hasattr(self, "_max_measurement_idx"):
+            self._refresh_measurement_summary_cache()
+        if meas.idx > self._max_measurement_idx:
+            self._max_measurement_idx = int(meas.idx)
+        if meas.valid and meas.weight > 0.0:
+            self._active_device_key_cache.add((meas.device_type, meas.device_name))
+            self._active_measurement_key_cache.add((meas.device_type, meas.device_name, meas.meas_type))
 
     def _append_pseudo_measurement(
         self,
@@ -869,19 +996,23 @@ class DCStateEstimator:
         device_name: str,
         meas_type: str,
         value: float,
+        *,
+        record_summary: bool = True,
     ) -> int:
-        self.measurements.append(
-            Measurement(
-                idx=next_idx,
-                name=name,
-                device_type=device_type,
-                device_name=device_name,
-                meas_type=meas_type,
-                weight=self.pseudo_measurement_weight,
-                valid=True,
-                value=float(value),
-            )
-        )
+        measurement = Measurement.__new__(Measurement)
+        measurement.idx = next_idx
+        measurement.name = name
+        measurement.device_type = device_type
+        measurement.device_name = device_name
+        measurement.meas_type = meas_type
+        measurement.weight = self.pseudo_measurement_weight
+        measurement.valid = True
+        measurement.value = float(value)
+        self.measurements.append(measurement)
+        if record_summary:
+            self._record_measurement_summary(measurement)
+        elif next_idx > getattr(self, "_max_measurement_idx", 0):
+            self._max_measurement_idx = int(next_idx)
         return next_idx + 1
 
     @staticmethod
@@ -909,7 +1040,7 @@ class DCStateEstimator:
 
     def _add_pseudo_topology_measurements(self, next_idx: int) -> int:
         """Add weak priors for topology devices that have no usable measurement row."""
-        measured_keys = self._active_measurement_keys()
+        measured_keys = self._active_measurement_key_cache
 
         for device_type, devices in (
             ("DCZeroBranch", self.zero_branches),
@@ -937,8 +1068,10 @@ class DCStateEstimator:
 
     def _add_pseudo_power_measurements(self) -> None:
         """Add weak priors for devices whose file measurements are missing or invalid."""
-        measured_devices = self._active_device_keys()
-        next_idx = max((meas.idx for meas in self.measurements), default=0) + 1
+        if not hasattr(self, "_active_device_key_cache") or not hasattr(self, "_active_measurement_key_cache"):
+            self._refresh_measurement_summary_cache()
+        measured_devices = self._active_device_key_cache
+        next_idx = self._next_measurement_idx()
         next_idx = self._add_pseudo_topology_measurements(next_idx)
 
         for gen in sorted(self.generator_by_name.values(), key=lambda item: item.idx):
@@ -1100,14 +1233,14 @@ class DCStateEstimator:
 
     def _add_zero_branch_constraint_measurements(self) -> None:
         """Add ideal DC voltage-equality constraints for zero branches and closed switches."""
+        if not hasattr(self, "_active_measurement_key_cache"):
+            self._refresh_measurement_summary_cache()
         existing = {
-            (meas.device_type, meas.device_name, meas.meas_type)
-            for meas in self.measurements
-            if meas.valid
-            and meas.weight > 0.0
-            and meas.device_type in ("DCZeroBranchConstraint", "DCBreakConstraint")
+            key
+            for key in self._active_measurement_key_cache
+            if key[0] in ("DCZeroBranchConstraint", "DCBreakConstraint")
         }
-        next_idx = max((meas.idx for meas in self.measurements), default=0) + 1
+        next_idx = self._next_measurement_idx()
         weight = 10.0
         ideal_devices = [
             ("DCZeroBranchConstraint", zbr)
@@ -1121,18 +1254,18 @@ class DCStateEstimator:
             key = (device_type, dev.name, "V_DIFF")
             if key in existing:
                 continue
-            self.measurements.append(
-                Measurement(
-                    idx=next_idx,
-                    name=f"constraint_v_diff_{dev.name}",
-                    device_type=device_type,
-                    device_name=dev.name,
-                    meas_type="V_DIFF",
-                    weight=weight,
-                    valid=True,
-                    value=0.0,
-                )
-            )
+            measurement = Measurement.__new__(Measurement)
+            measurement.idx = next_idx
+            measurement.name = f"constraint_v_diff_{dev.name}"
+            measurement.device_type = device_type
+            measurement.device_name = dev.name
+            measurement.meas_type = "V_DIFF"
+            measurement.weight = weight
+            measurement.valid = True
+            measurement.value = 0.0
+            self.measurements.append(measurement)
+            self._record_measurement_summary(measurement)
+            existing.add(key)
             next_idx += 1
 
     def initial_state(self) -> np.ndarray:
@@ -1829,11 +1962,11 @@ class DCStateEstimator:
         """Assemble analytical DC measurement sensitivities for WLS."""
         measurements = self._normalize_measurements(measurements)
         voltage, switch_current, dcdc_power, v_generator_power = self._unpack_state(x)
-        H = (
-            SparseJacobianBuilder((len(measurements), self.n_state))
-            if sparse
-            else np.zeros((len(measurements), self.n_state), dtype=np.float64)
-        )
+        if sparse:
+            H = self._jacobian_builder if measurements is self.active_measurements else SparseJacobianBuilder((len(measurements), self.n_state))
+            H.reset()
+        else:
+            H = np.zeros((len(measurements), self.n_state), dtype=np.float64)
         vectorized_rows = self._fill_jacobian_vectorized(
             H,
             measurements,
@@ -2066,7 +2199,7 @@ class DCStateEstimator:
             normal_matrix=normal_matrix,
             normal_factor_diag=normal_factor_diag,
         )
-        return ObservabilityResult(
+        result = ObservabilityResult(
             observable=rank == self.n_state,
             rank=rank,
             state_count=self.n_state,
@@ -2075,12 +2208,15 @@ class DCStateEstimator:
             singular_values=s,
             weak_states=weak_states,
         )
+        self._cache_observability_matrix(result, x, measurements, H)
+        return result
 
     def estimate(
         self,
         measurements: Optional[Sequence[Measurement]] = None,
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
+        observability: Optional[ObservabilityResult] = None,
     ) -> EstimateResult:
         """Solve the weighted least-squares DC state estimate with damped Newton steps."""
         measurements = self._normalize_measurements(measurements)
@@ -2088,12 +2224,17 @@ class DCStateEstimator:
             raise RuntimeError(f"Not enough valid measurements: {len(measurements)} < {self.n_state}")
 
         x = self.initial_state() if x0 is None else x0.copy()
-        if measurements is self.active_measurements:
-            z = self.active_z
-            weight = self.active_weight
-        else:
-            z = np.asarray([meas.value for meas in measurements], dtype=np.float64)
-            weight = np.asarray([meas.weight for meas in measurements], dtype=np.float64)
+        if observability is None:
+            if measurements is self.active_measurements and x0 is None:
+                observability = self.observability_analysis()
+            else:
+                observability = self.observability_analysis(x, measurements)
+        observability_cache = self._observability_matrix_cache_for(observability, measurements, x)
+        cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
+        z, weight = self._measurement_vectors(measurements)
+        uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
+        weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
+        weighted_residual = None if weights_are_uniform else np.empty_like(weight)
         converged = False
         max_correction = np.inf
         objective = np.inf
@@ -2102,6 +2243,10 @@ class DCStateEstimator:
         gain = np.zeros((self.n_state, self.n_state), dtype=np.float64)
         final_quantities_current = False
         normal_factor_diag = None
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
+        normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
+        if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
+            normal_pattern = observability_cache["normal_pattern"]
 
         if verbose:
             _print_iteration_header()
@@ -2111,9 +2256,30 @@ class DCStateEstimator:
             residual = z - z_est
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             objective = 0.5 * float(np.dot(weight * residual, residual))
-            H = self.jacobian_sparse(x, measurements)
-            gain, rhs = build_normal_equations(H, residual, weight)
-            dx, normal_factor_diag = solve_normal_equations_with_factor(gain, rhs)
+            if iteration == 1 and cached_initial_H is not None:
+                H = cached_initial_H
+                cached_initial_H = None
+            else:
+                H = self.jacobian_sparse(x, measurements)
+            if normal_pattern is None and is_sparse_matrix(H):
+                normal_pattern = _normal_equation_structural_pattern(H)
+                if measurements is self.active_measurements:
+                    self._active_normal_pattern = normal_pattern
+                if observability_cache is not None:
+                    observability_cache["normal_pattern"] = normal_pattern
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            gain, rhs = build_normal_equations(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+                normal_pattern=normal_pattern,
+                assume_normal_pattern_matches=measurements is self.active_measurements,
+            )
+            dx, normal_factor_diag = normal_solver.solve(gain, rhs, return_factor_diag=False)
 
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
             if max_correction < self.tol:
@@ -2161,16 +2327,24 @@ class DCStateEstimator:
             z_est = self.evaluate(x, measurements)
             residual = z - z_est
             H = self.jacobian_sparse(x, measurements)
-            gain, _ = build_normal_equations(H, residual, weight)
+            if normal_pattern is None and is_sparse_matrix(H):
+                normal_pattern = _normal_equation_structural_pattern(H)
+                if measurements is self.active_measurements:
+                    self._active_normal_pattern = normal_pattern
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            gain, _ = build_normal_equations(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+                normal_pattern=normal_pattern,
+                assume_normal_pattern_matches=measurements is self.active_measurements,
+            )
             objective = 0.5 * float(np.dot(weight * residual, residual))
             normal_factor_diag = None
-        observability = self.observability_analysis(
-            x,
-            measurements,
-            H=H,
-            normal_matrix=gain,
-            normal_factor_diag=normal_factor_diag,
-        )
         self.apply_state(x)
         return EstimateResult(
             converged=converged,
@@ -2214,6 +2388,28 @@ class DCStateEstimator:
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
         return bad_items, normalized
+
+    def build_se_result(
+        self,
+        result: EstimateResult,
+        bad_items: Optional[Sequence[BadDataItem]] = None,
+        normalized_residual: Optional[Sequence[float]] = None,
+        threshold: Optional[float] = None,
+    ) -> SEResult:
+        """Build the structured state-estimation result snapshot after WLS."""
+        if bad_items is None or normalized_residual is None:
+            computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
+            if bad_items is None:
+                bad_items = computed_bad_items
+            if normalized_residual is None:
+                normalized_residual = computed_normalized
+        self.se_result = SEResult.from_estimate_result(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized_residual,
+            all_measurements=self.measurements,
+        )
+        return self.se_result
 
     def estimate_with_bad_data_removal(
         self,
@@ -2436,10 +2632,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for item in removed:
                 print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
     else:
-        result = estimator.estimate(verbose=not args.quiet)
+        result = estimator.estimate(verbose=not args.quiet, observability=initial_observability)
 
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
     bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
+    estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
     print(
         "State estimation: "
         f"converged={result.converged}, "
@@ -2448,7 +2645,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"max_dx={result.max_correction:.3e}, "
         f"norm_res={result.residual_inf:.3e}"
     )
-    _print_observability(result.observability)
     _print_bad_data(bad_items, normalized, bad_threshold)
 
     if args.print_state:
