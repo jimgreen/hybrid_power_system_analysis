@@ -1,7 +1,6 @@
 import argparse
 import contextlib
 import io
-import math
 import sys
 import time
 from dataclasses import dataclass
@@ -33,7 +32,12 @@ from model.meas_model import (
 )
 from secore.ac_se import ACStateEstimator, _read_measurements_direct as _read_table_measurements_direct
 from secore.dc_se import DCStateEstimator
-from secore.se_array_plan import build_active_measurement_view, copy_measurement_view, partition_measurements_by_code
+from secore.se_array_plan import (
+    build_active_measurement_view,
+    build_measurement_plan_table,
+    copy_measurement_view,
+    partition_measurements_by_code,
+)
 from secore.se_math import (
     ANGLE_MEASUREMENT_TYPES,
     NormalEquationSolver,
@@ -162,6 +166,23 @@ class HybridStateEstimator:
     class _SubEstimatorMeasurementContext:
         measurements: Sequence[Measurement]
         summary_attrs: Optional[Dict[str, object]]
+
+    @dataclass(frozen=True)
+    class _HybridMeasurementPlan:
+        dcac_rows: np.ndarray
+        dcac_codes: np.ndarray
+        dcac_pos: np.ndarray
+        dcac_dc_v_col: np.ndarray
+        dcac_ac_v_col: np.ndarray
+        dcac_dc_v_default: np.ndarray
+        dcac_ac_v_default: np.ndarray
+        acac_rows: np.ndarray
+        acac_codes: np.ndarray
+        acac_pos: np.ndarray
+        acac_from_v_col: np.ndarray
+        acac_to_v_col: np.ndarray
+        acac_from_v_default: np.ndarray
+        acac_to_v_default: np.ndarray
 
     def __init__(
         self,
@@ -1246,7 +1267,14 @@ class HybridStateEstimator:
         if self._active_dc_hybrid_rows.size:
             self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
         self._jacobian_static_skip = np.zeros(len(self.active_measurements), dtype=bool)
-        self._active_hybrid_measurement_plan = self._build_active_hybrid_measurement_plan()
+        self._active_measurement_blocks = {
+            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
+            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
+        }
+        self._active_hybrid_measurement_plan = self._build_hybrid_measurement_plan(
+            self._active_measurement_blocks["hybrid"],
+        )
         self.active_z = active_view.z
         self.active_weight = active_view.weight
         self.active_angle_residual_mask = active_view.angle_mask
@@ -1258,71 +1286,146 @@ class HybridStateEstimator:
         self._observability_matrix_cache = None
         self.power_flow_state = self.initial_state(flat=False)
         self.flat_state = self.initial_state(flat=True)
-        self._active_measurement_blocks = {
-            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
-            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
-            "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
-        }
 
-    def _build_active_hybrid_measurement_plan(self) -> Dict[str, np.ndarray]:
-        dcac_rows: List[int] = []
-        dcac_codes: List[int] = []
-        dcac_pos: List[int] = []
-        dcac_dc_v_col: List[int] = []
-        dcac_ac_v_col: List[int] = []
-        dcac_dc_v_default: List[float] = []
-        dcac_ac_v_default: List[float] = []
-        acac_rows: List[int] = []
-        acac_codes: List[int] = []
-        acac_pos: List[int] = []
-        acac_from_v_col: List[int] = []
-        acac_to_v_col: List[int] = []
-        acac_from_v_default: List[float] = []
-        acac_to_v_default: List[float] = []
-
+    def _build_hybrid_measurement_plan(
+        self,
+        block: "HybridStateEstimator._MeasurementSideBlock",
+    ) -> "HybridStateEstimator._HybridMeasurementPlan":
         ac_node_dict = getattr(getattr(self.network, "ac", None), "node_dict", {})
         dc_node_dict = getattr(getattr(self.network, "dc", None), "node_dict", {})
+        dcac_code = int(DEVICE_TYPE_CODES["DCACConverter"])
+        acac_code = int(DEVICE_TYPE_CODES["ACACConverter"])
+        plan_table = build_measurement_plan_table(
+            block.measurements,
+            device_pos_by_type_code={
+                dcac_code: self.dcac_pos_by_name,
+                acac_code: self.acac_pos_by_name,
+            },
+            meas_kind_by_type_code={
+                dcac_code: self._DCAC_MEASUREMENT_CODE,
+                acac_code: self._ACAC_MEASUREMENT_CODE,
+            },
+            table_builder=_measurement_table_from_measurements,
+        )
 
-        for row, meas in zip(self.hybrid_meas_rows, self.hybrid_meas):
-            if meas.device_type == "DCACConverter":
-                conv = self.dcac_by_name[meas.device_name]
-                dcac_rows.append(int(row))
-                dcac_codes.append(int(self._DCAC_MEASUREMENT_CODE[meas.meas_type]))
-                dcac_pos.append(int(self.dcac_pos_by_name[conv.name]))
-                dcac_dc_v_col.append(int(self._dc_voltage_col_for_node(conv.dc_node)))
-                dcac_ac_v_col.append(int(self._ac_voltage_col_for_node(conv.ac_node)))
-                dc_node = dc_node_dict.get(int(conv.dc_node))
-                ac_node = ac_node_dict.get(int(conv.ac_node))
-                dcac_dc_v_default.append(float(getattr(dc_node, "voltage", 1.0) or 1.0))
-                dcac_ac_v_default.append(float(getattr(ac_node, "voltage", 1.0) or 1.0))
-            elif meas.device_type == "ACACConverter":
-                conv = self.acac_by_name[meas.device_name]
-                acac_rows.append(int(row))
-                acac_codes.append(int(self._ACAC_MEASUREMENT_CODE[meas.meas_type]))
-                acac_pos.append(int(self.acac_pos_by_name[conv.name]))
-                acac_from_v_col.append(int(self._ac_voltage_col_for_node(conv.i_node)))
-                acac_to_v_col.append(int(self._ac_voltage_col_for_node(conv.j_node)))
-                from_node = ac_node_dict.get(int(conv.i_node))
-                to_node = ac_node_dict.get(int(conv.j_node))
-                acac_from_v_default.append(float(getattr(from_node, "voltage", 1.0) or 1.0))
-                acac_to_v_default.append(float(getattr(to_node, "voltage", 1.0) or 1.0))
+        dcac_mask = plan_table.handled & (plan_table.device_type_code == dcac_code)
+        dcac_local_rows = plan_table.row[dcac_mask].astype(np.int64, copy=False)
+        dcac_pos = plan_table.device_pos[dcac_mask].astype(np.int32, copy=False)
+        dcac_rows = block.rows[dcac_local_rows].astype(np.int32, copy=False)
+        dcac_codes = plan_table.meas_kind[dcac_mask].astype(np.int8, copy=False)
+        dcac_dc_v_col = np.fromiter(
+            (self._dc_voltage_col_for_node(self.dcac_converters[int(pos)].dc_node) for pos in dcac_pos),
+            dtype=np.int32,
+            count=dcac_pos.size,
+        )
+        dcac_ac_v_col = np.fromiter(
+            (self._ac_voltage_col_for_node(self.dcac_converters[int(pos)].ac_node) for pos in dcac_pos),
+            dtype=np.int32,
+            count=dcac_pos.size,
+        )
+        dcac_dc_v_default = np.fromiter(
+            (
+                float(
+                    getattr(
+                        dc_node_dict.get(int(self.dcac_converters[int(pos)].dc_node)),
+                        "voltage",
+                        1.0,
+                    )
+                    or 1.0
+                )
+                for pos in dcac_pos
+            ),
+            dtype=np.float64,
+            count=dcac_pos.size,
+        )
+        dcac_ac_v_default = np.fromiter(
+            (
+                float(
+                    getattr(
+                        ac_node_dict.get(int(self.dcac_converters[int(pos)].ac_node)),
+                        "voltage",
+                        1.0,
+                    )
+                    or 1.0
+                )
+                for pos in dcac_pos
+            ),
+            dtype=np.float64,
+            count=dcac_pos.size,
+        )
 
-        return {
-            "dcac_rows": np.asarray(dcac_rows, dtype=np.int32),
-            "dcac_codes": np.asarray(dcac_codes, dtype=np.int8),
-            "dcac_pos": np.asarray(dcac_pos, dtype=np.int32),
-            "dcac_dc_v_col": np.asarray(dcac_dc_v_col, dtype=np.int32),
-            "dcac_ac_v_col": np.asarray(dcac_ac_v_col, dtype=np.int32),
-            "dcac_dc_v_default": np.asarray(dcac_dc_v_default, dtype=np.float64),
-            "dcac_ac_v_default": np.asarray(dcac_ac_v_default, dtype=np.float64),
-            "acac_rows": np.asarray(acac_rows, dtype=np.int32),
-            "acac_codes": np.asarray(acac_codes, dtype=np.int8),
-            "acac_pos": np.asarray(acac_pos, dtype=np.int32),
-            "acac_from_v_col": np.asarray(acac_from_v_col, dtype=np.int32),
-            "acac_to_v_col": np.asarray(acac_to_v_col, dtype=np.int32),
-            "acac_from_v_default": np.asarray(acac_from_v_default, dtype=np.float64),
-            "acac_to_v_default": np.asarray(acac_to_v_default, dtype=np.float64),
-        }
+        acac_mask = plan_table.handled & (plan_table.device_type_code == acac_code)
+        acac_local_rows = plan_table.row[acac_mask].astype(np.int64, copy=False)
+        acac_pos = plan_table.device_pos[acac_mask].astype(np.int32, copy=False)
+        acac_rows = block.rows[acac_local_rows].astype(np.int32, copy=False)
+        acac_codes = plan_table.meas_kind[acac_mask].astype(np.int8, copy=False)
+        acac_from_v_col = np.fromiter(
+            (self._ac_voltage_col_for_node(self.acac_converters[int(pos)].i_node) for pos in acac_pos),
+            dtype=np.int32,
+            count=acac_pos.size,
+        )
+        acac_to_v_col = np.fromiter(
+            (self._ac_voltage_col_for_node(self.acac_converters[int(pos)].j_node) for pos in acac_pos),
+            dtype=np.int32,
+            count=acac_pos.size,
+        )
+        acac_from_v_default = np.fromiter(
+            (
+                float(
+                    getattr(
+                        ac_node_dict.get(int(self.acac_converters[int(pos)].i_node)),
+                        "voltage",
+                        1.0,
+                    )
+                    or 1.0
+                )
+                for pos in acac_pos
+            ),
+            dtype=np.float64,
+            count=acac_pos.size,
+        )
+        acac_to_v_default = np.fromiter(
+            (
+                float(
+                    getattr(
+                        ac_node_dict.get(int(self.acac_converters[int(pos)].j_node)),
+                        "voltage",
+                        1.0,
+                    )
+                    or 1.0
+                )
+                for pos in acac_pos
+            ),
+            dtype=np.float64,
+            count=acac_pos.size,
+        )
+
+        return self._HybridMeasurementPlan(
+            dcac_rows=dcac_rows,
+            dcac_codes=dcac_codes,
+            dcac_pos=dcac_pos,
+            dcac_dc_v_col=dcac_dc_v_col,
+            dcac_ac_v_col=dcac_ac_v_col,
+            dcac_dc_v_default=dcac_dc_v_default,
+            dcac_ac_v_default=dcac_ac_v_default,
+            acac_rows=acac_rows,
+            acac_codes=acac_codes,
+            acac_pos=acac_pos,
+            acac_from_v_col=acac_from_v_col,
+            acac_to_v_col=acac_to_v_col,
+            acac_from_v_default=acac_from_v_default,
+            acac_to_v_default=acac_to_v_default,
+        )
+
+    def _hybrid_measurement_plan_for(
+        self,
+        measurements: Sequence[Measurement],
+        blocks: Optional[Dict[str, "HybridStateEstimator._MeasurementSideBlock"]] = None,
+    ) -> "HybridStateEstimator._HybridMeasurementPlan":
+        if measurements is self.active_measurements:
+            return self._active_hybrid_measurement_plan
+        side_blocks = self._measurement_blocks_for(measurements) if blocks is None else blocks
+        return self._build_hybrid_measurement_plan(side_blocks["hybrid"])
 
     def state_layout(self) -> Dict[str, object]:
         return {
@@ -1843,20 +1946,6 @@ class HybridStateEstimator:
         col = int(dc.voltage_col[pos])
         return self.dc_state_start + col if col >= 0 else -1
 
-    def _ac_voltage_value(self, ac_x: np.ndarray, node_idx: int) -> float:
-        col = self._ac_voltage_col_for_node(node_idx)
-        if col >= 0:
-            return float(ac_x[col])
-        node = self.network.ac.node_dict.get(int(node_idx))
-        return float(getattr(node, "voltage", 1.0) or 1.0)
-
-    def _dc_voltage_value(self, dc_x: np.ndarray, node_idx: int) -> float:
-        col = self._dc_voltage_col_for_node(node_idx)
-        if col >= 0:
-            return float(dc_x[col - self.dc_state_start])
-        node = self.network.dc.node_dict.get(int(node_idx))
-        return float(getattr(node, "voltage", 1.0) or 1.0)
-
     def _evaluate_active_hybrid_measurements(
         self,
         values: np.ndarray,
@@ -1864,22 +1953,31 @@ class HybridStateEstimator:
         dc_x: np.ndarray,
         hybrid_x: np.ndarray,
     ) -> None:
-        plan = self._active_hybrid_measurement_plan
-        rows = plan["dcac_rows"]
+        self._evaluate_hybrid_measurements(values, ac_x, dc_x, hybrid_x, self._active_hybrid_measurement_plan)
+
+    def _evaluate_hybrid_measurements(
+        self,
+        values: np.ndarray,
+        ac_x: np.ndarray,
+        dc_x: np.ndarray,
+        hybrid_x: np.ndarray,
+        plan: "HybridStateEstimator._HybridMeasurementPlan",
+    ) -> None:
+        rows = plan.dcac_rows
         if rows.size:
-            codes = plan["dcac_codes"]
-            pos = plan["dcac_pos"]
+            codes = plan.dcac_codes
+            pos = plan.dcac_pos
             base = 3 * pos
             p_dc = hybrid_x[base]
             p_ac = hybrid_x[base + 1]
             q_ac = hybrid_x[base + 2]
             v_dc = self._state_values_from_cols(
                 dc_x,
-                plan["dcac_dc_v_col"],
-                plan["dcac_dc_v_default"],
+                plan.dcac_dc_v_col,
+                plan.dcac_dc_v_default,
                 self.dc_state_start,
             )
-            v_ac = self._state_values_from_cols(ac_x, plan["dcac_ac_v_col"], plan["dcac_ac_v_default"])
+            v_ac = self._state_values_from_cols(ac_x, plan.dcac_ac_v_col, plan.dcac_ac_v_default)
             for code, source in (
                 (1, p_dc),
                 (2, p_ac),
@@ -1907,17 +2005,17 @@ class HybridStateEstimator:
                     where=np.abs(v_ac[mask]) > self.min_current_voltage,
                 )
 
-        rows = plan["acac_rows"]
+        rows = plan.acac_rows
         if rows.size:
-            codes = plan["acac_codes"]
-            pos = plan["acac_pos"]
+            codes = plan.acac_codes
+            pos = plan.acac_pos
             base = 3 * len(self.dcac_converters) + 4 * pos
             p_from = hybrid_x[base]
             q_from = hybrid_x[base + 1]
             p_to = hybrid_x[base + 2]
             q_to = hybrid_x[base + 3]
-            v_from = self._state_values_from_cols(ac_x, plan["acac_from_v_col"], plan["acac_from_v_default"])
-            v_to = self._state_values_from_cols(ac_x, plan["acac_to_v_col"], plan["acac_to_v_default"])
+            v_from = self._state_values_from_cols(ac_x, plan.acac_from_v_col, plan.acac_from_v_default)
+            v_to = self._state_values_from_cols(ac_x, plan.acac_to_v_col, plan.acac_to_v_default)
             for code, source in (
                 (1, p_from),
                 (2, q_from),
@@ -1956,70 +2054,18 @@ class HybridStateEstimator:
         blocks = self._measurement_blocks_for(measurements)
         ac_block = blocks["ac"]
         dc_block = blocks["dc"]
-        hybrid_block = blocks["hybrid"]
         if ac_block.measurements and self._ac_sub_estimator is not None:
             values[ac_block.rows] = self._ac_sub_estimator.evaluate(ac_x, ac_block.measurements)
         if dc_block.measurements and self._dc_sub_estimator is not None:
             values[dc_block.rows] = self._dc_sub_estimator.evaluate(dc_x, dc_block.measurements)
-        if measurements is self.active_measurements:
-            self._evaluate_active_hybrid_measurements(values, ac_x, dc_x, hybrid_x)
-        else:
-            for row, meas in zip(hybrid_block.rows, hybrid_block.measurements):
-                values[int(row)] = self._evaluate_hybrid_measurement(meas, ac_x, dc_x, hybrid_x)
+        self._evaluate_hybrid_measurements(
+            values,
+            ac_x,
+            dc_x,
+            hybrid_x,
+            self._hybrid_measurement_plan_for(measurements, blocks),
+        )
         return values
-
-    def _evaluate_hybrid_measurement(
-        self,
-        meas: Measurement,
-        ac_x: np.ndarray,
-        dc_x: np.ndarray,
-        hybrid_x: np.ndarray,
-    ) -> float:
-        if meas.device_type == "DCACConverter":
-            conv = self.dcac_by_name[meas.device_name]
-            k = self.dcac_pos_by_name[conv.name]
-            base = 3 * k
-            p_dc, p_ac, q_ac = hybrid_x[base : base + 3]
-            v_dc = self._dc_voltage_value(dc_x, conv.dc_node)
-            v_ac = self._ac_voltage_value(ac_x, conv.ac_node)
-            if meas.meas_type == "P_DC":
-                return float(p_dc)
-            if meas.meas_type == "P_AC":
-                return float(p_ac)
-            if meas.meas_type == "Q_AC":
-                return float(q_ac)
-            if meas.meas_type == "V_DC":
-                return float(v_dc)
-            if meas.meas_type == "I_DC":
-                return float(p_dc / v_dc) if abs(v_dc) > self.min_current_voltage else 0.0
-            if meas.meas_type == "V_AC":
-                return float(v_ac)
-            if meas.meas_type == "I_AC":
-                return float(math.hypot(p_ac, q_ac) / v_ac) if abs(v_ac) > self.min_current_voltage else 0.0
-        if meas.device_type == "ACACConverter":
-            conv = self.acac_by_name[meas.device_name]
-            k = self.acac_pos_by_name[conv.name]
-            base = 3 * len(self.dcac_converters) + 4 * k
-            p_from, q_from, p_to, q_to = hybrid_x[base : base + 4]
-            v_from = self._ac_voltage_value(ac_x, conv.i_node)
-            v_to = self._ac_voltage_value(ac_x, conv.j_node)
-            if meas.meas_type == "P_FROM":
-                return float(p_from)
-            if meas.meas_type == "Q_FROM":
-                return float(q_from)
-            if meas.meas_type == "P_TO":
-                return float(p_to)
-            if meas.meas_type == "Q_TO":
-                return float(q_to)
-            if meas.meas_type == "V_FROM":
-                return float(v_from)
-            if meas.meas_type == "I_FROM":
-                return float(math.hypot(p_from, q_from) / v_from) if abs(v_from) > self.min_current_voltage else 0.0
-            if meas.meas_type == "V_TO":
-                return float(v_to)
-            if meas.meas_type == "I_TO":
-                return float(math.hypot(p_to, q_to) / v_to) if abs(v_to) > self.min_current_voltage else 0.0
-        raise RuntimeError(f"Unsupported hybrid measurement: {meas.device_type}.{meas.meas_type}")
 
     def jacobian(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
         return self.jacobian_sparse(x, measurements).toarray()
@@ -2036,12 +2082,13 @@ class HybridStateEstimator:
         blocks = self._measurement_blocks_for(measurements)
         self._append_sub_jacobian(H, self._ac_sub_estimator, ac_x, blocks["ac"], 0)
         self._append_sub_jacobian(H, self._dc_sub_estimator, dc_x, blocks["dc"], self.dc_state_start)
-        if measurements is self.active_measurements:
-            self._append_active_hybrid_jacobian_entries(H, ac_x, dc_x, hybrid_x)
-        else:
-            hybrid_block = blocks["hybrid"]
-            for row, meas in zip(hybrid_block.rows, hybrid_block.measurements):
-                self._append_hybrid_jacobian_entries(H, int(row), meas, ac_x, dc_x, hybrid_x)
+        self._append_hybrid_jacobian_plan(
+            H,
+            ac_x,
+            dc_x,
+            hybrid_x,
+            self._hybrid_measurement_plan_for(measurements, blocks),
+        )
         return H.to_csr()
 
     def _append_sub_jacobian(
@@ -2108,11 +2155,20 @@ class HybridStateEstimator:
         dc_x: np.ndarray,
         hybrid_x: np.ndarray,
     ) -> None:
-        plan = self._active_hybrid_measurement_plan
-        row_array = plan["dcac_rows"]
+        self._append_hybrid_jacobian_plan(target, ac_x, dc_x, hybrid_x, self._active_hybrid_measurement_plan)
+
+    def _append_hybrid_jacobian_plan(
+        self,
+        target,
+        ac_x: np.ndarray,
+        dc_x: np.ndarray,
+        hybrid_x: np.ndarray,
+        plan: "HybridStateEstimator._HybridMeasurementPlan",
+    ) -> None:
+        row_array = plan.dcac_rows
         if row_array.size:
-            codes = plan["dcac_codes"]
-            pos = plan["dcac_pos"]
+            codes = plan.dcac_codes
+            pos = plan.dcac_pos
             base = 3 * pos
             p_dc = hybrid_x[base]
             p_ac = hybrid_x[base + 1]
@@ -2120,10 +2176,10 @@ class HybridStateEstimator:
             p_dc_col = self.dcac_p_dc_state_col[pos]
             p_ac_col = self.dcac_p_ac_state_col[pos]
             q_ac_col = self.dcac_q_ac_state_col[pos]
-            v_dc_col = plan["dcac_dc_v_col"]
-            v_ac_col = plan["dcac_ac_v_col"]
-            v_dc = self._state_values_from_cols(dc_x, v_dc_col, plan["dcac_dc_v_default"], self.dc_state_start)
-            v_ac = self._state_values_from_cols(ac_x, v_ac_col, plan["dcac_ac_v_default"])
+            v_dc_col = plan.dcac_dc_v_col
+            v_ac_col = plan.dcac_ac_v_col
+            v_dc = self._state_values_from_cols(dc_x, v_dc_col, plan.dcac_dc_v_default, self.dc_state_start)
+            v_ac = self._state_values_from_cols(ac_x, v_ac_col, plan.dcac_ac_v_default)
 
             self._append_vector_jacobian_entries(target, row_array, p_dc_col, 1.0, codes == 1)
             self._append_vector_jacobian_entries(target, row_array, p_ac_col, 1.0, codes == 2)
@@ -2172,10 +2228,10 @@ class HybridStateEstimator:
                 valid,
             )
 
-        row_array = plan["acac_rows"]
+        row_array = plan.acac_rows
         if row_array.size:
-            codes = plan["acac_codes"]
-            pos = plan["acac_pos"]
+            codes = plan.acac_codes
+            pos = plan.acac_pos
             base = 3 * len(self.dcac_converters) + 4 * pos
             p_from = hybrid_x[base]
             q_from = hybrid_x[base + 1]
@@ -2185,10 +2241,10 @@ class HybridStateEstimator:
             q_from_col = self.acac_q_from_state_col[pos]
             p_to_col = self.acac_p_to_state_col[pos]
             q_to_col = self.acac_q_to_state_col[pos]
-            v_from_col = plan["acac_from_v_col"]
-            v_to_col = plan["acac_to_v_col"]
-            v_from = self._state_values_from_cols(ac_x, v_from_col, plan["acac_from_v_default"])
-            v_to = self._state_values_from_cols(ac_x, v_to_col, plan["acac_to_v_default"])
+            v_from_col = plan.acac_from_v_col
+            v_to_col = plan.acac_to_v_col
+            v_from = self._state_values_from_cols(ac_x, v_from_col, plan.acac_from_v_default)
+            v_to = self._state_values_from_cols(ac_x, v_to_col, plan.acac_to_v_default)
 
             self._append_vector_jacobian_entries(target, row_array, p_from_col, 1.0, codes == 1)
             self._append_vector_jacobian_entries(target, row_array, q_from_col, 1.0, codes == 2)
@@ -2246,98 +2302,6 @@ class HybridStateEstimator:
                 self._masked_divide(-s_to, v_to * v_to, valid),
                 valid,
             )
-
-    def _append_hybrid_jacobian_entries(
-        self,
-        target,
-        row: int,
-        meas: Measurement,
-        ac_x: np.ndarray,
-        dc_x: np.ndarray,
-        hybrid_x: np.ndarray,
-    ) -> None:
-        def add(col: int, value: float) -> None:
-            if col >= 0 and value != 0.0:
-                target.add(row, int(col), float(value))
-
-        if meas.device_type == "DCACConverter":
-            conv = self.dcac_by_name[meas.device_name]
-            k = self.dcac_pos_by_name[conv.name]
-            p_dc_col = int(self.dcac_p_dc_state_col[k])
-            p_ac_col = int(self.dcac_p_ac_state_col[k])
-            q_ac_col = int(self.dcac_q_ac_state_col[k])
-            v_dc_col = self._dc_voltage_col_for_node(conv.dc_node)
-            v_ac_col = self._ac_voltage_col_for_node(conv.ac_node)
-            base = 3 * k
-            p_dc, p_ac, q_ac = hybrid_x[base : base + 3]
-            v_dc = self._dc_voltage_value(dc_x, conv.dc_node)
-            v_ac = self._ac_voltage_value(ac_x, conv.ac_node)
-            if meas.meas_type == "P_DC":
-                add(p_dc_col, 1.0)
-            elif meas.meas_type == "P_AC":
-                add(p_ac_col, 1.0)
-            elif meas.meas_type == "Q_AC":
-                add(q_ac_col, 1.0)
-            elif meas.meas_type == "V_DC":
-                add(v_dc_col, 1.0)
-            elif meas.meas_type == "V_AC":
-                add(v_ac_col, 1.0)
-            elif meas.meas_type == "I_DC" and abs(v_dc) > self.min_current_voltage:
-                add(p_dc_col, 1.0 / v_dc)
-                add(v_dc_col, -p_dc / (v_dc * v_dc))
-            elif meas.meas_type == "I_AC" and abs(v_ac) > self.min_current_voltage:
-                s = math.hypot(float(p_ac), float(q_ac))
-                if s > 1e-12:
-                    add(p_ac_col, p_ac / (s * v_ac))
-                    add(q_ac_col, q_ac / (s * v_ac))
-                    add(v_ac_col, -s / (v_ac * v_ac))
-            else:
-                if meas.meas_type not in ("I_DC", "I_AC"):
-                    raise RuntimeError(f"Unsupported DCACConverter measurement type: {meas.meas_type}")
-            return
-
-        if meas.device_type == "ACACConverter":
-            conv = self.acac_by_name[meas.device_name]
-            k = self.acac_pos_by_name[conv.name]
-            p_from_col = int(self.acac_p_from_state_col[k])
-            q_from_col = int(self.acac_q_from_state_col[k])
-            p_to_col = int(self.acac_p_to_state_col[k])
-            q_to_col = int(self.acac_q_to_state_col[k])
-            v_from_col = self._ac_voltage_col_for_node(conv.i_node)
-            v_to_col = self._ac_voltage_col_for_node(conv.j_node)
-            base = 3 * len(self.dcac_converters) + 4 * k
-            p_from, q_from, p_to, q_to = hybrid_x[base : base + 4]
-            v_from = self._ac_voltage_value(ac_x, conv.i_node)
-            v_to = self._ac_voltage_value(ac_x, conv.j_node)
-            if meas.meas_type == "P_FROM":
-                add(p_from_col, 1.0)
-            elif meas.meas_type == "Q_FROM":
-                add(q_from_col, 1.0)
-            elif meas.meas_type == "P_TO":
-                add(p_to_col, 1.0)
-            elif meas.meas_type == "Q_TO":
-                add(q_to_col, 1.0)
-            elif meas.meas_type == "V_FROM":
-                add(v_from_col, 1.0)
-            elif meas.meas_type == "V_TO":
-                add(v_to_col, 1.0)
-            elif meas.meas_type == "I_FROM" and abs(v_from) > self.min_current_voltage:
-                s = math.hypot(float(p_from), float(q_from))
-                if s > 1e-12:
-                    add(p_from_col, p_from / (s * v_from))
-                    add(q_from_col, q_from / (s * v_from))
-                    add(v_from_col, -s / (v_from * v_from))
-            elif meas.meas_type == "I_TO" and abs(v_to) > self.min_current_voltage:
-                s = math.hypot(float(p_to), float(q_to))
-                if s > 1e-12:
-                    add(p_to_col, p_to / (s * v_to))
-                    add(q_to_col, q_to / (s * v_to))
-                    add(v_to_col, -s / (v_to * v_to))
-            else:
-                if meas.meas_type not in ("I_FROM", "I_TO"):
-                    raise RuntimeError(f"Unsupported ACACConverter measurement type: {meas.meas_type}")
-            return
-        raise RuntimeError(f"Unsupported hybrid measurement device type: {meas.device_type}")
 
     def observability_analysis(
         self,
