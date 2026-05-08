@@ -966,14 +966,19 @@ class HybridPowerFlowCalc:
     def _write_back(self, x):
         """Write final global state back into AC, DC and converter model objects."""
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
+        skip_lf_result = getattr(self, "skip_lf_result", False)
         if self.ac_calc is not None:
             self.ac_calc.x = ac_x
             self.ac_calc.converged = self.converged
+            if skip_lf_result:
+                self.ac_calc.skip_lf_result = True
             self.ac_calc._write_back()
             self._write_ac_ppc_result_to_network()
         if self.dc_calc is not None:
             self.dc_calc.x = dc_x
             self.dc_calc.converged = self.converged
+            if skip_lf_result:
+                self.dc_calc.skip_lf_result = True
             self.dc_calc.update_lf_info(dc_x)
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
@@ -1027,7 +1032,10 @@ class HybridPowerFlowCalc:
                 conv.j_i = float(cur_j)
                 conv.i_c = float(cur_i)
                 conv.j_c = float(cur_j)
-        self.lf_result = self._build_lf_result(ac_V, dc_V)
+        if skip_lf_result:
+            self.lf_result = None
+        else:
+            self.lf_result = self._build_lf_result(ac_V, dc_V)
 
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
         result = HybridLFResult(

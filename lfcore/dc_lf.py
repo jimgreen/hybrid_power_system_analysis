@@ -1169,7 +1169,8 @@ class DCPowerFlowCalc:
             for gen in gens:
                 gen.p = share
                 gen.current = gen.p / V_final[node] if abs(V_final[node]) > self.runtime_params.min_voltage else 0.0
-        self.lf_result = self._build_lf_result()
+        if not getattr(self, "skip_lf_result", False):
+            self.lf_result = self._build_lf_result()
 
     def _node_voltage(self, node_idx) -> float:
         pos = self.alive_node_dict.get(int(node_idx), -1)
@@ -1179,6 +1180,14 @@ class DCPowerFlowCalc:
 
     def _build_lf_result(self) -> DCLFResult:
         result = DCLFResult()
+        voltage_by_node = {
+            int(getattr(node, "idx", -1)): float(getattr(node, "voltage", 0.0) or 0.0)
+            for node in getattr(self.model, "nodes", [])
+        }
+
+        def node_voltage(node_idx) -> float:
+            return voltage_by_node.get(int(node_idx), 0.0)
+
         for node in getattr(self.model, "nodes", []):
             result.nodes[_device_key(node)] = SimpleNamespace(
                 volt=float(getattr(node, "voltage", 0.0) or 0.0),
@@ -1193,43 +1202,43 @@ class DCPowerFlowCalc:
             result.branches[_device_key(br)] = SimpleNamespace(
                 i_p=float(getattr(br, "i_p", 0.0) or 0.0),
                 i_c=float(getattr(br, "current", 0.0) or 0.0),
-                i_v=self._node_voltage(getattr(br, "i_node", -1)),
+                i_v=node_voltage(getattr(br, "i_node", -1)),
                 j_p=float(getattr(br, "j_p", 0.0) or 0.0),
                 j_c=-float(getattr(br, "current", 0.0) or 0.0),
-                j_v=self._node_voltage(getattr(br, "j_node", -1)),
+                j_v=node_voltage(getattr(br, "j_node", -1)),
             )
         for zbr in getattr(self.model, "zero_branches", []):
             result.zero_branches[_device_key(zbr)] = SimpleNamespace(
                 i_p=float(getattr(zbr, "p", 0.0) or 0.0),
                 i_c=float(getattr(zbr, "current", 0.0) or 0.0),
-                i_v=self._node_voltage(getattr(zbr, "i_node", -1)),
+                i_v=node_voltage(getattr(zbr, "i_node", -1)),
             )
         for brk in getattr(self.model, "breakers", []):
             result.breakers[_device_key(brk)] = SimpleNamespace(
                 i_p=float(getattr(brk, "p", 0.0) or 0.0),
                 i_c=float(getattr(brk, "current", 0.0) or 0.0),
-                i_v=self._node_voltage(getattr(brk, "i_node", -1)),
+                i_v=node_voltage(getattr(brk, "i_node", -1)),
             )
         for conv in getattr(self.model, "dcdc_converters", []):
             result.dcdc_converters[_device_key(conv)] = SimpleNamespace(
                 i_p=float(getattr(conv, "i_p", 0.0) or 0.0),
                 i_c=float(getattr(conv, "i_c", 0.0) or 0.0),
-                i_v=self._node_voltage(getattr(conv, "i_node", -1)),
+                i_v=node_voltage(getattr(conv, "i_node", -1)),
                 j_p=float(getattr(conv, "j_p", 0.0) or 0.0),
                 j_c=float(getattr(conv, "j_c", 0.0) or 0.0),
-                j_v=self._node_voltage(getattr(conv, "j_node", -1)),
+                j_v=node_voltage(getattr(conv, "j_node", -1)),
             )
         for gen in getattr(self.model, "generators", []):
             result.generators[_device_key(gen)] = SimpleNamespace(
                 i_p=float(getattr(gen, "p", 0.0) or 0.0),
                 i_c=float(getattr(gen, "current", 0.0) or 0.0),
-                i_v=self._node_voltage(getattr(gen, "node", -1)),
+                i_v=node_voltage(getattr(gen, "node", -1)),
             )
         for load in getattr(self.model, "loads", []):
             result.loads[_device_key(load)] = SimpleNamespace(
                 i_p=float(getattr(load, "p", 0.0) or 0.0),
                 i_c=float(getattr(load, "current", 0.0) or 0.0),
-                i_v=self._node_voltage(getattr(load, "node", -1)),
+                i_v=node_voltage(getattr(load, "node", -1)),
             )
         return result
 

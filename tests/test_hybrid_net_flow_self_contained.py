@@ -350,6 +350,25 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(expected_acac.tolist(), calc._initial_acac_x().tolist())
         calc._write_back(calc.x)
 
+    def test_hybrid_power_flow_can_skip_full_lf_result_build(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
+
+        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        calc = HybridPowerFlowCalc(network, verbose=False)
+        calc.skip_lf_result = True
+
+        def reject_lf_result(*_args, **_kwargs):
+            raise AssertionError("Hybrid LF should skip full result construction when requested")
+
+        calc._build_lf_result = reject_lf_result
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertIsNone(calc.lf_result)
+        self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
+        self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
+
     def test_hybrid_topology_builds_hybrid_islands(self):
         import hybrid_net_flow
 

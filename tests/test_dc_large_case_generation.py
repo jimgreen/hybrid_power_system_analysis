@@ -243,6 +243,29 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         self.assertTrue(all(node.voltage > 0.0 for node in network.nodes if node.is_alive))
 
+    def test_lf_result_uses_cached_voltage_lookup(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import DCPowerNetwork
+
+        network = DCPowerNetwork()
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.topo()
+        calc = DCPowerFlowCalc(network)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _, x = calc.prepare()
+        calc.runtime_params = calc.params
+        calc.skip_lf_result = True
+        calc.update_lf_info(x)
+
+        def reject_node_voltage(*_args, **_kwargs):
+            raise AssertionError("DC LF result building should use a cached voltage lookup")
+
+        calc._node_voltage = reject_node_voltage
+        result = calc._build_lf_result()
+
+        self.assertEqual(len(network.nodes), len(result.nodes))
+        self.assertTrue(result.branches)
+
     def test_generates_solvable_dc_case_and_measurements(self):
         from generate_dc_large_cases import generate_dc_case_files
         from lfcore.dc_lf import DCPowerFlowCalc
