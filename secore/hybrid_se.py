@@ -41,6 +41,7 @@ from secore.se_array_plan import (
     copy_measurement_view,
     extend_measurement_partitions,
     partition_measurements_by_code,
+    take_measurement_view,
 )
 from secore.se_math import (
     ANGLE_MEASUREMENT_TYPES,
@@ -1372,6 +1373,69 @@ class HybridStateEstimator:
                 "hybrid": np.asarray(self.hybrid_meas_rows, dtype=np.int64),
             },
         )
+
+    @staticmethod
+    def _shrink_partition_rows(rows: Sequence[int], removed_pos: int) -> Tuple[np.ndarray, np.ndarray]:
+        row_array = np.asarray(rows, dtype=np.int64)
+        keep = row_array != int(removed_pos)
+        shrunk = row_array[keep]
+        shrunk = shrunk - (shrunk > int(removed_pos))
+        return shrunk.astype(np.int32, copy=False), keep
+
+    def _shrink_active_measurement_state_layout(self, removed_pos: int) -> MeasurementList:
+        keep_rows = np.concatenate(
+            (
+                np.arange(int(removed_pos), dtype=np.int64),
+                np.arange(int(removed_pos) + 1, len(self.active_measurements), dtype=np.int64),
+            )
+        )
+        self.active_measurements = take_measurement_view(self.active_measurements, keep_rows)
+        if not hasattr(self, "ac_meas_rows"):
+            return self.active_measurements
+        self.ac_meas_rows, ac_keep = self._shrink_partition_rows(self.ac_meas_rows, removed_pos)
+        self.dc_meas_rows, dc_keep = self._shrink_partition_rows(self.dc_meas_rows, removed_pos)
+        self.hybrid_meas_rows, hybrid_keep = self._shrink_partition_rows(self.hybrid_meas_rows, removed_pos)
+        self.ac_meas = take_measurement_view(self.ac_meas, np.flatnonzero(ac_keep).astype(np.int64, copy=False))
+        self.dc_meas = take_measurement_view(self.dc_meas, np.flatnonzero(dc_keep).astype(np.int64, copy=False))
+        self.hybrid_meas = take_measurement_view(
+            self.hybrid_meas,
+            np.flatnonzero(hybrid_keep).astype(np.int64, copy=False),
+        )
+        self._active_ac_hybrid_rows = self.ac_meas_rows.copy()
+        self._active_dc_hybrid_rows = self.dc_meas_rows.copy()
+        self._active_ac_sub_measurements = copy_measurement_view(self.ac_meas)
+        self._active_dc_sub_measurements = copy_measurement_view(self.dc_meas)
+        self._active_ac_sub_rows = np.arange(len(self.ac_meas), dtype=np.int32)
+        self._active_dc_sub_rows = np.arange(len(self.dc_meas), dtype=np.int32)
+        self._active_ac_delegated_row_mask = np.zeros(len(self.active_measurements), dtype=bool)
+        self._active_dc_delegated_row_mask = np.zeros(len(self.active_measurements), dtype=bool)
+        if self._active_ac_hybrid_rows.size:
+            self._active_ac_delegated_row_mask[self._active_ac_hybrid_rows] = True
+        if self._active_dc_hybrid_rows.size:
+            self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
+        self._jacobian_static_skip = np.zeros(len(self.active_measurements), dtype=bool)
+        self._active_measurement_blocks = {
+            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
+            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
+        }
+        self._active_hybrid_measurement_plan = self._build_hybrid_measurement_plan(
+            self._active_measurement_blocks["hybrid"],
+        )
+        active_table = self.active_measurements.table
+        self.active_z = np.asarray(active_table.value, dtype=np.float64)
+        self.active_weight = np.asarray(active_table.weight, dtype=np.float64)
+        self.active_angle_residual_mask = np.asarray(active_table.angle_mask, dtype=bool)
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        if not hasattr(self, "n_state"):
+            return self.active_measurements
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._active_normal_pattern = None
+        self._initial_observability_cache = None
+        self._observability_matrix_cache = None
+        self._invalidate_measurement_activity_summary()
+        return self.active_measurements
 
     def _build_hybrid_measurement_plan(
         self,
@@ -2903,7 +2967,7 @@ class HybridStateEstimator:
             return delegate.estimate_with_bad_data_removal(threshold=threshold, max_remove=max_remove, verbose=verbose)
         threshold = self.params.bad_threshold if threshold is None else threshold
         max_remove = self.params.bad_max_remove if max_remove is None else max_remove
-        measurements = list(self.active_measurements)
+        measurements = self.active_measurements
         removed: List[BadDataItem] = []
         x0 = self.initial_state()
         result = self.estimate(measurements=measurements, x0=x0, verbose=verbose)
@@ -2913,7 +2977,17 @@ class HybridStateEstimator:
                 break
             worst = bad_items[0]
             removed.append(worst)
-            measurements = [meas for meas in measurements if meas is not worst.measurement]
+            remove_pos = result.measurements.index(worst.measurement)
+            keep_rows = np.concatenate(
+                (
+                    np.arange(remove_pos, dtype=np.int64),
+                    np.arange(remove_pos + 1, len(result.measurements), dtype=np.int64),
+                )
+            )
+            if measurements is self.active_measurements and result.measurements is self.active_measurements:
+                measurements = self._shrink_active_measurement_state_layout(remove_pos)
+            else:
+                measurements = take_measurement_view(result.measurements, keep_rows)
             result = self.estimate(measurements=measurements, x0=result.x, verbose=verbose)
         return result, removed
 

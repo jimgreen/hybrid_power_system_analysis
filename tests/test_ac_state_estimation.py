@@ -3276,6 +3276,74 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(1, calls["generator_append"])
         self.assertEqual(1, calls["balance_append"])
 
+    def test_bad_data_removal_reuses_table_backed_measurement_subset(self):
+        from types import SimpleNamespace
+        from model.meas_model import BadDataItem, EstimateResult, MeasurementList, ObservabilityResult, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator, Measurement
+
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        m1 = Measurement(1, "m1", "ACNode", "n1", "V", 1.0, True, 1.0)
+        m2 = Measurement(2, "m2", "ACNode", "n2", "V", 1.0, True, 1.0)
+        measurements = MeasurementList([m1, m2], measurement_table_from_measurements([m1, m2]))
+        estimator.active_measurements = measurements
+        estimator.params = SimpleNamespace(bad_threshold=3.0, max_remove=1)
+        estimator.initial_state = lambda: np.array([0.0], dtype=np.float64)
+        result1 = EstimateResult(True, 1, 0.0, 0.0, 0.0, np.array([0.0]), np.zeros(2), np.zeros(2), None, None, measurements, ObservabilityResult(True, 1, 1, 2, 0, np.array([1.0]), []))
+        result2 = EstimateResult(True, 1, 0.0, 0.0, 0.0, np.array([0.0]), np.zeros(1), np.zeros(1), None, None, None, ObservabilityResult(True, 1, 1, 1, 0, np.array([1.0]), []))
+        seen = []
+
+        def estimate(measurements, x0=None, verbose=False):
+            seen.append(measurements)
+            return result1 if len(seen) == 1 else result2
+
+        estimator.estimate = estimate
+        estimator.identify_bad_data = lambda result, threshold=None: ([BadDataItem(m1, 1.0, 4.0, 0.0, 1.0)] if result is result1 else [], np.array([]))
+
+        estimator.estimate_with_bad_data_removal()
+
+        self.assertEqual(2, len(seen))
+        self.assertIsInstance(seen[1], MeasurementList)
+        self.assertIsNotNone(seen[1].table)
+        self.assertEqual([m2], list(seen[1]))
+
+    def test_bad_data_removal_reuses_active_shrink_update(self):
+        from types import SimpleNamespace
+        from model.meas_model import BadDataItem, EstimateResult, MeasurementList, ObservabilityResult, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator, Measurement
+
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        m1 = Measurement(1, "m1", "ACNode", "n1", "V", 1.0, True, 1.0)
+        m2 = Measurement(2, "m2", "ACNode", "n2", "V", 1.0, True, 1.0)
+        measurements = MeasurementList([m1, m2], measurement_table_from_measurements([m1, m2]))
+        estimator.active_measurements = measurements
+        estimator.active_measurement_table = measurements.table
+        estimator.params = SimpleNamespace(bad_threshold=3.0, max_remove=1)
+        estimator.initial_state = lambda: np.array([0.0], dtype=np.float64)
+        result1 = EstimateResult(True, 1, 0.0, 0.0, 0.0, np.array([0.0]), np.zeros(2), np.zeros(2), None, None, measurements, ObservabilityResult(True, 1, 1, 2, 0, np.array([1.0]), []))
+        result2 = EstimateResult(True, 1, 0.0, 0.0, 0.0, np.array([0.0]), np.zeros(1), np.zeros(1), None, None, None, ObservabilityResult(True, 1, 1, 1, 0, np.array([1.0]), []))
+        seen = []
+        shrink_calls = []
+
+        def estimate(measurements, x0=None, verbose=False):
+            seen.append(measurements)
+            return result1 if len(seen) == 1 else result2
+
+        def shrink(remove_pos):
+            shrink_calls.append(remove_pos)
+            estimator.active_measurements = MeasurementList([m2], measurement_table_from_measurements([m2]))
+            estimator.active_measurement_table = estimator.active_measurements.table
+            return estimator.active_measurements
+
+        estimator.estimate = estimate
+        estimator.identify_bad_data = lambda result, threshold=None: ([BadDataItem(m1, 1.0, 4.0, 0.0, 1.0)] if result is result1 else [], np.array([]))
+        estimator._shrink_active_measurement_indexes = shrink
+
+        estimator.estimate_with_bad_data_removal()
+
+        self.assertEqual([0], shrink_calls)
+        self.assertIs(seen[0], measurements)
+        self.assertIs(seen[1], estimator.active_measurements)
+
     def test_initial_observability_reuses_targeted_pseudo_result(self):
         from secore.ac_se import ACStateEstimator
 

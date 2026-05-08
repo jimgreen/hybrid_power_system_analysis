@@ -79,6 +79,9 @@ from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
+    copy_measurement_view,
+    rows_by_device_type_code,
+    take_measurement_view,
 )
 from secore.se_result import SEResult
 from unit_system import ac_current_base_ka
@@ -1517,6 +1520,193 @@ class ACStateEstimator:
                 continue
             merged[key] = np.concatenate((np.asarray(head_value), np.asarray(tail_value)))
         return merged
+
+    @staticmethod
+    def _shrink_plan_rows(
+        rows: Sequence[int],
+        removed_pos: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        row_array = np.asarray(rows, dtype=np.int64)
+        keep = row_array != int(removed_pos)
+        kept_rows = row_array[keep]
+        kept_rows = kept_rows - (kept_rows > int(removed_pos))
+        return kept_rows.astype(np.int64, copy=False), keep
+
+    def _shrink_active_plan_group(
+        self,
+        plan: Dict[str, object],
+        *,
+        removed_pos: int,
+        groups: Sequence[Tuple[str, Sequence[str]]],
+        passthrough_keys: Sequence[str] = (),
+    ) -> Dict[str, object]:
+        shrunk: Dict[str, object] = {
+            "handled_mask": np.delete(np.asarray(plan["handled_mask"], dtype=bool), int(removed_pos))
+        }
+        used_keys = {"handled_mask"}
+        for row_key, value_keys in groups:
+            shrunk_rows, keep = self._shrink_plan_rows(plan[row_key], removed_pos)
+            shrunk[row_key] = shrunk_rows
+            used_keys.add(row_key)
+            for value_key in value_keys:
+                shrunk[value_key] = np.asarray(plan[value_key])[keep]
+                used_keys.add(value_key)
+        for key in passthrough_keys:
+            shrunk[key] = np.asarray(plan[key]).copy()
+            used_keys.add(key)
+        for key, value in plan.items():
+            if key not in used_keys:
+                shrunk[key] = np.asarray(value).copy()
+        return shrunk
+
+    def _shrink_balance_measurement_plan(
+        self,
+        plan: Dict[str, object],
+        removed_pos: int,
+    ) -> Dict[str, object]:
+        shrunk_rows, keep = self._shrink_plan_rows(plan["rows"], removed_pos)
+        shrunk_pos = np.asarray(plan["pos"], dtype=np.int64)[keep]
+        shrunk_kind = np.asarray(plan["kind"], dtype=np.int64)[keep]
+        p_row_by_pos = np.asarray(plan["p_row_by_pos"], dtype=np.int32).copy()
+        q_row_by_pos = np.asarray(plan["q_row_by_pos"], dtype=np.int32).copy()
+        for mapped in (p_row_by_pos, q_row_by_pos):
+            removed_mask = mapped == int(removed_pos)
+            mapped[removed_mask] = -1
+            shift_mask = mapped > int(removed_pos)
+            mapped[shift_mask] -= 1
+        y_balance, y_nodes, y_nodes_i64, y_conj = self._balance_y_arrays(shrunk_pos)
+        return {
+            "handled_mask": np.delete(np.asarray(plan["handled_mask"], dtype=bool), int(removed_pos)),
+            "rows": shrunk_rows,
+            "pos": shrunk_pos.astype(np.int64, copy=False),
+            "pos_i64": np.asarray(shrunk_pos, dtype=np.int64),
+            "kind": shrunk_kind.astype(np.int64, copy=False),
+            "p_row_by_pos": p_row_by_pos,
+            "q_row_by_pos": q_row_by_pos,
+            "y_balance": y_balance,
+            "y_nodes": y_nodes,
+            "y_nodes_i64": y_nodes_i64,
+            "y_conj": y_conj,
+        }
+
+    def _shrink_active_measurement_indexes(self, removed_pos: int) -> MeasurementList:
+        keep_rows = np.concatenate(
+            (
+                np.arange(int(removed_pos), dtype=np.int64),
+                np.arange(int(removed_pos) + 1, len(self.active_measurements), dtype=np.int64),
+            )
+        )
+        self.active_measurements = take_measurement_view(self.active_measurements, keep_rows)
+        self.active_measurement_table = self.active_measurements.table
+        self.measurement_table = self.active_measurement_table
+        self.active_measurement_rows = np.arange(len(self.active_measurements), dtype=np.int64)
+        self.active_z = np.asarray(self.active_measurement_table.value, dtype=np.float64)
+        self.active_weight = np.asarray(self.active_measurement_table.weight, dtype=np.float64)
+        self.active_angle_residual_mask = np.asarray(self.active_measurement_table.angle_mask, dtype=bool)
+        self.active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask))
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_rows_by_device_type_code = rows_by_device_type_code(self.active_measurement_table)
+        if not hasattr(self, "n_state"):
+            return self.active_measurements
+        self._initial_observability_cache = None
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._active_normal_pattern = None
+        self._observability_matrix_cache = None
+        if hasattr(self, "_active_branch_transformer_vector_plan"):
+            self._active_branch_transformer_vector_plan = self._shrink_active_plan_group(
+                self._active_branch_transformer_vector_plan,
+                removed_pos=int(removed_pos),
+                groups=(
+                    ("voltage_rows", ("voltage_pos", "voltage_cols")),
+                    ("power_rows", ("power_is_p", "power_own", "power_other", "power_y_self", "power_y_mutual")),
+                    ("current_rows", ("current_own", "current_other", "current_y_self", "current_y_mutual")),
+                ),
+            )
+        if hasattr(self, "_active_simple_jacobian_plan"):
+            self._active_simple_jacobian_plan = self._shrink_active_plan_group(
+                self._active_simple_jacobian_plan,
+                removed_pos=int(removed_pos),
+                groups=(
+                    ("value_voltage_rows", ("value_voltage_pos",)),
+                    ("value_angle_rows", ("value_angle_pos",)),
+                    ("value_voltage_diff_rows", ("value_voltage_diff_i", "value_voltage_diff_j")),
+                    ("value_angle_diff_rows", ("value_angle_diff_i", "value_angle_diff_j")),
+                    ("load_rows", ("load_pos", "load_index", "load_kind")),
+                    ("scalar_rows", ("scalar_cols", "scalar_values")),
+                ),
+            )
+        if hasattr(self, "_active_zero_current_vector_plan"):
+            self._active_zero_current_vector_plan = self._shrink_active_plan_group(
+                self._active_zero_current_vector_plan,
+                removed_pos=int(removed_pos),
+                groups=(
+                    ("voltage_rows", ("voltage_pos",)),
+                    ("angle_diff_rows", ("angle_diff_i", "angle_diff_j")),
+                    ("voltage_diff_rows", ("voltage_diff_i", "voltage_diff_j")),
+                    ("power_rows", ("power_is_p", "power_pos", "power_current_idx", "power_sign")),
+                    ("current_rows", ("current_idx",)),
+                    ("scalar_rows", ("scalar_cols", "scalar_values")),
+                ),
+            )
+        if hasattr(self, "_active_generator_measurement_plan"):
+            self._active_generator_measurement_plan = self._shrink_active_plan_group(
+                self._active_generator_measurement_plan,
+                removed_pos=int(removed_pos),
+                groups=(("value_rows", ("value_kind", "value_pos", "value_index")),),
+            )
+        if hasattr(self, "_active_balance_measurement_plan"):
+            self._active_balance_measurement_plan = self._shrink_balance_measurement_plan(
+                self._active_balance_measurement_plan,
+                int(removed_pos),
+            )
+        self._branch_transformer_vector_plan_cache = {}
+        self._simple_jacobian_plan_cache = {}
+        self._zero_current_vector_plan_cache = {}
+        self._generator_measurement_plan_cache = {}
+        self._balance_measurement_plan_cache = {}
+        branch_plan = getattr(self, "_active_branch_transformer_vector_plan", None)
+        simple_plan = getattr(self, "_active_simple_jacobian_plan", None)
+        zero_plan = getattr(self, "_active_zero_current_vector_plan", None)
+        generator_plan = getattr(self, "_active_generator_measurement_plan", None)
+        balance_plan = getattr(self, "_active_balance_measurement_plan", None)
+        if branch_plan is not None:
+            self._branch_transformer_vector_plan_cache[id(self.active_measurements)] = (
+                self.active_measurements,
+                branch_plan,
+            )
+        if simple_plan is not None:
+            self._simple_jacobian_plan_cache[id(self.active_measurements)] = (
+                self.active_measurements,
+                simple_plan,
+            )
+        if zero_plan is not None:
+            self._zero_current_vector_plan_cache[id(self.active_measurements)] = (
+                self.active_measurements,
+                zero_plan,
+            )
+        if generator_plan is not None:
+            self._generator_measurement_plan_cache[id(self.active_measurements)] = (
+                self.active_measurements,
+                generator_plan,
+            )
+        if balance_plan is not None:
+            self._balance_measurement_plan_cache[id(self.active_measurements)] = (
+                self.active_measurements,
+                balance_plan,
+            )
+        if None not in (branch_plan, simple_plan, zero_plan, generator_plan, balance_plan):
+            self.active_measurements_are_vectorized = bool(
+                np.all(
+                    branch_plan["handled_mask"]
+                    | simple_plan["handled_mask"]
+                    | zero_plan["handled_mask"]
+                    | generator_plan["handled_mask"]
+                    | balance_plan["handled_mask"]
+                )
+            )
+        return self.active_measurements
 
     def _measurement_rows_for_types(
         self,
@@ -6737,7 +6927,7 @@ class ACStateEstimator:
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
         threshold = self.params.bad_threshold if threshold is None else threshold
         max_remove = self.params.max_remove if max_remove is None else max_remove
-        measurements = list(self.active_measurements)
+        measurements = self.active_measurements
         removed: List[BadDataItem] = []
         x0 = self.initial_state()
         for round_idx in range(max_remove + 1):
@@ -6749,7 +6939,17 @@ class ACStateEstimator:
                 return result, removed
             worst = bad_items[0]
             removed.append(worst)
-            measurements = [meas for meas in measurements if meas.idx != worst.measurement.idx]
+            remove_pos = result.measurements.index(worst.measurement)
+            keep_rows = np.concatenate(
+                (
+                    np.arange(remove_pos, dtype=np.int64),
+                    np.arange(remove_pos + 1, len(result.measurements), dtype=np.int64),
+                )
+            )
+            if measurements is self.active_measurements and result.measurements is self.active_measurements:
+                measurements = self._shrink_active_measurement_indexes(remove_pos)
+            else:
+                measurements = take_measurement_view(result.measurements, keep_rows)
             x0 = result.x
         return result, removed
 
