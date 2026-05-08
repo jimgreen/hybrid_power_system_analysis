@@ -124,6 +124,66 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             _again_G, again_x = DCPowerFlowCalc(ppc).prepare()
         self.assertNotEqual(123.0, again_x[0])
 
+    def test_dc_jacobian_reuses_precomputed_csr_pattern(self):
+        import numpy as np
+        import lfcore.dc_lf as dc_lf
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc.pop("_dc_pf_static", None)
+        calc = DCPowerFlowCalc(ppc)
+        with contextlib.redirect_stdout(io.StringIO()):
+            G, x = calc.prepare()
+
+        expected = calc.get_jacobi(G, x).toarray()
+        self.assertGreater(calc._dc_jac_csr_indices.size, 0)
+
+        original_coo_matrix = dc_lf.coo_matrix
+
+        def reject_coo_matrix(*_args, **_kwargs):
+            raise AssertionError("DC Jacobian should refresh precomputed CSR data without COO rebuild")
+
+        dc_lf.coo_matrix = reject_coo_matrix
+        try:
+            actual = calc.get_jacobi(G, x).toarray()
+        finally:
+            dc_lf.coo_matrix = original_coo_matrix
+
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+    def test_result_mode_skips_full_dc_result_backfill(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc.pop("_dc_pf_static", None)
+
+        calc = DCPowerFlowCalc(ppc, result_mode="none")
+
+        def reject_full_backfill(_x):
+            raise AssertionError("result_mode='none' should skip full DC result backfill")
+
+        calc._write_back_ppc = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual({}, calc.result)
+        self.assertTrue(hasattr(calc, "x"))
+
+        summary_calc = DCPowerFlowCalc(ppc, result_mode="summary")
+        summary_calc._write_back_ppc = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = summary_calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(summary_calc.converged)
+        self.assertEqual({"node_id", "voltage", "summary"}, set(summary_calc.result))
+        self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
+        self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)
+
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc

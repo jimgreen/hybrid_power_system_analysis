@@ -83,6 +83,16 @@ def copy_measurement_view(measurements: Sequence[Measurement]) -> MeasurementLis
     return MeasurementList(list(measurements), normalized=normalized)
 
 
+def take_measurement_view(measurements: Sequence[Measurement], rows: Sequence[int]) -> MeasurementList:
+    table = measurement_table_for(measurements)
+    row_array = np.asarray(rows, dtype=np.int64)
+    return MeasurementList(
+        [measurements[int(row)] for row in row_array],
+        measurement_table_take(table, row_array),
+        normalized=getattr(measurements, "normalized", False),
+    )
+
+
 def rows_by_device_type_code(table: MeasurementTable) -> Dict[int, np.ndarray]:
     codes = np.asarray(table.device_type_code, dtype=np.int16)
     result: Dict[int, np.ndarray] = {}

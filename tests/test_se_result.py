@@ -176,7 +176,7 @@ class SEResultTest(unittest.TestCase):
         self.assertEqual(se_result.statistics.iterations, result.iterations)
         self.assertEqual(se_result.statistics.measurement_count, len(result.measurements))
 
-    def test_dc_main_calls_build_se_result_after_bad_data_analysis(self):
+    def test_dc_main_calls_build_se_result_when_output_file_is_requested(self):
         import contextlib
         import io
         import secore.dc_se as dc_se
@@ -191,17 +191,22 @@ class SEResultTest(unittest.TestCase):
 
         DCStateEstimator.build_se_result = counted_build
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                rc = dc_se.main(
-                    [
-                        "--case",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
-                        "--meas",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
-                        "--flat-start",
-                        "--quiet",
-                    ]
-                )
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                result_file = Path(tmp_dir) / "dc_se_result.e"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = dc_se.main(
+                        [
+                            "--case",
+                            str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                            "--meas",
+                            str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                            "--flat-start",
+                            "--quiet",
+                            "--se-result",
+                            str(result_file),
+                        ]
+                    )
+                self.assertTrue(result_file.exists())
         finally:
             DCStateEstimator.build_se_result = original_build
 
