@@ -74,7 +74,12 @@ from secore.se_math import (
     targeted_redundancy_count,
     unanchored_angle_state_labels,
 )
-from secore.se_array_plan import build_active_measurement_view, build_measurement_plan_table
+from secore.se_array_plan import (
+    append_active_measurement_view,
+    build_active_measurement_view,
+    build_measurement_plan_table,
+    concat_measurement_tables,
+)
 from secore.se_result import SEResult
 from unit_system import ac_current_base_ka
 
@@ -1333,6 +1338,185 @@ class ACStateEstimator:
                 | self._active_balance_measurement_plan["handled_mask"]
             )
         )
+
+    def _incremental_update_active_measurement_indexes(self, appended_measurements: Sequence[Measurement]) -> bool:
+        if not appended_measurements:
+            return True
+        if not hasattr(self, "active_measurements"):
+            return False
+        if any((not meas.valid) or float(meas.weight) <= 0.0 for meas in appended_measurements):
+            return False
+        master_table = getattr(self, "measurement_table", getattr(self.measurements, "table", None))
+        active_table = getattr(self, "active_measurement_table", getattr(self.active_measurements, "table", None))
+        if master_table is None or active_table is None:
+            return False
+        if len(master_table.idx) != len(self.measurements) - len(appended_measurements):
+            return False
+        if len(active_table.idx) != len(self.active_measurements):
+            return False
+
+        appended_list = MeasurementList(
+            list(appended_measurements),
+            _measurement_table_from_measurements(appended_measurements),
+            normalized=getattr(self.measurements, "normalized", False),
+        )
+        self.measurement_table = concat_measurement_tables(master_table, appended_list.table)
+        self.measurements.table = self.measurement_table
+        active_view = append_active_measurement_view(
+            build_active_measurement_view(self.active_measurements, table_builder=_measurement_table_from_measurements),
+            appended_list,
+            source_row_start=len(master_table.idx),
+            table_builder=_measurement_table_from_measurements,
+        )
+        self._initial_observability_cache = None
+        self._max_measurement_idx = int(self.measurement_table.idx.max()) if self.measurement_table.idx.size else 0
+        self.active_measurements = active_view.measurements
+        self.active_measurement_rows = active_view.source_rows
+        self.active_measurement_table = active_view.table
+        self.active_z = active_view.z
+        self.active_weight = active_view.weight
+        self.active_angle_residual_mask = active_view.angle_mask
+        self.active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask))
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_rows_by_device_type_code = active_view.rows_by_device_type_code
+        row_offset = len(active_table.idx)
+        previous_branch_plan = getattr(self, "_active_branch_transformer_vector_plan", None)
+        previous_simple_plan = getattr(self, "_active_simple_jacobian_plan", None)
+        previous_zero_plan = getattr(self, "_active_zero_current_vector_plan", None)
+        previous_generator_plan = getattr(self, "_active_generator_measurement_plan", None)
+        previous_balance_plan = getattr(self, "_active_balance_measurement_plan", None)
+        self._branch_transformer_vector_plan_cache = {}
+        self._simple_jacobian_plan_cache = {}
+        self._zero_current_vector_plan_cache = {}
+        self._generator_measurement_plan_cache = {}
+        self._balance_measurement_plan_cache = {}
+        if previous_branch_plan is None:
+            self._active_branch_transformer_vector_plan = self._branch_transformer_vector_plan(self.active_measurements)
+        else:
+            self._active_branch_transformer_vector_plan = self._merge_active_plan_dict(
+                previous_branch_plan,
+                self._build_branch_transformer_vector_plan(appended_list),
+                row_offset=row_offset,
+                row_keys=("voltage_rows", "power_rows", "current_rows"),
+            )
+        self._branch_transformer_vector_plan_cache[id(self.active_measurements)] = (
+            self.active_measurements,
+            self._active_branch_transformer_vector_plan,
+        )
+        if previous_simple_plan is None:
+            self._active_simple_jacobian_plan = self._simple_jacobian_plan(self.active_measurements)
+        else:
+            self._active_simple_jacobian_plan = self._merge_active_plan_dict(
+                previous_simple_plan,
+                self._build_simple_jacobian_plan(appended_list),
+                row_offset=row_offset,
+                row_keys=(
+                    "scalar_rows",
+                    "value_voltage_rows",
+                    "value_angle_rows",
+                    "value_voltage_diff_rows",
+                    "value_angle_diff_rows",
+                    "load_rows",
+                ),
+            )
+        self._simple_jacobian_plan_cache[id(self.active_measurements)] = (
+            self.active_measurements,
+            self._active_simple_jacobian_plan,
+        )
+        if previous_zero_plan is None:
+            self._active_zero_current_vector_plan = self._zero_current_vector_plan(self.active_measurements)
+        else:
+            self._active_zero_current_vector_plan = self._merge_active_plan_dict(
+                previous_zero_plan,
+                self._build_zero_current_vector_plan(appended_list),
+                row_offset=row_offset,
+                row_keys=(
+                    "scalar_rows",
+                    "voltage_rows",
+                    "angle_diff_rows",
+                    "voltage_diff_rows",
+                    "power_rows",
+                    "current_rows",
+                ),
+            )
+        self._zero_current_vector_plan_cache[id(self.active_measurements)] = (
+            self.active_measurements,
+            self._active_zero_current_vector_plan,
+        )
+        if previous_generator_plan is None:
+            self._active_generator_measurement_plan = self._generator_measurement_plan(self.active_measurements)
+        else:
+            self._active_generator_measurement_plan = self._merge_active_plan_dict(
+                previous_generator_plan,
+                self._build_generator_measurement_plan(appended_list),
+                row_offset=row_offset,
+                row_keys=("value_rows",),
+            )
+        self._generator_measurement_plan_cache[id(self.active_measurements)] = (
+            self.active_measurements,
+            self._active_generator_measurement_plan,
+        )
+        if previous_balance_plan is None:
+            self._active_balance_measurement_plan = self._balance_measurement_plan(self.active_measurements)
+        else:
+            self._active_balance_measurement_plan = self._merge_active_plan_dict(
+                previous_balance_plan,
+                self._build_balance_measurement_plan(appended_list),
+                row_offset=row_offset,
+                row_keys=("rows",),
+                mapped_row_keys=("p_row_by_pos", "q_row_by_pos"),
+            )
+        self._balance_measurement_plan_cache[id(self.active_measurements)] = (
+            self.active_measurements,
+            self._active_balance_measurement_plan,
+        )
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._active_normal_pattern = None
+        self._observability_matrix_cache = None
+        self.active_measurements_are_vectorized = bool(
+            np.all(
+                self._active_branch_transformer_vector_plan["handled_mask"]
+                | self._active_simple_jacobian_plan["handled_mask"]
+                | self._active_zero_current_vector_plan["handled_mask"]
+                | self._active_generator_measurement_plan["handled_mask"]
+                | self._active_balance_measurement_plan["handled_mask"]
+            )
+        )
+        return True
+
+    @staticmethod
+    def _merge_active_plan_dict(
+        head: Dict[str, object],
+        tail: Dict[str, object],
+        *,
+        row_offset: int,
+        row_keys: Sequence[str],
+        mapped_row_keys: Sequence[str] = (),
+    ) -> Dict[str, object]:
+        row_key_set = set(row_keys)
+        mapped_key_set = set(mapped_row_keys)
+        merged: Dict[str, object] = {}
+        for key, head_value in head.items():
+            tail_value = tail[key]
+            if key in row_key_set:
+                merged[key] = np.concatenate(
+                    (
+                        np.asarray(head_value, dtype=np.int64),
+                        np.asarray(tail_value, dtype=np.int64) + int(row_offset),
+                    )
+                ).astype(np.int64, copy=False)
+                continue
+            if key in mapped_key_set:
+                mapped = np.asarray(head_value, dtype=np.int32).copy()
+                tail_rows = np.asarray(tail_value, dtype=np.int32)
+                valid = tail_rows >= 0
+                mapped[valid] = tail_rows[valid] + int(row_offset)
+                merged[key] = mapped
+                continue
+            merged[key] = np.concatenate((np.asarray(head_value), np.asarray(tail_value)))
+        return merged
 
     def _measurement_rows_for_types(
         self,
@@ -2689,6 +2873,7 @@ class ACStateEstimator:
             existing_names = {meas.name for meas in self.measurements}
             added = 0
             refreshed = False
+            measurement_count_before = len(self.measurements)
             remaining = batch_limit
             for label, _score in observability.weak_states:
                 if added >= remaining:
@@ -2710,6 +2895,10 @@ class ACStateEstimator:
             if added == 0:
                 break
             total_added += added
+            if not refreshed:
+                refreshed = self._incremental_update_active_measurement_indexes(
+                    self.measurements[measurement_count_before:]
+                )
             if not refreshed:
                 self._refresh_active_measurement_indexes()
             observability = None
@@ -2735,12 +2924,17 @@ class ACStateEstimator:
         if not selected:
             return 0
         next_idx = self._next_measurement_idx()
+        measurement_count_before = len(self.measurements)
         for candidate in selected:
             candidate.idx = next_idx
             next_idx += 1
             self.measurements.append(candidate)
         if refresh:
-            self._refresh_active_measurement_indexes()
+            refreshed = self._incremental_update_active_measurement_indexes(
+                self.measurements[measurement_count_before:]
+            )
+            if not refreshed:
+                self._refresh_active_measurement_indexes()
         return len(selected)
 
     def _add_redundant_observability_pseudo_measurements(self, max_add: int, refresh: bool = True) -> int:
@@ -3027,12 +3221,17 @@ class ACStateEstimator:
         if not selected_indices:
             return 0
         next_idx = self._next_measurement_idx()
+        measurement_count_before = len(self.measurements)
         for local_idx in selected_indices:
             candidate = candidates[int(local_idx)]
             candidate.idx = next_idx
             next_idx += 1
             self.measurements.append(candidate)
-        self._refresh_active_measurement_indexes()
+        refreshed = self._incremental_update_active_measurement_indexes(
+            self.measurements[measurement_count_before:]
+        )
+        if not refreshed:
+            self._refresh_active_measurement_indexes()
         return len(selected_indices)
 
     def _unanchored_angle_state_labels(self) -> List[str]:

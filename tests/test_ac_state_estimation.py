@@ -3137,6 +3137,145 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, estimator._add_targeted_observability_pseudo_measurements())
         self.assertEqual(1, calls)
 
+    def test_targeted_pseudo_small_batch_avoids_full_active_refresh(self):
+        from secore.ac_se import ACStateEstimator, ObservabilityResult
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+        estimator._refresh_active_measurement_indexes()
+        initial_active_count = len(estimator.active_measurements)
+        observable_result = ObservabilityResult(
+            observable=True,
+            rank=estimator.n_state,
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=0,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[],
+        )
+        non_observable_result = ObservabilityResult(
+            observable=False,
+            rank=max(estimator.n_state - 1, 0),
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=1,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[("V:bus_2", 1.0)],
+        )
+        results = [non_observable_result, observable_result]
+        estimator.observability_analysis = lambda: results.pop(0) if results else observable_result
+        estimator.targeted_pseudo_measurement_max = 1
+        estimator.targeted_pseudo_measurement_step = 1
+        estimator.targeted_pseudo_measurement_redundancy_ratio = 0.0
+        estimator._refresh_active_measurement_indexes = lambda: (_ for _ in ()).throw(
+            AssertionError("AC targeted pseudo append should update active layout incrementally")
+        )
+        estimator._add_structural_rank_restoring_pseudo_measurements = lambda max_add: 0
+
+        added = estimator._add_targeted_observability_pseudo_measurements()
+
+        self.assertEqual(1, added)
+        self.assertEqual(initial_active_count + 1, len(estimator.active_measurements))
+
+    def test_incremental_updater_reuses_shared_se_array_plan_helpers(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator, Measurement
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+        estimator._refresh_active_measurement_indexes()
+        additions = [Measurement(500000, "ac_v2", "ACNode", "bus_2", "V", 5.0, True, 1.01)]
+        estimator.measurements.extend(additions)
+        calls = {"active": 0}
+        original_active = ac_se.append_active_measurement_view
+
+        def counted_active(*args, **kwargs):
+            calls["active"] += 1
+            return original_active(*args, **kwargs)
+
+        ac_se.append_active_measurement_view = counted_active
+        try:
+            refreshed = estimator._incremental_update_active_measurement_indexes(additions)
+        finally:
+            ac_se.append_active_measurement_view = original_active
+
+        self.assertTrue(refreshed)
+        self.assertEqual(1, calls["active"])
+
+    def test_incremental_updater_reuses_existing_active_measurement_plans(self):
+        from secore.ac_se import ACStateEstimator, Measurement
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+        estimator._refresh_active_measurement_indexes()
+        additions = [Measurement(500001, "ac_v3", "ACNode", "bus_2", "V", 5.0, True, 1.02)]
+        estimator.measurements.extend(additions)
+        active_len = len(estimator.active_measurements)
+        calls = {
+            "branch_full": 0,
+            "branch_append": 0,
+            "simple_full": 0,
+            "simple_append": 0,
+            "zero_full": 0,
+            "zero_append": 0,
+            "generator_full": 0,
+            "generator_append": 0,
+            "balance_full": 0,
+            "balance_append": 0,
+        }
+
+        def count_builder(name, original):
+            def wrapped(measurements):
+                key = f"{name}_{'append' if len(measurements) == 1 else 'full' if len(measurements) == active_len + 1 else 'other'}"
+                if key in calls:
+                    calls[key] += 1
+                return original(measurements)
+
+            return wrapped
+
+        original_branch = estimator._build_branch_transformer_vector_plan
+        original_simple = estimator._build_simple_jacobian_plan
+        original_zero = estimator._build_zero_current_vector_plan
+        original_generator = estimator._build_generator_measurement_plan
+        original_balance = estimator._build_balance_measurement_plan
+        estimator._build_branch_transformer_vector_plan = count_builder("branch", original_branch)
+        estimator._build_simple_jacobian_plan = count_builder("simple", original_simple)
+        estimator._build_zero_current_vector_plan = count_builder("zero", original_zero)
+        estimator._build_generator_measurement_plan = count_builder("generator", original_generator)
+        estimator._build_balance_measurement_plan = count_builder("balance", original_balance)
+        try:
+            refreshed = estimator._incremental_update_active_measurement_indexes(additions)
+        finally:
+            estimator._build_branch_transformer_vector_plan = original_branch
+            estimator._build_simple_jacobian_plan = original_simple
+            estimator._build_zero_current_vector_plan = original_zero
+            estimator._build_generator_measurement_plan = original_generator
+            estimator._build_balance_measurement_plan = original_balance
+
+        self.assertTrue(refreshed)
+        self.assertEqual(0, calls["branch_full"])
+        self.assertEqual(0, calls["simple_full"])
+        self.assertEqual(0, calls["zero_full"])
+        self.assertEqual(0, calls["generator_full"])
+        self.assertEqual(0, calls["balance_full"])
+        self.assertEqual(1, calls["branch_append"])
+        self.assertEqual(1, calls["simple_append"])
+        self.assertEqual(1, calls["zero_append"])
+        self.assertEqual(1, calls["generator_append"])
+        self.assertEqual(1, calls["balance_append"])
+
     def test_initial_observability_reuses_targeted_pseudo_result(self):
         from secore.ac_se import ACStateEstimator
 

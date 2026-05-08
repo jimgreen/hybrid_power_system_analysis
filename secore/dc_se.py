@@ -59,7 +59,12 @@ from secore.se_math import (
     observability_weak_direction,
     targeted_redundancy_count,
 )
-from secore.se_array_plan import build_active_measurement_view, build_measurement_plan_table
+from secore.se_array_plan import (
+    append_active_measurement_view,
+    build_active_measurement_view,
+    build_measurement_plan_table,
+    concat_measurement_tables,
+)
 from secore.se_result import SEResult
 from unit_system import dc_current_base_ka
 
@@ -454,7 +459,87 @@ class DCStateEstimator:
         self._jacobian_builder._assume_fixed_pattern = True
         self._observability_matrix_cache = None
         self._measurement_plan_cache = {}
-        self._measurement_plan(self.active_measurements)
+        self._active_measurement_plan = self._measurement_plan(self.active_measurements)
+
+    @staticmethod
+    def _merge_measurement_plan(
+        head: Dict[str, np.ndarray],
+        tail: Dict[str, np.ndarray],
+        row_offset: int,
+    ) -> Dict[str, np.ndarray]:
+        row_keys = {
+            "node_rows",
+            "branch_rows",
+            "load_rows",
+            "gen_rows",
+            "switch_rows",
+            "constraint_rows",
+            "dcdc_rows",
+        }
+        merged: Dict[str, np.ndarray] = {}
+        for key, head_value in head.items():
+            tail_value = tail[key]
+            if key in row_keys:
+                merged[key] = np.concatenate(
+                    (
+                        np.asarray(head_value, dtype=np.int64),
+                        np.asarray(tail_value, dtype=np.int64) + int(row_offset),
+                    )
+                ).astype(np.int64, copy=False)
+            else:
+                merged[key] = np.concatenate((np.asarray(head_value), np.asarray(tail_value)))
+        return merged
+
+    def _incremental_update_active_measurement_indexes(self, appended_measurements: Sequence[Measurement]) -> bool:
+        if not appended_measurements:
+            return True
+        if not hasattr(self, "active_measurements"):
+            return False
+        if any((not meas.valid) or float(meas.weight) <= 0.0 for meas in appended_measurements):
+            return False
+        master_table = getattr(self, "measurement_table", getattr(self.measurements, "table", None))
+        active_table = getattr(self, "active_measurement_table", getattr(self.active_measurements, "table", None))
+        if master_table is None or active_table is None:
+            return False
+        if len(master_table.idx) != len(self.measurements) - len(appended_measurements):
+            return False
+        if len(active_table.idx) != len(self.active_measurements):
+            return False
+
+        appended_list = MeasurementList(
+            list(appended_measurements),
+            _measurement_table_from_measurements(appended_measurements),
+            normalized=getattr(self.measurements, "normalized", False),
+        )
+        self.measurement_table = concat_measurement_tables(master_table, appended_list.table)
+        self.measurements.table = self.measurement_table
+        active_view = append_active_measurement_view(
+            build_active_measurement_view(self.active_measurements, table_builder=_measurement_table_from_measurements),
+            appended_list,
+            source_row_start=len(master_table.idx),
+            table_builder=_measurement_table_from_measurements,
+        )
+        self._max_measurement_idx = int(self.measurement_table.idx.max()) if self.measurement_table.idx.size else 0
+        self.active_measurements = active_view.measurements
+        self.active_measurement_rows = active_view.source_rows
+        self.active_measurement_table = active_view.table
+        self.active_z = active_view.z
+        self.active_weight = active_view.weight
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_normal_pattern = None
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._observability_matrix_cache = None
+        previous_plan = getattr(self, "_active_measurement_plan", None)
+        if previous_plan is None:
+            self._measurement_plan_cache = {}
+            self._active_measurement_plan = self._measurement_plan(self.active_measurements)
+        else:
+            appended_plan = self._measurement_plan(appended_list)
+            self._active_measurement_plan = self._merge_measurement_plan(previous_plan, appended_plan, len(active_table.idx))
+            self._measurement_plan_cache = {id(self.active_measurements): (self.active_measurements, self._active_measurement_plan)}
+        return True
 
     def _normalize_measurements(self, measurements: Optional[Sequence[Measurement]]) -> List[Measurement]:
         if measurements is None:
@@ -1773,6 +1858,7 @@ class DCStateEstimator:
             existing_names = {meas.name for meas in self.measurements}
             added = 0
             refreshed = False
+            measurement_count_before = len(self.measurements)
             remaining = batch_limit
             for label, _score in observability.weak_states:
                 if added >= remaining:
@@ -1791,6 +1877,10 @@ class DCStateEstimator:
             if added == 0:
                 break
             total_added += added
+            if not refreshed:
+                refreshed = self._incremental_update_active_measurement_indexes(
+                    self.measurements[measurement_count_before:]
+                )
             if not refreshed:
                 self._refresh_active_measurement_indexes()
         return total_added
@@ -1811,12 +1901,17 @@ class DCStateEstimator:
         if not selected:
             return 0
         next_idx = self._next_measurement_idx()
+        measurement_count_before = len(self.measurements)
         for candidate in selected:
             candidate.idx = next_idx
             next_idx += 1
             self.measurements.append(candidate)
         if refresh:
-            self._refresh_active_measurement_indexes()
+            refreshed = self._incremental_update_active_measurement_indexes(
+                self.measurements[measurement_count_before:]
+            )
+            if not refreshed:
+                self._refresh_active_measurement_indexes()
         return len(selected)
 
     def _add_redundant_observability_pseudo_measurements(self, max_add: int, refresh: bool = True) -> int:
@@ -2326,6 +2421,8 @@ class DCStateEstimator:
         if len(self._measurement_plan_cache) > 16:
             self._measurement_plan_cache.clear()
         self._measurement_plan_cache[key] = (measurements, plan)
+        if hasattr(self, "active_measurements") and measurements is self.active_measurements:
+            self._active_measurement_plan = plan
         return plan
 
     def _fill_measurement_values_vectorized(

@@ -724,6 +724,105 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertIs(estimator.active_measurement_table, measurements.table)
         np.testing.assert_allclose(estimator.active_z, measurements.table.value)
 
+    def test_targeted_pseudo_small_batch_avoids_full_active_refresh(self):
+        from secore.dc_se import DCStateEstimator, ObservabilityResult
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
+        initial_active_count = len(estimator.active_measurements)
+        observable_result = ObservabilityResult(
+            observable=True,
+            rank=estimator.n_state,
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=0,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[],
+        )
+        non_observable_result = ObservabilityResult(
+            observable=False,
+            rank=max(estimator.n_state - 1, 0),
+            state_count=estimator.n_state,
+            measurement_count=len(estimator.active_measurements),
+            deficiency=1,
+            singular_values=np.ones(1, dtype=np.float64),
+            weak_states=[("V:dc1", 1.0)],
+        )
+        results = [non_observable_result, observable_result]
+        estimator.observability_analysis = lambda: results.pop(0) if results else observable_result
+        estimator.targeted_pseudo_measurement_max = 1
+        estimator.targeted_pseudo_measurement_step = 1
+        estimator.targeted_pseudo_measurement_redundancy_ratio = 0.0
+        estimator._refresh_active_measurement_indexes = lambda: (_ for _ in ()).throw(
+            AssertionError("DC targeted pseudo append should update active layout incrementally")
+        )
+
+        added = estimator._add_targeted_observability_pseudo_measurements()
+
+        self.assertEqual(1, added)
+        self.assertEqual(initial_active_count + 1, len(estimator.active_measurements))
+
+    def test_incremental_updater_reuses_shared_se_array_plan_helpers(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator, Measurement
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
+        additions = [Measurement(500000, "dc_v2", "DCNode", "dc1", "V", 5.0, True, 1.01)]
+        estimator.measurements.extend(additions)
+        calls = {"active": 0}
+        original_active = dc_se.append_active_measurement_view
+
+        def counted_active(*args, **kwargs):
+            calls["active"] += 1
+            return original_active(*args, **kwargs)
+
+        dc_se.append_active_measurement_view = counted_active
+        try:
+            refreshed = estimator._incremental_update_active_measurement_indexes(additions)
+        finally:
+            dc_se.append_active_measurement_view = original_active
+
+        self.assertTrue(refreshed)
+        self.assertEqual(1, calls["active"])
+
+    def test_incremental_updater_reuses_existing_active_measurement_plan(self):
+        from secore.dc_se import DCStateEstimator, Measurement
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+        )
+        additions = [Measurement(500001, "dc_v3", "DCNode", "dc1", "V", 5.0, True, 1.02)]
+        estimator.measurements.extend(additions)
+        original_plan = estimator._measurement_plan
+        active_len = len(estimator.active_measurements)
+        calls = {"full": 0, "append": 0}
+
+        def counted_plan(measurements):
+            if len(measurements) == active_len + 1:
+                calls["full"] += 1
+            elif len(measurements) == 1:
+                calls["append"] += 1
+            return original_plan(measurements)
+
+        estimator._measurement_plan = counted_plan
+        try:
+            refreshed = estimator._incremental_update_active_measurement_indexes(additions)
+        finally:
+            estimator._measurement_plan = original_plan
+
+        self.assertTrue(refreshed)
+        self.assertEqual(0, calls["full"])
+        self.assertEqual(1, calls["append"])
+
     def test_disable_unavailable_measurements_updates_cached_table(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.dc_se import DCStateEstimator
