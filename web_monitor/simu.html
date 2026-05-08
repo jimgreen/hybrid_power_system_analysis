@@ -53,7 +53,7 @@
     .clock span { display: block; color: var(--muted); font-size: 12px; }
     .clock strong { display: block; margin-top: 4px; font-size: 18px; }
 
-    .status-strip {
+    .telemetry-strip {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 14px;
@@ -74,6 +74,9 @@
     .status-card strong { display: block; margin-top: 7px; color: var(--cyan); font-size: 22px; }
     .status-card strong.running { color: var(--green); }
     .status-card strong.stopped { color: var(--yellow); }
+    .sidebar-status-grid { margin-top: 18px; display: grid; gap: 10px; }
+    .sidebar-status-grid .status-card { padding: 12px; }
+    .sidebar-status-grid .status-card strong { font-size: 18px; }
 
     .simu-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; }
     .curves { display: grid; gap: 14px; }
@@ -121,7 +124,7 @@
 
     @media (max-width: 1080px) {
       .simu-layout { grid-template-columns: 1fr; }
-      .status-strip { grid-template-columns: repeat(2, 1fr); }
+      .telemetry-strip { grid-template-columns: repeat(2, 1fr); }
     }
 
     @media (max-width: 760px) {
@@ -129,12 +132,12 @@
       .nav { grid-template-columns: 1fr; }
       .topbar { flex-direction: column; align-items: flex-start; }
       .clock { width: 100%; text-align: left; }
-      .status-strip { grid-template-columns: 1fr; }
+      .telemetry-strip { grid-template-columns: 1fr; }
       main { padding: 16px; }
     }
 
     body {
-      background: #030b18 url("assets/main-dashboard-bg.png") center / cover fixed no-repeat;
+      background: #030b18 url("assets/clean-dashboard-bg.png") center / cover fixed no-repeat;
     }
     body::before {
       content: "";
@@ -185,6 +188,9 @@
     .event-row {
       border-color: rgba(21, 211, 255, 0.28);
     }
+    .telemetry-strip .status-card strong {
+      font-size: 24px;
+    }
   </style>
 </head>
 <body>
@@ -204,6 +210,12 @@
         <small>仿真引擎状态</small>
         <strong id="side-status">STOPPED</strong>
       </div>
+      <div class="sidebar-status-grid" aria-label="系统状态标签栏">
+        <article class="status-card"><span>当前仿真时间</span><strong id="sim-time">00:00</strong></article>
+        <article class="status-card"><span>仿真速度</span><strong id="sim-speed">1.0x</strong></article>
+        <article class="status-card"><span>仿真运行状态</span><strong id="sim-status" class="stopped">STOPPED</strong></article>
+        <article class="status-card"><span>游标定位</span><strong id="cursor-hour">0.00 h</strong></article>
+      </div>
     </aside>
 
     <main>
@@ -215,11 +227,11 @@
         <div class="clock"><span>系统时间</span><strong id="clock">--</strong></div>
       </header>
 
-      <section class="status-strip">
-        <article class="status-card"><span>当前仿真时间</span><strong id="sim-time">00:00</strong></article>
-        <article class="status-card"><span>仿真速度</span><strong id="sim-speed">1.0x</strong></article>
-        <article class="status-card"><span>仿真运行状态</span><strong id="sim-status" class="stopped">STOPPED</strong></article>
-        <article class="status-card"><span>游标定位</span><strong id="cursor-hour">0.00 h</strong></article>
+      <section class="telemetry-strip" aria-label="实时数据标签栏">
+        <article class="status-card"><span>风速</span><strong id="live-wind">--</strong></article>
+        <article class="status-card"><span>温度</span><strong id="live-temp">--</strong></article>
+        <article class="status-card"><span>太阳辐射</span><strong id="live-solar">--</strong></article>
+        <article class="status-card"><span>负荷</span><strong id="live-load">--</strong></article>
       </section>
 
       <section class="simu-layout">
@@ -311,6 +323,21 @@
       document.getElementById("side-status").textContent = status.textContent;
     }
 
+    function renderTelemetry(curves, state) {
+      const targets = {
+        "风速": "live-wind",
+        "温度": "live-temp",
+        "太阳辐射": "live-solar",
+        "负荷": "live-load"
+      };
+      for (const curve of curves || []) {
+        const target = targets[curve.name];
+        if (!target) continue;
+        const value = pointValueAt(curve.points, Number(state.cursor_hour || 0));
+        document.getElementById(target).textContent = value + " " + curve.unit;
+      }
+    }
+
     function renderAlarms(items) {
       document.getElementById("simu-alarms").innerHTML = (items || []).map((item) => {
         const warn = item.status === "关注" ? " warn" : "";
@@ -323,8 +350,10 @@
       if (!response.ok) throw new Error("SIMU API unavailable");
       const data = await response.json();
       const state = data.state || {};
+      const curves = (data.charts && data.charts.daily) || [];
       renderState(state);
-      document.getElementById("curve-stack").innerHTML = ((data.charts && data.charts.daily) || []).map((curve) => renderCurve(curve, state)).join("");
+      renderTelemetry(curves, state);
+      document.getElementById("curve-stack").innerHTML = curves.map((curve) => renderCurve(curve, state)).join("");
       renderAlarms(data.alarms);
     }
 
