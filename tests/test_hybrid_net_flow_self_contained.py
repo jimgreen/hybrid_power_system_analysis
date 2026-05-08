@@ -262,6 +262,28 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(10, len(network.ac.nodes))
         self.assertTrue(network.ac.breakers)
 
+    def test_lf_loader_reuses_hybrid_model_built_with_ppc(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        original_ac_builder = hybrid_lf._build_lf_ac_network
+        original_dc_builder = hybrid_lf._build_lf_dc_network
+
+        def reject_rebuild(*_args, **_kwargs):
+            raise AssertionError("LF loader should reuse the HybridPowerNetwork returned with the ppc")
+
+        hybrid_lf._build_lf_ac_network = reject_rebuild
+        hybrid_lf._build_lf_dc_network = reject_rebuild
+        try:
+            network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        finally:
+            hybrid_lf._build_lf_ac_network = original_ac_builder
+            hybrid_lf._build_lf_dc_network = original_dc_builder
+
+        self.assertIs(network.ac, network.ppc["ac_network"])
+        self.assertIs(network.dc, network.ppc["dc_network"])
+        self.assertIs(network._ac_ppc, network.ppc["ac"])
+        self.assertIs(network._dc_ppc, network.ppc["dc"])
+
     def test_hybrid_ppc_model_build_delegates_to_ac_dc_array_helpers(self):
         import model.hybrid_array_model as hybrid_array_model
 

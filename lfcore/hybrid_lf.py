@@ -104,14 +104,12 @@ def _build_lf_converters(ppc):
 
 
 def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
-    _model_network, ppc = build_hybrid_ppc_from_e_file(file_name)
-    ac = _build_lf_ac_network(ppc["ac"])
-    dc = _build_lf_dc_network(ppc["dc"])
-    dcac, acac = _build_lf_converters(ppc)
-    network = HybridPowerNetwork(ac=ac, dc=dc, dcac_converters=dcac, acac_converters=acac)
+    network, ppc = build_hybrid_ppc_from_e_file(file_name)
     network.ppc = ppc
     network._ac_ppc = ppc["ac"]
     network._dc_ppc = ppc["dc"]
+    network.ac.ppc = ppc["ac"]
+    network.dc.ppc = ppc["dc"]
     base = ppc["base"]
     network.p_base = float(base[0])
     network.u_scale = float(base[1])
