@@ -730,6 +730,23 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertNotIn("Math.min(560", summary_layout_script)
         self.assertNotIn("Math.min(620", summary_layout_script)
 
+    def test_planning_overview_table_rows_wrap_and_use_adaptive_height(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("#quantitySummary table,", css)
+        self.assertIn("#planningSummary table", css)
+        self.assertIn("table-layout: fixed", css)
+        self.assertIn("#quantitySummary th,", css)
+        self.assertIn("#quantitySummary td,", css)
+        self.assertIn("#planningSummary th,", css)
+        self.assertIn("#planningSummary td", css)
+        self.assertNotIn("#limitsTab .data-table table", css)
+        self.assertIn("white-space: normal", css)
+        self.assertIn("overflow-wrap: anywhere", css)
+        self.assertIn("line-height: 1.45", css)
+        self.assertIn("min-height: 48px", css)
+        self.assertIn("vertical-align: top", css)
+
     def test_planning_layout_constrains_page_height_to_viewport(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
