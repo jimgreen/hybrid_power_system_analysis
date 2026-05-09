@@ -64,6 +64,8 @@ const labels = {
 
 document.addEventListener("DOMContentLoaded", () => {
   bindTabs();
+  bindSummaryTabs();
+  bindTimeResizeHandle();
   bindActions();
   loadSchemes().catch(showError);
 });
@@ -80,6 +82,26 @@ function bindTabs() {
   });
 }
 
+function bindSummaryTabs() {
+  const buttons = Array.from(document.querySelectorAll("[data-summary-tab]"));
+  const panels = Array.from(document.querySelectorAll("[data-summary-panel]"));
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.summaryTab;
+      buttons.forEach((item) => {
+        const active = item === button;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-selected", String(active));
+      });
+      panels.forEach((panel) => {
+        const active = panel.dataset.summaryPanel === target;
+        panel.classList.toggle("active", active);
+        panel.hidden = !active;
+      });
+    });
+  });
+}
+
 function bindActions() {
   document.getElementById("createScheme").addEventListener("click", createScheme);
   document.getElementById("copyScheme").addEventListener("click", copyScheme);
@@ -88,6 +110,74 @@ function bindActions() {
   document.getElementById("deleteScheme").addEventListener("click", deleteScheme);
   document.querySelectorAll("[data-curve]").forEach((box) => box.addEventListener("change", renderChart));
   window.addEventListener("resize", renderChart);
+}
+
+function bindTimeResizeHandle() {
+  const handle = document.getElementById("timeResizeHandle");
+  const chart = document.getElementById("timeChart");
+  if (!handle || !chart) return;
+
+  const applyHeight = (height) => {
+    const safeHeight = clampTimeChartHeight(height);
+    document.documentElement.style.setProperty("--time-chart-height", `${Math.round(safeHeight)}px`);
+    handle.setAttribute("aria-valuenow", String(Math.round(safeHeight)));
+    renderChart();
+  };
+
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = chart.getBoundingClientRect().height || 240;
+    handle.classList.add("dragging");
+    handle.setPointerCapture?.(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      applyHeight(startHeight + moveEvent.clientY - startY);
+    };
+    const onDone = () => {
+      handle.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onDone);
+      window.removeEventListener("pointercancel", onDone);
+      renderChart();
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onDone);
+    window.addEventListener("pointercancel", onDone);
+  });
+
+  handle.addEventListener("keydown", (event) => {
+    const currentHeight = chart.getBoundingClientRect().height || 240;
+    const keySteps = {
+      ArrowUp: -12,
+      ArrowDown: 12,
+      PageUp: -48,
+      PageDown: 48,
+    };
+    if (event.key in keySteps) {
+      event.preventDefault();
+      applyHeight(currentHeight + keySteps[event.key]);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      applyHeight(140);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      applyHeight(maxTimeChartHeight());
+    }
+  });
+
+  handle.setAttribute("aria-valuenow", String(Math.round(chart.getBoundingClientRect().height || 240)));
+}
+
+function clampTimeChartHeight(height) {
+  return Math.min(Math.max(Number(height) || 240, 140), maxTimeChartHeight());
+}
+
+function maxTimeChartHeight() {
+  const tab = document.getElementById("timeTab");
+  const available = tab ? tab.clientHeight - 260 : 420;
+  return Math.max(180, Math.min(520, available));
 }
 
 async function api(path, options = {}) {
@@ -289,14 +379,14 @@ function renderChart() {
   }
   if (!isTimeSeriesLoaded()) {
     const width = svg.clientWidth || 900;
-    const height = 320;
+    const height = svg.clientHeight || 320;
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.innerHTML = `<rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"/><text x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="#5a716e" font-size="16">${state.timeSeriesLoading ? "时序数据加载中..." : "时序数据尚未加载"}</text>`;
     return;
   }
   const rows = state.payload.time_series || [];
   const width = svg.clientWidth || 900;
-  const height = 320;
+  const height = svg.clientHeight || 320;
   const pad = 34;
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   const curves = summarySeries.filter(([key]) => {

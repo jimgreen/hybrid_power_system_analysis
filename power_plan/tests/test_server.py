@@ -390,6 +390,9 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn(".device-filter-row", css)
         self.assertIn("flex-wrap: nowrap", css)
         self.assertIn("overflow-x: auto", css)
+        self.assertIn("justify-content: flex-end", css)
+        self.assertIn("margin-left: auto", css)
+        self.assertIn("min-width: 0", css)
         for group_name in ("风光柴", "氢储能", "电储能"):
             self.assertIn(group_name, script)
         self.assertLess(script.index('"电储能"'), script.index('"氢储能"'))
@@ -430,7 +433,14 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('id="summaryCharts"', html)
         self.assertIn('id="quantitySummary"', html)
         self.assertIn("待选设备列表", html)
+        self.assertIn('class="summary-tabs"', html)
+        self.assertIn('data-summary-tab="charts"', html)
+        self.assertIn('data-summary-tab="devices"', html)
+        self.assertIn('data-summary-panel="charts"', html)
+        self.assertIn('data-summary-panel="devices"', html)
         self.assertNotIn("设计容量约束", html)
+        self.assertIn("bindSummaryTabs", script)
+        self.assertIn("data-summary-panel", script)
         self.assertIn("renderSchemeSummary", script)
         self.assertNotIn("renderStatsTable", script)
         self.assertIn("renderCandidateDeviceTable", script)
@@ -444,8 +454,19 @@ class PowerPlanServerTest(unittest.TestCase):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
         self.assertIn(".summary-page", css)
-        self.assertIn("max-height: calc(100vh - 188px)", css)
+        self.assertIn(".summary-switcher", css)
+        self.assertIn(".summary-tab-panel.active", css)
+        self.assertIn("flex: 1 1 auto", css)
         self.assertIn("overflow: auto", css)
+
+    def test_planning_layout_constrains_page_height_to_viewport(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("height: 100vh", css)
+        self.assertIn("overflow: hidden", css)
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr)", css)
+        self.assertIn("#timeTab #timeTable", css)
+        self.assertIn("height: var(--time-chart-height, clamp(180px, 28vh, 300px))", css)
 
     def test_planning_frontend_defers_time_series_loading(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
@@ -481,6 +502,24 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("1月", script)
         self.assertIn("12月", script)
 
+    def test_planning_time_series_chart_height_has_resizable_splitter(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="timeResizeHandle"', html)
+        self.assertIn('role="separator"', html)
+        self.assertIn("调整时序图高度", html)
+        self.assertLess(html.index('id="timeChart"'), html.index('id="timeResizeHandle"'))
+        self.assertLess(html.index('id="timeResizeHandle"'), html.index('id="timeTable"'))
+        self.assertIn("bindTimeResizeHandle", script)
+        self.assertIn("pointerdown", script)
+        self.assertIn("--time-chart-height", script)
+        self.assertIn("svg.clientHeight", script)
+        self.assertIn(".time-resize-handle", css)
+        self.assertIn("cursor: row-resize", css)
+        self.assertIn("height: var(--time-chart-height", css)
+
     def test_planning_time_series_input_refreshes_visible_chart(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
 
@@ -510,6 +549,14 @@ class PowerPlanServerTest(unittest.TestCase):
 
         self.assertEqual(resolved.name, "index.html")
         self.assertTrue(resolved.exists())
+
+    def test_planning_assets_are_cache_busted_and_static_js_css_are_no_cache(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+
+        self.assertIn("assets/planning.css?v=", html)
+        self.assertIn("assets/planning.js?v=", html)
+        self.assertEqual(server.resolve_static_path("/assets/planning.js?v=test").name, "planning.js")
+        self.assertIn('".css", ".js"', (WEB_ROOT / "server.py").read_text(encoding="utf-8"))
 
     def test_static_path_rejects_directory_traversal(self):
         with self.assertRaises(ValueError):

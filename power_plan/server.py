@@ -674,9 +674,10 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
             return
 
         content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        no_cache_suffixes = {".html", ".css", ".js"}
         headers = {
             "Content-Type": content_type,
-            "Cache-Control": "no-cache" if path.suffix == ".html" else "public, max-age=3600",
+            "Cache-Control": "no-cache" if path.suffix in no_cache_suffixes else "public, max-age=3600",
         }
         self._send(HTTPStatus.OK, headers, path.read_bytes())
 
