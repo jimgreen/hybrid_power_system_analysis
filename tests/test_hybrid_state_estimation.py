@@ -25,6 +25,25 @@ class HybridStateEstimationTest(unittest.TestCase):
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return target
 
+    def test_update_meas_snapshot_supports_hybrid_breaker_measurements(self):
+        import sys
+
+        scripts_dir = ROOT_DIR / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import update_meas_from_lf
+
+        snapshot, _info = update_meas_from_lf.solve_hybrid(
+            ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
+        )
+        ac_breaker = next(item for item in snapshot.ac.breakers if item.name == "sw_diesel_ac")
+        dc_breaker = next(item for item in snapshot.dc.breakers if item.name == "sw_wt01_dc")
+
+        self.assertIsNotNone(snapshot.value("ACBreak", ac_breaker.name, "V_FROM"))
+        self.assertIsNotNone(snapshot.value("ACBreak", ac_breaker.name, "I_FROM"))
+        self.assertIsNotNone(snapshot.value("DCBreak", dc_breaker.name, "V_FROM"))
+        self.assertIsNotNone(snapshot.value("DCBreak", dc_breaker.name, "I_FROM"))
+
     def test_hybrid_jacobian_uses_direct_derivatives_without_repeated_evaluation(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -517,7 +536,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         calls = []
 
         def fake_seed(network, _params, _e_file):
-            nd_1 = network.node_dict[0]
+            nd_1 = network.node_dict[1]
             self.assertAlmostEqual(1.6, float(nd_1.voltage))
             calls.append(True)
             for node in network.nodes:

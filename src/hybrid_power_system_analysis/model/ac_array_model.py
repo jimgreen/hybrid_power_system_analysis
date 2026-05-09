@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from efile_read import efile_factory_from_file
+from efile_read import efile_factory_from_file, efile_factory_from_rows
 from paths import resolve_project_file
 
 MODEL_DIR = Path(__file__).resolve().parent
@@ -185,6 +185,15 @@ def build_ac_ppc_from_e_file(file_path) -> Dict:
     ppc["source"] = str(file_key[0])
     with _AC_PPC_CACHE_LOCK:
         _AC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    return ppc
+
+
+def build_ac_ppc_from_efile_rows(file_path, rows) -> Dict:
+    """Build AC ppc from E rows that are already loaded in memory."""
+    path = resolve_project_file(file_path).resolve()
+    model = efile_factory_from_rows(rows)
+    _network, ppc = build_ac_ppc_from_model(model)
+    ppc["source"] = str(path)
     return ppc
 
 

@@ -184,6 +184,16 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)
 
+        array_calc = DCPowerFlowCalc(ppc, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = array_calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(array_calc.converged)
+        self.assertIn("bus", array_calc.result)
+        self.assertIn("branch", array_calc.result)
+        self.assertIsNone(getattr(array_calc, "lf_result", None))
+
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc
@@ -207,6 +217,22 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(["dc_net_30.e"], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("dc_ppc_v1", calc.ppc["format"])
+
+    def test_update_meas_snapshot_supports_dc_breaker_measurements(self):
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        scripts_dir = root / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import update_meas_from_lf
+
+        snapshot, _info = update_meas_from_lf.solve_dc(root / "data" / "model" / "dc" / "dc_net_30.e")
+        breaker = next(item for item in snapshot.dc.breakers if getattr(item, "is_alive", False))
+
+        self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "P_FROM"))
+        self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "V_FROM"))
+        self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "I_FROM"))
 
     def test_run_reuses_combined_dc_newton_system_builder(self):
         from lfcore.dc_lf import DCPowerFlowCalc
@@ -288,6 +314,19 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(0.987654, ppc["bus"][0, BUS_COLS["voltage"]])
         np.testing.assert_allclose(ppc["bus"][1:], expected["bus"][1:])
         np.testing.assert_array_equal(ppc["bus_name"], expected["bus_name"])
+
+    def test_build_dc_ppc_from_efile_rows_matches_file_builder(self):
+        import numpy as np
+        from efile_read import _read_efile_rows
+        from model.dc_array_model import build_dc_ppc_from_e_file, build_dc_ppc_from_efile_rows
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
+        expected = build_dc_ppc_from_e_file(e_file)
+        actual = build_dc_ppc_from_efile_rows(e_file, _read_efile_rows(e_file))
+
+        for key in ("bus", "branch", "load", "gen", "zero_branch", "switch", "break", "dcdc"):
+            self.assertEqual(expected[key].shape, actual[key].shape)
+            np.testing.assert_allclose(expected[key], actual[key], atol=0.0)
 
     def test_build_dc_ppc_from_e_file_delegates_through_network_model(self):
         from model import dc_array_model

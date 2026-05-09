@@ -384,6 +384,9 @@ class DCPowerFlowCalc:
             "all": "full",
             "full": "full",
             "complete": "full",
+            "array": "array",
+            "arrays": "array",
+            "ppc": "array",
             "summary": "summary",
             "minimal": "summary",
             "none": "none",
@@ -2073,7 +2076,7 @@ class DCPowerFlowCalc:
 
         if self.array_mode and self._direct_ppc_mode:
             self._write_back_ppc(x)
-            if not getattr(self, "skip_lf_result", False):
+            if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
                 self.lf_result = self._build_lf_result()
             return
 

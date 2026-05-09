@@ -557,6 +557,9 @@ class ACPowerFlowCalc:
             "summary": "summary",
             "brief": "summary",
             "minimal": "summary",
+            "array": "array",
+            "arrays": "array",
+            "ppc": "array",
             "none": "none",
             "skip": "none",
             "raw": "none",
@@ -3684,7 +3687,7 @@ class ACPowerFlowCalc:
             "break": breaker,
         }
         self._write_ppc_result_to_network()
-        if not getattr(self, "skip_lf_result", False):
+        if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
 
 def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:

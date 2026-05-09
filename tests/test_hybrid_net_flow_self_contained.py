@@ -597,6 +597,76 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(calc.dc_calc.array_mode)
         self.assertEqual("dc_ppc_v1", calc.dc_calc.ppc["format"])
 
+    def test_pure_ac_hybrid_lf_load_uses_lightweight_ac_fast_path(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        original_builder = hybrid_lf.build_hybrid_ppc_from_e_file
+        original_ac_file_builder = hybrid_lf.build_ac_ppc_from_e_file
+        original_rows_reader = hybrid_lf._read_efile_rows
+        row_reads = 0
+
+        def reject_full_hybrid_builder(*_args, **_kwargs):
+            raise AssertionError("pure AC hybrid LF should not build full hybrid object model")
+
+        def reject_ac_file_builder(*_args, **_kwargs):
+            raise AssertionError("pure AC hybrid LF should reuse already-loaded E rows")
+
+        def counted_rows_reader(*args, **kwargs):
+            nonlocal row_reads
+            row_reads += 1
+            return original_rows_reader(*args, **kwargs)
+
+        hybrid_lf.build_hybrid_ppc_from_e_file = reject_full_hybrid_builder
+        hybrid_lf.build_ac_ppc_from_e_file = reject_ac_file_builder
+        hybrid_lf._read_efile_rows = counted_rows_reader
+        try:
+            network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "ac" / "ieee14.e")
+        finally:
+            hybrid_lf.build_hybrid_ppc_from_e_file = original_builder
+            hybrid_lf.build_ac_ppc_from_e_file = original_ac_file_builder
+            hybrid_lf._read_efile_rows = original_rows_reader
+
+        self.assertTrue(getattr(network.ac, "_lf_lightweight", False))
+        self.assertTrue(hasattr(network, "_ac_ppc"))
+        self.assertFalse(hasattr(network, "_dc_ppc"))
+        self.assertEqual(14, network.total_nodes)
+        self.assertEqual(1, row_reads)
+
+    def test_pure_dc_hybrid_lf_load_uses_loaded_rows_once(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        original_builder = hybrid_lf.build_hybrid_ppc_from_e_file
+        original_dc_file_builder = hybrid_lf.build_dc_ppc_from_e_file
+        original_rows_reader = hybrid_lf._read_efile_rows
+        row_reads = 0
+
+        def reject_full_hybrid_builder(*_args, **_kwargs):
+            raise AssertionError("pure DC hybrid LF should not build full hybrid object model")
+
+        def reject_dc_file_builder(*_args, **_kwargs):
+            raise AssertionError("pure DC hybrid LF should reuse already-loaded E rows")
+
+        def counted_rows_reader(*args, **kwargs):
+            nonlocal row_reads
+            row_reads += 1
+            return original_rows_reader(*args, **kwargs)
+
+        hybrid_lf.build_hybrid_ppc_from_e_file = reject_full_hybrid_builder
+        hybrid_lf.build_dc_ppc_from_e_file = reject_dc_file_builder
+        hybrid_lf._read_efile_rows = counted_rows_reader
+        try:
+            network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "dc" / "dc_net_30.e")
+        finally:
+            hybrid_lf.build_hybrid_ppc_from_e_file = original_builder
+            hybrid_lf.build_dc_ppc_from_e_file = original_dc_file_builder
+            hybrid_lf._read_efile_rows = original_rows_reader
+
+        self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
+        self.assertFalse(hasattr(network, "_ac_ppc"))
+        self.assertTrue(hasattr(network, "_dc_ppc"))
+        self.assertEqual(30, network.total_nodes)
+        self.assertEqual(1, row_reads)
+
     def test_hybrid_topology_builds_hybrid_islands(self):
         import hybrid_net_flow
 
@@ -639,7 +709,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
 <ACACConverter>
 @ idx name     i_node j_node r1   r2   control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat i_p  i_q  j_p  j_q  i_i  j_i
-# 0   acac_3_4 3      4      0.01 0.01 PQQ          5.0   0.0     0.0     0.0     0.0     1        0.0  0.0 0.0 0.0 0.0 0.0
+# 1   acac_4_5 4      5      0.01 0.01 PQQ          5.0   0.0     0.0     0.0     0.0     1        0.0  0.0 0.0 0.0 0.0 0.0
 </ACACConverter>
 """
             case_path.write_text(source_text + acac_block, encoding="utf-8")
@@ -709,14 +779,14 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         text = _ensure_block_column(text, "ACNode", "run_stat", "1")
         text = _ensure_block_column(text, "DCNode", "run_stat", "1")
         for block_name, row_idx in (
-            ("ACNode", 0),
-            ("ACNode", 10),
-            ("DCNode", 1),
-            ("DCNode", 28),
-            ("ACBranch", 0),
-            ("DCBranch", 0),
-            ("ACGenerator", 0),
-            ("DCBreak", 0),
+            ("ACNode", 1),
+            ("ACNode", 11),
+            ("DCNode", 2),
+            ("DCNode", 29),
+            ("ACBranch", 1),
+            ("DCBranch", 1),
+            ("ACGenerator", 1),
+            ("DCBreak", 1),
         ):
             text = _set_block_value(text, block_name, row_idx, "run_stat", "0")
 

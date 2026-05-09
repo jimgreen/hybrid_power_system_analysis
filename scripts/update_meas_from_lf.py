@@ -88,6 +88,7 @@ class Snapshot:
             "ACBranch": self._by_name(getattr(ac_grid, "branches", [])),
             "ACTransformer": self._by_name(getattr(ac_grid, "transformers", [])),
             "ACSwitch": self._by_name(getattr(ac_grid, "switches", [])),
+            "ACBreak": self._by_name(getattr(ac_grid, "breakers", [])),
             "ACZeroBranch": self._by_name(getattr(ac_grid, "zero_branches", [])),
             "ACGenerator": self._by_name(getattr(ac_grid, "generators", [])),
             "ACLoad": self._by_name(getattr(ac_grid, "loads", [])),
@@ -95,6 +96,7 @@ class Snapshot:
         self.dc_devices = {
             "DCBranch": self._by_name(getattr(dc_grid, "branches", [])),
             "DCSwitch": self._by_name(getattr(dc_grid, "switches", [])),
+            "DCBreak": self._by_name(getattr(dc_grid, "breakers", [])),
             "DCZeroBranch": self._by_name(getattr(dc_grid, "zero_branches", [])),
             "DCDCConverter": self._by_name(getattr(dc_grid, "dcdc_converters", [])),
             "DCGenerator": self._by_name(getattr(dc_grid, "generators", [])),
@@ -163,7 +165,7 @@ class Snapshot:
         if dev_type in ("ACBranch", "ACTransformer"):
             dev = self.ac_devices[dev_type].get(dev_name)
             return None if dev is None else self._ac_line_value(dev, meas_type)
-        if dev_type in ("ACSwitch", "ACZeroBranch"):
+        if dev_type in ("ACSwitch", "ACBreak", "ACZeroBranch"):
             dev = self.ac_devices[dev_type].get(dev_name)
             return None if dev is None else self._ac_zero_value(dev, meas_type)
         if dev_type == "ACGenerator":
@@ -175,7 +177,7 @@ class Snapshot:
         if dev_type == "DCBranch":
             dev = self.dc_devices[dev_type].get(dev_name)
             return None if dev is None else self._dc_line_value(dev, meas_type)
-        if dev_type in ("DCSwitch", "DCZeroBranch"):
+        if dev_type in ("DCSwitch", "DCBreak", "DCZeroBranch"):
             dev = self.dc_devices[dev_type].get(dev_name)
             return None if dev is None else self._dc_zero_value(dev, meas_type)
         if dev_type == "DCDCConverter":
@@ -236,6 +238,8 @@ class Snapshot:
         return None
 
     def _ac_zero_value(self, dev, meas_type: str) -> Optional[float]:
+        i_node = self._ac_terminal_node(dev, "from")
+        j_node = self._ac_terminal_node(dev, "to")
         p_from = self._float(getattr(dev, "p", 0.0))
         q_from = self._float(getattr(dev, "q", 0.0))
         current_abs = abs(self._float(getattr(dev, "current", 0.0)))
@@ -244,19 +248,21 @@ class Snapshot:
         if meas_type == "Q_FROM":
             return self.power_to_file(q_from)
         if meas_type == "V_FROM":
-            return self.ac_voltage_to_file(dev.i_node_obj)
+            return None if i_node is None else self.ac_voltage_to_file(i_node)
         if meas_type == "I_FROM":
-            return self.ac_current_to_file(dev.i_node_obj, current_abs)
+            return None if i_node is None else self.ac_current_to_file(i_node, current_abs)
         if meas_type == "P_TO":
             return self.power_to_file(-p_from)
         if meas_type == "Q_TO":
             return self.power_to_file(-q_from)
         if meas_type == "V_TO":
-            return self.ac_voltage_to_file(dev.j_node_obj)
+            return None if j_node is None else self.ac_voltage_to_file(j_node)
         if meas_type == "I_TO":
-            return self.ac_current_to_file(dev.j_node_obj, current_abs)
+            return None if j_node is None else self.ac_current_to_file(j_node, current_abs)
         if meas_type == "V_DIFF":
-            return self.ac_voltage_to_file(dev.i_node_obj) - self.ac_voltage_to_file(dev.j_node_obj)
+            if i_node is None or j_node is None:
+                return None
+            return self.ac_voltage_to_file(i_node) - self.ac_voltage_to_file(j_node)
         return None
 
     def _ac_generator_value(self, dev, meas_type: str) -> Optional[float]:
@@ -302,21 +308,27 @@ class Snapshot:
         return None
 
     def _dc_zero_value(self, dev, meas_type: str) -> Optional[float]:
+        i_node = self._dc_terminal_node(dev, "from")
+        j_node = self._dc_terminal_node(dev, "to")
         current = self._float(getattr(dev, "current", 0.0))
         if meas_type == "P_FROM":
             return self.power_to_file(self._float(getattr(dev, "p", 0.0)))
         if meas_type == "V_FROM":
-            return self.dc_voltage_to_file(dev.i_node_obj)
+            return None if i_node is None else self.dc_voltage_to_file(i_node)
         if meas_type == "I_FROM":
-            return self.dc_current_to_file(dev.i_node_obj, current)
+            return None if i_node is None else self.dc_current_to_file(i_node, current)
         if meas_type == "P_TO":
-            return self.power_to_file(-self._float(dev.j_node_obj.voltage) * current)
+            if j_node is None:
+                return None
+            return self.power_to_file(-self._float(j_node.voltage) * current)
         if meas_type == "V_TO":
-            return self.dc_voltage_to_file(dev.j_node_obj)
+            return None if j_node is None else self.dc_voltage_to_file(j_node)
         if meas_type == "I_TO":
-            return self.dc_current_to_file(dev.j_node_obj, -current)
+            return None if j_node is None else self.dc_current_to_file(j_node, -current)
         if meas_type == "V_DIFF":
-            return self.dc_voltage_to_file(dev.i_node_obj) - self.dc_voltage_to_file(dev.j_node_obj)
+            if i_node is None or j_node is None:
+                return None
+            return self.dc_voltage_to_file(i_node) - self.dc_voltage_to_file(j_node)
         return None
 
     def _dcdc_value(self, dev, meas_type: str) -> Optional[float]:

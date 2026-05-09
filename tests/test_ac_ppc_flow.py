@@ -599,6 +599,18 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual(summary_calc.N, summary_calc.result["angle"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)
 
+        array_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            array_calc.prepare()
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = array_calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(array_calc.converged)
+        self.assertIn("bus", array_calc.result)
+        self.assertIn("branch", array_calc.result)
+        self.assertIsNone(getattr(array_calc, "lf_result", None))
+
     def test_ppc_prepare_uses_sparse_connected_components(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file

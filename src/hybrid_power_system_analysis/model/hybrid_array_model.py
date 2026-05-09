@@ -12,7 +12,7 @@ for path in (MODEL_DIR, ROOT_DIR):
 
 from ac_array_model import build_ac_ppc_from_model
 from dc_array_model import build_dc_ppc_from_model
-from efile_read import efile_factory_from_file
+from efile_read import efile_factory_from_file, efile_factory_from_rows
 from unit_system import normalize_model_named_units
 
 
@@ -151,6 +151,15 @@ def _build_acac(model) -> Tuple[np.ndarray, np.ndarray]:
 
 def build_hybrid_ppc_from_e_file(file_path):
     model = efile_factory_from_file(file_path)
+    return build_hybrid_ppc_from_model(file_path, model)
+
+
+def build_hybrid_ppc_from_efile_rows(file_path, rows):
+    model = efile_factory_from_rows(rows)
+    return build_hybrid_ppc_from_model(file_path, model)
+
+
+def build_hybrid_ppc_from_model(file_path, model):
     normalize_model_named_units(model)
     ac_network, ac_ppc = build_ac_ppc_from_model(model)
     ac_ppc["source"] = str(file_path)
