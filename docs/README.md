@@ -4,12 +4,12 @@
 
 | 模块 | 文档 | 源码 |
 | --- | --- | --- |
-| 交流潮流 | [ac_lf.md](ac_lf.md) | `lfcore/ac_lf.py` |
-| 交流状态估计 | [ac_se.md](ac_se.md) | `secore/ac_se.py` |
-| 直流潮流 | [dc_lf.md](dc_lf.md) | `lfcore/dc_lf.py` |
-| 直流状态估计 | [dc_se.md](dc_se.md) | `secore/dc_se.py` |
-| 交直流联合潮流 | [hybrid_lf.md](hybrid_lf.md) | `lfcore/hybrid_lf.py` |
-| 交直流联合状态估计 | [hybrid_se.md](hybrid_se.md) | `secore/hybrid_se.py` |
+| 交流潮流 | [ac_lf.md](ac_lf.md) | `src/hybrid_power_system_analysis/lfcore/ac_lf.py` |
+| 交流状态估计 | [ac_se.md](ac_se.md) | `src/hybrid_power_system_analysis/secore/ac_se.py` |
+| 直流潮流 | [dc_lf.md](dc_lf.md) | `src/hybrid_power_system_analysis/lfcore/dc_lf.py` |
+| 直流状态估计 | [dc_se.md](dc_se.md) | `src/hybrid_power_system_analysis/secore/dc_se.py` |
+| 交直流联合潮流 | [hybrid_lf.md](hybrid_lf.md) | `src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` |
+| 交直流联合状态估计 | [hybrid_se.md](hybrid_se.md) | `src/hybrid_power_system_analysis/secore/hybrid_se.py` |
 
 ## 公共约定
 
@@ -56,11 +56,10 @@ E 文件采用有名值输入，并通过模型中的基准配置转换为内部
 
 ### 公共数值实现
 
-状态估计公共稀疏矩阵工具位于 `secore/se_math.py`：
+状态估计公共稀疏矩阵工具位于 `src/hybrid_power_system_analysis/secore/se_math.py`：
 
 - `SparseJacobianBuilder`：以 COO triplet 方式批量构造稀疏 Jacobian。
 - `build_normal_equations()`：生成正规方程 `G = H.T W H` 和右端 `H.T W r`。
 - `solve_normal_equations_with_factor()`：优先使用 Cholesky，可退化到稀疏直接解。
 - `observability_rank_details()`：可观测性秩分析，优先复用正规矩阵或分解信息。
 - `identify_bad_data()` 在各 SE 模块内调用 `inverse_gain_for_bad_data()` 和 `measurement_leverage()` 计算归一化残差。
-

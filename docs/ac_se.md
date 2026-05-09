@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`secore/ac_se.py` 实现交流电网加权最小二乘状态估计。核心类是 `ACStateEstimator`。
+`src/hybrid_power_system_analysis/secore/ac_se.py` 实现交流电网加权最小二乘状态估计。核心类是 `ACStateEstimator`。
 
 该模块负责：
 
@@ -30,7 +30,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python secore\ac_se.py --case data\ac\ieee300.e --meas data\ac\ieee300.meas --flat-start --quiet
+python -m secore.ac_se --case data\ac\ieee300.e --meas data\ac\ieee300.meas --flat-start --quiet
 ```
 
 常用参数：
@@ -190,4 +190,3 @@ rN_i = abs(r_i) / sqrt(R_ii - h_i * G^-1 * h_i.T)
 - `.meas` 中的相角是度，内部自动转弧度。
 - E 文件和 `.meas` 的功率、电压、电流都应使用有名值，单位由 E 文件的 scale 字段解释。
 - AC 大规模拼接算例必须保留 `ACZeroBranch`，不要用普通极小阻抗线路替代。
-

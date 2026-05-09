@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`lfcore/ac_lf.py` 实现交流电网 Newton-Raphson 潮流计算。核心类是 `ACPowerFlowCalc`。
+`src/hybrid_power_system_analysis/lfcore/ac_lf.py` 实现交流电网 Newton-Raphson 潮流计算。核心类是 `ACPowerFlowCalc`。
 
 该模块负责：
 
@@ -151,4 +151,3 @@ array-mode 下结果写入 `calc.result`，不会直接修改输入 `ppc`。
 - 多个平衡节点只有在零阻抗等值相连且固定电压/相角一致时才可作为冗余参考处理。
 - 零阻抗支路作为拓扑约束处理，不应通过极小阻抗普通支路替代。
 - `run()` 会打印每次迭代残差，若需要静默运行可由上层重定向输出。
-

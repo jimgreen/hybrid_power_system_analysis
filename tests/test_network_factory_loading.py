@@ -44,8 +44,8 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
 
     def test_cache_ppc_helpers_are_removed_from_array_modules(self):
         for rel_path in (
-            "model/ac_array_model.py",
-            "model/dc_array_model.py",
+            "src/hybrid_power_system_analysis/model/ac_array_model.py",
+            "src/hybrid_power_system_analysis/model/dc_array_model.py",
         ):
             source = (ROOT_DIR / rel_path).read_text(encoding="utf-8")
             self.assertNotIn("def build_ac_ppc_from_cache", source, rel_path)
@@ -53,10 +53,10 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
 
     def test_model_array_imports_do_not_use_importerror_fallbacks(self):
         for rel_path in (
-            "model/ac_array_model.py",
-            "model/dc_array_model.py",
-            "model/hybrid_array_model.py",
-            "model/hybrid_model.py",
+            "src/hybrid_power_system_analysis/model/ac_array_model.py",
+            "src/hybrid_power_system_analysis/model/dc_array_model.py",
+            "src/hybrid_power_system_analysis/model/hybrid_array_model.py",
+            "src/hybrid_power_system_analysis/model/hybrid_model.py",
         ):
             source = (ROOT_DIR / rel_path).read_text(encoding="utf-8")
             self.assertNotIn("except ImportError", source, rel_path)
@@ -75,10 +75,10 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
             "sp_maximum_bipartite_matching = None",
         )
         for rel_path in (
-            "lfcore/ac_lf.py",
-            "lfcore/dc_lf.py",
-            "secore/ac_se.py",
-            "secore/se_math.py",
+            "src/hybrid_power_system_analysis/lfcore/ac_lf.py",
+            "src/hybrid_power_system_analysis/lfcore/dc_lf.py",
+            "src/hybrid_power_system_analysis/secore/ac_se.py",
+            "src/hybrid_power_system_analysis/secore/se_math.py",
         ):
             source = (ROOT_DIR / rel_path).read_text(encoding="utf-8")
             for token in forbidden_tokens:

@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`secore/dc_se.py` 实现直流电网加权最小二乘状态估计。核心类是 `DCStateEstimator`。
+`src/hybrid_power_system_analysis/secore/dc_se.py` 实现直流电网加权最小二乘状态估计。核心类是 `DCStateEstimator`。
 
 该模块负责：
 
@@ -30,7 +30,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python secore\dc_se.py --case data\dc\dc_net_3000.e --meas data\dc\dc_net_3000.meas --flat-start --quiet
+python -m secore.dc_se --case data\dc\dc_net_3000.e --meas data\dc\dc_net_3000.meas --flat-start --quiet
 ```
 
 ## 支持的量测
@@ -144,11 +144,10 @@ I = P / V
 - 量测计划缓存，避免每轮重新解析字符串和设备。
 - 量测值和 Jacobian 批量填充。
 - Jacobian 直接以稀疏矩阵生成。
-- 正规方程构造和求解复用 `secore/se_math.py`。
+- 正规方程构造和求解复用 `src/hybrid_power_system_analysis/secore/se_math.py`。
 
 ## 注意事项
 
 - `.meas` 文件不再包含独立 `PowerBase`，单位跟随 E 文件。
 - `valid=0` 的量测会被跳过。
 - 未量测设备的伪量测权重较低，只用于提高可观测性，不应替代真实量测质量建模。
-

@@ -184,6 +184,142 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "custom_lf.para"), "prepare", "run"], calls)
 
+    def test_hybrid_lf_cli_accepts_linear_solver_argument(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        calls = []
+
+        class FakeCalc:
+            converged = True
+
+            def __init__(self, network, **kwargs):
+                calls.append(("calc", network, kwargs.get("linear_solver")))
+
+            def prepare(self):
+                calls.append("prepare")
+
+            def run(self):
+                calls.append("run")
+                return 0
+
+            def _build_lf_result(self):
+                return hybrid_lf.HybridLFResult(calc=self, rc=0)
+
+        original_loader = hybrid_lf._read_lf_network_from_file
+        original_calc = hybrid_lf.HybridPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return "hybrid-network"
+
+        hybrid_lf._read_lf_network_from_file = fake_loader
+        hybrid_lf.HybridPowerFlowCalc = FakeCalc
+        try:
+            rc = hybrid_lf.main(
+                [
+                    "data/hybrid/hybrid_net_40.e",
+                    "--linear-solver",
+                    "sksparse.klu.klu_solve",
+                    "--quiet",
+                ]
+            )
+        finally:
+            hybrid_lf._read_lf_network_from_file = original_loader
+            hybrid_lf.HybridPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual(
+            [
+                ("load", "hybrid_net_40.e"),
+                ("calc", "hybrid-network", "sksparse.klu.klu_solve"),
+                "prepare",
+                "run",
+            ],
+            calls,
+        )
+
+    def test_ac_dc_sparse_solver_registry_supports_sksparse_klu_solve(self):
+        import types
+
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
+
+        fake_solver = object()
+        original_find_spec = ac_lf.importlib.util.find_spec
+        original_import_module = ac_lf.importlib.import_module
+
+        def fake_find_spec(module_name):
+            return object() if module_name == "sksparse.klu" else None
+
+        def fake_import_module(module_name):
+            if module_name == "sksparse.klu":
+                return types.SimpleNamespace(klu_solve=fake_solver)
+            raise ImportError(module_name)
+
+        ac_lf.importlib.util.find_spec = fake_find_spec
+        ac_lf.importlib.import_module = fake_import_module
+        try:
+            for module in (ac_lf, dc_lf):
+                for solver_name in ("sksparse.klu.klu_solve", "klu_solve", "auto"):
+                    module._OPTIONAL_SPARSE_SOLVERS.clear()
+                    module._OPTIONAL_SPARSE_MISSING.clear()
+                    self.assertIs(fake_solver, module._load_named_sparse_solver(solver_name))
+        finally:
+            ac_lf.importlib.util.find_spec = original_find_spec
+            ac_lf.importlib.import_module = original_import_module
+
+    def test_ac_dc_sparse_solver_registry_supports_pyklu_wrapper(self):
+        import types
+
+        import numpy as np
+        from scipy.sparse import csr_matrix
+
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
+
+        calls = []
+        original_find_spec = ac_lf.importlib.util.find_spec
+        original_import_module = ac_lf.importlib.import_module
+
+        class FakeKlu:
+            def __init__(self, matrix):
+                calls.append(("init", matrix.getformat()))
+
+            def solve(self, rhs):
+                calls.append(("solve", tuple(rhs.tolist())))
+                return np.asarray(rhs, dtype=float) + 1.0
+
+        def fake_find_spec(module_name):
+            return object() if module_name == "PyKLU" else None
+
+        def fake_import_module(module_name):
+            if module_name == "PyKLU":
+                return types.SimpleNamespace(Klu=FakeKlu)
+            raise ImportError(module_name)
+
+        ac_lf.importlib.util.find_spec = fake_find_spec
+        ac_lf.importlib.import_module = fake_import_module
+        try:
+            for module in (ac_lf, dc_lf):
+                module._OPTIONAL_SPARSE_SOLVERS.clear()
+                module._OPTIONAL_SPARSE_MISSING.clear()
+                solver = module._load_named_sparse_solver("pyklu")
+                result = solver(csr_matrix([[1.0]]), np.array([2.0]))
+                np.testing.assert_allclose([3.0], result)
+        finally:
+            ac_lf.importlib.util.find_spec = original_find_spec
+            ac_lf.importlib.import_module = original_import_module
+
+        self.assertEqual([("init", "csc"), ("solve", (2.0,)), ("init", "csc"), ("solve", (2.0,))], calls)
+
+    def test_hybrid_lf_cli_rejects_unknown_linear_solver(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        with self.assertRaises(SystemExit) as ctx:
+            hybrid_lf.main(["data/hybrid/hybrid_net_40.e", "--linear-solver", "unknown-solver", "--quiet"])
+
+        self.assertEqual(2, ctx.exception.code)
+
     def test_power_flow_classes_read_algorithm_parameters_from_lf_para(self):
         from algorithm_parameters import load_lf_parameters
         from lfcore.ac_lf import ACPowerFlowCalc

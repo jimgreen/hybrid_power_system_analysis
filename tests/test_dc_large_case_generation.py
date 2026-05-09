@@ -25,11 +25,11 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_programs_import_array_model_network(self):
         root = Path(__file__).resolve().parents[1]
         checked_files = [
-            root / "benchmark_flat_lf_se.py",
-            root / "generate_dc_large_cases.py",
-            root / "update_meas_from_lf.py",
-            root / "secore" / "dc_se.py",
-            root / "lfcore" / "dc_lf.py",
+            root / "benchmarks" / "benchmark_flat_lf_se.py",
+            root / "scripts" / "generate_dc_large_cases.py",
+            root / "scripts" / "update_meas_from_lf.py",
+            root / "src" / "hybrid_power_system_analysis" / "secore" / "dc_se.py",
+            root / "src" / "hybrid_power_system_analysis" / "lfcore" / "dc_lf.py",
         ]
 
         for file_path in checked_files:

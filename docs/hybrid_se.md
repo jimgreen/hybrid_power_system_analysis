@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`secore/hybrid_se.py` 实现交直流混联系统加权最小二乘状态估计。核心类是 `HybridStateEstimator`。
+`src/hybrid_power_system_analysis/secore/hybrid_se.py` 实现交直流混联系统加权最小二乘状态估计。核心类是 `HybridStateEstimator`。
 
 该模块用于同一套状态估计程序处理：
 
@@ -28,7 +28,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python secore\hybrid_se.py --case data\hybrid\qinling.e --meas data\hybrid\qinling.meas --flat-start --quiet
+python -m secore.hybrid_se --case data\hybrid\qinling.e --meas data\hybrid\qinling.meas --flat-start --quiet
 ```
 
 参数与 `ac_se.py`、`dc_se.py` 基本一致。
@@ -169,4 +169,3 @@ x <- x + step * dx
 - `hybrid_se` 初始化会先运行联合潮流，所以初始化时间通常高于单域 SE。
 - 对纯 AC/纯 DC 文件，未出现的子系统会自动跳过。
 - 变流器控制方程必须与量测和拓扑共同提供足够可观测性。
-

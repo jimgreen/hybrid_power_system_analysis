@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`lfcore/dc_lf.py` 实现直流电网 Newton 潮流计算。核心类是 `DCPowerFlowCalc`。
+`src/hybrid_power_system_analysis/lfcore/dc_lf.py` 实现直流电网 Newton 潮流计算。核心类是 `DCPowerFlowCalc`。
 
 该模块负责：
 
@@ -128,4 +128,3 @@ P_load(V) = pv0 + pv1 * V + pv2 * V^2
 - 每个存活直流岛必须至少有一个电压控制源。
 - 多个定电压源位于同一岛时需要确认拓扑和控制设定合理。
 - 零阻抗支路不应以极小电阻普通支路替代。
-

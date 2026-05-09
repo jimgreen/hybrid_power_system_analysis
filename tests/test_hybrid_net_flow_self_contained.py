@@ -199,16 +199,19 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
-        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, linear_solver="umfpack")
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
+
+        self.assertEqual("umfpack", calc.ac_calc.linear_solver)
+        self.assertEqual("umfpack", calc.dc_calc.linear_solver)
 
         original_solver = hybrid_lf.solve_sparse_system
         calls = []
 
         def counted_solver(matrix, rhs, solver_name="scipy"):
             calls.append((matrix.shape, rhs.shape, solver_name))
-            return original_solver(matrix, rhs, solver_name)
+            return original_solver(matrix, rhs, "scipy")
 
         hybrid_lf.solve_sparse_system = counted_solver
         try:
@@ -220,6 +223,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertTrue(calls)
         self.assertTrue(all(shape == (calc.total_eq, calc.total_vars) for shape, _rhs_shape, _solver in calls))
+        self.assertTrue(all(solver == "umfpack" for _shape, _rhs_shape, solver in calls))
 
     def test_converter_terms_reuse_ac_state_cache(self):
         import hybrid_net_flow

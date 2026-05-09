@@ -864,7 +864,9 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_array_equal(plan["y_balance"], np.array([0, 0, 1, 1], dtype=np.int32))
 
     def test_ac_state_estimator_does_not_use_profile_call_wrapper(self):
-        source = (ROOT_DIR / "secore" / "ac_se.py").read_text(encoding="utf-8")
+        source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "secore" / "ac_se.py").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("_profile_call", source)
 
     def test_normalize_model_named_units_reuses_current_base_per_node(self):

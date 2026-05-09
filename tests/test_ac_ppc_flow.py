@@ -327,7 +327,9 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual("ac_ppc_v1", ppc["format"])
 
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
-        source = (ROOT_DIR / "lfcore" / "ac_lf.py").read_text(encoding="utf-8")
+        source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
+            encoding="utf-8"
+        )
         main_block = source.split("def main", 1)[1].split('if __name__ == "__main__":', 1)[0]
 
         self.assertIn("load_ac_ppc_from_e_file(args.file)", main_block)

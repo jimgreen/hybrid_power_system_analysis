@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`lfcore/hybrid_lf.py` 实现交直流联合潮流计算。核心类包括：
+`src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` 实现交直流联合潮流计算。核心类包括：
 
 - `HybridACGrid`
 - `HybridDCGrid`
@@ -40,7 +40,7 @@ result = run_hybrid_power_flow(
 命令行：
 
 ```powershell
-python lfcore\hybrid_lf.py data\hybrid\qinling.e --quiet
+python -m lfcore.hybrid_lf data\hybrid\qinling.e --quiet
 ```
 
 参数：
@@ -202,4 +202,3 @@ Vi^2 * Vj^2 * (P_i + P_j)
 - 交直流联合潮流不是交替迭代，不能把 AC 和 DC 结果分别求完后简单拼接。
 - DCAC/ACAC 变流器两端节点必须属于存活拓扑。
 - 变流器控制模式必须提供足够约束，否则全局 Jacobian 会奇异。
-
