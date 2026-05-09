@@ -8,7 +8,7 @@
 
 - 读取或接收交流网络拓扑与设备参数。
 - 生成交流节点导纳矩阵 `Y`。
-- 支持 MATPOWER 风格支路 stamp，包括线路充电电纳 `b`、变压器 `tap/shift`。
+- 支持 MATPOWER 风格线路 stamp，包括线路充电电纳 `b`；变压器按 T 型单端对地支路建模，支持 `gt/bt/tap/shift`。
 - 支持普通线路、主变、ZIP 负荷、并联补偿、发电机控制、开关和零阻抗支路。
 - 生成残差向量 `F(x)` 和稀疏 Jacobian `J(x)`。
 - 迭代求解后把节点电压、相角、设备潮流、电流和发电机出力回填到模型对象或 array-mode 结果。
@@ -43,7 +43,7 @@ result = calc.result
 | --- | --- |
 | `ACNode` | 交流节点，含电压基准、初始电压和初始相角 |
 | `ACBranch` | 普通交流线路，参数 `r/x/b` |
-| `ACTransformer` | 主变，参数 `r/x/b/tap/shift` |
+| `ACTransformer` | 主变，参数 `r/x/gt/bt/tap/shift`，其中 `gt/bt` 为 i 侧单端对地导纳 |
 | `ACGenerator` | 发电机，支持 `V/SLACK/PH/PV/P/PQ` 等控制类型 |
 | `ACLoad` | ZIP 负荷，`pv0/pv1/pv2/qv0/qv1/qv2` |
 | `ACShuntCompensator` | 并联设备，支持 `g_set/b_set/q_set/v_set` |
@@ -71,7 +71,7 @@ result = calc.result
 普通支路和主变采用 MATPOWER 公式：
 
 ```text
-yff, yft, ytf, ytt = matpower_branch_stamp(r, x, b, tap, shift)
+yff, yft, ytf, ytt = matpower_transformer_stamp(r, x, gt, bt, tap, shift)
 ```
 
 其中：

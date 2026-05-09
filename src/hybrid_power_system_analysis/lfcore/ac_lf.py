@@ -229,6 +229,33 @@ def matpower_branch_stamp_vectorized(r, x, b=0.0, tap=1.0, shift=0.0):
     )
 
 
+def matpower_transformer_stamp_vectorized(r, x, gt=0.0, bt=0.0, tap=1.0, shift=0.0):
+    """Vectorized T-type transformer stamp with one grounding branch on the i side."""
+    r = np.asarray(r, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    gt = np.broadcast_to(np.asarray(gt, dtype=np.float64), r.shape)
+    bt = np.broadcast_to(np.asarray(bt, dtype=np.float64), r.shape)
+    tap = np.broadcast_to(np.asarray(tap, dtype=np.float64), r.shape)
+    shift = np.broadcast_to(np.asarray(shift, dtype=np.float64), r.shape)
+
+    z = r + 1j * x
+    y = np.divide(
+        1.0,
+        z,
+        out=np.zeros(r.shape, dtype=np.complex128),
+        where=np.abs(z) > 1e-12,
+    )
+    tap_mag = np.where(np.abs(tap) > 1e-12, tap, 1.0)
+    tap_complex = tap_mag * np.exp(1j * np.deg2rad(shift))
+    y_ground = gt + 1j * bt
+    return (
+        (y + y_ground) / (tap_complex * np.conj(tap_complex)),
+        -y / np.conj(tap_complex),
+        -y / tap_complex,
+        y,
+    )
+
+
 def build_jacobian_matrix(rows, cols, data, shape):
     """Build a sparse Jacobian from COO triplets."""
     J = coo_matrix((np.array(data), (np.array(rows), np.array(cols))), shape=shape).tocsr()
@@ -1261,10 +1288,11 @@ class ACPowerFlowCalc:
                 self.transformer_yft,
                 self.transformer_ytf,
                 self.transformer_ytt,
-            ) = matpower_branch_stamp_vectorized(
+            ) = matpower_transformer_stamp_vectorized(
                 transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["r"]],
                 transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["x"]],
-                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["b"]],
+                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["gt"]],
+                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["bt"]],
                 transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["tap"]],
                 transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["shift"]],
             )
@@ -2204,10 +2232,11 @@ class ACPowerFlowCalc:
                 self.transformer_yft,
                 self.transformer_ytf,
                 self.transformer_ytt,
-            ) = matpower_branch_stamp_vectorized(
+            ) = matpower_transformer_stamp_vectorized(
                 [tr.r for tr in self.live_transformers],
                 [tr.x for tr in self.live_transformers],
-                [tr.b for tr in self.live_transformers],
+                [getattr(tr, "gt", 0.0) for tr in self.live_transformers],
+                [getattr(tr, "bt", getattr(tr, "b", 0.0) / 2.0) for tr in self.live_transformers],
                 [tr.tap for tr in self.live_transformers],
                 [tr.shift for tr in self.live_transformers],
             )

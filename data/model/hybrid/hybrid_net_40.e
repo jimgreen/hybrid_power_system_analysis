@@ -76,8 +76,8 @@
 </ACBreak>
 
 <ACTransformer>
-@ idx name   i_node j_node r    x   b   tap  shift run_stat i_p i_q i_c j_p j_q j_c
-# 0   tf_2_5 2      5      0.01 0.1 0.0 1.05 0.05  1        0   0   0   0   0   0
+@ idx name i_node j_node r x gt bt tap shift run_stat i_p i_q i_c j_p j_q j_c
+# 0 tf_2_5 2 5 0.01 0.1 0.0 0 1.05 0.05 1 0 0 0 0 0 0
 </ACTransformer>
 
 <DCNode>

@@ -1216,7 +1216,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
         def fake_seed(network, _params, _e_file):
             bus_2 = network.node_dict[1]
-            self.assertAlmostEqual(119.0641444 / 115.0, float(bus_2.voltage))
+            self.assertAlmostEqual(119.053271 / 115.0, float(bus_2.voltage))
             calls.append(True)
             for node in network.nodes:
                 if getattr(node, "is_alive", False):
@@ -1264,7 +1264,7 @@ class ACStateEstimationTest(unittest.TestCase):
             def prepare(self):
                 bus_2_row = 1
                 self.testcase.assertAlmostEqual(
-                    119.0641444 / 115.0,
+                    119.053271 / 115.0,
                     float(self.ppc["bus"][bus_2_row, ac_se.BUS_COLS["voltage"]]),
                 )
 

@@ -15,10 +15,11 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-ROOT_DIR = Path(__file__).resolve().parent
-MODEL_DIR = ROOT_DIR / "model"
-LFCORE_DIR = ROOT_DIR / "lfcore"
-for path in (ROOT_DIR, MODEL_DIR, LFCORE_DIR):
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src" / "hybrid_power_system_analysis"
+MODEL_DIR = SRC_DIR / "model"
+LFCORE_DIR = SRC_DIR / "lfcore"
+for path in (SRC_DIR, MODEL_DIR, LFCORE_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -114,7 +115,21 @@ class Snapshot:
 
     @staticmethod
     def _terminal_node(device, side: str):
-        return device.i_node_obj if side == "from" else device.j_node_obj
+        return getattr(device, "i_node_obj", None) if side == "from" else getattr(device, "j_node_obj", None)
+
+    def _ac_terminal_node(self, device, side: str):
+        node = self._terminal_node(device, side)
+        if node is not None:
+            return node
+        attr = "i_node" if side == "from" else "j_node"
+        return self.ac_nodes_by_idx.get(getattr(device, attr, None))
+
+    def _dc_terminal_node(self, device, side: str):
+        node = self._terminal_node(device, side)
+        if node is not None:
+            return node
+        attr = "i_node" if side == "from" else "j_node"
+        return self.dc_nodes_by_idx.get(getattr(device, attr, None))
 
     def power_to_file(self, value: float) -> float:
         return float(value) * self.p_base
@@ -192,22 +207,32 @@ class Snapshot:
         return None
 
     def _ac_line_value(self, dev, meas_type: str) -> Optional[float]:
+        i_node = self._ac_terminal_node(dev, "from")
+        j_node = self._ac_terminal_node(dev, "to")
         if meas_type == "P_FROM":
             return self.power_to_file(self._float(dev.i_p))
         if meas_type == "Q_FROM":
             return self.power_to_file(self._float(dev.i_q))
         if meas_type == "V_FROM":
-            return self.ac_voltage_to_file(dev.i_node_obj)
+            if i_node is None:
+                return None
+            return self.ac_voltage_to_file(i_node)
         if meas_type == "I_FROM":
-            return self.ac_current_to_file(dev.i_node_obj, self._float(dev.i_c))
+            if i_node is None:
+                return None
+            return self.ac_current_to_file(i_node, self._float(dev.i_c))
         if meas_type == "P_TO":
             return self.power_to_file(self._float(dev.j_p))
         if meas_type == "Q_TO":
             return self.power_to_file(self._float(dev.j_q))
         if meas_type == "V_TO":
-            return self.ac_voltage_to_file(dev.j_node_obj)
+            if j_node is None:
+                return None
+            return self.ac_voltage_to_file(j_node)
         if meas_type == "I_TO":
-            return self.ac_current_to_file(dev.j_node_obj, self._float(dev.j_c))
+            if j_node is None:
+                return None
+            return self.ac_current_to_file(j_node, self._float(dev.j_c))
         return None
 
     def _ac_zero_value(self, dev, meas_type: str) -> Optional[float]:
@@ -235,41 +260,45 @@ class Snapshot:
         return None
 
     def _ac_generator_value(self, dev, meas_type: str) -> Optional[float]:
+        node = getattr(dev, "node_obj", None) or self.ac_nodes_by_idx.get(getattr(dev, "node", None))
         if meas_type == "P_GEN":
             return self.power_to_file(self._float(dev.p))
         if meas_type == "Q_GEN":
             return self.power_to_file(self._float(dev.q))
         if meas_type == "V_GEN":
-            return self.ac_voltage_to_file(dev.node_obj)
+            return None if node is None else self.ac_voltage_to_file(node)
         if meas_type == "I_GEN":
-            return self.ac_current_to_file(dev.node_obj, self._float(dev.current))
+            return None if node is None else self.ac_current_to_file(node, self._float(dev.current))
         return None
 
     def _ac_load_value(self, dev, meas_type: str) -> Optional[float]:
+        node = getattr(dev, "node_obj", None) or self.ac_nodes_by_idx.get(getattr(dev, "node", None))
         if meas_type == "P_LOAD":
             return self.power_to_file(self._float(dev.p))
         if meas_type == "Q_LOAD":
             return self.power_to_file(self._float(dev.q))
         if meas_type == "V_LOAD":
-            return self.ac_voltage_to_file(dev.node_obj)
+            return None if node is None else self.ac_voltage_to_file(node)
         if meas_type == "I_LOAD":
-            return self.ac_current_to_file(dev.node_obj, self._float(dev.current))
+            return None if node is None else self.ac_current_to_file(node, self._float(dev.current))
         return None
 
     def _dc_line_value(self, dev, meas_type: str) -> Optional[float]:
+        i_node = self._dc_terminal_node(dev, "from")
+        j_node = self._dc_terminal_node(dev, "to")
         current = self._float(getattr(dev, "current", 0.0))
         if meas_type == "P_FROM":
             return self.power_to_file(self._float(dev.i_p))
         if meas_type == "V_FROM":
-            return self.dc_voltage_to_file(dev.i_node_obj)
+            return None if i_node is None else self.dc_voltage_to_file(i_node)
         if meas_type == "I_FROM":
-            return self.dc_current_to_file(dev.i_node_obj, current)
+            return None if i_node is None else self.dc_current_to_file(i_node, current)
         if meas_type == "P_TO":
             return self.power_to_file(self._float(dev.j_p))
         if meas_type == "V_TO":
-            return self.dc_voltage_to_file(dev.j_node_obj)
+            return None if j_node is None else self.dc_voltage_to_file(j_node)
         if meas_type == "I_TO":
-            return self.dc_current_to_file(dev.j_node_obj, -current)
+            return None if j_node is None else self.dc_current_to_file(j_node, -current)
         return None
 
     def _dc_zero_value(self, dev, meas_type: str) -> Optional[float]:
@@ -291,36 +320,40 @@ class Snapshot:
         return None
 
     def _dcdc_value(self, dev, meas_type: str) -> Optional[float]:
+        i_node = self._dc_terminal_node(dev, "from")
+        j_node = self._dc_terminal_node(dev, "to")
         if meas_type == "P_FROM":
             return self.power_to_file(self._float(dev.i_p))
         if meas_type == "V_FROM":
-            return self.dc_voltage_to_file(dev.i_node_obj)
+            return None if i_node is None else self.dc_voltage_to_file(i_node)
         if meas_type == "I_FROM":
-            return self.dc_current_to_file(dev.i_node_obj, self._float(dev.i_c))
+            return None if i_node is None else self.dc_current_to_file(i_node, self._float(dev.i_c))
         if meas_type == "P_TO":
             return self.power_to_file(self._float(dev.j_p))
         if meas_type == "V_TO":
-            return self.dc_voltage_to_file(dev.j_node_obj)
+            return None if j_node is None else self.dc_voltage_to_file(j_node)
         if meas_type == "I_TO":
-            return self.dc_current_to_file(dev.j_node_obj, self._float(dev.j_c))
+            return None if j_node is None else self.dc_current_to_file(j_node, self._float(dev.j_c))
         return None
 
     def _dc_generator_value(self, dev, meas_type: str) -> Optional[float]:
+        node = getattr(dev, "node_obj", None) or self.dc_nodes_by_idx.get(getattr(dev, "node", None))
         if meas_type == "P_GEN":
             return self.power_to_file(self._float(dev.p))
         if meas_type == "V_GEN":
-            return self.dc_voltage_to_file(dev.node_obj)
+            return None if node is None else self.dc_voltage_to_file(node)
         if meas_type == "I_GEN":
-            return self.dc_current_to_file(dev.node_obj, self._float(dev.current))
+            return None if node is None else self.dc_current_to_file(node, self._float(dev.current))
         return None
 
     def _dc_load_value(self, dev, meas_type: str) -> Optional[float]:
+        node = getattr(dev, "node_obj", None) or self.dc_nodes_by_idx.get(getattr(dev, "node", None))
         if meas_type == "P_LOAD":
             return self.power_to_file(self._float(dev.p))
         if meas_type == "V_LOAD":
-            return self.dc_voltage_to_file(dev.node_obj)
+            return None if node is None else self.dc_voltage_to_file(node)
         if meas_type == "I_LOAD":
-            return self.dc_current_to_file(dev.node_obj, self._float(dev.current))
+            return None if node is None else self.dc_current_to_file(node, self._float(dev.current))
         return None
 
     def _dcac_value(self, dev, meas_type: str) -> Optional[float]:
@@ -495,6 +528,14 @@ def rewrite_measurements(meas_file: Path, snapshot: Snapshot) -> Tuple[int, int]
 
 
 def matching_e_file(meas_file: Path) -> Optional[Path]:
+    try:
+        rel = meas_file.resolve().relative_to(ROOT_DIR / "data" / "meas")
+    except ValueError:
+        rel = None
+    if rel is not None:
+        candidate = ROOT_DIR / "data" / "model" / rel.with_suffix(".e")
+        if candidate.exists():
+            return candidate
     candidate = meas_file.with_suffix(".e")
     return candidate if candidate.exists() else None
 

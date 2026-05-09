@@ -16,6 +16,7 @@ for path in (ROOT_DIR,):
         sys.path.insert(0, str(path))
 
 from lfcore.dc_lf import DCPowerFlowCalc, load_dc_ppc_from_e_file
+from efile_read import EBook
 from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BREAK_COLS as DC_BREAK_COLS,

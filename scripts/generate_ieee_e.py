@@ -130,7 +130,8 @@ def convert_case(case_name, out_path):
                     str(j_node),
                     _fmt(row[BR_R]),
                     _fmt(row[BR_X]),
-                    _fmt(row[BR_B]),
+                    "0.0",
+                    _fmt(row[BR_B] / 2.0),
                     _fmt(tap),
                     _fmt(shift),
                     str(run_stat),
@@ -273,7 +274,7 @@ def convert_case(case_name, out_path):
     _write_block(
         lines,
         "ACTransformer",
-        ["idx", "name", "i_node", "j_node", "r", "x", "b", "tap", "shift", "run_stat", "i_p", "i_q", "i_c", "j_p", "j_q", "j_c"],
+        ["idx", "name", "i_node", "j_node", "r", "x", "gt", "bt", "tap", "shift", "run_stat", "i_p", "i_q", "i_c", "j_p", "j_q", "j_c"],
         transformer_rows,
     )
 
@@ -293,7 +294,7 @@ def convert_case(case_name, out_path):
 
 
 def main():
-    data_dir = Path("data") / "ac"
+    data_dir = Path("data") / "model" / "ac"
     summaries = []
     for out_name, case_name in CASES.items():
         summaries.append(convert_case(case_name, data_dir / f"{out_name}.e"))

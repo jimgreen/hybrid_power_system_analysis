@@ -126,6 +126,10 @@ def normalize_model_named_units(model) -> float:
             _scale_attr_in_dict(br, "j_c", j_scale_base)
 
     for tr in getattr(model, "ACTransformer", []):
+        if not hasattr(tr, "gt"):
+            tr.gt = 0.0
+        if not hasattr(tr, "bt") and hasattr(tr, "b"):
+            tr.bt = float(tr.b) / 2.0
         _scale_power_attrs_in_dict(tr, ("i_p", "i_q", "j_p", "j_q"), p_base)
         i_scale_base = ac_current_scales.get(tr.i_node)
         if i_scale_base is not None:

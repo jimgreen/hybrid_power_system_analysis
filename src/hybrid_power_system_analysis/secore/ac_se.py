@@ -20,8 +20,14 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_lf import ACPowerFlowCalc, matpower_branch_stamp_vectorized
+from ac_lf import (
+    ACPowerFlowCalc,
+    matpower_branch_stamp,
+    matpower_branch_stamp_vectorized,
+    matpower_transformer_stamp_vectorized,
+)
 from ac_model import ACPowerNetwork
+from efile_read import EBook
 from ac_array_model import (
     BRANCH_COLS,
     BUS_COLS,
@@ -168,6 +174,8 @@ class _ACArrayObject:
         "r",
         "x",
         "b",
+        "gt",
+        "bt",
         "tap",
         "shift",
         "status",
@@ -774,6 +782,8 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
         r_col = extra.get("r") if extra else None
         x_col = extra.get("x") if extra else None
         b_col = extra.get("b") if extra else None
+        gt_col = extra.get("gt") if extra else None
+        bt_col = extra.get("bt") if extra else None
         tap_col = extra.get("tap") if extra else None
         shift_col = extra.get("shift") if extra else None
         status_col = extra.get("status") if extra else None
@@ -799,6 +809,10 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
                 dev.x = float(row[x_col])
             if b_col is not None:
                 dev.b = float(row[b_col])
+            if gt_col is not None:
+                dev.gt = float(row[gt_col])
+            if bt_col is not None:
+                dev.bt = float(row[bt_col])
             if tap_col is not None:
                 dev.tap = float(row[tap_col])
             if shift_col is not None:
@@ -821,7 +835,8 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
         {
             "r": TRANSFORMER_COLS["r"],
             "x": TRANSFORMER_COLS["x"],
-            "b": TRANSFORMER_COLS["b"],
+            "gt": TRANSFORMER_COLS["gt"],
+            "bt": TRANSFORMER_COLS["bt"],
             "tap": TRANSFORMER_COLS["tap"],
             "shift": TRANSFORMER_COLS["shift"],
         },
@@ -4224,10 +4239,11 @@ class ACStateEstimator:
         if not devices:
             return {}
         if with_tap:
-            yff, yft, ytf, ytt = matpower_branch_stamp_vectorized(
+            yff, yft, ytf, ytt = matpower_transformer_stamp_vectorized(
                 [dev.r for dev in devices],
                 [dev.x for dev in devices],
-                [dev.b for dev in devices],
+                [getattr(dev, "gt", 0.0) for dev in devices],
+                [getattr(dev, "bt", getattr(dev, "b", 0.0) / 2.0) for dev in devices],
                 [dev.tap for dev in devices],
                 [dev.shift for dev in devices],
             )

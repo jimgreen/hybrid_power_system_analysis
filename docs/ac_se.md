@@ -64,7 +64,7 @@ idx name dev_type dev_name meas_type weight valid value
 | --- | --- |
 | `ACNode` | `V`, `ANGLE`/`THETA` |
 | `ACBranch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, `P_TO`, `Q_TO`, `V_TO`, `I_TO` |
-| `ACTransformer` | 同 `ACBranch` |
+| `ACTransformer` | 两端 P/Q/V/I，导纳模型与潮流一致：串联阻抗加 i 侧单端对地 `gt/bt` |
 | `ACSwitch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, `P_TO`, `Q_TO`, `V_TO`, `I_TO` |
 | `ACZeroBranch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, 以及 `V_DIFF`, `ANGLE_DIFF` |
 | `ACGenerator` | `P_GEN`, `Q_GEN`, `V_GEN`, `I_GEN` |

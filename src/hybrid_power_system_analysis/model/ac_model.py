@@ -148,13 +148,14 @@ class ACBreak(ACSwitch):
 
 
 class ACTransformer:
-    def __init__(self, idx, i_node, j_node, r, x, tap, shift, b=0.0, run_stat=1):
+    def __init__(self, idx, i_node, j_node, r, x, tap, shift, gt=0.0, bt=0.0, run_stat=1, b=None):
         self.idx = idx
         self.i_node = i_node
         self.j_node = j_node
         self.r = r
         self.x = x
-        self.b = b
+        self.gt = gt
+        self.bt = float(b) / 2.0 if b is not None and bt == 0.0 else bt
         self.tap = tap
         self.shift = shift
         self.run_stat = run_stat
@@ -307,7 +308,8 @@ _AC_ROW_DEFAULT_ATTRS = {
         "j_node": 0,
         "r": 0.0,
         "x": 0.0,
-        "b": 0.0,
+        "gt": 0.0,
+        "bt": 0.0,
         "tap": 1.0,
         "shift": 0.0,
         "run_stat": 1,
@@ -331,11 +333,27 @@ def _coerce_ac_rows(rows, table_name):
     output = []
     for row in rows:
         if isinstance(row, row_cls):
+            if table_name == "ACTransformer":
+                if not hasattr(row, "gt"):
+                    row.gt = 0.0
+                if not hasattr(row, "bt") and hasattr(row, "b"):
+                    row.bt = float(row.b) / 2.0
             output.append(row)
             continue
+        row_values = getattr(row, "__dict__", {})
         obj = row_cls.__new__(row_cls)
         obj.__dict__.update(defaults)
-        obj.__dict__.update(getattr(row, "__dict__", {}))
+        obj.__dict__.update(row_values)
+        if table_name == "ACTransformer":
+            # Compatibility for older E files/objects that used one total
+            # shunt susceptance column b. The new transformer model is T-type
+            # with a single grounding branch on the i side, so preserve the
+            # old per-end magnitude by mapping bt = b / 2.
+            values = obj.__dict__
+            if "gt" not in row_values:
+                values["gt"] = 0.0
+            if "bt" not in row_values and "b" in row_values:
+                values["bt"] = float(values["b"]) / 2.0
         output.append(obj)
     return output
 
@@ -401,8 +419,8 @@ class ACPowerNetwork:
         self.breakers.append(brk)
         return brk
 
-    def add_transformer(self, idx, i_node, j_node, r, x, tap, shift, b=0.0, run_stat=1):
-        trfm = ACTransformer(idx, i_node, j_node, r, x, tap, shift, b, run_stat)
+    def add_transformer(self, idx, i_node, j_node, r, x, tap, shift, gt=0.0, bt=0.0, run_stat=1, b=None):
+        trfm = ACTransformer(idx, i_node, j_node, r, x, tap, shift, gt, bt, run_stat, b=b)
         self.transformers.append(trfm)
         return trfm
 
@@ -837,7 +855,7 @@ class ACPowerNetwork:
 
             print(f"    transformers = {len(isl.transformers)}:")
             for trfm in isl.transformers:
-                print(f"        {trfm.idx} {trfm.name} i_node = {trfm.i_node} j_node = {trfm.j_node} r = {trfm.r} x = {trfm.x} b = {trfm.b} tap = {trfm.tap} shift = {trfm.shift}")
+                print(f"        {trfm.idx} {trfm.name} i_node = {trfm.i_node} j_node = {trfm.j_node} r = {trfm.r} x = {trfm.x} gt = {trfm.gt} bt = {trfm.bt} tap = {trfm.tap} shift = {trfm.shift}")
 
             print(f"    switches = {len(isl.switches)}:")
             for sw in isl.switches:

@@ -557,7 +557,7 @@ class HybridStateEstimationTest(unittest.TestCase):
 
             def prepare(self):
                 self.testcase.assertAlmostEqual(
-                    119.0641444 / 115.0,
+                    119.053271 / 115.0,
                     float(self.ppc["bus"][1, ac_se.BUS_COLS["voltage"]]),
                 )
 

@@ -67,16 +67,17 @@ TRANSFORMER_COLS = {
     "j_node": 2,
     "r": 3,
     "x": 4,
-    "b": 5,
-    "tap": 6,
-    "shift": 7,
-    "run_stat": 8,
-    "i_p": 9,
-    "i_q": 10,
-    "i_c": 11,
-    "j_p": 12,
-    "j_q": 13,
-    "j_c": 14,
+    "gt": 5,
+    "bt": 6,
+    "tap": 7,
+    "shift": 8,
+    "run_stat": 9,
+    "i_p": 10,
+    "i_q": 11,
+    "i_c": 12,
+    "j_p": 13,
+    "j_q": 14,
+    "j_c": 15,
 }
 GEN_COLS = {
     "idx": 0,
@@ -263,7 +264,8 @@ def build_ac_ppc_from_network(network) -> Dict:
         transformer[row, TRANSFORMER_COLS["j_node"]] = _int_value(dev, "j_node")
         transformer[row, TRANSFORMER_COLS["r"]] = _float_value(dev, "r")
         transformer[row, TRANSFORMER_COLS["x"]] = _float_value(dev, "x")
-        transformer[row, TRANSFORMER_COLS["b"]] = _float_value(dev, "b")
+        transformer[row, TRANSFORMER_COLS["gt"]] = _float_value(dev, "gt")
+        transformer[row, TRANSFORMER_COLS["bt"]] = _float_value(dev, "bt", _float_value(dev, "b") / 2.0)
         transformer[row, TRANSFORMER_COLS["tap"]] = _float_value(dev, "tap", 1.0)
         transformer[row, TRANSFORMER_COLS["shift"]] = _float_value(dev, "shift")
         transformer[row, TRANSFORMER_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
@@ -478,7 +480,8 @@ def build_ac_network_from_ppc(ppc: Dict):
             float(row[TRANSFORMER_COLS["x"]]),
             float(row[TRANSFORMER_COLS["tap"]]),
             float(row[TRANSFORMER_COLS["shift"]]),
-            float(row[TRANSFORMER_COLS["b"]]),
+            float(row[TRANSFORMER_COLS["gt"]]),
+            float(row[TRANSFORMER_COLS["bt"]]),
             int(row[TRANSFORMER_COLS["run_stat"]]),
         )
         for row in ppc["transformer"]

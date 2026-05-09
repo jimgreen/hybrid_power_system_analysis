@@ -18,6 +18,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
 
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from paths import measurement_file, model_file
+from ac_lf import matpower_branch_stamp
 from hybrid_lf import HybridPowerNetwork
 from model.meas_model import (
     BadDataItem,
