@@ -330,7 +330,7 @@ class SparseJacobianBuilder:
         cols = np.asarray(col_key)
         if rows.ndim == 0 and cols.ndim == 0:
             return 0.0
-        broadcast_rows, broadcast_cols = np.broadcast_arrays(rows, cols)
+        broadcast_rows, _broadcast_cols = np.broadcast_arrays(rows, cols)
         return np.zeros(broadcast_rows.shape, dtype=np.float64)
 
     def __setitem__(self, key, value) -> None:
@@ -750,12 +750,6 @@ def unanchored_angle_state_labels(
         labels.append((len(local_cols), state_labels[int(angle_cols[representative])]))
     labels.sort(key=lambda item: (-item[0], item[1]))
     return [label for _, label in labels]
-
-
-def solve_normal_equations(gain: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Solve a WLS normal equation, preferring Cholesky for positive definite gain."""
-    dx, _ = solve_normal_equations_with_factor(gain, rhs)
-    return dx
 
 
 class NormalEquationSolver:

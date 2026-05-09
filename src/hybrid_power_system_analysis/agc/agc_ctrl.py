@@ -282,14 +282,6 @@ def _sum_attr(devices: Iterable, attr_name: str) -> float:
     return sum(_as_float(getattr(device, attr_name, 0.0)) for device in devices if _is_running(device))
 
 
-def _running_diesel_min_output(model) -> float:
-    return sum(
-        _as_float(getattr(gen, "p_min", 0.0))
-        for gen in getattr(model, "diesel_generator", [])
-        if _is_running(gen)
-    )
-
-
 def _running_diesel_output(model) -> float:
     return sum(
         _as_float(getattr(gen, "p_ctrl", getattr(gen, "p_cur", 0.0)))
@@ -324,13 +316,6 @@ def _renewable_output(model) -> float:
     return (
         _sum_attr(getattr(model, "wind_generator", []), "p_ctrl")
         + _sum_attr(getattr(model, "pv_generator", []), "p_ctrl")
-    )
-
-
-def _renewable_available_output(model) -> float:
-    return (
-        _sum_attr(getattr(model, "wind_generator", []), "p_fur")
-        + _sum_attr(getattr(model, "pv_generator", []), "p_fur")
     )
 
 
@@ -467,21 +452,6 @@ def _storage_by_soc(model, reverse: bool) -> list:
         key=lambda estore: _as_float(getattr(estore, "soc_cur", 0.0)),
         reverse=reverse,
     )
-
-
-def _dispatch_limited(devices: Iterable, demand: float, attr_name: str, max_attr: str, min_attr: str = None) -> float:
-    """Dispatch devices in order and return remaining positive demand."""
-    remaining = max(0.0, float(demand))
-    for device in devices:
-        if remaining <= 0.0 or not _is_running(device):
-            setattr(device, attr_name, 0.0)
-            continue
-        lower = _as_float(getattr(device, min_attr, 0.0), 0.0) if min_attr else 0.0
-        upper = _as_float(getattr(device, max_attr, 0.0), 0.0)
-        value = _clamp(remaining, lower if remaining >= lower else 0.0, upper)
-        setattr(device, attr_name, value)
-        remaining -= value
-    return remaining
 
 
 def _find_first_by_name(items: Iterable, keywords: Tuple[str, ...]):
@@ -854,7 +824,7 @@ def agc_ctrl_stg_check_default(logger, model) -> None:
 def _update_yc(config: SystemConfig) -> None:
     client = config.fes_client
     for yc in getattr(config.model, "yc", []):
-        result, name, value = client.get_yc_value(client.schema, client.context, yc.rtu, yc.pnt)
+        result, _name, value = client.get_yc_value(client.schema, client.context, yc.rtu, yc.pnt)
         if result:
             yc.value = value
         else:
@@ -864,7 +834,7 @@ def _update_yc(config: SystemConfig) -> None:
 def _update_yx(config: SystemConfig) -> None:
     client = config.fes_client
     for yx in getattr(config.model, "yx", []):
-        result, name, value = client.get_yx_value(client.schema, client.context, yx.rtu, yx.pnt)
+        result, _name, value = client.get_yx_value(client.schema, client.context, yx.rtu, yx.pnt)
         if result:
             yx.value = value
         else:

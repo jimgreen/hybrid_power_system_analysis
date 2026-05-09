@@ -455,11 +455,3 @@ def efile_factory(data):
         setattr(new_cls_dict, key, [Class_Def(item) for item in rows])
 
     return new_cls_dict
-
-
-if __name__ == '__main__':
-    path = "C:/Users/80747/OneDrive - zju.edu.cn/Desktop/py_code/data_generation/simp_syst.e"
-    cls = EBook(path)
-    cls.apply_to_file()
-    # csv文件测试
-    pass

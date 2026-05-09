@@ -2,15 +2,10 @@
 
 from pathlib import Path
 
-
-def find_project_root() -> Path:
-    for path in Path(__file__).resolve().parents:
-        if (path / "pyproject.toml").exists():
-            return path
-    return Path(__file__).resolve().parents[2]
-
-
-PROJECT_ROOT = find_project_root()
+PROJECT_ROOT = next(
+    (path for path in Path(__file__).resolve().parents if (path / "pyproject.toml").exists()),
+    Path(__file__).resolve().parents[2],
+)
 DATA_DIR = PROJECT_ROOT / "data"
 MODEL_DATA_DIR = DATA_DIR / "model"
 MEAS_DATA_DIR = DATA_DIR / "meas"
@@ -35,6 +30,8 @@ def resolve_project_file(path: str | Path) -> Path:
     text = candidate.as_posix()
     suffix = candidate.suffix.lower()
     if suffix == ".meas":
+        # Measurement files were historically mixed under model paths, so normalize
+        # them before the generic data/model rewrites below.
         rewrites = (
             ("data/ac/", "data/meas/ac/"),
             ("data/dc/", "data/meas/dc/"),

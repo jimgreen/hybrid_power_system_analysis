@@ -43,10 +43,6 @@ def get_unit_settings(model) -> UnitSettings:
     )
 
 
-def get_power_base_kw(model) -> float:
-    return get_unit_settings(model).p_base_kW
-
-
 def ac_current_base_ka(power_base_kW: float, vbase_kv: float) -> float:
     if abs(vbase_kv) <= 1e-12:
         return 1.0
@@ -81,27 +77,10 @@ def _scale_power_attrs_in_dict(obj, attrs, p_base: float) -> None:
             values[attr] = float(value) / p_base
 
 
-def _scale_power_attrs(obj, attrs, settings: UnitSettings) -> None:
-    for attr in attrs:
-        _scale_attr(obj, attr, settings.p_base)
-
-
 def _scale_voltage_attr(obj, attr: str, node, settings: UnitSettings) -> None:
     if node is None:
         return
     _scale_attr(obj, attr, settings.u_scale * float(node.vbase))
-
-
-def _scale_current_attr(obj, attr: str, node, settings: UnitSettings, is_ac: bool) -> None:
-    if node is None:
-        return
-    base = (
-        ac_current_base_ka(settings.p_base_kW, float(node.vbase))
-        if is_ac
-        else dc_current_base_ka(settings.p_base_kW, float(node.vbase))
-    )
-    _scale_attr(obj, attr, settings.i_scale * base)
-
 
 def _angle_deg_to_rad(obj, attr: str) -> None:
     value = getattr(obj, attr, None)
@@ -156,7 +135,6 @@ def normalize_model_named_units(model) -> float:
             _scale_attr_in_dict(tr, "j_c", j_scale_base)
 
     for load in getattr(model, "ACLoad", []):
-        node = ac_nodes.get(load.node)
         if not hasattr(load, "pbase"):
             load.pbase = 1.0
         if not hasattr(load, "qbase"):
@@ -203,7 +181,6 @@ def normalize_model_named_units(model) -> float:
             _scale_attr_in_dict(br, "current", scale_base)
 
     for load in getattr(model, "DCLoad", []):
-        node = dc_nodes.get(load.node)
         if not hasattr(load, "pbase"):
             load.pbase = 1.0
         _scale_power_attrs_in_dict(load, ("pbase", "p"), p_base)

@@ -21,7 +21,7 @@ from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, co
 from dc_lf import DCLFResult, DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
-from hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
+from hybrid_model import ACAC_CONTROL_TYPES, HybridPowerNetwork
 from ac_array_model import build_ac_network_from_ppc
 from dc_array_model import build_dc_network_from_ppc
 from hybrid_array_model import (
@@ -1609,7 +1609,6 @@ def main(argv=None) -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
-    verbose = not args.quiet
     network = _read_lf_network_from_file(args.file)
     calc = HybridPowerFlowCalc(
         network,

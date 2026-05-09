@@ -2321,7 +2321,7 @@ class ACPowerFlowCalc:
         cos_theta, sin_theta = self._cache['cos_theta'], self._cache['sin_theta']
         for c in range(len(self.comp_nodes)):
             for edge_idx in self.comp_tree_edges[c]:
-                index, type, a, b = self.zero_edges[edge_idx]
+                _index, _type, a, b = self.zero_edges[edge_idx]
                 F[eq_idx] = V[a] * cos_theta[a] - V[b] * cos_theta[b]
                 F[eq_idx + 1] = V[a] * sin_theta[a] - V[b] * sin_theta[b]
                 eq_idx += 2
@@ -2535,7 +2535,7 @@ class ACPowerFlowCalc:
         eq_idx = self.n_theta + self.n_V
         for c in range(len(self.comp_nodes)):
             for edge_idx in self.comp_tree_edges[c]:
-                index, type, a, b = self.zero_edges[edge_idx]
+                _index, _type, a, b = self.zero_edges[edge_idx]
 
                 # 实部约束
                 if self.node_type[a] != 'SLACK':
@@ -3265,7 +3265,6 @@ class ACPowerFlowCalc:
             if hasattr(self, "x"):
                 _theta, voltage, _phi_re, _phi_im = self._extract_state_vars(self.x)
                 return float(voltage[pos])
-        node = getattr(self, "network", None)
         return 0.0
 
     def _build_lf_result(self) -> ACLFResult:
@@ -3792,7 +3791,6 @@ def main(argv=None) -> int:
         result_mode=args.result_mode,
         verbose=not args.quiet,
     )
-    verbose = not args.quiet
     calc.prepare()
     rc = calc.run()
     if not args.quiet and calc.result_mode == "full":

@@ -1532,7 +1532,6 @@ class DCPowerFlowCalc:
 
         V = terms["V"]
         GV = terms["GV"]
-        Pdc = terms["Pdc"]
         rows_parts = []
         cols_parts = []
         data_parts = []
@@ -1679,7 +1678,6 @@ class DCPowerFlowCalc:
             p_from = Pdc[0::2]
             p_to = Pdc[1::2]
             vi = terms["dcdc_vi"]
-            vj = terms["dcdc_vj"]
             ctrl_values = np.empty(self.N_dcdc, dtype=np.float64)
             ctrl_values[self.dcdc_ctrl_p_mask] = p_from[self.dcdc_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_ctrl_p_mask]
             ctrl_values[self.dcdc_ctrl_v_mask] = vi[self.dcdc_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_ctrl_v_mask]

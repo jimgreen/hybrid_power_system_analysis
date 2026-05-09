@@ -45,7 +45,6 @@ from model.meas_model import (
     print_iteration_header as _print_iteration_header,
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
-from efile_read import EBook  # Retained for compatibility; measurement loading uses the direct parser below.
 from paths import measurement_file, model_file
 from secore.se_math import (
     NormalEquationSolver,
@@ -65,7 +64,6 @@ from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
-    copy_measurement_view,
     take_measurement_view,
 )
 from secore.se_result import SEResult
@@ -91,7 +89,7 @@ def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) 
 
 
 def _read_measurements_direct(meas_file: Path) -> MeasurementList:
-    """Read only the Measurement block without materializing a generic EBook dict."""
+    """Read only the Measurement block via the direct row parser."""
     measurements: List[Measurement] = []
     idx_values = []
     name_values = []
@@ -3261,7 +3259,6 @@ class DCStateEstimator:
         H = None
         gain = np.zeros((self.n_state, self.n_state), dtype=np.float64)
         final_quantities_current = False
-        normal_factor_diag = None
         normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
         normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
         if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
@@ -3298,7 +3295,7 @@ class DCStateEstimator:
                 normal_pattern=normal_pattern,
                 assume_normal_pattern_matches=measurements is self.active_measurements,
             )
-            dx, normal_factor_diag = normal_solver.solve(gain, rhs, return_factor_diag=False)
+            dx, _ = normal_solver.solve(gain, rhs, return_factor_diag=False)
 
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
             if max_correction < self.tol:
@@ -3363,7 +3360,6 @@ class DCStateEstimator:
                 assume_normal_pattern_matches=measurements is self.active_measurements,
             )
             objective = 0.5 * float(np.dot(weight * residual, residual))
-            normal_factor_diag = None
         self.apply_state(x)
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)

@@ -7,7 +7,7 @@ import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -20,7 +20,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_lf import ACPowerFlowCalc, matpower_branch_stamp, matpower_branch_stamp_vectorized
+from ac_lf import ACPowerFlowCalc, matpower_branch_stamp_vectorized
 from ac_model import ACPowerNetwork
 from ac_array_model import (
     BRANCH_COLS,
@@ -43,7 +43,6 @@ from ac_array_model import (
     build_ac_ppc_from_e_file,
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
-from efile_read import EBook
 from paths import measurement_file, model_file
 from model.meas_model import (
     BadDataItem,
@@ -70,7 +69,6 @@ from secore.se_math import (
     _normal_equation_structural_pattern,
     observability_rank_details,
     observability_weak_direction,
-    solve_normal_equations_with_factor,
     sparse_structural_rank,
     targeted_redundancy_count,
     unanchored_angle_state_labels,
@@ -80,7 +78,6 @@ from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
-    copy_measurement_view,
     rows_by_device_type_code,
     take_measurement_view,
 )
@@ -404,7 +401,6 @@ def _measurement_scale_lookup(
     branch_by_name = getattr(scale_context, "branch_by_name", {})
     transformer_by_name = getattr(scale_context, "transformer_by_name", {})
     zero_branch_by_name = getattr(scale_context, "zero_branch_by_name", {})
-    switch_by_name = getattr(scale_context, "switch_by_name", {})
     generator_by_name = getattr(scale_context, "generator_by_name", {})
     load_by_name = getattr(scale_context, "load_by_name", {})
 
@@ -6729,7 +6725,6 @@ class ACStateEstimator:
         H = None
         gain = np.zeros((self.n_state, self.n_state), dtype=np.float64)
         final_quantities_current = False
-        normal_factor_diag = None
         cached_z_est = None
         cached_residual = None
         cached_objective = None
@@ -6781,7 +6776,7 @@ class ACStateEstimator:
                 normal_pattern=normal_pattern,
                 assume_normal_pattern_matches=measurements is self.active_measurements,
             )
-            dx, normal_factor_diag = normal_solver.solve(
+            dx, _ = normal_solver.solve(
                 gain,
                 rhs,
                 return_factor_diag=False,

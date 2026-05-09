@@ -1,4 +1,3 @@
-import math
 import sys
 import threading
 from pathlib import Path
@@ -158,11 +157,6 @@ def clear_ac_ppc_cache(file_path=None) -> None:
         else:
             path = Path(file_path).resolve()
             _AC_PPC_CACHE.pop(path, None)
-
-
-def _node_row_maps(bus: np.ndarray) -> Tuple[Dict[int, int], np.ndarray]:
-    node_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
-    return {int(node_id): pos for pos, node_id in enumerate(node_ids)}, node_ids
 
 
 def _empty(width: int) -> np.ndarray:
