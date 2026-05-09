@@ -16,7 +16,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
-from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, unquote, urlparse
+from urllib.request import urlopen
 
 import planning_store
 
@@ -24,6 +26,13 @@ import planning_store
 WEB_ROOT = Path(__file__).resolve().parent
 DATA_DIR = WEB_ROOT / "data"
 VENDOR_DIR = WEB_ROOT / "vendor"
+NASA_POWER_HOURLY_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+NASA_POWER_PARAMETERS = {
+    "wind_speed": "WS10M",
+    "solar_irradiance": "ALLSKY_SFC_SW_DWN",
+    "temperature": "T2M",
+}
 if VENDOR_DIR.exists():
     sys.path.insert(0, str(VENDOR_DIR))
 DB_CONFIG = {
@@ -570,9 +579,148 @@ def _read_json_body(body: bytes) -> dict:
         raise ValueError("请求体不是合法 JSON") from exc
 
 
+class WeatherHistoryError(RuntimeError):
+    """Raised when historical weather data cannot be fetched or parsed."""
+
+
+class GeocodingError(RuntimeError):
+    """Raised when a place name cannot be resolved to coordinates."""
+
+
+def geocode_place_name(place: str) -> dict:
+    query_text = str(place or "").strip()
+    if not query_text:
+        raise ValueError("地名不能为空")
+    query = urlencode({"q": query_text, "format": "json", "limit": 1, "accept-language": "zh-CN"})
+    url = f"{NOMINATIM_SEARCH_URL}?{query}"
+    try:
+        with urlopen_with_user_agent(url, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise GeocodingError(f"地名解析接口返回错误: HTTP {exc.code}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise GeocodingError(f"地名解析接口连接失败: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise GeocodingError("地名解析接口返回内容不是合法 JSON") from exc
+    if not isinstance(data, list) or not data:
+        raise GeocodingError("未找到该地名对应的经纬度坐标")
+    first = data[0]
+    try:
+        latitude = float(first["lat"])
+        longitude = float(first["lon"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GeocodingError("地名解析结果缺少有效经纬度") from exc
+    return {
+        "place": query_text,
+        "display_name": first.get("display_name", query_text),
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": "OpenStreetMap Nominatim",
+    }
+
+
+def urlopen_with_user_agent(url: str, timeout: int):
+    from urllib.request import Request
+
+    request = Request(url, headers={"User-Agent": "power-plan-local-web/1.0"})
+    return urlopen(request, timeout=timeout)
+
+
+def fetch_weather_history(latitude: float, longitude: float, year: int) -> dict:
+    latitude, longitude, year = validate_weather_history_inputs(latitude, longitude, year)
+    query = urlencode(
+        {
+            "parameters": ",".join(NASA_POWER_PARAMETERS.values()),
+            "community": "RE",
+            "longitude": longitude,
+            "latitude": latitude,
+            "start": f"{year}0101",
+            "end": f"{year}1231",
+            "format": "JSON",
+            "time-standard": "LST",
+        }
+    )
+    url = f"{NASA_POWER_HOURLY_URL}?{query}"
+    try:
+        with urlopen_with_user_agent(url, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise WeatherHistoryError(f"历史气象数据接口返回错误: HTTP {exc.code}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise WeatherHistoryError(f"历史气象数据接口连接失败: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise WeatherHistoryError("历史气象数据接口返回内容不是合法 JSON") from exc
+    rows = parse_nasa_power_hourly_response(data, year)
+    return {
+        "source": "NASA POWER Hourly API",
+        "source_url": url,
+        "latitude": latitude,
+        "longitude": longitude,
+        "year": year,
+        "rows": rows,
+    }
+
+
+def validate_weather_history_inputs(latitude: float, longitude: float, year: int) -> tuple[float, float, int]:
+    try:
+        latitude_number = float(latitude)
+        longitude_number = float(longitude)
+        year_number = int(year)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("经纬度和历史数据年必须为数值") from exc
+    current_year = datetime.now().year
+    if not -90 <= latitude_number <= 90:
+        raise ValueError("纬度范围应为 -90 到 90")
+    if not -180 <= longitude_number <= 180:
+        raise ValueError("经度范围应为 -180 到 180")
+    if year_number < 2001:
+        raise ValueError("NASA POWER 小时历史数据年份不能早于 2001")
+    if year_number >= current_year:
+        raise ValueError(f"历史数据年必须小于当前年 {current_year}")
+    return latitude_number, longitude_number, year_number
+
+
+def parse_nasa_power_hourly_response(data: dict, year: int) -> list[dict]:
+    parameters = data.get("properties", {}).get("parameter", {})
+    fill_value = data.get("header", {}).get("fill_value", -999)
+    missing = [api_name for api_name in NASA_POWER_PARAMETERS.values() if api_name not in parameters]
+    if missing:
+        raise WeatherHistoryError(f"历史气象数据缺少字段: {', '.join(missing)}")
+    wind_values = parameters[NASA_POWER_PARAMETERS["wind_speed"]]
+    keys = sorted(key for key in wind_values if str(key).startswith(str(year)) and str(key)[4:8] != "0229")
+    rows = []
+    for hour_index, key in enumerate(keys, start=1):
+        row = {"hour_index": hour_index, "datetime": power_hour_key_to_datetime(str(key))}
+        for field, api_name in NASA_POWER_PARAMETERS.items():
+            value = parameters.get(api_name, {}).get(key)
+            if value in (None, "", fill_value):
+                raise WeatherHistoryError(f"历史气象数据在 {key} 缺少 {api_name}")
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise WeatherHistoryError(f"历史气象数据在 {key} 的 {api_name} 不是数值") from exc
+            row[field] = round(number, 4)
+        rows.append(row)
+    if len(rows) != 8760:
+        raise WeatherHistoryError(f"历史气象数据小时数应为8760，当前为{len(rows)}")
+    return rows
+
+
+def power_hour_key_to_datetime(key: str) -> str:
+    return f"{key[0:4]}-{key[4:6]}-{key[6:8]} {key[8:10]}:00"
+
+
 def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
     prefix = "/api/planning/schemes"
     try:
+        if path == "/api/planning/weather-history" and method == "POST":
+            payload = _read_json_body(body)
+            return _json_response(
+                fetch_weather_history(payload.get("latitude"), payload.get("longitude"), payload.get("year"))
+            )
+        if path == "/api/planning/geocode" and method == "POST":
+            payload = _read_json_body(body)
+            return _json_response(geocode_place_name(str(payload.get("place", ""))))
         if path == prefix and method == "GET":
             return _json_response({"schemes": PLANNING_STORE.list_schemes()})
         if path == prefix and method == "POST":
@@ -604,6 +752,10 @@ def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") 
                 return _json_response(PLANNING_STORE.read_scheme(name))
             if method == "DELETE":
                 return _json_response(PLANNING_STORE.delete_scheme(name))
+    except WeatherHistoryError as exc:
+        return _json_response({"error": "weather_history_error", "message": str(exc)}, HTTPStatus.BAD_GATEWAY)
+    except GeocodingError as exc:
+        return _json_response({"error": "geocoding_error", "message": str(exc)}, HTTPStatus.BAD_GATEWAY)
     except (ValueError, FileExistsError, FileNotFoundError) as exc:
         return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
     return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)

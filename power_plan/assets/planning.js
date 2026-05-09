@@ -18,6 +18,21 @@ const summarySeries = [
   ["load", "负荷", "#2d6b45", "kW"],
 ];
 
+const planningParameterSpecs = [
+  ["design_life_years", "设计使用年限(年)", "number", { min: 1, integer: true, defaultValue: 20 }],
+  ["diesel_price", "柴油价格(万元/吨)", "number", { min: 0, defaultValue: 0 }],
+  ["planning_load_factor", "规划负荷系数(0.1-10.0)", "number", { min: 0.1, max: 10, defaultValue: 1 }],
+  ["green_power_ratio_lower", "绿电电量占比下限(0.0-1.0)", "number", { min: 0, max: 1, defaultValue: 0 }],
+  ["storage_frequency_regulation_enabled", "储能是否参与调频", "boolean", { defaultValue: false }],
+  ["load_disturbance_factor", "负荷扰动系数(0.0-0.5)", "number", { min: 0, max: 0.5, defaultValue: 0 }],
+  ["frequency_security_constraint_enabled", "是否考虑频率安全约束", "boolean", { defaultValue: false }],
+  ["frequency_security_upper", "频率安全上限(1.0-1.5)", "number", { min: 1, max: 1.5, defaultValue: 1.5 }],
+  ["frequency_security_lower", "频率安全下限(1.0-1.5)", "number", { min: 1, max: 1.5, defaultValue: 1.0 }],
+  ["post_disturbance_power_balance_enabled", "是否考虑扰动后功率平衡", "boolean", { defaultValue: false }],
+  ["renewable_n_1_enabled", "是否考虑新能源N-1", "boolean", { defaultValue: false }],
+  ["load_disturbance_enabled", "是否考虑负荷扰动", "boolean", { defaultValue: false }],
+];
+
 const visibleDevices = new Set(deviceSpecs.map(([key]) => key));
 
 const monthRanges = [
@@ -108,6 +123,8 @@ function bindActions() {
   document.getElementById("renameScheme").addEventListener("click", renameScheme);
   document.getElementById("saveScheme").addEventListener("click", saveScheme);
   document.getElementById("deleteScheme").addEventListener("click", deleteScheme);
+  document.getElementById("geocodePlace").addEventListener("click", geocodePlace);
+  document.getElementById("fetchWeatherHistory").addEventListener("click", fetchWeatherHistory);
   document.querySelectorAll("[data-curve]").forEach((box) => box.addEventListener("change", renderChart));
   window.addEventListener("resize", renderChart);
 }
@@ -304,6 +321,100 @@ async function deleteScheme() {
   alert("删除成功");
 }
 
+async function geocodePlace() {
+  const placeInput = document.getElementById("weatherPlace");
+  const place = placeInput.value.trim();
+  if (!place) {
+    setWeatherImportStatus("请输入地名", "error");
+    return;
+  }
+  setWeatherImportStatus("正在获取坐标...");
+  const result = await api("/api/planning/geocode", {
+    method: "POST",
+    body: JSON.stringify({ place }),
+  }).catch((error) => {
+    setWeatherImportStatus(error.message || String(error), "error");
+    return null;
+  });
+  if (!result) return;
+  document.getElementById("weatherLatitude").value = result.latitude;
+  document.getElementById("weatherLongitude").value = result.longitude;
+  setWeatherImportStatus(`坐标已填入：${formatNumber(result.latitude)}, ${formatNumber(result.longitude)}`, "ok");
+}
+
+async function fetchWeatherHistory() {
+  if (!state.currentScheme || !state.payload) {
+    setWeatherImportStatus("请先选择方案", "error");
+    return;
+  }
+  const latitude = Number(document.getElementById("weatherLatitude").value);
+  const longitude = Number(document.getElementById("weatherLongitude").value);
+  const year = Number(document.getElementById("weatherYear").value);
+  const localError = validateWeatherInputs(latitude, longitude, year);
+  if (localError) {
+    setWeatherImportStatus(localError, "error");
+    return;
+  }
+  setWeatherImportStatus("正在获取历史气象...");
+  const result = await api("/api/planning/weather-history", {
+    method: "POST",
+    body: JSON.stringify({ latitude, longitude, year }),
+  }).catch((error) => {
+    setWeatherImportStatus(error.message || String(error), "error");
+    return null;
+  });
+  if (!result) return;
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+  if (rows.length !== 8760) {
+    setWeatherImportStatus(`历史气象数据小时数应为8760，当前为${rows.length}`, "error");
+    return;
+  }
+  await ensureTimeSeriesLoaded().catch((error) => {
+    setWeatherImportStatus(error.message || String(error), "error");
+    return false;
+  });
+  if (!isTimeSeriesLoaded()) return;
+  const nextRows = (state.payload.time_series || []).map((row, index) => {
+    const weather = rows[index];
+    if (!weather) return row;
+    return {
+      ...row,
+      datetime: weather.datetime || row.datetime,
+      wind_speed: weather.wind_speed,
+      solar_irradiance: weather.solar_irradiance,
+      temperature: weather.temperature,
+    };
+  });
+  if (nextRows.length !== 8760) {
+    setWeatherImportStatus("当前时序表不是8760行，未更新数据", "error");
+    return;
+  }
+  state.payload.time_series = nextRows;
+  state.payload.time_series_count = nextRows.length;
+  setTimeSeriesLoaded(true);
+  renderChart();
+  renderTimeTable();
+  renderLimitSummary();
+  renderSummary();
+  setWeatherImportStatus(`已更新${year}年风速、太阳辐照和温度数据`, "ok");
+}
+
+function validateWeatherInputs(latitude, longitude, year) {
+  const currentYear = new Date().getFullYear();
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) return "纬度范围应为 -90 到 90";
+  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) return "经度范围应为 -180 到 180";
+  if (!Number.isInteger(year) || year < 2001 || year >= currentYear) return `历史数据年必须为2001到${currentYear - 1}之间的整数`;
+  return "";
+}
+
+function setWeatherImportStatus(message, level = "") {
+  const host = document.getElementById("weatherImportStatus");
+  if (!host) return;
+  host.textContent = message;
+  host.classList.toggle("error", level === "error");
+  host.classList.toggle("ok", level === "ok");
+}
+
 async function selectNextSchemeAfterDelete(deletedIndex) {
   state.schemes = (await api("/api/planning/schemes")).schemes;
   const nextScheme = state.schemes[Math.min(deletedIndex, state.schemes.length - 1)];
@@ -367,6 +478,7 @@ function renderAll() {
   renderTimeTable();
   renderDeviceFilters();
   renderDeviceTables();
+  renderPlanningParameters();
   renderLimitSummary();
   renderSummary();
 }
@@ -543,6 +655,98 @@ function deleteDeviceRow(event) {
   renderSummary();
 }
 
+function renderPlanningParameters() {
+  const host = document.getElementById("planningParametersTable");
+  if (!host) return;
+  if (!state.payload) {
+    host.innerHTML = "";
+    return;
+  }
+  const row = planningParameterRow();
+  host.innerHTML = `<table><thead><tr><th>参数名称</th><th>参数值</th><th>取值范围</th></tr></thead><tbody>${planningParameterSpecs
+    .map(([key, label, type, options]) => `<tr><td>${label}</td><td>${planningParameterControl(key, type, options, row[key])}</td><td>${planningParameterRangeText(type, options)}</td></tr>`)
+    .join("")}</tbody></table>`;
+  host.querySelectorAll("[data-planning-key]").forEach((input) => {
+    const eventName = input.type === "checkbox" ? "change" : "input";
+    input.addEventListener(eventName, onPlanningParameterInput);
+  });
+}
+
+function planningParameterControl(key, type, options, value) {
+  if (type === "boolean") {
+    return `<label class="switch-cell"><input type="checkbox" data-planning-key="${key}" ${truthyPlanningValue(value) ? "checked" : ""}> 是</label>`;
+  }
+  const attrs = [
+    `data-planning-key="${key}"`,
+    'type="number"',
+    options.min !== undefined ? `min="${options.min}"` : "",
+    options.max !== undefined ? `max="${options.max}"` : "",
+    `step="${options.integer ? 1 : 0.01}"`,
+  ].filter(Boolean).join(" ");
+  return `<input ${attrs} value="${escapeHtml(value)}">`;
+}
+
+function onPlanningParameterInput(event) {
+  const input = event.target;
+  const row = planningParameterRow();
+  row[input.dataset.planningKey] = input.type === "checkbox" ? input.checked : coerceInput(input.value);
+  renderLimitSummary();
+  renderSummary();
+}
+
+function planningParameterRow() {
+  if (!state.payload) return defaultPlanningParameterRow();
+  if (!Array.isArray(state.payload.planning_parameters)) {
+    state.payload.planning_parameters = state.payload.planning_parameters ? [state.payload.planning_parameters] : [defaultPlanningParameterRow()];
+  }
+  if (!state.payload.planning_parameters.length) {
+    state.payload.planning_parameters.push(defaultPlanningParameterRow());
+  }
+  state.payload.planning_parameters[0] = normalizePlanningParameterRow(state.payload.planning_parameters[0]);
+  return state.payload.planning_parameters[0];
+}
+
+function defaultPlanningParameterRow() {
+  return Object.fromEntries(planningParameterSpecs.map(([key, , , options]) => [key, options.defaultValue]));
+}
+
+function normalizePlanningParameterRow(row) {
+  const normalized = { ...defaultPlanningParameterRow(), ...(row || {}) };
+  planningParameterSpecs.forEach(([key, , type]) => {
+    if (type === "boolean") {
+      normalized[key] = truthyPlanningValue(normalized[key]);
+    }
+  });
+  return normalized;
+}
+
+function renderPlanningParameterSummaryTable() {
+  if (!state.payload) return "";
+  const row = planningParameterRow();
+  return `<table><thead><tr><th>参数名称</th><th>参数值</th><th>取值范围</th></tr></thead><tbody>${planningParameterSpecs
+    .map(([key, label, type, options]) => `<tr><td>${label}</td><td>${escapeHtml(formatPlanningParameterValue(row[key], type))}</td><td>${planningParameterRangeText(type, options)}</td></tr>`)
+    .join("")}</tbody></table>`;
+}
+
+function formatPlanningParameterValue(value, type) {
+  if (type === "boolean") return truthyPlanningValue(value) ? "是" : "否";
+  return value;
+}
+
+function planningParameterRangeText(type, options) {
+  if (type === "boolean") return "是/否";
+  if (options.min !== undefined && options.max !== undefined) return `${options.min} - ${options.max}`;
+  if (options.min !== undefined) return `不小于 ${options.min}`;
+  if (options.max !== undefined) return `不大于 ${options.max}`;
+  return "-";
+}
+
+function truthyPlanningValue(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  return ["true", "1", "yes", "y", "是"].includes(String(value).trim().toLowerCase());
+}
+
 function renderLimitSummary() {
   renderSchemeSummary();
 }
@@ -552,6 +756,7 @@ function renderSchemeSummary() {
     document.getElementById("schemeOverview"),
     document.getElementById("summaryCharts"),
     document.getElementById("quantitySummary"),
+    document.getElementById("planningSummary"),
   ].filter(Boolean);
   if (!state.payload) {
     hosts.forEach((host) => {
@@ -567,6 +772,7 @@ function renderSchemeSummary() {
   const overviewHost = document.getElementById("schemeOverview");
   const chartsHost = document.getElementById("summaryCharts");
   const quantityHost = document.getElementById("quantitySummary");
+  const planningHost = document.getElementById("planningSummary");
 
   if (overviewHost) {
     overviewHost.innerHTML = [
@@ -587,6 +793,10 @@ function renderSchemeSummary() {
 
   if (quantityHost) {
     quantityHost.innerHTML = renderCandidateDeviceTable();
+  }
+
+  if (planningHost) {
+    planningHost.innerHTML = renderPlanningParameterSummaryTable();
   }
 }
 
@@ -761,6 +971,36 @@ function collectSaveWarnings() {
       }
     });
   });
+  messages.push(...collectPlanningParameterWarnings());
+  return messages;
+}
+
+function collectPlanningParameterWarnings() {
+  if (!state.payload) return [];
+  const row = planningParameterRow();
+  const messages = [];
+  planningParameterSpecs.forEach(([key, label, type, options]) => {
+    if (type === "boolean") return;
+    const value = Number(row[key]);
+    if (!Number.isFinite(value)) {
+      messages.push({ level: "error", message: `${label}必须为数值` });
+      return;
+    }
+    if (options.integer && !Number.isInteger(value)) {
+      messages.push({ level: "error", message: `${label}必须为整数` });
+    }
+    if (options.min !== undefined && value < options.min) {
+      messages.push({ level: "error", message: `${label}不能小于${options.min}` });
+    }
+    if (options.max !== undefined && value > options.max) {
+      messages.push({ level: "error", message: `${label}不能大于${options.max}` });
+    }
+  });
+  const upper = Number(row.frequency_security_upper);
+  const lower = Number(row.frequency_security_lower);
+  if (Number.isFinite(upper) && Number.isFinite(lower) && upper < lower) {
+    messages.push({ level: "error", message: "频率安全上限不能小于频率安全下限" });
+  }
   return messages;
 }
 
@@ -787,6 +1027,10 @@ function normalizePayload(payload) {
   if (payload.time_series && payload.time_series_count === undefined) {
     payload.time_series_count = payload.time_series.length;
   }
+  if (!Array.isArray(payload.planning_parameters)) {
+    payload.planning_parameters = payload.planning_parameters ? [payload.planning_parameters] : [defaultPlanningParameterRow()];
+  }
+  payload.planning_parameters[0] = normalizePlanningParameterRow(payload.planning_parameters[0]);
   return payload;
 }
 

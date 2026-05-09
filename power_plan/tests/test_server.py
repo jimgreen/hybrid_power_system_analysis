@@ -3,6 +3,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 WEB_ROOT = Path(__file__).resolve().parents[1]
@@ -243,8 +244,11 @@ class PowerPlanServerTest(unittest.TestCase):
             created = json.loads(body.decode("utf-8"))
             self.assertEqual(created["scheme"], "方案A")
             self.assertEqual(len(created["time_series"]), 8760)
+            self.assertIn("planning_parameters", created)
 
             created["time_series"][0]["load"] = 123.4
+            created["planning_parameters"][0]["design_life_years"] = 30
+            created["planning_parameters"][0]["storage_frequency_regulation_enabled"] = True
             status, headers, body = server.handle_planning_api_path(
                 "/api/planning/schemes/方案A",
                 "PUT",
@@ -255,6 +259,8 @@ class PowerPlanServerTest(unittest.TestCase):
             status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A", "GET", b"")
             loaded = json.loads(body.decode("utf-8"))
             self.assertEqual(loaded["time_series"][0]["load"], 123.4)
+            self.assertEqual(loaded["planning_parameters"][0]["design_life_years"], 30)
+            self.assertTrue(loaded["planning_parameters"][0]["storage_frequency_regulation_enabled"])
 
             status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A/overview", "GET", b"")
             overview = json.loads(body.decode("utf-8"))
@@ -263,6 +269,8 @@ class PowerPlanServerTest(unittest.TestCase):
             self.assertFalse(overview["time_series_loaded"])
             self.assertEqual(overview["time_series_count"], 8760)
             self.assertIn("diesel_generators", overview)
+            self.assertIn("planning_parameters", overview)
+            self.assertEqual(overview["planning_parameters"][0]["design_life_years"], 30)
 
             status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A/time-series", "GET", b"")
             time_payload = json.loads(body.decode("utf-8"))
@@ -321,6 +329,57 @@ class PowerPlanServerTest(unittest.TestCase):
 
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(body.decode("utf-8"))["error"], "bad_request")
+
+    def test_planning_weather_history_endpoint_validates_year_before_current_year(self):
+        status, headers, body = server.handle_planning_api_path(
+            "/api/planning/weather-history",
+            "POST",
+            json.dumps({"latitude": 10, "longitude": 20, "year": 9999}).encode("utf-8"),
+        )
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"], "bad_request")
+        self.assertIn("历史数据年必须小于当前年", data["message"])
+
+    def test_parse_nasa_power_hourly_response_requires_8760_rows(self):
+        payload = {
+            "header": {"fill_value": -999},
+            "properties": {
+                "parameter": {
+                    "WS10M": {"2025010100": 7.1},
+                    "ALLSKY_SFC_SW_DWN": {"2025010100": 0},
+                    "T2M": {"2025010100": -12.5},
+                }
+            },
+        }
+
+        with self.assertRaises(server.WeatherHistoryError):
+            server.parse_nasa_power_hourly_response(payload, 2025)
+
+    def test_planning_geocode_endpoint_fills_coordinates_from_place_name(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps([{"lat": "39.9042", "lon": "116.4074", "display_name": "北京"}]).encode("utf-8")
+
+        with patch.object(server, "urlopen_with_user_agent", return_value=FakeResponse()):
+            status, headers, body = server.handle_planning_api_path(
+                "/api/planning/geocode",
+                "POST",
+                json.dumps({"place": "北京"}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(data["latitude"], 39.9042)
+        self.assertEqual(data["longitude"], 116.4074)
+        self.assertEqual(data["source"], "OpenStreetMap Nominatim")
 
     def test_planning_page_has_current_scheme_display(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
@@ -382,6 +441,8 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("visibleDevices", script)
         self.assertIn("deviceGroups", script)
         self.assertIn("data-device-group", script)
+        self.assertNotIn("<h2>设备类型显示</h2>", html)
+        self.assertNotIn("默认全部显示，取消勾选则隐藏对应表格。", html)
         self.assertIn('class="device-filter-row"', html)
         device_filter_card = html.split('<div class="device-filter-card">', 1)[1].split('<div id="deviceTables"', 1)[0]
         self.assertIn('id="deviceFilters"', device_filter_card)
@@ -400,6 +461,42 @@ class PowerPlanServerTest(unittest.TestCase):
         for name in ("柴发", "风机", "光伏", "储能PCS", "储能电池组", "电制氢", "储氢罐", "燃料电池"):
             self.assertIn(name, script)
 
+    def test_planning_page_has_planning_parameters_tab_and_summary_panel(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn('data-tab="planning"', html)
+        self.assertIn('id="planningTab"', html)
+        self.assertIn('id="planningParametersTable"', html)
+        self.assertLess(html.index('data-tab="devices"'), html.index('data-tab="planning"'))
+        self.assertLess(html.index('data-tab="planning"'), html.index('data-tab="limits"'))
+        self.assertIn('data-summary-tab="planning"', html)
+        self.assertIn('data-summary-panel="planning"', html)
+        self.assertIn('id="planningSummary"', html)
+        self.assertIn("planningParameterSpecs", script)
+        self.assertIn("renderPlanningParameters", script)
+        self.assertIn("renderPlanningParameterSummaryTable", script)
+        self.assertIn("collectPlanningParameterWarnings", script)
+        self.assertIn("planning_parameters", script)
+        self.assertIn(".planning-parameters-card", css)
+        self.assertIn("#planningTab #planningParametersTable", css)
+        for label in (
+            "设计使用年限(年)",
+            "柴油价格(万元/吨)",
+            "规划负荷系数(0.1-10.0)",
+            "绿电电量占比下限(0.0-1.0)",
+            "储能是否参与调频",
+            "负荷扰动系数(0.0-0.5)",
+            "是否考虑频率安全约束",
+            "频率安全上限(1.0-1.5)",
+            "频率安全下限(1.0-1.5)",
+            "是否考虑扰动后功率平衡",
+            "是否考虑新能源N-1",
+            "是否考虑负荷扰动",
+        ):
+            self.assertIn(label, script)
+
     def test_planning_save_has_parameter_alarm_validation(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
 
@@ -408,6 +505,8 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("数据下限(台)", script)
         self.assertIn("数据上限(台)", script)
         self.assertIn("数据上限不能小于数据下限", script)
+        self.assertIn("频率安全上限不能小于频率安全下限", script)
+        self.assertIn("规划负荷系数(0.1-10.0)", script)
         self.assertNotIn("设计容量上限不能小于下限", script)
 
     def test_planning_scheme_actions_validate_duplicates_and_delete_current_scheme(self):
@@ -436,8 +535,10 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('class="summary-tabs"', html)
         self.assertIn('data-summary-tab="charts"', html)
         self.assertIn('data-summary-tab="devices"', html)
+        self.assertIn('data-summary-tab="planning"', html)
         self.assertIn('data-summary-panel="charts"', html)
         self.assertIn('data-summary-panel="devices"', html)
+        self.assertIn('data-summary-panel="planning"', html)
         self.assertNotIn("设计容量约束", html)
         self.assertIn("bindSummaryTabs", script)
         self.assertIn("data-summary-panel", script)
@@ -486,9 +587,40 @@ class PowerPlanServerTest(unittest.TestCase):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
 
+        self.assertNotIn("8760点曲线板", html)
         self.assertIn('data-curve="temperature"', html)
         self.assertIn("temperature", script)
         self.assertIn("温度", script)
+
+    def test_planning_time_series_page_can_fetch_geocoded_weather_history(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        for element_id in (
+            "weatherPlace",
+            "geocodePlace",
+            "weatherLatitude",
+            "weatherLongitude",
+            "weatherYear",
+            "fetchWeatherHistory",
+            "weatherImportStatus",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("/api/planning/geocode", script)
+        self.assertIn("/api/planning/weather-history", script)
+        self.assertIn("geocodePlace", script)
+        self.assertIn("fetchWeatherHistory", script)
+        self.assertIn("validateWeatherInputs", script)
+        self.assertIn("历史数据年必须", script)
+        self.assertIn("rows.length !== 8760", script)
+        self.assertIn("未更新数据", script)
+        self.assertIn("wind_speed: weather.wind_speed", script)
+        self.assertIn("solar_irradiance: weather.solar_irradiance", script)
+        self.assertIn("temperature: weather.temperature", script)
+        self.assertNotIn("load: weather.load", script)
+        self.assertIn(".weather-import-bar", css)
+        self.assertIn(".weather-import-status.error", css)
 
     def test_planning_time_series_table_uses_month_tabs(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
@@ -497,6 +629,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('id="monthTabs"', html)
         self.assertNotIn('id="prevPage"', html)
         self.assertNotIn('id="nextPage"', html)
+        self.assertNotIn("<h2>小时级数据</h2>", html)
         self.assertIn("monthRanges", script)
         self.assertIn("renderMonthTabs", script)
         self.assertIn("1月", script)

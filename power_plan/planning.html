@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>电网规划参数维护</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="assets/planning.css?v=20260510-resize-chart">
+  <link rel="stylesheet" href="assets/planning.css?v=20260510-planning-params">
 </head>
 <body>
   <main class="planning-shell">
@@ -37,6 +37,7 @@
           <div class="tabs" role="tablist" aria-label="参数维护标签">
             <button class="tab active" data-tab="time" type="button">8760时序数据</button>
             <button class="tab" data-tab="devices" type="button">设备参数</button>
+            <button class="tab" data-tab="planning" type="button">规划参数</button>
             <button class="tab" data-tab="limits" type="button">方案概览</button>
           </div>
           <div class="scheme-actions" aria-label="方案操作">
@@ -51,13 +52,21 @@
         <section id="timeTab" class="tab-panel active">
           <div class="chart-card">
             <div class="panel-heading">
-              <h1>8760点曲线板</h1>
               <div class="legend">
                 <label><input type="checkbox" data-curve="wind_speed" checked> 风速</label>
                 <label><input type="checkbox" data-curve="solar_irradiance" checked> 太阳辐照</label>
                 <label><input type="checkbox" data-curve="temperature" checked> 温度</label>
                 <label><input type="checkbox" data-curve="load" checked> 负荷</label>
               </div>
+            </div>
+            <div class="weather-import-bar" aria-label="历史气象数据获取">
+              <label>地名<input id="weatherPlace" type="text" placeholder="例如：秦岭站"></label>
+              <button id="geocodePlace" type="button">获取坐标</button>
+              <label>纬度<input id="weatherLatitude" type="number" min="-90" max="90" step="0.000001" placeholder="-90 到 90"></label>
+              <label>经度<input id="weatherLongitude" type="number" min="-180" max="180" step="0.000001" placeholder="-180 到 180"></label>
+              <label>历史数据年<input id="weatherYear" type="number" min="2001" step="1" placeholder="当前年之前"></label>
+              <button id="fetchWeatherHistory" class="primary" type="button">获取历史气象</button>
+              <span id="weatherImportStatus" class="weather-import-status" role="status" aria-live="polite"></span>
             </div>
             <svg id="timeChart" class="time-chart" role="img" aria-label="8760点风光温荷曲线"></svg>
             <div id="chartTip" class="chart-tip" hidden></div>
@@ -67,7 +76,6 @@
 
           <div class="table-card">
             <div class="panel-heading">
-              <h2>小时级数据</h2>
               <span id="pageInfo" class="page-info">未加载</span>
             </div>
             <div id="monthTabs" class="month-tabs" aria-label="小时级数据月份分页"></div>
@@ -77,16 +85,22 @@
 
         <section id="devicesTab" class="tab-panel">
           <div class="device-filter-card">
-            <div class="panel-heading">
-              <h2>设备类型显示</h2>
-              <span class="filter-hint">默认全部显示，取消勾选则隐藏对应表格。</span>
-            </div>
             <div class="device-filter-row">
               <div id="deviceFilters" class="device-filters" aria-label="设备类型显示筛选"></div>
               <div id="deviceJump" class="device-jump" aria-label="设备参数快捷跳转"></div>
             </div>
           </div>
           <div id="deviceTables" class="device-tables"></div>
+        </section>
+
+        <section id="planningTab" class="tab-panel">
+          <div class="planning-parameters-card">
+            <div class="panel-heading">
+              <h1>规划参数</h1>
+              <span class="filter-hint">参数随当前方案保存到 XLSX 文件。</span>
+            </div>
+            <div id="planningParametersTable" class="data-table planning-parameters-table"></div>
+          </div>
         </section>
 
         <section id="limitsTab" class="tab-panel">
@@ -100,6 +114,7 @@
               <div class="summary-tabs" role="tablist" aria-label="方案概览详情切换">
                 <button class="summary-tab active" type="button" data-summary-tab="charts" aria-controls="summaryChartsPanel" aria-selected="true">统计直方图</button>
                 <button class="summary-tab" type="button" data-summary-tab="devices" aria-controls="summaryDevicesPanel" aria-selected="false">待选设备列表</button>
+                <button class="summary-tab" type="button" data-summary-tab="planning" aria-controls="summaryPlanningPanel" aria-selected="false">规划参数</button>
               </div>
 
               <div id="summaryChartsPanel" class="summary-tab-panel active" role="tabpanel" data-summary-panel="charts">
@@ -110,6 +125,11 @@
               <div id="summaryDevicesPanel" class="summary-tab-panel" role="tabpanel" data-summary-panel="devices" hidden>
                 <div class="panel-heading"><h2>待选设备列表</h2></div>
                 <div id="quantitySummary" class="data-table"></div>
+              </div>
+
+              <div id="summaryPlanningPanel" class="summary-tab-panel" role="tabpanel" data-summary-panel="planning" hidden>
+                <div class="panel-heading"><h2>规划参数</h2></div>
+                <div id="planningSummary" class="data-table planning-parameters-table"></div>
               </div>
             </section>
           </div>
@@ -123,6 +143,6 @@
       </aside>
     </section>
   </main>
-  <script src="assets/planning.js?v=20260510-resize-chart"></script>
+  <script src="assets/planning.js?v=20260510-planning-params"></script>
 </body>
 </html>
