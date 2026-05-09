@@ -52,21 +52,19 @@
         <section id="timeTab" class="tab-panel active">
           <div class="chart-card">
             <div class="weather-import-bar" aria-label="历史气象数据获取">
-              <label>地名<input id="weatherPlace" type="text" placeholder="例如：秦岭站"></label>
-              <button id="geocodePlace" type="button">获取坐标</button>
-              <button id="openMapPicker" type="button">地图选点</button>
+              <button id="openCoordinatePicker" type="button">坐标选择</button>
               <label>纬度<input id="weatherLatitude" type="number" min="-90" max="90" step="0.000001" placeholder="-90 到 90"></label>
               <label>经度<input id="weatherLongitude" type="number" min="-180" max="180" step="0.000001" placeholder="-180 到 180"></label>
-              <label>历史数据年<input id="weatherYear" type="number" min="2001" step="1" placeholder="当前年之前"></label>
+              <label>历史数据年<input id="weatherYear" type="number" min="2001" step="1" value="2024" placeholder="当前年之前"></label>
               <button id="fetchWeatherHistory" class="primary" type="button">获取历史气象</button>
               <span id="weatherImportStatus" class="weather-import-status" role="status" aria-live="polite"></span>
             </div>
             <div class="curve-switch-row" aria-label="曲线切换显示">
-              <div class="legend">
-                <label><input type="radio" name="timeCurve" data-curve="wind_speed" checked> 风速</label>
-                <label><input type="radio" name="timeCurve" data-curve="solar_irradiance"> 太阳辐照</label>
-                <label><input type="radio" name="timeCurve" data-curve="temperature"> 温度</label>
-                <label><input type="radio" name="timeCurve" data-curve="load"> 负荷</label>
+              <div class="curve-buttons">
+                <button type="button" data-curve="wind_speed" class="curve-button active" aria-pressed="true">风速</button>
+                <button type="button" data-curve="solar_irradiance" class="curve-button" aria-pressed="false">太阳辐照</button>
+                <button type="button" data-curve="temperature" class="curve-button" aria-pressed="false">温度</button>
+                <button type="button" data-curve="load" class="curve-button" aria-pressed="false">负荷</button>
               </div>
             </div>
             <svg id="timeChart" class="time-chart" role="img" aria-label="8760点风光温荷曲线"></svg>
@@ -74,14 +72,18 @@
           </div>
 
           <div id="mapPickerModal" class="map-picker-modal" hidden>
-            <div class="map-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="mapPickerTitle">
+            <div class="map-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="mapPickerTitle" aria-describedby="mapPickerHint">
               <div class="map-picker-head">
-                <h2 id="mapPickerTitle">地图选点</h2>
-                <button id="closeMapPicker" type="button" aria-label="关闭地图选点">关闭</button>
+                <h2 id="mapPickerTitle">坐标选择</h2>
+                <button id="closeMapPicker" type="button" aria-label="关闭坐标选择">关闭</button>
+              </div>
+              <div class="coordinate-search-row">
+                <label>地名<input id="weatherPlace" type="text" placeholder="例如：上海"></label>
+                <button id="geocodePlace" type="button">获取坐标</button>
               </div>
               <div id="mapPickerCanvas" class="map-picker-canvas"></div>
               <div class="map-picker-foot">
-                <span id="mapPickerHint">点击地图选择位置，坐标会自动填入上方输入框。</span>
+                <span id="mapPickerHint">根据地名查找坐标，或点击地图选点。</span>
                 <button id="confirmMapPoint" class="primary" type="button">确认坐标</button>
               </div>
             </div>

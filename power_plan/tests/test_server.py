@@ -687,7 +687,7 @@ class PowerPlanServerTest(unittest.TestCase):
             self.assertIn(name, script)
         self.assertNotIn("formatFixed2", script)
         self.assertIn("formatInteger", script)
-        self.assertIn("频数", script)
+        self.assertNotIn(">频数</text>", script)
         self.assertIn("yAxis", script)
         self.assertIn("formatInteger(count)", script)
         self.assertIn("formatInteger(bin.count)", script)
@@ -766,11 +766,20 @@ class PowerPlanServerTest(unittest.TestCase):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
 
         self.assertNotIn("8760点曲线板", html)
-        self.assertIn('data-curve="temperature"', html)
-        self.assertIn('type="radio"', html)
-        self.assertIn('name="timeCurve"', html)
+        for curve_key, label in (
+            ("wind_speed", "风速"),
+            ("solar_irradiance", "太阳辐照"),
+            ("temperature", "温度"),
+            ("load", "负荷"),
+        ):
+            self.assertIn(f'<button type="button" data-curve="{curve_key}"', html)
+            self.assertIn(f">{label}</button>", html)
+        self.assertNotIn('type="radio"', html)
+        self.assertNotIn('name="timeCurve"', html)
         self.assertNotIn('type="checkbox" data-curve', html)
         self.assertIn('class="curve-switch-row"', html)
+        self.assertIn('class="curve-button active"', html)
+        self.assertIn('aria-pressed="true"', html)
         self.assertLess(html.index('class="weather-import-bar"'), html.index('class="curve-switch-row"'))
         self.assertIn("temperature", script)
         self.assertIn("温度", script)
@@ -783,7 +792,7 @@ class PowerPlanServerTest(unittest.TestCase):
         for element_id in (
             "weatherPlace",
             "geocodePlace",
-            "openMapPicker",
+            "openCoordinatePicker",
             "weatherLatitude",
             "weatherLongitude",
             "weatherYear",
@@ -795,14 +804,24 @@ class PowerPlanServerTest(unittest.TestCase):
             "confirmMapPoint",
         ):
             self.assertIn(f'id="{element_id}"', html)
+        self.assertIn('id="weatherYear" type="number" min="2001" step="1" value="2024"', html)
+        weather_bar = html.split('<div class="weather-import-bar"', 1)[1].split("</div>", 1)[0]
+        modal = html.split('<div id="mapPickerModal"', 1)[1].split('<div id="timeResizeHandle"', 1)[0]
+        self.assertIn(">坐标选择<", weather_bar)
+        self.assertNotIn('id="weatherPlace"', weather_bar)
+        self.assertNotIn('id="geocodePlace"', weather_bar)
+        self.assertNotIn(">地图选点</button>", weather_bar)
+        self.assertIn('id="weatherPlace"', modal)
+        self.assertIn('id="geocodePlace"', modal)
+        self.assertIn("根据地名查找坐标", modal)
         self.assertIn("/api/planning/map-config", script)
         self.assertIn("/api/planning/geocode", script)
         self.assertIn("/api/planning/weather-history", script)
-        self.assertIn("openMapPicker", script)
+        self.assertIn("openCoordinatePicker", script)
         self.assertIn("loadAmapScript", script)
         self.assertIn("initAmapPicker", script)
         self.assertIn("setMapPoint", script)
-        self.assertIn("POWER_PLAN_AMAP_KEY", script)
+        self.assertIn("未配置地图 Key", script)
         self.assertIn("geocodePlace", script)
         self.assertIn("fetchWeatherHistory", script)
         self.assertIn("validateWeatherInputs", script)
@@ -813,7 +832,10 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("solar_irradiance: weather.solar_irradiance", script)
         self.assertIn("temperature: weather.temperature", script)
         self.assertNotIn("load: weather.load", script)
+        self.assertIn("气象已更新", script)
+        self.assertNotIn("风速、太阳辐照和温度数据", script)
         self.assertIn(".weather-import-bar", css)
+        self.assertIn(".coordinate-search-row", css)
         self.assertIn(".weather-import-status.error", css)
         self.assertIn(".map-picker-modal", css)
         self.assertIn(".map-picker-canvas", css)
@@ -865,7 +887,8 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("function onTimeInput", script)
         self.assertIn("renderChart();", script)
         self.assertIn("selectedCurveSpec", script)
-        self.assertIn("[data-curve]:checked", script)
+        self.assertIn('[data-curve][aria-pressed="true"]', script)
+        self.assertIn("selectCurve", script)
         self.assertIn("时间（月）", script)
         self.assertIn("monthRanges", script)
         self.assertIn("yTicks", script)

@@ -142,10 +142,12 @@ function bindActions() {
   document.getElementById("deleteScheme").addEventListener("click", deleteScheme);
   document.getElementById("geocodePlace").addEventListener("click", geocodePlace);
   document.getElementById("fetchWeatherHistory").addEventListener("click", fetchWeatherHistory);
-  document.getElementById("openMapPicker").addEventListener("click", openMapPicker);
+  document.getElementById("openCoordinatePicker").addEventListener("click", openCoordinatePicker);
   document.getElementById("closeMapPicker").addEventListener("click", closeMapPicker);
   document.getElementById("confirmMapPoint").addEventListener("click", confirmMapPoint);
-  document.querySelectorAll("[data-curve]").forEach((box) => box.addEventListener("change", renderChart));
+  document.querySelectorAll("[data-curve]").forEach((button) => {
+    button.addEventListener("click", () => selectCurve(button.dataset.curve));
+  });
   document.getElementById("timeChart").addEventListener("mousemove", onChartMouseMove);
   document.getElementById("timeChart").addEventListener("mouseleave", hideChartCursor);
   document.addEventListener("mousemove", onHistogramMouseMove);
@@ -420,21 +422,19 @@ async function geocodePlace() {
   const placeInput = document.getElementById("weatherPlace");
   const place = placeInput.value.trim();
   if (!place) {
-    setWeatherImportStatus("请输入地名", "error");
+    setMapPickerHint("请输入地名");
     return;
   }
-  setWeatherImportStatus("正在获取坐标...");
+  setMapPickerHint("正在获取坐标...");
   const result = await api("/api/planning/geocode", {
     method: "POST",
     body: JSON.stringify({ place }),
   }).catch((error) => {
-    setWeatherImportStatus(error.message || String(error), "error");
+    setMapPickerHint(error.message || String(error));
     return null;
   });
   if (!result) return;
-  document.getElementById("weatherLatitude").value = result.latitude;
-  document.getElementById("weatherLongitude").value = result.longitude;
-  setWeatherImportStatus(`坐标已填入：${formatNumber(result.latitude)}, ${formatNumber(result.longitude)}`, "ok");
+  setMapPoint(result.latitude, result.longitude, "geocode");
 }
 
 async function fetchWeatherHistory() {
@@ -491,25 +491,24 @@ async function fetchWeatherHistory() {
   renderTimeTable();
   renderLimitSummary();
   renderSummary();
-  setWeatherImportStatus(`已更新${year}年风速、太阳辐照和温度数据`, "ok");
+  setWeatherImportStatus(`${year}年气象已更新`, "ok");
 }
 
-async function openMapPicker() {
+async function openCoordinatePicker() {
   const modal = document.getElementById("mapPickerModal");
-  const hint = document.getElementById("mapPickerHint");
   modal.hidden = false;
-  hint.textContent = "正在加载地图...";
+  setMapPickerHint("根据地名查找坐标，或点击地图选点。");
   const config = await loadMapConfig();
   if (!config || !config.amap_key) {
-    hint.textContent = "未配置高德地图 Key，暂不能打开地图选点。请配置 POWER_PLAN_AMAP_KEY、AMAP_WEB_SERVICE_KEY 或 AMAP_KEY 后重启服务。";
+    setMapPickerHint("可按地名查找；未配置地图 Key。");
     return;
   }
   try {
     await loadAmapScript(config.amap_key);
     initAmapPicker();
-    hint.textContent = "点击地图选择位置，坐标会自动填入上方输入框。";
+    setMapPickerHint("根据地名查找坐标，或点击地图选点。");
   } catch (error) {
-    hint.textContent = `地图加载失败：${error.message || error}`;
+    setMapPickerHint(`地图加载失败：${error.message || error}`);
   }
 }
 
@@ -562,15 +561,19 @@ function initAmapPicker() {
   setTimeout(() => state.mapInstance.resize?.(), 80);
 }
 
-function setMapPoint(latitude, longitude) {
+function setMapPoint(latitude, longitude, source = "map") {
   state.mapPoint = { latitude, longitude };
   document.getElementById("weatherLatitude").value = Number(latitude).toFixed(6);
   document.getElementById("weatherLongitude").value = Number(longitude).toFixed(6);
+  if (state.mapInstance) {
+    state.mapInstance.setCenter([longitude, latitude]);
+  }
   if (state.mapMarker) {
     state.mapMarker.setPosition([longitude, latitude]);
   }
-  document.getElementById("mapPickerHint").textContent = `已选择：${Number(latitude).toFixed(6)}, ${Number(longitude).toFixed(6)}`;
-  setWeatherImportStatus("地图选点坐标已填入", "ok");
+  const sourceText = source === "geocode" ? "地名坐标" : "地图坐标";
+  setMapPickerHint(`${sourceText}：${Number(latitude).toFixed(6)}, ${Number(longitude).toFixed(6)}`);
+  setWeatherImportStatus("坐标已填入", "ok");
 }
 
 function confirmMapPoint() {
@@ -595,6 +598,11 @@ function setWeatherImportStatus(message, level = "") {
   host.textContent = message;
   host.classList.toggle("error", level === "error");
   host.classList.toggle("ok", level === "ok");
+}
+
+function setMapPickerHint(message) {
+  const hint = document.getElementById("mapPickerHint");
+  if (hint) hint.textContent = message;
 }
 
 async function selectNextSchemeAfterDelete(deletedIndex) {
@@ -723,8 +731,19 @@ function renderChart() {
 }
 
 function selectedCurveSpec() {
-  const checked = document.querySelector("[data-curve]:checked");
-  return summarySeries.find(([key]) => key === checked?.dataset.curve) || summarySeries[0];
+  const selected = document.querySelector('[data-curve][aria-pressed="true"]');
+  return summarySeries.find(([key]) => key === selected?.dataset.curve) || summarySeries[0];
+}
+
+function selectCurve(curveKey) {
+  const target = summarySeries.find(([key]) => key === curveKey) || summarySeries[0];
+  document.querySelectorAll("[data-curve]").forEach((button) => {
+    const active = button.dataset.curve === target[0];
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  hideChartCursor();
+  renderChart();
 }
 
 function onChartMouseMove(event) {
@@ -1151,7 +1170,7 @@ function histogramSvg(values, color, title = "") {
     .join("");
   const minLabel = formatNumber(bins[0].lower);
   const maxLabel = formatNumber(bins[bins.length - 1].upper);
-  return `<svg class="histogram-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}统计直方图"><g>${yAxis}</g><line x1="${padLeft}" x2="${width - padRight}" y1="${padTop + plotHeight}" y2="${padTop + plotHeight}" stroke="#8ba49f"/><line x1="${padLeft}" x2="${padLeft}" y1="${padTop}" y2="${padTop + plotHeight}" stroke="#8ba49f"/><text x="14" y="${padTop + 8}" fill="#294944" font-size="12">频数</text>${bars}<text x="${padLeft}" y="${height - 8}" fill="#5a716e" font-size="12">${escapeHtml(minLabel)}</text><text x="${width - padRight}" y="${height - 8}" fill="#5a716e" font-size="12" text-anchor="end">${escapeHtml(maxLabel)}</text></svg>`;
+  return `<svg class="histogram-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}统计直方图"><g>${yAxis}</g><line x1="${padLeft}" x2="${width - padRight}" y1="${padTop + plotHeight}" y2="${padTop + plotHeight}" stroke="#8ba49f"/><line x1="${padLeft}" x2="${padLeft}" y1="${padTop}" y2="${padTop + plotHeight}" stroke="#8ba49f"/>${bars}<text x="${padLeft}" y="${height - 8}" fill="#5a716e" font-size="12">${escapeHtml(minLabel)}</text><text x="${width - padRight}" y="${height - 8}" fill="#5a716e" font-size="12" text-anchor="end">${escapeHtml(maxLabel)}</text></svg>`;
 }
 
 function formatNumber(value) {

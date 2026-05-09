@@ -357,12 +357,36 @@ h2 {
 h1 { font-size: 24px; }
 h2 { font-size: 19px; }
 
-.legend {
+.curve-buttons {
   display: flex;
-  gap: 14px;
+  gap: 8px;
   flex-wrap: wrap;
-  font-weight: 700;
+}
+
+.curve-button {
+  min-width: 82px;
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid #cbdcd7;
+  border-radius: 8px;
+  background: #f8fbfa;
   color: #415f5c;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.curve-button:hover {
+  border-color: #88aaa2;
+  background: #eef7f5;
+}
+
+.curve-button.active,
+.curve-button[aria-pressed="true"] {
+  border-color: #0d5c59;
+  background: #0d5c59;
+  color: #ffffff;
+  box-shadow: 0 8px 18px rgba(13, 92, 89, 0.18);
 }
 
 .weather-import-bar {
@@ -458,6 +482,7 @@ h2 { font-size: 19px; }
 }
 
 .map-picker-head,
+.coordinate-search-row,
 .map-picker-foot {
   display: flex;
   align-items: center;
@@ -473,12 +498,36 @@ h2 { font-size: 19px; }
 }
 
 .map-picker-head button,
+.coordinate-search-row button,
 .map-picker-foot button {
   padding: 8px 12px;
   border-radius: 10px;
   background: #edf4f2;
   color: #24413d;
   font-weight: 800;
+}
+
+.coordinate-search-row {
+  justify-content: flex-start;
+  flex-wrap: nowrap;
+}
+
+.coordinate-search-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #405b58;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.coordinate-search-row input {
+  width: 220px;
+  border: 1px solid #d7e4e0;
+  border-radius: 10px;
+  padding: 7px 8px;
+  background: #f8fbfa;
+  color: #172033;
 }
 
 .map-picker-canvas {
