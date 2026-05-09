@@ -27,7 +27,10 @@ WEB_ROOT = Path(__file__).resolve().parent
 DATA_DIR = WEB_ROOT / "data"
 VENDOR_DIR = WEB_ROOT / "vendor"
 NASA_POWER_HOURLY_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
+AMAP_GEOCODING_URL = "https://restapi.amap.com/v3/geocode/geo"
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+AMAP_WEB_SERVICE_KEY = os.environ.get("POWER_PLAN_AMAP_KEY") or os.environ.get("AMAP_WEB_SERVICE_KEY") or os.environ.get("AMAP_KEY")
 NASA_POWER_PARAMETERS = {
     "wind_speed": "WS10M",
     "solar_irradiance": "ALLSKY_SFC_SW_DWN",
@@ -591,28 +594,120 @@ def geocode_place_name(place: str) -> dict:
     query_text = str(place or "").strip()
     if not query_text:
         raise ValueError("地名不能为空")
-    query = urlencode({"q": query_text, "format": "json", "limit": 1, "accept-language": "zh-CN"})
-    url = f"{NOMINATIM_SEARCH_URL}?{query}"
+    errors: list[str] = []
+    providers = []
+    if AMAP_WEB_SERVICE_KEY:
+        providers.append(geocode_with_amap)
+    providers.extend([geocode_with_open_meteo, geocode_with_nominatim])
+    for provider in providers:
+        try:
+            return provider(query_text)
+        except GeocodingError as exc:
+            errors.append(str(exc))
+    raise GeocodingError("；".join(errors) or "未找到该地名对应的经纬度坐标")
+
+
+def geocode_with_amap(place: str) -> dict:
+    query = urlencode({"address": place, "output": "JSON", "key": AMAP_WEB_SERVICE_KEY})
+    url = f"{AMAP_GEOCODING_URL}?{query}"
     try:
-        with urlopen_with_user_agent(url, timeout=30) as response:
+        with urlopen_with_user_agent(url, timeout=8) as response:
             data = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        raise GeocodingError(f"地名解析接口返回错误: HTTP {exc.code}") from exc
+        raise GeocodingError(f"高德地名解析接口返回错误: HTTP {exc.code}") from exc
     except (URLError, TimeoutError) as exc:
-        raise GeocodingError(f"地名解析接口连接失败: {exc}") from exc
+        raise GeocodingError(f"高德地名解析接口连接失败: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise GeocodingError("地名解析接口返回内容不是合法 JSON") from exc
+        raise GeocodingError("高德地名解析接口返回内容不是合法 JSON") from exc
+    if str(data.get("status")) != "1":
+        raise GeocodingError(f"高德地名解析失败: {data.get('info') or data.get('infocode') or '未知错误'}")
+    geocodes = data.get("geocodes", [])
+    if not geocodes:
+        raise GeocodingError("高德未找到该地名对应的经纬度坐标")
+    first = geocodes[0]
+    location = str(first.get("location", ""))
+    try:
+        longitude_text, latitude_text = location.split(",", 1)
+        longitude = float(longitude_text)
+        latitude = float(latitude_text)
+    except (ValueError, AttributeError) as exc:
+        raise GeocodingError("高德地名解析结果缺少有效经纬度") from exc
+    display_parts = [
+        first.get("formatted_address"),
+        first.get("province"),
+        first.get("city"),
+        first.get("district"),
+    ]
+    display_name = "，".join(str(part) for part in display_parts if part and part != [])
+    return {
+        "place": place,
+        "display_name": display_name or place,
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": "高德地图 Web 服务地理编码 API",
+    }
+
+
+def geocode_with_open_meteo(place: str) -> dict:
+    query = urlencode({"name": place, "count": 1, "language": "zh", "format": "json"})
+    url = f"{OPEN_METEO_GEOCODING_URL}?{query}"
+    try:
+        with urlopen_with_user_agent(url, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise GeocodingError(f"Open-Meteo 地名解析接口返回错误: HTTP {exc.code}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise GeocodingError(f"Open-Meteo 地名解析接口连接失败: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise GeocodingError("Open-Meteo 地名解析接口返回内容不是合法 JSON") from exc
+    results = data.get("results", []) if isinstance(data, dict) else []
+    if not results:
+        raise GeocodingError("Open-Meteo 未找到该地名对应的经纬度坐标")
+    first = results[0]
+    try:
+        latitude = float(first["latitude"])
+        longitude = float(first["longitude"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GeocodingError("Open-Meteo 地名解析结果缺少有效经纬度") from exc
+    display_parts = [
+        first.get("name"),
+        first.get("admin2"),
+        first.get("admin1"),
+        first.get("country"),
+    ]
+    display_name = "，".join(str(part) for part in display_parts if part)
+    return {
+        "place": place,
+        "display_name": display_name or place,
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": "Open-Meteo Geocoding API",
+    }
+
+
+def geocode_with_nominatim(place: str) -> dict:
+    query = urlencode({"q": place, "format": "json", "limit": 1, "accept-language": "zh-CN"})
+    url = f"{NOMINATIM_SEARCH_URL}?{query}"
+    try:
+        with urlopen_with_user_agent(url, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise GeocodingError(f"Nominatim 地名解析接口返回错误: HTTP {exc.code}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise GeocodingError(f"Nominatim 地名解析接口连接失败: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise GeocodingError("Nominatim 地名解析接口返回内容不是合法 JSON") from exc
     if not isinstance(data, list) or not data:
-        raise GeocodingError("未找到该地名对应的经纬度坐标")
+        raise GeocodingError("Nominatim 未找到该地名对应的经纬度坐标")
     first = data[0]
     try:
         latitude = float(first["lat"])
         longitude = float(first["lon"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise GeocodingError("地名解析结果缺少有效经纬度") from exc
+        raise GeocodingError("Nominatim 地名解析结果缺少有效经纬度") from exc
     return {
-        "place": query_text,
-        "display_name": first.get("display_name", query_text),
+        "place": place,
+        "display_name": first.get("display_name", place),
         "latitude": latitude,
         "longitude": longitude,
         "source": "OpenStreetMap Nominatim",
@@ -713,6 +808,8 @@ def power_hour_key_to_datetime(key: str) -> str:
 def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
     prefix = "/api/planning/schemes"
     try:
+        if path == "/api/planning/map-config" and method == "GET":
+            return _json_response({"amap_key": AMAP_WEB_SERVICE_KEY, "preferred_provider": "amap" if AMAP_WEB_SERVICE_KEY else "manual"})
         if path == "/api/planning/weather-history" and method == "POST":
             payload = _read_json_body(body)
             return _json_response(

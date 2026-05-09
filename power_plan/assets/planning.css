@@ -403,6 +403,68 @@ h2 { font-size: 19px; }
   color: #0d5c59;
 }
 
+.map-picker-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(13, 32, 38, 0.44);
+}
+
+.map-picker-modal[hidden] {
+  display: none;
+}
+
+.map-picker-dialog {
+  width: min(920px, 94vw);
+  height: min(680px, 88vh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(13, 32, 38, 0.28);
+}
+
+.map-picker-head,
+.map-picker-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e5eeeb;
+}
+
+.map-picker-foot {
+  border-top: 1px solid #e5eeeb;
+  border-bottom: 0;
+}
+
+.map-picker-head button,
+.map-picker-foot button {
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #edf4f2;
+  color: #24413d;
+  font-weight: 800;
+}
+
+.map-picker-canvas {
+  flex: 1 1 auto;
+  min-height: 360px;
+  background: #edf4f2;
+}
+
+#mapPickerHint {
+  color: #405b58;
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .time-chart {
   width: 100%;
   height: var(--time-chart-height, clamp(180px, 28vh, 300px));
@@ -459,16 +521,32 @@ h2 { font-size: 19px; }
   font-weight: 800;
 }
 
+.time-table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  margin-bottom: 12px;
+  min-width: 0;
+}
+
 .page-info {
+  flex: 0 0 auto;
+  margin-left: auto;
   color: #405b58;
   font-weight: 800;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .month-tabs {
   display: flex;
+  justify-content: flex-start;
   gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-x: auto;
-  padding: 2px 0 12px;
+  padding: 2px 0;
   white-space: nowrap;
 }
 

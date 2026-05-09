@@ -1,4 +1,4 @@
-const state = { schemes: [], currentScheme: "", payload: null, month: 0, timeSeriesLoading: null };
+const state = { schemes: [], currentScheme: "", payload: null, month: 0, timeSeriesLoading: null, mapConfig: null, mapPoint: null, mapInstance: null, mapMarker: null };
 
 const deviceSpecs = [
   ["diesel_generators", "柴发", ["name", "capacity", "cost", "power_upper", "power_lower", "fuel_rate", "quantity_lower", "quantity_upper"]],
@@ -125,6 +125,9 @@ function bindActions() {
   document.getElementById("deleteScheme").addEventListener("click", deleteScheme);
   document.getElementById("geocodePlace").addEventListener("click", geocodePlace);
   document.getElementById("fetchWeatherHistory").addEventListener("click", fetchWeatherHistory);
+  document.getElementById("openMapPicker").addEventListener("click", openMapPicker);
+  document.getElementById("closeMapPicker").addEventListener("click", closeMapPicker);
+  document.getElementById("confirmMapPoint").addEventListener("click", confirmMapPoint);
   document.querySelectorAll("[data-curve]").forEach((box) => box.addEventListener("change", renderChart));
   window.addEventListener("resize", renderChart);
 }
@@ -397,6 +400,93 @@ async function fetchWeatherHistory() {
   renderLimitSummary();
   renderSummary();
   setWeatherImportStatus(`已更新${year}年风速、太阳辐照和温度数据`, "ok");
+}
+
+async function openMapPicker() {
+  const modal = document.getElementById("mapPickerModal");
+  const hint = document.getElementById("mapPickerHint");
+  modal.hidden = false;
+  hint.textContent = "正在加载地图...";
+  const config = await loadMapConfig();
+  if (!config || !config.amap_key) {
+    hint.textContent = "未配置高德地图 Key，暂不能打开地图选点。请配置 POWER_PLAN_AMAP_KEY、AMAP_WEB_SERVICE_KEY 或 AMAP_KEY 后重启服务。";
+    return;
+  }
+  try {
+    await loadAmapScript(config.amap_key);
+    initAmapPicker();
+    hint.textContent = "点击地图选择位置，坐标会自动填入上方输入框。";
+  } catch (error) {
+    hint.textContent = `地图加载失败：${error.message || error}`;
+  }
+}
+
+function closeMapPicker() {
+  document.getElementById("mapPickerModal").hidden = true;
+}
+
+async function loadMapConfig() {
+  if (state.mapConfig) return state.mapConfig;
+  state.mapConfig = await api("/api/planning/map-config").catch((error) => {
+    document.getElementById("mapPickerHint").textContent = error.message || String(error);
+    return null;
+  });
+  return state.mapConfig;
+}
+
+function loadAmapScript(key) {
+  if (window.AMap) return Promise.resolve();
+  if (window.__powerPlanAmapLoading) return window.__powerPlanAmapLoading;
+  window.__powerPlanAmapLoading = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}`;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("高德地图脚本加载失败"));
+    document.head.appendChild(script);
+  });
+  return window.__powerPlanAmapLoading;
+}
+
+function initAmapPicker() {
+  const latitude = Number(document.getElementById("weatherLatitude").value);
+  const longitude = Number(document.getElementById("weatherLongitude").value);
+  const center = Number.isFinite(latitude) && Number.isFinite(longitude) ? [longitude, latitude] : [116.39723, 39.9075];
+  if (!state.mapInstance) {
+    state.mapInstance = new window.AMap.Map("mapPickerCanvas", {
+      zoom: 5,
+      center,
+      resizeEnable: true,
+    });
+    state.mapMarker = new window.AMap.Marker({ position: center });
+    state.mapInstance.add(state.mapMarker);
+    state.mapInstance.on("click", (event) => {
+      const point = event.lnglat;
+      setMapPoint(point.getLat(), point.getLng());
+    });
+  } else {
+    state.mapInstance.setCenter(center);
+  }
+  setTimeout(() => state.mapInstance.resize?.(), 80);
+}
+
+function setMapPoint(latitude, longitude) {
+  state.mapPoint = { latitude, longitude };
+  document.getElementById("weatherLatitude").value = Number(latitude).toFixed(6);
+  document.getElementById("weatherLongitude").value = Number(longitude).toFixed(6);
+  if (state.mapMarker) {
+    state.mapMarker.setPosition([longitude, latitude]);
+  }
+  document.getElementById("mapPickerHint").textContent = `已选择：${Number(latitude).toFixed(6)}, ${Number(longitude).toFixed(6)}`;
+  setWeatherImportStatus("地图选点坐标已填入", "ok");
+}
+
+function confirmMapPoint() {
+  if (!state.mapPoint) {
+    document.getElementById("mapPickerHint").textContent = "请先点击地图选择位置";
+    return;
+  }
+  closeMapPicker();
 }
 
 function validateWeatherInputs(latitude, longitude, year) {

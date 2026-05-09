@@ -359,6 +359,9 @@ class PowerPlanServerTest(unittest.TestCase):
 
     def test_planning_geocode_endpoint_fills_coordinates_from_place_name(self):
         class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
             def __enter__(self):
                 return self
 
@@ -366,9 +369,119 @@ class PowerPlanServerTest(unittest.TestCase):
                 return False
 
             def read(self):
-                return json.dumps([{"lat": "39.9042", "lon": "116.4074", "display_name": "北京"}]).encode("utf-8")
+                return json.dumps(self.payload).encode("utf-8")
 
-        with patch.object(server, "urlopen_with_user_agent", return_value=FakeResponse()):
+        def fake_urlopen(url, timeout):
+            self.assertIn("geocoding-api.open-meteo.com", url)
+            return FakeResponse(
+                {
+                    "results": [
+                        {
+                            "name": "北京",
+                            "latitude": 39.9075,
+                            "longitude": 116.39723,
+                            "country": "中国",
+                            "admin1": "北京市",
+                        }
+                    ]
+                }
+            )
+
+        with patch.object(server, "urlopen_with_user_agent", side_effect=fake_urlopen):
+            status, headers, body = server.handle_planning_api_path(
+                "/api/planning/geocode",
+                "POST",
+                json.dumps({"place": "北京"}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(data["latitude"], 39.9075)
+        self.assertEqual(data["longitude"], 116.39723)
+        self.assertEqual(data["source"], "Open-Meteo Geocoding API")
+
+    def test_planning_geocode_prefers_amap_when_key_is_configured(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "status": "1",
+                        "geocodes": [
+                            {
+                                "formatted_address": "北京市",
+                                "province": "北京市",
+                                "city": "北京市",
+                                "district": [],
+                                "location": "116.407526,39.904030",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        original_key = server.AMAP_WEB_SERVICE_KEY
+        server.AMAP_WEB_SERVICE_KEY = "test-key"
+        try:
+            def fake_urlopen(url, timeout):
+                self.assertIn("restapi.amap.com", url)
+                self.assertIn("key=test-key", url)
+                return FakeResponse()
+
+            with patch.object(server, "urlopen_with_user_agent", side_effect=fake_urlopen):
+                status, headers, body = server.handle_planning_api_path(
+                    "/api/planning/geocode",
+                    "POST",
+                    json.dumps({"place": "北京"}, ensure_ascii=False).encode("utf-8"),
+                )
+        finally:
+            server.AMAP_WEB_SERVICE_KEY = original_key
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(data["latitude"], 39.90403)
+        self.assertEqual(data["longitude"], 116.407526)
+        self.assertEqual(data["source"], "高德地图 Web 服务地理编码 API")
+
+    def test_planning_map_config_exposes_amap_key_when_configured(self):
+        original_key = server.AMAP_WEB_SERVICE_KEY
+        server.AMAP_WEB_SERVICE_KEY = "test-key"
+        try:
+            status, headers, body = server.handle_planning_api_path("/api/planning/map-config", "GET", b"")
+        finally:
+            server.AMAP_WEB_SERVICE_KEY = original_key
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(data["amap_key"], "test-key")
+        self.assertEqual(data["preferred_provider"], "amap")
+
+    def test_planning_geocode_endpoint_falls_back_to_nominatim(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(url, timeout):
+            if "geocoding-api.open-meteo.com" in url:
+                return FakeResponse({"results": []})
+            self.assertIn("nominatim.openstreetmap.org", url)
+            return FakeResponse([{"lat": "39.9042", "lon": "116.4074", "display_name": "北京"}])
+
+        with patch.object(server, "urlopen_with_user_agent", side_effect=fake_urlopen):
             status, headers, body = server.handle_planning_api_path(
                 "/api/planning/geocode",
                 "POST",
@@ -600,15 +713,26 @@ class PowerPlanServerTest(unittest.TestCase):
         for element_id in (
             "weatherPlace",
             "geocodePlace",
+            "openMapPicker",
             "weatherLatitude",
             "weatherLongitude",
             "weatherYear",
             "fetchWeatherHistory",
             "weatherImportStatus",
+            "mapPickerModal",
+            "mapPickerCanvas",
+            "closeMapPicker",
+            "confirmMapPoint",
         ):
             self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("/api/planning/map-config", script)
         self.assertIn("/api/planning/geocode", script)
         self.assertIn("/api/planning/weather-history", script)
+        self.assertIn("openMapPicker", script)
+        self.assertIn("loadAmapScript", script)
+        self.assertIn("initAmapPicker", script)
+        self.assertIn("setMapPoint", script)
+        self.assertIn("POWER_PLAN_AMAP_KEY", script)
         self.assertIn("geocodePlace", script)
         self.assertIn("fetchWeatherHistory", script)
         self.assertIn("validateWeatherInputs", script)
@@ -621,15 +745,26 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertNotIn("load: weather.load", script)
         self.assertIn(".weather-import-bar", css)
         self.assertIn(".weather-import-status.error", css)
+        self.assertIn(".map-picker-modal", css)
+        self.assertIn(".map-picker-canvas", css)
 
     def test_planning_time_series_table_uses_month_tabs(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
         self.assertIn('id="monthTabs"', html)
+        self.assertIn('class="time-table-toolbar"', html)
         self.assertNotIn('id="prevPage"', html)
         self.assertNotIn('id="nextPage"', html)
         self.assertNotIn("<h2>小时级数据</h2>", html)
+        toolbar = html.split('<div class="time-table-toolbar">', 1)[1].split('<div id="timeTable"', 1)[0]
+        self.assertLess(toolbar.index('id="monthTabs"'), toolbar.index('id="pageInfo"'))
+        self.assertIn(".time-table-toolbar", css)
+        self.assertIn("flex-wrap: nowrap", css)
+        self.assertIn("justify-content: flex-start", css)
+        self.assertIn("margin-left: auto", css)
+        self.assertIn("text-align: right", css)
         self.assertIn("monthRanges", script)
         self.assertIn("renderMonthTabs", script)
         self.assertIn("1月", script)

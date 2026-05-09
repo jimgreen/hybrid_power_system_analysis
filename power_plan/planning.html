@@ -62,6 +62,7 @@
             <div class="weather-import-bar" aria-label="历史气象数据获取">
               <label>地名<input id="weatherPlace" type="text" placeholder="例如：秦岭站"></label>
               <button id="geocodePlace" type="button">获取坐标</button>
+              <button id="openMapPicker" type="button">地图选点</button>
               <label>纬度<input id="weatherLatitude" type="number" min="-90" max="90" step="0.000001" placeholder="-90 到 90"></label>
               <label>经度<input id="weatherLongitude" type="number" min="-180" max="180" step="0.000001" placeholder="-180 到 180"></label>
               <label>历史数据年<input id="weatherYear" type="number" min="2001" step="1" placeholder="当前年之前"></label>
@@ -72,13 +73,27 @@
             <div id="chartTip" class="chart-tip" hidden></div>
           </div>
 
+          <div id="mapPickerModal" class="map-picker-modal" hidden>
+            <div class="map-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="mapPickerTitle">
+              <div class="map-picker-head">
+                <h2 id="mapPickerTitle">地图选点</h2>
+                <button id="closeMapPicker" type="button" aria-label="关闭地图选点">关闭</button>
+              </div>
+              <div id="mapPickerCanvas" class="map-picker-canvas"></div>
+              <div class="map-picker-foot">
+                <span id="mapPickerHint">点击地图选择位置，坐标会自动填入上方输入框。</span>
+                <button id="confirmMapPoint" class="primary" type="button">确认坐标</button>
+              </div>
+            </div>
+          </div>
+
           <div id="timeResizeHandle" class="time-resize-handle" role="separator" tabindex="0" aria-label="调整时序图高度" aria-orientation="horizontal" aria-valuemin="140" aria-valuemax="520" aria-valuenow="0"></div>
 
           <div class="table-card">
-            <div class="panel-heading">
+            <div class="time-table-toolbar">
+              <div id="monthTabs" class="month-tabs" aria-label="小时级数据月份分页"></div>
               <span id="pageInfo" class="page-info">未加载</span>
             </div>
-            <div id="monthTabs" class="month-tabs" aria-label="小时级数据月份分页"></div>
             <div id="timeTable" class="data-table"></div>
           </div>
         </section>
