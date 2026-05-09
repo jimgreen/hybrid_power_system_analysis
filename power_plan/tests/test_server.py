@@ -717,6 +717,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("--summary-histogram-svg-height", css)
         self.assertIn("max-height: var(--summary-table-height", css)
         self.assertIn("height: auto", css)
+        self.assertNotIn("min(50vh, 560px)", css)
         self.assertIn("height: var(--summary-histogram-grid-height", css)
         self.assertIn("grid-template-rows: repeat(2, minmax(0, 1fr))", css)
         self.assertIn("flex-direction: column", css)
@@ -724,6 +725,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("summaryTabs", script)
         self.assertIn("summary-histogram-grid-height", script)
         self.assertIn("summary-table-height", script)
+        self.assertNotIn("Math.min(560", script)
 
     def test_planning_layout_constrains_page_height_to_viewport(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")

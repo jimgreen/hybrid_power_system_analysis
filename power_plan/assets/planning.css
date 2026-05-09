@@ -3,8 +3,8 @@
 :root {
   --panel-table-max-height: min(62vh, 680px);
   --time-table-height: clamp(220px, 38vh, 520px);
-  --summary-panel-height: clamp(260px, 58vh, 680px);
-  --summary-table-height: clamp(220px, 50vh, 560px);
+  --summary-panel-height: min(72vh, 960px);
+  --summary-table-height: min(72vh, 960px);
   --summary-histogram-grid-height: clamp(280px, 52vh, 620px);
   --summary-histogram-svg-height: clamp(120px, 22vh, 240px);
 }
@@ -337,7 +337,7 @@ button:disabled {
 #limitsTab .summary-tab-panel.active .data-table {
   flex: 0 1 auto;
   height: auto;
-  max-height: var(--summary-table-height, min(50vh, 560px));
+  max-height: var(--summary-table-height, min(72vh, 960px));
 }
 
 .panel-heading {

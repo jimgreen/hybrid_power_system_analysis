@@ -224,7 +224,7 @@ function applyAdaptiveSummaryLayout() {
   const availablePanelHeight = (summarySwitcher.clientHeight || Math.max(260, tab.clientHeight - 32)) - switcherPadding - tabsHeight;
   const panelHeight = Math.max(180, availablePanelHeight);
   const contentHeight = Math.max(140, panelHeight - headingHeight);
-  const tableHeight = Math.min(560, Math.max(140, contentHeight));
+  const tableHeight = Math.max(160, contentHeight);
   const histogramGridHeight = Math.min(620, Math.max(240, contentHeight));
   const histogramSvgHeight = Math.min(240, Math.max(120, (histogramGridHeight - 14) / 2 - 76));
 
