@@ -22,6 +22,7 @@ if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
+from paths import model_file
 from ac_array_model import (
     BRANCH_COLS,
     BUS_COLS,
@@ -3768,7 +3769,7 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="AC power flow")
-    parser.add_argument("file", nargs="?", default=str(ROOT_DIR / "data" / "ac" / "ieee300.e"), help="AC E file path")
+    parser.add_argument("file", nargs="?", default=str(model_file("ac", "ieee300.e")), help="AC E file path")
     parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)

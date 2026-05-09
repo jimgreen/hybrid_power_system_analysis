@@ -18,8 +18,8 @@
 from secore.hybrid_se import HybridStateEstimator
 
 estimator = HybridStateEstimator(
-    e_file="data/hybrid/qinling.e",
-    meas_file="data/hybrid/qinling.meas",
+    e_file="data/model/hybrid/qinling.e",
+    meas_file="data/meas/hybrid/qinling.meas",
     flat_start=True,
 )
 result = estimator.estimate(verbose=False)
@@ -28,7 +28,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python -m secore.hybrid_se --case data\hybrid\qinling.e --meas data\hybrid\qinling.meas --flat-start --quiet
+python -m secore.hybrid_se --case data\model\hybrid\qinling.e --meas data\meas\hybrid\qinling.meas --flat-start --quiet
 ```
 
 参数与 `ac_se.py`、`dc_se.py` 基本一致。

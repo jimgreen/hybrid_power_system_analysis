@@ -17,6 +17,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
         sys.path.insert(0, str(path))
 
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
+from paths import measurement_file, model_file
 from ac_lf import matpower_branch_stamp, matpower_branch_stamp_vectorized
 from hybrid_lf import HybridPowerNetwork
 from model.meas_model import (
@@ -63,8 +64,8 @@ from secore.se_result import SEResult
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
-DEFAULT_CASE = ROOT_DIR / "data" / "hybrid" / "qinling.e"
-DEFAULT_MEAS = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+DEFAULT_CASE = model_file("hybrid", "qinling.e")
+DEFAULT_MEAS = measurement_file("hybrid", "qinling.meas")
 
 
 def _read_measurements_direct(meas_file: Path):

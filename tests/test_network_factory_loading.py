@@ -88,7 +88,7 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
         import ac_model
         from efile_read import efile_factory_from_file
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"
         model = efile_factory_from_file(case_path)
 
         expected = ac_model.ACPowerNetwork()
@@ -124,7 +124,7 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
     def test_ac_read_from_file_uses_factory_then_delegates_to_read_from_model(self):
         import ac_model
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"
         original_factory = ac_model.efile_factory_from_file
         original_read_from_model = ac_model.ACPowerNetwork.read_from_model
         calls = []
@@ -157,7 +157,7 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
         import model.dc_model as dc_model
         from efile_read import efile_factory_from_file
 
-        case_path = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
+        case_path = ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"
         model = efile_factory_from_file(case_path)
 
         expected = dc_model.DCPowerNetwork()
@@ -193,7 +193,7 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
     def test_dc_read_from_file_uses_factory_then_delegates_to_read_from_model(self):
         import model.dc_model as dc_model
 
-        case_path = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
+        case_path = ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"
         original_factory = dc_model.efile_factory_from_file
         original_read_from_model = dc_model.DCPowerNetwork.read_from_model
         calls = []

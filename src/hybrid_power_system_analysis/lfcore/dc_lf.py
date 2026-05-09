@@ -57,6 +57,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
+from paths import model_file
 from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BUS_COLS as DC_BUS_COLS,
@@ -2513,7 +2514,7 @@ def _run_with_optional_output(emit_output: bool, func, *args, **kwargs):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="DC power flow")
-    parser.add_argument("file", nargs="?", default=str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"), help="DC E file path")
+    parser.add_argument("file", nargs="?", default=str(model_file("dc", "dc_net_30.e")), help="DC E file path")
     parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)

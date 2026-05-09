@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from secore.ac_se import ACStateEstimator
+from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE
+from paths import measurement_file, model_file
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -18,8 +20,7 @@ _CASE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 def _case_paths(case_name: str):
     if not _CASE_RE.match(case_name):
         raise ValueError(f"Invalid case name: {case_name!r}")
-    base = ROOT_DIR / "data" / "ac"
-    return base / f"{case_name}.e", base / f"{case_name}.meas"
+    return model_file("ac", f"{case_name}.e"), measurement_file("ac", f"{case_name}.meas")
 
 
 def run_case(
@@ -169,7 +170,7 @@ def main(argv: Sequence[str] = None) -> int:
     parser = argparse.ArgumentParser(description="Run AC SE benchmarks in one Python process.")
     parser.add_argument("cases", nargs="*", default=list(DEFAULT_CASES), help="Case basenames under data/ac.")
     parser.add_argument("--repeats", type=int, default=3, help="Number of runs per case.")
-    parser.add_argument("--para", default=str(ROOT_DIR / "se.para"), help="State-estimation parameter file.")
+    parser.add_argument("--para", default=str(DEFAULT_SE_PARAMETER_FILE), help="State-estimation parameter file.")
     parser.add_argument("--file-start", action="store_true", help="Use E-file voltage/angle start instead of flat start.")
     parser.add_argument("--with-bad-data", action="store_true", help="Include post-estimation bad-data analysis.")
     parser.add_argument("--profile", action="store_true", help="Print averaged initialization profile timings.")

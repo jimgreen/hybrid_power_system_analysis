@@ -20,8 +20,8 @@
 from secore.dc_se import DCStateEstimator
 
 estimator = DCStateEstimator(
-    e_file="data/dc/dc_net_3000.e",
-    meas_file="data/dc/dc_net_3000.meas",
+    e_file="data/model/dc/dc_net_3000.e",
+    meas_file="data/meas/dc/dc_net_3000.meas",
     flat_start=True,
 )
 result = estimator.estimate(verbose=False)
@@ -30,7 +30,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python -m secore.dc_se --case data\dc\dc_net_3000.e --meas data\dc\dc_net_3000.meas --flat-start --quiet
+python -m secore.dc_se --case data\model\dc\dc_net_3000.e --meas data\meas\dc\dc_net_3000.meas --flat-start --quiet
 ```
 
 ## 支持的量测

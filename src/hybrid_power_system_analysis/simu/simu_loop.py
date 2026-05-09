@@ -32,6 +32,7 @@ for path in (PACKAGE_DIR, PACKAGE_DIR / "lfcore", PACKAGE_DIR / "model", ROOT_DI
         sys.path.insert(0, str(path))
 
 from efile_read import EBook
+from paths import measurement_file, model_file
 from update_meas_from_lf import (  # noqa: E402
     ANGLE_TYPES,
     MEAS_HEADER,
@@ -46,9 +47,9 @@ from hybrid_lf import run_hybrid_power_flow  # noqa: E402
 
 
 DEFAULT_MODEL_FILE = SIMU_DIR / "qinling.e"
-DEFAULT_MODEL_FALLBACK = ROOT_DIR / "data" / "hybrid" / "qinling.e"
+DEFAULT_MODEL_FALLBACK = model_file("hybrid", "qinling.e")
 DEFAULT_MEAS_FILE = SIMU_DIR / "meas.e"
-DEFAULT_MEAS_FALLBACK = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+DEFAULT_MEAS_FALLBACK = measurement_file("hybrid", "qinling.meas")
 DEFAULT_WEATHER_FILE = SIMU_DIR / "weather.e"
 DEFAULT_DEV_STAT_FILE = SIMU_DIR / "dev_stat.e"
 DEFAULT_YT_CTRL_FILE = SIMU_DIR / "yt_ctrl.e"

@@ -3,18 +3,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from efile_read import EBook
+from paths import LF_PARAMETER_DIR, PROJECT_ROOT, SE_PARAMETER_DIR, resolve_project_file
 
 
-def _find_project_root() -> Path:
-    for path in Path(__file__).resolve().parents:
-        if (path / "pyproject.toml").exists():
-            return path
-    return Path(__file__).resolve().parent
-
-
-ROOT_DIR = _find_project_root()
-DEFAULT_LF_PARAMETER_FILE = ROOT_DIR / "lf.para"
-DEFAULT_SE_PARAMETER_FILE = ROOT_DIR / "se.para"
+ROOT_DIR = PROJECT_ROOT
+DEFAULT_LF_PARAMETER_FILE = LF_PARAMETER_DIR / "lf.para"
+DEFAULT_SE_PARAMETER_FILE = SE_PARAMETER_DIR / "se.para"
 
 
 def _to_bool(value: Any) -> bool:
@@ -123,7 +117,7 @@ class StateEstimationParameters:
 
 
 def load_lf_parameters(path: Optional[Path] = None) -> PowerFlowParameters:
-    parameter_file = Path(path) if path is not None else DEFAULT_LF_PARAMETER_FILE
+    parameter_file = resolve_project_file(path) if path is not None else DEFAULT_LF_PARAMETER_FILE
     values = _load_key_value_block(parameter_file, "PowerFlowParameter")
     return PowerFlowParameters(
         tol=float(_require(values, "tol")),
@@ -134,7 +128,7 @@ def load_lf_parameters(path: Optional[Path] = None) -> PowerFlowParameters:
 
 
 def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters:
-    parameter_file = Path(path) if path is not None else DEFAULT_SE_PARAMETER_FILE
+    parameter_file = resolve_project_file(path) if path is not None else DEFAULT_SE_PARAMETER_FILE
     values = _load_key_value_block(parameter_file, "StateEstimationParameter")
     return StateEstimationParameters(
         tol=float(_require(values, "tol")),

@@ -42,7 +42,7 @@ class DCStateEstimationTest(unittest.TestCase):
         from model.dc_array_model import SWITCH_COLS, build_dc_ppc_from_e_file
         from model.dc_model import DCBreak, DCPowerNetwork as ObjectDCPowerNetwork
 
-        source = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
+        source = ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"
         with tempfile.TemporaryDirectory() as tmp_dir:
             case_path = Path(tmp_dir) / "dc_break.e"
             text = source.read_text(encoding="utf-8")
@@ -102,7 +102,7 @@ class DCStateEstimationTest(unittest.TestCase):
 
         dc_se.EBook = fail_ebook
         try:
-            measurements = DCStateEstimator._load_measurements(ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+            measurements = DCStateEstimator._load_measurements(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas")
         finally:
             dc_se.EBook = original_ebook
 
@@ -117,8 +117,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
 
@@ -139,8 +139,8 @@ class DCStateEstimationTest(unittest.TestCase):
         dc_se.load_dc_ppc_from_e_file = counted_loader
         try:
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=True,
             )
         finally:
@@ -161,8 +161,8 @@ class DCStateEstimationTest(unittest.TestCase):
         dc_se.DCPowerNetwork.check_topo = reject_check_topo
         try:
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=True,
             )
         finally:
@@ -189,7 +189,7 @@ class DCStateEstimationTest(unittest.TestCase):
             )
 
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
             )
 
@@ -227,7 +227,7 @@ class DCStateEstimationTest(unittest.TestCase):
             )
 
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
             )
 
@@ -254,8 +254,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         expected_refs = ["nd_11", "nd_21", "nd_26"]
@@ -273,8 +273,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
@@ -314,7 +314,7 @@ class DCStateEstimationTest(unittest.TestCase):
             )
 
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
             )
 
@@ -342,8 +342,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
             prepare_active_measurements=False,
         )
@@ -368,8 +368,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
             prepare_active_measurements=False,
         )
@@ -407,7 +407,7 @@ class DCStateEstimationTest(unittest.TestCase):
             )
 
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
@@ -446,7 +446,7 @@ class DCStateEstimationTest(unittest.TestCase):
             )
 
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
@@ -480,9 +480,9 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas")
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
                 max_iter=20,
             )
@@ -514,8 +514,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         original_evaluate = estimator.evaluate
@@ -537,8 +537,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         x = estimator.initial_state()
@@ -553,8 +553,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
         x = estimator.initial_state()
         expected = estimator.evaluate(x)
@@ -576,8 +576,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
         x = estimator.initial_state()
         dense = estimator.jacobian(x)
@@ -597,8 +597,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         self.assertIsInstance(estimator.active_measurements, MeasurementList)
@@ -728,8 +728,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator, ObservabilityResult
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         initial_active_count = len(estimator.active_measurements)
@@ -770,8 +770,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator, Measurement
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         additions = [Measurement(500000, "dc_v2", "DCNode", "dc1", "V", 5.0, True, 1.01)]
@@ -796,8 +796,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator, Measurement
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         additions = [Measurement(500001, "dc_v3", "DCNode", "dc1", "V", 5.0, True, 1.02)]
@@ -921,11 +921,11 @@ class DCStateEstimationTest(unittest.TestCase):
     def test_prepare_preserves_provided_measurement_list_cache(self):
         from secore.dc_se import DCStateEstimator
 
-        network = DCStateEstimator._load_network(ROOT_DIR / "data" / "dc" / "dc_net_30.e")
-        measurements = DCStateEstimator._load_measurements(ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+        network = DCStateEstimator._load_network(ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e")
+        measurements = DCStateEstimator._load_measurements(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas")
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             network=network,
             measurements=measurements,
             flat_start=True,
@@ -939,8 +939,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         def fail_scalar_value_path(*args, **kwargs):
@@ -961,8 +961,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             max_iter=20,
         )
 
@@ -985,8 +985,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             max_iter=20,
         )
 
@@ -1010,8 +1010,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         self.assertTrue(hasattr(estimator, "_jacobian_builder"))
@@ -1030,8 +1030,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             max_iter=5,
         )
 
@@ -1065,8 +1065,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             max_iter=5,
         )
 
@@ -1115,8 +1115,8 @@ class DCStateEstimationTest(unittest.TestCase):
         dc_se.DCPowerFlowCalc.run = counted_run
         try:
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=True,
             )
         finally:
@@ -1143,8 +1143,8 @@ class DCStateEstimationTest(unittest.TestCase):
         dc_se.DCStateEstimator._run_power_flow_seed = staticmethod(fake_seed)
         try:
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=False,
             )
         finally:
@@ -1198,8 +1198,8 @@ class DCStateEstimationTest(unittest.TestCase):
         DCStateEstimator._sync_dc_network_to_ppc = staticmethod(reject_full_sync)
         try:
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=False,
             )
         finally:
@@ -1278,8 +1278,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
         observability = estimator.observability_analysis()
 
@@ -1302,8 +1302,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
         observability = estimator.observability_analysis()
 
@@ -1330,8 +1330,8 @@ class DCStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(hasattr(dc_se, "build_normal_equations"))
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         original = dc_se.build_normal_equations
@@ -1359,9 +1359,9 @@ class DCStateEstimationTest(unittest.TestCase):
             self.skipTest("SciPy Cholesky solver is not available")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas")
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
             )
 
@@ -1412,9 +1412,9 @@ class DCStateEstimationTest(unittest.TestCase):
                 code = dc_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        str(ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas"),
                         "--flat-start",
                         "--quiet",
                     ]
@@ -1444,9 +1444,9 @@ class DCStateEstimationTest(unittest.TestCase):
                 code = dc_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        str(ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas"),
                         "--flat-start",
                         "--quiet",
                     ]
@@ -1460,9 +1460,9 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas")
             estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
             )
 
@@ -1494,8 +1494,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
 
         x = estimator.initial_state()

@@ -46,6 +46,7 @@ from model.meas_model import (
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook  # Retained for compatibility; measurement loading uses the direct parser below.
+from paths import measurement_file, model_file
 from secore.se_math import (
     NormalEquationSolver,
     SparseJacobianBuilder,
@@ -71,8 +72,8 @@ from secore.se_result import SEResult
 from unit_system import dc_current_base_ka
 
 
-DEFAULT_CASE = ROOT_DIR / "data" / "dc" / "dc_net_30.e"
-DEFAULT_MEAS = ROOT_DIR / "data" / "dc" / "dc_net_30.meas"
+DEFAULT_CASE = model_file("dc", "dc_net_30.e")
+DEFAULT_MEAS = measurement_file("dc", "dc_net_30.meas")
 
 _MEASUREMENT_REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
 _TERMINAL_KIND = TERMINAL_MEASUREMENT_KIND

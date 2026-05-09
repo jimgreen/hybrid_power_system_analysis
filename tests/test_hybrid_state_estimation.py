@@ -29,8 +29,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
 
         original_evaluate = estimator.evaluate
@@ -62,8 +62,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         DCStateEstimator._refresh_measurement_summary_cache = counted_refresh
         try:
             HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
                 flat_start=True,
             )
         finally:
@@ -75,8 +75,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         before_count = len(estimator.measurements)
@@ -93,8 +93,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         calls = {"count": 0}
@@ -113,8 +113,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         calls = {"count": 0}
@@ -134,8 +134,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator, Measurement
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         self.assertFalse(hasattr(estimator, "_measurement_activity_summary_cache"))
@@ -156,7 +156,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         from model.meas_model import MeasurementList
         from secore.hybrid_se import HybridStateEstimator
 
-        measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+        measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
 
         self.assertIsInstance(measurements, MeasurementList)
         self.assertIsNotNone(measurements.table)
@@ -171,7 +171,7 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         estimator = HybridStateEstimator.__new__(HybridStateEstimator)
         estimator.measurements = HybridStateEstimator._load_measurements(
-            ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+            ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"
         )
         estimator._sub_measurements_converted_by_side = {}
 
@@ -285,8 +285,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
         )
         ac = estimator.calc.ac_calc
@@ -309,8 +309,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
             max_iter=1,
         )
@@ -333,8 +333,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator, Measurement
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee300.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas",
             flat_start=False,
         )
         x0 = estimator.initial_state()
@@ -364,8 +364,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         kwargs = dict(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
         )
 
@@ -386,8 +386,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         kwargs = dict(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
         )
 
@@ -408,8 +408,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
             max_iter=25,
         )
@@ -424,8 +424,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
         )
         ac = estimator.calc.ac_calc
@@ -454,8 +454,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         kwargs = dict(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee300.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas",
             flat_start=False,
         )
 
@@ -474,8 +474,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         kwargs = dict(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=False,
         )
 
@@ -490,8 +490,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         kwargs = dict(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=False,
         )
 
@@ -527,8 +527,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         dc_se.DCStateEstimator._run_power_flow_seed = staticmethod(fake_seed)
         try:
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=False,
             )
         finally:
@@ -577,8 +577,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         ac_se.ACPowerFlowCalc = FakePowerFlowCalc
         try:
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee300.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas",
                 flat_start=False,
             )
         finally:
@@ -594,13 +594,13 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         dc_estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         dc = estimator.calc.dc_calc
@@ -622,8 +622,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         kwargs = dict(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
 
@@ -656,8 +656,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -677,8 +677,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -698,8 +698,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         x = estimator.initial_state()
@@ -719,8 +719,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         x = estimator.initial_state()
@@ -753,8 +753,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         x = estimator.initial_state()
@@ -791,8 +791,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.se_array_plan import build_measurement_plan_table as original_builder
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         calls = {"count": 0}
@@ -821,8 +821,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.se_array_plan import build_measurement_plan_table as original_builder
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         calls = {"count": 0}
@@ -847,8 +847,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         calls = []
@@ -868,8 +868,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         calls = []
@@ -889,8 +889,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator, Measurement
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         side_calls = 0
@@ -953,8 +953,8 @@ class HybridStateEstimationTest(unittest.TestCase):
             side_effect=fail_load,
         ):
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
                 flat_start=True,
             )
 
@@ -969,19 +969,19 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         from secore.hybrid_se import HybridStateEstimator
 
-        ac_measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "ac" / "ieee39.meas")
+        ac_measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas")
         with patch.object(HybridStateEstimator, "_load_measurements", return_value=ac_measurements):
             ac_estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
 
-        dc_measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "dc" / "dc_net_30.meas")
+        dc_measurements = HybridStateEstimator._load_measurements(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas")
         with patch.object(HybridStateEstimator, "_load_measurements", return_value=dc_measurements):
             dc_estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=True,
             )
 
@@ -1000,13 +1000,13 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         with patch.object(HybridStateEstimator, "_partition_measurement_list", reject_partition):
             ac_estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
             dc_estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=True,
             )
 
@@ -1025,13 +1025,13 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         with patch.object(HybridStateEstimator, "_initial_measurement_sources_by_side", reject_side_partition):
             ac_estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
             dc_estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-                meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
                 flat_start=True,
             )
 
@@ -1054,8 +1054,8 @@ class HybridStateEstimationTest(unittest.TestCase):
             side_effect=fail_refresh,
         ):
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
                 flat_start=True,
             )
 
@@ -1089,8 +1089,8 @@ class HybridStateEstimationTest(unittest.TestCase):
             wrapped_dc_convert,
         ):
             HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
                 flat_start=True,
             )
 
@@ -1102,7 +1102,7 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         estimator = HybridStateEstimator.__new__(HybridStateEstimator)
         estimator.measurements = HybridStateEstimator._load_measurements(
-            ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+            ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"
         )
         estimator._sub_measurements_converted_by_side = {"ac": False, "dc": False}
 
@@ -1116,8 +1116,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -1139,8 +1139,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -1310,8 +1310,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -1347,8 +1347,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -1366,8 +1366,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
 
@@ -1387,8 +1387,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
         )
         device_name = next(iter(estimator.ac_zero_branch_by_name))
@@ -1415,8 +1415,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
         )
         device_name = next(iter(estimator.ac_zero_branch_by_name))
@@ -1446,8 +1446,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
@@ -1478,8 +1478,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
@@ -1510,8 +1510,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
 
         x = estimator.initial_state()
@@ -1526,9 +1526,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -1561,9 +1561,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -1589,9 +1589,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -1610,8 +1610,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
         x = estimator.initial_state()
         expected = estimator._expand_state_mapped_only(x)
@@ -1640,8 +1640,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         hybrid_se.matpower_branch_stamp = fail_scalar_stamp
         try:
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-                meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             )
         finally:
             hybrid_se.matpower_branch_stamp = original_stamp
@@ -1653,8 +1653,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             max_iter=20,
         )
 
@@ -1704,9 +1704,9 @@ class HybridStateEstimationTest(unittest.TestCase):
                 rc = hybrid_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "hybrid" / "qinling.e"),
+                        str(ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "hybrid" / "qinling.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"),
                         "--flat-start",
                         "--quiet",
                     ]
@@ -1730,9 +1730,9 @@ class HybridStateEstimationTest(unittest.TestCase):
             rc = hybrid_se.main(
                 [
                     "--case",
-                    str(ROOT_DIR / "data" / "hybrid" / "qinling.e"),
+                    str(ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"),
                     "--meas",
-                    str(ROOT_DIR / "data" / "hybrid" / "qinling.meas"),
+                    str(ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"),
                     "--flat-start",
                     "--quiet",
                     "--max-iter",
@@ -1748,8 +1748,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
             max_iter=5,
         )
@@ -1784,8 +1784,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
             max_iter=5,
         )
@@ -1825,8 +1825,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             max_iter=20,
         )
         original_evaluate = estimator.evaluate
@@ -1864,8 +1864,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
         observability = estimator.observability_analysis()
 
@@ -1888,8 +1888,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
         observability = estimator.observability_analysis()
 
@@ -1914,8 +1914,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
         observability = estimator.observability_analysis()
         candidates = estimator._observability_pseudo_candidate_measurements()
@@ -1944,8 +1944,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         initial_active_count = len(estimator.active_measurements)
@@ -1991,8 +1991,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator, Measurement
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         initial_active_count = len(estimator.active_measurements)
@@ -2032,8 +2032,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator, Measurement
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
         additions = [Measurement(500000, "ac_v2", "ACNode", "wt02_src", "V", 5.0, True, 1.01)]
@@ -2134,8 +2134,8 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(hasattr(hybrid_se, "build_normal_equations"))
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
 
         original = hybrid_se.build_normal_equations
@@ -2163,9 +2163,9 @@ class HybridStateEstimationTest(unittest.TestCase):
             self.skipTest("SciPy Cholesky solver is not available")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -2190,9 +2190,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -2224,9 +2224,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -2267,9 +2267,9 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "hybrid" / "qinling.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas")
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -2290,8 +2290,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
-            meas_file=ROOT_DIR / "data" / "hybrid" / "qinling.meas",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
         )
 
         sampled_measurements = []
@@ -2350,7 +2350,7 @@ class HybridStateEstimationTest(unittest.TestCase):
             )
 
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -2417,7 +2417,7 @@ class HybridStateEstimationTest(unittest.TestCase):
             with warnings.catch_warnings():
                 warnings.simplefilter("error", RuntimeWarning)
                 HybridStateEstimator(
-                    e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                    e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                     meas_file=meas_file,
                 )
 
@@ -2443,7 +2443,7 @@ class HybridStateEstimationTest(unittest.TestCase):
             )
 
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
             )
 
@@ -2496,7 +2496,7 @@ class HybridStateEstimationTest(unittest.TestCase):
             )
 
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
@@ -2542,7 +2542,7 @@ class HybridStateEstimationTest(unittest.TestCase):
             )
 
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
@@ -2559,13 +2559,13 @@ class HybridStateEstimationTest(unittest.TestCase):
     def test_qinling_hybrid_state_estimation_with_converter_measurements(self):
         from secore.hybrid_se import HybridStateEstimator
 
-        meas_file = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+        meas_file = ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"
         self.assertTrue(meas_file.exists())
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             all_valid_meas = self._all_valid_measurement_file(tmp_dir, meas_file)
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+                e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
                 meas_file=all_valid_meas,
                 max_iter=20,
             )
@@ -2612,8 +2612,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
         )
 
@@ -2625,14 +2625,14 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "dc" / "dc_net_3000.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "dc" / "dc_net_3000.meas")
             dc_estimator = DCStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_3000.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_3000.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
             estimator = HybridStateEstimator(
-                e_file=ROOT_DIR / "data" / "dc" / "dc_net_3000.e",
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_3000.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
@@ -2661,13 +2661,13 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         dc_estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
 
@@ -2699,9 +2699,9 @@ class HybridStateEstimationTest(unittest.TestCase):
                 code = hybrid_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        str(ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas"),
                         "--flat-start",
                         "--quiet",
                     ]

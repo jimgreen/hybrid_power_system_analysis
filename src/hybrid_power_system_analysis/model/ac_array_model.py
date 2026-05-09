@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from efile_read import efile_factory_from_file
+from paths import resolve_project_file
 
 MODEL_DIR = Path(__file__).resolve().parent
 if str(MODEL_DIR) not in sys.path:
@@ -145,7 +146,7 @@ _AC_PPC_CACHE_LOCK = threading.Lock()
 
 
 def _file_cache_key(file_path) -> Tuple[Path, int, int]:
-    path = Path(file_path).resolve()
+    path = resolve_project_file(file_path).resolve()
     stat = path.stat()
     return path, stat.st_mtime_ns, stat.st_size
 

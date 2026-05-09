@@ -20,8 +20,8 @@
 from secore.ac_se import ACStateEstimator
 
 estimator = ACStateEstimator(
-    e_file="data/ac/ieee300.e",
-    meas_file="data/ac/ieee300.meas",
+    e_file="data/model/ac/ieee300.e",
+    meas_file="data/meas/ac/ieee300.meas",
     flat_start=True,
 )
 result = estimator.estimate(verbose=False)
@@ -30,7 +30,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python -m secore.ac_se --case data\ac\ieee300.e --meas data\ac\ieee300.meas --flat-start --quiet
+python -m secore.ac_se --case data\model\ac\ieee300.e --meas data\meas\ac\ieee300.meas --flat-start --quiet
 ```
 
 常用参数：

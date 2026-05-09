@@ -20,6 +20,7 @@ if str(MODEL_DIR) not in sys.path:
 from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, coo_matrix, csr_matrix, solve_sparse_system
 from dc_lf import DCLFResult, DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
+from paths import model_file
 from hybrid_model import ACAC_CONTROL_TYPES, HybridIsland, HybridPowerNetwork
 from ac_array_model import build_ac_network_from_ppc
 from dc_array_model import build_dc_network_from_ppc
@@ -32,7 +33,7 @@ from hybrid_array_model import (
 )
 
 
-DEFAULT_HYBRID_EFILE = ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e"
+DEFAULT_HYBRID_EFILE = model_file("hybrid", "hybrid_net_40.e")
 LINEAR_SOLVER_CHOICES = (
     "scipy",
     "superlu",

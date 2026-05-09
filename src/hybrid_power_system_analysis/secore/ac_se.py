@@ -44,6 +44,7 @@ from ac_array_model import (
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from efile_read import EBook
+from paths import measurement_file, model_file
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -87,8 +88,8 @@ from secore.se_result import SEResult
 from unit_system import ac_current_base_ka
 
 
-DEFAULT_CASE = ROOT_DIR / "data" / "ac" / "ieee39.e"
-DEFAULT_MEAS = ROOT_DIR / "data" / "ac" / "ieee39.meas"
+DEFAULT_CASE = model_file("ac", "ieee39.e")
+DEFAULT_MEAS = measurement_file("ac", "ieee39.meas")
 
 
 _DEVICE_TYPE_CODES = DEVICE_TYPE_CODES

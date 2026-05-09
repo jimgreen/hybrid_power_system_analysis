@@ -24,6 +24,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
 
 from ac_array_model import build_ac_ppc_from_e_file  # noqa: E402
 from ac_lf import ACPowerFlowCalc  # noqa: E402
+from paths import model_file  # noqa: E402
 
 
 DEFAULT_CASES = ("ieee300", "ieee3k", "ieee1w", "ieee3w")
@@ -33,7 +34,7 @@ _CASE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 def _case_path(case_name: str) -> Path:
     if not _CASE_RE.match(case_name):
         raise ValueError(f"Invalid case name: {case_name!r}")
-    return ROOT_DIR / "data" / "ac" / f"{case_name}.e"
+    return model_file("ac", f"{case_name}.e")
 
 
 def _silent(func, *args, **kwargs):

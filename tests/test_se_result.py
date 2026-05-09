@@ -161,8 +161,8 @@ class SEResultTest(unittest.TestCase):
         from secore.se_result import SEResult
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             flat_start=True,
         )
 
@@ -197,9 +197,9 @@ class SEResultTest(unittest.TestCase):
                     rc = dc_se.main(
                         [
                             "--case",
-                            str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                            str(ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"),
                             "--meas",
-                            str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                            str(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas"),
                             "--flat-start",
                             "--quiet",
                             "--se-result",
@@ -319,9 +319,9 @@ class SEResultTest(unittest.TestCase):
                 rc = dc_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.e"),
+                        str(ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "dc" / "dc_net_30.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas"),
                         "--flat-start",
                         "--quiet",
                         "--se-result",

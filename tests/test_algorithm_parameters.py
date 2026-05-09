@@ -92,7 +92,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         ac_lf.load_ac_ppc_from_e_file = fake_loader
         ac_lf.ACPowerFlowCalc = FakeCalc
         try:
-            rc = ac_lf.main(["data/ac/ieee39.e", "--para", "custom_lf.para", "--quiet"])
+            rc = ac_lf.main(["data/model/ac/ieee39.e", "--para", "custom_lf.para", "--quiet"])
         finally:
             ac_lf.load_ac_ppc_from_e_file = original_loader
             ac_lf.ACPowerFlowCalc = original_calc
@@ -133,7 +133,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         dc_lf._dc_network_from_ppc = fake_network_builder
         dc_lf.DCPowerFlowCalc = FakeCalc
         try:
-            rc = dc_lf.main(["data/dc/dc_net_30.e", "--para", "custom_lf.para", "--quiet"])
+            rc = dc_lf.main(["data/model/dc/dc_net_30.e", "--para", "custom_lf.para", "--quiet"])
         finally:
             dc_lf.load_dc_ppc_from_e_file = original_loader
             dc_lf._dc_network_from_ppc = original_network_builder
@@ -176,7 +176,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         hybrid_lf._read_lf_network_from_file = fake_loader
         hybrid_lf.HybridPowerFlowCalc = FakeCalc
         try:
-            rc = hybrid_lf.main(["data/hybrid/hybrid_net_40.e", "--para", "custom_lf.para", "--quiet"])
+            rc = hybrid_lf.main(["data/model/hybrid/hybrid_net_40.e", "--para", "custom_lf.para", "--quiet"])
         finally:
             hybrid_lf._read_lf_network_from_file = original_loader
             hybrid_lf.HybridPowerFlowCalc = original_calc
@@ -217,7 +217,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         try:
             rc = hybrid_lf.main(
                 [
-                    "data/hybrid/hybrid_net_40.e",
+                    "data/model/hybrid/hybrid_net_40.e",
                     "--linear-solver",
                     "sksparse.klu.klu_solve",
                     "--quiet",
@@ -316,7 +316,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         with self.assertRaises(SystemExit) as ctx:
-            hybrid_lf.main(["data/hybrid/hybrid_net_40.e", "--linear-solver", "unknown-solver", "--quiet"])
+            hybrid_lf.main(["data/model/hybrid/hybrid_net_40.e", "--linear-solver", "unknown-solver", "--quiet"])
 
         self.assertEqual(2, ctx.exception.code)
 
@@ -346,7 +346,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             self.assertEqual(params.max_iter, dc_calc.params.max_iter)
             self.assertEqual(params.min_voltage, dc_calc.params.min_voltage)
 
-            network = HybridPowerNetwork.read_from_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+            network = HybridPowerNetwork.read_from_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
             hybrid_calc = HybridPowerFlowCalc(network, parameter_file=para_file, verbose=False)
             self.assertEqual(params.tol, hybrid_calc.tol)
             self.assertEqual(params.max_iter, hybrid_calc.max_iter)
@@ -379,7 +379,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             self.assertEqual(5, params.targeted_pseudo_measurement_step)
 
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ac_net_10.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e",
                 meas_file=meas_file,
                 parameter_file=para_file,
             )

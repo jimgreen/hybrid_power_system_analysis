@@ -29,7 +29,7 @@
 from lfcore.hybrid_lf import run_hybrid_power_flow
 
 result = run_hybrid_power_flow(
-    "data/hybrid/qinling.e",
+    "data/model/hybrid/qinling.e",
     tol=1e-8,
     max_iter=50,
     min_voltage=0.01,
@@ -40,7 +40,7 @@ result = run_hybrid_power_flow(
 命令行：
 
 ```powershell
-python -m lfcore.hybrid_lf data\hybrid\qinling.e --quiet
+python -m lfcore.hybrid_lf data\model\hybrid\qinling.e --quiet
 ```
 
 参数：

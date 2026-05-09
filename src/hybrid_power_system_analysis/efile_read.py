@@ -3,6 +3,8 @@ import threading
 import weakref
 from pathlib import Path
 
+from paths import resolve_project_file
+
 
 _QUOTED_SPLIT_RE = re.compile(r"\s+(?=(?:[^']*'[^']*')*[^']*$)")
 
@@ -133,6 +135,7 @@ class EBook():
 
         
     def _read_file_(self, file_path):
+        file_path = resolve_project_file(file_path)
         data = self.data
         block_read = None
         split_data_row = _split_data_row
@@ -198,6 +201,7 @@ class EBook():
 
 
 def _read_efile_rows(file_path):
+    file_path = resolve_project_file(file_path)
     data = {}
     block_name = None
     header = None
@@ -458,5 +462,4 @@ if __name__ == '__main__':
     cls = EBook(path)
     cls.apply_to_file()
     # csv文件测试
-
     pass

@@ -1,7 +1,0 @@
-<PowerFlowParameter>
-@ name                 value
-# tol                  1e-8
-# max_iter             50
-# min_voltage          0.01
-# divergence_threshold 1e6
-</PowerFlowParameter>

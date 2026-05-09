@@ -50,7 +50,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import SWITCH_COLS, build_ac_ppc_from_e_file
         from ac_model import ACPowerNetwork, ACBreak
 
-        source = ROOT_DIR / "data" / "ac" / "ac_net_10.e"
+        source = ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e"
         with tempfile.TemporaryDirectory() as tmp_dir:
             case_path = Path(tmp_dir) / "ac_break.e"
             text = source.read_text(encoding="utf-8")
@@ -89,7 +89,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "hybrid" / "qinling_100.e"
+        case_path = ROOT_DIR / "data" / "model" / "hybrid" / "qinling_100.e"
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             network.read_from_file(case_path)
@@ -112,7 +112,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"
         expected_network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             expected_network.read_from_file(case_path)
@@ -145,7 +145,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
 
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -177,7 +177,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
 
         nr_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
@@ -212,7 +212,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         with self.assertRaises(ValueError):
             ACPowerFlowCalc(ppc, algorithm="bad")
@@ -222,7 +222,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_network as original_builder
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         previous_builder = getattr(ac_lf, "build_ac_ppc_from_network", None)
         previous_file_builder = getattr(ac_lf, "build_ac_ppc_from_e_file", None)
         calls = []
@@ -257,7 +257,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             network.read_from_file(case_path)
@@ -290,7 +290,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import BUS_COLS, build_ac_ppc_from_e_file, build_ac_ppc_from_network
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         expected = build_ac_ppc_from_e_file(case_path)
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -308,7 +308,7 @@ class ACPPCFlowTest(unittest.TestCase):
     def test_build_ac_ppc_from_e_file_delegates_through_network_model(self):
         import ac_array_model
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ac_array_model.clear_ac_ppc_cache(case_path)
         original = ac_array_model.build_ac_ppc_from_network
         calls = []
@@ -358,7 +358,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
 
         original_splu = ac_lf.splu
@@ -394,7 +394,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -413,7 +413,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -438,7 +438,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -465,7 +465,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -498,7 +498,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -530,7 +530,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -550,7 +550,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "ac" / "ieee300.e")
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee300.e")
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="none", verbose=False)
 
         captured = io.StringIO()
@@ -565,7 +565,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "ac" / "ieee300.e")
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee300.e")
         ppc.pop("_pf_static", None)
 
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="none")
@@ -604,7 +604,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         ppc.pop("_pf_static", None)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
@@ -631,7 +631,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from hybrid_array_model import build_hybrid_ppc_from_e_file
 
-        _, hybrid_ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, hybrid_ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         ppc = hybrid_ppc["ac"]
         first = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):

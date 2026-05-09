@@ -28,14 +28,14 @@ from hybrid_net_flow import run_hybrid_power_flow
 
 
 CASES = (
-    ("ieee9", "case9", ROOT_DIR / "data" / "ac" / "ieee9.e"),
-    ("ieee14", "case14", ROOT_DIR / "data" / "ac" / "ieee14.e"),
-    ("ieee24", "case24_ieee_rts", ROOT_DIR / "data" / "ac" / "ieee24.e"),
-    ("ieee30", "case30", ROOT_DIR / "data" / "ac" / "ieee30.e"),
-    ("ieee39", "case39", ROOT_DIR / "data" / "ac" / "ieee39.e"),
-    ("ieee57", "case57", ROOT_DIR / "data" / "ac" / "ieee57.e"),
-    ("ieee118", "case118", ROOT_DIR / "data" / "ac" / "ieee118.e"),
-    ("ieee300", "case300", ROOT_DIR / "data" / "ac" / "ieee300.e"),
+    ("ieee9", "case9", ROOT_DIR / "data" / "model" / "ac" / "ieee9.e"),
+    ("ieee14", "case14", ROOT_DIR / "data" / "model" / "ac" / "ieee14.e"),
+    ("ieee24", "case24_ieee_rts", ROOT_DIR / "data" / "model" / "ac" / "ieee24.e"),
+    ("ieee30", "case30", ROOT_DIR / "data" / "model" / "ac" / "ieee30.e"),
+    ("ieee39", "case39", ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"),
+    ("ieee57", "case57", ROOT_DIR / "data" / "model" / "ac" / "ieee57.e"),
+    ("ieee118", "case118", ROOT_DIR / "data" / "model" / "ac" / "ieee118.e"),
+    ("ieee300", "case300", ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"),
 )
 
 

@@ -23,24 +23,24 @@ from hybrid_se import HybridStateEstimator  # noqa: E402
 
 
 CASE_MAP = {
-    "ieee300": ("ac", ROOT_DIR / "data" / "ac" / "ieee300.e", ROOT_DIR / "data" / "ac" / "ieee300.meas"),
-    "ieee3k": ("ac", ROOT_DIR / "data" / "ac" / "ieee3k.e", ROOT_DIR / "data" / "ac" / "ieee3k.meas"),
-    "ieee1w": ("ac", ROOT_DIR / "data" / "ac" / "ieee1w.e", ROOT_DIR / "data" / "ac" / "ieee1w.meas"),
-    "ieee3w": ("ac", ROOT_DIR / "data" / "ac" / "ieee3w.e", ROOT_DIR / "data" / "ac" / "ieee3w.meas"),
+    "ieee300": ("ac", ROOT_DIR / "data" / "model" / "ac" / "ieee300.e", ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas"),
+    "ieee3k": ("ac", ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e", ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas"),
+    "ieee1w": ("ac", ROOT_DIR / "data" / "model" / "ac" / "ieee1w.e", ROOT_DIR / "data" / "meas" / "ac" / "ieee1w.meas"),
+    "ieee3w": ("ac", ROOT_DIR / "data" / "model" / "ac" / "ieee3w.e", ROOT_DIR / "data" / "meas" / "ac" / "ieee3w.meas"),
     "dc_net_3000": (
         "dc",
-        ROOT_DIR / "data" / "dc" / "dc_net_3000.e",
-        ROOT_DIR / "data" / "dc" / "dc_net_3000.meas",
+        ROOT_DIR / "data" / "model" / "dc" / "dc_net_3000.e",
+        ROOT_DIR / "data" / "meas" / "dc" / "dc_net_3000.meas",
     ),
     "qingling_100": (
         "hybrid",
-        ROOT_DIR / "data" / "hybrid" / "qingling_100.e",
-        ROOT_DIR / "data" / "hybrid" / "qingling_100.meas",
+        ROOT_DIR / "data" / "model" / "hybrid" / "qingling_100.e",
+        ROOT_DIR / "data" / "meas" / "hybrid" / "qingling_100.meas",
     ),
     "qingling_1000": (
         "hybrid",
-        ROOT_DIR / "data" / "hybrid" / "qingling_1000.e",
-        ROOT_DIR / "data" / "hybrid" / "qingling_1000.meas",
+        ROOT_DIR / "data" / "model" / "hybrid" / "qingling_1000.e",
+        ROOT_DIR / "data" / "meas" / "hybrid" / "qingling_1000.meas",
     ),
 }
 

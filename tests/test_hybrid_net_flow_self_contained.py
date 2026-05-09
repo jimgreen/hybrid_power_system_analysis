@@ -64,7 +64,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import hybrid_net_flow
 
         result = hybrid_net_flow.run_hybrid_power_flow(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e",
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
             verbose=False,
         )
 
@@ -91,7 +91,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import hybrid_net_flow
 
         network = hybrid_net_flow.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         )
         network.prepare(verbose=False)
         calc = hybrid_net_flow.HybridPowerFlowCalc(network, verbose=False)
@@ -114,7 +114,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         network = hybrid_lf.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         )
         calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -141,7 +141,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         network = hybrid_lf.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         )
         calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -172,7 +172,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         network = hybrid_lf.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         )
         calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="none")
 
@@ -198,7 +198,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_newton_uses_shared_sparse_solver(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, linear_solver="umfpack")
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -229,7 +229,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import hybrid_net_flow
 
         network = hybrid_net_flow.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         )
         network.prepare(verbose=False)
         calc = hybrid_net_flow.HybridPowerFlowCalc(network, verbose=False)
@@ -259,9 +259,9 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_network_load_uses_array_model_for_all_case_shapes(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        ac_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "ac" / "ieee300.e")
-        dc_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "dc" / "dc_net_30.e")
-        hybrid_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        ac_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "ac" / "ieee300.e")
+        dc_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "dc" / "dc_net_30.e")
+        hybrid_network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
 
         self.assertEqual("hybrid_ppc_v1", ac_network.ppc["format"])
         self.assertEqual("hybrid_ppc_v1", dc_network.ppc["format"])
@@ -277,7 +277,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_ppc_builds_sub_ppc_from_shared_model(self):
         import model.hybrid_array_model as hybrid_array_model
 
-        case_path = ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+        case_path = ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         original_factory = hybrid_array_model.efile_factory_from_file
         original_ac_builder = hybrid_array_model.build_ac_ppc_from_model
         original_dc_builder = hybrid_array_model.build_dc_ppc_from_model
@@ -343,7 +343,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
         from ac_model import ACPowerNetwork
 
-        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
 
         self.assertFalse(hasattr(hybrid_lf, "_build_lf_ac_facade"))
         self.assertTrue(hasattr(hybrid_lf, "_build_lf_ac_network"))
@@ -364,7 +364,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         hybrid_lf._build_lf_ac_network = reject_rebuild
         hybrid_lf._build_lf_dc_network = reject_rebuild
         try:
-            network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+            network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         finally:
             hybrid_lf._build_lf_ac_network = original_ac_builder
             hybrid_lf._build_lf_dc_network = original_dc_builder
@@ -377,7 +377,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_ppc_model_build_delegates_to_ac_dc_array_helpers(self):
         import model.hybrid_array_model as hybrid_array_model
 
-        _network, ppc = hybrid_array_model.build_hybrid_ppc_from_e_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        _network, ppc = hybrid_array_model.build_hybrid_ppc_from_e_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
 
         self.assertFalse(hasattr(hybrid_array_model, "_build_ac_network"))
         self.assertFalse(hasattr(hybrid_array_model, "_build_dc_network"))
@@ -402,7 +402,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         result = hybrid_lf.run_hybrid_power_flow(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e",
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
             verbose=False,
         )
 
@@ -423,7 +423,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             def __iter__(self):
                 raise AssertionError("hybrid converter helpers should use cached converter arrays")
 
-        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         network.prepare(verbose=False)
         calc = HybridPowerFlowCalc(network, verbose=False)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -443,7 +443,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_power_flow_can_skip_full_lf_result_build(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 
-        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False)
         calc.skip_lf_result = True
 
@@ -462,7 +462,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_result_mode_skips_full_hybrid_result_backfill(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
 
-        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
 
         def reject_full_backfill(_x):
@@ -493,7 +493,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_power_flow_uses_dc_ppc_without_dc_object_topo(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "hybrid" / "hybrid_net_40.e")
+        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         dc_network_class = network.dc.__class__
         original_topo = dc_network_class.topo
 
@@ -517,7 +517,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import hybrid_net_flow
 
         network = hybrid_net_flow.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         )
 
         network.topo()
@@ -549,7 +549,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             case_path = Path(tmpdir) / "hybrid_acac.e"
-            source_path = ROOT / "data" / "hybrid" / "hybrid_net_40.e"
+            source_path = ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
             source_text = source_path.read_text(encoding="utf-8").split("<ACACConverter>")[0].rstrip()
             acac_block = """
 
@@ -584,7 +584,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import hybrid_net_flow
 
         network = hybrid_net_flow.HybridPowerNetwork.read_from_file(
-            ROOT / "data" / "hybrid" / "qinling.e"
+            ROOT / "data" / "model" / "hybrid" / "qinling.e"
         )
 
         ac_warnings, ac_errors, dc_warnings, dc_errors = network.prepare(verbose=False)
@@ -609,7 +609,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         DCPowerNetwork.check_topo = reject_check_topo
         try:
             result = hybrid_net_flow.run_hybrid_power_flow(
-                ROOT / "data" / "hybrid" / "qinling.e",
+                ROOT / "data" / "model" / "hybrid" / "qinling.e",
                 verbose=False,
             )
         finally:
@@ -621,7 +621,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_node_run_stat_zero_removes_attached_converter_from_solution(self):
         import hybrid_net_flow
 
-        text = (ROOT / "data" / "hybrid" / "qinling.e").read_text(encoding="utf-8")
+        text = (ROOT / "data" / "model" / "hybrid" / "qinling.e").read_text(encoding="utf-8")
         text = _ensure_block_column(text, "ACNode", "run_stat", "1")
         text = _ensure_block_column(text, "DCNode", "run_stat", "1")
         for block_name, row_idx in (

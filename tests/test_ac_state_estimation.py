@@ -156,8 +156,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
         self.assertTrue(estimator.active_measurements_are_vectorized)
@@ -181,8 +181,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         class FailingList(list):
@@ -201,8 +201,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         class TableBackedList(list):
@@ -728,8 +728,8 @@ class ACStateEstimationTest(unittest.TestCase):
         secore.ac_se.build_ac_ppc_from_e_file = counted_file_loader
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             )
         finally:
             if previous_builder is None:
@@ -787,11 +787,11 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         loader = ACStateEstimator.__new__(ACStateEstimator)
-        network = loader._load_network(ROOT_DIR / "data" / "ac" / "ieee39.e")
-        measurements = ACStateEstimator._load_measurements(ROOT_DIR / "data" / "ac" / "ieee39.meas")
+        network = loader._load_network(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        measurements = ACStateEstimator._load_measurements(ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas")
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             network=network,
             measurements=measurements,
             flat_start=True,
@@ -955,8 +955,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ac_se.ACPowerNetwork.check_topo = reject_check_topo
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
         finally:
@@ -1013,10 +1013,10 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
-        estimator.measurements = estimator._load_measurements(ROOT_DIR / "data" / "ac" / "ieee39.meas")
+        estimator.measurements = estimator._load_measurements(ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas")
         estimator._disable_angle_measurements()
         estimator._disable_unavailable_measurements()
 
@@ -1040,8 +1040,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ac_se.ACStateEstimator._disable_unavailable_measurements = reject_scan
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
         finally:
@@ -1061,8 +1061,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ac_se.ACStateEstimator._refresh_measurement_summary_cache = reject_summary_scan
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
         finally:
@@ -1087,8 +1087,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ac_se.ACStateEstimator._active_measurement_keys = reject_active_measurements
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
                 flat_start=True,
             )
         finally:
@@ -1101,8 +1101,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
         )
         theta, _voltage = estimator._unpack_state(estimator.initial_state())
@@ -1121,8 +1121,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
             max_iter=1,
         )
@@ -1140,8 +1140,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, Measurement
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee300.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas",
             flat_start=False,
         )
         x0 = estimator.initial_state()
@@ -1170,8 +1170,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3k.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas",
             flat_start=True,
             max_iter=25,
         )
@@ -1184,8 +1184,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
         )
         ref = estimator.node_by_name["bus_16"]
@@ -1226,8 +1226,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ac_se.ACStateEstimator._run_power_flow_seed = staticmethod(fake_seed)
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee300.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas",
                 flat_start=False,
             )
         finally:
@@ -1289,8 +1289,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ACStateEstimator._sync_ac_network_to_ppc = staticmethod(reject_full_sync)
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee300.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee300.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee300.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas",
                 flat_start=False,
             )
         finally:
@@ -1379,8 +1379,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
         device_name = next(iter(estimator.zero_branch_by_name))
@@ -1407,8 +1407,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
@@ -1431,8 +1431,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.se_math import ANGLE_MEASUREMENT_TYPES
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee3w.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee3w.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3w.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee3w.meas",
             flat_start=True,
         )
 
@@ -1499,7 +1499,7 @@ class ACStateEstimationTest(unittest.TestCase):
             )
 
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
                 meas_file=meas_file,
             )
 
@@ -1538,7 +1538,7 @@ class ACStateEstimationTest(unittest.TestCase):
             )
 
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
                 meas_file=meas_file,
             )
 
@@ -1581,7 +1581,7 @@ class ACStateEstimationTest(unittest.TestCase):
                 encoding="utf-8",
             )
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ac_net_10.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e",
                 meas_file=meas_file,
             )
 
@@ -1637,8 +1637,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
 
@@ -1656,8 +1656,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         pseudo_keys = {
@@ -1692,7 +1692,7 @@ class ACStateEstimationTest(unittest.TestCase):
             )
 
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
                 meas_file=meas_file,
             )
 
@@ -1734,7 +1734,7 @@ class ACStateEstimationTest(unittest.TestCase):
             )
 
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
                 meas_file=meas_file,
                 flat_start=True,
             )
@@ -1756,8 +1756,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         original_evaluate = estimator.evaluate
@@ -1779,8 +1779,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         x = estimator.initial_state()
@@ -1796,8 +1796,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
         x = estimator.initial_state()
@@ -1821,8 +1821,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         old_state_count = estimator.n_angle + estimator.n_voltage + 2 * estimator.n_switch_current
@@ -1842,8 +1842,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, Measurement
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         gen = estimator.generator_order[0]
         load = estimator.load_order[0]
@@ -1871,8 +1871,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, Measurement
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         gen = next(
             item
@@ -1909,8 +1909,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         balance_rows = [
@@ -1930,8 +1930,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
         dense = estimator.jacobian(x)
@@ -1951,8 +1951,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
         dense = estimator.jacobian(x)
@@ -1972,8 +1972,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
         dense = estimator.jacobian(x)
@@ -1993,8 +1993,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
         dense = estimator.jacobian(x)
@@ -2013,8 +2013,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
         generator_measurements = [
@@ -2037,8 +2037,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
         x = estimator.initial_state()
@@ -2063,8 +2063,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             max_iter=20,
         )
 
@@ -2087,8 +2087,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             max_iter=20,
         )
 
@@ -2110,8 +2110,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         cached = estimator._simple_jacobian_plan_cache.get(id(estimator.active_measurements))
@@ -2122,8 +2122,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         class RejectCache(dict):
@@ -2171,8 +2171,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.se_array_plan import build_measurement_plan_table as original_builder
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
         )
         for attr in (
@@ -2215,12 +2215,12 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         first = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         second = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         self.assertIsNot(
@@ -2233,8 +2233,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         expected_device_keys = set(estimator._active_device_keys())
         expected_measurement_keys = set(estimator._active_measurement_keys())
@@ -2254,8 +2254,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         np.testing.assert_allclose(
@@ -2279,8 +2279,8 @@ class ACStateEstimationTest(unittest.TestCase):
         ac_se.matpower_branch_stamp = fail_scalar_stamp
         try:
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-                meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             )
         finally:
             ac_se.matpower_branch_stamp = original_stamp
@@ -2292,8 +2292,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, ObservabilityResult
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         initial_observability = ObservabilityResult(
             True,
@@ -2322,8 +2322,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, ObservabilityResult
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         measurements = estimator.active_measurements[:]
         initial_observability = ObservabilityResult(
@@ -2356,8 +2356,8 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(hasattr(ac_se, "build_normal_equations"))
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         original = ac_se.build_normal_equations
@@ -2391,11 +2391,11 @@ class ACStateEstimationTest(unittest.TestCase):
             rc = ac_se.main(
                 [
                     "--case",
-                    str(ROOT_DIR / "data" / "ac" / "ieee39.e"),
+                    str(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"),
                     "--meas",
-                    str(ROOT_DIR / "data" / "ac" / "ieee39.meas"),
+                    str(ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas"),
                     "--para",
-                    str(ROOT_DIR / "se.para"),
+                    str(ROOT_DIR / "data" / "se" / "se.para"),
                     "--flat-start",
                     "--quiet",
                     "--skip-bad-data",
@@ -2437,11 +2437,11 @@ class ACStateEstimationTest(unittest.TestCase):
                 rc = ac_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "ac" / "ieee39.e"),
+                        str(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "ac" / "ieee39.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas"),
                         "--para",
-                        str(ROOT_DIR / "se.para"),
+                        str(ROOT_DIR / "data" / "se" / "se.para"),
                         "--flat-start",
                         "--quiet",
                     ]
@@ -2472,11 +2472,11 @@ class ACStateEstimationTest(unittest.TestCase):
                 rc = ac_se.main(
                     [
                         "--case",
-                        str(ROOT_DIR / "data" / "ac" / "ieee39.e"),
+                        str(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"),
                         "--meas",
-                        str(ROOT_DIR / "data" / "ac" / "ieee39.meas"),
+                        str(ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas"),
                         "--para",
-                        str(ROOT_DIR / "se.para"),
+                        str(ROOT_DIR / "data" / "se" / "se.para"),
                         "--flat-start",
                         "--quiet",
                     ]
@@ -2490,8 +2490,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         original_jacobian = estimator.jacobian_sparse
         calls = 0
@@ -2517,8 +2517,8 @@ class ACStateEstimationTest(unittest.TestCase):
             self.skipTest("SciPy Cholesky solver is not available")
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         original_solve = np.linalg.solve
@@ -2549,8 +2549,8 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsNotNone(getattr(se_math, "DPOSV", None))
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         call_count = 0
@@ -2574,8 +2574,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         original_svd = np.linalg.svd
@@ -2658,8 +2658,8 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsNotNone(getattr(se_math, "DPOTRF", None))
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         original_cholesky = np.linalg.cholesky
@@ -2683,9 +2683,9 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "ac" / "ieee39.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas")
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
                 meas_file=meas_file,
             )
 
@@ -2726,8 +2726,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         builder = getattr(estimator, "_build_branch_transformer_vector_plan", None)
         self.assertIsNotNone(builder)
@@ -2750,8 +2750,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         self.assertIn(id(estimator.active_measurements), estimator._branch_transformer_vector_plan_cache)
@@ -2760,9 +2760,9 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "ac" / "ieee39.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas")
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
                 meas_file=meas_file,
             )
 
@@ -2803,8 +2803,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         gen_name = next(iter(estimator.generator_by_name))
@@ -2835,8 +2835,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         generator_measurements = [
@@ -2863,8 +2863,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
         x = estimator.initial_state()
@@ -2884,9 +2884,9 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "ac" / "ac_net_30.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas")
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
                 meas_file=meas_file,
                 max_iter=20,
             )
@@ -2908,9 +2908,9 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "ac" / "ac_net_30.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas")
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
                 meas_file=meas_file,
                 max_iter=20,
             )
@@ -2943,9 +2943,9 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "ac" / "ieee3k.meas")
+            meas_file = self._all_valid_measurement_file(tmp_dir, ROOT_DIR / "data" / "meas" / "ac" / "ieee3k.meas")
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ieee3k.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee3k.e",
                 meas_file=meas_file,
                 flat_start=True,
                 max_iter=30,
@@ -2975,8 +2975,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
 
@@ -2996,8 +2996,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
 
@@ -3143,8 +3143,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, ObservabilityResult
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
             prepare_active_measurements=False,
         )
@@ -3188,8 +3188,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, Measurement
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
             prepare_active_measurements=False,
         )
@@ -3216,8 +3216,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator, Measurement
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
             prepare_active_measurements=False,
         )
@@ -3350,8 +3350,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
         )
 
         original_jacobian_sparse = estimator.jacobian_sparse
@@ -3405,8 +3405,8 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ac_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
             flat_start=True,
         )
 

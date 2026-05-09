@@ -17,10 +17,11 @@ if str(LFCORE_DIR) not in sys.path:
 
 from efile_read import EBook
 from lfcore.hybrid_lf import run_hybrid_power_flow
+from paths import DATA_DIR, model_file
 
 
-DEFAULT_MODEL_FILE = ROOT_DIR / "data" / "hybrid" / "qinling.e"
-DEFAULT_LIMIT_FILE = ROOT_DIR / "data" / "hybrid" / "qinling.calmt"
+DEFAULT_MODEL_FILE = model_file("hybrid", "qinling.e")
+DEFAULT_LIMIT_FILE = DATA_DIR / "ca" / "qinling.calmt"
 DEFAULT_N0_RESULT_FILE = ROOT_DIR / "data" / "ca" / "qinling.ca.n0rslt"
 DEFAULT_N1_RESULT_FILE = ROOT_DIR / "data" / "ca" / "qinling.ca.n1rslt"
 DEFAULT_CALC_INFO_FILE = ROOT_DIR / "data" / "ca" / "ca_calc_info.e"

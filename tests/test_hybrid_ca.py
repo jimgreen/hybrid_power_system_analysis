@@ -47,7 +47,7 @@ def test_hybrid_ca_writes_risk_result_efile(tmp_path):
     _write_tight_calmt(calmt_file)
 
     n0_risks, n1_risks = run_hybrid_ca(
-        ROOT / "data" / "hybrid" / "hybrid_net_40.e",
+        ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
         calmt_file,
         n0_file,
         n1_file,
@@ -83,7 +83,7 @@ def test_hybrid_ca_writes_risk_result_efile(tmp_path):
 def test_hybrid_ca_n1_scan_includes_ac_units_and_loads():
     from cacore.hybrid_ca import _contingency_rows
 
-    contingencies = set(_contingency_rows(ROOT / "data" / "hybrid" / "qinling.e"))
+    contingencies = set(_contingency_rows(ROOT / "data" / "model" / "hybrid" / "qinling.e"))
 
     assert ("ACGenerator", "ACUnit", "wt01_10kw") in contingencies
     assert ("ACLoad", "ACLoad", "load_ac_1") in contingencies

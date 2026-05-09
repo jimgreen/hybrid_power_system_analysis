@@ -10,7 +10,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import DCPowerNetwork
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
 
         self.assertEqual("dc_ppc_v1", network.ppc["format"])
@@ -42,7 +42,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import DCPowerNetwork
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = DCPowerFlowCalc(network, linear_solver="not-installed-solver")
 
@@ -59,7 +59,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import DCPowerNetwork
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = DCPowerFlowCalc(network)
 
@@ -77,7 +77,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import build_dc_ppc_from_e_file
 
-        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         calc = DCPowerFlowCalc(ppc)
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -94,7 +94,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import build_dc_ppc_from_e_file
 
-        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         ppc.pop("_dc_pf_static", None)
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -130,7 +130,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import build_dc_ppc_from_e_file
 
-        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         ppc.pop("_dc_pf_static", None)
         calc = DCPowerFlowCalc(ppc)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -156,7 +156,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import build_dc_ppc_from_e_file
 
-        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         ppc.pop("_dc_pf_static", None)
 
         calc = DCPowerFlowCalc(ppc, result_mode="none")
@@ -188,7 +188,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc
 
-        case_path = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        case_path = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         original_loader = dc_lf._build_dc_ppc_from_e_file
         calls = []
 
@@ -232,7 +232,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
                 return super().get_jacobi(G, x, terms=terms)
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = CountingDCPowerFlowCalc(network)
 
@@ -255,7 +255,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             build_dc_ppc_from_e_file,
         )
 
-        e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         ppc = build_dc_ppc_from_e_file(e_file)
         cached_ppc = build_dc_ppc_from_e_file(e_file)
 
@@ -275,7 +275,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         import numpy as np
         from model.dc_array_model import BUS_COLS, DCPowerNetwork, build_dc_ppc_from_e_file, build_dc_ppc_from_network
 
-        e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         expected = build_dc_ppc_from_e_file(e_file)
         network = DCPowerNetwork()
         network.read_from_file(e_file)
@@ -292,7 +292,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_build_dc_ppc_from_e_file_delegates_through_network_model(self):
         from model import dc_array_model
 
-        e_file = Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e"
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         dc_array_model.clear_dc_ppc_cache(e_file)
         original = dc_array_model.build_dc_ppc_from_network
         calls = []
@@ -320,7 +320,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
                 raise AssertionError("DCDC control equations should use cached vectorized masks")
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -342,7 +342,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
                 raise AssertionError("DC load-flow backfill should use cached branch arrays")
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -359,7 +359,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import DCPowerNetwork
 
         network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "dc" / "dc_net_30.e")
+        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
