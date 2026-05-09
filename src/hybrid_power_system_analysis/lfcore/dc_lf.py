@@ -53,8 +53,9 @@ from pathlib import Path
 import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+for path in (ROOT_DIR,):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
@@ -1639,7 +1640,7 @@ class DCPowerFlowCalc:
         return coo_matrix((J_data, (J_rows, J_cols)), shape=(self.total_eq, self.total_vars)).tocsr()
 
     def get_jacobi(self, G, x, terms=None):
-        """Public Jacobian API retained for tests and callers."""
+        """Public Jacobian API for tests and external callers."""
         terms = self._eval_newton_terms(G, x) if terms is None else terms
         return self._get_jacobi_from_terms(G, x, terms)
 
@@ -1699,7 +1700,7 @@ class DCPowerFlowCalc:
         return F
 
     def get_f(self, x, terms=None):
-        """Public residual API retained for tests and callers."""
+        """Public residual API for tests and external callers."""
         terms = self._eval_newton_terms(self.G, x) if terms is None else terms
         return self._get_f_from_terms(x, terms)
 

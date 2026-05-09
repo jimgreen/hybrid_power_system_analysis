@@ -5,11 +5,10 @@ from typing import Dict, Tuple
 import numpy as np
 
 MODEL_DIR = Path(__file__).resolve().parent
-if str(MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(MODEL_DIR))
 ROOT_DIR = MODEL_DIR.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+for path in (MODEL_DIR, ROOT_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from ac_array_model import build_ac_ppc_from_model
 from dc_array_model import build_dc_ppc_from_model

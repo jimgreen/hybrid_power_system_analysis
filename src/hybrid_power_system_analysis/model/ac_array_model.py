@@ -9,8 +9,9 @@ from efile_read import efile_factory_from_file
 from paths import resolve_project_file
 
 MODEL_DIR = Path(__file__).resolve().parent
-if str(MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(MODEL_DIR))
+for path in (MODEL_DIR,):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 
 CTRL_PQ = 0

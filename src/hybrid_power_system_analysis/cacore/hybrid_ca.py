@@ -9,11 +9,10 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 LFCORE_DIR = ROOT_DIR / "lfcore"
-if str(LFCORE_DIR) not in sys.path:
-    sys.path.insert(0, str(LFCORE_DIR))
+for path in (ROOT_DIR, LFCORE_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from efile_read import EBook
 from lfcore.hybrid_lf import run_hybrid_power_flow

@@ -4,8 +4,9 @@ import sys
 from typing import List, Tuple
 
 MODEL_DIR = Path(__file__).resolve().parent
-if str(MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(MODEL_DIR))
+for path in (MODEL_DIR,):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from ac_model import ACPowerNetwork
 from dc_array_model import DCPowerNetwork

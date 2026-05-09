@@ -15,11 +15,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 MODEL_DIR = ROOT_DIR / "model"
-if str(MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(MODEL_DIR))
+for path in (ROOT_DIR, MODEL_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file

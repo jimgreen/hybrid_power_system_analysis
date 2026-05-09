@@ -8,14 +8,11 @@ from typing import Any, List, Optional, Tuple
 import numpy as np
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 LFCORE_DIR = Path(__file__).resolve().parent
-if str(LFCORE_DIR) not in sys.path:
-    sys.path.insert(0, str(LFCORE_DIR))
 MODEL_DIR = ROOT_DIR / "model"
-if str(MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(MODEL_DIR))
+for path in (ROOT_DIR, LFCORE_DIR, MODEL_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, coo_matrix, csr_matrix, solve_sparse_system
 from dc_lf import DCLFResult, DCPowerFlowCalc
