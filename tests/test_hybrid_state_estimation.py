@@ -44,6 +44,43 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertIsNotNone(snapshot.value("DCBreak", dc_breaker.name, "V_FROM"))
         self.assertIsNotNone(snapshot.value("DCBreak", dc_breaker.name, "I_FROM"))
 
+    def test_hybrid_net_40_sparse_jacobian_skips_missing_balance_rows(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+            flat_start=True,
+        )
+
+        H = estimator.jacobian_sparse(estimator.initial_state(), estimator.active_measurements)
+
+        self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
+
+    def test_hybrid_net_40_estimates_voltage_control_shunt_q_state(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+            flat_start=True,
+        )
+
+        q_balance_keys = {
+            (meas.device_name, meas.meas_type)
+            for meas in estimator.active_measurements
+            if meas.device_type == "ACPowerBalance"
+        }
+        self.assertIn(("nd_5", "Q_BALANCE"), q_balance_keys)
+        self.assertIn("AC_Q_SHUNT:shunt_5", estimator.state_labels)
+
+        result = estimator.estimate(verbose=False)
+        shunt_q = result.x[estimator.state_labels.index("AC_Q_SHUNT:shunt_5")]
+
+        self.assertTrue(result.converged)
+        self.assertLess(result.residual_inf, 1e-6)
+        self.assertGreater(abs(shunt_q), 1.0)
+
     def test_hybrid_jacobian_uses_direct_derivatives_without_repeated_evaluation(self):
         from secore.hybrid_se import HybridStateEstimator
 

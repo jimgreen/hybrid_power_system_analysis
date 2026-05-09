@@ -1163,15 +1163,24 @@ class ACStateEstimator:
         )
         self.generator_power_idx_array = np.arange(self.n_generator_power, dtype=np.int32)
         self.load_power_idx_array = np.arange(self.n_load_power, dtype=np.int32)
+        self.voltage_control_shunt_order = self._voltage_control_shunts()
+        self.n_shunt_q = len(self.voltage_control_shunt_order)
+        self.shunt_q_pos_array = np.asarray(
+            [self.node_pos[shunt.node] for shunt in self.voltage_control_shunt_order],
+            dtype=np.int32,
+        )
+        self.shunt_q_idx_array = np.arange(self.n_shunt_q, dtype=np.int32)
         self.generator_balance_minus_ones = -np.ones(self.n_generator_power, dtype=np.float64)
         self.load_balance_ones = np.ones(self.n_load_power, dtype=np.float64)
+        self.shunt_balance_minus_ones = -np.ones(self.n_shunt_q, dtype=np.float64)
         self.base_switch_re = self.n_angle + self.n_voltage
         self.base_switch_im = self.base_switch_re + self.n_switch_current
         self.base_gen_p = self.base_switch_im + self.n_switch_current
         self.base_gen_q = self.base_gen_p + self.n_generator_power
         self.base_load_p = self.base_gen_q + self.n_generator_power
         self.base_load_q = self.base_load_p + self.n_load_power
-        self.n_state = self.base_load_q + self.n_load_power
+        self.base_shunt_q = self.base_load_q + self.n_load_power
+        self.n_state = self.base_shunt_q + self.n_shunt_q
         self.gen_p_col_by_name = {
             gen.name: self.base_gen_p + idx for idx, gen in enumerate(self.generator_order)
         }
@@ -1190,6 +1199,16 @@ class ACStateEstimator:
         self.load_state_index_by_name = {
             load.name: idx for idx, load in enumerate(self.load_order)
         }
+        self.shunt_q_col_by_name = {
+            shunt.name: self.base_shunt_q + idx for idx, shunt in enumerate(self.voltage_control_shunt_order)
+        }
+        self.shunt_q_state_index_by_name = {
+            shunt.name: idx for idx, shunt in enumerate(self.voltage_control_shunt_order)
+        }
+        self.initial_shunt_q_array = np.asarray(
+            [self._initial_voltage_control_shunt_q(shunt) for shunt in self.voltage_control_shunt_order],
+            dtype=np.float64,
+        )
         self.state_labels = [f"theta:{self.nodes[pos].name}" for pos in self.angle_state_pos] + [
             f"V:{self.nodes[pos].name}" for pos in self.voltage_state_pos
         ]
@@ -1199,6 +1218,7 @@ class ACStateEstimator:
         self.state_labels.extend(f"Q_GEN:{gen.name}" for gen in self.generator_order)
         self.state_labels.extend(f"P_LOAD:{load.name}" for load in self.load_order)
         self.state_labels.extend(f"Q_LOAD:{load.name}" for load in self.load_order)
+        self.state_labels.extend(f"Q_SHUNT:{shunt.name}" for shunt in self.voltage_control_shunt_order)
 
         self.branch_stamp_by_name = self._build_branch_stamp_map(list(self.branch_by_name.values()), False)
         self.transformer_stamp_by_name = self._build_branch_stamp_map(list(self.transformer_by_name.values()), True)
@@ -3620,6 +3640,29 @@ class ACStateEstimator:
                 next_idx += 1
         self._max_measurement_idx = next_idx - 1 if next_idx > 0 else self._max_measurement_idx
 
+    def _voltage_control_shunts(self) -> List[object]:
+        """Return live V-control shunts whose reactive output is estimated."""
+        shunts = []
+        for shunt in getattr(self.network, "shunt_compensators", []) or []:
+            if not getattr(shunt, "is_alive", False):
+                continue
+            if int(getattr(shunt, "node", -1)) not in self.node_pos:
+                continue
+            if str(getattr(shunt, "control_type", "")).upper() == "V":
+                shunts.append(shunt)
+        return sorted(shunts, key=lambda item: item.idx)
+
+    @staticmethod
+    def _initial_voltage_control_shunt_q(shunt) -> float:
+        """Use any already-computed shunt Q as a seed; otherwise start at zero."""
+        value = getattr(shunt, "q", None)
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _node_voltage_measurements(self) -> Dict[int, float]:
         """Return valid real ACNode voltage measurements keyed by node index."""
         cached = getattr(self, "_node_voltage_measurement_cache", None)
@@ -3958,6 +4001,7 @@ class ACStateEstimator:
         gen_q: Optional[np.ndarray] = None,
         load_p: Optional[np.ndarray] = None,
         load_q: Optional[np.ndarray] = None,
+        shunt_q: Optional[np.ndarray] = None,
         rebase_angles: bool = True,
     ) -> np.ndarray:
         """Pack full node values into the WLS state vector, excluding reference angles."""
@@ -3988,8 +4032,12 @@ class ACStateEstimator:
             x[self.base_load_p : self.base_load_q] = (
                 self.initial_load_p_array if load_p is None else np.asarray(load_p, dtype=np.float64)
             )
-            x[self.base_load_q : self.n_state] = (
+            x[self.base_load_q : self.base_shunt_q] = (
                 self.initial_load_q_array if load_q is None else np.asarray(load_q, dtype=np.float64)
+            )
+        if self.n_shunt_q:
+            x[self.base_shunt_q : self.n_state] = (
+                self.initial_shunt_q_array if shunt_q is None else np.asarray(shunt_q, dtype=np.float64)
             )
         return x
 
@@ -4053,7 +4101,7 @@ class ACStateEstimator:
     def _load_power_from_state(self, x: np.ndarray) -> Tuple[Dict[str, Tuple[float, float]], np.ndarray, np.ndarray]:
         """Return load P/Q states and node totals used by balance equations."""
         p_values = np.asarray(x[self.base_load_p : self.base_load_q], dtype=np.float64)
-        q_values = np.asarray(x[self.base_load_q : self.n_state], dtype=np.float64)
+        q_values = np.asarray(x[self.base_load_q : self.base_shunt_q], dtype=np.float64)
         p_load = np.zeros(len(self.nodes), dtype=np.float64)
         q_load = np.zeros(len(self.nodes), dtype=np.float64)
         if self.load_pos_array.size:
@@ -4071,7 +4119,17 @@ class ACStateEstimator:
             return np.zeros(self.n_nodes, dtype=np.float64), np.zeros(self.n_nodes, dtype=np.float64)
         return (
             np.bincount(self.load_pos_array, weights=x[self.base_load_p : self.base_load_q], minlength=self.n_nodes),
-            np.bincount(self.load_pos_array, weights=x[self.base_load_q : self.n_state], minlength=self.n_nodes),
+            np.bincount(self.load_pos_array, weights=x[self.base_load_q : self.base_shunt_q], minlength=self.n_nodes),
+        )
+
+    def _shunt_q_injections_from_state(self, x: np.ndarray) -> np.ndarray:
+        """Return node-level reactive injections from V-control shunt Q states."""
+        if not self.n_shunt_q:
+            return np.zeros(self.n_nodes, dtype=np.float64)
+        return np.bincount(
+            self.shunt_q_pos_array,
+            weights=x[self.base_shunt_q : self.n_state],
+            minlength=self.n_nodes,
         )
 
     def _generator_power_from_state(self, x: np.ndarray) -> Tuple[Dict[str, Tuple[float, float]], np.ndarray, np.ndarray]:
@@ -4120,14 +4178,15 @@ class ACStateEstimator:
         voltage_complex: np.ndarray,
         switch_current: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Evaluate nodal mismatch S_net + S_switch + S_load - S_gen."""
+        """Evaluate nodal mismatch S_net + S_switch + S_load - S_gen - Q_shunt."""
         s_network = voltage_complex * np.conj(self.Y.dot(voltage_complex))
         p_switch, q_switch = self._switch_power_injections(voltage_complex, switch_current)
         p_load, q_load = self._load_power_totals_from_state(x)
         p_gen, q_gen = self._generator_power_totals_from_state(x)
+        q_shunt = self._shunt_q_injections_from_state(x)
         return (
             s_network.real + p_switch + p_load - p_gen,
-            s_network.imag + q_switch + q_load - q_gen,
+            s_network.imag + q_switch + q_load - q_gen - q_shunt,
         )
 
     def _generator_power(
@@ -5164,7 +5223,7 @@ class ACStateEstimator:
             return
         if hasattr(H, "add_many"):
             for rows, cols, values in blocks:
-                H.add_many(rows, cols, values)
+                self._add_indexed_values(H, rows, cols, values)
             return
         row_parts = []
         col_parts = []
@@ -5806,6 +5865,19 @@ class ACStateEstimator:
                 (
                     (load_p_rows, self.base_load_p + load_idx, self.load_balance_ones),
                     (load_q_rows, self.base_load_q + load_idx, self.load_balance_ones),
+                ),
+            )
+
+        if self.n_shunt_q:
+            shunt_q_rows = q_row_by_pos[self.shunt_q_pos_array]
+            self._add_indexed_value_blocks(
+                H,
+                (
+                    (
+                        shunt_q_rows,
+                        self.base_shunt_q + self.shunt_q_idx_array,
+                        self.shunt_balance_minus_ones,
+                    ),
                 ),
             )
 
@@ -7036,6 +7108,11 @@ class ACStateEstimator:
         for idx, load in enumerate(self.load_order):
             load.p = float(x[self.base_load_p + idx])
             load.q = float(x[self.base_load_q + idx])
+        for idx, shunt in enumerate(self.voltage_control_shunt_order):
+            shunt.p = 0.0
+            shunt.q = float(x[self.base_shunt_q + idx])
+            voltage_value = float(getattr(getattr(shunt, "node_obj", None), "voltage", 1.0) or 1.0)
+            shunt.current = abs(shunt.q) / voltage_value if abs(voltage_value) > self.min_current_voltage else 0.0
 
     def print_state(self, x: np.ndarray, limit: int = 20) -> None:
         theta, voltage = self._unpack_state(x)
