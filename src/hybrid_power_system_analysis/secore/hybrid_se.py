@@ -1151,9 +1151,14 @@ class HybridStateEstimator:
         summary = self._measurement_activity_summary()
         next_idx = int(summary.max_idx) + 1
         measured_devices = summary.measured_devices
+        specs_to_add = []
         for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
             if (spec.device_type, spec.device_name) in measured_devices:
                 continue
+            if self._voltage_pseudo_is_covered(spec.device_type, spec.device_name, spec.meas_type):
+                continue
+            specs_to_add.append(spec)
+        for spec in specs_to_add:
             next_idx = self._append_pseudo_measurement(
                 next_idx,
                 f"pseudo_{spec.meas_type.lower()}_{spec.device_name}",
@@ -1774,7 +1779,47 @@ class HybridStateEstimator:
             finally:
                 self._dc_sub_estimator.flat_start = original
         parts.append(self._hybrid_seed_vector(flat=flat))
-        return np.concatenate(parts) if parts else np.array([], dtype=np.float64)
+        x = np.concatenate(parts) if parts else np.array([], dtype=np.float64)
+        if not flat:
+            self._seed_state_from_real_voltage_measurements(x)
+        return x
+
+    def _seed_state_from_real_voltage_measurements(self, x: np.ndarray) -> None:
+        """Seed AC/DC voltage states from the strongest real voltage row per node."""
+        measurements = getattr(self, "active_measurements", self.measurements)
+        best_ac: Dict[int, Tuple[float, float]] = {}
+        best_dc: Dict[int, Tuple[float, float]] = {}
+        voltage_types = {"V", "V_FROM", "V_TO", "V_GEN", "V_LOAD", "V_DC", "V_AC"}
+        for meas in measurements:
+            if (
+                not bool(getattr(meas, "valid", True))
+                or float(getattr(meas, "weight", 0.0)) <= 0.0
+                or str(getattr(meas, "name", "")).startswith("pseudo_")
+            ):
+                continue
+            meas_type = str(getattr(meas, "meas_type", "")).upper()
+            if meas_type not in voltage_types:
+                continue
+            weight = float(meas.weight)
+            value = float(meas.value)
+            ac_node_idx = self._ac_voltage_measurement_node_idx(meas.device_type, meas.device_name, meas_type)
+            if ac_node_idx is not None:
+                current = best_ac.get(int(ac_node_idx))
+                if current is None or weight > current[0]:
+                    best_ac[int(ac_node_idx)] = (weight, value)
+            dc_node_idx = self._dc_voltage_measurement_node_idx(meas.device_type, meas.device_name, meas_type)
+            if dc_node_idx is not None:
+                current = best_dc.get(int(dc_node_idx))
+                if current is None or weight > current[0]:
+                    best_dc[int(dc_node_idx)] = (weight, value)
+        for node_idx, (_weight, value) in best_ac.items():
+            col = self._ac_voltage_col_for_node(node_idx)
+            if col >= 0:
+                x[col] = value
+        for node_idx, (_weight, value) in best_dc.items():
+            col = self._dc_voltage_col_for_node(node_idx)
+            if col >= 0:
+                x[col] = value
 
     def _split_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         x = np.asarray(x, dtype=np.float64)
@@ -1850,6 +1895,156 @@ class HybridStateEstimator:
                     names.add(node.name)
         return names
 
+    def _ac_voltage_measurement_node_idx(
+        self,
+        device_type: str,
+        device_name: str,
+        meas_type: str,
+    ) -> Optional[int]:
+        """Return the AC-side node associated with a voltage measurement row."""
+        if device_type == "ACNode":
+            if meas_type == "V" and device_name in self.ac_node_by_name:
+                return int(self.ac_node_by_name[device_name].idx)
+            return None
+        if device_type == "ACGenerator":
+            gen = self.ac_generator_by_name.get(device_name)
+            if meas_type == "V_GEN" and gen is not None:
+                return int(gen.node)
+            return None
+        if device_type == "ACLoad":
+            load = self.ac_load_by_name.get(device_name)
+            if meas_type == "V_LOAD" and load is not None:
+                return int(load.node)
+            return None
+        if device_type in ("ACBranch", "ACTransformer", "ACZeroBranch", "ACBreak", "ACACConverter"):
+            if device_type == "ACBranch":
+                dev = self.ac_branch_by_name.get(device_name)
+            elif device_type == "ACTransformer":
+                dev = self.ac_transformer_by_name.get(device_name)
+            elif device_type == "ACZeroBranch":
+                dev = self.ac_zero_branch_by_name.get(device_name)
+            elif device_type == "ACBreak":
+                dev = self.ac_break_by_name.get(device_name)
+            else:
+                dev = self.acac_by_name.get(device_name)
+            if dev is None:
+                return None
+            if meas_type == "V_FROM":
+                return int(dev.i_node)
+            if meas_type == "V_TO":
+                return int(dev.j_node)
+            return None
+        if device_type == "DCACConverter":
+            conv = self.dcac_by_name.get(device_name)
+            if meas_type == "V_AC" and conv is not None:
+                return int(conv.ac_node)
+        return None
+
+    def _dc_voltage_measurement_node_idx(
+        self,
+        device_type: str,
+        device_name: str,
+        meas_type: str,
+    ) -> Optional[int]:
+        """Return the DC-side node associated with a voltage measurement row."""
+        if device_type == "DCNode":
+            if meas_type == "V" and device_name in self.dc_node_by_name:
+                return int(self.dc_node_by_name[device_name].idx)
+            return None
+        if device_type == "DCGenerator":
+            gen = self.dc_generator_by_name.get(device_name)
+            if meas_type == "V_GEN" and gen is not None:
+                return int(gen.node)
+            return None
+        if device_type == "DCLoad":
+            load = self.dc_load_by_name.get(device_name)
+            if meas_type == "V_LOAD" and load is not None:
+                return int(load.node)
+            return None
+        if device_type in ("DCBranch", "DCZeroBranch", "DCBreak", "DCDCConverter"):
+            if device_type == "DCBranch":
+                dev = self.dc_branch_by_name.get(device_name)
+            elif device_type == "DCZeroBranch":
+                dev = self.dc_zero_branch_by_name.get(device_name)
+            elif device_type == "DCBreak":
+                dev = self.dc_break_by_name.get(device_name)
+            else:
+                dev = self.dcdc_by_name.get(device_name)
+            if dev is None:
+                return None
+            if meas_type == "V_FROM":
+                return int(dev.i_node)
+            if meas_type == "V_TO":
+                return int(dev.j_node)
+            return None
+        if device_type == "DCACConverter":
+            conv = self.dcac_by_name.get(device_name)
+            if meas_type == "V_DC" and conv is not None:
+                return int(conv.dc_node)
+        return None
+
+    def _real_voltage_observation_nodes(self, side: str) -> Dict[int, float]:
+        """Return side nodes covered by real usable voltage measurements on any device."""
+        cache_name = f"_{side}_real_voltage_observation_node_cache"
+        cache = getattr(self, cache_name, None)
+        if cache is not None:
+            return cache
+        if side == "ac":
+            mapper = self._ac_voltage_measurement_node_idx
+            node_pos = getattr(self._ac_sub_estimator, "node_pos", {})
+        else:
+            mapper = self._dc_voltage_measurement_node_idx
+            node_pos = getattr(self._dc_sub_estimator, "node_pos", {})
+        best: Dict[int, Tuple[float, float]] = {}
+        for meas in self.measurements:
+            if not meas.valid or meas.weight <= 0.0 or meas.name.startswith("pseudo_"):
+                continue
+            node_idx = mapper(meas.device_type, meas.device_name, meas.meas_type)
+            if node_idx is None or node_idx not in node_pos:
+                continue
+            current = best.get(node_idx)
+            if current is None or float(meas.weight) > current[0]:
+                best[node_idx] = (float(meas.weight), float(meas.value))
+        cache = {node_idx: value for node_idx, (_weight, value) in best.items()}
+        setattr(self, cache_name, cache)
+        return cache
+
+    def _real_voltage_observation_value_for_side_node(
+        self,
+        side: str,
+        node_idx: Optional[int],
+    ) -> Optional[float]:
+        """Return a real side voltage on the node or its compressed zero-tie component."""
+        if node_idx is None:
+            return None
+        observed = self._real_voltage_observation_nodes(side)
+        if node_idx in observed:
+            return float(observed[node_idx])
+        estimator = self._ac_sub_estimator if side == "ac" else self._dc_sub_estimator
+        node_pos = getattr(estimator, "node_pos", {})
+        pos = node_pos.get(node_idx)
+        component_by_pos = getattr(estimator, "zero_tie_component_by_pos", None)
+        components = getattr(estimator, "zero_tie_components", None)
+        nodes = getattr(estimator, "nodes", None)
+        if pos is None or component_by_pos is None or not components or nodes is None:
+            return None
+        component = components[int(component_by_pos[int(pos)])]
+        for member_pos in component:
+            member_idx = nodes[int(member_pos)].idx
+            if member_idx in observed:
+                return float(observed[member_idx])
+        return None
+
+    def _voltage_pseudo_is_covered(self, device_type: str, device_name: str, meas_type: str) -> bool:
+        """Check whether a voltage pseudo row is redundant because the node already has real V data."""
+        ac_node_idx = self._ac_voltage_measurement_node_idx(device_type, device_name, meas_type)
+        if ac_node_idx is not None:
+            return self._real_voltage_observation_value_for_side_node("ac", ac_node_idx) is not None
+        dc_node_idx = self._dc_voltage_measurement_node_idx(device_type, device_name, meas_type)
+        if dc_node_idx is not None:
+            return self._real_voltage_observation_value_for_side_node("dc", dc_node_idx) is not None
+        return False
+
     def _active_measurement_keys(self) -> set:
         return set(self._measurement_activity_summary().active_keys)
 
@@ -1858,6 +2053,10 @@ class HybridStateEstimator:
             delattr(self, "_measurement_activity_summary_cache")
         if hasattr(self, "_observability_pseudo_candidate_cache"):
             delattr(self, "_observability_pseudo_candidate_cache")
+        if hasattr(self, "_ac_real_voltage_observation_node_cache"):
+            delattr(self, "_ac_real_voltage_observation_node_cache")
+        if hasattr(self, "_dc_real_voltage_observation_node_cache"):
+            delattr(self, "_dc_real_voltage_observation_node_cache")
 
     def _measurement_activity_summary(self) -> "_MeasurementActivitySummary":
         cache = getattr(self, "_measurement_activity_summary_cache", None)
@@ -2034,6 +2233,8 @@ class HybridStateEstimator:
         def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
             key = (device_type, device_name, meas_type)
             pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+            if self._voltage_pseudo_is_covered(device_type, device_name, meas_type):
+                return
             if key in existing_keys or pseudo_name in existing_names:
                 return
             candidates.append(
@@ -2219,6 +2420,8 @@ class HybridStateEstimator:
                 return
             key = (device_type, name, meas_type)
             pseudo_name = f"pseudo_obs_{meas_type.lower()}_{name}"
+            if self._voltage_pseudo_is_covered(device_type, name, meas_type):
+                return
             if key in existing_keys or pseudo_name in existing_names:
                 return
             next_idx = self._append_pseudo_measurement(next_idx, pseudo_name, device_type, name, meas_type, value)

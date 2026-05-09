@@ -764,6 +764,87 @@ class DCStateEstimator:
                 best[node_idx] = (float(meas.weight), float(meas.value))
         return {node_idx: value for node_idx, (_weight, value) in best.items()}
 
+    def _voltage_measurement_node_idx(
+        self,
+        device_type: str,
+        device_name: str,
+        meas_type: str,
+    ) -> Optional[int]:
+        """Return the DC node associated with a voltage measurement row."""
+        if device_type == "DCNode":
+            if meas_type == "V" and device_name in self.node_by_name:
+                return int(self.node_by_name[device_name].idx)
+            return None
+        if device_type == "DCGenerator":
+            gen = self.generator_by_name.get(device_name)
+            if meas_type == "V_GEN" and gen is not None:
+                return int(gen.node)
+            return None
+        if device_type == "DCLoad":
+            load = self.load_by_name.get(device_name)
+            if meas_type == "V_LOAD" and load is not None:
+                return int(load.node)
+            return None
+        if device_type in ("DCBranch", "DCZeroBranch", "DCBreak", "DCDCConverter"):
+            if device_type == "DCBranch":
+                dev = self.branch_by_name.get(device_name)
+            elif device_type == "DCZeroBranch":
+                dev = self.zero_branch_by_name.get(device_name)
+            elif device_type == "DCBreak":
+                dev = self.break_by_name.get(device_name)
+            else:
+                dev = self.dcdc_by_name.get(device_name)
+            if dev is None:
+                return None
+            if meas_type == "V_FROM":
+                return int(dev.i_node)
+            if meas_type == "V_TO":
+                return int(dev.j_node)
+        return None
+
+    def _real_voltage_observation_nodes(self) -> Dict[int, float]:
+        """Return nodes covered by real usable voltage measurements on any DC device."""
+        cache = getattr(self, "_real_voltage_observation_node_cache", None)
+        if cache is not None:
+            return cache
+        best: Dict[int, Tuple[float, float]] = {}
+        for meas in self.measurements:
+            if not meas.valid or meas.weight <= 0.0 or meas.name.startswith("pseudo_"):
+                continue
+            node_idx = self._voltage_measurement_node_idx(meas.device_type, meas.device_name, meas.meas_type)
+            if node_idx is None or node_idx not in self.node_pos:
+                continue
+            current = best.get(node_idx)
+            if current is None or float(meas.weight) > current[0]:
+                best[node_idx] = (float(meas.weight), float(meas.value))
+        cache = {node_idx: value for node_idx, (_weight, value) in best.items()}
+        self._real_voltage_observation_node_cache = cache
+        return cache
+
+    def _real_voltage_observation_value_for_node(self, node_idx: Optional[int]) -> Optional[float]:
+        """Return a real voltage value on the node or its compressed zero-tie component."""
+        if node_idx is None:
+            return None
+        observed = self._real_voltage_observation_nodes()
+        if node_idx in observed:
+            return float(observed[node_idx])
+        pos = self.node_pos.get(node_idx)
+        component_by_pos = getattr(self, "zero_tie_component_by_pos", None)
+        components = getattr(self, "zero_tie_components", None)
+        if pos is None or component_by_pos is None or not components:
+            return None
+        component = components[int(component_by_pos[int(pos)])]
+        for member_pos in component:
+            member_idx = self.nodes[int(member_pos)].idx
+            if member_idx in observed:
+                return float(observed[member_idx])
+        return None
+
+    def _voltage_pseudo_is_covered(self, device_type: str, device_name: str, meas_type: str) -> bool:
+        """Check whether a voltage pseudo row is redundant because the node already has real V data."""
+        node_idx = self._voltage_measurement_node_idx(device_type, device_name, meas_type)
+        return self._real_voltage_observation_value_for_node(node_idx) is not None
+
     def _node_incident_degrees(self) -> Dict[int, int]:
         """Count live DC topology terminals used when choosing island voltage references."""
         degrees = {node.idx: 0 for node in self.nodes}
@@ -834,6 +915,9 @@ class DCStateEstimator:
         components = [sorted(group) for group in groups.values()]
         components.sort(key=lambda group: group[0])
         self.zero_tie_components = components
+        self.zero_tie_component_by_pos = np.empty(n, dtype=np.int32)
+        for component_idx, component in enumerate(components):
+            self.zero_tie_component_by_pos[np.asarray(component, dtype=np.int32)] = component_idx
 
         node_voltage_state = np.full(n, -1, dtype=np.int32)
         voltage_state_pos = []
@@ -1921,20 +2005,32 @@ class DCStateEstimator:
         voltage = float(getattr(node, "voltage", 1.0) or 1.0)
         return float(getattr(load, "pbase", 1.0) * (load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage))
 
+    def _topology_voltage_pseudo_seed(self, dev) -> float:
+        """Pick a voltage seed for DC zero-impedance topology pseudo measurements."""
+        for node_idx in (getattr(dev, "i_node", None), getattr(dev, "j_node", None)):
+            measured = self._real_voltage_observation_value_for_node(node_idx)
+            if measured is not None:
+                return max(float(measured), self.voltage_floor)
+        return max(float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0), self.voltage_floor)
+
     def _add_pseudo_topology_measurements(self, next_idx: int) -> int:
-        """Add weak P/V priors for DC topology devices, excluding explicit current rows."""
+        """Add weak P/V priors for unmeasured DC topology-device states."""
         measured_keys = self._active_measurement_key_cache
+        topology_weight = float(self.pseudo_measurement_weight) * 1e-4
 
         for device_type, devices in (
             ("DCZeroBranch", self.zero_branches),
             ("DCBreak", self.breakers),
         ):
             for dev in sorted(devices, key=lambda item: item.idx):
-                voltage = float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0)
-                values = (
-                    ("P_FROM", float(getattr(dev, "p", 0.0) or 0.0)),
-                    ("V_FROM", voltage),
-                )
+                values = []
+                if not any(
+                    (device_type, dev.name, meas_type) in measured_keys
+                    for meas_type in ("P_FROM", "P_TO", "I_FROM", "I_TO")
+                ):
+                    values.append(("P_FROM", float(getattr(dev, "p", 0.0) or 0.0)))
+                if not self._voltage_pseudo_is_covered(device_type, dev.name, "V_FROM"):
+                    values.append(("V_FROM", self._topology_voltage_pseudo_seed(dev)))
                 for meas_type, value in values:
                     key = (device_type, dev.name, meas_type)
                     if key in measured_keys:
@@ -1947,6 +2043,7 @@ class DCStateEstimator:
                         meas_type,
                         value,
                     )
+                    self.measurements[-1].weight = topology_weight
         return next_idx
 
     def _add_pseudo_power_measurements(self) -> None:
@@ -1954,6 +2051,7 @@ class DCStateEstimator:
         if not hasattr(self, "_active_device_key_cache") or not hasattr(self, "_active_measurement_key_cache"):
             self._refresh_measurement_summary_cache()
         measured_devices = self._active_device_key_cache
+        measured_keys = self._active_measurement_key_cache
         next_idx = self._next_measurement_idx()
         next_idx = self._add_pseudo_topology_measurements(next_idx)
 
@@ -1968,14 +2066,18 @@ class DCStateEstimator:
                 "P_GEN",
                 self._generator_pseudo_power(gen),
             )
-            next_idx = self._append_pseudo_measurement(
-                next_idx,
-                f"pseudo_v_{gen.name}",
-                "DCGenerator",
-                gen.name,
-                "V_GEN",
-                float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0),
-            )
+            if (
+                ("DCGenerator", gen.name, "V_GEN") not in measured_keys
+                and not self._voltage_pseudo_is_covered("DCGenerator", gen.name, "V_GEN")
+            ):
+                next_idx = self._append_pseudo_measurement(
+                    next_idx,
+                    f"pseudo_v_{gen.name}",
+                    "DCGenerator",
+                    gen.name,
+                    "V_GEN",
+                    float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0),
+                )
 
         for load in sorted(self.load_by_name.values(), key=lambda item: item.idx):
             if ("DCLoad", load.name) in measured_devices:
@@ -1988,14 +2090,18 @@ class DCStateEstimator:
                 "P_LOAD",
                 self._load_pseudo_power(load),
             )
-            next_idx = self._append_pseudo_measurement(
-                next_idx,
-                f"pseudo_v_{load.name}",
-                "DCLoad",
-                load.name,
-                "V_LOAD",
-                float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0),
-            )
+            if (
+                ("DCLoad", load.name, "V_LOAD") not in measured_keys
+                and not self._voltage_pseudo_is_covered("DCLoad", load.name, "V_LOAD")
+            ):
+                next_idx = self._append_pseudo_measurement(
+                    next_idx,
+                    f"pseudo_v_{load.name}",
+                    "DCLoad",
+                    load.name,
+                    "V_LOAD",
+                    float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0),
+                )
 
         for conv in self.dcdc_converters:
             if ("DCDCConverter", conv.name) in measured_devices:
@@ -2016,22 +2122,30 @@ class DCStateEstimator:
                 "P_TO",
                 float(getattr(conv, "j_p", 0.0) or 0.0),
             )
-            next_idx = self._append_pseudo_measurement(
-                next_idx,
-                f"pseudo_v_from_{conv.name}",
-                "DCDCConverter",
-                conv.name,
-                "V_FROM",
-                float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0),
-            )
-            next_idx = self._append_pseudo_measurement(
-                next_idx,
-                f"pseudo_v_to_{conv.name}",
-                "DCDCConverter",
-                conv.name,
-                "V_TO",
-                float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0),
-            )
+            if (
+                ("DCDCConverter", conv.name, "V_FROM") not in measured_keys
+                and not self._voltage_pseudo_is_covered("DCDCConverter", conv.name, "V_FROM")
+            ):
+                next_idx = self._append_pseudo_measurement(
+                    next_idx,
+                    f"pseudo_v_from_{conv.name}",
+                    "DCDCConverter",
+                    conv.name,
+                    "V_FROM",
+                    float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0),
+                )
+            if (
+                ("DCDCConverter", conv.name, "V_TO") not in measured_keys
+                and not self._voltage_pseudo_is_covered("DCDCConverter", conv.name, "V_TO")
+            ):
+                next_idx = self._append_pseudo_measurement(
+                    next_idx,
+                    f"pseudo_v_to_{conv.name}",
+                    "DCDCConverter",
+                    conv.name,
+                    "V_TO",
+                    float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0),
+                )
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch DC rank deficiencies and optional post-observability redundancy."""
@@ -2132,6 +2246,8 @@ class DCStateEstimator:
         def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
             key = (device_type, device_name, meas_type)
             pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+            if self._voltage_pseudo_is_covered(device_type, device_name, meas_type):
+                return
             if key in existing_keys or pseudo_name in existing_names:
                 return
             candidates.append(
@@ -2211,6 +2327,8 @@ class DCStateEstimator:
                 return next_idx, 0
             key = (device_type, device_name, meas_type)
             pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+            if self._voltage_pseudo_is_covered(device_type, device_name, meas_type):
+                return next_idx, 0
             if key in existing_keys or pseudo_name in existing_names:
                 return next_idx, 0
             new_idx = self._append_pseudo_measurement(

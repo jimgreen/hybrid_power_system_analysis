@@ -1406,11 +1406,25 @@ class ACStateEstimationTest(unittest.TestCase):
     def test_targeted_node_voltage_state_adds_pseudo_measurement(self):
         from secore.ac_se import ACStateEstimator
 
-        estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
-            flat_start=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "no_real_voltage.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 p_bad ACLoad load_1 P_LOAD 1.0 0 0",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+                meas_file=meas_file,
+                flat_start=True,
+            )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
         existing_keys = set()
         existing_names = set()
@@ -1556,15 +1570,20 @@ class ACStateEstimationTest(unittest.TestCase):
         pseudo_load_keys = {(meas.device_name, meas.meas_type) for meas in pseudo_loads}
 
         self.assertEqual(selected_loads, pseudo_load_devices)
-        self.assertEqual(3 * len(selected_loads), len(pseudo_loads))
+        voltage_covered_loads = {"load_1"}
+        self.assertEqual(3 * len(selected_loads) - len(voltage_covered_loads), len(pseudo_loads))
         for load_name in selected_loads:
             self.assertIn((load_name, "P_LOAD"), pseudo_load_keys)
             self.assertIn((load_name, "Q_LOAD"), pseudo_load_keys)
-            self.assertIn((load_name, "V_LOAD"), pseudo_load_keys)
+            if load_name in voltage_covered_loads:
+                self.assertNotIn((load_name, "V_LOAD"), pseudo_load_keys)
+            else:
+                self.assertIn((load_name, "V_LOAD"), pseudo_load_keys)
 
     def test_ac_targeted_pseudo_uses_ratio_target_and_step_between_reanalysis(self):
         from model.meas_model import Measurement
         from secore.ac_se import ACStateEstimator, ObservabilityResult
+        from secore.se_math import targeted_redundancy_count
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             meas_file = Path(tmp_dir) / "voltage_only.meas"
@@ -1623,24 +1642,44 @@ class ACStateEstimationTest(unittest.TestCase):
 
         estimator.observability_analysis = observable_now
         estimator._add_weak_direction_observability_pseudo_measurements = add_batch
+        expected_redundancy = targeted_redundancy_count(
+            estimator.n_state,
+            estimator.targeted_pseudo_measurement_redundancy_ratio,
+        )
+        expected_added = expected_redundancy - (base_count - estimator.n_state)
         added = estimator._add_targeted_observability_pseudo_measurements()
 
-        self.assertEqual(5, added)
-        self.assertEqual([2, 2, 1], batches)
-        self.assertEqual(base_count + 5, len(estimator.active_measurements))
+        self.assertEqual(expected_added, added)
+        self.assertEqual([2] * (expected_added // 2) + ([1] if expected_added % 2 else []), batches)
+        self.assertEqual(base_count + expected_added, len(estimator.active_measurements))
         self.assertGreaterEqual(
             len(estimator.active_measurements),
-            estimator.n_state + target_redundancy,
+            estimator.n_state + expected_redundancy,
         )
 
     def test_ac_weak_direction_candidates_include_voltage_and_branch_power_rows(self):
         from secore.ac_se import ACStateEstimator
 
-        estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
-            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ac_net_30.meas",
-            flat_start=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "no_real_voltage.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 p_bad ACLoad load_1 P_LOAD 1.0 0 0",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_30.e",
+                meas_file=meas_file,
+                flat_start=True,
+                prepare_active_measurements=False,
+            )
 
         keys = {
             (meas.device_type, meas.meas_type)
@@ -1712,7 +1751,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn(("ACGenerator", "gen_31_1", "Q_GEN"), pseudo_keys)
         self.assertIn(("ACGenerator", "gen_31_1", "V_GEN"), pseudo_keys)
 
-    def test_adds_low_weight_pseudo_pqv_measurements_for_unmetered_ac_topology_devices(self):
+    def test_adds_low_weight_pseudo_pq_measurements_for_unmetered_ac_topology_devices(self):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1750,11 +1789,47 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertFalse(
             any(device_type == "ACNode" and meas_type == "V" for device_type, _name, meas_type in regular_pseudo_keys)
         )
-        for meas_type in ("P_FROM", "Q_FROM", "V_FROM"):
+        for meas_type in ("P_FROM", "Q_FROM"):
             self.assertIn(("ACBreak", "sw_0_1", meas_type), regular_pseudo_keys)
             self.assertIn(("ACZeroBranch", "zbr_1_2", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("ACBreak", "sw_0_1", "V_FROM"), regular_pseudo_keys)
+        self.assertNotIn(("ACZeroBranch", "zbr_1_2", "V_FROM"), regular_pseudo_keys)
         self.assertNotIn(("ACBreak", "sw_0_1", "I_FROM"), regular_pseudo_keys)
         self.assertNotIn(("ACZeroBranch", "zbr_1_2", "I_FROM"), regular_pseudo_keys)
+
+    def test_device_voltage_pseudo_is_skipped_when_peer_device_on_node_has_real_voltage(self):
+        from secore.ac_se import ACStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "peer_device_voltage.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 v_load_31 ACLoad load_31 V_LOAD 1.0 1 345",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=meas_file,
+                flat_start=True,
+            )
+
+        pseudo_keys = {
+            (meas.device_type, meas.device_name, meas.meas_type)
+            for meas in estimator.active_measurements
+            if meas.name.startswith("pseudo_") and not meas.name.startswith("pseudo_obs_")
+        }
+
+        self.assertIn(("ACGenerator", "gen_31_1", "P_GEN"), pseudo_keys)
+        self.assertIn(("ACGenerator", "gen_31_1", "Q_GEN"), pseudo_keys)
+        self.assertNotIn(("ACGenerator", "gen_31_1", "V_GEN"), pseudo_keys)
 
     def test_jacobian_uses_direct_derivatives_without_repeated_evaluation(self):
         from secore.ac_se import ACStateEstimator

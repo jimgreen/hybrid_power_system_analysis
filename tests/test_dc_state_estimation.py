@@ -245,10 +245,18 @@ class DCStateEstimationTest(unittest.TestCase):
         pseudo_load_keys = {(meas.device_name, meas.meas_type) for meas in pseudo_loads}
 
         self.assertEqual(selected_loads, pseudo_load_devices)
-        self.assertEqual(2 * len(selected_loads), len(pseudo_loads))
+        voltage_covered_loads = {
+            load_name
+            for load_name in selected_loads
+            if estimator._voltage_pseudo_is_covered("DCLoad", load_name, "V_LOAD")
+        }
+        self.assertEqual(2 * len(selected_loads) - len(voltage_covered_loads), len(pseudo_loads))
         for load_name in selected_loads:
             self.assertIn((load_name, "P_LOAD"), pseudo_load_keys)
-            self.assertIn((load_name, "V_LOAD"), pseudo_load_keys)
+            if load_name in voltage_covered_loads:
+                self.assertNotIn((load_name, "V_LOAD"), pseudo_load_keys)
+            else:
+                self.assertIn((load_name, "V_LOAD"), pseudo_load_keys)
 
     def test_reference_nodes_use_highest_degree_nodes_with_valid_voltage_measurements(self):
         from secore.dc_se import DCStateEstimator
@@ -272,11 +280,25 @@ class DCStateEstimationTest(unittest.TestCase):
     def test_targeted_node_voltage_state_adds_pseudo_measurement(self):
         from secore.dc_se import DCStateEstimator
 
-        estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
-            flat_start=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "no_real_voltage.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 p_bad DCLoad load_1 P_LOAD 1.0 0 0",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=meas_file,
+                flat_start=True,
+            )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
         existing_keys = set()
         existing_names = set()
@@ -338,6 +360,42 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertIn(("DCDCConverter", "conv_2", "V_FROM"), pseudo_keys)
         self.assertIn(("DCDCConverter", "conv_2", "V_TO"), pseudo_keys)
 
+    def test_dc_converter_voltage_pseudo_is_skipped_per_terminal_when_node_has_real_voltage(self):
+        from secore.dc_se import DCStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "converter_terminal_voltage.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 v_nd_9 DCNode nd_9 V 1.0 1 100",
+                        "# 2 p_conv_bad DCDCConverter conv_2 P_FROM 1.0 0 0",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=meas_file,
+                flat_start=True,
+            )
+
+        pseudo_keys = {
+            (meas.device_type, meas.device_name, meas.meas_type)
+            for meas in estimator.active_measurements
+            if meas.name.startswith("pseudo_") and not meas.name.startswith("pseudo_obs_")
+        }
+
+        self.assertIn(("DCDCConverter", "conv_2", "P_FROM"), pseudo_keys)
+        self.assertIn(("DCDCConverter", "conv_2", "P_TO"), pseudo_keys)
+        self.assertNotIn(("DCDCConverter", "conv_2", "V_FROM"), pseudo_keys)
+        self.assertIn(("DCDCConverter", "conv_2", "V_TO"), pseudo_keys)
+
     def test_dc_pseudo_measurements_reuse_measurement_summary_cache(self):
         from secore.dc_se import DCStateEstimator
 
@@ -360,7 +418,7 @@ class DCStateEstimationTest(unittest.TestCase):
             for meas in estimator.measurements
             if meas.name.startswith("pseudo_")
         }
-        self.assertIn(("DCBreak", "sw_0_1", "V_FROM"), pseudo_keys)
+        self.assertNotIn(("DCBreak", "sw_0_1", "V_FROM"), pseudo_keys)
         self.assertTrue(hasattr(estimator, "_active_device_key_cache"))
         self.assertTrue(hasattr(estimator, "_active_measurement_key_cache"))
 
@@ -419,9 +477,11 @@ class DCStateEstimationTest(unittest.TestCase):
         }
 
         self.assertNotIn(("DCNode", "nd_1", "V"), regular_pseudo_keys)
-        for meas_type in ("P_FROM", "V_FROM"):
+        for meas_type in ("P_FROM",):
             self.assertIn(("DCBreak", "sw_0_1", meas_type), regular_pseudo_keys)
             self.assertIn(("DCZeroBranch", "zbr_1_2", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("DCBreak", "sw_0_1", "V_FROM"), regular_pseudo_keys)
+        self.assertNotIn(("DCZeroBranch", "zbr_1_2", "V_FROM"), regular_pseudo_keys)
         self.assertNotIn(("DCBreak", "sw_0_1", "I_FROM"), regular_pseudo_keys)
         self.assertNotIn(("DCZeroBranch", "zbr_1_2", "I_FROM"), regular_pseudo_keys)
         self.assertIn("zbr_1_2", estimator.zero_branch_pos)
