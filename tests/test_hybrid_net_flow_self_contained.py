@@ -490,6 +490,90 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         )
         self.assertEqual(summary_calc.iterations, summary_calc.lf_result["hybrid"]["iterations"])
 
+    def test_array_result_mode_keeps_arrays_without_hybrid_object_backfill(self):
+        import numpy as np
+        from lfcore.hybrid_lf import HybridLFResult, HybridPowerFlowCalc, _read_lf_network_from_file, run_hybrid_power_flow
+
+        network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+
+        def reject_full_backfill(_x):
+            raise AssertionError("result_mode='array' should skip hybrid object backfill")
+
+        calc._write_back = reject_full_backfill
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run(result_mode="array")
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertIsNone(calc.lf_result)
+        self.assertEqual({"ac", "dc", "dcac", "acac", "summary"}, set(calc.result))
+        self.assertIsInstance(calc.result["dcac"], np.ndarray)
+        self.assertIsInstance(calc.result["acac"], np.ndarray)
+        self.assertIn("bus", calc.result["ac"])
+        self.assertIn("bus", calc.result["dc"])
+        self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
+        self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
+
+        result = run_hybrid_power_flow(
+            ROOT / "data" / "model" / "ac" / "ieee14.e",
+            verbose=False,
+            result_mode="array",
+        )
+        self.assertIsInstance(result, HybridLFResult)
+        self.assertTrue(result.converged)
+        self.assertIn("ac", result.calc.result)
+
+    def test_single_ac_hybrid_newton_uses_ac_solver_without_global_packaging(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
+
+        network = _read_lf_network_from_file(ROOT / "data" / "model" / "ac" / "ieee14.e")
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        def reject_residual_packaging(*_args, **_kwargs):
+            raise AssertionError("single AC block should reuse AC residuals directly")
+
+        def reject_jacobian_packaging(*_args, **_kwargs):
+            raise AssertionError("single AC block should reuse AC Jacobian directly")
+
+        calc._fill_residual_work = reject_residual_packaging
+        calc._assemble_jacobian = reject_jacobian_packaging
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertTrue(calc._single_ac_newton_block)
+        self.assertEqual(0, calc.global_jac_raw_data.size)
+        self.assertEqual(calc.ac_calc.iterations, calc.iterations)
+
+    def test_single_dc_hybrid_newton_uses_dc_solver_without_global_packaging(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
+
+        network = _read_lf_network_from_file(ROOT / "data" / "model" / "dc" / "dc_net_30.e")
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        def reject_residual_packaging(*_args, **_kwargs):
+            raise AssertionError("single DC block should reuse DC residuals directly")
+
+        def reject_jacobian_packaging(*_args, **_kwargs):
+            raise AssertionError("single DC block should reuse DC Jacobian directly")
+
+        calc._fill_residual_work = reject_residual_packaging
+        calc._assemble_jacobian = reject_jacobian_packaging
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertTrue(calc._single_dc_newton_block)
+        self.assertEqual(0, calc.global_jac_raw_data.size)
+        self.assertEqual(calc.dc_calc.iterations, calc.iterations)
+
     def test_hybrid_power_flow_uses_dc_ppc_without_dc_object_topo(self):
         import lfcore.hybrid_lf as hybrid_lf
 

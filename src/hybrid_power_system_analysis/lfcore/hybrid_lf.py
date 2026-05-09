@@ -231,12 +231,13 @@ class HybridPowerFlowCalc:
         self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
+        sub_result_mode = "full" if self.result_mode == "array" else self.result_mode
         self.ac_calc = (
             ACPowerFlowCalc(
                 network._ac_ppc,
                 parameters=self.params,
                 linear_solver=self.linear_solver,
-                result_mode=self.result_mode,
+                result_mode=sub_result_mode,
                 verbose=self.verbose,
             )
             if self.has_ac and hasattr(network, "_ac_ppc")
@@ -244,7 +245,7 @@ class HybridPowerFlowCalc:
                 network.ac,
                 parameters=self.params,
                 linear_solver=self.linear_solver,
-                result_mode=self.result_mode,
+                result_mode=sub_result_mode,
                 verbose=self.verbose,
             ) if self.has_ac else None
         )
@@ -254,10 +255,10 @@ class HybridPowerFlowCalc:
                 parameters=self.params,
                 linear_solver=self.linear_solver,
                 writeback_network=network.dc,
-                result_mode=self.result_mode,
+                result_mode=sub_result_mode,
             )
         else:
-            self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver, result_mode=self.result_mode) if self.has_dc else None
+            self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver, result_mode=sub_result_mode) if self.has_dc else None
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -286,6 +287,9 @@ class HybridPowerFlowCalc:
         self._clear_converter_jacobian_structure()
         self._clear_global_jacobian_pattern()
         self.lf_result = None
+        self._single_ac_newton_block = False
+        self._single_dc_newton_block = False
+        self.result = {}
 
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
@@ -297,6 +301,9 @@ class HybridPowerFlowCalc:
             "summary": "summary",
             "brief": "summary",
             "minimal": "summary",
+            "array": "array",
+            "arrays": "array",
+            "ppc": "array",
             "none": "none",
             "skip": "none",
             "raw": "none",
@@ -305,8 +312,16 @@ class HybridPowerFlowCalc:
             raise ValueError(f"Unsupported Hybrid result_mode: {result_mode!r}")
         return aliases[mode]
 
+    def _sync_sub_result_modes(self) -> None:
+        sub_result_mode = "full" if self.result_mode == "array" else self.result_mode
+        if self.ac_calc is not None:
+            self.ac_calc.result_mode = sub_result_mode
+        if self.dc_calc is not None:
+            self.dc_calc.result_mode = sub_result_mode
+
     def prepare(self):
         """Build the global hybrid state vector and block equation layout."""
+        self._sync_sub_result_modes()
         parts = []
         if self.ac_calc is not None:
             self.ac_calc.verbose = self.verbose
@@ -341,8 +356,27 @@ class HybridPowerFlowCalc:
         # Variable/equation order is block diagonal first, then converter coupling rows.
         self.last_jacobian_shape = (self.total_eq, self.total_vars)
         self._residual_work = np.empty(self.total_eq, dtype=np.float64)
+        self._single_ac_newton_block = (
+            self.ac_calc is not None
+            and self.dc_calc is None
+            and self.N_dcac == 0
+            and self.N_acac == 0
+            and self.ac_size == self.total_vars
+            and self.ac_eq == self.total_eq
+        )
+        self._single_dc_newton_block = (
+            self.dc_calc is not None
+            and self.ac_calc is None
+            and self.N_dcac == 0
+            and self.N_acac == 0
+            and self.dc_size == self.total_vars
+            and self.dc_eq == self.total_eq
+        )
         self._cache_converter_jacobian_structure()
-        self._cache_global_jacobian_pattern()
+        if self._single_ac_newton_block or self._single_dc_newton_block:
+            self._clear_global_jacobian_pattern()
+        else:
+            self._cache_global_jacobian_pattern()
         if self.verbose:
             print(
                 "Hybrid prepare:",
@@ -882,6 +916,11 @@ class HybridPowerFlowCalc:
 
     def get_f(self, x):
         """Assemble global residuals for AC, DC, DCAC and ACAC equations."""
+        # 纯 AC/纯 DC 文件没有跨域耦合时，直接复用子求解器残差，避免全局向量拆装。
+        if self._single_ac_newton_block:
+            return self.ac_calc.get_f(x)
+        if self._single_dc_newton_block:
+            return self.dc_calc.get_f(x)
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         ac_f = None
         dc_f = None
@@ -896,6 +935,15 @@ class HybridPowerFlowCalc:
 
     def get_jacobi(self, x):
         """Build the global sparse Jacobian from sub-solver blocks plus converter couplings."""
+        # 单块 Newton 的 Jacobian 与子系统完全一致，不需要再包一层 hybrid CSR。
+        if self._single_ac_newton_block:
+            jac = self.ac_calc.get_jacobi(x)
+            self.last_jacobian_shape = jac.shape
+            return jac
+        if self._single_dc_newton_block:
+            jac = self.dc_calc.get_jacobi(self.dc_G, x)
+            self.last_jacobian_shape = jac.shape
+            return jac
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         ac_j = self.ac_calc.get_jacobi(ac_x) if self.ac_calc is not None else None
         dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x) if self.dc_calc is not None else None
@@ -1053,6 +1101,14 @@ class HybridPowerFlowCalc:
 
     def _build_newton_system(self, x):
         """Build residual and Jacobian together, reusing AC/DC sub-solver caches."""
+        if self._single_ac_newton_block:
+            F, J = self.ac_calc._build_newton_system(x)
+            self.last_jacobian_shape = J.shape
+            return F, J
+        if self._single_dc_newton_block:
+            F, J = self.dc_calc._build_newton_system(self.dc_G, x)
+            self.last_jacobian_shape = J.shape
+            return F, J
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         ac_f = ac_j = None
         dc_f = dc_j = None
@@ -1174,6 +1230,7 @@ class HybridPowerFlowCalc:
         """Execute unified Newton iterations over the full hybrid state vector."""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
+            self._sync_sub_result_modes()
         if self.x.size == 0:
             self.prepare()
 
@@ -1219,6 +1276,8 @@ class HybridPowerFlowCalc:
     def _finish_result(self, x):
         if self.result_mode == "full":
             self._write_back(x)
+        elif self.result_mode == "array":
+            self._write_array_result(x)
         elif self.result_mode == "summary":
             self._write_summary_result(x)
         else:
@@ -1265,6 +1324,82 @@ class HybridPowerFlowCalc:
                 "total_eq": int(self.total_eq),
             },
         }
+
+    def _write_array_result(self, x):
+        """Keep sub-solver array results without copying them to object facades."""
+        ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
+        ac_result = None
+        dc_result = None
+        if self.ac_calc is not None:
+            self.ac_calc.x = ac_x
+            self.ac_calc.converged = self.converged
+            self.ac_calc.iterations = self.iterations
+            self.ac_calc.skip_lf_result = True
+            self.ac_calc._write_back()
+            ac_result = self.ac_calc.result
+        if self.dc_calc is not None:
+            self.dc_calc.x = dc_x
+            self.dc_calc.converged = self.converged
+            self.dc_calc.iterations = self.iterations
+            self.dc_calc.skip_lf_result = True
+            self.dc_calc.update_lf_info(dc_x)
+            dc_result = self.dc_calc.result
+
+        dcac_result = np.zeros((self.N_dcac, 5), dtype=np.float64)
+        acac_result = np.zeros((self.N_acac, 6), dtype=np.float64)
+        ac_V = dc_V = None
+        if self.N_dcac or self.N_acac:
+            _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+        if self.N_dcac:
+            dcac = dcac_x.reshape(self.N_dcac, 3)
+            dcac_result[:, 0] = dcac[:, 0]
+            dcac_result[:, 1] = dcac[:, 1]
+            dcac_result[:, 2] = dcac[:, 2]
+            dc_v = dc_V[self.dcac_dc_pos]
+            ac_v = ac_V[self.dcac_ac_pos]
+            dcac_result[:, 3] = np.divide(
+                dcac[:, 0],
+                dc_v,
+                out=np.zeros(self.N_dcac, dtype=np.float64),
+                where=np.abs(dc_v) > self.params.min_voltage,
+            )
+            dcac_result[:, 4] = np.divide(
+                np.hypot(dcac[:, 1], dcac[:, 2]),
+                ac_v,
+                out=np.zeros(self.N_dcac, dtype=np.float64),
+                where=np.abs(ac_v) > self.params.min_voltage,
+            )
+        if self.N_acac:
+            acac = acac_x.reshape(self.N_acac, 4)
+            acac_result[:, 0:4] = acac
+            vi = ac_V[self.acac_i_pos]
+            vj = ac_V[self.acac_j_pos]
+            acac_result[:, 4] = np.divide(
+                np.hypot(acac[:, 0], acac[:, 1]),
+                vi,
+                out=np.zeros(self.N_acac, dtype=np.float64),
+                where=np.abs(vi) > self.params.min_voltage,
+            )
+            acac_result[:, 5] = np.divide(
+                np.hypot(acac[:, 2], acac[:, 3]),
+                vj,
+                out=np.zeros(self.N_acac, dtype=np.float64),
+                where=np.abs(vj) > self.params.min_voltage,
+            )
+        self.result = {
+            "ac": ac_result,
+            "dc": dc_result,
+            "dcac": dcac_result,
+            "acac": acac_result,
+            "summary": {
+                "converged": bool(self.converged),
+                "iterations": int(self.iterations),
+                "normF": float(self.normF),
+                "total_vars": int(self.total_vars),
+                "total_eq": int(self.total_eq),
+            },
+        }
+        self.lf_result = None
 
     def _write_ac_ppc_result_to_network(self) -> None:
         """Copy array-mode AC results back to the hybrid AC object facade."""
@@ -1610,7 +1745,7 @@ def main(argv=None) -> int:
         default="scipy",
         help=LINEAR_SOLVER_HELP,
     )
-    parser.add_argument("--result-mode", choices=("full", "summary", "none"), default="full")
+    parser.add_argument("--result-mode", choices=("full", "array", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 

@@ -52,6 +52,15 @@ result = calc.result
 
 所有设备都通过 `run_stat` 控制是否参与计算。
 
+E 文件中的设备块只保存拓扑、参数和控制设定。`ACBranch`、`ACTransformer`、
+`ACLoad`、`ACGenerator`、`ACShuntCompensator`、`ACSwitch`、`ACBreak`、`ACZeroBranch` 等块不再保存
+`p/q/current` 或两端 `i_p/i_q/i_c/j_p/j_q/j_c` 运行结果列；这些结果由潮流
+求解后写入运行时对象或 `calc.result` 数组。
+
+DC 与 Hybrid 专属输入块也遵循同一约定：`DCBranch`、`DCLoad`、`DCGenerator`、
+`DCZeroBranch`、`DCSwitch`、`DCBreak`、`DCDCConverter`、`DCACConverter`、
+`ACACConverter` 不在输入 E 文件中保存端口功率和电流结果列。
+
 ## 状态变量
 
 交流潮流状态由三类变量组成：

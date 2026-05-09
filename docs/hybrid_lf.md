@@ -52,6 +52,7 @@ python -m lfcore.hybrid_lf data\model\hybrid\qinling.e --quiet
 | `--tol` | 覆盖收敛阈值 |
 | `--max-iter` | 覆盖最大迭代次数 |
 | `--min-voltage` | 覆盖最小电压 |
+| `--result-mode` | 结果回填模式：`full`、`array`、`summary`、`none` |
 | `--quiet` | 抑制迭代输出 |
 
 ## 拓扑对象
@@ -167,12 +168,13 @@ Vi^2 * Vj^2 * (P_i + P_j)
 `run()` 执行统一 Newton 迭代：
 
 1. 若状态为空，先调用 `prepare()`。
-2. 计算全局残差 `F`。
-3. 分别记录 AC、DC 残差范数，同时使用全局 `normF` 判收敛。
-4. 构造全局 Jacobian。
-5. 稀疏直接解 `J * delta = F`。
-6. 更新 `x = x - delta`。
-7. 收敛后 `_write_back(x)`。
+2. 若当前模型只有 AC 或只有 DC 且没有跨域变流器，直接调用对应子求解器的残差和 Jacobian，避免重复包装全局 residual/Jacobian。
+3. 含混合耦合时计算全局残差 `F`。
+4. 分别记录 AC、DC 残差范数，同时使用全局 `normF` 判收敛。
+5. 构造全局 Jacobian。
+6. 稀疏直接解 `J * delta = F`。
+7. 更新 `x = x - delta`。
+8. 收敛后按 `result_mode` 写出结果。
 
 ## 结果对象
 
@@ -190,12 +192,26 @@ Vi^2 * Vj^2 * (P_i + P_j)
 | `ac_warnings/ac_errors` | AC 拓扑信息 |
 | `dc_warnings/dc_errors` | DC 拓扑信息 |
 
+### 结果回填模式
+
+`HybridPowerFlowCalc` 和 `run_hybrid_power_flow()` 支持以下 `result_mode`：
+
+| 模式 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `full` | 构造完整 `HybridLFResult`，并把节点电压、设备潮流和变流器结果回填到对象模型 | 需要逐设备对象结果或打印完整结果 |
+| `array` | 保留 AC/DC 子求解器的数组结果，并返回 DCAC/ACAC 数组摘要；跳过 hybrid 对象门面回填和完整 `HybridLFResult` 构造 | 大规模算例基准、只需要数组后处理 |
+| `summary` | 只保留节点电压、相角和收敛摘要 | 快速检查收敛和电压水平 |
+| `none` | 只保留 `calc.x`、迭代次数和残差，不做结果回填 | 批量性能测试或上层自行读取状态向量 |
+
+`array` 模式下，`run_hybrid_power_flow()` 仍返回 `HybridLFResult` 包装对象以保持 API 兼容；数组结果位于 `result.calc.result` 中。
+
 ## 性能设计
 
 - AC/DC 子系统只在全局残差/Jacobian 中调用一次。
 - DCAC/ACAC 变流器数组化缓存节点位置、控制模式、方程行列索引。
 - Jacobian 按稀疏 triplet 直接生成，避免构造全局稠密矩阵。
-- 支持纯 AC/纯 DC 时自动跳过空子系统。
+- 支持纯 AC/纯 DC 时自动跳过空子系统，并在单 Newton 块场景直接复用子求解器的 residual/Jacobian。
+- 支持 `result_mode="array"`，用于跳过大规模对象结果回填。
 
 ## 注意事项
 

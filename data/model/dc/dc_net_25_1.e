@@ -33,105 +33,105 @@
 </DCNode>
 
 <DCBranch>
-@ idx name       i_node j_node r    run_stat i_p j_p current
-# 0   line_0_1   0      1      0.01 1        0   0   0
-# 1   line_1_2   1      2      0.02 1        0   0   0
-# 2   line_2_3   2      3      0.03 1        0   0   0
-# 3   line_3_4   3      4      0.01 1        0   0   0
-# 4   line_4_0   4      0      0.02 1        0   0   0
-# 5   line_5_6   5      6      0.01 1        0   0   0
-# 6   line_6_7   6      7      0.02 1        0   0   0
-# 7   line_7_8   7      8      0.03 1        0   0   0
-# 8   line_8_9   8      9      0.01 1        0   0   0
-# 9   line_9_5   9      5      0.02 1        0   0   0
-# 10  line_10_11 10     11     0.01 1        0   0   0
-# 11  line_11_12 11     12     0.02 1        0   0   0
-# 12  line_12_13 12     13     0.03 1        0   0   0
-# 13  line_13_14 13     14     0.01 1        0   0   0
-# 14  line_14_10 14     10     0.02 1        0   0   0
-# 15  line_15_16 15     16     0.01 1        0   0   0
-# 16  line_16_17 16     17     0.02 1        0   0   0
-# 17  line_17_18 17     18     0.03 1        0   0   0
-# 18  line_18_19 18     19     0.01 1        0   0   0
-# 19  line_19_15 19     15     0.02 1        0   0   0
-# 20  line_4_5   4      5      0.04 1        0   0   0
-# 21  line_9_10  9      10     0.05 1        0   0   0
-# 22  line_14_15 14     15     0.03 1        0   0   0
-# 23  line_2_6   2      6      0.06 1        0   0   0
-# 24  line_8_12  8      12     0.07 1        0   0   0
-# 25  line_13_17 13     17     0.05 1        0   0   0
-# 26  line_0_19  0      19     0.08 1        0   0   0
-# 27  line_20_21 20     21     0.02 1        0   0   0
-# 28  line_21_22 21     22     0.03 1        0   0   0
-# 29  line_22_23 22     23     0.01 1        0   0   0
-# 30  line_23_24 23     24     0.02 1        0   0   0
-# 31  line_24_20 24     20     0.04 1        0   0   0
+@ idx name i_node j_node r run_stat
+# 0 line_0_1 0 1 0.01 1
+# 1 line_1_2 1 2 0.02 1
+# 2 line_2_3 2 3 0.03 1
+# 3 line_3_4 3 4 0.01 1
+# 4 line_4_0 4 0 0.02 1
+# 5 line_5_6 5 6 0.01 1
+# 6 line_6_7 6 7 0.02 1
+# 7 line_7_8 7 8 0.03 1
+# 8 line_8_9 8 9 0.01 1
+# 9 line_9_5 9 5 0.02 1
+# 10 line_10_11 10 11 0.01 1
+# 11 line_11_12 11 12 0.02 1
+# 12 line_12_13 12 13 0.03 1
+# 13 line_13_14 13 14 0.01 1
+# 14 line_14_10 14 10 0.02 1
+# 15 line_15_16 15 16 0.01 1
+# 16 line_16_17 16 17 0.02 1
+# 17 line_17_18 17 18 0.03 1
+# 18 line_18_19 18 19 0.01 1
+# 19 line_19_15 19 15 0.02 1
+# 20 line_4_5 4 5 0.04 1
+# 21 line_9_10 9 10 0.05 1
+# 22 line_14_15 14 15 0.03 1
+# 23 line_2_6 2 6 0.06 1
+# 24 line_8_12 8 12 0.07 1
+# 25 line_13_17 13 17 0.05 1
+# 26 line_0_19 0 19 0.08 1
+# 27 line_20_21 20 21 0.02 1
+# 28 line_21_22 21 22 0.03 1
+# 29 line_22_23 22 23 0.01 1
+# 30 line_23_24 23 24 0.02 1
+# 31 line_24_20 24 20 0.04 1
 </DCBranch>
 
 <DCLoad>
-@ idx name    node pbase pv0 pv1 pv2 run_stat p current
-# 0   load_1  0    1.0    200 0   0   1        0 0
-# 1   load_2  2    1.0    0   0   100 1        0 0
-# 2   load_3  4    1.0    0   150 0   1        0 0
-# 3   load_4  6    1.0    150 0   0   1        0 0
-# 4   load_5  8    1.0    10  10  90  1        0 0
-# 5   load_6  10   1.0   100 0   0   1        0 0
-# 6   load_7  12   1.0   0   120 0   1        0 0
-# 7   load_8  14   1.0   20  20  80  1        0 0
-# 8   load_9  16   1.0   250 0   0   1        0 0
-# 9   load_10 18   1.0   0   90  0   1        0 0
-# 10  load_11 19   1.0   120 0   0   1        0 0
-# 11  load_12 20   1.0   180 0   0   1        0 0
-# 12  load_13 22   1.0   0   120 0   1        0 0
-# 13  load_14 24   1.0   20  20  170 1        0 0
+@ idx name node pbase pv0 pv1 pv2 run_stat
+# 0 load_1 0 1.0 200 0 0 1
+# 1 load_2 2 1.0 0 0 100 1
+# 2 load_3 4 1.0 0 150 0 1
+# 3 load_4 6 1.0 150 0 0 1
+# 4 load_5 8 1.0 10 10 90 1
+# 5 load_6 10 1.0 100 0 0 1
+# 6 load_7 12 1.0 0 120 0 1
+# 7 load_8 14 1.0 20 20 80 1
+# 8 load_9 16 1.0 250 0 0 1
+# 9 load_10 18 1.0 0 90 0 1
+# 10 load_11 19 1.0 120 0 0 1
+# 11 load_12 20 1.0 180 0 0 1
+# 12 load_13 22 1.0 0 120 0 1
+# 13 load_14 24 1.0 20 20 170 1
 </DCLoad>
 
 <DCGenerator>
-@ idx name   node control_type v_set p_set i_set  run_stat p current
-# 0   gen_v1 3    V            110   100   0      1        0 0
-# 1   gen_v2 10   P            100   100   0      1        0 0
-# 2   gen_v3 17   P            100   150   0      1        0 0
-# 3   gen_p1 5    P            110   200   0      1        0 0
-# 4   gen_i1 7    I            110   0     0.0015 1        0 0
-# 5   gen_p2 11   P            110   180   0      1        0 0
-# 6   gen_i2 13   I            110   0     0.0012 1        0 0
-# 7   gen_p3 15   P            110   220   0      1        0 0
-# 8   gen_i3 19   I            110   0     0.001  1        0 0
-# 9   gen_p4 21   P            0     150   0      1        0 0
-# 10  gen_i4 23   I            0     0     0.001  1        0 0
+@ idx name node control_type v_set p_set i_set run_stat
+# 0 gen_v1 3 V 110 100 0 1
+# 1 gen_v2 10 P 100 100 0 1
+# 2 gen_v3 17 P 100 150 0 1
+# 3 gen_p1 5 P 110 200 0 1
+# 4 gen_i1 7 I 110 0 0.0015 1
+# 5 gen_p2 11 P 110 180 0 1
+# 6 gen_i2 13 I 110 0 0.0012 1
+# 7 gen_p3 15 P 110 220 0 1
+# 8 gen_i3 19 I 110 0 0.001 1
+# 9 gen_p4 21 P 0 150 0 1
+# 10 gen_i4 23 I 0 0 0.001 1
 </DCGenerator>
 
 <DCZeroBranch>
-@ idx name      i_node j_node run_stat p current
-# 0   zbr_1_2   1      2      1        0 0
-# 1   zbr_3_4   3      4      1        0 0
-# 2   zbr_6_7   6      7      1        0 0
-# 3   zbr_9_10  9      10     1        0 0
-# 4   zbr_11_12 11     12     1        0 0
-# 5   zbr_14_15 14     15     1        0 0
-# 6   zbr_16_17 16     17     1        0 0
-# 7   zbr_20_21 20     21     1        0 0
+@ idx name i_node j_node run_stat
+# 0 zbr_1_2 1 2 1
+# 1 zbr_3_4 3 4 1
+# 2 zbr_6_7 6 7 1
+# 3 zbr_9_10 9 10 1
+# 4 zbr_11_12 11 12 1
+# 5 zbr_14_15 14 15 1
+# 6 zbr_16_17 16 17 1
+# 7 zbr_20_21 20 21 1
 </DCZeroBranch>
 
 <DCSwitch>
-@ idx name     i_node j_node status run_stat p current
-# 1   sw_2_3   2      3      1      1        0 0
-# 3   sw_6_8   6      8      1      1        0 0
-# 5   sw_10_12 10     12     1      1        0 0
-# 7   sw_15_17 15     17     1      1        0 0
+@ idx name i_node j_node status run_stat
+# 1 sw_2_3 2 3 1 1
+# 3 sw_6_8 6 8 1 1
+# 5 sw_10_12 10 12 1 1
+# 7 sw_15_17 15 17 1 1
 </DCSwitch>
 
 <DCBreak>
-@ idx name     i_node j_node status run_stat p current
-# 0   sw_0_1   0      1      1      1        0 0
-# 2   sw_4_5   4      5      1      1        0 0
-# 4   sw_9_11  9      11     1      1        0 0
-# 6   sw_13_14 13     14     1      1        0 0
-# 8   sw_18_19 18     19     1      1        0 0
+@ idx name i_node j_node status run_stat
+# 0 sw_0_1 0 1 1 1
+# 2 sw_4_5 4 5 1 1
+# 4 sw_9_11 9 11 1 1
+# 6 sw_13_14 13 14 1 1
+# 8 sw_18_19 18 19 1 1
 </DCBreak>
 
 <DCDCConverter>
-@ idx name      i_node j_node r1    r2    control_type p_set i_set v_set run_stat i_p j_p i_c j_c
-# 6   conv_link 20     10     0.015 0.015 V            0     0     100   1        0   0   0   0
-# 7   conv_7    22     23     0     0     P            10    0     0     1        0   0   0   0
+@ idx name i_node j_node r1 r2 control_type p_set i_set v_set run_stat
+# 6 conv_link 20 10 0.015 0.015 V 0 0 100 1
+# 7 conv_7 22 23 0 0 P 10 0 0 1
 </DCDCConverter>

@@ -77,29 +77,29 @@ def _build_case_tables(n_nodes: int) -> List[tuple]:
         for local in range(NODES_PER_BLOCK):
             i_node = base + local
             j_node = base + ((local + 1) % NODES_PER_BLOCK)
-            branches.append((branch_idx, f"line_{i_node}_{j_node}", i_node, j_node, ring_r[local], 1, 0, 0, 0))
+            branches.append((branch_idx, f"line_{i_node}_{j_node}", i_node, j_node, ring_r[local], 1))
             branch_idx += 1
         for i_local, j_local, r in ((1, 5, 0.12), (3, 7, 0.11)):
             i_node = base + i_local
             j_node = base + j_local
-            branches.append((branch_idx, f"line_{i_node}_{j_node}", i_node, j_node, r, 1, 0, 0, 0))
+            branches.append((branch_idx, f"line_{i_node}_{j_node}", i_node, j_node, r, 1))
             branch_idx += 1
 
         for node_local, pv0, pv1, pv2 in load_specs:
             node = base + node_local
-            loads.append((load_idx, f"load_{load_idx + 1}", node, 1.0, pv0, pv1, pv2, 1, 0, 0))
+            loads.append((load_idx, f"load_{load_idx + 1}", node, 1.0, pv0, pv1, pv2, 1))
             load_idx += 1
 
-        generators.append((gen_idx, f"gen_v_{block + 1}", base + 0, "V", 160.0, 0.0, 0.0, 1, 0, 0))
+        generators.append((gen_idx, f"gen_v_{block + 1}", base + 0, "V", 160.0, 0.0, 0.0, 1))
         gen_idx += 1
-        generators.append((gen_idx, f"gen_p_{block + 1}", base + 3, "P", 100.0, 80.0, 0.0, 1, 0, 0))
+        generators.append((gen_idx, f"gen_p_{block + 1}", base + 3, "P", 100.0, 80.0, 0.0, 1))
         gen_idx += 1
-        generators.append((gen_idx, f"gen_i_{block + 1}", base + 7, "I", 100.0, 0.0, 0.00055, 1, 0, 0))
+        generators.append((gen_idx, f"gen_i_{block + 1}", base + 7, "I", 100.0, 0.0, 0.00055, 1))
         gen_idx += 1
 
-        zero_branches.append((zero_idx, f"zbr_{base + 1}_{base + 2}", base + 1, base + 2, 1, 0, 0))
+        zero_branches.append((zero_idx, f"zbr_{base + 1}_{base + 2}", base + 1, base + 2, 1))
         zero_idx += 1
-        switches.append((switch_idx, f"sw_{base + 2}_{base + 3}", base + 2, base + 3, 1, 1, 0, 0))
+        switches.append((switch_idx, f"sw_{base + 2}_{base + 3}", base + 2, base + 3, 1, 1))
         switch_idx += 1
 
         dcdcs.append(
@@ -115,10 +115,6 @@ def _build_case_tables(n_nodes: int) -> List[tuple]:
                 0.0,
                 0.0,
                 1,
-                0,
-                0,
-                0,
-                0,
             )
         )
         dcdc_idx += 1
@@ -126,14 +122,14 @@ def _build_case_tables(n_nodes: int) -> List[tuple]:
     return [
         ("PowerBase", ("p_base", "u_scale", "p_scale", "i_scale"), [(POWER_BASE, U_SCALE, P_SCALE, I_SCALE)]),
         ("DCNode", ("idx", "name", "vbase", "voltage", "isl", "run_stat"), nodes),
-        ("DCBranch", ("idx", "name", "i_node", "j_node", "r", "run_stat", "i_p", "j_p", "current"), branches),
-        ("DCLoad", ("idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "run_stat", "p", "current"), loads),
-        ("DCGenerator", ("idx", "name", "node", "control_type", "v_set", "p_set", "i_set", "run_stat", "p", "current"), generators),
-        ("DCZeroBranch", ("idx", "name", "i_node", "j_node", "run_stat", "p", "current"), zero_branches),
-        ("DCSwitch", ("idx", "name", "i_node", "j_node", "status", "run_stat", "p", "current"), switches),
+        ("DCBranch", ("idx", "name", "i_node", "j_node", "r", "run_stat"), branches),
+        ("DCLoad", ("idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "run_stat"), loads),
+        ("DCGenerator", ("idx", "name", "node", "control_type", "v_set", "p_set", "i_set", "run_stat"), generators),
+        ("DCZeroBranch", ("idx", "name", "i_node", "j_node", "run_stat"), zero_branches),
+        ("DCSwitch", ("idx", "name", "i_node", "j_node", "status", "run_stat"), switches),
         (
             "DCDCConverter",
-            ("idx", "name", "i_node", "j_node", "r1", "r2", "control_type", "p_set", "i_set", "v_set", "run_stat", "i_p", "j_p", "i_c", "j_c"),
+            ("idx", "name", "i_node", "j_node", "r1", "r2", "control_type", "p_set", "i_set", "v_set", "run_stat"),
             dcdcs,
         ),
     ]

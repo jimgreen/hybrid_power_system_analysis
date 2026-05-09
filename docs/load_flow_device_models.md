@@ -23,6 +23,8 @@
 
 AC 和 DC 求解都会先剔除停运设备、断开开关以及无有效平衡源的拓扑岛。闭合开关在拓扑上可合并节点或作为零阻抗约束参与计算，具体取决于 AC/DC 求解器路径。
 
+AC、DC 和 Hybrid 模型输入 E 文件只保留设备拓扑、参数和控制设定。`ACBranch`、`ACTransformer`、`ACLoad`、`ACGenerator`、`ACShuntCompensator`、`ACSwitch`、`ACBreak`、`ACZeroBranch`，以及 `DCBranch`、`DCLoad`、`DCGenerator`、`DCZeroBranch`、`DCSwitch`、`DCBreak`、`DCDCConverter`、`DCACConverter`、`ACACConverter` 的 `p/q/current`、端口功率或端口电流属于潮流结果，不再写入输入 E 文件；求解器仍会在运行时对象和数组结果中生成这些状态。
+
 ## 3. AC 设备模型
 
 ### 3.1 ACNode / ACBus
@@ -511,4 +513,4 @@ x_hybrid = [x_ac, x_dc, dcac(Pdc, Pac, Qac), acac(Pi, Qi, Pj, Qj)]
 - 零阻抗支路、闭合开关和闭合刀闸不应通过小阻抗近似处理；当前代码使用 phi 辅助变量精确建模。
 - AC 支路和开关类设备两端电压基值应一致。
 - DCAC 和 ACAC 会直接修改端口节点的功率平衡残差，因此端口节点类型需要避免与变流器控制重复约束。
-- `result_mode="summary"` 或 `"none"` 会减少结果回填成本，但不适合需要逐设备结果的后处理。
+- `result_mode="array"` 会保留数组结果并跳过 hybrid 对象门面回填；`"summary"` 或 `"none"` 会进一步减少结果输出成本，但不适合需要逐设备对象结果的后处理。

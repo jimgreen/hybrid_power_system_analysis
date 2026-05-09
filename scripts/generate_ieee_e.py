@@ -135,12 +135,6 @@ def convert_case(case_name, out_path):
                     _fmt(tap),
                     _fmt(shift),
                     str(run_stat),
-                    "0.0",
-                    "0.0",
-                    "0.0",
-                    "0.0",
-                    "0.0",
-                    "0.0",
                 ]
             )
             transformer_idx += 1
@@ -155,19 +149,13 @@ def convert_case(case_name, out_path):
                     _fmt(row[BR_X]),
                     _fmt(row[BR_B]),
                     str(run_stat),
-                    "0.0",
-                    "0.0",
-                    "0.0",
-                    "0.0",
-                    "0.0",
-                    "0.0",
                 ]
             )
             branch_idx += 1
     _write_block(
         lines,
         "ACBranch",
-        ["idx", "name", "i_node", "j_node", "r", "x", "b", "run_stat", "i_p", "i_q", "i_c", "j_p", "j_q", "j_c"],
+        ["idx", "name", "i_node", "j_node", "r", "x", "b", "run_stat"],
         branch_rows,
     )
 
@@ -194,16 +182,13 @@ def convert_case(case_name, out_path):
                 "0.0",
                 "0.0",
                 str(run_stat),
-                "0.0",
-                "0.0",
-                "0.0",
             ]
         )
         load_idx += 1
     _write_block(
         lines,
         "ACLoad",
-        ["idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "qbase", "qv0", "qv1", "qv2", "run_stat", "p", "q", "current"],
+        ["idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "qbase", "qv0", "qv1", "qv2", "run_stat"],
         load_rows,
     )
 
@@ -224,15 +209,12 @@ def convert_case(case_name, out_path):
                 _fmt((row[VG] if row.shape[0] > VG else bus_vm[bus_id]) * bus_kv[bus_id]),
                 "1.0",
                 str(run_stat),
-                "0.0",
-                "0.0",
-                "0.0",
             ]
         )
     _write_block(
         lines,
         "ACGenerator",
-        ["idx", "name", "node", "control_type", "p_set", "q_set", "v_set", "alpha", "run_stat", "p", "q", "current"],
+        ["idx", "name", "node", "control_type", "p_set", "q_set", "v_set", "alpha", "run_stat"],
         gen_rows,
     )
 
@@ -256,25 +238,22 @@ def convert_case(case_name, out_path):
                 _fmt(bs),
                 "0.0",
                 str(run_stat),
-                "0.0",
-                "0.0",
-                "0.0",
             ]
         )
         shunt_idx += 1
     _write_block(
         lines,
         "ACShuntCompensator",
-        ["idx", "name", "node", "control_type", "q_set", "g_set", "b_set", "v_set", "run_stat", "p", "q", "current"],
+        ["idx", "name", "node", "control_type", "q_set", "g_set", "b_set", "v_set", "run_stat"],
         shunt_rows,
     )
 
-    _write_block(lines, "ACZeroBranch", ["idx", "name", "i_node", "j_node", "run_stat", "p", "q", "current"], [])
-    _write_block(lines, "ACSwitch", ["idx", "name", "i_node", "j_node", "status", "run_stat", "p", "q", "current"], [])
+    _write_block(lines, "ACZeroBranch", ["idx", "name", "i_node", "j_node", "run_stat"], [])
+    _write_block(lines, "ACSwitch", ["idx", "name", "i_node", "j_node", "status", "run_stat"], [])
     _write_block(
         lines,
         "ACTransformer",
-        ["idx", "name", "i_node", "j_node", "r", "x", "gt", "bt", "tap", "shift", "run_stat", "i_p", "i_q", "i_c", "j_p", "j_q", "j_c"],
+        ["idx", "name", "i_node", "j_node", "r", "x", "gt", "bt", "tap", "shift", "run_stat"],
         transformer_rows,
     )
 
