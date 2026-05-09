@@ -3012,7 +3012,7 @@ class HybridStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
-        if mode == "summary":
+        if mode in ("summary", "array"):
             self.se_result = build_seresult_summary(
                 result,
                 bad_items=bad_items,

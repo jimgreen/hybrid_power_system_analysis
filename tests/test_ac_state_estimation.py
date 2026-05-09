@@ -2563,6 +2563,44 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, len(se_result.bad_data))
         self.assertEqual(0, len(se_result.normal_measurements))
 
+    def test_run_array_return_mode_skips_full_seresult_tables(self):
+        from secore.ac_se import ACStateEstimator
+        from secore.se_result import SEResult
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            auto_prepare=False,
+        )
+        estimator.prepare()
+        original_from_estimate = SEResult.from_estimate_result
+
+        def reject_full_tables(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not build full SEResult measurement tables")
+
+        SEResult.from_estimate_result = reject_full_tables
+        try:
+            se_result = estimator.run(
+                return_mode="array",
+                verbose=False,
+                skip_bad_data=True,
+                final_diagnostics=False,
+            )
+        finally:
+            SEResult.from_estimate_result = original_from_estimate
+        result = estimator.estimate_result
+
+        self.assertIs(se_result, estimator.se_result)
+        self.assertTrue(result.converged)
+        self.assertGreater(result.x.size, 0)
+        self.assertGreater(result.z_est.size, 0)
+        self.assertGreater(result.residual.size, 0)
+        self.assertGreater(se_result.statistics.normal_measurement_count, 0)
+        self.assertEqual(0, len(se_result.prefiltered_measurements))
+        self.assertEqual(0, len(se_result.pseudo_measurements))
+        self.assertEqual(0, len(se_result.bad_data))
+        self.assertEqual(0, len(se_result.normal_measurements))
+
     def test_estimate_uses_cholesky_solver_when_available(self):
         import secore.se_math as se_math
         from secore.ac_se import ACStateEstimator
