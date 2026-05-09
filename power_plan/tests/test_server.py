@@ -707,6 +707,22 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("flex: 1 1 auto", css)
         self.assertIn("overflow: auto", css)
 
+    def test_planning_overview_charts_and_tables_adapt_to_available_height(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("--summary-panel-height", css)
+        self.assertIn("--summary-table-height", css)
+        self.assertIn("--summary-histogram-grid-height", css)
+        self.assertIn("--summary-histogram-svg-height", css)
+        self.assertIn("height: var(--summary-table-height", css)
+        self.assertIn("height: var(--summary-histogram-grid-height", css)
+        self.assertIn("grid-template-rows: repeat(2, minmax(0, 1fr))", css)
+        self.assertIn("flex-direction: column", css)
+        self.assertIn("applyAdaptiveSummaryLayout", script)
+        self.assertIn("summary-histogram-grid-height", script)
+        self.assertIn("summary-table-height", script)
+
     def test_planning_layout_constrains_page_height_to_viewport(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 

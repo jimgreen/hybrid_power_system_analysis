@@ -169,6 +169,7 @@ function bindAdaptiveLayout() {
 function syncAdaptiveLayout() {
   applyPanelTableMaxHeight();
   applyAdaptiveTimeSeriesLayout();
+  applyAdaptiveSummaryLayout();
   renderChart();
 }
 
@@ -202,6 +203,24 @@ function applyAdaptiveTimeSeriesLayout() {
   document.documentElement.style.setProperty("--time-chart-height", `${Math.round(chartHeight)}px`);
   document.documentElement.style.setProperty("--time-table-height", `${Math.round(tableHeight)}px`);
   handle?.setAttribute("aria-valuenow", String(Math.round(chartHeight)));
+}
+
+function applyAdaptiveSummaryLayout() {
+  const tab = document.getElementById("limitsTab");
+  const activePanel = tab?.querySelector(".summary-tab-panel.active");
+  const heading = activePanel?.querySelector(".panel-heading");
+  if (!tab || !activePanel || !tab.classList.contains("active")) return;
+
+  const panelHeight = activePanel.clientHeight || Math.max(260, tab.clientHeight - 88);
+  const contentHeight = Math.max(220, panelHeight - (heading?.offsetHeight || 0) - 12);
+  const tableHeight = Math.min(560, Math.max(220, contentHeight));
+  const histogramGridHeight = Math.min(620, Math.max(280, contentHeight));
+  const histogramSvgHeight = Math.min(240, Math.max(120, (histogramGridHeight - 14) / 2 - 76));
+
+  document.documentElement.style.setProperty("--summary-panel-height", `${Math.round(panelHeight)}px`);
+  document.documentElement.style.setProperty("--summary-table-height", `${Math.round(tableHeight)}px`);
+  document.documentElement.style.setProperty("--summary-histogram-grid-height", `${Math.round(histogramGridHeight)}px`);
+  document.documentElement.style.setProperty("--summary-histogram-svg-height", `${Math.round(histogramSvgHeight)}px`);
 }
 
 function bindTimeResizeHandle() {
@@ -1002,6 +1021,7 @@ function renderSchemeSummary() {
   if (planningHost) {
     planningHost.innerHTML = renderPlanningParameterSummaryTable();
   }
+  requestAnimationFrame(syncAdaptiveLayout);
 }
 
 function renderHistogramPanel(rows, key, title, color, unit) {
