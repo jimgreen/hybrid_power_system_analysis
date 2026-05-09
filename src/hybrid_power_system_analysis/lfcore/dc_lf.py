@@ -191,7 +191,12 @@ def find_spanning_tree_edges(edges, n_nodes):
     return tree
 
 class DCPowerFlowCalc:
-    """直流潮流计算器，使用节点电压、零阻抗 phi 和 DCDC 端口功率统一求解。"""
+    """直流潮流计算器，使用节点电压、零阻抗 phi 和 DCDC 端口功率统一求解。
+
+    状态向量布局为 ``V``、``phi``、``Pdc_i/Pdc_j``。节点功率平衡、定压
+    节点约束、零阻抗电压相等约束、phi 参考约束和 DC-DC 控制/损耗方程
+    在同一个 Newton 系统中求解。
+    """
 
     _DIRECT_PPC_STATIC_ATTRS = (
         "alive_nodes",
@@ -596,6 +601,8 @@ class DCPowerFlowCalc:
             status_col=DC_BREAK_COLS["status"],
         )
 
+        # 闭合开关会把多个物理节点合并为同一个电气计算节点；普通支路、
+        # 零阻抗支路和闭合刀闸只用于判断包含定压源的可计算拓扑岛。
         switch_labels = self._component_labels_from_edges(n_running, ((switch_i, switch_j),))
         full_labels = self._component_labels_from_edges(
             n_running,
@@ -1147,6 +1154,8 @@ class DCPowerFlowCalc:
             print("self.N_dcdc = ", self.N_dcdc)
 
         # ---------- 5. 变量定义 ----------
+        # 前 N 个变量是节点电压；随后是零阻抗连通分量的 phi；最后每台
+        # DCDC 有两端端口功率未知量，用于同时表达控制模式和损耗方程。
         self.total_vars = self.N + self.N_phi + self.N_dcdc * 2
         x = np.zeros(self.total_vars, dtype=np.float64)
         x[:self.N] = 1.0

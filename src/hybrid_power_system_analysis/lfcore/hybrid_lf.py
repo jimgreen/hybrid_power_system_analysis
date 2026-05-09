@@ -202,6 +202,8 @@ class HybridPowerFlowCalc:
     """统一交直流 Newton 求解器。
 
     AC、DC 子网和 DC/AC 换流器变量在同一个全局状态向量中求解。
+    全局向量按 AC 子系统、DC 子系统、DCAC 变流器、ACAC 变流器顺序拼接；
+    换流器方程通过修改 AC/DC 端口节点的功率平衡残差实现耦合。
     """
 
     def __init__(
@@ -321,6 +323,8 @@ class HybridPowerFlowCalc:
         self._prepare_acac_converters()
         if not parts:
             raise RuntimeError("E 文件中没有 ACNode 或 DCNode，无法进行交直流潮流计算")
+        # 全局变量布局：
+        # [AC 内部变量][DC 内部变量][每台 DCAC: Pdc, Pac, Qac][每台 ACAC: Pi, Qi, Pj, Qj]
         self.dcac_start = self.ac_size + self.dc_size
         dcac_x = self._initial_dcac_x()
         if dcac_x.size:
@@ -559,6 +563,8 @@ class HybridPowerFlowCalc:
             self.dcac_eq_ctrl_1 = self.dcac_eq_loss + 1
             self.dcac_eq_ctrl_2 = self.dcac_eq_loss + 2
 
+            # DCAC 损耗方程依赖 Pdc、Pac、Qac 以及两侧电压；控制方程根据
+            # DCV/ACV/ACP 模式切换为定 DC 电压、定 AC 电压或定 AC 有功。
             self.dcac_loss_rows = np.repeat(self.dcac_eq_loss, 5)
             self.dcac_loss_cols = np.empty(self.N_dcac * 5, dtype=np.int32)
             self.dcac_loss_cols[0::5] = self.dcac_dc_p_col
@@ -587,6 +593,8 @@ class HybridPowerFlowCalc:
             self.acac_eq_ctrl_2 = self.acac_eq_loss + 2
             self.acac_eq_ctrl_3 = self.acac_eq_loss + 3
 
+            # ACAC 损耗方程依赖两端 P/Q 和电压；四类控制模式通过布尔掩码
+            # 选择 i/j 侧是定 Q 还是定 V。
             self.acac_loss_rows = np.repeat(self.acac_eq_loss, 6)
             self.acac_loss_cols = np.empty(self.N_acac * 6, dtype=np.int32)
             self.acac_loss_cols[0::6] = self.acac_i_p_col
@@ -1612,7 +1620,7 @@ def main(argv=None) -> int:
         tol=args.tol,
         max_iter=args.max_iter,
         min_voltage=args.min_voltage,
-        verbose=verbose,
+        verbose=not args.quiet,
         parameter_file=args.para,
         linear_solver=args.linear_solver,
         result_mode=args.result_mode,

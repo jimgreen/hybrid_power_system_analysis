@@ -240,7 +240,12 @@ def build_jacobian_matrix(rows, cols, data, shape):
 # 核心潮流计算类（精简极速版）
 # ==============================================================================
 class ACPowerFlowCalc:
-    """交流潮流计算类（极坐标牛顿-拉夫逊法）- 精简极速版"""
+    """交流潮流计算类（极坐标牛顿-拉夫逊法）。
+
+    求解变量按 ``theta_unknown``、``V_unknown``、零阻抗支路辅助电位
+    ``phi_re/phi_im`` 排列。节点 P/Q 平衡、PV/Slack 电压约束、零阻抗
+    支路电压相等约束和 phi 参考约束共同组成 Newton 方程组。
+    """
 
     def __init__(
         self,
@@ -319,7 +324,9 @@ class ACPowerFlowCalc:
         self.load_info: List = []
         self.slack_node: int = -1
 
-        # 零阻抗支路相关
+        # 零阻抗支路相关。
+        # 零阻抗支路不进入常规 Y 矩阵；这里把每个零阻抗连通分量映射为
+        # 一组 phi 辅助变量，支路电流由两端 phi 差表示。
         self.zero_edges = []
         self.comp_nodes: List[List[int]] = []
         self.comp_tree_edges: List[List[int]] = []
@@ -329,7 +336,9 @@ class ACPowerFlowCalc:
         self.zero_branch_info: np.ndarray = np.array([])
         self.N_phi: int = 0
 
-        # 变量/方程索引
+        # 变量/方程索引。
+        # theta_idx/V_idx 指向 Newton 状态向量中的列号；后续构造残差和
+        # 雅可比时只使用这些预计算索引，避免在迭代中重复查表。
         self.theta_unknown: np.ndarray = np.array([])
         self.V_unknown: np.ndarray = np.array([])
         self.theta_idx: Dict[int, int] = {}
