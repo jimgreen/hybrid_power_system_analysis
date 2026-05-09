@@ -1,5 +1,10 @@
 * { box-sizing: border-box; }
 
+:root {
+  --panel-table-max-height: min(62vh, 680px);
+  --time-table-height: clamp(220px, 38vh, 520px);
+}
+
 body {
   margin: 0;
   height: 100vh;
@@ -12,7 +17,8 @@ body {
 }
 
 button,
-input { font: inherit; }
+input,
+select { font: inherit; }
 
 button {
   border: 0;
@@ -146,9 +152,9 @@ button:disabled {
 }
 
 .scheme-list-title {
-  margin: 18px 0 10px;
-  color: #405b58;
-  font-size: 14px;
+  margin: 0 0 14px;
+  color: #102b2a;
+  font-size: 18px;
   font-weight: 900;
 }
 
@@ -353,13 +359,17 @@ h2 { font-size: 19px; }
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow-x: auto;
   margin: 0 0 10px;
+  padding-bottom: 2px;
 }
 
 .weather-import-bar label {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   gap: 6px;
   color: #405b58;
   font-size: 13px;
@@ -389,6 +399,7 @@ h2 { font-size: 19px; }
 }
 
 .weather-import-status {
+  flex: 0 0 auto;
   min-width: 120px;
   color: #5a716e;
   font-size: 13px;
@@ -401,6 +412,13 @@ h2 { font-size: 19px; }
 
 .weather-import-status.ok {
   color: #0d5c59;
+}
+
+.curve-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  margin: 0 0 10px;
 }
 
 .map-picker-modal {
@@ -513,6 +531,21 @@ h2 { font-size: 19px; }
   font-size: 12px;
 }
 
+.chart-cursor line {
+  stroke: #173f3b;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+}
+
+.chart-cursor circle {
+  stroke: #fff;
+  stroke-width: 2;
+}
+
+.histogram-bar {
+  cursor: crosshair;
+}
+
 .pager {
   display: flex;
   align-items: center;
@@ -568,7 +601,7 @@ h2 { font-size: 19px; }
   overflow: auto;
   border: 1px solid #d7e4e0;
   border-radius: 16px;
-  max-height: min(62vh, 680px);
+  max-height: var(--panel-table-max-height, min(62vh, 680px));
 }
 
 #timeTab .chart-card {
@@ -576,8 +609,12 @@ h2 { font-size: 19px; }
   margin-bottom: 0;
 }
 
+#timeTab.tab-panel.active {
+  overflow: auto;
+}
+
 #timeTab .table-card {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -587,6 +624,7 @@ h2 { font-size: 19px; }
 #timeTab #timeTable {
   flex: 1 1 auto;
   min-height: 0;
+  height: var(--time-table-height, clamp(220px, 38vh, 520px));
   max-height: none;
 }
 
@@ -638,7 +676,8 @@ th {
   z-index: 1;
 }
 
-td input {
+td input,
+td select {
   width: 100%;
   min-width: 80px;
   border: 1px solid transparent;
@@ -648,7 +687,8 @@ td input {
   color: #172033;
 }
 
-td input:focus {
+td input:focus,
+td select:focus {
   outline: 2px solid #72b7ad;
   background: #fff;
 }
@@ -656,6 +696,12 @@ td input:focus {
 td input[type="checkbox"] {
   width: auto;
   min-width: 0;
+}
+
+.planning-bool-select {
+  width: 108px;
+  min-width: 108px;
+  font-weight: 800;
 }
 
 .planning-parameters-table table {
@@ -858,4 +904,8 @@ td input[type="checkbox"] {
   .histogram-grid { grid-template-columns: 1fr; }
   .scheme-rail,
   .summary-rail { max-height: none; }
+  .weather-import-bar {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
 }

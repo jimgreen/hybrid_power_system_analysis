@@ -509,11 +509,16 @@ class PowerPlanServerTest(unittest.TestCase):
 
     def test_planning_scheme_rail_only_shows_scheme_list_title(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
         rail = html.split('<aside class="scheme-rail">', 1)[1].split("</aside>", 1)[0]
 
         self.assertNotIn("方案管理", rail)
         self.assertIn("方案列表", rail)
         self.assertIn('id="schemeList"', rail)
+        self.assertIn(".scheme-list-title", css)
+        self.assertIn("color: #102b2a", css)
+        self.assertIn("font-size: 18px", css)
+        self.assertIn("font-weight: 900", css)
 
     def test_planning_page_save_button_is_in_scheme_actions(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
@@ -582,6 +587,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('data-tab="planning"', html)
         self.assertIn('id="planningTab"', html)
         self.assertIn('id="planningParametersTable"', html)
+        self.assertNotIn("参数随当前方案保存到 XLSX 文件。", html)
         self.assertLess(html.index('data-tab="devices"'), html.index('data-tab="planning"'))
         self.assertLess(html.index('data-tab="planning"'), html.index('data-tab="limits"'))
         self.assertIn('data-summary-tab="planning"', html)
@@ -609,6 +615,20 @@ class PowerPlanServerTest(unittest.TestCase):
             "是否考虑负荷扰动",
         ):
             self.assertIn(label, script)
+
+    def test_planning_boolean_parameters_use_yes_no_selects(self):
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("planning-bool-select", script)
+        self.assertIn('<option value="true"', script)
+        self.assertIn('<option value="false"', script)
+        self.assertIn(">是</option>", script)
+        self.assertIn(">否</option>", script)
+        self.assertIn('input.type === "checkbox"', script)
+        self.assertIn('input.tagName === "SELECT"', script)
+        self.assertNotIn('type="checkbox" data-planning-key', script)
+        self.assertIn(".planning-bool-select", css)
 
     def test_planning_save_has_parameter_alarm_validation(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
@@ -640,6 +660,8 @@ class PowerPlanServerTest(unittest.TestCase):
 
         self.assertIn("方案概览", html)
         self.assertNotIn("方案汇总", html)
+        self.assertNotIn('id="schemeOverview"', html)
+        self.assertNotIn("overviewHost", script)
         self.assertNotIn('id="summaryStats"', html)
         self.assertNotIn("时序统计量", html)
         self.assertIn('id="summaryCharts"', html)
@@ -663,6 +685,18 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("buildHistogram", script)
         for name in ("风速", "太阳辐照", "温度", "负荷", "最大值", "最小值", "平均值", "数据下限(台)", "数据上限(台)"):
             self.assertIn(name, script)
+        self.assertNotIn("formatFixed2", script)
+        self.assertIn("formatInteger", script)
+        self.assertIn("频数", script)
+        self.assertIn("yAxis", script)
+        self.assertIn("formatInteger(count)", script)
+        self.assertIn("formatInteger(bin.count)", script)
+        self.assertIn("histogram-bar", script)
+        self.assertIn("data-bin-range", script)
+        self.assertIn("data-bin-count", script)
+        self.assertIn("onHistogramMouseMove", script)
+        self.assertIn("横坐标", script)
+        self.assertIn("纵坐标", script)
 
     def test_planning_overview_page_scrolls_when_content_overflows(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
@@ -681,6 +715,21 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("grid-template-rows: auto minmax(0, 1fr)", css)
         self.assertIn("#timeTab #timeTable", css)
         self.assertIn("height: var(--time-chart-height, clamp(180px, 28vh, 300px))", css)
+
+    def test_planning_layout_adapts_chart_and_table_heights_to_viewport(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("--panel-table-max-height", css)
+        self.assertIn("--time-table-height", css)
+        self.assertIn("height: var(--time-table-height", css)
+        self.assertIn("max-height: var(--panel-table-max-height", css)
+        self.assertIn("#timeTab.tab-panel.active", css)
+        self.assertIn("syncAdaptiveLayout", script)
+        self.assertIn("applyAdaptiveTimeSeriesLayout", script)
+        self.assertIn("ResizeObserver", script)
+        self.assertIn("timeChartManualHeight", script)
+        self.assertIn("Math.round(tableHeight)", script)
 
     def test_planning_frontend_defers_time_series_loading(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
@@ -702,6 +751,11 @@ class PowerPlanServerTest(unittest.TestCase):
 
         self.assertNotIn("8760点曲线板", html)
         self.assertIn('data-curve="temperature"', html)
+        self.assertIn('type="radio"', html)
+        self.assertIn('name="timeCurve"', html)
+        self.assertNotIn('type="checkbox" data-curve', html)
+        self.assertIn('class="curve-switch-row"', html)
+        self.assertLess(html.index('class="weather-import-bar"'), html.index('class="curve-switch-row"'))
         self.assertIn("temperature", script)
         self.assertIn("温度", script)
 
@@ -790,11 +844,24 @@ class PowerPlanServerTest(unittest.TestCase):
 
     def test_planning_time_series_input_refreshes_visible_chart(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
         self.assertIn("function onTimeInput", script)
         self.assertIn("renderChart();", script)
-        self.assertIn(".map(([key, , color])", script)
+        self.assertIn("selectedCurveSpec", script)
+        self.assertIn("[data-curve]:checked", script)
+        self.assertIn("时间（月）", script)
+        self.assertIn("monthRanges", script)
+        self.assertIn("yTicks", script)
         self.assertIn('stroke="${color}"', script)
+        self.assertIn("onChartMouseMove", script)
+        self.assertIn("hideChartCursor", script)
+        self.assertIn('id="chartCursor"', script)
+        self.assertIn('id="chartCursorLine"', script)
+        self.assertIn('id="chartCursorPoint"', script)
+        self.assertIn("mousemove", script)
+        self.assertIn("mouseleave", script)
+        self.assertIn(".chart-cursor", css)
 
     def test_planning_device_fields_follow_latest_parameter_names(self):
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")

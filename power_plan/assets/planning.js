@@ -1,4 +1,17 @@
-const state = { schemes: [], currentScheme: "", payload: null, month: 0, timeSeriesLoading: null, mapConfig: null, mapPoint: null, mapInstance: null, mapMarker: null };
+const state = {
+  schemes: [],
+  currentScheme: "",
+  payload: null,
+  month: 0,
+  timeSeriesLoading: null,
+  mapConfig: null,
+  mapPoint: null,
+  mapInstance: null,
+  mapMarker: null,
+  chartMeta: null,
+  timeChartManualHeight: null,
+  layoutObserver: null,
+};
 
 const deviceSpecs = [
   ["diesel_generators", "柴发", ["name", "capacity", "cost", "power_upper", "power_lower", "fuel_rate", "quantity_lower", "quantity_upper"]],
@@ -82,6 +95,8 @@ document.addEventListener("DOMContentLoaded", () => {
   bindSummaryTabs();
   bindTimeResizeHandle();
   bindActions();
+  bindAdaptiveLayout();
+  syncAdaptiveLayout();
   loadSchemes().catch(showError);
 });
 
@@ -92,6 +107,7 @@ function bindTabs() {
       document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
       button.classList.add("active");
       document.getElementById(`${button.dataset.tab}Tab`).classList.add("active");
+      syncAdaptiveLayout();
       ensureTimeSeriesForActiveTab();
     });
   });
@@ -113,6 +129,7 @@ function bindSummaryTabs() {
         panel.classList.toggle("active", active);
         panel.hidden = !active;
       });
+      syncAdaptiveLayout();
     });
   });
 }
@@ -129,7 +146,62 @@ function bindActions() {
   document.getElementById("closeMapPicker").addEventListener("click", closeMapPicker);
   document.getElementById("confirmMapPoint").addEventListener("click", confirmMapPoint);
   document.querySelectorAll("[data-curve]").forEach((box) => box.addEventListener("change", renderChart));
-  window.addEventListener("resize", renderChart);
+  document.getElementById("timeChart").addEventListener("mousemove", onChartMouseMove);
+  document.getElementById("timeChart").addEventListener("mouseleave", hideChartCursor);
+  document.addEventListener("mousemove", onHistogramMouseMove);
+  document.addEventListener("mouseleave", hideHistogramTip);
+  window.addEventListener("resize", syncAdaptiveLayout);
+}
+
+function bindAdaptiveLayout() {
+  if (!("ResizeObserver" in window)) return;
+  const targets = [
+    document.querySelector(".editor-panel"),
+    document.getElementById("timeTab"),
+    document.getElementById("devicesTab"),
+    document.getElementById("planningTab"),
+    document.getElementById("limitsTab"),
+  ].filter(Boolean);
+  state.layoutObserver = new ResizeObserver(() => syncAdaptiveLayout());
+  targets.forEach((target) => state.layoutObserver.observe(target));
+}
+
+function syncAdaptiveLayout() {
+  applyPanelTableMaxHeight();
+  applyAdaptiveTimeSeriesLayout();
+  renderChart();
+}
+
+function applyPanelTableMaxHeight() {
+  const editor = document.querySelector(".editor-panel");
+  const header = document.querySelector(".editor-header");
+  const available = editor ? editor.clientHeight - (header?.offsetHeight || 0) - 72 : window.innerHeight * 0.55;
+  const tableMaxHeight = Math.min(680, Math.max(220, available));
+  document.documentElement.style.setProperty("--panel-table-max-height", `${Math.round(tableMaxHeight)}px`);
+}
+
+function applyAdaptiveTimeSeriesLayout() {
+  const tab = document.getElementById("timeTab");
+  const chart = document.getElementById("timeChart");
+  const chartCard = tab?.querySelector(".chart-card");
+  const tableCard = tab?.querySelector(".table-card");
+  const table = document.getElementById("timeTable");
+  const toolbar = tab?.querySelector(".time-table-toolbar");
+  const handle = document.getElementById("timeResizeHandle");
+  if (!tab || !chart || !chartCard || !tableCard || !table || !tab.classList.contains("active")) return;
+
+  const tabHeight = tab.clientHeight || Math.max(520, window.innerHeight - 180);
+  const chartChrome = Math.max(0, chartCard.offsetHeight - chart.clientHeight);
+  const tableChrome = Math.max(0, tableCard.offsetHeight - table.clientHeight) || (toolbar?.offsetHeight || 0) + 44;
+  const handleHeight = (handle?.offsetHeight || 14) + 10;
+  const available = Math.max(240, tabHeight - chartChrome - tableChrome - handleHeight - 32);
+  const autoChartHeight = Math.min(340, Math.max(140, available * 0.4));
+  const chartHeight = clampTimeChartHeight(state.timeChartManualHeight ?? autoChartHeight);
+  const tableHeight = Math.min(620, Math.max(120, available - chartHeight));
+
+  document.documentElement.style.setProperty("--time-chart-height", `${Math.round(chartHeight)}px`);
+  document.documentElement.style.setProperty("--time-table-height", `${Math.round(tableHeight)}px`);
+  handle?.setAttribute("aria-valuenow", String(Math.round(chartHeight)));
 }
 
 function bindTimeResizeHandle() {
@@ -139,9 +211,10 @@ function bindTimeResizeHandle() {
 
   const applyHeight = (height) => {
     const safeHeight = clampTimeChartHeight(height);
+    state.timeChartManualHeight = safeHeight;
     document.documentElement.style.setProperty("--time-chart-height", `${Math.round(safeHeight)}px`);
     handle.setAttribute("aria-valuenow", String(Math.round(safeHeight)));
-    renderChart();
+    syncAdaptiveLayout();
   };
 
   handle.addEventListener("pointerdown", (event) => {
@@ -159,7 +232,7 @@ function bindTimeResizeHandle() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onDone);
       window.removeEventListener("pointercancel", onDone);
-      renderChart();
+      syncAdaptiveLayout();
     };
 
     window.addEventListener("pointermove", onMove);
@@ -180,7 +253,7 @@ function bindTimeResizeHandle() {
       applyHeight(currentHeight + keySteps[event.key]);
     } else if (event.key === "Home") {
       event.preventDefault();
-      applyHeight(140);
+      applyHeight(120);
     } else if (event.key === "End") {
       event.preventDefault();
       applyHeight(maxTimeChartHeight());
@@ -191,13 +264,13 @@ function bindTimeResizeHandle() {
 }
 
 function clampTimeChartHeight(height) {
-  return Math.min(Math.max(Number(height) || 240, 140), maxTimeChartHeight());
+  return Math.min(Math.max(Number(height) || 240, 120), maxTimeChartHeight());
 }
 
 function maxTimeChartHeight() {
   const tab = document.getElementById("timeTab");
-  const available = tab ? tab.clientHeight - 260 : 420;
-  return Math.max(180, Math.min(520, available));
+  const available = tab ? tab.clientHeight - 230 : 420;
+  return Math.max(140, Math.min(520, available));
 }
 
 async function api(path, options = {}) {
@@ -577,6 +650,7 @@ function renderChart() {
   const svg = document.getElementById("timeChart");
   if (!state.payload) {
     svg.innerHTML = "";
+    state.chartMeta = null;
     return;
   }
   if (!isTimeSeriesLoaded()) {
@@ -584,37 +658,92 @@ function renderChart() {
     const height = svg.clientHeight || 320;
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.innerHTML = `<rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"/><text x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="#5a716e" font-size="16">${state.timeSeriesLoading ? "时序数据加载中..." : "时序数据尚未加载"}</text>`;
+    state.chartMeta = null;
     return;
   }
   const rows = state.payload.time_series || [];
   const width = svg.clientWidth || 900;
   const height = svg.clientHeight || 320;
-  const pad = 34;
+  const padLeft = 62;
+  const padRight = 28;
+  const padTop = 28;
+  const padBottom = 48;
+  const plotWidth = Math.max(1, width - padLeft - padRight);
+  const plotHeight = Math.max(1, height - padTop - padBottom);
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  const curves = summarySeries.filter(([key]) => {
-    const checkbox = document.querySelector(`[data-curve="${key}"]`);
-    return checkbox && checkbox.checked;
-  });
-  const values = curves.flatMap(([key]) => numericValues(rows, key));
-  const minValue = Math.min(0, ...values);
-  const maxValue = Math.max(1, ...values);
+  const [curveKey, curveTitle, color, unit] = selectedCurveSpec();
+  const values = numericValues(rows, curveKey);
+  const rawMin = values.length ? Math.min(...values) : 0;
+  const rawMax = values.length ? Math.max(...values) : 1;
+  const minValue = rawMin === rawMax ? rawMin - 1 : rawMin;
+  const maxValue = rawMin === rawMax ? rawMax + 1 : rawMax;
   const valueSpan = maxValue - minValue || 1;
-  const x = (index) => pad + (index / Math.max(1, rows.length - 1)) * (width - pad * 2);
+  const x = (index) => padLeft + (index / Math.max(1, rows.length - 1)) * plotWidth;
   const y = (value) => {
     const number = Number(value);
     const safeValue = Number.isFinite(number) ? number : 0;
-    return height - pad - ((safeValue - minValue) / valueSpan) * (height - pad * 2);
+    return padTop + plotHeight - ((safeValue - minValue) / valueSpan) * plotHeight;
   };
-  const grid = [0, 1, 2, 3]
-    .map((n) => `<line x1="${pad}" x2="${width - pad}" y1="${pad + (n * (height - pad * 2)) / 3}" y2="${pad + (n * (height - pad * 2)) / 3}" stroke="#9db4ae"/>`)
-    .join("");
-  const paths = curves
-    .map(([key, , color]) => {
-      const d = rows.map((row, index) => `${index === 0 ? "M" : "L"}${x(index).toFixed(1)},${y(row[key]).toFixed(1)}`).join(" ");
-      return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+  const yTicks = [0, 1, 2, 3, 4].map((index) => minValue + (valueSpan * index) / 4);
+  const yGrid = yTicks
+    .map((value) => {
+      const tickY = y(value);
+      return `<line x1="${padLeft}" x2="${width - padRight}" y1="${tickY.toFixed(1)}" y2="${tickY.toFixed(1)}" stroke="#d4e1dd"/><text x="${padLeft - 8}" y="${(tickY + 4).toFixed(1)}" text-anchor="end" fill="#5a716e" font-size="11">${escapeHtml(formatNumber(value))}</text>`;
     })
     .join("");
-  svg.innerHTML = `<rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"/><g opacity=".35">${grid}</g>${paths}`;
+  const xTicks = monthRanges
+    .map(([label, start]) => {
+      const tickX = x(start);
+      return `<line x1="${tickX.toFixed(1)}" x2="${tickX.toFixed(1)}" y1="${padTop + plotHeight}" y2="${padTop + plotHeight + 5}" stroke="#8ba49f"/><text x="${tickX.toFixed(1)}" y="${height - 12}" text-anchor="middle" fill="#5a716e" font-size="11">${label}</text>`;
+    })
+    .join("");
+  const d = rows.map((row, index) => `${index === 0 ? "M" : "L"}${x(index).toFixed(1)},${y(row[curveKey]).toFixed(1)}`).join(" ");
+  const axisTitle = `${curveTitle}${unit ? `(${unit})` : ""}`;
+  svg.innerHTML = `<rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="transparent"/><g>${yGrid}</g><line x1="${padLeft}" x2="${width - padRight}" y1="${padTop + plotHeight}" y2="${padTop + plotHeight}" stroke="#5a716e"/><line x1="${padLeft}" x2="${padLeft}" y1="${padTop}" y2="${padTop + plotHeight}" stroke="#5a716e"/><g>${xTicks}</g><path d="${d}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/><g id="chartCursor" class="chart-cursor" hidden><line id="chartCursorLine" x1="0" x2="0" y1="${padTop}" y2="${padTop + plotHeight}"/><circle id="chartCursorPoint" cx="0" cy="0" r="4"/></g><text x="${padLeft}" y="18" fill="#294944" font-size="13" font-weight="700">${escapeHtml(axisTitle)}</text><text x="${width / 2}" y="${height - 2}" text-anchor="middle" fill="#294944" font-size="12">时间（月）</text>`;
+  state.chartMeta = { rows, curveKey, curveTitle, color, unit, padLeft, padRight, padTop, plotWidth, plotHeight, minValue, valueSpan, width, height };
+}
+
+function selectedCurveSpec() {
+  const checked = document.querySelector("[data-curve]:checked");
+  return summarySeries.find(([key]) => key === checked?.dataset.curve) || summarySeries[0];
+}
+
+function onChartMouseMove(event) {
+  if (!state.chartMeta) return;
+  const svg = document.getElementById("timeChart");
+  const cursor = document.getElementById("chartCursor");
+  const cursorLine = document.getElementById("chartCursorLine");
+  const cursorPoint = document.getElementById("chartCursorPoint");
+  const tip = document.getElementById("chartTip");
+  if (!svg || !cursor || !cursorLine || !cursorPoint || !tip) return;
+  const meta = state.chartMeta;
+  const rect = svg.getBoundingClientRect();
+  const localX = ((event.clientX - rect.left) / Math.max(1, rect.width)) * meta.width;
+  const ratio = Math.min(1, Math.max(0, (localX - meta.padLeft) / meta.plotWidth));
+  const index = Math.round(ratio * Math.max(1, meta.rows.length - 1));
+  const row = meta.rows[index];
+  if (!row) return;
+  const pointX = meta.padLeft + (index / Math.max(1, meta.rows.length - 1)) * meta.plotWidth;
+  const value = Number(row[meta.curveKey]);
+  const safeValue = Number.isFinite(value) ? value : 0;
+  const pointY = meta.padTop + meta.plotHeight - ((safeValue - meta.minValue) / meta.valueSpan) * meta.plotHeight;
+  cursor.hidden = false;
+  cursorLine.setAttribute("x1", pointX.toFixed(1));
+  cursorLine.setAttribute("x2", pointX.toFixed(1));
+  cursorPoint.setAttribute("cx", pointX.toFixed(1));
+  cursorPoint.setAttribute("cy", pointY.toFixed(1));
+  cursorPoint.setAttribute("fill", meta.color);
+  tip.hidden = false;
+  tip.innerHTML = `${escapeHtml(meta.curveTitle)}：${escapeHtml(formatNumber(safeValue))}${escapeHtml(meta.unit)}<br>小时：${escapeHtml(row.hour_index ?? index + 1)}<br>时间：${escapeHtml(row.datetime || "")}`;
+  tip.style.left = `${Math.min(window.innerWidth - 180, event.clientX + 14)}px`;
+  tip.style.top = `${Math.max(12, event.clientY - 28)}px`;
+}
+
+function hideChartCursor() {
+  const cursor = document.getElementById("chartCursor");
+  const tip = document.getElementById("chartTip");
+  if (cursor) cursor.hidden = true;
+  if (tip) tip.hidden = true;
 }
 
 function renderMonthTabs() {
@@ -757,14 +886,15 @@ function renderPlanningParameters() {
     .map(([key, label, type, options]) => `<tr><td>${label}</td><td>${planningParameterControl(key, type, options, row[key])}</td><td>${planningParameterRangeText(type, options)}</td></tr>`)
     .join("")}</tbody></table>`;
   host.querySelectorAll("[data-planning-key]").forEach((input) => {
-    const eventName = input.type === "checkbox" ? "change" : "input";
+    const eventName = input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input";
     input.addEventListener(eventName, onPlanningParameterInput);
   });
 }
 
 function planningParameterControl(key, type, options, value) {
   if (type === "boolean") {
-    return `<label class="switch-cell"><input type="checkbox" data-planning-key="${key}" ${truthyPlanningValue(value) ? "checked" : ""}> 是</label>`;
+    const checked = truthyPlanningValue(value);
+    return `<select class="planning-bool-select" data-planning-key="${key}" data-planning-type="boolean"><option value="true" ${checked ? "selected" : ""}>是</option><option value="false" ${checked ? "" : "selected"}>否</option></select>`;
   }
   const attrs = [
     `data-planning-key="${key}"`,
@@ -779,7 +909,7 @@ function planningParameterControl(key, type, options, value) {
 function onPlanningParameterInput(event) {
   const input = event.target;
   const row = planningParameterRow();
-  row[input.dataset.planningKey] = input.type === "checkbox" ? input.checked : coerceInput(input.value);
+  row[input.dataset.planningKey] = input.dataset.planningType === "boolean" ? truthyPlanningValue(input.value) : input.type === "checkbox" ? input.checked : coerceInput(input.value);
   renderLimitSummary();
   renderSummary();
 }
@@ -843,7 +973,6 @@ function renderLimitSummary() {
 
 function renderSchemeSummary() {
   const hosts = [
-    document.getElementById("schemeOverview"),
     document.getElementById("summaryCharts"),
     document.getElementById("quantitySummary"),
     document.getElementById("planningSummary"),
@@ -856,24 +985,9 @@ function renderSchemeSummary() {
   }
 
   const rows = isTimeSeriesLoaded() ? state.payload.time_series || [] : [];
-  const timeSeriesCount = isTimeSeriesLoaded() ? rows.length : state.payload.time_series_count || 0;
-  const deviceCount = deviceSpecs.reduce((sum, [key]) => sum + (state.payload[key] || []).length, 0);
-  const warningCount = collectSaveWarnings().filter((item) => item.level === "error").length;
-  const overviewHost = document.getElementById("schemeOverview");
   const chartsHost = document.getElementById("summaryCharts");
   const quantityHost = document.getElementById("quantitySummary");
   const planningHost = document.getElementById("planningSummary");
-
-  if (overviewHost) {
-    overviewHost.innerHTML = [
-      ["当前方案", state.currentScheme || state.payload.scheme || "未选择方案"],
-      ["8760行数", timeSeriesCount],
-      ["设备条目", deviceCount],
-      ["校验问题", warningCount ? `${warningCount}项` : "0项"],
-    ]
-      .map(([label, value]) => `<div class="overview-item"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`)
-      .join("");
-  }
 
   if (chartsHost) {
     chartsHost.innerHTML = isTimeSeriesLoaded()
@@ -893,7 +1007,7 @@ function renderSchemeSummary() {
 function renderHistogramPanel(rows, key, title, color, unit) {
   const values = numericValues(rows, key);
   const stats = calculateSeriesStats(rows, key);
-  return `<div class="histogram-panel"><div class="histogram-head"><strong>${title}分布</strong><span>${stats.count}点</span></div>${histogramSvg(values, color)}<div class="histogram-meta">最小值 ${formatNumber(stats.min)} ${unit} / 最大值 ${formatNumber(stats.max)} ${unit} / 平均值 ${formatNumber(stats.avg)} ${unit}</div></div>`;
+  return `<div class="histogram-panel"><div class="histogram-head"><strong>${title}分布</strong><span>${stats.count}点</span></div>${histogramSvg(values, color, title)}<div class="histogram-meta">最小值 ${formatNumber(stats.min)} ${unit} / 最大值 ${formatNumber(stats.max)} ${unit} / 平均值 ${formatNumber(stats.avg)} ${unit}</div></div>`;
 }
 
 function renderTimeSeriesPlaceholder(message) {
@@ -981,38 +1095,78 @@ function buildHistogram(values, binCount = 12) {
   return bins;
 }
 
-function histogramSvg(values, color) {
+function histogramSvg(values, color, title = "") {
   const bins = buildHistogram(values);
   if (!bins.length) {
     return "<div class=\"empty-summary\">暂无时序数据</div>";
   }
-  const width = 420;
-  const height = 180;
-  const padX = 34;
-  const padY = 24;
-  const plotWidth = width - padX * 2;
-  const plotHeight = height - padY * 2;
+  const width = 460;
+  const height = 220;
+  const padLeft = 48;
+  const padRight = 20;
+  const padTop = 34;
+  const padBottom = 34;
+  const plotWidth = width - padLeft - padRight;
+  const plotHeight = height - padTop - padBottom;
   const step = plotWidth / bins.length;
   const barWidth = Math.max(2, step - 4);
   const maxCount = Math.max(1, ...bins.map((bin) => bin.count));
+  const y = (count) => padTop + plotHeight - (count / maxCount) * plotHeight;
+  const yTicks = [0, 0.5, 1].map((ratio) => maxCount * ratio);
+  const yAxis = yTicks
+    .map((count) => {
+      const tickY = y(count);
+      return `<line x1="${padLeft}" x2="${width - padRight}" y1="${tickY.toFixed(1)}" y2="${tickY.toFixed(1)}" stroke="#d4e1dd"/><text x="${padLeft - 8}" y="${(tickY + 4).toFixed(1)}" fill="#5a716e" font-size="11" text-anchor="end">${formatInteger(count)}</text>`;
+    })
+    .join("");
   const bars = bins
     .map((bin, index) => {
       const barHeight = (bin.count / maxCount) * plotHeight;
-      const x = padX + step * index + (step - barWidth) / 2;
-      const y = height - padY - barHeight;
+      const x = padLeft + step * index + (step - barWidth) / 2;
+      const barY = padTop + plotHeight - barHeight;
       const title = `${formatNumber(bin.lower)} - ${formatNumber(bin.upper)}: ${bin.count}`;
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="3" fill="${color}"><title>${escapeHtml(title)}</title></rect>`;
+      const labelY = Math.max(12, barY - 5);
+      return `<rect class="histogram-bar" data-bin-range="${escapeHtml(formatHistogramRange(bin))}" data-bin-count="${escapeHtml(formatInteger(bin.count))}" x="${x.toFixed(1)}" y="${barY.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="3" fill="${color}"><title>${escapeHtml(title)}</title></rect><text x="${(x + barWidth / 2).toFixed(1)}" y="${labelY.toFixed(1)}" fill="#294944" font-size="10" text-anchor="middle">${formatInteger(bin.count)}</text>`;
     })
     .join("");
   const minLabel = formatNumber(bins[0].lower);
   const maxLabel = formatNumber(bins[bins.length - 1].upper);
-  return `<svg class="histogram-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="统计直方图">${bars}<line x1="${padX}" x2="${width - padX}" y1="${height - padY}" y2="${height - padY}" stroke="#8ba49f"/><text x="${padX}" y="${height - 4}" fill="#5a716e" font-size="12">${escapeHtml(minLabel)}</text><text x="${width - padX}" y="${height - 4}" fill="#5a716e" font-size="12" text-anchor="end">${escapeHtml(maxLabel)}</text></svg>`;
+  return `<svg class="histogram-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}统计直方图"><g>${yAxis}</g><line x1="${padLeft}" x2="${width - padRight}" y1="${padTop + plotHeight}" y2="${padTop + plotHeight}" stroke="#8ba49f"/><line x1="${padLeft}" x2="${padLeft}" y1="${padTop}" y2="${padTop + plotHeight}" stroke="#8ba49f"/><text x="14" y="${padTop + 8}" fill="#294944" font-size="12">频数</text>${bars}<text x="${padLeft}" y="${height - 8}" fill="#5a716e" font-size="12">${escapeHtml(minLabel)}</text><text x="${width - padRight}" y="${height - 8}" fill="#5a716e" font-size="12" text-anchor="end">${escapeHtml(maxLabel)}</text></svg>`;
 }
 
 function formatNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
   return number.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function formatInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? String(Math.round(number)) : "-";
+}
+
+function formatHistogramRange(bin) {
+  return `${formatNumber(bin.lower)} - ${formatNumber(bin.upper)}`;
+}
+
+function onHistogramMouseMove(event) {
+  const bar = event.target.closest?.(".histogram-bar");
+  if (!bar) {
+    hideHistogramTip();
+    return;
+  }
+  const tip = document.getElementById("chartTip");
+  if (!tip) return;
+  tip.hidden = false;
+  tip.innerHTML = `横坐标：${escapeHtml(bar.dataset.binRange || "")}<br>纵坐标：${escapeHtml(bar.dataset.binCount || "")}`;
+  tip.style.left = `${Math.min(window.innerWidth - 200, event.clientX + 14)}px`;
+  tip.style.top = `${Math.max(12, event.clientY - 28)}px`;
+}
+
+function hideHistogramTip() {
+  const tip = document.getElementById("chartTip");
+  if (tip && !document.getElementById("chartCursor")?.hidden) return;
+  if (tip) tip.hidden = true;
 }
 
 function renderSummary() {

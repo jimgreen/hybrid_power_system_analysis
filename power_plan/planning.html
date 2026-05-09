@@ -51,14 +51,6 @@
 
         <section id="timeTab" class="tab-panel active">
           <div class="chart-card">
-            <div class="panel-heading">
-              <div class="legend">
-                <label><input type="checkbox" data-curve="wind_speed" checked> 风速</label>
-                <label><input type="checkbox" data-curve="solar_irradiance" checked> 太阳辐照</label>
-                <label><input type="checkbox" data-curve="temperature" checked> 温度</label>
-                <label><input type="checkbox" data-curve="load" checked> 负荷</label>
-              </div>
-            </div>
             <div class="weather-import-bar" aria-label="历史气象数据获取">
               <label>地名<input id="weatherPlace" type="text" placeholder="例如：秦岭站"></label>
               <button id="geocodePlace" type="button">获取坐标</button>
@@ -68,6 +60,14 @@
               <label>历史数据年<input id="weatherYear" type="number" min="2001" step="1" placeholder="当前年之前"></label>
               <button id="fetchWeatherHistory" class="primary" type="button">获取历史气象</button>
               <span id="weatherImportStatus" class="weather-import-status" role="status" aria-live="polite"></span>
+            </div>
+            <div class="curve-switch-row" aria-label="曲线切换显示">
+              <div class="legend">
+                <label><input type="radio" name="timeCurve" data-curve="wind_speed" checked> 风速</label>
+                <label><input type="radio" name="timeCurve" data-curve="solar_irradiance"> 太阳辐照</label>
+                <label><input type="radio" name="timeCurve" data-curve="temperature"> 温度</label>
+                <label><input type="radio" name="timeCurve" data-curve="load"> 负荷</label>
+              </div>
             </div>
             <svg id="timeChart" class="time-chart" role="img" aria-label="8760点风光温荷曲线"></svg>
             <div id="chartTip" class="chart-tip" hidden></div>
@@ -87,7 +87,7 @@
             </div>
           </div>
 
-          <div id="timeResizeHandle" class="time-resize-handle" role="separator" tabindex="0" aria-label="调整时序图高度" aria-orientation="horizontal" aria-valuemin="140" aria-valuemax="520" aria-valuenow="0"></div>
+          <div id="timeResizeHandle" class="time-resize-handle" role="separator" tabindex="0" aria-label="调整时序图高度" aria-orientation="horizontal" aria-valuemin="120" aria-valuemax="520" aria-valuenow="0"></div>
 
           <div class="table-card">
             <div class="time-table-toolbar">
@@ -112,7 +112,6 @@
           <div class="planning-parameters-card">
             <div class="panel-heading">
               <h1>规划参数</h1>
-              <span class="filter-hint">参数随当前方案保存到 XLSX 文件。</span>
             </div>
             <div id="planningParametersTable" class="data-table planning-parameters-table"></div>
           </div>
@@ -120,11 +119,6 @@
 
         <section id="limitsTab" class="tab-panel">
           <div class="summary-page">
-            <section class="summary-section">
-              <div class="panel-heading"><h1>方案概览</h1></div>
-              <div id="schemeOverview" class="overview-grid"></div>
-            </section>
-
             <section class="summary-section summary-switcher">
               <div class="summary-tabs" role="tablist" aria-label="方案概览详情切换">
                 <button class="summary-tab active" type="button" data-summary-tab="charts" aria-controls="summaryChartsPanel" aria-selected="true">统计直方图</button>
