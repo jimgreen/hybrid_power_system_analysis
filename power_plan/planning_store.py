@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,18 +18,18 @@ DEFAULT_SCHEME_ROOT = WEB_ROOT / "planning_schemes"
 WORKBOOK_NAME = "parameters.xlsx"
 
 SHEET_SPECS: dict[str, tuple[str, list[str]]] = {
-    "time_series": ("8760时序数据", ["hour_index", "datetime", "wind_speed", "solar_irradiance", "load"]),
+    "time_series": ("8760时序数据", ["hour_index", "datetime", "wind_speed", "solar_irradiance", "load", "temperature"]),
     "diesel_generators": (
         "柴发参数",
         [
             "name",
             "capacity",
-            "design_capacity_lower",
-            "design_capacity_upper",
             "cost",
             "power_upper",
             "power_lower",
             "fuel_rate",
+            "quantity_lower",
+            "quantity_upper",
         ],
     ),
     "wind_turbines": (
@@ -36,11 +37,11 @@ SHEET_SPECS: dict[str, tuple[str, list[str]]] = {
         [
             "name",
             "capacity",
-            "design_capacity_lower",
-            "design_capacity_upper",
             "cost",
             "cut_in_wind_speed",
             "cut_out_wind_speed",
+            "quantity_lower",
+            "quantity_upper",
         ],
     ),
     "photovoltaics": (
@@ -48,45 +49,50 @@ SHEET_SPECS: dict[str, tuple[str, list[str]]] = {
         [
             "name",
             "capacity",
-            "design_capacity_lower",
-            "design_capacity_upper",
             "cost",
-            "cut_in_wind_speed",
-            "cut_out_wind_speed",
+            "generation_efficiency",
+            "quantity_lower",
+            "quantity_upper",
         ],
     ),
     "storage_pcs": (
         "储能PCS参数",
-        ["name", "power_capacity", "design_capacity_lower", "design_capacity_upper", "cost"],
+        ["name", "power_capacity", "cost", "quantity_lower", "quantity_upper"],
     ),
     "storage_battery_packs": (
         "储能电池组参数",
-        ["name", "battery_capacity", "design_capacity_lower", "design_capacity_upper", "cost"],
+        ["name", "battery_capacity", "cost", "quantity_lower", "quantity_upper"],
     ),
     "hydrogen_electrolyzers": (
         "电制氢参数",
         [
             "name",
             "power_capacity",
-            "design_capacity_lower",
-            "design_capacity_upper",
             "cost",
             "electric_to_hydrogen_efficiency",
+            "quantity_lower",
+            "quantity_upper",
         ],
     ),
     "hydrogen_tanks": (
         "储氢罐参数",
-        ["name", "hydrogen_tank_capacity", "design_capacity_lower", "design_capacity_upper", "cost"],
+        [
+            "name",
+            "hydrogen_tank_capacity",
+            "cost",
+            "quantity_lower",
+            "quantity_upper",
+        ],
     ),
     "fuel_cells": (
         "燃料电池参数",
         [
             "name",
             "power_capacity",
-            "design_capacity_lower",
-            "design_capacity_upper",
             "cost",
             "hydrogen_to_electric_efficiency",
+            "quantity_lower",
+            "quantity_upper",
         ],
     ),
 }
@@ -96,75 +102,80 @@ DEFAULT_DEVICE_ROWS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "柴发1",
             "capacity": 100,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 500,
             "cost": 0,
             "power_upper": 100,
             "power_lower": 20,
             "fuel_rate": 0.26,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
     "wind_turbines": [
         {
             "name": "风机1",
             "capacity": 50,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 1000,
             "cost": 0,
             "cut_in_wind_speed": 3,
             "cut_out_wind_speed": 25,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
     "photovoltaics": [
         {
             "name": "光伏1",
             "capacity": 50,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 1000,
             "cost": 0,
-            "cut_in_wind_speed": 0,
-            "cut_out_wind_speed": 0,
+            "generation_efficiency": 0.8,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
     "storage_pcs": [
-        {"name": "储能PCS1", "power_capacity": 50, "design_capacity_lower": 0, "design_capacity_upper": 500, "cost": 0}
+        {
+            "name": "储能PCS1",
+            "power_capacity": 50,
+            "cost": 0,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
+        }
     ],
     "storage_battery_packs": [
         {
             "name": "储能电池组1",
             "battery_capacity": 200,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 2000,
             "cost": 0,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
     "hydrogen_electrolyzers": [
         {
             "name": "电制氢1",
             "power_capacity": 50,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 500,
             "cost": 0,
             "electric_to_hydrogen_efficiency": 0.7,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
     "hydrogen_tanks": [
         {
             "name": "储氢罐1",
             "hydrogen_tank_capacity": 100,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 2000,
             "cost": 0,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
     "fuel_cells": [
         {
             "name": "燃料电池1",
             "power_capacity": 50,
-            "design_capacity_lower": 0,
-            "design_capacity_upper": 500,
             "cost": 0,
             "hydrogen_to_electric_efficiency": 0.55,
+            "quantity_lower": 0,
+            "quantity_upper": 0,
         }
     ],
 }
@@ -172,8 +183,16 @@ DEFAULT_DEVICE_ROWS: dict[str, list[dict[str, Any]]] = {
 INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*]')
 
 
+def sanitize_scheme_name(name: str) -> str:
+    return "".join(
+        char
+        for char in str(name or "")
+        if not char.isspace() and unicodedata.category(char) not in {"Cc", "Cf"}
+    )
+
+
 def validate_scheme_name(name: str) -> str:
-    clean = str(name or "").strip()
+    clean = sanitize_scheme_name(name)
     if clean in {"", ".", ".."} or INVALID_NAME_RE.search(clean) or ".." in clean:
         raise ValueError("方案名称不能为空，且不能包含路径或非法字符")
     return clean
@@ -181,7 +200,14 @@ def validate_scheme_name(name: str) -> str:
 
 def default_time_series() -> list[dict[str, Any]]:
     return [
-        {"hour_index": hour, "datetime": f"H{hour:04d}", "wind_speed": 0, "solar_irradiance": 0, "load": 0}
+        {
+            "hour_index": hour,
+            "datetime": f"H{hour:04d}",
+            "wind_speed": 0,
+            "solar_irradiance": 0,
+            "load": 0,
+            "temperature": 0,
+        }
         for hour in range(1, 8761)
     ]
 
@@ -257,6 +283,14 @@ class PlanningStore:
         source_dir.rename(target_dir)
         return self.read_scheme(target)
 
+    def delete_scheme(self, name: str) -> dict[str, str]:
+        clean = validate_scheme_name(name)
+        folder = self.scheme_dir(clean)
+        if not folder.exists() or not folder.is_dir():
+            raise FileNotFoundError(f"方案不存在: {clean}")
+        shutil.rmtree(folder)
+        return {"deleted": clean}
+
     def write_scheme(self, name: str, payload: dict[str, Any]) -> None:
         clean = validate_scheme_name(name)
         folder = self.scheme_dir(clean)
@@ -274,6 +308,30 @@ class PlanningStore:
             raise FileNotFoundError(f"方案参数文件不存在: {path}")
         payload = read_workbook(path, clean)
         payload["validation"] = validate_payload(payload)
+        payload["time_series_loaded"] = True
+        payload["time_series_count"] = len(payload.get("time_series", []))
+        return payload
+
+    def read_scheme_overview(self, name: str) -> dict[str, Any]:
+        clean = validate_scheme_name(name)
+        path = self.workbook_path(clean)
+        if not path.exists():
+            raise FileNotFoundError(f"方案参数文件不存在: {path}")
+        payload = read_workbook(path, clean, include_keys=[key for key in SHEET_SPECS if key != "time_series"])
+        payload["time_series_loaded"] = False
+        payload["time_series_count"] = count_sheet_rows(path, SHEET_SPECS["time_series"][0])
+        payload["validation"] = validate_payload(payload, require_time_series=False)
+        return payload
+
+    def read_time_series(self, name: str) -> dict[str, Any]:
+        clean = validate_scheme_name(name)
+        path = self.workbook_path(clean)
+        if not path.exists():
+            raise FileNotFoundError(f"方案参数文件不存在: {path}")
+        payload = read_workbook(path, clean, include_keys=["time_series"])
+        payload["time_series_loaded"] = True
+        payload["time_series_count"] = len(payload.get("time_series", []))
+        payload["validation"] = validate_payload(payload)
         return payload
 
 
@@ -288,51 +346,83 @@ def build_workbook(payload: dict[str, Any]) -> Workbook:
     return workbook
 
 
-def read_workbook(path: Path, scheme: str) -> dict[str, Any]:
-    workbook = load_workbook(path, data_only=True)
+def read_workbook(path: Path, scheme: str, include_keys: list[str] | None = None) -> dict[str, Any]:
+    selected_keys = set(include_keys) if include_keys is not None else set(SHEET_SPECS)
+    workbook = load_workbook(path, data_only=True, read_only=True)
     payload: dict[str, Any] = {"scheme": scheme, "validation": [], "capacity_limits": []}
-    for key, (sheet_name, headers) in SHEET_SPECS.items():
-        if sheet_name not in workbook.sheetnames:
-            payload[key] = []
-            payload["validation"].append({"level": "error", "message": f"缺少工作表: {sheet_name}"})
-            continue
-        sheet = workbook[sheet_name]
-        rows = []
-        for values in sheet.iter_rows(min_row=2, values_only=True):
-            if values is None or all(value is None for value in values):
+    try:
+        for key, (sheet_name, headers) in SHEET_SPECS.items():
+            if key not in selected_keys:
                 continue
-            rows.append(
-                {
-                    header: values[index] if index < len(values) and values[index] is not None else ""
-                    for index, header in enumerate(headers)
-                }
-            )
-        payload[key] = rows
+            if sheet_name not in workbook.sheetnames:
+                payload[key] = []
+                payload["validation"].append({"level": "error", "message": f"缺少工作表: {sheet_name}"})
+                continue
+            sheet = workbook[sheet_name]
+            header_values = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1), [])]
+            has_named_header = any(value is not None for value in header_values)
+            header_index = {
+                str(value): index
+                for index, value in enumerate(header_values)
+                if value is not None and str(value) in headers
+            }
+            rows = []
+            for values in sheet.iter_rows(min_row=2, values_only=True):
+                if values is None or all(value is None for value in values):
+                    continue
+                row = {}
+                for index, header in enumerate(headers):
+                    if header in header_index:
+                        source_index = header_index[header]
+                    elif has_named_header:
+                        row[header] = ""
+                        continue
+                    else:
+                        source_index = index
+                    row[header] = values[source_index] if source_index < len(values) and values[source_index] is not None else ""
+                rows.append(row)
+            payload[key] = rows
+    finally:
+        workbook.close()
     return payload
 
 
-def validate_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+def count_sheet_rows(path: Path, sheet_name: str) -> int:
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            return 0
+        sheet = workbook[sheet_name]
+        return max(0, (sheet.max_row or 1) - 1)
+    finally:
+        workbook.close()
+
+
+def validate_payload(payload: dict[str, Any], require_time_series: bool = True) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
-    time_series = payload.get("time_series", [])
-    if len(time_series) != 8760:
-        messages.append({"level": "error", "message": f"8760时序数据行数应为8760，当前为{len(time_series)}"})
-    else:
-        messages.append({"level": "ok", "message": "8760时序数据行数正确"})
+    if require_time_series:
+        time_series = payload.get("time_series", [])
+        if len(time_series) != 8760:
+            messages.append({"level": "error", "message": f"8760时序数据行数应为8760，当前为{len(time_series)}"})
+        else:
+            messages.append({"level": "ok", "message": "8760时序数据行数正确"})
+    elif "time_series_count" in payload:
+        messages.append({"level": "ok", "message": f"8760时序数据延迟加载，当前行数为{payload['time_series_count']}"})
 
     for key in SHEET_SPECS:
         if key == "time_series":
             continue
         for index, row in enumerate(payload.get(key, []), start=1):
-            lower = row.get("design_capacity_lower", "")
-            upper = row.get("design_capacity_upper", "")
-            if lower == "" or upper == "":
+            quantity_lower = row.get("quantity_lower", "")
+            quantity_upper = row.get("quantity_upper", "")
+            if quantity_lower == "" or quantity_upper == "":
                 continue
             try:
-                lower_number = float(lower)
-                upper_number = float(upper)
+                quantity_lower_number = float(quantity_lower)
+                quantity_upper_number = float(quantity_upper)
             except (TypeError, ValueError):
-                messages.append({"level": "error", "message": f"{SHEET_SPECS[key][0]}第{index}行设计容量上下限不是数值"})
+                messages.append({"level": "error", "message": f"{SHEET_SPECS[key][0]}第{index}行数量上下限不是数值"})
                 continue
-            if lower_number > upper_number:
-                messages.append({"level": "error", "message": f"{SHEET_SPECS[key][0]}第{index}行设计容量上限不能小于下限"})
+            if quantity_lower_number > quantity_upper_number:
+                messages.append({"level": "error", "message": f"{SHEET_SPECS[key][0]}第{index}行数据上限不能小于数据下限"})
     return messages

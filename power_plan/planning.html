@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>电网规划参数维护</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="assets/planning.css">
 </head>
 <body>
@@ -21,27 +22,29 @@
 
     <section class="workspace">
       <aside class="scheme-rail">
-        <div class="rail-title">方案管理</div>
-        <div class="scheme-actions">
-          <button id="createScheme" type="button">新建方案</button>
-          <button id="copyScheme" type="button">复制方案</button>
-          <button id="renameScheme" type="button">修改方案名</button>
-          <button id="saveScheme" class="primary" type="button">保存方案</button>
-        </div>
         <div class="scheme-list-title">方案列表</div>
         <div id="schemeList" class="scheme-list"></div>
       </aside>
 
       <section class="editor-panel">
         <div class="editor-header">
+          <div class="current-scheme-panel">
+            <div class="current-scheme" aria-live="polite">
+              <span>当前方案:</span>
+              <strong id="currentSchemeName">未选择方案</strong>
+            </div>
+          </div>
           <div class="tabs" role="tablist" aria-label="参数维护标签">
             <button class="tab active" data-tab="time" type="button">8760时序数据</button>
             <button class="tab" data-tab="devices" type="button">设备参数</button>
-            <button class="tab" data-tab="limits" type="button">设计容量约束汇总</button>
+            <button class="tab" data-tab="limits" type="button">方案概览</button>
           </div>
-          <div class="current-scheme" aria-live="polite">
-            <span>当前方案</span>
-            <strong id="currentSchemeName">未选择方案</strong>
+          <div class="scheme-actions" aria-label="方案操作">
+            <button id="createScheme" type="button">新建方案</button>
+            <button id="copyScheme" type="button">复制方案</button>
+            <button id="renameScheme" type="button">修改名称</button>
+            <button id="saveScheme" class="primary" type="button">保存方案</button>
+            <button id="deleteScheme" class="danger" type="button">删除方案</button>
           </div>
         </div>
 
@@ -51,23 +54,21 @@
               <h1>8760点曲线板</h1>
               <div class="legend">
                 <label><input type="checkbox" data-curve="wind_speed" checked> 风速</label>
-                <label><input type="checkbox" data-curve="solar_irradiance" checked> 太阳辐射</label>
+                <label><input type="checkbox" data-curve="solar_irradiance" checked> 太阳辐照</label>
+                <label><input type="checkbox" data-curve="temperature" checked> 温度</label>
                 <label><input type="checkbox" data-curve="load" checked> 负荷</label>
               </div>
             </div>
-            <svg id="timeChart" class="time-chart" role="img" aria-label="8760点风光荷曲线"></svg>
+            <svg id="timeChart" class="time-chart" role="img" aria-label="8760点风光温荷曲线"></svg>
             <div id="chartTip" class="chart-tip" hidden></div>
           </div>
 
           <div class="table-card">
             <div class="panel-heading">
               <h2>小时级数据</h2>
-              <div class="pager">
-                <button id="prevPage" type="button">上一页</button>
-                <span id="pageInfo">第 1 页</span>
-                <button id="nextPage" type="button">下一页</button>
-              </div>
+              <span id="pageInfo" class="page-info">未加载</span>
             </div>
+            <div id="monthTabs" class="month-tabs" aria-label="小时级数据月份分页"></div>
             <div id="timeTable" class="data-table"></div>
           </div>
         </section>
@@ -78,16 +79,30 @@
               <h2>设备类型显示</h2>
               <span class="filter-hint">默认全部显示，取消勾选则隐藏对应表格。</span>
             </div>
-            <div id="deviceFilters" class="device-filters" aria-label="设备类型显示筛选"></div>
+            <div class="device-filter-row">
+              <div id="deviceFilters" class="device-filters" aria-label="设备类型显示筛选"></div>
+              <div id="deviceJump" class="device-jump" aria-label="设备参数快捷跳转"></div>
+            </div>
           </div>
-          <div id="deviceJump" class="device-jump"></div>
           <div id="deviceTables" class="device-tables"></div>
         </section>
 
         <section id="limitsTab" class="tab-panel">
-          <div class="table-card">
-            <div class="panel-heading"><h2>设计容量约束汇总</h2></div>
-            <div id="limitSummary" class="data-table"></div>
+          <div class="summary-page">
+            <section class="summary-section">
+              <div class="panel-heading"><h1>方案概览</h1></div>
+              <div id="schemeOverview" class="overview-grid"></div>
+            </section>
+
+            <section class="summary-section">
+              <div class="panel-heading"><h2>统计直方图</h2></div>
+              <div id="summaryCharts" class="histogram-grid"></div>
+            </section>
+
+            <section class="summary-section">
+              <div class="panel-heading"><h2>待选设备列表</h2></div>
+              <div id="quantitySummary" class="data-table"></div>
+            </section>
           </div>
         </section>
       </section>

@@ -256,6 +256,20 @@ class PowerPlanServerTest(unittest.TestCase):
             loaded = json.loads(body.decode("utf-8"))
             self.assertEqual(loaded["time_series"][0]["load"], 123.4)
 
+            status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A/overview", "GET", b"")
+            overview = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertNotIn("time_series", overview)
+            self.assertFalse(overview["time_series_loaded"])
+            self.assertEqual(overview["time_series_count"], 8760)
+            self.assertIn("diesel_generators", overview)
+
+            status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A/time-series", "GET", b"")
+            time_payload = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(time_payload["time_series"][0]["load"], 123.4)
+            self.assertNotIn("diesel_generators", time_payload)
+
             status, headers, body = server.handle_planning_api_path(
                 "/api/planning/schemes/copy",
                 "POST",
@@ -277,6 +291,27 @@ class PowerPlanServerTest(unittest.TestCase):
             server.PLANNING_STORE = original_store
             shutil.rmtree(planning_root, ignore_errors=True)
 
+    def test_planning_api_delete_scheme(self):
+        planning_root = WEB_ROOT / "tests" / "tmp_planning_delete_api"
+        shutil.rmtree(planning_root, ignore_errors=True)
+        planning_root.mkdir(parents=True)
+        original_store = server.PLANNING_STORE
+        server.PLANNING_STORE = server.planning_store.PlanningStore(root=planning_root)
+        try:
+            server.PLANNING_STORE.create_scheme("方案A")
+            server.PLANNING_STORE.create_scheme("方案B")
+
+            status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A", "DELETE", b"")
+
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body.decode("utf-8"))["deleted"], "方案A")
+            self.assertFalse((planning_root / "方案A").exists())
+            names = [item["name"] for item in server.PLANNING_STORE.list_schemes()]
+            self.assertEqual(names, ["方案B"])
+        finally:
+            server.PLANNING_STORE = original_store
+            shutil.rmtree(planning_root, ignore_errors=True)
+
     def test_planning_api_rejects_bad_scheme_name(self):
         status, headers, body = server.handle_planning_api_path(
             "/api/planning/schemes",
@@ -289,26 +324,76 @@ class PowerPlanServerTest(unittest.TestCase):
 
     def test_planning_page_has_current_scheme_display(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
         self.assertIn('id="currentSchemeName"', html)
-        self.assertIn("当前方案", html)
+        self.assertIn("当前方案:", html)
+        self.assertIn(".current-scheme", css)
+        self.assertIn("display: flex", css)
+        self.assertIn("justify-content: flex-start", css)
+        self.assertIn("white-space: nowrap", css)
+        self.assertIn("text-overflow: ellipsis", css)
+        self.assertLess(html.index('id="currentSchemeName"'), html.index(">8760时序数据<"))
+
+    def test_planning_scheme_rail_only_shows_scheme_list_title(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        rail = html.split('<aside class="scheme-rail">', 1)[1].split("</aside>", 1)[0]
+
+        self.assertNotIn("方案管理", rail)
+        self.assertIn("方案列表", rail)
+        self.assertIn('id="schemeList"', rail)
 
     def test_planning_page_save_button_is_in_scheme_actions(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
-        scheme_actions = html.split('<div class="scheme-actions">', 1)[1].split("</div>", 1)[0]
+        current_scheme_panel = html.split('<div class="current-scheme-panel">', 1)[1].split('<div class="tabs"', 1)[0]
+        editor_header = html.split('<div class="editor-header">', 1)[1].split("</div>\n\n        <section", 1)[0]
         topbar = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
+        rail = html.split('<aside class="scheme-rail">', 1)[1].split("</aside>", 1)[0]
 
-        self.assertIn('id="saveScheme"', scheme_actions)
+        self.assertNotIn('id="saveScheme"', current_scheme_panel)
+        self.assertIn('class="scheme-actions"', editor_header)
+        self.assertIn("margin-left: auto", (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8"))
+        self.assertIn('id="saveScheme"', editor_header)
+        self.assertIn('id="renameScheme"', editor_header)
+        self.assertIn('id="copyScheme"', editor_header)
+        self.assertIn('id="deleteScheme"', editor_header)
+        self.assertIn(">修改名称<", editor_header)
+        self.assertNotIn("修改方案名称", editor_header)
+        self.assertNotIn("修改方案名", editor_header)
         self.assertNotIn('id="saveScheme"', topbar)
-        self.assertLess(html.index('<div class="scheme-actions">'), html.index('id="schemeList"'))
+        self.assertNotIn('id="saveScheme"', rail)
+        self.assertLess(html.index('id="currentSchemeName"'), html.index(">8760时序数据<"))
+        self.assertLess(html.index(">8760时序数据<"), html.index('id="saveScheme"'))
+
+    def test_planning_scheme_actions_are_horizontal(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("flex-wrap: nowrap", css)
+        self.assertIn("overflow-x: auto", css)
+        self.assertIn("white-space: nowrap", css)
 
     def test_planning_page_has_device_filter_tags(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
         self.assertIn('id="deviceFilters"', html)
         self.assertIn("renderDeviceFilters", script)
         self.assertIn("visibleDevices", script)
+        self.assertIn("deviceGroups", script)
+        self.assertIn("data-device-group", script)
+        self.assertIn('class="device-filter-row"', html)
+        device_filter_card = html.split('<div class="device-filter-card">', 1)[1].split('<div id="deviceTables"', 1)[0]
+        self.assertIn('id="deviceFilters"', device_filter_card)
+        self.assertIn('id="deviceJump"', device_filter_card)
+        self.assertLess(device_filter_card.index('id="deviceFilters"'), device_filter_card.index('id="deviceJump"'))
+        self.assertIn(".device-filter-row", css)
+        self.assertIn("flex-wrap: nowrap", css)
+        self.assertIn("overflow-x: auto", css)
+        for group_name in ("风光柴", "氢储能", "电储能"):
+            self.assertIn(group_name, script)
+        self.assertLess(script.index('"电储能"'), script.index('"氢储能"'))
+        self.assertLess(script.index('"储能PCS"'), script.index('"电制氢"'))
         for name in ("柴发", "风机", "光伏", "储能PCS", "储能电池组", "电制氢", "储氢罐", "燃料电池"):
             self.assertIn(name, script)
 
@@ -317,7 +402,108 @@ class PowerPlanServerTest(unittest.TestCase):
 
         self.assertIn("collectSaveWarnings", script)
         self.assertIn("参数校验未通过", script)
-        self.assertIn("设计容量上限不能小于下限", script)
+        self.assertIn("数据下限(台)", script)
+        self.assertIn("数据上限(台)", script)
+        self.assertIn("数据上限不能小于数据下限", script)
+        self.assertNotIn("设计容量上限不能小于下限", script)
+
+    def test_planning_scheme_actions_validate_duplicates_and_delete_current_scheme(self):
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("schemeNameExists", script)
+        self.assertIn("normalizeSchemeName", script)
+        self.assertIn("\\s\\u0000-\\u001f", script)
+        self.assertIn("方案名称已存在", script)
+        self.assertIn("deleteScheme", script)
+        self.assertIn("DELETE", script)
+        self.assertIn("确认删除方案", script)
+        self.assertIn("selectNextSchemeAfterDelete", script)
+
+    def test_planning_overview_page_has_statistics_histograms_and_candidate_device_list(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("方案概览", html)
+        self.assertNotIn("方案汇总", html)
+        self.assertNotIn('id="summaryStats"', html)
+        self.assertNotIn("时序统计量", html)
+        self.assertIn('id="summaryCharts"', html)
+        self.assertIn('id="quantitySummary"', html)
+        self.assertIn("待选设备列表", html)
+        self.assertNotIn("设计容量约束", html)
+        self.assertIn("renderSchemeSummary", script)
+        self.assertNotIn("renderStatsTable", script)
+        self.assertIn("renderCandidateDeviceTable", script)
+        self.assertIn("capacityValue", script)
+        self.assertIn("calculateSeriesStats", script)
+        self.assertIn("buildHistogram", script)
+        for name in ("风速", "太阳辐照", "温度", "负荷", "最大值", "最小值", "平均值", "数据下限(台)", "数据上限(台)"):
+            self.assertIn(name, script)
+
+    def test_planning_overview_page_scrolls_when_content_overflows(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn(".summary-page", css)
+        self.assertIn("max-height: calc(100vh - 188px)", css)
+        self.assertIn("overflow: auto", css)
+
+    def test_planning_frontend_defers_time_series_loading(self):
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("/overview", script)
+        self.assertIn("/time-series", script)
+        self.assertIn("ensureTimeSeriesLoaded", script)
+        self.assertIn("ensureTimeSeriesForActiveTab", script)
+        self.assertIn("shouldAutoLoadTimeSeries", script)
+        self.assertIn("timeSeriesLoaded", script)
+        self.assertIn("时序数据尚未加载", script)
+        self.assertIn("自动加载", script)
+        self.assertNotIn("data-load-time-series", script)
+        self.assertNotIn("点击加载", script)
+
+    def test_planning_time_series_page_includes_temperature(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-curve="temperature"', html)
+        self.assertIn("temperature", script)
+        self.assertIn("温度", script)
+
+    def test_planning_time_series_table_uses_month_tabs(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="monthTabs"', html)
+        self.assertNotIn('id="prevPage"', html)
+        self.assertNotIn('id="nextPage"', html)
+        self.assertIn("monthRanges", script)
+        self.assertIn("renderMonthTabs", script)
+        self.assertIn("1月", script)
+        self.assertIn("12月", script)
+
+    def test_planning_time_series_input_refreshes_visible_chart(self):
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("function onTimeInput", script)
+        self.assertIn("renderChart();", script)
+        self.assertIn(".map(([key, , color])", script)
+        self.assertIn('stroke="${color}"', script)
+
+    def test_planning_device_fields_follow_latest_parameter_names(self):
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertNotIn("design_capacity_lower", script)
+        self.assertNotIn("design_capacity_upper", script)
+        self.assertIn("generation_efficiency", script)
+        self.assertIn("发电效率(0-1.0)", script)
+        self.assertIn("氢-电效率(kWh/Nm3)", script)
+        self.assertIn("电-氢效率(Nm3/kWh)", script)
+        self.assertIn("切入风速(m/s)", script)
+        self.assertIn("切出风速(m/s)", script)
+        self.assertIn("成本(万元/台)", script)
+        self.assertIn("油耗率(kg/kWh)", script)
+        self.assertIn("功率上限(kW)", script)
+        self.assertIn("功率下限(kW)", script)
 
     def test_static_path_resolves_index(self):
         resolved = server.resolve_static_path("/")

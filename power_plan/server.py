@@ -588,6 +588,12 @@ def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") 
             return _json_response(
                 PLANNING_STORE.rename_scheme(str(payload.get("source", "")), str(payload.get("target", "")))
             )
+        if path.startswith(f"{prefix}/") and path.endswith("/overview") and method == "GET":
+            name = unquote(path[len(prefix) + 1 : -len("/overview")])
+            return _json_response(PLANNING_STORE.read_scheme_overview(name))
+        if path.startswith(f"{prefix}/") and path.endswith("/time-series") and method == "GET":
+            name = unquote(path[len(prefix) + 1 : -len("/time-series")])
+            return _json_response(PLANNING_STORE.read_time_series(name))
         if path.startswith(f"{prefix}/"):
             name = unquote(path[len(prefix) + 1 :])
             if method == "GET":
@@ -596,6 +602,8 @@ def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") 
                 payload = _read_json_body(body)
                 PLANNING_STORE.write_scheme(name, payload)
                 return _json_response(PLANNING_STORE.read_scheme(name))
+            if method == "DELETE":
+                return _json_response(PLANNING_STORE.delete_scheme(name))
     except (ValueError, FileExistsError, FileNotFoundError) as exc:
         return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
     return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
@@ -692,6 +700,14 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b"{}"
         if parsed.path.startswith("/api/planning/"):
             status, headers, response_body = handle_planning_api_path(parsed.path, "PUT", body)
+            self._send(status, headers, response_body)
+            return
+        self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/planning/"):
+            status, headers, response_body = handle_planning_api_path(parsed.path, "DELETE", b"")
             self._send(status, headers, response_body)
             return
         self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
