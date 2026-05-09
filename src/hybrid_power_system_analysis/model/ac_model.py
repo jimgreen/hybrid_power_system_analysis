@@ -148,6 +148,14 @@ class ACBreak(ACSwitch):
 
 
 class ACTransformer:
+    """AC transformer with a T-type single-ended shunt model.
+
+    ``gt`` and ``bt`` are the conductance and susceptance of the i-side
+    grounding branch. They are not line-style total charging terms. The optional
+    legacy ``b`` argument is accepted only for old E files and is converted to
+    ``bt = b / 2`` to preserve the previous per-end charging magnitude.
+    """
+
     def __init__(self, idx, i_node, j_node, r, x, tap, shift, gt=0.0, bt=0.0, run_stat=1, b=None):
         self.idx = idx
         self.i_node = i_node

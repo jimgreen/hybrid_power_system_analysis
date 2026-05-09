@@ -166,9 +166,13 @@ def _empty(width: int) -> np.ndarray:
 
 
 def build_ac_ppc_from_e_file(file_path) -> Dict:
-    """Build a MATPOWER-like NumPy dictionary for AC power-flow fast paths.
+    """Build a NumPy dictionary for AC power-flow fast paths.
 
-    The returned arrays are in pu/radians and should be treated as read-only by callers.
+    The layout is MATPOWER-like for buses, branches, generators, and loads, but
+    transformer rows use this project's T-type model: ``gt`` and ``bt`` are
+    single-ended i-side shunt admittance terms, not MATPOWER ``BR_B`` charging.
+    The returned arrays are in pu/radians and should be treated as read-only by
+    callers.
     """
     file_key = _file_cache_key(file_path)
     with _AC_PPC_CACHE_LOCK:
@@ -472,6 +476,8 @@ def build_ac_network_from_ppc(ppc: Dict):
         for row in ppc["branch"]
     ]
     network.transformers = [
+        # ACTransformer expects gt/bt as i-side single-ended shunt admittance.
+        # Older E files using b are normalized during array construction.
         ACTransformer(
             int(row[TRANSFORMER_COLS["idx"]]),
             int(row[TRANSFORMER_COLS["i_node"]]),

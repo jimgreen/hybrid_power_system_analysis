@@ -11,6 +11,7 @@
 | 交直流联合潮流 | [hybrid_lf.md](hybrid_lf.md) | `src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` |
 | 交直流联合状态估计 | [hybrid_se.md](hybrid_se.md) | `src/hybrid_power_system_analysis/secore/hybrid_se.py` |
 | 潮流设备模型汇总 | [load_flow_device_models.md](load_flow_device_models.md) | `src/hybrid_power_system_analysis/lfcore/*.py` |
+| AC/Hybrid 与 MATPOWER 对比 | [load_flow_matpower_comparison.md](load_flow_matpower_comparison.md) | 对比口径与基准结果 |
 
 ## 公共约定
 
@@ -64,3 +65,7 @@ E 文件采用有名值输入，并通过模型中的基准配置转换为内部
 - `solve_normal_equations_with_factor()`：优先使用 Cholesky，可退化到稀疏直接解。
 - `observability_rank_details()`：可观测性秩分析，优先复用正规矩阵或分解信息。
 - `identify_bad_data()` 在各 SE 模块内调用 `inverse_gain_for_bad_data()` 和 `measurement_leverage()` 计算归一化残差。
+
+### MATPOWER 对比口径
+
+当前 `ACTransformer` 采用 T 型单端对地模型，`gt/bt` 是 i 侧对地导纳；MATPOWER 标准 branch/tap 模型只能表达两端平分的 `BR_B` 线路充电。因此与 MATPOWER/PYPOWER 结果对比时，需先确认是否为同一物理模型。`load_flow_matpower_comparison.md` 给出了 `ieee300`、`ieee3k` 的实测结果和误差解释。

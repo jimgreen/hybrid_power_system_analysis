@@ -188,7 +188,11 @@ def safe_division(a, b, default=0.0):
 
 
 def matpower_branch_stamp(r: float, x: float, b: float = 0.0, tap: float = 1.0, shift: float = 0.0):
-    """Return MATPOWER-compatible branch admittance entries Yff, Yft, Ytf, Ytt."""
+    """Return MATPOWER-compatible branch admittance entries Yff, Yft, Ytf, Ytt.
+
+    ``b`` is the total line charging susceptance and is split equally between
+    both terminal self-admittances, matching MATPOWER's branch model.
+    """
     y = safe_division(1.0, complex(r, x))
     tap_mag = tap if abs(tap) > 1e-12 else 1.0
     tap_complex = tap_mag * np.exp(1j * np.deg2rad(shift))
@@ -203,7 +207,11 @@ def matpower_branch_stamp(r: float, x: float, b: float = 0.0, tap: float = 1.0, 
 
 
 def matpower_branch_stamp_vectorized(r, x, b=0.0, tap=1.0, shift=0.0):
-    """Vectorized MATPOWER-compatible branch admittance stamp for branch batches."""
+    """Vectorized MATPOWER-compatible branch admittance stamp for branch batches.
+
+    ``b`` remains a branch parameter, not a transformer parameter. It is the
+    total shunt susceptance and is applied as ``j*b/2`` at each end.
+    """
     r = np.asarray(r, dtype=np.float64)
     x = np.asarray(x, dtype=np.float64)
     b = np.broadcast_to(np.asarray(b, dtype=np.float64), r.shape)
@@ -230,7 +238,12 @@ def matpower_branch_stamp_vectorized(r, x, b=0.0, tap=1.0, shift=0.0):
 
 
 def matpower_transformer_stamp_vectorized(r, x, gt=0.0, bt=0.0, tap=1.0, shift=0.0):
-    """Vectorized T-type transformer stamp with one grounding branch on the i side."""
+    """Vectorized T-type transformer stamp with one grounding branch on the i side.
+
+    ``gt + j*bt`` is a single shunt admittance on the i side before the ideal
+    tap/phase-shift transformer. It is not MATPOWER's symmetric ``BR_B`` line
+    charging and must not be split across both terminals.
+    """
     r = np.asarray(r, dtype=np.float64)
     x = np.asarray(x, dtype=np.float64)
     gt = np.broadcast_to(np.asarray(gt, dtype=np.float64), r.shape)
@@ -247,6 +260,8 @@ def matpower_transformer_stamp_vectorized(r, x, gt=0.0, bt=0.0, tap=1.0, shift=0
     )
     tap_mag = np.where(np.abs(tap) > 1e-12, tap, 1.0)
     tap_complex = tap_mag * np.exp(1j * np.deg2rad(shift))
+    # Transformer shunt is single-ended: add it only to the i-side
+    # self-admittance, then refer it through the complex tap.
     y_ground = gt + 1j * bt
     return (
         (y + y_ground) / (tap_complex * np.conj(tap_complex)),
@@ -2190,7 +2205,12 @@ class ACPowerFlowCalc:
         return True
 
     def _build_y_matrix(self):
-        """构建稀疏导纳矩阵，支路/变压器采用 MATPOWER tap/shift stamp。"""
+        """构建稀疏导纳矩阵。
+
+        普通支路采用 MATPOWER 对称线路充电模型；变压器采用本工程的
+        T 型模型，`gt/bt` 是 i 侧单端对地导纳，不等同于 MATPOWER
+        `BR_B` 的两端平分充电电纳。
+        """
         N = self.N
         rows, cols, data = [], [], []
         self.live_branches = [br for br in self.isl.branches if br.is_alive]
@@ -2223,7 +2243,7 @@ class ACPowerFlowCalc:
                 np.column_stack((self.branch_yff, self.branch_yft, self.branch_ytf, self.branch_ytt)).ravel()
             )
 
-        # 变压器
+        # 变压器：gt/bt 为 i 侧单端对地导纳，不能按线路 b/2 平分。
         if self.live_transformers:
             self.transformer_i = np.asarray([self.node_pos[tr.i_node] for tr in self.live_transformers], dtype=np.int32)
             self.transformer_j = np.asarray([self.node_pos[tr.j_node] for tr in self.live_transformers], dtype=np.int32)

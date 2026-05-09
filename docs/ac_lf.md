@@ -68,20 +68,34 @@ result = calc.result
 
 ## 导纳矩阵 stamp
 
-普通支路和主变采用 MATPOWER 公式：
+普通支路采用 MATPOWER 线路公式：
 
 ```text
-yff, yft, ytf, ytt = matpower_transformer_stamp(r, x, gt, bt, tap, shift)
+yff, yft, ytf, ytt = matpower_branch_stamp(r, x, b, tap, shift)
 ```
 
 其中：
 
-- `b` 保留为线路总充电电纳。
+- `b` 保留为线路总充电电纳，按 `j*b/2` 加到两端自导纳。
 - `tap=0` 时按 `1.0` 处理。
 - `shift` 为角度输入，内部转换为弧度。
-- 主变按复变比 `tap * exp(j * shift)` stamp。
+- `tap/shift` 按 MATPOWER branch 的复变比规则处理。
 
 向量化函数 `matpower_branch_stamp_vectorized()` 用于批量生成大型算例的支路 stamp。
+
+主变采用本工程的 T 型单端对地模型：
+
+```text
+y  = 1 / (r + j*x)
+yt = gt + j*bt
+tapc = tap * exp(j*shift)
+Yff = (y + yt) / (tapc * conj(tapc))
+Yft = -y / conj(tapc)
+Ytf = -y / tapc
+Ytt = y
+```
+
+`gt/bt` 是 i 侧单端对地导纳，经复变比折算到 i 端自导纳；它不是 MATPOWER `BR_B` 的两端平分线路充电。因此与 MATPOWER/PYPOWER 对比时，如果把变压器 `bt` 投影为 `BR_B=2*bt`，只能得到近似参照，端口无功和发电机无功会出现系统性差异。
 
 ## 残差方程
 
@@ -146,8 +160,18 @@ array-mode 下结果写入 `calc.result`，不会直接修改输入 `ppc`。
 - Jacobian 直接按稀疏 triplet 生成。
 - array-mode 避免大量 Python 对象访问，适合 IEEE 大规模拼接算例。
 
+## 与 MATPOWER/PYPOWER 对比
+
+`docs/load_flow_matpower_comparison.md` 记录了 `ieee300`、`ieee3k` 的基准结果和对比口径。纯 AC 算例中，`hybrid_lf` 的 AC 子系统和 `ac_lf` 使用同一套数组模型与 T 型变压器 stamp，潮流结果应逐项一致；两者的主要差别是 `hybrid_lf` 需要构造统一交直流 Newton 框架，纯 AC 场景下会有额外开销。
+
+MATPOWER/PYPOWER 参照使用标准 branch/tap 模型，不能精确表达变压器 i 侧单端 `gt/bt`。因此：
+
+- 数值收敛精度应优先看 `normF` 和 `ac_lf` 与 `hybrid_lf` 的同模型差异。
+- 与 MATPOWER 的 `Vm/Va/P/Q` 差异需要结合变压器建模差异解释。
+- 若要严格验证 Newton 实现，应使用同一导纳模型；若要严格对标 MATPOWER，应把本地模型临时退化为 MATPOWER 对称充电模型，或在 MATPOWER 侧额外建模单端 shunt。
+
 ## 注意事项
 
 - 多个平衡节点只有在零阻抗等值相连且固定电压/相角一致时才可作为冗余参考处理。
 - 零阻抗支路作为拓扑约束处理，不应通过极小阻抗普通支路替代。
-- `run()` 会打印每次迭代残差，若需要静默运行可由上层重定向输出。
+- `verbose=True` 时会打印每次迭代残差；批量基准或测试应使用 `verbose=False` 或由上层重定向输出。
