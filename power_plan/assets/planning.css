@@ -335,9 +335,9 @@ button:disabled {
 }
 
 #limitsTab .summary-tab-panel.active .data-table {
-  flex: 0 0 auto;
-  height: var(--summary-table-height, min(50vh, 560px));
-  max-height: none;
+  flex: 0 1 auto;
+  height: auto;
+  max-height: var(--summary-table-height, min(50vh, 560px));
 }
 
 .panel-heading {

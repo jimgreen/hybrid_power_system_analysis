@@ -209,14 +209,23 @@ function applyAdaptiveTimeSeriesLayout() {
 
 function applyAdaptiveSummaryLayout() {
   const tab = document.getElementById("limitsTab");
+  const summarySwitcher = tab?.querySelector(".summary-switcher");
+  const summaryTabs = tab?.querySelector(".summary-tabs");
   const activePanel = tab?.querySelector(".summary-tab-panel.active");
   const heading = activePanel?.querySelector(".panel-heading");
-  if (!tab || !activePanel || !tab.classList.contains("active")) return;
+  if (!tab || !summarySwitcher || !activePanel || !tab.classList.contains("active")) return;
 
-  const panelHeight = activePanel.clientHeight || Math.max(260, tab.clientHeight - 88);
-  const contentHeight = Math.max(220, panelHeight - (heading?.offsetHeight || 0) - 12);
-  const tableHeight = Math.min(560, Math.max(220, contentHeight));
-  const histogramGridHeight = Math.min(620, Math.max(280, contentHeight));
+  const switcherStyle = getComputedStyle(summarySwitcher);
+  const tabsStyle = summaryTabs ? getComputedStyle(summaryTabs) : null;
+  const headingStyle = heading ? getComputedStyle(heading) : null;
+  const switcherPadding = parseFloat(switcherStyle.paddingTop || 0) + parseFloat(switcherStyle.paddingBottom || 0);
+  const tabsHeight = (summaryTabs?.offsetHeight || 0) + parseFloat(tabsStyle?.marginBottom || 0);
+  const headingHeight = (heading?.offsetHeight || 0) + parseFloat(headingStyle?.marginBottom || 0);
+  const availablePanelHeight = (summarySwitcher.clientHeight || Math.max(260, tab.clientHeight - 32)) - switcherPadding - tabsHeight;
+  const panelHeight = Math.max(180, availablePanelHeight);
+  const contentHeight = Math.max(140, panelHeight - headingHeight);
+  const tableHeight = Math.min(560, Math.max(140, contentHeight));
+  const histogramGridHeight = Math.min(620, Math.max(240, contentHeight));
   const histogramSvgHeight = Math.min(240, Math.max(120, (histogramGridHeight - 14) / 2 - 76));
 
   document.documentElement.style.setProperty("--summary-panel-height", `${Math.round(panelHeight)}px`);
