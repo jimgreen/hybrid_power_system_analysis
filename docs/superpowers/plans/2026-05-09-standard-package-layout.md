@@ -1,4 +1,4 @@
-# Standard Package Layout Implementation Plan
+﻿# Standard Package Layout Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -40,7 +40,7 @@
 - Create directory: `scripts/`
 - Create directory: `benchmarks/`
 - Move root utility scripts into `scripts/` or `benchmarks/`
-- Leave `data/`, `docs/`, `tests/`, `web_monitor/`, parameter files, and sample `.e` files in place.
+- Leave `data/`, `docs/`, `tests/`, `power_plan/`, parameter files, and sample `.e` files in place.
 
 - [ ] Move benchmark scripts to `benchmarks/`.
 - [ ] Move generation/comparison utility scripts to `scripts/`.
@@ -67,3 +67,4 @@
 - [ ] Run `python -m pytest tests/test_network_factory_loading.py tests/test_hybrid_net_flow_self_contained.py -q`.
 - [ ] Run `python -m ruff check .` if ruff is available; if not, report the missing tool and the configured command.
 - [ ] Summarize moved paths, config added, and verification results.
+

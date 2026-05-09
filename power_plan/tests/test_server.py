@@ -51,13 +51,16 @@ class FakeConnection:
         pass
 
 
-class WebMonitorServerTest(unittest.TestCase):
+class PowerPlanServerTest(unittest.TestCase):
     def setUp(self):
         self._original_data_source = server.DATA_SOURCE
+        self._original_simu_runtime = server.SIMU_RUNTIME
         server.DATA_SOURCE = server.CsvDataSource()
+        server.SIMU_RUNTIME = server.SimuRuntime()
 
     def tearDown(self):
         server.DATA_SOURCE = self._original_data_source
+        server.SIMU_RUNTIME = self._original_simu_runtime
 
     def test_api_payload_contains_all_monitor_sections(self):
         payload = server.build_snapshot()
@@ -223,6 +226,98 @@ class WebMonitorServerTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
         self.assertEqual(json.loads(body.decode("utf-8"))["error"], "not_found")
+
+    def test_planning_api_create_read_save_copy_rename(self):
+        planning_root = WEB_ROOT / "tests" / "tmp_planning_api"
+        shutil.rmtree(planning_root, ignore_errors=True)
+        planning_root.mkdir(parents=True)
+        original_store = server.PLANNING_STORE
+        server.PLANNING_STORE = server.planning_store.PlanningStore(root=planning_root)
+        try:
+            status, headers, body = server.handle_planning_api_path(
+                "/api/planning/schemes",
+                "POST",
+                json.dumps({"name": "方案A"}).encode("utf-8"),
+            )
+            self.assertEqual(status, 200)
+            created = json.loads(body.decode("utf-8"))
+            self.assertEqual(created["scheme"], "方案A")
+            self.assertEqual(len(created["time_series"]), 8760)
+
+            created["time_series"][0]["load"] = 123.4
+            status, headers, body = server.handle_planning_api_path(
+                "/api/planning/schemes/方案A",
+                "PUT",
+                json.dumps(created, ensure_ascii=False).encode("utf-8"),
+            )
+            self.assertEqual(status, 200)
+
+            status, headers, body = server.handle_planning_api_path("/api/planning/schemes/方案A", "GET", b"")
+            loaded = json.loads(body.decode("utf-8"))
+            self.assertEqual(loaded["time_series"][0]["load"], 123.4)
+
+            status, headers, body = server.handle_planning_api_path(
+                "/api/planning/schemes/copy",
+                "POST",
+                json.dumps({"source": "方案A", "target": "方案B"}, ensure_ascii=False).encode("utf-8"),
+            )
+            self.assertEqual(status, 200)
+
+            status, headers, body = server.handle_planning_api_path(
+                "/api/planning/schemes/rename",
+                "POST",
+                json.dumps({"source": "方案B", "target": "方案C"}, ensure_ascii=False).encode("utf-8"),
+            )
+            self.assertEqual(status, 200)
+
+            status, headers, body = server.handle_planning_api_path("/api/planning/schemes", "GET", b"")
+            names = [item["name"] for item in json.loads(body.decode("utf-8"))["schemes"]]
+            self.assertEqual(names, ["方案A", "方案C"])
+        finally:
+            server.PLANNING_STORE = original_store
+            shutil.rmtree(planning_root, ignore_errors=True)
+
+    def test_planning_api_rejects_bad_scheme_name(self):
+        status, headers, body = server.handle_planning_api_path(
+            "/api/planning/schemes",
+            "POST",
+            json.dumps({"name": "../bad"}).encode("utf-8"),
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body.decode("utf-8"))["error"], "bad_request")
+
+    def test_planning_page_has_current_scheme_display(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="currentSchemeName"', html)
+        self.assertIn("当前方案", html)
+
+    def test_planning_page_save_button_is_in_scheme_actions(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        scheme_actions = html.split('<div class="scheme-actions">', 1)[1].split("</div>", 1)[0]
+        topbar = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
+
+        self.assertIn('id="saveScheme"', scheme_actions)
+        self.assertNotIn('id="saveScheme"', topbar)
+        self.assertLess(html.index('<div class="scheme-actions">'), html.index('id="schemeList"'))
+
+    def test_planning_page_has_device_filter_tags(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="deviceFilters"', html)
+        self.assertIn("renderDeviceFilters", script)
+        self.assertIn("visibleDevices", script)
+        for name in ("柴发", "风机", "光伏", "储能PCS", "储能电池组", "电制氢", "储氢罐", "燃料电池"):
+            self.assertIn(name, script)
+
+    def test_planning_save_has_parameter_alarm_validation(self):
+        script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+
+        self.assertIn("collectSaveWarnings", script)
+        self.assertIn("参数校验未通过", script)
+        self.assertIn("设计容量上限不能小于下限", script)
 
     def test_static_path_resolves_index(self):
         resolved = server.resolve_static_path("/")

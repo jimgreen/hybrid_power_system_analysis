@@ -51,8 +51,8 @@ extend-exclude = [
     "tests",
     "tmp_*",
     "log",
-    "web_monitor",
-    "web_monitor/data",
+    "power_plan",
+    "power_plan/data",
 ]
 
 [tool.ruff.lint]
@@ -65,3 +65,4 @@ ignore = [
 
 [tool.ruff.format]
 line-ending = "auto"
+

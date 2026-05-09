@@ -1,4 +1,4 @@
-# hybrid_power_system_analysis
+﻿# hybrid_power_system_analysis
 
 Hybrid AC/DC power-flow, state-estimation, simulation, AGC, and contingency-analysis tools.
 
@@ -10,7 +10,7 @@ Hybrid AC/DC power-flow, state-estimation, simulation, AGC, and contingency-anal
 - `docs/` contains technical notes and implementation plans.
 - `scripts/` contains one-off generation and comparison utilities.
 - `benchmarks/` contains benchmark drivers and performance comparison scripts.
-- `web_monitor/` is a standalone monitoring UI/server area.
+- `power_plan/` is a standalone monitoring UI/server area.
 
 ## Development
 
@@ -37,3 +37,4 @@ Format Python files:
 ```powershell
 python -m ruff format .
 ```
+

@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Initialize MySQL tables and import web_monitor/data CSV seed data."""
+﻿#!/usr/bin/env python3
+"""Initialize MySQL tables and import power_plan/data CSV seed data."""
 
 from __future__ import annotations
 
@@ -163,3 +163,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

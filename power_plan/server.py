@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Static web server and JSON API for the web_monitor dashboard."""
+﻿#!/usr/bin/env python3
+"""Static web server and JSON API for the power_plan dashboard."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from pathlib import Path
 import sys
 from urllib.parse import unquote, urlparse
 
+import planning_store
+
 
 WEB_ROOT = Path(__file__).resolve().parent
 DATA_DIR = WEB_ROOT / "data"
@@ -25,11 +27,11 @@ VENDOR_DIR = WEB_ROOT / "vendor"
 if VENDOR_DIR.exists():
     sys.path.insert(0, str(VENDOR_DIR))
 DB_CONFIG = {
-    "host": os.environ.get("WEB_MONITOR_DB_HOST", "127.0.0.1"),
-    "port": int(os.environ.get("WEB_MONITOR_DB_PORT", "3306")),
-    "user": os.environ.get("WEB_MONITOR_DB_USER", "root"),
-    "password": os.environ.get("WEB_MONITOR_DB_PASSWORD", "scadaems"),
-    "database": os.environ.get("WEB_MONITOR_DB_NAME", "scadaems"),
+    "host": os.environ.get("POWER_PLAN_DB_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("POWER_PLAN_DB_PORT", "3306")),
+    "user": os.environ.get("POWER_PLAN_DB_USER", "root"),
+    "password": os.environ.get("POWER_PLAN_DB_PASSWORD", "scadaems"),
+    "database": os.environ.get("POWER_PLAN_DB_NAME", "scadaems"),
     "charset": "utf8mb4",
 }
 
@@ -545,6 +547,7 @@ def _load_initial_simu_runtime() -> SimuRuntime:
 
 SIMU_RUNTIME = _load_initial_simu_runtime()
 DATA_SOURCE = MySqlDataSource()
+PLANNING_STORE = planning_store.PlanningStore()
 
 
 def build_snapshot(force_reload: bool = False) -> dict:
@@ -560,7 +563,47 @@ def _json_response(payload: dict, status: int = 200) -> tuple[int, dict[str, str
     }, body
 
 
+def _read_json_body(body: bytes) -> dict:
+    try:
+        return json.loads(body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("请求体不是合法 JSON") from exc
+
+
+def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
+    prefix = "/api/planning/schemes"
+    try:
+        if path == prefix and method == "GET":
+            return _json_response({"schemes": PLANNING_STORE.list_schemes()})
+        if path == prefix and method == "POST":
+            payload = _read_json_body(body)
+            return _json_response(PLANNING_STORE.create_scheme(str(payload.get("name", ""))))
+        if path == f"{prefix}/copy" and method == "POST":
+            payload = _read_json_body(body)
+            return _json_response(
+                PLANNING_STORE.copy_scheme(str(payload.get("source", "")), str(payload.get("target", "")))
+            )
+        if path == f"{prefix}/rename" and method == "POST":
+            payload = _read_json_body(body)
+            return _json_response(
+                PLANNING_STORE.rename_scheme(str(payload.get("source", "")), str(payload.get("target", "")))
+            )
+        if path.startswith(f"{prefix}/"):
+            name = unquote(path[len(prefix) + 1 :])
+            if method == "GET":
+                return _json_response(PLANNING_STORE.read_scheme(name))
+            if method == "PUT":
+                payload = _read_json_body(body)
+                PLANNING_STORE.write_scheme(name, payload)
+                return _json_response(PLANNING_STORE.read_scheme(name))
+    except (ValueError, FileExistsError, FileNotFoundError) as exc:
+        return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+    return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+
 def handle_api_path(path: str) -> tuple[int, dict[str, str], bytes]:
+    if path.startswith("/api/planning/"):
+        return handle_planning_api_path(path, "GET", b"")
     snapshot = build_snapshot()
     routes = {
         "/api/health": {"ok": True, "timestamp": snapshot["timestamp"]},
@@ -602,8 +645,8 @@ def resolve_static_path(request_path: str) -> Path:
     return candidate
 
 
-class WebMonitorHandler(BaseHTTPRequestHandler):
-    server_version = "WebMonitor/1.0"
+class PowerPlanHandler(BaseHTTPRequestHandler):
+    server_version = "PowerPlan/1.0"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -634,7 +677,21 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
         if parsed.path.startswith("/api/"):
+            if parsed.path.startswith("/api/planning/"):
+                status, headers, response_body = handle_planning_api_path(parsed.path, "POST", body)
+                self._send(status, headers, response_body)
+                return
             status, headers, response_body = handle_control_path(parsed.path, body)
+            self._send(status, headers, response_body)
+            return
+        self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
+
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b"{}"
+        if parsed.path.startswith("/api/planning/"):
+            status, headers, response_body = handle_planning_api_path(parsed.path, "PUT", body)
             self._send(status, headers, response_body)
             return
         self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
@@ -655,12 +712,12 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
 
 
 def run(host: str = "127.0.0.1", port: int = 8866) -> None:
-    server = ThreadingHTTPServer((host, port), WebMonitorHandler)
+    server = ThreadingHTTPServer((host, port), PowerPlanHandler)
     server.serve_forever()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the web monitor server.")
+    parser = argparse.ArgumentParser(description="Run the power plan server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8866, type=int)
     args = parser.parse_args()
@@ -669,3 +726,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
