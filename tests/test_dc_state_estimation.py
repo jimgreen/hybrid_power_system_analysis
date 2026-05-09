@@ -54,7 +54,7 @@ class DCStateEstimationTest(unittest.TestCase):
                 text[:switch_start]
                 + "<DCSwitch>\n@ idx name     i_node j_node status run_stat p current\n</DCSwitch>\n\n"
                 + "<DCBreak>\n@ idx name     i_node j_node status run_stat p current\n"
-                + "# 0   brk_0_1   0      1      1      1        0 0\n"
+                + "# 1   brk_1_2   1      2      1      1        0 0\n"
                 + "</DCBreak>"
                 + text[break_end:]
             )
@@ -67,13 +67,13 @@ class DCStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(0, ppc["switch"].shape[0])
         self.assertEqual(1, ppc["break"].shape[0])
-        self.assertEqual("brk_0_1", ppc["break_name"][0])
-        self.assertEqual(0, int(ppc["break"][0, SWITCH_COLS["i_node"]]))
-        self.assertEqual(1, int(ppc["break"][0, SWITCH_COLS["j_node"]]))
+        self.assertEqual("brk_1_2", ppc["break_name"][0])
+        self.assertEqual(1, int(ppc["break"][0, SWITCH_COLS["i_node"]]))
+        self.assertEqual(2, int(ppc["break"][0, SWITCH_COLS["j_node"]]))
         self.assertEqual(1, len(network.breakers))
         self.assertIsInstance(network.breakers[0], DCBreak)
-        self.assertEqual("brk_0_1", network.breakers[0].name)
-        self.assertTrue(network.node_dict[0].isl_obj is network.node_dict[1].isl_obj)
+        self.assertEqual("brk_1_2", network.breakers[0].name)
+        self.assertTrue(network.node_dict[1].isl_obj is network.node_dict[2].isl_obj)
 
     @staticmethod
     def _all_valid_measurement_file(tmp_dir, source: Path) -> Path:
@@ -385,7 +385,7 @@ class DCStateEstimationTest(unittest.TestCase):
             estimator._max_measurement_idx,
         )
 
-    def test_adds_low_weight_pseudo_measurements_for_unmetered_breaks_and_zero_branches(self):
+    def test_adds_low_weight_pseudo_pv_measurements_for_unmetered_dc_topology_devices(self):
         from secore.dc_se import DCStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -412,17 +412,18 @@ class DCStateEstimationTest(unittest.TestCase):
                 flat_start=True,
             )
 
-        pseudo_keys = {
+        regular_pseudo_keys = {
             (meas.device_type, meas.device_name, meas.meas_type)
             for meas in estimator.active_measurements
-            if meas.name.startswith("pseudo_")
+            if meas.name.startswith("pseudo_") and not meas.name.startswith("pseudo_obs_")
         }
 
-        self.assertNotIn(("DCNode", "nd_1", "V"), pseudo_keys)
-        self.assertNotIn(("DCNode", "nd_2", "V"), pseudo_keys)
-        for meas_type in ("P_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("DCBreak", "sw_0_1", meas_type), pseudo_keys)
-            self.assertIn(("DCZeroBranch", "zbr_1_2", meas_type), pseudo_keys)
+        self.assertNotIn(("DCNode", "nd_1", "V"), regular_pseudo_keys)
+        for meas_type in ("P_FROM", "V_FROM"):
+            self.assertIn(("DCBreak", "sw_0_1", meas_type), regular_pseudo_keys)
+            self.assertIn(("DCZeroBranch", "zbr_1_2", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("DCBreak", "sw_0_1", "I_FROM"), regular_pseudo_keys)
+        self.assertNotIn(("DCZeroBranch", "zbr_1_2", "I_FROM"), regular_pseudo_keys)
         self.assertIn("zbr_1_2", estimator.zero_branch_pos)
 
     def test_dc_zero_branches_are_compressed_like_closed_switches(self):
@@ -1133,7 +1134,7 @@ class DCStateEstimationTest(unittest.TestCase):
         calls = []
 
         def fake_seed(network, _params, _e_file):
-            nd_1 = network.node_dict[0]
+            nd_1 = network.node_dict[1]
             self.assertAlmostEqual(1.6, float(nd_1.voltage))
             calls.append(True)
             for node in network.nodes:
@@ -1388,9 +1389,15 @@ class DCStateEstimationTest(unittest.TestCase):
         import secore.dc_se as dc_se
 
         events = []
+        original_prepare = dc_se.DCStateEstimator.prepare
         original_observability = dc_se.DCStateEstimator.observability_analysis
         original_estimate = dc_se.DCStateEstimator.estimate
+        original_run = dc_se.DCStateEstimator.run
         test_case = self
+
+        def counted_prepare(self, *args, **kwargs):
+            events.append("prepare")
+            return original_prepare(self, *args, **kwargs)
 
         def counted_observability(self, *args, **kwargs):
             events.append("observability")
@@ -1404,9 +1411,16 @@ class DCStateEstimationTest(unittest.TestCase):
             test_case.assertEqual(observability_calls, events.count("observability"))
             return result
 
+        def counted_run(self, *args, **kwargs):
+            test_case.assertNotIn("observability", kwargs)
+            test_case.assertTrue(getattr(self, "_prepared", False))
+            return original_run(self, *args, **kwargs)
+
         output = io.StringIO()
+        dc_se.DCStateEstimator.prepare = counted_prepare
         dc_se.DCStateEstimator.observability_analysis = counted_observability
         dc_se.DCStateEstimator.estimate = counted_estimate
+        dc_se.DCStateEstimator.run = counted_run
         try:
             with contextlib.redirect_stdout(output):
                 code = dc_se.main(
@@ -1420,10 +1434,14 @@ class DCStateEstimationTest(unittest.TestCase):
                     ]
                 )
         finally:
+            dc_se.DCStateEstimator.prepare = original_prepare
             dc_se.DCStateEstimator.observability_analysis = original_observability
             dc_se.DCStateEstimator.estimate = original_estimate
+            dc_se.DCStateEstimator.run = original_run
 
         self.assertEqual(0, code)
+        self.assertEqual("prepare", events[0])
+        self.assertEqual(1, events.count("prepare"))
         self.assertEqual(["observability", "estimate"], events[-2:])
         self.assertEqual(1, output.getvalue().count("Observability:"))
         self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
@@ -1455,6 +1473,32 @@ class DCStateEstimationTest(unittest.TestCase):
             dc_se.DCStateEstimator.build_se_result = original_build
 
         self.assertEqual(0, code)
+
+    def test_run_summary_return_mode_limits_seresult_only(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+            auto_prepare=False,
+        )
+        self.assertFalse(estimator._prepared)
+        estimator.prepare()
+        se_result = estimator.run(return_mode="summary", verbose=False, skip_bad_data=True)
+        result = estimator.estimate_result
+
+        self.assertIs(se_result, estimator.se_result)
+        self.assertTrue(result.converged)
+        self.assertIs(estimator.observability_result, result.observability)
+        self.assertFalse(hasattr(result, "return_mode"))
+        self.assertGreater(result.x.size, 0)
+        self.assertGreater(result.z_est.size, 0)
+        self.assertGreater(result.residual.size, 0)
+        self.assertEqual(result.iterations, se_result.statistics.iterations)
+        self.assertEqual(0, len(se_result.prefiltered_measurements))
+        self.assertEqual(0, len(se_result.pseudo_measurements))
+        self.assertEqual(0, len(se_result.bad_data))
+        self.assertEqual(0, len(se_result.normal_measurements))
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator

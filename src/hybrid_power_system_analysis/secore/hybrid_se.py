@@ -60,7 +60,7 @@ from secore.se_math import (
     observability_weak_direction,
     targeted_redundancy_count,
 )
-from secore.se_result import SEResult
+from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_return_mode
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
@@ -219,6 +219,7 @@ class HybridStateEstimator:
         parameter_file: Path = DEFAULT_SE_PARAMETER_FILE,
         parameters: Optional[StateEstimationParameters] = None,
         profile: bool = False,
+        auto_prepare: bool = True,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -244,9 +245,18 @@ class HybridStateEstimator:
         self.min_current_voltage = self.params.min_current_voltage
 
         self._prepared = False
-        self.prepare()
+        self.observability_result = None
+        self.estimate_result = None
+        self.removed_bad_data: List[BadDataItem] = []
+        self.bad_items: List[BadDataItem] = []
+        self.normalized_residual = np.array([], dtype=np.float64)
+        self.se_result = None
+        if auto_prepare:
+            self.prepare()
 
     def prepare(self) -> "HybridStateEstimator":
+        if self._prepared:
+            return self
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
         self.network = self._load_network(self.e_file)
@@ -305,6 +315,10 @@ class HybridStateEstimator:
         self._prepared = True
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
         return self
+
+    def _require_prepared(self, action: str) -> None:
+        if not self._prepared:
+            raise RuntimeError(f"Call prepare() before {action}.")
 
     def _record_profile_time(self, name: str, elapsed: float) -> None:
         if self.profile_enabled:
@@ -384,7 +398,7 @@ class HybridStateEstimator:
         defer_finalize = reuse_loaded and self._defer_sub_prepare_finalize()
         share_measurements = defer_active or (reuse_loaded and self._is_uncoupled_single_side("ac"))
         try:
-            return ACStateEstimator(
+            estimator = ACStateEstimator(
                 e_file=self.e_file,
                 meas_file=self.meas_file,
                 tol=self.tol,
@@ -397,7 +411,10 @@ class HybridStateEstimator:
                 prepare_active_measurements=not defer_active,
                 defer_prepare_finalize=defer_finalize,
                 profile=self.profile_enabled,
+                auto_prepare=False,
             )
+            estimator.prepare()
+            return estimator
         except RuntimeError as exc:
             if "No alive AC nodes" in str(exc):
                 return None
@@ -411,7 +428,7 @@ class HybridStateEstimator:
         defer_finalize = reuse_loaded and self._defer_sub_prepare_finalize()
         share_measurements = defer_active or (reuse_loaded and self._is_uncoupled_single_side("dc"))
         try:
-            return DCStateEstimator(
+            estimator = DCStateEstimator(
                 e_file=self.e_file,
                 meas_file=self.meas_file,
                 tol=self.tol,
@@ -424,7 +441,10 @@ class HybridStateEstimator:
                 prepare_active_measurements=not defer_active,
                 defer_prepare_finalize=defer_finalize,
                 profile=self.profile_enabled,
+                auto_prepare=False,
             )
+            estimator.prepare()
+            return estimator
         except RuntimeError as exc:
             if "No alive DC nodes" in str(exc):
                 return None
@@ -1487,8 +1507,6 @@ class HybridStateEstimator:
         self,
         block: "HybridStateEstimator._MeasurementSideBlock",
     ) -> "HybridStateEstimator._HybridMeasurementPlan":
-        ac_node_dict = getattr(getattr(self.network, "ac", None), "node_dict", {})
-        dc_node_dict = getattr(getattr(self.network, "dc", None), "node_dict", {})
         dcac_code = int(DEVICE_TYPE_CODES["DCACConverter"])
         acac_code = int(DEVICE_TYPE_CODES["ACACConverter"])
         plan_table = build_measurement_plan_table(
@@ -1521,14 +1539,7 @@ class HybridStateEstimator:
         )
         dcac_dc_v_default = np.fromiter(
             (
-                float(
-                    getattr(
-                        dc_node_dict.get(int(self.dcac_converters[int(pos)].dc_node)),
-                        "voltage",
-                        1.0,
-                    )
-                    or 1.0
-                )
+                self._dc_voltage_default_for_node(int(self.dcac_converters[int(pos)].dc_node))
                 for pos in dcac_pos
             ),
             dtype=np.float64,
@@ -1536,14 +1547,7 @@ class HybridStateEstimator:
         )
         dcac_ac_v_default = np.fromiter(
             (
-                float(
-                    getattr(
-                        ac_node_dict.get(int(self.dcac_converters[int(pos)].ac_node)),
-                        "voltage",
-                        1.0,
-                    )
-                    or 1.0
-                )
+                self._ac_voltage_default_for_node(int(self.dcac_converters[int(pos)].ac_node))
                 for pos in dcac_pos
             ),
             dtype=np.float64,
@@ -1567,14 +1571,7 @@ class HybridStateEstimator:
         )
         acac_from_v_default = np.fromiter(
             (
-                float(
-                    getattr(
-                        ac_node_dict.get(int(self.acac_converters[int(pos)].i_node)),
-                        "voltage",
-                        1.0,
-                    )
-                    or 1.0
-                )
+                self._ac_voltage_default_for_node(int(self.acac_converters[int(pos)].i_node))
                 for pos in acac_pos
             ),
             dtype=np.float64,
@@ -1582,14 +1579,7 @@ class HybridStateEstimator:
         )
         acac_to_v_default = np.fromiter(
             (
-                float(
-                    getattr(
-                        ac_node_dict.get(int(self.acac_converters[int(pos)].j_node)),
-                        "voltage",
-                        1.0,
-                    )
-                    or 1.0
-                )
+                self._ac_voltage_default_for_node(int(self.acac_converters[int(pos)].j_node))
                 for pos in acac_pos
             ),
             dtype=np.float64,
@@ -2370,6 +2360,24 @@ class HybridStateEstimator:
         col = int(ac.voltage_col[pos])
         return col if col >= 0 else -1
 
+    def _ac_voltage_default_for_node(self, node_idx: int) -> float:
+        ac = self._ac_sub_estimator
+        if ac is not None and int(node_idx) in ac.node_pos:
+            pos = int(ac.node_pos[int(node_idx)])
+            if pos in getattr(ac, "ref_voltages", {}):
+                return float(ac.ref_voltages[pos])
+        node = self.ac_node_by_idx.get(int(node_idx))
+        return float(getattr(node, "voltage", 1.0) or 1.0)
+
+    def _dc_voltage_default_for_node(self, node_idx: int) -> float:
+        dc = self._dc_sub_estimator
+        if dc is not None and int(node_idx) in dc.node_pos:
+            pos = int(dc.node_pos[int(node_idx)])
+            if pos in getattr(dc, "ref_voltages", {}):
+                return float(dc.ref_voltages[pos])
+        node = self.dc_node_by_idx.get(int(node_idx))
+        return float(getattr(node, "voltage", 1.0) or 1.0)
+
     def _dc_voltage_col_for_node(self, node_idx: int) -> int:
         dc = self._dc_sub_estimator
         if dc is None or int(node_idx) not in dc.node_pos:
@@ -2800,7 +2808,12 @@ class HybridStateEstimator:
             except TypeError as exc:
                 if "final_diagnostics" not in str(exc):
                     raise
-                result = delegate.estimate(measurements, x0, verbose=verbose, observability=observability)
+                result = delegate.estimate(
+                    measurements,
+                    x0,
+                    verbose=verbose,
+                    observability=observability,
+                )
             if solve_profile_start is not None:
                 self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
             return result
@@ -2986,14 +2999,26 @@ class HybridStateEstimator:
         bad_items: Optional[Sequence[BadDataItem]] = None,
         normalized_residual: Optional[Sequence[float]] = None,
         threshold: Optional[float] = None,
-    ) -> SEResult:
+        return_mode: str = "full",
+    ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
+        mode = normalize_seresult_return_mode(return_mode)
+        if mode == "none":
+            self.se_result = None
+            return None
         if bad_items is None or normalized_residual is None:
             computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
             if bad_items is None:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
+        if mode == "summary":
+            self.se_result = build_seresult_summary(
+                result,
+                bad_items=bad_items,
+                all_measurements=self.measurements,
+            )
+            return self.se_result
         self.se_result = SEResult.from_estimate_result(
             result,
             bad_items=bad_items,
@@ -3001,6 +3026,56 @@ class HybridStateEstimator:
             all_measurements=self.measurements,
         )
         return self.se_result
+
+    def run(
+        self,
+        *,
+        return_mode: str = "full",
+        remove_bad_data: bool = False,
+        bad_threshold: Optional[float] = None,
+        max_remove: Optional[int] = None,
+        skip_bad_data: bool = False,
+        verbose: bool = False,
+        final_diagnostics: bool = True,
+        observability: Optional[ObservabilityResult] = None,
+    ) -> Optional[SEResult]:
+        self._require_prepared("run()")
+        mode = normalize_seresult_return_mode(return_mode)
+        threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
+        if observability is None:
+            observability = self.observability_analysis()
+        self.observability_result = observability
+        removed: List[BadDataItem] = []
+        if remove_bad_data:
+            result, removed = self.estimate_with_bad_data_removal(
+                threshold=threshold,
+                max_remove=max_remove,
+                verbose=verbose,
+            )
+        else:
+            result = self.estimate(
+                verbose=verbose,
+                final_diagnostics=final_diagnostics and not skip_bad_data,
+                observability=observability,
+            )
+        self.estimate_result = result
+        self.removed_bad_data = removed
+        if skip_bad_data:
+            bad_items = []
+            normalized = np.array([], dtype=np.float64)
+        else:
+            bad_items, normalized = self.identify_bad_data(result, threshold)
+        self.bad_items = bad_items
+        self.normalized_residual = normalized
+        if mode == "none":
+            self.se_result = None
+            return None
+        return self.build_se_result(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized,
+            return_mode=mode,
+        )
 
     def estimate_with_bad_data_removal(
         self,
@@ -3010,7 +3085,11 @@ class HybridStateEstimator:
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
         delegate = self._delegate()
         if delegate is not None:
-            return delegate.estimate_with_bad_data_removal(threshold=threshold, max_remove=max_remove, verbose=verbose)
+            return delegate.estimate_with_bad_data_removal(
+                threshold=threshold,
+                max_remove=max_remove,
+                verbose=verbose,
+            )
         threshold = self.params.bad_threshold if threshold is None else threshold
         max_remove = self.params.bad_max_remove if max_remove is None else max_remove
         measurements = self.active_measurements
@@ -3130,6 +3209,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
+    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, or none.")
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
@@ -3142,26 +3222,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         flat_start=args.flat_start,
         parameter_file=Path(args.para),
         profile=args.profile,
+        auto_prepare=False,
     )
+    estimator.prepare()
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
-    initial_observability = estimator.observability_analysis()
-    _print_observability(initial_observability)
-    if args.remove_bad_data:
-        result, removed = estimator.estimate_with_bad_data_removal(
-            threshold=bad_threshold,
-            max_remove=args.max_remove,
-            verbose=not args.quiet,
-        )
-        if removed:
-            print("Removed bad data:")
-            for item in removed:
-                print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
-    else:
-        result = estimator.estimate(verbose=not args.quiet, observability=initial_observability)
-
-    profile_stage_start = time.perf_counter()
-    bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
-    estimator._record_profile_time("bad_data.identify", time.perf_counter() - profile_stage_start)
+    se_result = estimator.run(
+        return_mode=args.return_mode if args.se_result else "none",
+        remove_bad_data=args.remove_bad_data,
+        bad_threshold=bad_threshold,
+        max_remove=args.max_remove,
+        verbose=not args.quiet,
+    )
+    _print_observability(estimator.observability_result)
+    result = estimator.estimate_result
+    removed = estimator.removed_bad_data
+    if removed:
+        print("Removed bad data:")
+        for item in removed:
+            print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
+    bad_items = estimator.bad_items
+    normalized = estimator.normalized_residual
     print(
         "State estimation: "
         f"converged={result.converged}, iterations={result.iterations}, "
@@ -3169,10 +3249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"residual_inf={result.residual_inf:.3e}"
     )
     _print_bad_data(bad_items, normalized, bad_threshold)
-    if args.se_result:
-        profile_stage_start = time.perf_counter()
-        se_result = estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
-        estimator._record_profile_time("se_result.build", time.perf_counter() - profile_stage_start)
+    if args.se_result and se_result is not None:
         se_result.write_e_file(Path(args.se_result))
     if args.print_state:
         estimator.print_state(result.x)

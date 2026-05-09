@@ -1215,7 +1215,7 @@ class ACStateEstimationTest(unittest.TestCase):
         calls = []
 
         def fake_seed(network, _params, _e_file):
-            bus_2 = network.node_dict[1]
+            bus_2 = network.node_dict[2]
             self.assertAlmostEqual(119.053271 / 115.0, float(bus_2.voltage))
             calls.append(True)
             for node in network.nodes:
@@ -1712,7 +1712,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn(("ACGenerator", "gen_31_1", "Q_GEN"), pseudo_keys)
         self.assertIn(("ACGenerator", "gen_31_1", "V_GEN"), pseudo_keys)
 
-    def test_adds_low_weight_pseudo_measurements_for_unmetered_nodes_switches_and_zero_branches(self):
+    def test_adds_low_weight_pseudo_pqv_measurements_for_unmetered_ac_topology_devices(self):
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1739,18 +1739,22 @@ class ACStateEstimationTest(unittest.TestCase):
                 flat_start=True,
             )
 
-        pseudo_keys = {
+        regular_pseudo_keys = {
             (meas.device_type, meas.device_name, meas.meas_type)
             for meas in estimator.active_measurements
-            if meas.name.startswith("pseudo_")
+            if meas.name.startswith("pseudo_") and not meas.name.startswith("pseudo_obs_")
         }
 
-        self.assertNotIn(("ACNode", "nd_1", "V"), pseudo_keys)
-        self.assertNotIn(("ACNode", "nd_2", "V"), pseudo_keys)
-        self.assertFalse(any(device_type == "ACNode" and meas_type == "V" for device_type, _name, meas_type in pseudo_keys))
-        for meas_type in ("P_FROM", "Q_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("ACBreak", "sw_0_1", meas_type), pseudo_keys)
-            self.assertIn(("ACZeroBranch", "zbr_1_2", meas_type), pseudo_keys)
+        self.assertNotIn(("ACNode", "nd_1", "V"), regular_pseudo_keys)
+        self.assertNotIn(("ACNode", "nd_2", "V"), regular_pseudo_keys)
+        self.assertFalse(
+            any(device_type == "ACNode" and meas_type == "V" for device_type, _name, meas_type in regular_pseudo_keys)
+        )
+        for meas_type in ("P_FROM", "Q_FROM", "V_FROM"):
+            self.assertIn(("ACBreak", "sw_0_1", meas_type), regular_pseudo_keys)
+            self.assertIn(("ACZeroBranch", "zbr_1_2", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("ACBreak", "sw_0_1", "I_FROM"), regular_pseudo_keys)
+        self.assertNotIn(("ACZeroBranch", "zbr_1_2", "I_FROM"), regular_pseudo_keys)
 
     def test_jacobian_uses_direct_derivatives_without_repeated_evaluation(self):
         from secore.ac_se import ACStateEstimator
@@ -2413,9 +2417,15 @@ class ACStateEstimationTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         events = []
+        original_prepare = ACStateEstimator.prepare
         original_observability = ACStateEstimator.observability_analysis
         original_estimate = ACStateEstimator.estimate
+        original_run = ACStateEstimator.run
         test_case = self
+
+        def counted_prepare(self, *args, **kwargs):
+            events.append("prepare")
+            return original_prepare(self, *args, **kwargs)
 
         def counted_observability(self, *args, **kwargs):
             events.append("observability")
@@ -2429,9 +2439,16 @@ class ACStateEstimationTest(unittest.TestCase):
             test_case.assertEqual(observability_calls, events.count("observability"))
             return result
 
+        def counted_run(self, *args, **kwargs):
+            test_case.assertNotIn("observability", kwargs)
+            test_case.assertTrue(getattr(self, "_prepared", False))
+            return original_run(self, *args, **kwargs)
+
         output = io.StringIO()
+        ACStateEstimator.prepare = counted_prepare
         ACStateEstimator.observability_analysis = counted_observability
         ACStateEstimator.estimate = counted_estimate
+        ACStateEstimator.run = counted_run
         try:
             with contextlib.redirect_stdout(output):
                 rc = ac_se.main(
@@ -2447,10 +2464,14 @@ class ACStateEstimationTest(unittest.TestCase):
                     ]
                 )
         finally:
+            ACStateEstimator.prepare = original_prepare
             ACStateEstimator.observability_analysis = original_observability
             ACStateEstimator.estimate = original_estimate
+            ACStateEstimator.run = original_run
 
         self.assertEqual(0, rc)
+        self.assertEqual("prepare", events[0])
+        self.assertEqual(1, events.count("prepare"))
         self.assertEqual(["observability", "estimate"], events[-2:])
         self.assertEqual(1, output.getvalue().count("Observability:"))
         self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
@@ -2508,6 +2529,39 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(result.iterations, calls)
         self.assertIsNone(result.H)
         self.assertIsNone(result.gain)
+
+    def test_run_summary_return_mode_limits_seresult_only(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            auto_prepare=False,
+        )
+        self.assertFalse(estimator._prepared)
+        estimator.prepare()
+        se_result = estimator.run(
+            return_mode="summary",
+            verbose=False,
+            skip_bad_data=True,
+            final_diagnostics=False,
+        )
+        result = estimator.estimate_result
+
+        self.assertIs(se_result, estimator.se_result)
+        self.assertTrue(result.converged)
+        self.assertIs(estimator.observability_result, result.observability)
+        self.assertFalse(hasattr(result, "return_mode"))
+        self.assertGreater(result.x.size, 0)
+        self.assertGreater(result.z_est.size, 0)
+        self.assertGreater(result.residual.size, 0)
+        self.assertIsNone(result.H)
+        self.assertIsNone(result.gain)
+        self.assertEqual(result.iterations, se_result.statistics.iterations)
+        self.assertEqual(0, len(se_result.prefiltered_measurements))
+        self.assertEqual(0, len(se_result.pseudo_measurements))
+        self.assertEqual(0, len(se_result.bad_data))
+        self.assertEqual(0, len(se_result.normal_measurements))
 
     def test_estimate_uses_cholesky_solver_when_available(self):
         import secore.se_math as se_math

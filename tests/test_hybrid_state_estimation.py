@@ -505,6 +505,166 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, theta[ref_pos])
         self.assertAlmostEqual(ref_voltage, voltage[ref_pos])
 
+    def test_dcac_ac_reference_voltage_measurements_use_reference_voltage(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling_1000.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling_1000.meas",
+            flat_start=True,
+        )
+        device_name = "c0992_grid_inv_acp"
+        converter = estimator.dcac_by_name[device_name]
+        ac_node = estimator.ac_node_by_idx[converter.ac_node]
+        ref_pos = estimator._ac_sub_estimator.node_pos[ac_node.idx]
+        self.assertEqual(-1, estimator._ac_voltage_col_for_node(ac_node.idx))
+        self.assertIn(ref_pos, estimator._ac_sub_estimator.ref_voltages)
+
+        z_est = estimator.evaluate(estimator.initial_state(), estimator.active_measurements)
+        active_row = next(
+            idx
+            for idx, meas in enumerate(estimator.active_measurements)
+            if meas.device_type == "DCACConverter"
+            and meas.device_name == device_name
+            and meas.meas_type == "V_AC"
+        )
+
+        self.assertAlmostEqual(
+            estimator._ac_sub_estimator.ref_voltages[ref_pos],
+            z_est[active_row],
+        )
+
+    def test_dcac_dc_reference_voltage_measurements_use_reference_voltage(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            e_file = Path(tmp_dir) / "dcac_dc_reference.e"
+            e_text = (ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e").read_text(encoding="utf-8")
+            e_text = e_text.replace(
+                "#   1 wt01_rect         11       2 0.005",
+                "#   1 wt01_rect         11       1 0.005",
+                1,
+            )
+            e_file.write_text(e_text, encoding="utf-8")
+
+            meas_file = Path(tmp_dir) / "dcac_dc_reference.meas"
+            meas_lines = []
+            for line in (ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                parts = line.split()
+                if len(parts) >= 9 and parts[3] == "DCNode":
+                    if parts[5] == "V":
+                        parts[7] = "0"
+                    if parts[4] == "dc_bus_720v" and parts[5] == "V":
+                        parts[7] = "1"
+                        parts[8] = "710"
+                    line = " ".join(parts)
+                meas_lines.append(line)
+            meas_file.write_text("\n".join(meas_lines) + "\n", encoding="utf-8")
+
+            estimator = HybridStateEstimator(
+                e_file=e_file,
+                meas_file=meas_file,
+                flat_start=True,
+            )
+
+        device_name = "wt01_rect"
+        converter = estimator.dcac_by_name[device_name]
+        dc_pos = estimator._dc_sub_estimator.node_pos[converter.dc_node]
+        self.assertEqual(-1, estimator._dc_voltage_col_for_node(converter.dc_node))
+        self.assertIn(dc_pos, estimator._dc_sub_estimator.ref_voltages)
+
+        z_est = estimator.evaluate(estimator.initial_state(), estimator.active_measurements)
+        active_row = next(
+            idx
+            for idx, meas in enumerate(estimator.active_measurements)
+            if meas.device_type == "DCACConverter"
+            and meas.device_name == device_name
+            and meas.meas_type == "V_DC"
+        )
+
+        self.assertAlmostEqual(
+            estimator._dc_sub_estimator.ref_voltages[dc_pos],
+            z_est[active_row],
+        )
+
+    def test_acac_reference_voltage_measurements_use_both_reference_voltages(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            e_file = Path(tmp_dir) / "acac_reference.e"
+            e_file.write_text(
+                "\n".join(
+                    [
+                        "<PowerBase>",
+                        "@ p_base u_scale p_scale i_scale",
+                        "# 100 1.0 1.0 1.0",
+                        "</PowerBase>",
+                        "",
+                        "<ACNode>",
+                        "@ idx name vbase voltage angle isl run_stat",
+                        "# 1 ac_ref_a 1.0 1.0 0 0 1",
+                        "# 2 ac_ref_b 1.0 1.0 0 0 1",
+                        "</ACNode>",
+                        "",
+                        "<ACGenerator>",
+                        "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                        "# 1 gen_a 1 V 0 0 1.0 1.0 1",
+                        "# 2 gen_b 2 V 0 0 1.0 1.0 1",
+                        "</ACGenerator>",
+                        "",
+                        "<ACACConverter>",
+                        "@ idx name i_node j_node r1 r2 control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
+                        "# 1 acac_ref 1 2 0.01 0.01 PQQ 0 0 0 0 0 1",
+                        "</ACACConverter>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            meas_file = Path(tmp_dir) / "acac_reference.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 v_a ACNode ac_ref_a V 1.0 1 0.97",
+                        "# 2 v_b ACNode ac_ref_b V 1.0 1 1.03",
+                        "# 3 vf ACACConverter acac_ref V_FROM 1.0 1 0.97",
+                        "# 4 vt ACACConverter acac_ref V_TO 1.0 1 1.03",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            estimator = HybridStateEstimator(
+                e_file=e_file,
+                meas_file=meas_file,
+                flat_start=True,
+            )
+
+        converter = estimator.acac_by_name["acac_ref"]
+        from_pos = estimator._ac_sub_estimator.node_pos[converter.i_node]
+        to_pos = estimator._ac_sub_estimator.node_pos[converter.j_node]
+        self.assertEqual(-1, estimator._ac_voltage_col_for_node(converter.i_node))
+        self.assertEqual(-1, estimator._ac_voltage_col_for_node(converter.j_node))
+        self.assertEqual(0.97, estimator._ac_sub_estimator.ref_voltages[from_pos])
+        self.assertEqual(1.03, estimator._ac_sub_estimator.ref_voltages[to_pos])
+
+        z_est = estimator.evaluate(estimator.initial_state(), estimator.active_measurements)
+        z_by_type = {
+            meas.meas_type: z_est[idx]
+            for idx, meas in enumerate(estimator.active_measurements)
+            if meas.device_type == "ACACConverter" and meas.device_name == "acac_ref"
+        }
+
+        self.assertAlmostEqual(0.97, z_by_type["V_FROM"])
+        self.assertAlmostEqual(1.03, z_by_type["V_TO"])
+
     def test_nonflat_start_reuses_ac_measurement_seeded_power_flow(self):
         from secore.ac_se import ACStateEstimator
         from secore.hybrid_se import HybridStateEstimator
@@ -1736,9 +1896,15 @@ class HybridStateEstimationTest(unittest.TestCase):
         from secore.hybrid_se import HybridStateEstimator
 
         events = []
+        original_prepare = HybridStateEstimator.prepare
         original_observability = HybridStateEstimator.observability_analysis
         original_estimate = HybridStateEstimator.estimate
+        original_run = HybridStateEstimator.run
         test_case = self
+
+        def counted_prepare(self, *args, **kwargs):
+            events.append("prepare")
+            return original_prepare(self, *args, **kwargs)
 
         def counted_observability(self, *args, **kwargs):
             events.append("observability")
@@ -1752,9 +1918,16 @@ class HybridStateEstimationTest(unittest.TestCase):
             test_case.assertEqual(observability_calls, events.count("observability"))
             return result
 
+        def counted_run(self, *args, **kwargs):
+            test_case.assertNotIn("observability", kwargs)
+            test_case.assertTrue(getattr(self, "_prepared", False))
+            return original_run(self, *args, **kwargs)
+
         output = io.StringIO()
+        HybridStateEstimator.prepare = counted_prepare
         HybridStateEstimator.observability_analysis = counted_observability
         HybridStateEstimator.estimate = counted_estimate
+        HybridStateEstimator.run = counted_run
         try:
             with contextlib.redirect_stdout(output):
                 rc = hybrid_se.main(
@@ -1768,10 +1941,14 @@ class HybridStateEstimationTest(unittest.TestCase):
                     ]
                 )
         finally:
+            HybridStateEstimator.prepare = original_prepare
             HybridStateEstimator.observability_analysis = original_observability
             HybridStateEstimator.estimate = original_estimate
+            HybridStateEstimator.run = original_run
 
         self.assertEqual(0, rc)
+        self.assertEqual("prepare", events[0])
+        self.assertEqual(1, events.count("prepare"))
         self.assertEqual(["observability", "estimate"], events[-2:])
         self.assertEqual(1, output.getvalue().count("Observability:"))
         self.assertLess(output.getvalue().index("Observability:"), output.getvalue().index("State estimation:"))
@@ -2557,28 +2734,22 @@ class HybridStateEstimationTest(unittest.TestCase):
                 flat_start=True,
             )
 
-        pseudo_keys = {
+        regular_pseudo_keys = {
             (meas.device_type, meas.device_name, meas.meas_type)
             for meas in estimator.active_measurements
-            if meas.name.startswith("pseudo_")
+            if meas.name.startswith("pseudo_") and not meas.name.startswith("pseudo_obs_")
         }
 
-        self.assertNotIn(("ACNode", "wt01_src", "V"), pseudo_keys)
-        self.assertNotIn(("ACNode", "wt02_src", "V"), pseudo_keys)
-        self.assertNotIn(("DCNode", "dc_bus_720v", "V"), pseudo_keys)
-        self.assertNotIn(("DCNode", "wt01_dc_sw", "V"), pseudo_keys)
-        self.assertFalse(
-            any(
-                device_type in ("ACNode", "DCNode") and meas_type == "V"
-                for device_type, _name, meas_type in pseudo_keys
-            )
-        )
-        for meas_type in ("P_FROM", "Q_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("ACBreak", "sw_diesel_ac", meas_type), pseudo_keys)
-        for meas_type in ("P_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("DCBreak", "sw_wt01_dc", meas_type), pseudo_keys)
+        self.assertNotIn(("ACNode", "wt01_src", "V"), regular_pseudo_keys)
+        self.assertNotIn(("DCNode", "dc_bus_720v", "V"), regular_pseudo_keys)
+        for meas_type in ("P_FROM", "Q_FROM", "V_FROM"):
+            self.assertIn(("ACBreak", "sw_diesel_ac", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("ACBreak", "sw_diesel_ac", "I_FROM"), regular_pseudo_keys)
+        for meas_type in ("P_FROM", "V_FROM"):
+            self.assertIn(("DCBreak", "sw_wt01_dc", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("DCBreak", "sw_wt01_dc", "I_FROM"), regular_pseudo_keys)
 
-    def test_adds_low_weight_pseudo_measurements_for_unmetered_hybrid_zero_branches(self):
+    def test_adds_low_weight_pseudo_pv_measurements_for_unmetered_hybrid_dc_topology_devices(self):
         from secore.hybrid_se import HybridStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2603,14 +2774,15 @@ class HybridStateEstimationTest(unittest.TestCase):
                 flat_start=True,
             )
 
-        pseudo_keys = {
+        regular_pseudo_keys = {
             (meas.device_type, meas.device_name, meas.meas_type)
             for meas in estimator.active_measurements
-            if meas.name.startswith("pseudo_")
+            if meas.name.startswith("pseudo_") and not meas.name.startswith("pseudo_obs_")
         }
 
-        for meas_type in ("P_FROM", "V_FROM", "I_FROM"):
-            self.assertIn(("DCZeroBranch", "zbr_1_2", meas_type), pseudo_keys)
+        for meas_type in ("P_FROM", "V_FROM"):
+            self.assertIn(("DCZeroBranch", "zbr_1_2", meas_type), regular_pseudo_keys)
+        self.assertNotIn(("DCZeroBranch", "zbr_1_2", "I_FROM"), regular_pseudo_keys)
 
     def test_qinling_hybrid_state_estimation_with_converter_measurements(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -2766,6 +2938,38 @@ class HybridStateEstimationTest(unittest.TestCase):
             hybrid_se.HybridStateEstimator.build_se_result = original_build
 
         self.assertEqual(0, code)
+
+    def test_run_summary_return_mode_limits_hybrid_seresult_only(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+        self.assertFalse(estimator._prepared)
+        estimator.prepare()
+        se_result = estimator.run(
+            return_mode="summary",
+            verbose=False,
+            skip_bad_data=True,
+            final_diagnostics=False,
+        )
+        result = estimator.estimate_result
+
+        self.assertIs(se_result, estimator.se_result)
+        self.assertTrue(result.converged)
+        self.assertIs(estimator.observability_result, result.observability)
+        self.assertFalse(hasattr(result, "return_mode"))
+        self.assertGreater(result.x.size, 0)
+        self.assertGreater(result.z_est.size, 0)
+        self.assertGreater(result.residual.size, 0)
+        self.assertEqual(result.iterations, se_result.statistics.iterations)
+        self.assertEqual(0, len(se_result.prefiltered_measurements))
+        self.assertEqual(0, len(se_result.pseudo_measurements))
+        self.assertEqual(0, len(se_result.bad_data))
+        self.assertEqual(0, len(se_result.normal_measurements))
 
 
 if __name__ == "__main__":

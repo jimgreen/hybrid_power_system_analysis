@@ -87,7 +87,7 @@ from secore.se_array_plan import (
     rows_by_device_type_code,
     take_measurement_view,
 )
-from secore.se_result import SEResult
+from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_return_mode
 from unit_system import ac_current_base_ka
 
 
@@ -932,6 +932,7 @@ class ACStateEstimator:
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
+        auto_prepare: bool = True,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -957,23 +958,53 @@ class ACStateEstimator:
         self.min_current_voltage = self.params.min_current_voltage
 
         self._prepared = False
-        prepare_kwargs = {
-            "network": network,
-            "measurements": measurements,
-            "prepare_active_measurements": prepare_active_measurements,
-        }
-        if defer_prepare_finalize:
-            prepare_kwargs["defer_prepare_finalize"] = defer_prepare_finalize
-        self.prepare(**prepare_kwargs)
+        self._prepare_network = network
+        self._prepare_measurements = measurements
+        self._prepare_active_measurements = bool(prepare_active_measurements)
+        self._prepare_defer_finalize = bool(defer_prepare_finalize)
+        self.observability_result = None
+        self.estimate_result = None
+        self.removed_bad_data: List[BadDataItem] = []
+        self.bad_items: List[BadDataItem] = []
+        self.normalized_residual = np.array([], dtype=np.float64)
+        self.se_result = None
+        if auto_prepare:
+            self.prepare()
 
     def prepare(
         self,
         *,
         network: Optional[ACPowerNetwork] = None,
         measurements: Optional[Sequence[Measurement]] = None,
-        prepare_active_measurements: bool = True,
-        defer_prepare_finalize: bool = False,
+        prepare_active_measurements: Optional[bool] = None,
+        defer_prepare_finalize: Optional[bool] = None,
     ) -> "ACStateEstimator":
+        if (
+            self._prepared
+            and network is None
+            and measurements is None
+            and prepare_active_measurements is None
+            and defer_prepare_finalize is None
+        ):
+            return self
+        if network is None:
+            network = self._prepare_network
+        else:
+            self._prepare_network = network
+        if measurements is None:
+            measurements = self._prepare_measurements
+        else:
+            self._prepare_measurements = measurements
+        if prepare_active_measurements is None:
+            prepare_active_measurements = self._prepare_active_measurements
+        else:
+            self._prepare_active_measurements = bool(prepare_active_measurements)
+        if defer_prepare_finalize is None:
+            defer_prepare_finalize = self._prepare_defer_finalize
+        else:
+            self._prepare_defer_finalize = bool(defer_prepare_finalize)
+        prepare_active_measurements = bool(prepare_active_measurements)
+        defer_prepare_finalize = bool(defer_prepare_finalize)
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
         self.network = network if network is not None else self._load_network(self.e_file)
@@ -1068,6 +1099,10 @@ class ACStateEstimator:
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
         self._prepared = True
         return self
+
+    def _require_prepared(self, action: str) -> None:
+        if not self._prepared:
+            raise RuntimeError(f"Call prepare() before {action}.")
 
     def finalize_prepare(
         self,
@@ -2962,7 +2997,7 @@ class ACStateEstimator:
         return counts
 
     def _add_pseudo_topology_measurements(self, next_idx: int) -> Tuple[int, set]:
-        """Add weak priors for topology devices that have no usable measurement row."""
+        """Add weak P/Q/V priors for AC topology devices, excluding explicit current rows."""
         measured_keys = self._active_measurement_key_cache
         added_keys = set()
 
@@ -2970,13 +3005,12 @@ class ACStateEstimator:
             ("ACZeroBranch", self.zero_branches),
             ("ACBreak", self.breakers),
         ):
-            for dev in devices:
+            for dev in sorted(devices, key=lambda item: item.idx):
                 voltage = float(getattr(getattr(dev, "i_node_obj", None), "voltage", 1.0) or 1.0)
                 values = (
                     ("P_FROM", float(getattr(dev, "p", 0.0) or 0.0)),
                     ("Q_FROM", float(getattr(dev, "q", 0.0) or 0.0)),
                     ("V_FROM", voltage),
-                    ("I_FROM", abs(getattr(dev, "current", 0.0) or 0.0)),
                 )
                 for meas_type, value in values:
                     key = (device_type, dev.name, meas_type)
@@ -7044,14 +7078,26 @@ class ACStateEstimator:
         bad_items: Optional[Sequence[BadDataItem]] = None,
         normalized_residual: Optional[Sequence[float]] = None,
         threshold: Optional[float] = None,
-    ) -> SEResult:
+        return_mode: str = "full",
+    ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
+        mode = normalize_seresult_return_mode(return_mode)
+        if mode == "none":
+            self.se_result = None
+            return None
         if bad_items is None or normalized_residual is None:
             computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
             if bad_items is None:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
+        if mode == "summary":
+            self.se_result = build_seresult_summary(
+                result,
+                bad_items=bad_items,
+                all_measurements=self.measurements,
+            )
+            return self.se_result
         self.se_result = SEResult.from_estimate_result(
             result,
             bad_items=bad_items,
@@ -7059,6 +7105,56 @@ class ACStateEstimator:
             all_measurements=self.measurements,
         )
         return self.se_result
+
+    def run(
+        self,
+        *,
+        return_mode: str = "full",
+        remove_bad_data: bool = False,
+        bad_threshold: Optional[float] = None,
+        max_remove: Optional[int] = None,
+        skip_bad_data: bool = False,
+        verbose: bool = False,
+        final_diagnostics: bool = True,
+        observability: Optional[ObservabilityResult] = None,
+    ) -> Optional[SEResult]:
+        self._require_prepared("run()")
+        mode = normalize_seresult_return_mode(return_mode)
+        threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
+        if observability is None:
+            observability = self.observability_analysis()
+        self.observability_result = observability
+        removed: List[BadDataItem] = []
+        if remove_bad_data:
+            result, removed = self.estimate_with_bad_data_removal(
+                threshold,
+                max_remove=max_remove,
+                verbose=verbose,
+            )
+        else:
+            result = self.estimate(
+                verbose=verbose,
+                final_diagnostics=final_diagnostics and not skip_bad_data,
+                observability=observability,
+            )
+        self.estimate_result = result
+        self.removed_bad_data = removed
+        if skip_bad_data:
+            bad_items = []
+            normalized = np.array([], dtype=np.float64)
+        else:
+            bad_items, normalized = self.identify_bad_data(result, threshold)
+        self.bad_items = bad_items
+        self.normalized_residual = normalized
+        if mode == "none":
+            self.se_result = None
+            return None
+        return self.build_se_result(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized,
+            return_mode=mode,
+        )
 
     def estimate_with_bad_data_removal(
         self,
@@ -7168,6 +7264,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated node states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
+    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, or none.")
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
@@ -7180,27 +7277,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parameter_file=Path(args.para),
         flat_start=args.flat_start,
         profile=args.profile,
+        auto_prepare=False,
     )
+    estimator.prepare()
 
-    initial_observability = estimator.observability_analysis()
-    _print_observability(initial_observability)
-
-    if args.remove_bad_data:
-        result, removed = estimator.estimate_with_bad_data_removal(
-            args.bad_threshold,
-            max_remove=args.max_remove,
-            verbose=not args.quiet,
-        )
-        if removed:
-            print("Removed bad data:")
-            for item in removed:
-                print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
-    else:
-        result = estimator.estimate(
-            verbose=not args.quiet,
-            final_diagnostics=not args.skip_bad_data,
-            observability=initial_observability,
-        )
+    bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
+    se_result = estimator.run(
+        return_mode=args.return_mode if args.se_result else "none",
+        remove_bad_data=args.remove_bad_data,
+        bad_threshold=bad_threshold,
+        max_remove=args.max_remove,
+        skip_bad_data=args.skip_bad_data,
+        verbose=not args.quiet,
+        final_diagnostics=not args.skip_bad_data,
+    )
+    _print_observability(estimator.observability_result)
+    result = estimator.estimate_result
+    removed = estimator.removed_bad_data
+    if removed:
+        print("Removed bad data:")
+        for item in removed:
+            print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
 
     print(
         "State estimation: "
@@ -7211,19 +7308,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"norm_res={result.residual_inf:.3e}"
     )
     if not args.skip_bad_data:
-        bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
-        profile_stage_start = time.perf_counter()
-        bad_items, normalized = estimator.identify_bad_data(result, bad_threshold)
-        estimator._record_profile_time("bad_data.identify", time.perf_counter() - profile_stage_start)
+        bad_items = estimator.bad_items
+        normalized = estimator.normalized_residual
         _print_bad_data(bad_items, normalized, bad_threshold)
     else:
         bad_items = []
         normalized = np.array([], dtype=np.float64)
 
-    if args.se_result:
-        profile_stage_start = time.perf_counter()
-        se_result = estimator.build_se_result(result, bad_items=bad_items, normalized_residual=normalized)
-        estimator._record_profile_time("se_result.build", time.perf_counter() - profile_stage_start)
+    if args.se_result and se_result is not None:
         se_result.write_e_file(Path(args.se_result))
 
     if args.print_state:

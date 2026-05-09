@@ -43,8 +43,16 @@ def run_case(
             parameter_file=parameter_file,
             flat_start=flat_start,
             profile=profile,
+            auto_prepare=False,
         )
-        result = estimator.estimate(verbose=False, final_diagnostics=not skip_bad_data)
+        estimator.prepare()
+        estimator.run(
+            return_mode="none",
+            skip_bad_data=skip_bad_data,
+            verbose=False,
+            final_diagnostics=not skip_bad_data,
+        )
+        result = estimator.estimate_result
         bad_count = None
         max_normalized = None
         if not skip_bad_data:

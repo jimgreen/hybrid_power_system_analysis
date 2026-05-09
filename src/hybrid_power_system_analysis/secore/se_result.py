@@ -7,6 +7,64 @@ import numpy as np
 from model.meas_model import BadDataItem, EstimateResult, Measurement
 
 
+def normalize_seresult_return_mode(return_mode: str) -> str:
+    mode = str(return_mode or "full").strip().lower()
+    aliases = {
+        "all": "full",
+        "full": "full",
+        "complete": "full",
+        "array": "full",
+        "arrays": "full",
+        "ppc": "full",
+        "summary": "summary",
+        "brief": "summary",
+        "minimal": "summary",
+        "none": "none",
+        "skip": "none",
+        "raw": "none",
+    }
+    if mode not in aliases:
+        raise ValueError(f"Unsupported SEResult return_mode: {return_mode!r}")
+    return aliases[mode]
+
+
+def build_seresult_summary(
+    result: EstimateResult,
+    *,
+    bad_items: Optional[Sequence[BadDataItem]] = None,
+    all_measurements: Optional[Iterable[Measurement]] = None,
+) -> "SEResult":
+    se_result = SEResult()
+    bad_items = list(bad_items or ())
+    active_ids = {id(meas) for meas in result.measurements}
+    prefiltered_count = 0
+    if all_measurements is not None:
+        for measurement in all_measurements:
+            if id(measurement) not in active_ids and SEResult._prefiltered_reason(measurement):
+                prefiltered_count += 1
+    pseudo_count = sum(1 for measurement in result.measurements if SEResult._is_pseudo_measurement(measurement))
+    bad_count = len(bad_items)
+    normal_count = max(0, len(result.measurements) - pseudo_count - bad_count)
+    obs = result.observability
+    se_result.statistics = SEResult.StatisticsTable(
+        converged=bool(result.converged),
+        iterations=int(result.iterations),
+        objective=float(result.objective),
+        max_correction=float(result.max_correction),
+        residual_inf=float(result.residual_inf),
+        observable=bool(obs.observable),
+        rank=int(obs.rank),
+        state_count=int(obs.state_count),
+        measurement_count=int(obs.measurement_count),
+        deficiency=int(obs.deficiency),
+        prefiltered_measurement_count=prefiltered_count,
+        pseudo_measurement_count=pseudo_count,
+        bad_data_count=bad_count,
+        normal_measurement_count=normal_count,
+    )
+    return se_result
+
+
 class _MeasurementResultTable:
     __slots__ = ("rows",)
 
