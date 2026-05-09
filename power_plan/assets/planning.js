@@ -225,8 +225,8 @@ function applyAdaptiveSummaryLayout() {
   const panelHeight = Math.max(180, availablePanelHeight);
   const contentHeight = Math.max(140, panelHeight - headingHeight);
   const tableHeight = Math.max(160, contentHeight);
-  const histogramGridHeight = Math.min(620, Math.max(240, contentHeight));
-  const histogramSvgHeight = Math.min(240, Math.max(120, (histogramGridHeight - 14) / 2 - 76));
+  const histogramGridHeight = Math.max(240, contentHeight);
+  const histogramSvgHeight = Math.max(120, (histogramGridHeight - 14) / 2 - 76);
 
   document.documentElement.style.setProperty("--summary-panel-height", `${Math.round(panelHeight)}px`);
   document.documentElement.style.setProperty("--summary-table-height", `${Math.round(tableHeight)}px`);

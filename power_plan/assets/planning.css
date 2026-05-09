@@ -5,8 +5,8 @@
   --time-table-height: clamp(220px, 38vh, 520px);
   --summary-panel-height: min(72vh, 960px);
   --summary-table-height: min(72vh, 960px);
-  --summary-histogram-grid-height: clamp(280px, 52vh, 620px);
-  --summary-histogram-svg-height: clamp(120px, 22vh, 240px);
+  --summary-histogram-grid-height: min(72vh, 960px);
+  --summary-histogram-svg-height: min(32vh, 360px);
 }
 
 body {
@@ -335,9 +335,9 @@ button:disabled {
 }
 
 #limitsTab .summary-tab-panel.active .data-table {
-  flex: 0 1 auto;
-  height: auto;
-  max-height: var(--summary-table-height, min(72vh, 960px));
+  flex: 1 1 auto;
+  height: var(--summary-table-height, min(72vh, 960px));
+  max-height: none;
 }
 
 .panel-heading {
@@ -871,7 +871,7 @@ td input[type="checkbox"] {
   grid-template-columns: repeat(2, minmax(260px, 1fr));
   grid-template-rows: repeat(2, minmax(0, 1fr));
   gap: 14px;
-  height: var(--summary-histogram-grid-height, min(52vh, 620px));
+  height: var(--summary-histogram-grid-height, min(72vh, 960px));
   min-height: 0;
   overflow: auto;
 }

@@ -710,22 +710,25 @@ class PowerPlanServerTest(unittest.TestCase):
     def test_planning_overview_charts_and_tables_adapt_to_available_height(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
         script = (WEB_ROOT / "assets" / "planning.js").read_text(encoding="utf-8")
+        summary_layout_script = script.split("function applyAdaptiveSummaryLayout()", 1)[1].split("function bindTimeResizeHandle()", 1)[0]
 
         self.assertIn("--summary-panel-height", css)
         self.assertIn("--summary-table-height", css)
         self.assertIn("--summary-histogram-grid-height", css)
         self.assertIn("--summary-histogram-svg-height", css)
-        self.assertIn("max-height: var(--summary-table-height", css)
-        self.assertIn("height: auto", css)
+        self.assertIn("height: var(--summary-table-height", css)
+        self.assertIn("max-height: none", css)
         self.assertNotIn("min(50vh, 560px)", css)
         self.assertIn("height: var(--summary-histogram-grid-height", css)
+        self.assertNotIn("min(52vh, 620px)", css)
         self.assertIn("grid-template-rows: repeat(2, minmax(0, 1fr))", css)
         self.assertIn("flex-direction: column", css)
         self.assertIn("applyAdaptiveSummaryLayout", script)
         self.assertIn("summaryTabs", script)
         self.assertIn("summary-histogram-grid-height", script)
         self.assertIn("summary-table-height", script)
-        self.assertNotIn("Math.min(560", script)
+        self.assertNotIn("Math.min(560", summary_layout_script)
+        self.assertNotIn("Math.min(620", summary_layout_script)
 
     def test_planning_layout_constrains_page_height_to_viewport(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
