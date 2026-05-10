@@ -131,13 +131,14 @@ class PowerPlanServerTest(unittest.TestCase):
 
     def test_optimization_api_start_stop_and_logs(self):
         original_runtime = server.OPTIMIZATION_RUNTIME
-        server.OPTIMIZATION_RUNTIME = server.OptimizationRuntime()
+        server.OPTIMIZATION_RUNTIME = server.OptimizationRuntimeManager()
         try:
-            status, headers, body = server.handle_api_path("/api/optimization/status")
+            status, headers, body = server.handle_api_path("/api/optimization/status?scheme=方案A")
             initial = json.loads(body.decode("utf-8"))
             self.assertEqual(status, 200)
             self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
             self.assertEqual(initial["status"], "待启动")
+            self.assertEqual(initial["scheme"], "方案A")
             self.assertIn("metrics", initial)
             self.assertIn("results", initial)
             self.assertIn("logs", initial)
@@ -165,6 +166,32 @@ class PowerPlanServerTest(unittest.TestCase):
 
             status, headers, body = server.handle_control_path(
                 "/api/optimization/control",
+                json.dumps({"action": "start", "scheme": "方案B"}, ensure_ascii=False).encode("utf-8"),
+            )
+            second_started = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(second_started["state"]["status"], "运行中")
+            self.assertEqual(second_started["state"]["scheme"], "方案B")
+
+            status, headers, body = server.handle_api_path("/api/optimization/status?scheme=方案A")
+            scheme_a = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(scheme_a["status"], "运行中")
+            self.assertEqual(scheme_a["scheme"], "方案A")
+            self.assertIn("方案A", scheme_a["running_schemes"])
+            self.assertIn("方案B", scheme_a["running_schemes"])
+
+            status, headers, body = server.handle_api_path("/api/optimization/status?scheme=方案B")
+            scheme_b = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(scheme_b["status"], "运行中")
+            self.assertEqual(scheme_b["scheme"], "方案B")
+            self.assertTrue(any("方案：方案A" in item["message"] for item in scheme_a["logs"]))
+            self.assertFalse(any("方案：方案B" in item["message"] for item in scheme_a["logs"]))
+            self.assertTrue(any("方案：方案B" in item["message"] for item in scheme_b["logs"]))
+
+            status, headers, body = server.handle_control_path(
+                "/api/optimization/control",
                 json.dumps({"action": "stop", "scheme": "方案A"}, ensure_ascii=False).encode("utf-8"),
             )
             stopped = json.loads(body.decode("utf-8"))
@@ -182,6 +209,12 @@ class PowerPlanServerTest(unittest.TestCase):
             self.assertEqual(not_running["error"], "not_running")
             self.assertIn("没有运行", not_running["message"])
 
+            status, headers, body = server.handle_api_path("/api/optimization/status?scheme=方案B")
+            scheme_b_after_a_stop = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(scheme_b_after_a_stop["status"], "运行中")
+            self.assertEqual(scheme_b_after_a_stop["scheme"], "方案B")
+
             status, headers, body = server.handle_control_path(
                 "/api/optimization/control",
                 json.dumps({"action": "bad"}).encode("utf-8"),
@@ -191,13 +224,13 @@ class PowerPlanServerTest(unittest.TestCase):
         finally:
             server.OPTIMIZATION_RUNTIME = original_runtime
 
-    def test_optimization_overview_results_are_three_requested_tables(self):
+    def test_optimization_overview_results_are_two_tables_with_ratio_disks(self):
         runtime = server.OptimizationRuntime()
         payload = runtime.apply("start", scheme="方案A")
 
         tables = payload["results"]["overview_tables"]
-        self.assertEqual([table["title"] for table in tables], ["规划结果", "规划年指标", "规划年效益"])
-        self.assertEqual(len(tables), 3)
+        self.assertEqual([table["title"] for table in tables], ["规划结果", "规划年指标"])
+        self.assertEqual(len(tables), 2)
         self.assertTrue(any(row["设备类型"] == "柴发" and "设计台数" in row for row in tables[0]["rows"]))
         self.assertTrue(any(row["设备类型"] == "储能" and "设计台数" in row for row in tables[0]["rows"]))
         annual_metric_names = {row["指标"] for row in tables[1]["rows"]}
@@ -215,22 +248,19 @@ class PowerPlanServerTest(unittest.TestCase):
             "储能总电量",
             "制氢总量",
             "燃料电池发电量",
+            "总成本",
+            "绿电占比",
+            "频率风险点",
         ):
             self.assertIn(name, annual_metric_names)
-        benefit_names = {row["指标"] for row in tables[2]["rows"]}
-        for name in (
-            "总成本",
-            "度电成本",
-            "建设成本",
-            "柴油消耗量",
-            "运行成本",
-            "绿电占比",
-            "弃电占比",
-            "最高频率",
-            "最低频率",
-            "频率安全风险点",
-        ):
-            self.assertIn(name, benefit_names)
+        self.assertNotIn("规划年效益", [table["title"] for table in tables])
+
+        disks = payload["results"]["overview_disks"]
+        self.assertEqual([disk["title"] for disk in disks], ["成本构成", "电量构成"])
+        self.assertEqual(disks[0]["left_label"], "运行成本")
+        self.assertEqual(disks[0]["right_label"], "建设成本")
+        self.assertEqual(disks[1]["left_label"], "柴发电量")
+        self.assertEqual(disks[1]["right_label"], "新能源电量")
 
     def test_snapshot_reads_values_from_csv_files(self):
         payload = server.build_snapshot(force_reload=True)
@@ -644,7 +674,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('assets/optimize.js', html)
         self.assertIn('href="optimize.html">启动优化</a>', planning_html)
         self.assertIn(".optimization-panel", css)
-        self.assertIn("grid-template-rows: auto 14px minmax(220px, var(--optimization-result-height, 1fr)) 14px minmax(120px, var(--optimization-log-height, 24vh))", css)
+        self.assertIn("grid-template-rows: var(--optimization-command-height, max-content) 14px minmax(220px, var(--optimization-result-height, 1fr)) 14px minmax(120px, var(--optimization-log-height, 24vh))", css)
 
     def test_optimization_frontend_polls_status_and_binds_controls(self):
         script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
@@ -654,6 +684,11 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("/api/optimization/control", script)
         self.assertIn("startOptimization", script)
         self.assertIn("stopOptimization", script)
+        self.assertIn("updateOptimizationActions", script)
+        self.assertIn("startButton.disabled = !hasScheme || isRunning", script)
+        self.assertIn("stopButton.disabled = !hasScheme || !isRunning", script)
+        self.assertIn("classList.toggle(\"is-disabled\"", script)
+        self.assertIn("classList.toggle(\"is-active\"", script)
         self.assertIn("正在运行，无法再次启动", script)
         self.assertIn("没有运行", script)
         self.assertIn("alert(data.message", script)
@@ -666,6 +701,13 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("结果概览", script)
         self.assertIn("绿电结果", script)
         self.assertIn("安全结果", script)
+        self.assertIn("optimizationStatusPath", script)
+        self.assertIn("defaultOptimizationState", script)
+        self.assertIn("scheme=", script)
+        self.assertIn("encodeURIComponent(scheme)", script)
+        self.assertIn("refreshOptimizationStatus().catch(showError)", script)
+        self.assertIn(".optimization-actions button.is-disabled", css := (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8"))
+        self.assertIn(".optimization-actions button.is-active", css)
 
     def test_optimization_page_has_draggable_result_and_log_resize_handles(self):
         html = (WEB_ROOT / "optimize.html").read_text(encoding="utf-8")
@@ -680,6 +722,9 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('aria-orientation="horizontal"', html)
         self.assertIn("bindOptimizationResultResizeHandle", script)
         self.assertIn("bindOptimizationLogResizeHandle", script)
+        self.assertIn("lockOptimizationCommandHeight", script)
+        self.assertIn("--optimization-command-height", script)
+        self.assertIn("optimizationResizableContentHeight() - safeHeight", script)
         self.assertIn("optimizationResultHeight", script)
         self.assertIn("optimizationLogHeight", script)
         self.assertIn("--optimization-result-height", script)
@@ -688,26 +733,54 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("setPointerCapture", script)
         self.assertIn("ArrowUp", script)
         self.assertIn("ArrowDown", script)
+        result_resize_script = script.split("function bindOptimizationResultResizeHandle()", 1)[1].split("function bindOptimizationLogResizeHandle()", 1)[0]
+        self.assertIn("applyHeight(startHeight - (moveEvent.clientY - startY))", result_resize_script)
+        self.assertNotIn("applyHeight(startHeight + moveEvent.clientY - startY)", result_resize_script)
         self.assertIn(".optimization-result-resize-handle", css)
         self.assertIn(".optimization-log-resize-handle", css)
+        result_tabs_css = css.split(".result-tabs {", 1)[1].split("}", 1)[0]
+        self.assertIn("flex: 0 0 auto", result_tabs_css)
+        self.assertIn("min-height: 38px", result_tabs_css)
+        result_tab_css = css.split(".result-tab {", 1)[1].split("}", 1)[0]
+        self.assertIn("height: 36px", result_tab_css)
+        self.assertIn("display: inline-flex", result_tab_css)
         self.assertIn("cursor: row-resize", css)
         self.assertIn("--optimization-result-height", css)
         self.assertIn("--optimization-log-height", css)
 
-    def test_optimization_overview_frontend_renders_three_parallel_tables(self):
+    def test_optimization_overview_frontend_renders_two_tables_and_ratio_disks(self):
         script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
         self.assertIn("renderOverviewTables", script)
         self.assertIn("overview_tables", script)
+        self.assertIn("renderOverviewDisks", script)
+        self.assertIn("overview_disks", script)
+        self.assertIn("overview-ratio-stack", script)
         self.assertIn("optimization-overview-grid", script)
-        for title in ("规划结果", "规划年指标", "规划年效益"):
+        for title in ("规划结果", "规划年指标"):
             self.assertIn(title, script)
+        self.assertNotIn("规划年效益", script)
+        for label in ("运行成本", "建设成本", "柴发电量", "新能源电量"):
+            self.assertIn(label, script)
         for field in ("设备类型", "设计台数", "指标", "数值", "单位"):
             self.assertIn(field, script)
         self.assertIn(".optimization-overview-grid", css)
-        self.assertIn("grid-template-columns: repeat(3, minmax(260px, 1fr))", css)
+        self.assertIn("grid-template-columns: minmax(260px, 1fr) minmax(360px, 0.95fr) minmax(260px, 1fr)", css)
         self.assertIn(".overview-table-card", css)
+        self.assertIn(".overview-ratio-stack", css)
+        ratio_stack_css = css.split(".overview-ratio-stack {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: grid", ratio_stack_css)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", ratio_stack_css)
+        self.assertIn("overflow: auto", ratio_stack_css)
+        ratio_card_css = css.split(".ratio-disk-card {", 1)[1].split("}", 1)[0]
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr)", ratio_card_css)
+        self.assertIn("min-height: 172px", ratio_card_css)
+        self.assertIn("border: 1px solid #d7e4e0", ratio_card_css)
+        self.assertIn(".ratio-disk", css)
+        ratio_disk_css = css.split(".ratio-disk {", 1)[1].split("}", 1)[0]
+        self.assertIn("width: clamp(96px, 7.4vw, 116px)", ratio_disk_css)
+        self.assertIn("conic-gradient", css)
 
     def test_planning_scheme_rail_only_shows_scheme_list_title(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")

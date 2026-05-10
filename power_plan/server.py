@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, unquote, urlparse
+from urllib.parse import parse_qs, urlencode, unquote, urlparse
 from urllib.request import urlopen
 
 import planning_store
@@ -144,9 +144,9 @@ class SimuRuntime:
 class OptimizationRuntime:
     """In-memory runtime state for the planning optimization page."""
 
-    def __init__(self) -> None:
+    def __init__(self, scheme: str = "") -> None:
         self.status = "待启动"
-        self.scheme = ""
+        self.scheme = str(scheme or "").strip()
         self.start_time = ""
         self.end_time = ""
         self.progress = 0
@@ -242,6 +242,9 @@ class OptimizationRuntime:
         storage_energy = round(720 + self.progress * 3.5, 1)
         hydrogen_production = round(148 + self.progress * 1.1, 1)
         fuel_cell_energy = round(420 + self.progress * 2.6, 1)
+        construction_cost = 2180.0
+        operation_cost = round(980 - self.progress * 1.4, 1)
+        renewable_energy = round(wind_energy + pv_energy + fuel_cell_energy, 1)
         return {
             "overview_tables": [
                 {
@@ -272,22 +275,28 @@ class OptimizationRuntime:
                         {"指标": "储能总电量", "数值": storage_energy, "单位": "MWh"},
                         {"指标": "制氢总量", "数值": hydrogen_production, "单位": "万Nm3"},
                         {"指标": "燃料电池发电量", "数值": fuel_cell_energy, "单位": "MWh"},
+                        {"指标": "总成本", "数值": round(3280 - self.progress * 3.2, 1), "单位": "万元"},
+                        {"指标": "绿电占比", "数值": green_ratio, "单位": "%"},
+                        {"指标": "频率风险点", "数值": max(0, 6 - self.progress // 18), "单位": "个"},
                     ],
                 },
+            ],
+            "overview_disks": [
                 {
-                    "title": "规划年效益",
-                    "rows": [
-                        {"指标": "总成本", "数值": round(3280 - self.progress * 3.2, 1), "单位": "万元"},
-                        {"指标": "度电成本", "数值": cost, "单位": "元/kWh"},
-                        {"指标": "建设成本", "数值": 2180.0, "单位": "万元"},
-                        {"指标": "柴油消耗量", "数值": round(diesel_energy * 0.238, 1), "单位": "吨"},
-                        {"指标": "运行成本", "数值": round(980 - self.progress * 1.4, 1), "单位": "万元"},
-                        {"指标": "绿电占比", "数值": green_ratio, "单位": "%"},
-                        {"指标": "弃电占比", "数值": curtailed_ratio, "单位": "%"},
-                        {"指标": "最高频率", "数值": round(50.0 + frequency_margin * 0.22, 3), "单位": "Hz"},
-                        {"指标": "最低频率", "数值": round(50.0 - frequency_margin * 0.18, 3), "单位": "Hz"},
-                        {"指标": "频率安全风险点", "数值": max(0, 6 - self.progress // 18), "单位": "个"},
-                    ],
+                    "title": "成本构成",
+                    "left_label": "运行成本",
+                    "left_value": operation_cost,
+                    "right_label": "建设成本",
+                    "right_value": construction_cost,
+                    "unit": "万元",
+                },
+                {
+                    "title": "电量构成",
+                    "left_label": "柴发电量",
+                    "left_value": diesel_energy,
+                    "right_label": "新能源电量",
+                    "right_value": renewable_energy,
+                    "unit": "MWh",
                 },
             ],
             "overview": [
@@ -343,6 +352,46 @@ class OptimizationStateError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class OptimizationRuntimeManager:
+    """Holds independent optimization runtimes for multiple schemes."""
+
+    def __init__(self) -> None:
+        self._runtimes: dict[str, OptimizationRuntime] = {}
+        self._lock = threading.Lock()
+
+    def snapshot(self, scheme: str = "") -> dict:
+        runtime = self._runtime_for_scheme(scheme)
+        payload = runtime.snapshot()
+        payload["running_schemes"] = self.running_schemes()
+        return payload
+
+    def apply(self, action: str, scheme: str = "") -> dict:
+        runtime = self._runtime_for_scheme(scheme)
+        payload = runtime.apply(action, scheme=self._scheme_name(scheme))
+        payload["running_schemes"] = self.running_schemes()
+        return payload
+
+    def running_schemes(self) -> list[str]:
+        with self._lock:
+            runtimes = list(self._runtimes.items())
+        running = []
+        for scheme, runtime in runtimes:
+            if runtime.snapshot()["status"] == "运行中":
+                running.append(scheme)
+        return running
+
+    def _runtime_for_scheme(self, scheme: str = "") -> OptimizationRuntime:
+        name = self._scheme_name(scheme)
+        with self._lock:
+            if name not in self._runtimes:
+                self._runtimes[name] = OptimizationRuntime(scheme=name)
+            return self._runtimes[name]
+
+    @staticmethod
+    def _scheme_name(scheme: str = "") -> str:
+        return str(scheme or "未选择方案").strip() or "未选择方案"
 
 
 class CsvDataSource:
@@ -762,7 +811,7 @@ def _load_initial_simu_runtime() -> SimuRuntime:
 
 
 SIMU_RUNTIME = _load_initial_simu_runtime()
-OPTIMIZATION_RUNTIME = OptimizationRuntime()
+OPTIMIZATION_RUNTIME = OptimizationRuntimeManager()
 DATA_SOURCE = MySqlDataSource()
 PLANNING_STORE = planning_store.PlanningStore()
 
@@ -1063,11 +1112,17 @@ def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") 
     return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
 
-def handle_api_path(path: str) -> tuple[int, dict[str, str], bytes]:
+def handle_api_path(path: str, query: str = "") -> tuple[int, dict[str, str], bytes]:
+    parsed_api_path = urlparse(path)
+    if parsed_api_path.query and not query:
+        query = parsed_api_path.query
+        path = parsed_api_path.path
+    query_params = parse_qs(query)
     if path.startswith("/api/planning/"):
         return handle_planning_api_path(path, "GET", b"")
     if path == "/api/optimization/status":
-        return _json_response(OPTIMIZATION_RUNTIME.snapshot())
+        scheme = query_params.get("scheme", [""])[0]
+        return _json_response(OPTIMIZATION_RUNTIME.snapshot(scheme=scheme))
     snapshot = build_snapshot()
     routes = {
         "/api/health": {"ok": True, "timestamp": snapshot["timestamp"]},
@@ -1126,7 +1181,7 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
-            status, headers, body = handle_api_path(parsed.path)
+            status, headers, body = handle_api_path(parsed.path, parsed.query)
             self._send(status, headers, body)
             return
 

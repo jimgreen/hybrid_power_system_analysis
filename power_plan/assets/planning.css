@@ -198,7 +198,7 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto 14px minmax(220px, var(--optimization-result-height, 1fr)) 14px minmax(120px, var(--optimization-log-height, 24vh));
+  grid-template-rows: var(--optimization-command-height, max-content) 14px minmax(220px, var(--optimization-result-height, 1fr)) 14px minmax(120px, var(--optimization-log-height, 24vh));
   gap: 16px;
   padding: 16px;
   overflow: hidden;
@@ -233,6 +233,18 @@ button:disabled {
   padding: 10px 14px;
   border-radius: 12px;
   font-weight: 800;
+  transition: background 0.16s ease, box-shadow 0.16s ease, color 0.16s ease, opacity 0.16s ease;
+}
+
+.optimization-actions button.is-active {
+  opacity: 1;
+  box-shadow: 0 10px 22px rgba(13, 92, 89, 0.18);
+}
+
+.optimization-actions button.is-disabled {
+  opacity: 0.42;
+  filter: grayscale(0.25);
+  box-shadow: none;
 }
 
 .optimization-current-scheme {
@@ -283,8 +295,10 @@ button:disabled {
 }
 
 .result-tabs {
+  flex: 0 0 auto;
   display: flex;
   gap: 8px;
+  min-height: 38px;
   margin-bottom: 12px;
   overflow-x: auto;
   white-space: nowrap;
@@ -292,7 +306,11 @@ button:disabled {
 
 .result-tab {
   flex: 0 0 auto;
-  padding: 9px 13px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 13px;
   border-radius: 999px;
   background: #e7f2ef;
   color: #0d5c59;
@@ -328,10 +346,11 @@ button:disabled {
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(260px, 1fr));
+  grid-template-columns: minmax(260px, 1fr) minmax(360px, 0.95fr) minmax(260px, 1fr);
   gap: 14px;
 }
 
+.overview-ratio-stack,
 .overview-table-card {
   min-width: 0;
   min-height: 0;
@@ -344,11 +363,106 @@ button:disabled {
   background: #f8fbfa;
 }
 
+.overview-ratio-stack {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  overflow: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
 .overview-table-card h2 {
   flex: 0 0 auto;
   margin: 0 0 10px;
   font-size: 17px;
 }
+
+.ratio-disk-card {
+  flex: 1 1 0;
+  min-height: 172px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  align-items: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 12px 10px;
+  border: 1px solid #d7e4e0;
+  border-radius: 16px;
+  background: #f8fbfa;
+}
+
+.ratio-disk-card + .ratio-disk-card {
+  padding-top: 12px;
+}
+
+.ratio-disk-info {
+  min-width: 0;
+  width: 100%;
+  text-align: center;
+}
+
+.ratio-disk-card h2 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.ratio-disk {
+  width: clamp(96px, 7.4vw, 116px);
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at center, #f8fbfa 0 54%, transparent 55%),
+    conic-gradient(#0d5c59 calc(var(--ratio-percent, 0) * 1%), #d8b35d 0);
+  box-shadow: inset 0 0 0 1px #d7e4e0;
+}
+
+.ratio-disk span {
+  color: #102b2a;
+  font-size: 21px;
+  font-weight: 900;
+}
+
+.ratio-legend {
+  width: 100%;
+  display: grid;
+  gap: 5px;
+  color: #405b58;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ratio-legend div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 5px;
+  min-width: 0;
+  text-align: left;
+}
+
+.ratio-legend strong {
+  grid-column: 2;
+  color: #102b2a;
+  font-size: 12px;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.primary-dot { background: #0d5c59; }
+.secondary-dot { background: #d8b35d; }
 
 .optimization-overview-table {
   flex: 1 1 auto;
@@ -1313,7 +1427,7 @@ td input[type="checkbox"] {
   }
   .optimization-panel {
     min-height: 76vh;
-    grid-template-rows: auto 14px minmax(420px, var(--optimization-result-height, 1fr)) 14px minmax(180px, var(--optimization-log-height, 24vh));
+    grid-template-rows: var(--optimization-command-height, max-content) 14px minmax(420px, var(--optimization-result-height, 1fr)) 14px minmax(180px, var(--optimization-log-height, 24vh));
     overflow: visible;
   }
   .optimization-status-grid,
