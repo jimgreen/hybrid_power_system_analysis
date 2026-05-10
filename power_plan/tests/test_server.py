@@ -262,6 +262,41 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertEqual(disks[1]["left_label"], "柴发电量")
         self.assertEqual(disks[1]["right_label"], "新能源电量")
 
+    def test_optimization_green_result_has_summary_table_and_daily_curve(self):
+        runtime = server.OptimizationRuntime()
+        payload = runtime.apply("start", scheme="方案A")
+
+        green_rows = payload["results"]["green_table"]
+        metric_names = {row["指标"] for row in green_rows}
+        for name in (
+            "负荷总电量(kWh)",
+            "柴发总电量(kWh)",
+            "风机总发电量(kWh)",
+            "光伏总发电量(kWh)",
+            "电储总发电量(kWh)",
+            "氢储总发电量(kWh)",
+            "新能源总弃电量(%)",
+            "柴油消耗(吨)",
+            "制氢总量(Nm3)",
+        ):
+            self.assertIn(name, metric_names)
+        self.assertTrue(all(set(row) == {"指标", "数值"} for row in green_rows))
+
+        daily = payload["results"]["curves"]["green_daily"]
+        self.assertEqual(len(daily), 365)
+        self.assertEqual(daily[0]["day"], 1)
+        self.assertEqual(daily[-1]["day"], 365)
+        for field in (
+            "diesel_energy",
+            "wind_energy",
+            "pv_energy",
+            "hydrogen_energy",
+            "load_energy",
+            "hydrogen_production_energy",
+        ):
+            self.assertIn(field, daily[0])
+            self.assertIsInstance(daily[0][field], (int, float))
+
     def test_snapshot_reads_values_from_csv_files(self):
         payload = server.build_snapshot(force_reload=True)
 
@@ -781,6 +816,43 @@ class PowerPlanServerTest(unittest.TestCase):
         ratio_disk_css = css.split(".ratio-disk {", 1)[1].split("}", 1)[0]
         self.assertIn("width: clamp(96px, 7.4vw, 116px)", ratio_disk_css)
         self.assertIn("conic-gradient", css)
+
+    def test_optimization_green_frontend_renders_daily_stacked_chart_and_table(self):
+        script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("renderGreenResult", script)
+        self.assertIn("green_table", script)
+        self.assertIn("green_daily", script)
+        self.assertIn("renderGreenDailyChart", script)
+        self.assertIn("green-daily-chart", script)
+        self.assertIn("green-zero-line", script)
+        self.assertIn("green-axis-label", script)
+        green_render_script = script.split("function renderGreenResult", 1)[1].split("function renderGreenDailyChart", 1)[0]
+        self.assertLess(green_render_script.index("green-result-table"), green_render_script.index("green-chart-card"))
+        for label in ("柴发日电量", "风电日电量", "光伏日电量", "氢能日电量", "负荷电量", "制氢电量"):
+            self.assertIn(label, script)
+        for metric in (
+            "负荷总电量(kWh)",
+            "柴发总电量(kWh)",
+            "风机总发电量(kWh)",
+            "光伏总发电量(kWh)",
+            "电储总发电量(kWh)",
+            "氢储总发电量(kWh)",
+            "新能源总弃电量(%)",
+            "柴油消耗(吨)",
+            "制氢总量(Nm3)",
+        ):
+            self.assertIn(metric, script)
+
+        self.assertIn(".green-result-layout", css)
+        green_layout_css = css.split(".green-result-layout {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: grid", green_layout_css)
+        self.assertIn("grid-template-columns: minmax(320px, 34%) minmax(0, 1fr)", green_layout_css)
+        self.assertIn(".green-daily-chart", css)
+        self.assertIn(".green-chart-svg", css)
+        self.assertIn(".green-chart-legend", css)
+        self.assertIn(".green-result-table", css)
 
     def test_planning_scheme_rail_only_shows_scheme_list_title(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")

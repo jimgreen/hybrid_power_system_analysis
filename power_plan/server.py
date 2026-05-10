@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import mimetypes
 import os
 import threading
@@ -245,6 +246,22 @@ class OptimizationRuntime:
         construction_cost = 2180.0
         operation_cost = round(980 - self.progress * 1.4, 1)
         renewable_energy = round(wind_energy + pv_energy + fuel_cell_energy, 1)
+        load_energy_kwh = 6840.0 * 1000
+        diesel_energy_kwh = diesel_energy * 1000
+        wind_energy_kwh = wind_energy * 1000
+        pv_energy_kwh = pv_energy * 1000
+        storage_energy_kwh = storage_energy * 1000
+        fuel_cell_energy_kwh = fuel_cell_energy * 1000
+        hydrogen_production_nm3 = hydrogen_production * 10000
+        hydrogen_production_energy_kwh = hydrogen_production_nm3 / 0.2
+        green_daily = self._green_daily_curve_unlocked(
+            load_energy_kwh,
+            diesel_energy_kwh,
+            wind_energy_kwh,
+            pv_energy_kwh,
+            fuel_cell_energy_kwh,
+            hydrogen_production_energy_kwh,
+        )
         return {
             "overview_tables": [
                 {
@@ -309,6 +326,17 @@ class OptimizationRuntime:
                 {"指标": "光伏消纳率", "数值": round(min(98.5, 84.0 + self.progress * 0.07), 1), "单位": "%", "说明": "光伏出力消纳水平"},
                 {"指标": "弃电率", "数值": round(max(1.0, 9.0 - self.progress * 0.04), 1), "单位": "%", "说明": "新能源未利用电量占比"},
             ],
+            "green_table": [
+                {"指标": "负荷总电量(kWh)", "数值": round(load_energy_kwh, 1)},
+                {"指标": "柴发总电量(kWh)", "数值": round(diesel_energy_kwh, 1)},
+                {"指标": "风机总发电量(kWh)", "数值": round(wind_energy_kwh, 1)},
+                {"指标": "光伏总发电量(kWh)", "数值": round(pv_energy_kwh, 1)},
+                {"指标": "电储总发电量(kWh)", "数值": round(storage_energy_kwh, 1)},
+                {"指标": "氢储总发电量(kWh)", "数值": round(fuel_cell_energy_kwh, 1)},
+                {"指标": "新能源总弃电量(%)", "数值": curtailed_ratio},
+                {"指标": "柴油消耗(吨)", "数值": round(diesel_energy * 0.24, 1)},
+                {"指标": "制氢总量(Nm3)", "数值": round(hydrogen_production_nm3, 1)},
+            ],
             "safety": [
                 {"指标": "备用裕度", "数值": reserve_margin, "单位": "%", "说明": "负荷扰动后的可用备用"},
                 {"指标": "频率安全裕度", "数值": frequency_margin, "单位": "p.u.", "说明": "频率约束裕度"},
@@ -328,6 +356,7 @@ class OptimizationRuntime:
                     {"label": "氢储", "value": round(min(90.0, 66.0 + self.progress * 0.09), 1)},
                     {"label": "总体", "value": green_ratio},
                 ],
+                "green_daily": green_daily,
                 "safety": [
                     {"label": "备用", "value": reserve_margin},
                     {"label": "频率", "value": round(frequency_margin * 10, 2)},
@@ -335,6 +364,55 @@ class OptimizationRuntime:
                 ],
             },
         }
+
+    def _green_daily_curve_unlocked(
+        self,
+        load_total: float,
+        diesel_total: float,
+        wind_total: float,
+        pv_total: float,
+        hydrogen_total: float,
+        hydrogen_production_total: float,
+    ) -> list[dict[str, float | int]]:
+        days = list(range(1, 366))
+
+        def seasonal(day: int, phase_shift: float, amplitude: float, second: float = 0.0) -> float:
+            phase = 2 * math.pi * (day - 1) / 365
+            return max(0.05, 1 + amplitude * math.sin(phase + phase_shift) + second * math.sin(phase * 2 + phase_shift / 2))
+
+        raw = {
+            "load_energy": [seasonal(day, -0.25, 0.12, 0.05) for day in days],
+            "diesel_energy": [seasonal(day, 0.8, 0.18, 0.03) for day in days],
+            "wind_energy": [seasonal(day, 1.25, 0.22, 0.05) for day in days],
+            "pv_energy": [seasonal(day, -1.15, 0.34, 0.04) for day in days],
+            "hydrogen_energy": [seasonal(day, 0.35, 0.16, 0.03) for day in days],
+            "hydrogen_production_energy": [seasonal(day, -0.75, 0.2, 0.04) for day in days],
+        }
+        totals = {
+            "load_energy": load_total,
+            "diesel_energy": diesel_total,
+            "wind_energy": wind_total,
+            "pv_energy": pv_total,
+            "hydrogen_energy": hydrogen_total,
+            "hydrogen_production_energy": hydrogen_production_total,
+        }
+        scaled: dict[str, list[float]] = {}
+        for key, values in raw.items():
+            raw_total = sum(values) or 1
+            scaled[key] = [round(totals[key] * value / raw_total, 1) for value in values]
+
+        return [
+            {
+                "day": day,
+                "diesel_energy": scaled["diesel_energy"][index],
+                "wind_energy": scaled["wind_energy"][index],
+                "pv_energy": scaled["pv_energy"][index],
+                "hydrogen_energy": scaled["hydrogen_energy"][index],
+                "load_energy": scaled["load_energy"][index],
+                "hydrogen_production_energy": scaled["hydrogen_production_energy"][index],
+            }
+            for index, day in enumerate(days)
+        ]
 
     def _append_log_unlocked(self, level: str, message: str) -> None:
         self._logs.append({"time": _now_text(), "level": level, "message": message})

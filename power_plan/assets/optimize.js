@@ -21,6 +21,15 @@ const resultTabLabels = {
   safety: "安全结果",
 };
 
+const greenDailySeries = [
+  { key: "diesel_energy", label: "柴发日电量", direction: "up", color: "#7a6650" },
+  { key: "wind_energy", label: "风电日电量", direction: "up", color: "#2a9d8f" },
+  { key: "pv_energy", label: "光伏日电量", direction: "up", color: "#d8a31a" },
+  { key: "hydrogen_energy", label: "氢能日电量", direction: "up", color: "#4d7fd1" },
+  { key: "load_energy", label: "负荷电量", direction: "down", color: "#c7504a" },
+  { key: "hydrogen_production_energy", label: "制氢电量", direction: "down", color: "#6b5fb5" },
+];
+
 document.addEventListener("DOMContentLoaded", () => {
   bindResultTabs();
   bindOptimizationActions();
@@ -156,7 +165,7 @@ function renderOptimization(data) {
   updateOptimizationActions(data);
   renderMetrics(data.metrics || []);
   renderOverviewTables(data.results?.overview_tables || defaultOverviewTables(), data.results?.overview_disks || defaultOverviewDisks());
-  renderResultPanel("green", resultTabLabels.green, data.results?.green || [], data.results?.curves?.green || []);
+  renderGreenResult(data.results?.green_table || defaultGreenTable(), data.results?.curves?.green_daily || []);
   renderResultPanel("safety", resultTabLabels.safety, data.results?.safety || [], data.results?.curves?.safety || []);
   renderOptimizationLogs(data.logs || []);
   window.requestAnimationFrame(lockOptimizationCommandHeight);
@@ -198,8 +207,9 @@ function defaultOptimizationState(scheme = "") {
       overview_tables: defaultOverviewTables(),
       overview_disks: defaultOverviewDisks(),
       green: [],
+      green_table: defaultGreenTable(),
       safety: [],
-      curves: { green: [], safety: [] },
+      curves: { green: [], green_daily: [], safety: [] },
     },
     logs: [{ time: "", level: "", message: "正在加载当前方案优化状态" }],
     running_schemes: [],
@@ -237,6 +247,20 @@ function defaultOverviewDisks() {
   return [
     { title: "成本构成", left_label: "运行成本", left_value: 0, right_label: "建设成本", right_value: 0, unit: "万元" },
     { title: "电量构成", left_label: "柴发电量", left_value: 0, right_label: "新能源电量", right_value: 0, unit: "MWh" },
+  ];
+}
+
+function defaultGreenTable() {
+  return [
+    { "指标": "负荷总电量(kWh)", "数值": "-" },
+    { "指标": "柴发总电量(kWh)", "数值": "-" },
+    { "指标": "风机总发电量(kWh)", "数值": "-" },
+    { "指标": "光伏总发电量(kWh)", "数值": "-" },
+    { "指标": "电储总发电量(kWh)", "数值": "-" },
+    { "指标": "氢储总发电量(kWh)", "数值": "-" },
+    { "指标": "新能源总弃电量(%)", "数值": "-" },
+    { "指标": "柴油消耗(吨)", "数值": "-" },
+    { "指标": "制氢总量(Nm3)", "数值": "-" },
   ];
 }
 
@@ -294,12 +318,118 @@ function renderResultPanel(key, title, rows, points) {
     </div>`;
 }
 
+function renderGreenResult(rows, dailyPoints) {
+  const panel = document.getElementById("greenResult");
+  if (!panel) return;
+  const safeRows = rows.length ? rows : defaultGreenTable();
+  const formattedRows = safeRows.map((row) => ({
+    "指标": row["指标"],
+    "数值": typeof row["数值"] === "number" ? formatNumber(row["数值"]) : row["数值"],
+  }));
+  panel.innerHTML = `
+    <div class="green-result-layout">
+      <div class="data-table green-result-table">${renderResultTable(formattedRows)}</div>
+      <section class="green-chart-card green-daily-chart" aria-label="${escapeHtml(resultTabLabels.green)}日曲线">
+        ${renderGreenDailyChart(dailyPoints)}
+      </section>
+    </div>`;
+}
+
+function renderGreenDailyChart(points) {
+  if (!points.length) return '<div class="empty-summary">暂无日曲线</div>';
+  const width = 1000;
+  const height = 330;
+  const margin = { top: 18, right: 22, bottom: 38, left: 72 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const upSeries = greenDailySeries.filter((series) => series.direction === "up");
+  const downSeries = greenDailySeries.filter((series) => series.direction === "down");
+  const upMax = Math.max(
+    ...points.map((point) => upSeries.reduce((total, series) => total + numericValue(point[series.key]), 0)),
+    1,
+  );
+  const downMax = Math.max(
+    ...points.map((point) => downSeries.reduce((total, series) => total + numericValue(point[series.key]), 0)),
+    1,
+  );
+  const zeroY = margin.top + plotHeight * (upMax / (upMax + downMax));
+  const topSpan = Math.max(1, zeroY - margin.top);
+  const bottomSpan = Math.max(1, margin.top + plotHeight - zeroY);
+  const xAt = (index) => margin.left + (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
+  const yUp = (value) => zeroY - (value / upMax) * topSpan;
+  const yDown = (value) => zeroY + (value / downMax) * bottomSpan;
+  const positiveTicks = [0.5, 1].map((ratio) => ({
+    y: yUp(upMax * ratio),
+    label: formatAxisNumber(upMax * ratio),
+  }));
+  const negativeTicks = [0.5, 1].map((ratio) => ({
+    y: yDown(downMax * ratio),
+    label: `-${formatAxisNumber(downMax * ratio)}`,
+  }));
+  return `
+    <div class="green-chart-legend">${greenDailySeries
+      .map((series) => `<span><i style="background:${series.color}"></i>${escapeHtml(series.label)}</span>`)
+      .join("")}</div>
+    <svg class="green-chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="绿电日曲线">
+      <line class="green-axis-line" x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${height - margin.bottom}"></line>
+      <line class="green-zero-line" x1="${margin.left}" y1="${zeroY.toFixed(2)}" x2="${width - margin.right}" y2="${zeroY.toFixed(2)}"></line>
+      ${positiveTicks.concat(negativeTicks).map((tick) => renderGreenTick(tick, margin.left, width - margin.right)).join("")}
+      ${renderGreenStackedAreas(points, upSeries, xAt, yUp)}
+      ${renderGreenStackedAreas(points, downSeries, xAt, yDown)}
+      ${renderGreenXAxis(points, xAt, zeroY, height - margin.bottom)}
+      <text class="green-axis-label" x="14" y="${margin.top + 14}">kWh</text>
+      <text class="green-axis-label" x="${width - 76}" y="${height - 8}">日序号</text>
+    </svg>`;
+}
+
+function renderGreenStackedAreas(points, seriesList, xAt, yAt) {
+  const base = points.map(() => 0);
+  return seriesList
+    .map((series) => {
+      const top = points.map((point, index) => base[index] + numericValue(point[series.key]));
+      const upperLine = top.map((value, index) => `${xAt(index).toFixed(2)},${yAt(value).toFixed(2)}`).join(" ");
+      const lowerLine = base
+        .map((value, index) => `${xAt(index).toFixed(2)},${yAt(value).toFixed(2)}`)
+        .reverse()
+        .join(" ");
+      top.forEach((value, index) => {
+        base[index] = value;
+      });
+      return `<polygon class="green-stack-area" points="${upperLine} ${lowerLine}" fill="${series.color}"><title>${escapeHtml(series.label)}</title></polygon>`;
+    })
+    .join("");
+}
+
+function renderGreenTick(tick, left, right) {
+  return `
+    <line class="green-grid-line" x1="${left}" y1="${tick.y.toFixed(2)}" x2="${right}" y2="${tick.y.toFixed(2)}"></line>
+    <text class="green-tick-label" x="${left - 8}" y="${tick.y.toFixed(2)}">${escapeHtml(tick.label)}</text>`;
+}
+
+function renderGreenXAxis(points, xAt, zeroY, bottomY) {
+  const tickIndexes = [0, 90, 181, 272, points.length - 1].filter((index, position, values) => index >= 0 && index < points.length && values.indexOf(index) === position);
+  return tickIndexes
+    .map((index) => {
+      const x = xAt(index);
+      const day = points[index]?.day ?? index + 1;
+      return `
+        <line class="green-x-tick" x1="${x.toFixed(2)}" y1="${zeroY.toFixed(2)}" x2="${x.toFixed(2)}" y2="${bottomY}"></line>
+        <text class="green-x-label" x="${x.toFixed(2)}" y="${bottomY + 24}">${escapeHtml(`第${day}日`)}</text>`;
+    })
+    .join("");
+}
+
 function renderResultTable(rows) {
   if (!rows.length) return '<div class="empty-summary">暂无结果</div>';
   const headers = Object.keys(rows[0]);
   return `<table><thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr></thead><tbody>${rows
     .map((row) => `<tr>${headers.map((header) => `<td>${escapeHtml(row[header])}</td>`).join("")}</tr>`)
     .join("")}</tbody></table>`;
+}
+
+function numericValue(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
 }
 
 function renderMiniBars(points) {
@@ -318,6 +448,12 @@ function formatNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
   return number.toLocaleString("zh-CN", { maximumFractionDigits: 1 });
+}
+
+function formatAxisNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return Math.round(number).toLocaleString("zh-CN");
 }
 
 function renderOptimizationLogs(logs) {

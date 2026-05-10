@@ -537,6 +537,114 @@ button:disabled {
   background: #0d5c59;
 }
 
+.green-result-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(320px, 34%) minmax(0, 1fr);
+  gap: 12px;
+  overflow: hidden;
+}
+
+.green-chart-card {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #d7e4e0;
+  border-radius: 16px;
+  background: #f8fbfa;
+}
+
+.green-daily-chart {
+  overflow: hidden;
+}
+
+.green-chart-legend {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+  color: #405b58;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.green-chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.green-chart-legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.green-chart-svg {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 220px;
+  display: block;
+  overflow: visible;
+}
+
+.green-stack-area {
+  opacity: 0.74;
+}
+
+.green-axis-line,
+.green-zero-line {
+  stroke: #224048;
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+}
+
+.green-grid-line,
+.green-x-tick {
+  stroke: #c8d8d3;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.green-x-tick {
+  stroke-dasharray: 4 7;
+}
+
+.green-tick-label,
+.green-x-label,
+.green-axis-label {
+  fill: #5a716e;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.green-tick-label {
+  text-anchor: end;
+  dominant-baseline: central;
+}
+
+.green-x-label,
+.green-axis-label {
+  text-anchor: middle;
+}
+
+.green-result-table {
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  background: #fff;
+}
+
+.green-result-table table {
+  min-width: 520px;
+}
+
 .optimization-result-resize-handle,
 .optimization-log-resize-handle {
   display: flex;
@@ -1432,7 +1540,8 @@ td input[type="checkbox"] {
   }
   .optimization-status-grid,
   .optimization-overview-grid,
-  .optimization-result-layout {
+  .optimization-result-layout,
+  .green-result-layout {
     grid-template-columns: 1fr;
   }
   .optimization-command-row {
