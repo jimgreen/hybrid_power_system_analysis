@@ -20,7 +20,14 @@ from ac_lf import matpower_branch_stamp
 from efile_read import _read_efile_rows
 from hybrid_lf import HybridPowerNetwork
 from model import topology as network_topology
-from model.hybrid_array_model import build_hybrid_ppc_from_efile_rows
+from model.hybrid_array_model import (
+    ACAC_COLS,
+    ACAC_CONTROL_LABEL,
+    DCAC_COLS,
+    DCAC_CONTROL_LABEL,
+    build_hybrid_ppc_from_efile_rows,
+    build_hybrid_ppc_only_from_efile_rows,
+)
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -38,8 +45,12 @@ from model.meas_model import (
     print_iteration as _print_iteration,
     print_iteration_header as _print_iteration_header,
 )
-from secore.ac_se import ACStateEstimator, _read_measurements_direct as _read_table_measurements_direct
-from secore.dc_se import DCStateEstimator
+from secore.ac_se import (
+    ACStateEstimator,
+    _build_ac_se_network_from_ppc_dict,
+    _read_measurements_direct as _read_table_measurements_direct,
+)
+from secore.dc_se import DCStateEstimator, _build_dc_se_network_from_ppc_dict
 from secore.se_array_plan import (
     MeasurementPartitions,
     append_active_measurement_view,
@@ -78,7 +89,7 @@ DEFAULT_MEAS = measurement_file("hybrid", "qinling.meas")
 
 def _read_measurements_direct(meas_file: Path):
     """Read Measurement rows through the shared table-backed SE parser."""
-    return _read_table_measurements_direct(meas_file, Measurement)
+    return _read_table_measurements_direct(meas_file, Measurement, table_only=True)
 
 
 def _measurement_table_from_measurements(measurements: Sequence[Measurement]):
@@ -87,6 +98,161 @@ def _measurement_table_from_measurements(measurements: Sequence[Measurement]):
         device_type_codes=DEVICE_TYPE_CODES,
         angle_measurement_types=ANGLE_MEASUREMENT_TYPES,
     )
+
+
+class _SELightweightHybridNetwork(SimpleNamespace):
+    @property
+    def total_nodes(self) -> int:
+        return len(getattr(self.ac, "nodes", ())) + len(getattr(self.dc, "nodes", ()))
+
+    def prepare(self, verbose: bool = True):
+        return [], [], [], []
+
+    def check_topology(self):
+        return [], [], [], []
+
+
+def _array_device(idx, name=None, **values):
+    return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
+
+
+def _name_at(names, pos: int, prefix: str, idx: int) -> str:
+    if names is None or pos >= len(names):
+        return f"{prefix}_{idx}"
+    return str(names[pos])
+
+
+def _build_se_dcac_converters(ppc: Dict) -> List[SimpleNamespace]:
+    rows = np.asarray(ppc.get("dcac", np.zeros((0, len(DCAC_COLS)), dtype=np.float64)))
+    names = ppc.get("dcac_name")
+    converters = []
+    for pos, row in enumerate(rows):
+        idx = int(row[DCAC_COLS["idx"]])
+        converters.append(
+            _array_device(
+                idx,
+                _name_at(names, pos, "dcac", idx),
+                ac_node=int(row[DCAC_COLS["ac_node"]]),
+                dc_node=int(row[DCAC_COLS["dc_node"]]),
+                r1=float(row[DCAC_COLS["r1"]]),
+                r2=float(row[DCAC_COLS["r2"]]),
+                control_type=DCAC_CONTROL_LABEL.get(int(row[DCAC_COLS["control_type"]]), "DCV"),
+                p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
+                q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
+                v_ac_set=float(row[DCAC_COLS["v_ac_set"]]),
+                v_dc_set=float(row[DCAC_COLS["v_dc_set"]]),
+                run_stat=int(row[DCAC_COLS["run_stat"]]),
+                dc_p=float(row[DCAC_COLS["dc_p"]]),
+                ac_p=float(row[DCAC_COLS["ac_p"]]),
+                ac_q=float(row[DCAC_COLS["ac_q"]]),
+                dc_i=float(row[DCAC_COLS["dc_i"]]),
+                ac_i=float(row[DCAC_COLS["ac_i"]]),
+                ac_node_obj=None,
+                dc_node_obj=None,
+                ac_isl_obj=None,
+                dc_isl_obj=None,
+                hybrid_isl=0,
+                hybrid_isl_obj=None,
+                is_alive=False,
+            )
+        )
+    return converters
+
+
+def _build_se_acac_converters(ppc: Dict) -> List[SimpleNamespace]:
+    rows = np.asarray(ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)))
+    names = ppc.get("acac_name")
+    converters = []
+    for pos, row in enumerate(rows):
+        idx = int(row[ACAC_COLS["idx"]])
+        converters.append(
+            _array_device(
+                idx,
+                _name_at(names, pos, "acac", idx),
+                i_node=int(row[ACAC_COLS["i_node"]]),
+                j_node=int(row[ACAC_COLS["j_node"]]),
+                r1=float(row[ACAC_COLS["r1"]]),
+                r2=float(row[ACAC_COLS["r2"]]),
+                control_type=ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
+                p_set=float(row[ACAC_COLS["p_set"]]),
+                i_q_set=float(row[ACAC_COLS["i_q_set"]]),
+                j_q_set=float(row[ACAC_COLS["j_q_set"]]),
+                i_v_set=float(row[ACAC_COLS["i_v_set"]]),
+                j_v_set=float(row[ACAC_COLS["j_v_set"]]),
+                run_stat=int(row[ACAC_COLS["run_stat"]]),
+                i_p=float(row[ACAC_COLS["i_p"]]),
+                i_q=float(row[ACAC_COLS["i_q"]]),
+                j_p=float(row[ACAC_COLS["j_p"]]),
+                j_q=float(row[ACAC_COLS["j_q"]]),
+                i_i=float(row[ACAC_COLS["i_i"]]),
+                j_i=float(row[ACAC_COLS["j_i"]]),
+                i_node_obj=None,
+                j_node_obj=None,
+                i_isl_obj=None,
+                j_isl_obj=None,
+                hybrid_isl=0,
+                hybrid_isl_obj=None,
+                is_alive=False,
+            )
+        )
+    return converters
+
+
+def _assign_se_converter_topology(network: _SELightweightHybridNetwork) -> None:
+    ac_nodes = getattr(network.ac, "node_dict", {})
+    dc_nodes = getattr(network.dc, "node_dict", {})
+    for conv in network.dcac_converters:
+        ac_node = ac_nodes.get(int(conv.ac_node))
+        dc_node = dc_nodes.get(int(conv.dc_node))
+        conv.ac_node_obj = ac_node
+        conv.dc_node_obj = dc_node
+        conv.ac_isl_obj = None if ac_node is None else getattr(ac_node, "isl_obj", None)
+        conv.dc_isl_obj = None if dc_node is None else getattr(dc_node, "isl_obj", None)
+        conv.is_alive = bool(
+            int(getattr(conv, "run_stat", 1)) == 1
+            and ac_node is not None
+            and dc_node is not None
+            and getattr(ac_node, "is_alive", False)
+            and getattr(dc_node, "is_alive", False)
+        )
+    for conv in network.acac_converters:
+        i_node = ac_nodes.get(int(conv.i_node))
+        j_node = ac_nodes.get(int(conv.j_node))
+        conv.i_node_obj = i_node
+        conv.j_node_obj = j_node
+        conv.i_isl_obj = None if i_node is None else getattr(i_node, "isl_obj", None)
+        conv.j_isl_obj = None if j_node is None else getattr(j_node, "isl_obj", None)
+        conv.is_alive = bool(
+            int(getattr(conv, "run_stat", 1)) == 1
+            and i_node is not None
+            and j_node is not None
+            and getattr(i_node, "is_alive", False)
+            and getattr(j_node, "is_alive", False)
+        )
+
+
+def _build_hybrid_se_network_from_ppc(ppc: Dict) -> _SELightweightHybridNetwork:
+    ac_network = _build_ac_se_network_from_ppc_dict(ppc["ac"], Path(ppc.get("source", "")) if ppc.get("source") else None)
+    dc_network = _build_dc_se_network_from_ppc_dict(ppc["dc"])
+    network = _SELightweightHybridNetwork(
+        _se_lightweight=True,
+        ac=ac_network,
+        dc=dc_network,
+        dcac_converters=_build_se_dcac_converters(ppc),
+        acac_converters=_build_se_acac_converters(ppc),
+        hybrid_islands=[],
+        ppc=ppc,
+        _ac_ppc=ppc["ac"],
+        _dc_ppc=ppc["dc"],
+    )
+    base = ppc["base"]
+    network.p_base = float(base[0])
+    network.u_scale = float(base[1])
+    network.p_scale = float(base[2])
+    network.i_scale = float(base[3])
+    network.p_base_kW = float(base[4])
+    _assign_se_converter_topology(network)
+    return network
 
 
 class HybridStateEstimator:
@@ -361,34 +527,8 @@ class HybridStateEstimator:
     @staticmethod
     def _load_network(e_file: Path) -> HybridPowerNetwork:
         efile_rows = _read_efile_rows(e_file)
-        network, ppc = build_hybrid_ppc_from_efile_rows(e_file, efile_rows)
-        if isinstance(ppc.get("ac"), dict) and "bus" in ppc["ac"]:
-            ac_topology = ppc["ac"].get("_topology_arrays")
-            if ac_topology is None:
-                ac_topology = network_topology.prepare_ac_topology_ppc(ppc["ac"])
-                ppc["ac"]["_topology_arrays"] = ac_topology
-            network.ac._topology_arrays = ac_topology
-            network_topology.apply_ac_topology_arrays(network.ac, ac_topology, compact=True, build_alive_maps=False)
-        if isinstance(ppc.get("dc"), dict) and "bus" in ppc["dc"]:
-            dc_topology = ppc["dc"].get("_topology_arrays")
-            if dc_topology is None:
-                dc_topology = network_topology.prepare_dc_topology_ppc(ppc["dc"])
-                ppc["dc"]["_topology_arrays"] = dc_topology
-            network.dc._topology_arrays = dc_topology
-            network_topology.apply_dc_topology_arrays(network.dc, dc_topology, compact=True, build_alive_maps=False)
-        network.ppc = ppc
-        network._ac_ppc = ppc["ac"]
-        network._dc_ppc = ppc["dc"]
-        network.ac.ppc = ppc["ac"]
-        network.dc.ppc = ppc["dc"]
-        base = ppc["base"]
-        network.p_base = float(base[0])
-        network.u_scale = float(base[1])
-        network.p_scale = float(base[2])
-        network.i_scale = float(base[3])
-        network.p_base_kW = float(base[4])
-        network._build_hybrid_topo()
-        return network
+        ppc = build_hybrid_ppc_only_from_efile_rows(e_file, efile_rows)
+        return _build_hybrid_se_network_from_ppc(ppc)
 
     def _initial_measurement_sources_by_side(self) -> Dict[str, List[Measurement]]:
         sources_by_side = getattr(self, "_sub_measurement_sources_by_side", None)
@@ -883,6 +1023,21 @@ class HybridStateEstimator:
             setattr(estimator, name, value)
 
     @staticmethod
+    def _iter_measurements_from(measurements: Sequence[Measurement], start: int):
+        table = getattr(measurements, "table", None)
+        if table is not None and hasattr(measurements, "_incorporated_tail_size"):
+            table_size = int(table.idx.size)
+            if int(start) >= table_size:
+                incorporated = measurements._incorporated_tail_size()
+                raw_start = incorporated + int(start) - table_size
+                raw_stop = list.__len__(measurements)
+                for pos in range(raw_start, raw_stop):
+                    yield list.__getitem__(measurements, pos)
+                return
+        for meas in measurements[int(start):]:
+            yield meas
+
+    @staticmethod
     def _max_measurement_idx_fast(measurements: Sequence[Measurement]) -> int:
         table = getattr(measurements, "table", None)
         count = len(measurements)
@@ -892,7 +1047,7 @@ class HybridStateEstimator:
             if table_size == count:
                 return max_idx
             if table_size < count:
-                for meas in measurements[table_size:]:
+                for meas in HybridStateEstimator._iter_measurements_from(measurements, table_size):
                     if meas.idx > max_idx:
                         max_idx = int(meas.idx)
                 return max_idx
@@ -1351,8 +1506,17 @@ class HybridStateEstimator:
             out=table.value[active].copy(),
             where=np.abs(scale[active]) > 1e-12,
         )
-        for pos, meas in enumerate(measurements):
-            meas.value = float(table.value[pos])
+        object_count = list.__len__(measurements) if isinstance(measurements, list) else 0
+        if object_count == table.value.size and object_count > 0:
+            for pos, meas in enumerate(list.__iter__(measurements)):
+                meas.value = float(table.value[pos])
+        else:
+            source = getattr(measurements, "source", None)
+            source_rows = getattr(measurements, "rows", None)
+            source_count = list.__len__(source) if isinstance(source, list) else 0
+            if source_count > 0 and source_rows is not None:
+                for pos, source_row in enumerate(source_rows):
+                    source[int(source_row)].value = float(table.value[pos])
 
     def _sync_measurement_table_from_partition_tables(
         self,
@@ -1506,15 +1670,40 @@ class HybridStateEstimator:
         if not coupled:
             return
         table = getattr(self.measurements, "table", None)
-        table_valid = table.valid if table is not None and len(table.valid) == len(self.measurements) else None
-        table_status = measurement_table_status_code(table) if table_valid is not None else None
-        for pos, meas in enumerate(self.measurements):
+        if table is not None:
+            table_size = int(table.idx.size)
+            if table_size:
+                rows_by_code = getattr(table, "rows_by_device_type_code", None) or {}
+                balance_code = DEVICE_TYPE_CODES.get("ACPowerBalance")
+                balance_rows = rows_by_code.get(balance_code) if balance_code is not None else None
+                if balance_rows is None:
+                    balance_rows = np.flatnonzero(np.asarray(table.device_type, dtype=object) == "ACPowerBalance")
+                else:
+                    balance_rows = np.asarray(balance_rows, dtype=np.int64)
+                if balance_rows.size:
+                    names = table.device_name
+                    matched = np.fromiter(
+                        (str(names[int(row)]) in coupled for row in balance_rows),
+                        dtype=bool,
+                        count=int(balance_rows.size),
+                    )
+                    if np.any(matched):
+                        disable_rows = balance_rows[matched]
+                        table.valid[disable_rows] = False
+                        measurement_table_status_code(table)[disable_rows] = MEAS_STATUS_INVALID
+            incorporated = (
+                self.measurements._incorporated_tail_size()
+                if hasattr(self.measurements, "_incorporated_tail_size")
+                else 0
+            )
+            for pos in range(incorporated, list.__len__(self.measurements)):
+                meas = list.__getitem__(self.measurements, pos)
+                if meas.device_type == "ACPowerBalance" and meas.device_name in coupled:
+                    mark_measurement_invalid(meas)
+            return
+        for meas in self.measurements:
             if meas.device_type == "ACPowerBalance" and meas.device_name in coupled:
                 mark_measurement_invalid(meas)
-                if table_valid is not None:
-                    table_valid[pos] = False
-                if table_status is not None:
-                    table_status[pos] = MEAS_STATUS_INVALID
 
     def _populate_side_device_pseudo_values(self) -> None:
         ac = self._ac_sub_estimator
@@ -1560,7 +1749,9 @@ class HybridStateEstimator:
         source_count = int(getattr(self, "_sub_measurement_source_count", len(self.measurements)))
         if source_count < len(self.measurements):
             measured_devices.update(
-                self._active_hybrid_converter_measurement_devices_from(self.measurements[source_count:])
+                self._active_hybrid_converter_measurement_devices_from(
+                    self._iter_measurements_from(self.measurements, source_count)
+                )
             )
         return measured_devices
 

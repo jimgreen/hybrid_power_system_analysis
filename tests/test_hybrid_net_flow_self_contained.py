@@ -310,27 +310,30 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertGreater(ppc["dcac"].shape[0], 0)
         self.assertGreater(ppc["acac"].shape[0], 0)
 
-    def test_lf_loader_builds_real_ac_network_from_ppc(self):
+    def test_lf_loader_uses_lightweight_hybrid_network_from_ppc(self):
         import lfcore.hybrid_lf as hybrid_lf
-        from ac_model import ACPowerNetwork
 
         network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
 
         self.assertFalse(hasattr(hybrid_lf, "_build_lf_ac_facade"))
         self.assertTrue(hasattr(hybrid_lf, "_build_lf_ac_network"))
-        self.assertIsInstance(network.ac, ACPowerNetwork)
-        self.assertFalse(getattr(network.ac, "_lf_lightweight", False))
+        self.assertTrue(getattr(network.ac, "_lf_lightweight", False))
+        self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
+        self.assertNotIn("ac_network", network.ppc)
+        self.assertNotIn("dc_network", network.ppc)
         self.assertEqual(10, len(network.ac.nodes))
-        self.assertTrue(network.ac.breakers)
+        self.assertGreater(len(network.dc.nodes), 0)
+        self.assertGreater(len(network.dcac_converters), 0)
+        self.assertGreater(len(network.acac_converters), 0)
 
-    def test_lf_loader_reuses_hybrid_model_built_with_ppc(self):
+    def test_lf_loader_does_not_rebuild_full_ac_dc_networks(self):
         import lfcore.hybrid_lf as hybrid_lf
 
         original_ac_builder = hybrid_lf._build_lf_ac_network
         original_dc_builder = hybrid_lf._build_lf_dc_network
 
         def reject_rebuild(*_args, **_kwargs):
-            raise AssertionError("LF loader should reuse the HybridPowerNetwork returned with the ppc")
+            raise AssertionError("LF loader should stay on the PPC-only lightweight path")
 
         hybrid_lf._build_lf_ac_network = reject_rebuild
         hybrid_lf._build_lf_dc_network = reject_rebuild
@@ -340,8 +343,8 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             hybrid_lf._build_lf_ac_network = original_ac_builder
             hybrid_lf._build_lf_dc_network = original_dc_builder
 
-        self.assertIs(network.ac, network.ppc["ac_network"])
-        self.assertIs(network.dc, network.ppc["dc_network"])
+        self.assertTrue(getattr(network.ac, "_lf_lightweight", False))
+        self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
         self.assertIs(network._ac_ppc, network.ppc["ac"])
         self.assertIs(network._dc_ppc, network.ppc["dc"])
 
@@ -549,20 +552,12 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         import lfcore.hybrid_lf as hybrid_lf
 
         network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
-        dc_network_class = network.dc.__class__
-        original_topo = dc_network_class.topo
-
-        def reject_topo(*_args, **_kwargs):
-            raise AssertionError("Hybrid LF DC path should prepare directly from dc_ppc_v1")
-
-        dc_network_class.topo = reject_topo
-        try:
-            calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
-            calc.skip_lf_result = True
-            with contextlib.redirect_stdout(io.StringIO()):
-                rc = calc.run()
-        finally:
-            dc_network_class.topo = original_topo
+        self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
+        self.assertFalse(hasattr(network.dc, "topo"))
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
+        calc.skip_lf_result = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(calc.dc_calc.array_mode)

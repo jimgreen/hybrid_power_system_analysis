@@ -172,9 +172,6 @@ class StateEstimatorPrepareTest(unittest.TestCase):
                 self.ac = FakeSide()
                 self.dc = FakeSide()
 
-            def _build_hybrid_topo(self):
-                calls.append(("build_hybrid_topo",))
-
         fake_network = FakeNetwork()
         fake_ppc = {
             "ac": {"kind": "ac"},
@@ -185,7 +182,8 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         e_file = Path("case.e")
         sentinel = object()
         original_read_rows = getattr(hybrid_se, "_read_efile_rows", sentinel)
-        original_build = getattr(hybrid_se, "build_hybrid_ppc_from_efile_rows", sentinel)
+        original_build = getattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows", sentinel)
+        original_build_network = getattr(hybrid_se, "_build_hybrid_se_network_from_ppc", sentinel)
         original_read_from_file = hybrid_se.HybridPowerNetwork.read_from_file
 
         def read_rows(path):
@@ -194,13 +192,27 @@ class StateEstimatorPrepareTest(unittest.TestCase):
 
         def build_from_rows(path, rows):
             calls.append(("build_from_rows", path, rows))
-            return fake_network, fake_ppc
+            return fake_ppc
+
+        def build_network(ppc):
+            calls.append(("build_network", ppc))
+            fake_network.ppc = ppc
+            fake_network.ac.ppc = ppc["ac"]
+            fake_network.dc.ppc = ppc["dc"]
+            base = ppc["base"]
+            fake_network.p_base = float(base[0])
+            fake_network.u_scale = float(base[1])
+            fake_network.p_scale = float(base[2])
+            fake_network.i_scale = float(base[3])
+            fake_network.p_base_kW = float(base[4])
+            return fake_network
 
         def read_from_file_forbidden(*args, **kwargs):
             raise AssertionError("Hybrid load should reuse in-memory E rows")
 
         hybrid_se._read_efile_rows = read_rows
-        hybrid_se.build_hybrid_ppc_from_efile_rows = build_from_rows
+        hybrid_se.build_hybrid_ppc_only_from_efile_rows = build_from_rows
+        hybrid_se._build_hybrid_se_network_from_ppc = build_network
         hybrid_se.HybridPowerNetwork.read_from_file = read_from_file_forbidden
         try:
             network = HybridStateEstimator._load_network(e_file)
@@ -210,14 +222,18 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             else:
                 hybrid_se._read_efile_rows = original_read_rows
             if original_build is sentinel:
-                delattr(hybrid_se, "build_hybrid_ppc_from_efile_rows")
+                delattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows")
             else:
-                hybrid_se.build_hybrid_ppc_from_efile_rows = original_build
+                hybrid_se.build_hybrid_ppc_only_from_efile_rows = original_build
+            if original_build_network is sentinel:
+                delattr(hybrid_se, "_build_hybrid_se_network_from_ppc")
+            else:
+                hybrid_se._build_hybrid_se_network_from_ppc = original_build_network
             hybrid_se.HybridPowerNetwork.read_from_file = original_read_from_file
 
         self.assertIs(network, fake_network)
         self.assertEqual(
-            [("read_rows", e_file), ("build_from_rows", e_file, fake_rows), ("build_hybrid_topo",)],
+            [("read_rows", e_file), ("build_from_rows", e_file, fake_rows), ("build_network", fake_ppc)],
             calls,
         )
         self.assertIs(network.ppc, fake_ppc)
@@ -228,6 +244,135 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         self.assertEqual(3.0, network.p_scale)
         self.assertEqual(4.0, network.i_scale)
         self.assertEqual(100000.0, network.p_base_kW)
+
+    def test_hybrid_load_network_uses_ppc_only_loader_without_full_hybrid_topology(self):
+        import numpy as np
+        import secore.hybrid_se as hybrid_se
+        from model.ac_array_model import (
+            BRANCH_COLS as AC_BRANCH_COLS,
+            BUS_COLS as AC_BUS_COLS,
+            GEN_COLS as AC_GEN_COLS,
+            LOAD_COLS as AC_LOAD_COLS,
+            SHUNT_COLS as AC_SHUNT_COLS,
+            SWITCH_COLS as AC_SWITCH_COLS,
+            TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
+        )
+        from model.dc_array_model import (
+            BRANCH_COLS as DC_BRANCH_COLS,
+            BUS_COLS as DC_BUS_COLS,
+            DCDC_COLS,
+            GEN_COLS as DC_GEN_COLS,
+            LOAD_COLS as DC_LOAD_COLS,
+            SWITCH_COLS as DC_SWITCH_COLS,
+            ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+        )
+        from model.hybrid_array_model import ACAC_COLS, DCAC_COLS
+        from secore.hybrid_se import HybridStateEstimator
+
+        calls = []
+        fake_rows = {"ACNode": {"rows": []}}
+        e_file = Path("case.e")
+
+        def empty(width):
+            return np.zeros((0, width), dtype=np.float64)
+
+        ac_bus = np.zeros((1, len(AC_BUS_COLS)), dtype=np.float64)
+        ac_bus[0, AC_BUS_COLS["idx"]] = 1
+        ac_bus[0, AC_BUS_COLS["vbase"]] = 110.0
+        ac_bus[0, AC_BUS_COLS["voltage"]] = 1.0
+        ac_bus[0, AC_BUS_COLS["run_stat"]] = 1
+        dc_bus = np.zeros((1, len(DC_BUS_COLS)), dtype=np.float64)
+        dc_bus[0, DC_BUS_COLS["idx"]] = 1
+        dc_bus[0, DC_BUS_COLS["vbase"]] = 500.0
+        dc_bus[0, DC_BUS_COLS["voltage"]] = 1.0
+        dc_bus[0, DC_BUS_COLS["run_stat"]] = 1
+        fake_ppc = {
+            "base": np.array([100.0, 2.0, 3.0, 4.0, 100000.0], dtype=np.float64),
+            "ac": {
+                "base": np.array([100.0, 2.0, 3.0, 4.0, 100000.0], dtype=np.float64),
+                "bus": ac_bus,
+                "branch": empty(len(AC_BRANCH_COLS)),
+                "transformer": empty(len(AC_TRANSFORMER_COLS)),
+                "gen": empty(len(AC_GEN_COLS)),
+                "load": empty(len(AC_LOAD_COLS)),
+                "shunt": empty(len(AC_SHUNT_COLS)),
+                "zero_branch": empty(len(AC_ZERO_BRANCH_COLS)),
+                "switch": empty(len(AC_SWITCH_COLS)),
+                "break": empty(len(AC_SWITCH_COLS)),
+                "bus_name": np.asarray(["ac_1"], dtype=object),
+                "branch_name": np.asarray([], dtype=object),
+                "transformer_name": np.asarray([], dtype=object),
+                "gen_name": np.asarray([], dtype=object),
+                "load_name": np.asarray([], dtype=object),
+                "shunt_name": np.asarray([], dtype=object),
+                "zero_branch_name": np.asarray([], dtype=object),
+                "switch_name": np.asarray([], dtype=object),
+                "break_name": np.asarray([], dtype=object),
+            },
+            "dc": {
+                "base": {"p_base": 100.0, "u_scale": 2.0, "p_scale": 3.0, "i_scale": 4.0, "p_base_kW": 100000.0},
+                "bus": dc_bus,
+                "branch": empty(len(DC_BRANCH_COLS)),
+                "load": empty(len(DC_LOAD_COLS)),
+                "gen": empty(len(DC_GEN_COLS)),
+                "zero_branch": empty(len(DC_ZERO_BRANCH_COLS)),
+                "switch": empty(len(DC_SWITCH_COLS)),
+                "break": empty(len(DC_SWITCH_COLS)),
+                "dcdc": empty(len(DCDC_COLS)),
+                "bus_name": np.asarray(["dc_1"], dtype=object),
+                "branch_name": np.asarray([], dtype=object),
+                "load_name": np.asarray([], dtype=object),
+                "gen_name": np.asarray([], dtype=object),
+                "zero_branch_name": np.asarray([], dtype=object),
+                "switch_name": np.asarray([], dtype=object),
+                "break_name": np.asarray([], dtype=object),
+                "dcdc_name": np.asarray([], dtype=object),
+            },
+            "dcac": empty(len(DCAC_COLS)),
+            "acac": empty(len(ACAC_COLS)),
+            "dcac_name": np.asarray([], dtype=object),
+            "acac_name": np.asarray([], dtype=object),
+        }
+
+        original_read_rows = hybrid_se._read_efile_rows
+        original_ppc_only = getattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows", None)
+        original_full = getattr(hybrid_se, "build_hybrid_ppc_from_efile_rows", None)
+
+        def read_rows(path):
+            calls.append(("read_rows", path))
+            return fake_rows
+
+        def build_ppc_only(path, rows):
+            calls.append(("ppc_only", path, rows))
+            return fake_ppc
+
+        def reject_full_loader(*_args, **_kwargs):
+            raise AssertionError("Hybrid SE array path should not build the full HybridPowerNetwork")
+
+        hybrid_se._read_efile_rows = read_rows
+        hybrid_se.build_hybrid_ppc_only_from_efile_rows = build_ppc_only
+        hybrid_se.build_hybrid_ppc_from_efile_rows = reject_full_loader
+        try:
+            network = HybridStateEstimator._load_network(e_file)
+        finally:
+            hybrid_se._read_efile_rows = original_read_rows
+            if original_ppc_only is None:
+                delattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows")
+            else:
+                hybrid_se.build_hybrid_ppc_only_from_efile_rows = original_ppc_only
+            if original_full is None:
+                delattr(hybrid_se, "build_hybrid_ppc_from_efile_rows")
+            else:
+                hybrid_se.build_hybrid_ppc_from_efile_rows = original_full
+
+        self.assertEqual([("read_rows", e_file), ("ppc_only", e_file, fake_rows)], calls)
+        self.assertIs(network.ppc, fake_ppc)
+        self.assertIs(network.ac.ppc, fake_ppc["ac"])
+        self.assertIs(network.dc.ppc, fake_ppc["dc"])
+        self.assertTrue(getattr(network, "_se_lightweight", False))
+        self.assertTrue(getattr(network.ac, "_se_lightweight", False))
+        self.assertTrue(getattr(network.dc, "_se_lightweight", False))
 
     def test_hybrid_ppc_model_build_normalizes_named_units_once(self):
         import model.hybrid_array_model as hybrid_array_model

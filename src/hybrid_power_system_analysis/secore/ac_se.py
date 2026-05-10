@@ -62,6 +62,7 @@ from model.meas_model import (
     MeasurementList,
     MeasurementTable,
     ObservabilityResult,
+    TableBackedMeasurementList,
     is_pseudo_measurement,
     mark_measurement_invalid,
     mark_measurement_pseudo,
@@ -225,9 +226,9 @@ def _file_cache_key(file_name: Path) -> Tuple[Path, int, int]:
     return path, int(stat.st_mtime_ns), int(stat.st_size)
 
 
-def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str], measurement_cls):
+def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str], measurement_cls, table_only: bool = False):
     count = len(data_lines)
-    measurements = [None] * count
+    measurements = None if table_only else [None] * count
     idx_values = np.empty(count, dtype=np.int64)
     name_values = np.empty(count, dtype=object)
     device_type_values = np.empty(count, dtype=object)
@@ -240,7 +241,7 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
     angle_mask_values = np.empty(count, dtype=bool)
     status_values = np.empty(count, dtype=np.int16)
 
-    new_measurement = measurement_cls.__new__
+    new_measurement = None if table_only else measurement_cls.__new__
     device_type_code_get = _DEVICE_TYPE_CODES.get
     angle_types = ANGLE_MEASUREMENT_TYPES
     intern = sys.intern
@@ -282,22 +283,23 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
         valid = row[6] == "1"
         value = float(row[7])
         status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
-        meas = new_measurement(measurement_cls)
-        meas.idx = idx
-        meas.name = name
-        meas.device_type = device_type
-        meas.device_name = row[3]
-        meas.meas_type = meas_type
-        meas.weight = weight
-        meas.valid = valid
-        meas.value = value
-        meas.status = status
-
-        measurements[row_pos] = meas
+        device_name = row[3]
+        if not table_only:
+            meas = new_measurement(measurement_cls)
+            meas.idx = idx
+            meas.name = name
+            meas.device_type = device_type
+            meas.device_name = device_name
+            meas.meas_type = meas_type
+            meas.weight = weight
+            meas.valid = valid
+            meas.value = value
+            meas.status = status
+            measurements[row_pos] = meas
         idx_values[row_pos] = idx
         name_values[row_pos] = name
         device_type_values[row_pos] = device_type
-        device_name_values[row_pos] = meas.device_name
+        device_name_values[row_pos] = device_name
         meas_type_values[row_pos] = meas_type
         weight_values[row_pos] = weight
         valid_values[row_pos] = valid
@@ -325,18 +327,22 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
         status_code=status_values,
         rows_by_device_type_code=rows_by_code,
     )
+    if table_only:
+        return TableBackedMeasurementList(table, normalized=False)
     return MeasurementList(measurements, table, normalized=False)
 
 
-def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=None):
+def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=None, table_only: bool = False):
+    if table_only and scale_context is not None:
+        raise ValueError("table_only measurement parsing is only supported before per-unit normalization")
     required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
     header = None
     column_index = None
     header_len = 0
     standard_header = False
     idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = status_col = -1
-    measurements = []
-    append_measurement = measurements.append
+    measurements = None if table_only else []
+    append_measurement = None if table_only else measurements.append
     idx_values = []
     name_values = []
     device_type_values = []
@@ -360,7 +366,7 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
     append_device_type_code = device_type_code_values.append
     append_angle_mask = angle_mask_values.append
     append_status = status_values.append
-    new_measurement = measurement_cls.__new__
+    new_measurement = None if table_only else measurement_cls.__new__
     int_cell = int
     float_cell = float
     device_type_code_get = _DEVICE_TYPE_CODES.get
@@ -414,9 +420,19 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                         if not line:
                             continue
                         if line == "</Measurement>":
-                            return _read_standard_measurement_lines(file_name, data_lines, measurement_cls)
+                            return _read_standard_measurement_lines(
+                                file_name,
+                                data_lines,
+                                measurement_cls,
+                                table_only=table_only,
+                            )
                         raise SyntaxError(f"Invalid Measurement row at line {line_no} in {file_name}")
-                    return _read_standard_measurement_lines(file_name, data_lines, measurement_cls)
+                    return _read_standard_measurement_lines(
+                        file_name,
+                        data_lines,
+                        measurement_cls,
+                        table_only=table_only,
+                    )
                 if standard_header:
                     row = raw_line[1:].split()
                     if len(row) < header_len:
@@ -490,38 +506,46 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                     )
                     if not measurement_status_is_active(status):
                         valid = False
-                meas = new_measurement(measurement_cls)
-                meas.idx = idx
-                meas.name = name
-                meas.device_type = device_type
-                meas.device_name = device_name
-                meas.meas_type = meas_type
-                meas.weight = weight
-                meas.valid = valid
-                meas.value = value
-                meas.status = status
-                if scale_context is not None:
-                    if is_angle_measurement:
-                        mark_measurement_invalid(meas)
-                        meas.value = 0.0 if getattr(scale_context, "flat_start", False) else math.radians(float(meas.value))
-                    else:
-                        normalized_value = _normalize_measurement_value(scale_context, meas)
-                        if normalized_value is None:
+                if table_only:
+                    stored_valid = valid
+                    stored_value = value
+                    stored_status = status
+                else:
+                    meas = new_measurement(measurement_cls)
+                    meas.idx = idx
+                    meas.name = name
+                    meas.device_type = device_type
+                    meas.device_name = device_name
+                    meas.meas_type = meas_type
+                    meas.weight = weight
+                    meas.valid = valid
+                    meas.value = value
+                    meas.status = status
+                    if scale_context is not None:
+                        if is_angle_measurement:
                             mark_measurement_invalid(meas)
+                            meas.value = 0.0 if getattr(scale_context, "flat_start", False) else math.radians(float(meas.value))
                         else:
-                            meas.value = normalized_value
-                append_measurement(meas)
+                            normalized_value = _normalize_measurement_value(scale_context, meas)
+                            if normalized_value is None:
+                                mark_measurement_invalid(meas)
+                            else:
+                                meas.value = normalized_value
+                    append_measurement(meas)
+                    stored_valid = meas.valid
+                    stored_value = meas.value if scale_context is not None else value
+                    stored_status = meas.status
                 append_idx(idx)
                 append_name(name)
                 append_device_type(device_type)
                 append_device_name(device_name)
                 append_meas_type(meas_type)
                 append_weight(weight)
-                append_valid(meas.valid)
-                append_value(meas.value if scale_context is not None else value)
+                append_valid(stored_valid)
+                append_value(stored_value)
                 append_device_type_code(device_type_code)
                 append_angle_mask(is_angle_measurement)
-                append_status(meas.status)
+                append_status(stored_status)
                 code_rows.append(row_pos)
                 row_pos += 1
                 continue
@@ -555,6 +579,8 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
         status_code=np.asarray(status_values, dtype=np.int16),
         rows_by_device_type_code=rows_by_code,
     )
+    if table_only:
+        return TableBackedMeasurementList(table, normalized=scale_context is not None)
     return MeasurementList(measurements, table, normalized=scale_context is not None)
 
 
@@ -666,15 +692,16 @@ def _normalize_measurement_value(scale_context, meas: "Measurement") -> Optional
     return float(meas.value) / scale
 
 
-def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
-    source = Path(e_file).resolve()
-    ppc = build_ac_ppc_from_e_file(source)
-    ppc["source"] = str(source)
+def _build_ac_se_network_from_ppc_dict(ppc: Dict, source: Optional[Path] = None) -> ACPowerNetwork:
+    if source is not None:
+        ppc["source"] = str(Path(source).resolve())
     topology_arrays = ppc.get("_topology_arrays")
     if topology_arrays is None:
         topology_arrays = network_topology.prepare_ac_topology_ppc(ppc)
         ppc["_topology_arrays"] = topology_arrays
     network = ACPowerNetwork()
+    network._se_lightweight = True
+    network.ppc = ppc
     base = ppc["base"]
     network.p_base = float(base[0])
     network.u_scale = float(base[1])
@@ -841,6 +868,12 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
     network._topology_arrays = topology_arrays
     network_topology.apply_ac_topology_arrays(network, topology_arrays, compact=True, build_alive_maps=False)
     return network
+
+
+def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
+    source = Path(e_file).resolve()
+    ppc = build_ac_ppc_from_e_file(source)
+    return _build_ac_se_network_from_ppc_dict(ppc, source)
 
 
 class ACStateEstimator:
@@ -2599,6 +2632,8 @@ class ACStateEstimator:
 
     @staticmethod
     def _load_measurements(meas_file: Path, scale_context=None) -> List[Measurement]:
+        if scale_context is None:
+            return _read_measurements_direct(meas_file, Measurement, table_only=True)
         return Measurement.read_from_file(meas_file, scale_context=scale_context)
 
     def _node_current_base(self, node_idx: int) -> float:
@@ -2840,12 +2875,11 @@ class ACStateEstimator:
             elif mtype == "I_LOAD":
                 scale_array[int(row)] = node_scales[1]
 
-        def invalidate_measurement(pos: int, meas: Measurement) -> None:
+        def invalidate_measurement(pos: int) -> None:
             valid_array[pos] = False
             status_array[pos] = MEAS_STATUS_INVALID
-            mark_measurement_invalid(meas)
 
-        for pos, meas in enumerate(self.measurements):
+        for pos in range(value_array.size):
             meas_idx = int(idx_array[pos])
             mtype = meas_type_array[pos]
             device_type = device_type_array[pos]
@@ -2856,18 +2890,16 @@ class ACStateEstimator:
             if mtype in ANGLE_MEASUREMENT_TYPES:
                 if self.flat_start:
                     value_array[pos] = 0.0
-                    meas.value = 0.0
-                invalidate_measurement(pos, meas)
+                invalidate_measurement(pos)
                 continue
             if not bool(valid_array[pos]) or weight <= 0.0:
                 continue
             if bool(unavailable_mask[pos]):
-                invalidate_measurement(pos, meas)
+                invalidate_measurement(pos)
                 continue
             scale = float(scale_array[pos])
             converted_value = float(value_array[pos]) / scale
             value_array[pos] = converted_value
-            meas.value = converted_value
             is_real_measurement = int(status_array[pos]) != MEAS_STATUS_PSEUDO
             if is_real_measurement and mtype in _VOLTAGE_MEASUREMENT_TYPES:
                 node_idx = self._voltage_measurement_node_idx(device_type, device_name, mtype)
@@ -2913,6 +2945,12 @@ class ACStateEstimator:
         self._real_power_measurement_seed_cache = power_seed_best
         self._power_flow_seed_rows = power_flow_seed_rows
         self._has_valid_angle_measurements = has_valid_angle_measurements
+        object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
+        if object_count == value_array.size and object_count > 0:
+            for pos, meas in enumerate(list.__iter__(self.measurements)):
+                meas.valid = bool(valid_array[pos])
+                meas.value = float(value_array[pos])
+                meas.status = int(status_array[pos])
 
     def _active_device_keys(self) -> set:
         """Return devices that already have at least one usable measurement."""

@@ -165,6 +165,83 @@ class MeasurementList(list):
         self.normalized = bool(normalized)
 
 
+def measurement_from_table_row(table: MeasurementTable, row: int) -> Measurement:
+    pos = int(row)
+    status_code = measurement_table_status_code(table)
+    measurement = Measurement.__new__(Measurement)
+    measurement.idx = int(table.idx[pos])
+    measurement.name = str(table.name[pos])
+    measurement.device_type = str(table.device_type[pos])
+    measurement.device_name = str(table.device_name[pos])
+    measurement.meas_type = str(table.meas_type[pos])
+    measurement.weight = float(table.weight[pos])
+    measurement.valid = bool(table.valid[pos])
+    measurement.value = float(table.value[pos])
+    measurement.status = int(status_code[pos])
+    return measurement
+
+
+class TableBackedMeasurementList(MeasurementList):
+    """Measurement sequence backed by MeasurementTable, with lazy row objects."""
+
+    __slots__ = ("_table_prefix_size",)
+
+    def __init__(self, table: MeasurementTable, normalized: bool = False):
+        list.__init__(self)
+        self.table = table
+        self.normalized = bool(normalized)
+        self._table_prefix_size = int(table.idx.size)
+
+    def _table_size(self) -> int:
+        table = self.table
+        return 0 if table is None else int(table.idx.size)
+
+    def _incorporated_tail_size(self) -> int:
+        return max(0, min(list.__len__(self), self._table_size() - self._table_prefix_size))
+
+    def __len__(self) -> int:
+        incorporated = self._incorporated_tail_size()
+        return self._table_size() + list.__len__(self) - incorporated
+
+    def __iter__(self):
+        table = self.table
+        table_size = self._table_size()
+        for row in range(table_size):
+            yield measurement_from_table_row(table, row)
+        incorporated = self._incorporated_tail_size()
+        for pos in range(incorporated, list.__len__(self)):
+            yield list.__getitem__(self, pos)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[pos] for pos in range(start, stop, step)]
+        pos = int(index)
+        size = len(self)
+        if pos < 0:
+            pos += size
+        if pos < 0 or pos >= size:
+            raise IndexError("measurement index out of range")
+        table_size = self._table_size()
+        if pos < table_size:
+            return measurement_from_table_row(self.table, pos)
+        incorporated = self._incorporated_tail_size()
+        return list.__getitem__(self, incorporated + pos - table_size)
+
+    def __contains__(self, item) -> bool:
+        return any(measurement is item or measurement == item for measurement in self)
+
+    def index(self, item, start=0, stop=None) -> int:
+        size = len(self)
+        start = max(0, int(start))
+        stop = size if stop is None else min(size, int(stop))
+        for pos in range(start, stop):
+            measurement = self[pos]
+            if measurement is item or measurement == item:
+                return pos
+        raise ValueError(f"{item!r} is not in measurement table")
+
+
 class MeasurementView(MeasurementList):
     """A table-backed row view over an existing measurement sequence."""
 

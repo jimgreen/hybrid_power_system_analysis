@@ -111,6 +111,38 @@ class DCStateEstimationTest(unittest.TestCase):
         np.testing.assert_array_equal(measurements.table.status_code, np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID]))
         np.testing.assert_array_equal(measurements.table.valid, np.array([True, False]))
 
+    def test_measurement_parser_can_return_table_backed_rows_without_object_list(self):
+        import secore.dc_se as dc_se
+        from model.meas_model import DEVICE_TYPE_CODES, TableBackedMeasurementList
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@idx name dev_type dev_name meas_type weight valid value",
+                        "#1 v1 DCNode n1 V 2.0 1 1.01",
+                        "#2 p1 DCLoad load P_LOAD 3.0 1 5.0",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            measurements = dc_se._read_measurements_direct(meas_file, table_only=True)
+
+        self.assertIsInstance(measurements, TableBackedMeasurementList)
+        self.assertEqual(2, len(measurements))
+        self.assertEqual(0, list.__len__(measurements))
+        np.testing.assert_array_equal(
+            measurements.table.device_type_code,
+            np.array([DEVICE_TYPE_CODES["DCNode"], DEVICE_TYPE_CODES["DCLoad"]], dtype=np.int16),
+        )
+        self.assertEqual("v1", measurements[0].name)
+        self.assertEqual("P_LOAD", measurements[1].meas_type)
+
     def test_summary_cache_maps_only_voltage_rows(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.dc_se import DCStateEstimator
@@ -325,7 +357,7 @@ class DCStateEstimationTest(unittest.TestCase):
             flat_start=True,
         )
 
-        self.assertEqual("model.dc_array_model", estimator.network.__class__.__module__)
+        self.assertTrue(getattr(estimator.network, "_se_lightweight", False))
         self.assertEqual("dc_ppc_v1", estimator.network.ppc["format"])
 
     def test_dc_network_load_uses_dc_lf_efile_loader(self):
@@ -394,6 +426,27 @@ class DCStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(estimator.nodes)
         self.assertIsNotNone(getattr(estimator.network, "_topology_arrays", None))
+
+    def test_load_network_uses_lightweight_ppc_facade_without_full_dc_network_build(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original_build_network = dc_se.build_dc_network_from_ppc
+
+        def reject_full_network_build(*_args, **_kwargs):
+            raise AssertionError("DC SE load should build a lightweight ppc facade")
+
+        dc_se.build_dc_network_from_ppc = reject_full_network_build
+        try:
+            network = DCStateEstimator._load_network(
+                ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e"
+            )
+        finally:
+            dc_se.build_dc_network_from_ppc = original_build_network
+
+        self.assertTrue(getattr(network, "_se_lightweight", False))
+        self.assertTrue(network.nodes)
+        self.assertIsNotNone(getattr(network, "_topology_arrays", None))
 
     def test_adds_low_weight_pseudo_power_measurements_for_unmetered_generators_and_loads(self):
         from secore.dc_se import DCStateEstimator

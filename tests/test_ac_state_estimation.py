@@ -124,6 +124,39 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_array_equal(cache[DEVICE_TYPE_CODES["ACNode"]], np.array([0, 2], dtype=np.int64))
         np.testing.assert_array_equal(cache[DEVICE_TYPE_CODES["ACLoad"]], np.array([1], dtype=np.int64))
 
+    def test_standard_measurement_parser_can_return_table_backed_rows_without_object_list(self):
+        import secore.ac_se as ac_se
+        from model.meas_model import DEVICE_TYPE_CODES, Measurement, TableBackedMeasurementList
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@idx name dev_type dev_name meas_type weight valid value",
+                        "#1 v1 ACNode n1 V 2.0 1 1.01",
+                        "#2 p1 ACLoad load P_LOAD 3.0 1 5.0",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            class RejectMeasurement(Measurement):
+                def __new__(cls, *_args, **_kwargs):
+                    raise AssertionError("table-only parsing should not instantiate Measurement rows")
+
+            measurements = ac_se._read_measurements_direct(meas_file, RejectMeasurement, table_only=True)
+
+        self.assertIsInstance(measurements, TableBackedMeasurementList)
+        self.assertEqual(2, len(measurements))
+        self.assertEqual(0, list.__len__(measurements))
+        np.testing.assert_array_equal(measurements.table.device_type_code, np.array([DEVICE_TYPE_CODES["ACNode"], DEVICE_TYPE_CODES["ACLoad"]], dtype=np.int16))
+        self.assertEqual("v1", measurements[0].name)
+        self.assertEqual("P_LOAD", measurements[1].meas_type)
+
     def test_summary_cache_maps_only_voltage_rows(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.ac_se import ACStateEstimator
@@ -220,6 +253,38 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
         self.assertEqual({1: 1.02}, estimator._real_voltage_observation_node_cache)
+
+    def test_conversion_uses_table_without_iterating_table_backed_measurements(self):
+        from model.meas_model import Measurement, TableBackedMeasurementList, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator
+
+        class NoIterTableBackedMeasurementList(TableBackedMeasurementList):
+            def __iter__(self):
+                raise AssertionError("AC conversion should use the measurement table directly")
+
+        rows = [Measurement(1, "node_v", "ACNode", "n1", "V", 2.0, True, 10.2)]
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.measurements = NoIterTableBackedMeasurementList(measurement_table_from_measurements(rows))
+        estimator.flat_start = False
+        estimator.p_base = 100.0
+        estimator.p_base_kW = 100.0
+        estimator.u_scale = 1.0
+        estimator.i_scale = 1.0
+        estimator.network = SimpleNamespace(node_dict={1: SimpleNamespace(vbase=10.0)})
+        estimator.node_by_name = {"n1": SimpleNamespace(idx=1)}
+        estimator.node_pos = {1: 0}
+        estimator.node_by_idx = {1: estimator.node_by_name["n1"]}
+        estimator.branch_by_name = {}
+        estimator.transformer_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.break_by_name = {}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {}
+
+        estimator._convert_measurements_to_pu()
+
+        np.testing.assert_allclose(estimator.measurements.table.value, np.array([1.02]))
+        self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
 
     def test_build_normal_equations_accepts_sparse_jacobian(self):
         from scipy.sparse import csr_matrix
@@ -455,6 +520,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
     def test_load_measurements_uses_direct_measurement_parser(self):
         import secore.ac_se as ac_se
+        from model.meas_model import TableBackedMeasurementList
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -489,6 +555,8 @@ class ACStateEstimationTest(unittest.TestCase):
                 ac_se.EBook = original_ebook
 
         self.assertEqual(1, len(measurements))
+        self.assertIsInstance(measurements, TableBackedMeasurementList)
+        self.assertEqual(0, list.__len__(measurements))
         measurement = measurements[0]
         self.assertEqual(7, measurement.idx)
         self.assertEqual("vm_bus_1", measurement.name)
@@ -521,9 +589,9 @@ class ACStateEstimationTest(unittest.TestCase):
             original_read_direct = ac_se._read_measurements_direct
             calls = []
 
-            def counted_read_direct(file_name, measurement_cls):
+            def counted_read_direct(file_name, measurement_cls, *args, **kwargs):
                 calls.append(Path(file_name))
-                return original_read_direct(file_name, measurement_cls)
+                return original_read_direct(file_name, measurement_cls, *args, **kwargs)
 
             ac_se._read_measurements_direct = counted_read_direct
             try:

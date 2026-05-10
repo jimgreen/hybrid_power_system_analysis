@@ -9,6 +9,7 @@ from model.meas_model import (
     MEAS_STATUS_PSEUDO,
     Measurement,
     MeasurementList,
+    TableBackedMeasurementList,
     MeasurementView,
     is_pseudo_measurement,
     measurement_table_from_measurements,
@@ -111,6 +112,39 @@ class SEArrayPlanTest(unittest.TestCase):
         self.assertIs(partitions.measurements["ac"][0], measurements[0])
         self.assertIs(partitions.measurements["ac"][1], measurements[3])
         np.testing.assert_array_equal(partitions.measurements["ac"].table.idx, np.array([1, 4], dtype=np.int64))
+
+    def test_partition_measurements_by_code_keeps_non_view_results_table_backed(self):
+        from secore.se_array_plan import partition_measurements_by_code
+
+        source = TableBackedMeasurementList(self._measurements().table)
+        side_by_code = {
+            DEVICE_TYPE_CODES["ACNode"]: "ac",
+            DEVICE_TYPE_CODES["ACLoad"]: "ac",
+            DEVICE_TYPE_CODES["DCNode"]: "dc",
+            DEVICE_TYPE_CODES["DCACConverter"]: "hybrid",
+        }
+
+        partitions = partition_measurements_by_code(
+            source,
+            side_by_code,
+            sides=("ac", "dc", "hybrid"),
+        )
+
+        self.assertIsInstance(partitions.measurements["ac"], TableBackedMeasurementList)
+        self.assertEqual(0, list.__len__(partitions.measurements["ac"]))
+        self.assertEqual(["ac_v", "ac_p"], [meas.name for meas in partitions.measurements["ac"]])
+        np.testing.assert_array_equal(partitions.measurements["ac"].table.idx, np.array([1, 4], dtype=np.int64))
+
+    def test_copy_measurement_view_keeps_table_backed_source_lazy(self):
+        from secore.se_array_plan import copy_measurement_view
+
+        source = TableBackedMeasurementList(self._measurements().table)
+
+        copied = copy_measurement_view(source)
+
+        self.assertIsInstance(copied, TableBackedMeasurementList)
+        self.assertEqual(0, list.__len__(copied))
+        self.assertEqual(["ac_v", "dc_v", "conv_p", "ac_p"], [meas.name for meas in copied])
 
     def test_measurement_status_is_explicit_and_preserved_in_table_slices(self):
         from secore.se_array_plan import measurement_table_take
@@ -462,6 +496,31 @@ class SEArrayPlanTest(unittest.TestCase):
         np.testing.assert_allclose(updated.z, np.array([1.02, 3.0, 1.01]))
         np.testing.assert_allclose(updated.weight, np.array([1.0, 2.0, 5.0]))
 
+    def test_append_active_measurement_view_keeps_table_backed_source_lazy(self):
+        from secore.se_array_plan import append_active_measurement_view, build_active_measurement_view
+
+        class NoIterTableBackedMeasurementList(TableBackedMeasurementList):
+            def __iter__(self):
+                raise AssertionError("append_active_measurement_view should not materialize source measurements")
+
+        rows = [
+            Measurement(1, "ac_v", "ACNode", "ac_bus", "V", 1.0, True, 1.02),
+            Measurement(2, "conv_p", "DCACConverter", "conv", "P_AC", 2.0, True, 3.0),
+        ]
+        source = NoIterTableBackedMeasurementList(measurement_table_from_measurements(rows))
+        view = build_active_measurement_view(source)
+        additions = [
+            Measurement(3, "ac_v2", "ACNode", "ac_bus_2", "V", 5.0, True, 1.01),
+        ]
+
+        updated = append_active_measurement_view(view, additions)
+
+        self.assertIsInstance(updated.measurements, TableBackedMeasurementList)
+        self.assertEqual(0, list.__len__(updated.measurements))
+        self.assertEqual(["ac_v", "conv_p", "ac_v2"], [meas.name for meas in updated.measurements])
+        np.testing.assert_array_equal(updated.source_rows, np.array([0, 1, 2], dtype=np.int64))
+        np.testing.assert_array_equal(updated.table.idx, np.array([1, 2, 3], dtype=np.int64))
+
     def test_extend_measurement_partitions_appends_side_rows_and_tables(self):
         from secore.se_array_plan import build_active_measurement_view, extend_measurement_partitions, partition_measurements_by_code
 
@@ -495,6 +554,39 @@ class SEArrayPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(updated.rows["hybrid"], np.array([1, 3], dtype=np.int64))
         np.testing.assert_array_equal(updated.measurements["ac"].table.idx, np.array([1, 5], dtype=np.int64))
         np.testing.assert_array_equal(updated.measurements["hybrid"].table.idx, np.array([3, 6], dtype=np.int64))
+
+    def test_extend_measurement_partitions_keeps_results_table_backed(self):
+        from secore.se_array_plan import extend_measurement_partitions, partition_measurements_by_code
+
+        source = TableBackedMeasurementList(self._measurements().table)
+        side_by_code = {
+            DEVICE_TYPE_CODES["ACNode"]: "ac",
+            DEVICE_TYPE_CODES["ACLoad"]: "ac",
+            DEVICE_TYPE_CODES["DCNode"]: "dc",
+            DEVICE_TYPE_CODES["DCACConverter"]: "hybrid",
+        }
+        partitions = partition_measurements_by_code(
+            source,
+            side_by_code,
+            sides=("ac", "dc", "hybrid"),
+        )
+        additions = [
+            Measurement(5, "ac_v2", "ACNode", "ac_bus_2", "V", 5.0, True, 1.01),
+            Measurement(6, "conv_q", "DCACConverter", "conv", "Q_AC", 6.0, True, 0.5),
+        ]
+
+        updated = extend_measurement_partitions(
+            partitions,
+            additions,
+            side_by_code,
+            row_offset=4,
+            sides=("ac", "dc", "hybrid"),
+        )
+
+        self.assertIsInstance(updated.measurements["ac"], TableBackedMeasurementList)
+        self.assertEqual(0, list.__len__(updated.measurements["ac"]))
+        self.assertEqual(["ac_v", "ac_p", "ac_v2"], [meas.name for meas in updated.measurements["ac"]])
+        np.testing.assert_array_equal(updated.measurements["ac"].table.idx, np.array([1, 4, 5], dtype=np.int64))
 
 
 if __name__ == "__main__":

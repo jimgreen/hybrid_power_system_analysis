@@ -160,6 +160,88 @@ class HybridStateEstimationTest(unittest.TestCase):
         estimator._measurement_activity_summary = fail_full_summary
         estimator._add_hybrid_pseudo_measurements()
 
+    def test_disabling_coupled_ac_power_balance_rows_updates_table_without_iterating_measurements(self):
+        import secore.hybrid_se as hybrid_se
+        from model.meas_model import (
+            MEAS_STATUS_INVALID,
+            TableBackedMeasurementList,
+            measurement_table_from_measurements,
+            measurement_table_status_code,
+        )
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class NonIterableTableMeasurements(TableBackedMeasurementList):
+            def __iter__(self):
+                raise AssertionError("table-backed power-balance invalidation should not materialize rows")
+
+        rows = [
+            Measurement(1, "pb_1", "ACPowerBalance", "n1", "P_BALANCE", 1.0, True, 0.0),
+            Measurement(2, "pb_2", "ACPowerBalance", "n2", "P_BALANCE", 1.0, True, 0.0),
+            Measurement(3, "v_1", "ACNode", "n1", "V", 1.0, True, 1.0),
+        ]
+        table = measurement_table_from_measurements(rows)
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = NonIterableTableMeasurements(table)
+        estimator._converter_coupled_ac_node_names = lambda: {"n1"}
+
+        original_isin = hybrid_se.np.isin
+
+        def reject_isin(*_args, **_kwargs):
+            raise AssertionError("large object-array isin should not be used for coupled power-balance rows")
+
+        hybrid_se.np.isin = reject_isin
+        try:
+            estimator._disable_coupled_ac_power_balance_rows()
+        finally:
+            hybrid_se.np.isin = original_isin
+
+        status = measurement_table_status_code(table)
+        self.assertFalse(bool(table.valid[0]))
+        self.assertTrue(bool(table.valid[1]))
+        self.assertTrue(bool(table.valid[2]))
+        self.assertEqual(MEAS_STATUS_INVALID, int(status[0]))
+
+    def test_max_measurement_idx_fast_reads_table_backed_tail_without_slicing(self):
+        from model.meas_model import TableBackedMeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class NonSlicingTableMeasurements(TableBackedMeasurementList):
+            def __getitem__(self, _index):
+                raise AssertionError("tail max-id scan should use the raw list tail directly")
+
+        table = measurement_table_from_measurements(
+            [Measurement(1, "v_1", "ACNode", "n1", "V", 1.0, True, 1.0)]
+        )
+        measurements = NonSlicingTableMeasurements(table)
+        measurements.append(Measurement(7, "pseudo_p", "ACLoad", "load_1", "P_LOAD", 1.0, True, 0.0))
+
+        self.assertEqual(7, HybridStateEstimator._max_measurement_idx_fast(measurements))
+
+    def test_active_hybrid_converter_devices_reads_table_backed_tail_without_slicing(self):
+        from model.meas_model import TableBackedMeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class NonSlicingTableMeasurements(TableBackedMeasurementList):
+            def __getitem__(self, _index):
+                raise AssertionError("hybrid tail scan should use the raw list tail directly")
+
+        source_rows = [Measurement(1, "v_1", "ACNode", "n1", "V", 1.0, True, 1.0)]
+        table = measurement_table_from_measurements(source_rows)
+        measurements = NonSlicingTableMeasurements(table)
+        measurements.append(Measurement(2, "conv_p", "DCACConverter", "conv_1", "P_AC", 1.0, True, 0.0))
+
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = measurements
+        estimator._sub_measurement_sources_by_side = {
+            "hybrid": TableBackedMeasurementList(measurement_table_from_measurements([]))
+        }
+        estimator._sub_measurement_source_count = len(table.idx)
+
+        self.assertEqual(
+            {("DCACConverter", "conv_1")},
+            estimator._active_hybrid_converter_measurement_devices(),
+        )
+
     def test_active_measurement_keys_use_measurement_summary_helper(self):
         from secore.hybrid_se import HybridStateEstimator
 
@@ -1681,9 +1763,10 @@ class HybridStateEstimationTest(unittest.TestCase):
             hybrid_se.HybridPowerNetwork.prepare = original_prepare
             hybrid_model.HybridPowerNetwork.prepare = original_model_prepare
 
-        self.assertTrue(estimator.network.hybrid_islands)
+        self.assertTrue(getattr(estimator.network, "_se_lightweight", False))
         self.assertTrue(estimator.network.ac.alive_buses)
         self.assertTrue(estimator.network.dc.alive_buses)
+        self.assertTrue(estimator.dcac_by_name or estimator.acac_by_name)
 
     def test_pure_single_side_delegate_does_not_copy_measurement_objects(self):
         from unittest.mock import patch
@@ -1865,15 +1948,14 @@ class HybridStateEstimationTest(unittest.TestCase):
             flat_start=True,
         )
 
-        partitioned = list(estimator.ac_meas) + list(estimator.dc_meas) + list(estimator.hybrid_meas)
-        partitioned_ids = {id(meas) for meas in partitioned}
-        active_ids = {id(meas) for meas in estimator.active_measurements}
         ac_rows = set(int(row) for row in estimator.ac_meas_rows)
         dc_rows = set(int(row) for row in estimator.dc_meas_rows)
         hybrid_rows = set(int(row) for row in estimator.hybrid_meas_rows)
+        partitioned_count = len(estimator.ac_meas) + len(estimator.dc_meas) + len(estimator.hybrid_meas)
+        active_rows = set(range(len(estimator.active_measurements)))
 
-        self.assertEqual(len(estimator.active_measurements), len(partitioned))
-        self.assertEqual(active_ids, partitioned_ids)
+        self.assertEqual(len(estimator.active_measurements), partitioned_count)
+        self.assertEqual(active_rows, ac_rows | dc_rows | hybrid_rows)
         self.assertFalse(ac_rows & dc_rows)
         self.assertFalse(ac_rows & hybrid_rows)
         self.assertFalse(dc_rows & hybrid_rows)

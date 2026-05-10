@@ -431,7 +431,13 @@ def _build_acac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
     return out, names, objects
 
 
-def _build_dcac_from_rows(rows: Dict, ac_ppc: Dict, dc_ppc: Dict) -> Tuple[np.ndarray, np.ndarray, list]:
+def _build_dcac_from_rows(
+    rows: Dict,
+    ac_ppc: Dict,
+    dc_ppc: Dict,
+    *,
+    build_objects: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, list]:
     columns, table_rows = _rows_for(rows, "DCACConverter")
     if not table_rows:
         return _empty(len(DCAC_COLS)), np.asarray([], dtype=object), []
@@ -475,6 +481,8 @@ def _build_dcac_from_rows(rows: Dict, ac_ppc: Dict, dc_ppc: Dict) -> Tuple[np.nd
         out[:, DCAC_COLS["ac_i"]] = _current_column(table_rows, columns, "ac_i", out[:, DCAC_COLS["ac_node"]], ac_current)
 
     names = _names_from_rows(table_rows, columns, "dcac", out[:, DCAC_COLS["idx"]])
+    if not build_objects:
+        return out, names, []
     DCACConverter, _ACACConverter = _converter_classes()
     objects = []
     for pos, row in enumerate(out):
@@ -503,7 +511,13 @@ def _build_dcac_from_rows(rows: Dict, ac_ppc: Dict, dc_ppc: Dict) -> Tuple[np.nd
     return out, names, objects
 
 
-def _build_acac_from_rows(rows: Dict, ac_ppc: Dict, dc_ppc: Dict) -> Tuple[np.ndarray, np.ndarray, list]:
+def _build_acac_from_rows(
+    rows: Dict,
+    ac_ppc: Dict,
+    dc_ppc: Dict,
+    *,
+    build_objects: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, list]:
     columns, table_rows = _rows_for(rows, "ACACConverter")
     if not table_rows:
         return _empty(len(ACAC_COLS)), np.asarray([], dtype=object), []
@@ -550,6 +564,8 @@ def _build_acac_from_rows(rows: Dict, ac_ppc: Dict, dc_ppc: Dict) -> Tuple[np.nd
         out[:, ACAC_COLS["j_i"]] = _current_column(table_rows, columns, "j_i", out[:, ACAC_COLS["j_node"]], ac_current)
 
     names = _names_from_rows(table_rows, columns, "acac", out[:, ACAC_COLS["idx"]])
+    if not build_objects:
+        return out, names, []
     _DCACConverter, ACACConverter = _converter_classes()
     objects = []
     for pos, row in enumerate(out):
@@ -583,6 +599,28 @@ def _build_acac_from_rows(rows: Dict, ac_ppc: Dict, dc_ppc: Dict) -> Tuple[np.nd
 def build_hybrid_ppc_from_e_file(file_path):
     rows = _read_efile_rows(file_path)
     return build_hybrid_ppc_from_efile_rows(file_path, rows)
+
+
+def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
+    ac_ppc = build_ac_ppc_from_efile_rows(file_path, rows)
+    dc_ppc = build_dc_ppc_from_efile_rows(file_path, rows)
+    ac_ppc["source"] = str(file_path)
+    dc_ppc["source"] = str(file_path)
+    dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(rows, ac_ppc, dc_ppc, build_objects=False)
+    acac, acac_name, _acac_objects = _build_acac_from_rows(rows, ac_ppc, dc_ppc, build_objects=False)
+    return {
+        "format": "hybrid_ppc_v1",
+        "source": str(file_path),
+        "base": ac_ppc["base"],
+        "ac": ac_ppc,
+        "dc": dc_ppc,
+        "dcac": dcac,
+        "acac": acac,
+        "dcac_name": dcac_name,
+        "acac_name": acac_name,
+        "dcac_cols": DCAC_COLS,
+        "acac_cols": ACAC_COLS,
+    }
 
 
 def build_hybrid_ppc_from_efile_rows(file_path, rows):

@@ -7,6 +7,7 @@ from model.meas_model import (
     Measurement,
     MeasurementList,
     MeasurementTable,
+    TableBackedMeasurementList,
     MeasurementView,
     measurement_table_from_measurements,
     measurement_table_status_code,
@@ -139,7 +140,7 @@ def copy_measurement_view(measurements: Sequence[Measurement]) -> MeasurementLis
     table = getattr(measurements, "table", None)
     normalized = getattr(measurements, "normalized", False)
     if table is not None and len(table.idx) == len(measurements):
-        return MeasurementList(list(measurements), table, normalized=normalized)
+        return TableBackedMeasurementList(table, normalized=normalized)
     return MeasurementList(list(measurements), normalized=normalized)
 
 
@@ -330,12 +331,10 @@ def append_active_measurement_view(
     active_rows_in_additions = np.flatnonzero(active_mask)
     source_table = concat_measurement_tables(view.source_table, additions_table)
     if active_rows_in_additions.size == 0:
-        measurements = MeasurementList(
-            list(view.measurements),
+        measurements = TableBackedMeasurementList(
             view.table,
             normalized=getattr(view.measurements, "normalized", False),
         )
-        measurements.table = view.table
         return ActiveMeasurementView(
             source_table=source_table,
             measurements=measurements,
@@ -347,17 +346,12 @@ def append_active_measurement_view(
             all_active=False,
             rows_by_device_type_code=view.rows_by_device_type_code,
         )
-    active_additions = MeasurementList(
-        [additions[int(row)] for row in active_rows_in_additions],
-        measurement_table_take(additions_table, active_rows_in_additions),
+    active_additions_table = measurement_table_take(additions_table, active_rows_in_additions)
+    active_table = concat_measurement_tables(view.table, active_additions_table)
+    measurements = TableBackedMeasurementList(
+        active_table,
         normalized=getattr(view.measurements, "normalized", False),
     )
-    measurements = MeasurementList(
-        list(view.measurements) + list(active_additions),
-        normalized=getattr(view.measurements, "normalized", False),
-    )
-    active_table = concat_measurement_tables(view.table, active_additions.table)
-    measurements.table = active_table
     source_rows = np.concatenate((view.source_rows, source_start + active_rows_in_additions.astype(np.int64, copy=False)))
     return ActiveMeasurementView(
         source_table=source_table,
@@ -451,8 +445,7 @@ def partition_measurements_by_code(
                 rows_by_device_type_code=local_rows_by_code,
             )
         else:
-            measurement_views[side] = MeasurementList(
-                [measurements[int(row)] for row in row_array],
+            measurement_views[side] = TableBackedMeasurementList(
                 measurement_table_take(table, row_array, rows_by_device_type_code=local_rows_by_code),
                 normalized=normalized,
             )
@@ -498,22 +491,14 @@ def extend_measurement_partitions(
         row_arrays[side] = np.asarray(rows[side], dtype=np.int64)
         current = partitions.measurements[side]
         if side_additions[side]:
-            addition_list = MeasurementList(
-                list(side_additions[side]),
-                measurement_table_for(side_additions[side], table_builder),
+            addition_table = measurement_table_for(side_additions[side], table_builder)
+            measurement_views[side] = TableBackedMeasurementList(
+                concat_measurement_tables(current.table, addition_table),
                 normalized=getattr(current, "normalized", normalized),
             )
-            merged = MeasurementList(
-                list(current) + list(addition_list),
-                normalized=getattr(current, "normalized", normalized),
-            )
-            merged.table = concat_measurement_tables(current.table, addition_list.table)
-            measurement_views[side] = merged
         else:
-            measurement_views[side] = MeasurementList(
-                list(current),
+            measurement_views[side] = TableBackedMeasurementList(
                 current.table,
                 normalized=getattr(current, "normalized", normalized),
             )
-            measurement_views[side].table = current.table
     return MeasurementPartitions(measurements=measurement_views, rows=row_arrays)

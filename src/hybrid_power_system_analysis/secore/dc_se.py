@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -22,6 +23,9 @@ from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BREAK_COLS as DC_BREAK_COLS,
     BUS_COLS as DC_BUS_COLS,
+    CTRL_I as DC_CTRL_I,
+    CTRL_P as DC_CTRL_P,
+    CTRL_V as DC_CTRL_V,
     DCDC_COLS as DC_DCDC_COLS,
     GEN_COLS as DC_GEN_COLS,
     LOAD_COLS as DC_LOAD_COLS,
@@ -44,6 +48,7 @@ from model.meas_model import (
     MeasurementList,
     MeasurementTable,
     ObservabilityResult,
+    TableBackedMeasurementList,
     TERMINAL_MEASUREMENT_KIND,
     is_pseudo_measurement,
     mark_measurement_invalid,
@@ -102,9 +107,9 @@ def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) 
     )
 
 
-def _read_measurements_direct(meas_file: Path) -> MeasurementList:
+def _read_measurements_direct(meas_file: Path, table_only: bool = False) -> MeasurementList:
     """Read only the Measurement block via the direct row parser."""
-    measurements: List[Measurement] = []
+    measurements: Optional[List[Measurement]] = None if table_only else []
     idx_values = []
     name_values = []
     device_type_values = []
@@ -130,8 +135,8 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     found_measurement_block = False
     header = None
     missing = ()
-    new_measurement = Measurement.__new__
-    append_measurement = measurements.append
+    new_measurement = None if table_only else Measurement.__new__
+    append_measurement = None if table_only else measurements.append
     intern = sys.intern
     device_type_cache: Dict[str, str] = {}
     meas_type_cache: Dict[str, str] = {}
@@ -214,17 +219,18 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
             if not measurement_status_is_active(status):
                 valid = False
 
-            meas = new_measurement(Measurement)
-            meas.idx = idx
-            meas.name = name
-            meas.device_type = device_type
-            meas.device_name = device_name
-            meas.meas_type = meas_type
-            meas.weight = weight
-            meas.valid = valid
-            meas.value = value
-            meas.status = status
-            append_measurement(meas)
+            if not table_only:
+                meas = new_measurement(Measurement)
+                meas.idx = idx
+                meas.name = name
+                meas.device_type = device_type
+                meas.device_name = device_name
+                meas.meas_type = meas_type
+                meas.weight = weight
+                meas.valid = valid
+                meas.value = value
+                meas.status = status
+                append_measurement(meas)
             append_idx(idx)
             append_name(name)
             append_device_type(device_type)
@@ -257,11 +263,243 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
         valid=np.asarray(valid_values, dtype=bool),
         value=np.asarray(value_values, dtype=np.float64),
         device_type_code=device_type_code_array,
-        angle_mask=np.zeros(len(measurements), dtype=bool),
+        angle_mask=np.zeros(len(idx_values), dtype=bool),
         status_code=np.asarray(status_values, dtype=np.int16),
         rows_by_device_type_code=rows_by_code,
     )
+    if table_only:
+        return TableBackedMeasurementList(table)
     return MeasurementList(measurements, table)
+
+
+class _DCArrayObject:
+    __slots__ = (
+        "idx",
+        "name",
+        "vbase",
+        "voltage",
+        "run_stat",
+        "is_alive",
+        "isl",
+        "isl_obj",
+        "bus",
+        "bus_obj",
+        "v_set",
+        "v_gens",
+        "v_dcdcs",
+        "is_slack",
+        "node",
+        "node_obj",
+        "i_node",
+        "j_node",
+        "i_node_obj",
+        "j_node_obj",
+        "r",
+        "r1",
+        "r2",
+        "status",
+        "control_type",
+        "p_set",
+        "i_set",
+        "pbase",
+        "pv0",
+        "pv1",
+        "pv2",
+        "p",
+        "current",
+        "i_p",
+        "j_p",
+        "i_c",
+        "j_c",
+    )
+
+
+_DC_CTRL_NAME_BY_CODE = {DC_CTRL_P: "P", DC_CTRL_V: "V", DC_CTRL_I: "I"}
+
+
+def _dc_array_object(idx, name, **values):
+    obj = _DCArrayObject()
+    obj.idx = int(idx)
+    obj.name = str(name)
+    obj.is_alive = False
+    for key, value in values.items():
+        setattr(obj, key, value)
+    return obj
+
+
+def _ppc_name(names, pos: int, prefix: str, idx: int) -> str:
+    if names is None or pos >= len(names):
+        return f"{prefix}_{idx}"
+    return str(names[pos])
+
+
+def _build_dc_se_network_from_ppc_dict(ppc: Dict) -> DCPowerNetwork:
+    topology_arrays = ppc.get("_topology_arrays")
+    if topology_arrays is None:
+        topology_arrays = network_topology.prepare_dc_topology_ppc(ppc)
+        ppc["_topology_arrays"] = topology_arrays
+    base = ppc["base"]
+    network = SimpleNamespace(
+        _se_lightweight=True,
+        ppc=ppc,
+        _array_model=ppc,
+        p_base=float(base["p_base"]),
+        p_base_kW=float(base["p_base_kW"]),
+        u_scale=float(base["u_scale"]),
+        p_scale=float(base["p_scale"]),
+        i_scale=float(base["i_scale"]),
+        buses=[],
+        islands=[],
+        node_dict={},
+        bus_dict={},
+        node_to_bus={},
+        switch_dict={},
+        break_dict={},
+        load_dict={},
+        generator_dict={},
+        zero_branch_dict={},
+        zero_branche_dict={},
+        branch_dict={},
+        branche_dict={},
+        dcdc_converter_dict={},
+    )
+
+    bus_names = ppc.get("bus_name")
+    network.nodes = []
+    append_node = network.nodes.append
+    for pos, row in enumerate(ppc["bus"]):
+        idx = int(row[DC_BUS_COLS["idx"]])
+        append_node(
+            _dc_array_object(
+                idx,
+                _ppc_name(bus_names, pos, "bus", idx),
+                vbase=float(row[DC_BUS_COLS["vbase"]]),
+                voltage=float(row[DC_BUS_COLS["voltage"]]),
+                run_stat=int(row[DC_BUS_COLS["run_stat"]]),
+                isl=None,
+                isl_obj=None,
+                bus=None,
+                bus_obj=None,
+                v_set=1.0,
+                v_gens=[],
+                v_dcdcs=[],
+                is_slack=False,
+            )
+        )
+
+    def terminal_devices(table_key, name_key, cols, prefix, extra=None):
+        rows = ppc.get(table_key)
+        if rows is None:
+            return []
+        names = ppc.get(name_key)
+        out = []
+        append = out.append
+        extra = extra or {}
+        for pos, row in enumerate(rows):
+            idx = int(row[cols["idx"]])
+            values = {
+                "i_node": int(row[cols["i_node"]]),
+                "j_node": int(row[cols["j_node"]]),
+                "run_stat": int(row[cols["run_stat"]]),
+                "i_node_obj": None,
+                "j_node_obj": None,
+            }
+            for attr, col_name in extra.items():
+                raw = row[cols[col_name]]
+                values[attr] = int(raw) if attr == "status" else float(raw)
+            append(_dc_array_object(idx, _ppc_name(names, pos, prefix, idx), **values))
+        return out
+
+    network.branches = terminal_devices(
+        "branch",
+        "branch_name",
+        DC_BRANCH_COLS,
+        "branch",
+        {"r": "r", "i_p": "i_p", "j_p": "j_p", "current": "current"},
+    )
+    network.zero_branches = terminal_devices(
+        "zero_branch",
+        "zero_branch_name",
+        DC_ZERO_BRANCH_COLS,
+        "zero_branch",
+        {"p": "p", "current": "current"},
+    )
+    switch_extra = {"status": "status", "p": "p", "current": "current"}
+    network.switches = terminal_devices("switch", "switch_name", DC_SWITCH_COLS, "switch", switch_extra)
+    network.breakers = terminal_devices("break", "break_name", DC_BREAK_COLS, "break", switch_extra)
+
+    network.loads = []
+    append_load = network.loads.append
+    load_names = ppc.get("load_name")
+    for pos, row in enumerate(ppc["load"]):
+        idx = int(row[DC_LOAD_COLS["idx"]])
+        append_load(
+            _dc_array_object(
+                idx,
+                _ppc_name(load_names, pos, "load", idx),
+                node=int(row[DC_LOAD_COLS["node"]]),
+                pbase=float(row[DC_LOAD_COLS["pbase"]]),
+                pv0=float(row[DC_LOAD_COLS["pv0"]]),
+                pv1=float(row[DC_LOAD_COLS["pv1"]]),
+                pv2=float(row[DC_LOAD_COLS["pv2"]]),
+                run_stat=int(row[DC_LOAD_COLS["run_stat"]]),
+                p=float(row[DC_LOAD_COLS["p"]]),
+                current=float(row[DC_LOAD_COLS["current"]]),
+                node_obj=None,
+            )
+        )
+
+    network.generators = []
+    append_gen = network.generators.append
+    gen_names = ppc.get("gen_name")
+    for pos, row in enumerate(ppc["gen"]):
+        idx = int(row[DC_GEN_COLS["idx"]])
+        append_gen(
+            _dc_array_object(
+                idx,
+                _ppc_name(gen_names, pos, "gen", idx),
+                node=int(row[DC_GEN_COLS["node"]]),
+                control_type=_DC_CTRL_NAME_BY_CODE.get(int(row[DC_GEN_COLS["control_type"]]), "P"),
+                p_set=float(row[DC_GEN_COLS["p_set"]]),
+                v_set=float(row[DC_GEN_COLS["v_set"]]),
+                i_set=float(row[DC_GEN_COLS["i_set"]]),
+                run_stat=int(row[DC_GEN_COLS["run_stat"]]),
+                p=float(row[DC_GEN_COLS["p"]]),
+                current=float(row[DC_GEN_COLS["current"]]),
+                node_obj=None,
+            )
+        )
+
+    network.dcdc_converters = []
+    append_dcdc = network.dcdc_converters.append
+    dcdc_names = ppc.get("dcdc_name")
+    for pos, row in enumerate(ppc["dcdc"]):
+        idx = int(row[DC_DCDC_COLS["idx"]])
+        append_dcdc(
+            _dc_array_object(
+                idx,
+                _ppc_name(dcdc_names, pos, "dcdc", idx),
+                i_node=int(row[DC_DCDC_COLS["i_node"]]),
+                j_node=int(row[DC_DCDC_COLS["j_node"]]),
+                r1=float(row[DC_DCDC_COLS["r1"]]),
+                r2=float(row[DC_DCDC_COLS["r2"]]),
+                control_type=_DC_CTRL_NAME_BY_CODE.get(int(row[DC_DCDC_COLS["control_type"]]), "P"),
+                p_set=float(row[DC_DCDC_COLS["p_set"]]),
+                i_set=float(row[DC_DCDC_COLS["i_set"]]),
+                v_set=float(row[DC_DCDC_COLS["v_set"]]),
+                run_stat=int(row[DC_DCDC_COLS["run_stat"]]),
+                i_p=float(row[DC_DCDC_COLS["i_p"]]),
+                j_p=float(row[DC_DCDC_COLS["j_p"]]),
+                i_c=float(row[DC_DCDC_COLS["i_c"]]),
+                j_c=float(row[DC_DCDC_COLS["j_c"]]),
+                i_node_obj=None,
+                j_node_obj=None,
+            )
+        )
+
+    network._topology_arrays = topology_arrays
+    network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, build_alive_maps=False)
+    return network
 
 
 class DCStateEstimator:
@@ -1399,14 +1637,7 @@ class DCStateEstimator:
     def _load_network(e_file: Path) -> DCPowerNetwork:
         """Read the DC case and build topology references used by measurements."""
         ppc = load_dc_ppc_from_e_file(e_file)
-        topology_arrays = ppc.get("_topology_arrays")
-        if topology_arrays is None:
-            topology_arrays = network_topology.prepare_dc_topology_ppc(ppc)
-            ppc["_topology_arrays"] = topology_arrays
-        network = build_dc_network_from_ppc(ppc)
-        network._topology_arrays = topology_arrays
-        network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, build_alive_maps=False)
-        return network
+        return _build_dc_se_network_from_ppc_dict(ppc)
 
     @staticmethod
     def _run_power_flow_seed(network: DCPowerNetwork, params: StateEstimationParameters, e_file: Path) -> bool:
@@ -1456,7 +1687,6 @@ class DCStateEstimator:
         ok = bool(rc == 0 and calc.converged)
         if not ok:
             DCStateEstimator._restore_power_flow_seed_snapshot(snapshot)
-            return False
         return ok
 
     @staticmethod
@@ -1906,7 +2136,7 @@ class DCStateEstimator:
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> MeasurementList:
-        return _read_measurements_direct(meas_file)
+        return _read_measurements_direct(meas_file, table_only=True)
 
     def _voltage_base(self, node_idx: int) -> float:
         return self._node_vbase_by_idx[int(node_idx)]
@@ -2101,8 +2331,10 @@ class DCStateEstimator:
             _LOAD_MEASUREMENT_KIND,
         )
         value[active] = np.divide(value[active], scale[active], out=value[active].copy(), where=np.abs(scale[active]) > 1e-12)
-        for pos, meas in enumerate(self.measurements):
-            meas.value = float(value[pos])
+        object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
+        if object_count == value.size and object_count > 0:
+            for pos, meas in enumerate(list.__iter__(self.measurements)):
+                meas.value = float(value[pos])
 
         active_rows = np.flatnonzero(active)
         active_device_keys = set(zip(table.device_type[active_rows], table.device_name[active_rows]))
