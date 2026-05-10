@@ -291,9 +291,42 @@ class PowerPlanServerTest(unittest.TestCase):
             "wind_energy",
             "pv_energy",
             "hydrogen_energy",
+            "storage_discharge_energy",
             "load_energy",
             "hydrogen_production_energy",
+            "storage_charge_energy",
         ):
+            self.assertIn(field, daily[0])
+            self.assertIsInstance(daily[0][field], (int, float))
+
+    def test_optimization_safety_result_has_summary_table_and_daily_frequency_curve(self):
+        runtime = server.OptimizationRuntime()
+        payload = runtime.apply("start", scheme="方案A")
+
+        safety_rows = payload["results"]["safety_table"]
+        metric_names = {row["指标"] for row in safety_rows}
+        for name in (
+            "向上扰动最大量",
+            "向下扰动最大量",
+            "最高频率",
+            "最低频率",
+            "频率安全风险小时数",
+        ):
+            self.assertIn(name, metric_names)
+        units = {row["指标"]: row["单位"] for row in safety_rows}
+        self.assertEqual(units["向上扰动最大量"], "kW")
+        self.assertEqual(units["向下扰动最大量"], "kW")
+        self.assertEqual(units["最高频率"], "Hz")
+        self.assertEqual(units["最低频率"], "Hz")
+        self.assertEqual(units["频率安全风险小时数"], "h")
+
+        daily = payload["results"]["curves"]["safety_daily"]
+        self.assertEqual(len(daily), 365)
+        self.assertEqual(daily[0]["day"], 1)
+        self.assertEqual(daily[-1]["day"], 365)
+        self.assertGreater(daily[0]["frequency_max"], 50)
+        self.assertLess(daily[0]["frequency_min"], 50)
+        for field in ("frequency_max", "frequency_min"):
             self.assertIn(field, daily[0])
             self.assertIsInstance(daily[0][field], (int, float))
 
@@ -700,8 +733,10 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('id="stopOptimization"', html)
         for label in ("当前状态", "启动时刻", "结束时刻", "度电成本", "绿电占比"):
             self.assertIn(label, html)
-        for tab in ("结果概览", "绿电结果", "安全结果"):
+        for tab in ("结果概览", "供能分析", "安全评估"):
             self.assertIn(tab, html)
+        self.assertNotIn("绿电结果", html)
+        self.assertNotIn("安全结果", html)
         self.assertIn('id="overviewResult"', html)
         self.assertIn('id="greenResult"', html)
         self.assertIn('id="safetyResult"', html)
@@ -734,8 +769,10 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("scrollTop", script)
         self.assertIn("data-result-tab", script)
         self.assertIn("结果概览", script)
-        self.assertIn("绿电结果", script)
-        self.assertIn("安全结果", script)
+        self.assertIn("供能分析", script)
+        self.assertIn("安全评估", script)
+        self.assertNotIn("绿电结果", script)
+        self.assertNotIn("安全结果", script)
         self.assertIn("optimizationStatusPath", script)
         self.assertIn("defaultOptimizationState", script)
         self.assertIn("scheme=", script)
@@ -825,12 +862,38 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("green_table", script)
         self.assertIn("green_daily", script)
         self.assertIn("renderGreenDailyChart", script)
+        self.assertIn("bindResultColumnResizeHandles", script)
+        self.assertIn("bindAdaptiveResultCharts", script)
+        self.assertIn("bindChartHoverCursors", script)
+        self.assertIn("updateChartHoverCursor", script)
+        self.assertIn("renderGreenHoverTooltip", script)
+        self.assertIn("ResizeObserver", script)
+        self.assertIn("resultChartMargins", script)
+        self.assertIn("chartTickIndexes", script)
+        self.assertIn("height >= 200", script)
+        self.assertIn("width < 620", script)
+        self.assertNotIn("right: 22", script)
+        self.assertIn('data-result-column-resize="green"', script)
+        self.assertIn('data-result-chart-viewport="green"', script)
+        self.assertIn("--green-result-table-width", script)
         self.assertIn("green-daily-chart", script)
         self.assertIn("green-zero-line", script)
-        self.assertIn("green-axis-label", script)
+        self.assertIn("green-zero-label", script)
+        self.assertIn('data-chart-hover="green"', script)
+        self.assertIn('data-chart-hover-line="green"', script)
+        self.assertIn('data-chart-hover-tooltip="green"', script)
+        self.assertNotIn("green-axis-label", script)
+        self.assertNotIn("green-y-axis-title", script)
+        self.assertNotIn("green-x-axis-title", script)
+        self.assertNotIn(">kWh<", script)
+        self.assertNotIn("日序号", script)
+        self.assertNotIn("renderGreenDailyDataTable", script)
+        self.assertNotIn("green-daily-data-table", script)
+        self.assertNotIn("日曲线测试数据", script)
+        self.assertNotIn("第${day}日", script)
         green_render_script = script.split("function renderGreenResult", 1)[1].split("function renderGreenDailyChart", 1)[0]
         self.assertLess(green_render_script.index("green-result-table"), green_render_script.index("green-chart-card"))
-        for label in ("柴发日电量", "风电日电量", "光伏日电量", "氢能日电量", "负荷电量", "制氢电量"):
+        for label in ("柴发日电量", "风电日电量", "光伏日电量", "氢能日电量", "储能放电量", "负荷电量", "制氢电量", "储能充电量"):
             self.assertIn(label, script)
         for metric in (
             "负荷总电量(kWh)",
@@ -848,11 +911,115 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn(".green-result-layout", css)
         green_layout_css = css.split(".green-result-layout {", 1)[1].split("}", 1)[0]
         self.assertIn("display: grid", green_layout_css)
-        self.assertIn("grid-template-columns: minmax(320px, 34%) minmax(0, 1fr)", green_layout_css)
+        self.assertIn("grid-template-columns: minmax(260px, var(--green-result-table-width, 34%)) 10px minmax(0, 1fr)", green_layout_css)
+        self.assertIn(".result-column-resize-handle", css)
+        result_column_resize_css = css.split(".result-column-resize-handle {", 1)[1].split("}", 1)[0]
+        self.assertIn("cursor: col-resize", result_column_resize_css)
         self.assertIn(".green-daily-chart", css)
+        green_chart_card_css = css.split(".green-chart-card {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: grid", green_chart_card_css)
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr)", green_chart_card_css)
+        self.assertIn(".green-chart-viewport", css)
+        green_chart_viewport_css = css.split(".green-chart-viewport,", 1)[1].split("{", 1)[1].split("}", 1)[0]
+        self.assertIn("height: 100%", green_chart_viewport_css)
+        self.assertIn("min-height: 0", green_chart_viewport_css)
         self.assertIn(".green-chart-svg", css)
+        self.assertIn(".chart-hover-line", css)
+        self.assertIn(".chart-hover-tooltip", css)
+        chart_tooltip_css = css.split(".chart-hover-tooltip {", 1)[1].split("}", 1)[0]
+        self.assertIn("position: absolute", chart_tooltip_css)
+        self.assertIn("pointer-events: none", chart_tooltip_css)
+        self.assertIn('preserveAspectRatio="xMidYMid meet"', script)
+        self.assertNotIn('preserveAspectRatio="none"', script)
+        self.assertIn('resultChartSize("green"', script)
+        green_chart_svg_css = css.split(".green-chart-svg {", 1)[1].split("}", 1)[0]
+        self.assertIn("width: 100%", green_chart_svg_css)
+        self.assertIn("height: 100%", green_chart_svg_css)
+        self.assertIn("min-height: 0", green_chart_svg_css)
         self.assertIn(".green-chart-legend", css)
         self.assertIn(".green-result-table", css)
+        self.assertNotIn(".green-daily-data-table", css)
+        self.assertNotIn(".green-daily-data-section", css)
+
+    def test_optimization_safety_frontend_renders_frequency_chart_and_table(self):
+        script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("renderSafetyResult", script)
+        self.assertIn("safety_table", script)
+        self.assertIn("safety_daily", script)
+        self.assertIn("renderSafetyDailyChart", script)
+        self.assertIn("bindResultColumnResizeHandles", script)
+        self.assertIn("bindAdaptiveResultCharts", script)
+        self.assertIn("bindChartHoverCursors", script)
+        self.assertIn("updateChartHoverCursor", script)
+        self.assertIn("renderSafetyHoverTooltip", script)
+        self.assertIn("ResizeObserver", script)
+        self.assertIn("resultChartMargins", script)
+        self.assertIn("chartTickIndexes", script)
+        self.assertIn("height >= 200", script)
+        self.assertIn("width < 620", script)
+        self.assertNotIn("right: 22", script)
+        self.assertIn('data-result-column-resize="safety"', script)
+        self.assertIn('data-result-chart-viewport="safety"', script)
+        self.assertIn("--safety-result-table-width", script)
+        self.assertIn("safety-frequency-chart", script)
+        self.assertIn("safety-center-line", script)
+        self.assertIn("safety-zero-label", script)
+        self.assertIn('data-chart-hover="safety"', script)
+        self.assertIn('data-chart-hover-line="safety"', script)
+        self.assertIn('data-chart-hover-tooltip="safety"', script)
+        self.assertIn("formatFrequencyDeviation", script)
+        self.assertNotIn("safety-axis-label", script)
+        self.assertNotIn("safety-y-axis-title", script)
+        self.assertNotIn("safety-x-axis-title", script)
+        self.assertNotIn(">Hz<", script)
+        self.assertNotIn("日序号", script)
+        self.assertNotIn(">50Hz<", script)
+        self.assertIn("向上频率最大值", script)
+        self.assertIn("向下频率最小值", script)
+        self.assertNotIn("第${day}日", script)
+        safety_render_script = script.split("function renderSafetyResult", 1)[1].split("function renderSafetyDailyChart", 1)[0]
+        self.assertLess(safety_render_script.index("safety-result-table"), safety_render_script.index("safety-chart-card"))
+        for metric in (
+            "向上扰动最大量",
+            "向下扰动最大量",
+            "最高频率",
+            "最低频率",
+            "频率安全风险小时数",
+        ):
+            self.assertIn(metric, script)
+
+        self.assertIn(".safety-result-layout", css)
+        safety_layout_css = css.split(".safety-result-layout {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: grid", safety_layout_css)
+        self.assertIn("grid-template-columns: minmax(260px, var(--safety-result-table-width, 34%)) 10px minmax(0, 1fr)", safety_layout_css)
+        self.assertIn(".result-column-resize-handle", css)
+        result_column_resize_css = css.split(".result-column-resize-handle {", 1)[1].split("}", 1)[0]
+        self.assertIn("cursor: col-resize", result_column_resize_css)
+        self.assertIn(".safety-chart-card", css)
+        safety_chart_card_css = css.split(".safety-chart-card {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: grid", safety_chart_card_css)
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr)", safety_chart_card_css)
+        self.assertIn(".safety-chart-viewport", css)
+        safety_chart_viewport_css = css.split(".green-chart-viewport,", 1)[1].split("{", 1)[1].split("}", 1)[0]
+        self.assertIn("height: 100%", safety_chart_viewport_css)
+        self.assertIn("min-height: 0", safety_chart_viewport_css)
+        self.assertIn(".safety-chart-svg", css)
+        self.assertIn(".chart-hover-line", css)
+        self.assertIn(".chart-hover-tooltip", css)
+        chart_tooltip_css = css.split(".chart-hover-tooltip {", 1)[1].split("}", 1)[0]
+        self.assertIn("position: absolute", chart_tooltip_css)
+        self.assertIn("pointer-events: none", chart_tooltip_css)
+        self.assertIn('preserveAspectRatio="xMidYMid meet"', script)
+        self.assertNotIn('preserveAspectRatio="none"', script)
+        self.assertIn('resultChartSize("safety"', script)
+        safety_chart_svg_css = css.split(".safety-chart-svg {", 1)[1].split("}", 1)[0]
+        self.assertIn("width: 100%", safety_chart_svg_css)
+        self.assertIn("height: 100%", safety_chart_svg_css)
+        self.assertIn("min-height: 0", safety_chart_svg_css)
+        self.assertIn(".safety-center-line", css)
+        self.assertIn(".safety-result-table", css)
 
     def test_planning_scheme_rail_only_shows_scheme_list_title(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")

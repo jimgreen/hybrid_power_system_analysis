@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>微电网风光氢储联合规划系统</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="assets/planning.css?v=20260510-green-result">
+  <link rel="stylesheet" href="assets/planning.css?v=20260510-energy-safety-tabs">
 </head>
 <body>
   <main class="planning-shell">
@@ -49,8 +49,8 @@
         <section class="optimization-result-card">
           <div class="result-tabs" role="tablist" aria-label="优化规划结果切换">
             <button class="result-tab active" data-result-tab="overview" type="button" aria-selected="true">结果概览</button>
-            <button class="result-tab" data-result-tab="green" type="button" aria-selected="false">绿电结果</button>
-            <button class="result-tab" data-result-tab="safety" type="button" aria-selected="false">安全结果</button>
+            <button class="result-tab" data-result-tab="green" type="button" aria-selected="false">供能分析</button>
+            <button class="result-tab" data-result-tab="safety" type="button" aria-selected="false">安全评估</button>
           </div>
           <div id="overviewResult" class="result-panel active" data-result-panel="overview" role="tabpanel"></div>
           <div id="greenResult" class="result-panel" data-result-panel="green" role="tabpanel" hidden></div>
@@ -66,6 +66,6 @@
       </section>
     </section>
   </main>
-  <script src="assets/optimize.js?v=20260510-green-result"></script>
+  <script src="assets/optimize.js?v=20260510-energy-safety-tabs"></script>
 </body>
 </html>

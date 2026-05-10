@@ -7,6 +7,13 @@ const state = {
   optimizationCommandHeight: null,
   optimizationResultHeight: null,
   optimizationLogHeight: null,
+  greenResultTableWidth: null,
+  safetyResultTableWidth: null,
+  greenDailyPoints: [],
+  safetyDailyPoints: [],
+  greenChartSize: null,
+  safetyChartSize: null,
+  resultChartResizeObserver: null,
 };
 
 const optimizationResizeMinHeights = {
@@ -17,8 +24,8 @@ const optimizationResizeMinHeights = {
 
 const resultTabLabels = {
   overview: "结果概览",
-  green: "绿电结果",
-  safety: "安全结果",
+  green: "供能分析",
+  safety: "安全评估",
 };
 
 const greenDailySeries = [
@@ -26,9 +33,31 @@ const greenDailySeries = [
   { key: "wind_energy", label: "风电日电量", direction: "up", color: "#2a9d8f" },
   { key: "pv_energy", label: "光伏日电量", direction: "up", color: "#d8a31a" },
   { key: "hydrogen_energy", label: "氢能日电量", direction: "up", color: "#4d7fd1" },
+  { key: "storage_discharge_energy", label: "储能放电量", direction: "up", color: "#5aa66f" },
   { key: "load_energy", label: "负荷电量", direction: "down", color: "#c7504a" },
   { key: "hydrogen_production_energy", label: "制氢电量", direction: "down", color: "#6b5fb5" },
+  { key: "storage_charge_energy", label: "储能充电量", direction: "down", color: "#3c9fb2" },
 ];
+
+const safetyDailySeries = [
+  { key: "frequency_max", label: "向上频率最大值", color: "#c7504a" },
+  { key: "frequency_min", label: "向下频率最小值", color: "#4d7fd1" },
+];
+
+const resultColumnResizeConfig = {
+  green: {
+    stateKey: "greenResultTableWidth",
+    cssVariable: "--green-result-table-width",
+    layoutSelector: ".green-result-layout",
+    tableSelector: ".green-result-table",
+  },
+  safety: {
+    stateKey: "safetyResultTableWidth",
+    cssVariable: "--safety-result-table-width",
+    layoutSelector: ".safety-result-layout",
+    tableSelector: ".safety-result-table",
+  },
+};
 
 document.addEventListener("DOMContentLoaded", () => {
   bindResultTabs();
@@ -157,6 +186,7 @@ function bindResultTabs() {
         panel.classList.toggle("active", active);
         panel.hidden = !active;
       });
+      window.requestAnimationFrame(refreshAdaptiveResultCharts);
     });
   });
 }
@@ -166,7 +196,10 @@ function renderOptimization(data) {
   renderMetrics(data.metrics || []);
   renderOverviewTables(data.results?.overview_tables || defaultOverviewTables(), data.results?.overview_disks || defaultOverviewDisks());
   renderGreenResult(data.results?.green_table || defaultGreenTable(), data.results?.curves?.green_daily || []);
-  renderResultPanel("safety", resultTabLabels.safety, data.results?.safety || [], data.results?.curves?.safety || []);
+  renderSafetyResult(data.results?.safety_table || defaultSafetyTable(), data.results?.curves?.safety_daily || []);
+  bindResultColumnResizeHandles();
+  bindAdaptiveResultCharts();
+  bindChartHoverCursors();
   renderOptimizationLogs(data.logs || []);
   window.requestAnimationFrame(lockOptimizationCommandHeight);
 }
@@ -209,7 +242,8 @@ function defaultOptimizationState(scheme = "") {
       green: [],
       green_table: defaultGreenTable(),
       safety: [],
-      curves: { green: [], green_daily: [], safety: [] },
+      safety_table: defaultSafetyTable(),
+      curves: { green: [], green_daily: [], safety: [], safety_daily: [] },
     },
     logs: [{ time: "", level: "", message: "正在加载当前方案优化状态" }],
     running_schemes: [],
@@ -261,6 +295,16 @@ function defaultGreenTable() {
     { "指标": "新能源总弃电量(%)", "数值": "-" },
     { "指标": "柴油消耗(吨)", "数值": "-" },
     { "指标": "制氢总量(Nm3)", "数值": "-" },
+  ];
+}
+
+function defaultSafetyTable() {
+  return [
+    { "指标": "向上扰动最大量", "数值": "-", "单位": "kW" },
+    { "指标": "向下扰动最大量", "数值": "-", "单位": "kW" },
+    { "指标": "最高频率", "数值": "-", "单位": "Hz" },
+    { "指标": "最低频率", "数值": "-", "单位": "Hz" },
+    { "指标": "频率安全风险小时数", "数值": "-", "单位": "h" },
   ];
 }
 
@@ -321,6 +365,7 @@ function renderResultPanel(key, title, rows, points) {
 function renderGreenResult(rows, dailyPoints) {
   const panel = document.getElementById("greenResult");
   if (!panel) return;
+  state.greenDailyPoints = Array.isArray(dailyPoints) ? dailyPoints : [];
   const safeRows = rows.length ? rows : defaultGreenTable();
   const formattedRows = safeRows.map((row) => ({
     "指标": row["指标"],
@@ -329,17 +374,17 @@ function renderGreenResult(rows, dailyPoints) {
   panel.innerHTML = `
     <div class="green-result-layout">
       <div class="data-table green-result-table">${renderResultTable(formattedRows)}</div>
+      <div class="result-column-resize-handle" data-result-column-resize="green" role="separator" tabindex="0" aria-label="调整供能分析表格和曲线宽度" aria-orientation="vertical"></div>
       <section class="green-chart-card green-daily-chart" aria-label="${escapeHtml(resultTabLabels.green)}日曲线">
-        ${renderGreenDailyChart(dailyPoints)}
+        <div class="green-chart-viewport" data-result-chart-viewport="green">${renderGreenDailyChart(state.greenDailyPoints)}</div>
       </section>
     </div>`;
 }
 
 function renderGreenDailyChart(points) {
   if (!points.length) return '<div class="empty-summary">暂无日曲线</div>';
-  const width = 1000;
-  const height = 330;
-  const margin = { top: 18, right: 22, bottom: 38, left: 72 };
+  const { width, height } = resultChartSize("green", 1000, 330);
+  const margin = resultChartMargins(width, height);
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
   const upSeries = greenDailySeries.filter((series) => series.direction === "up");
@@ -358,11 +403,12 @@ function renderGreenDailyChart(points) {
   const xAt = (index) => margin.left + (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
   const yUp = (value) => zeroY - (value / upMax) * topSpan;
   const yDown = (value) => zeroY + (value / downMax) * bottomSpan;
-  const positiveTicks = [0.5, 1].map((ratio) => ({
+  const tickRatios = height >= 200 ? [0.5, 1] : [1];
+  const positiveTicks = tickRatios.map((ratio) => ({
     y: yUp(upMax * ratio),
-    label: formatAxisNumber(upMax * ratio),
+    label: `+${formatAxisNumber(upMax * ratio)}`,
   }));
-  const negativeTicks = [0.5, 1].map((ratio) => ({
+  const negativeTicks = tickRatios.map((ratio) => ({
     y: yDown(downMax * ratio),
     label: `-${formatAxisNumber(downMax * ratio)}`,
   }));
@@ -370,16 +416,106 @@ function renderGreenDailyChart(points) {
     <div class="green-chart-legend">${greenDailySeries
       .map((series) => `<span><i style="background:${series.color}"></i>${escapeHtml(series.label)}</span>`)
       .join("")}</div>
-    <svg class="green-chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="绿电日曲线">
+    <svg class="green-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="绿电日曲线" data-chart-kind="green" data-chart-width="${width}" data-chart-height="${height}" data-plot-left="${margin.left}" data-plot-right="${width - margin.right}" data-plot-top="${margin.top}" data-plot-bottom="${height - margin.bottom}">
       <line class="green-axis-line" x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${height - margin.bottom}"></line>
       <line class="green-zero-line" x1="${margin.left}" y1="${zeroY.toFixed(2)}" x2="${width - margin.right}" y2="${zeroY.toFixed(2)}"></line>
       ${positiveTicks.concat(negativeTicks).map((tick) => renderGreenTick(tick, margin.left, width - margin.right)).join("")}
+      <text class="green-tick-label green-zero-label" x="${margin.left - 8}" y="${zeroY.toFixed(2)}">0</text>
       ${renderGreenStackedAreas(points, upSeries, xAt, yUp)}
       ${renderGreenStackedAreas(points, downSeries, xAt, yDown)}
-      ${renderGreenXAxis(points, xAt, zeroY, height - margin.bottom)}
-      <text class="green-axis-label" x="14" y="${margin.top + 14}">kWh</text>
-      <text class="green-axis-label" x="${width - 76}" y="${height - 8}">日序号</text>
-    </svg>`;
+      ${renderGreenXAxis(points, xAt, zeroY, height - margin.bottom, width)}
+      <line class="chart-hover-line" data-chart-hover-line="green" x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${height - margin.bottom}" hidden></line>
+      <rect class="chart-hover-capture" data-chart-hover="green" x="${margin.left}" y="${margin.top}" width="${plotWidth}" height="${plotHeight}"></rect>
+    </svg>
+    <div class="chart-hover-tooltip" data-chart-hover-tooltip="green" hidden></div>`;
+}
+
+function renderSafetyResult(rows, dailyPoints) {
+  const panel = document.getElementById("safetyResult");
+  if (!panel) return;
+  state.safetyDailyPoints = Array.isArray(dailyPoints) ? dailyPoints : [];
+  const safeRows = rows.length ? rows : defaultSafetyTable();
+  const formattedRows = safeRows.map((row) => ({
+    "指标": row["指标"],
+    "数值": typeof row["数值"] === "number" ? formatNumber(row["数值"]) : row["数值"],
+    "单位": row["单位"] || "",
+  }));
+  panel.innerHTML = `
+    <div class="safety-result-layout">
+      <div class="data-table safety-result-table">${renderResultTable(formattedRows)}</div>
+      <div class="result-column-resize-handle" data-result-column-resize="safety" role="separator" tabindex="0" aria-label="调整安全评估表格和曲线宽度" aria-orientation="vertical"></div>
+      <section class="safety-chart-card safety-frequency-chart" aria-label="${escapeHtml(resultTabLabels.safety)}日曲线">
+        <div class="safety-chart-viewport" data-result-chart-viewport="safety">${renderSafetyDailyChart(state.safetyDailyPoints)}</div>
+      </section>
+    </div>`;
+}
+
+function renderSafetyDailyChart(points) {
+  if (!points.length) return '<div class="empty-summary">暂无日曲线</div>';
+  const { width, height } = resultChartSize("safety", 1000, 330);
+  const margin = resultChartMargins(width, height);
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const centerY = margin.top + plotHeight / 2;
+  const halfSpan = Math.max(1, plotHeight / 2);
+  const maxDeviation = Math.max(
+    ...points.map((point) => Math.abs(numericFrequency(point.frequency_max) - 50)),
+    ...points.map((point) => Math.abs(numericFrequency(point.frequency_min) - 50)),
+    0.05,
+  );
+  const xAt = (index) => margin.left + (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
+  const yAt = (value) => centerY - ((numericFrequency(value) - 50) / maxDeviation) * halfSpan;
+  const maxPath = linePath(points, (point) => point.frequency_max, xAt, yAt);
+  const minPath = linePath(points, (point) => point.frequency_min, xAt, yAt);
+  const upLabel = `+${formatFrequencyDeviation(maxDeviation)}`;
+  const downLabel = `-${formatFrequencyDeviation(maxDeviation)}`;
+  return `
+    <div class="safety-chart-legend">${safetyDailySeries
+      .map((series) => `<span><i style="background:${series.color}"></i>${escapeHtml(series.label)}</span>`)
+      .join("")}</div>
+    <svg class="safety-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="安全频率日曲线" data-chart-kind="safety" data-chart-width="${width}" data-chart-height="${height}" data-plot-left="${margin.left}" data-plot-right="${width - margin.right}" data-plot-top="${margin.top}" data-plot-bottom="${height - margin.bottom}">
+      <line class="safety-axis-line" x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${height - margin.bottom}"></line>
+      <line class="safety-center-line" x1="${margin.left}" y1="${centerY.toFixed(2)}" x2="${width - margin.right}" y2="${centerY.toFixed(2)}"></line>
+      <line class="safety-grid-line" x1="${margin.left}" y1="${margin.top}" x2="${width - margin.right}" y2="${margin.top}"></line>
+      <line class="safety-grid-line" x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}"></line>
+      <text class="safety-tick-label" x="${margin.left - 8}" y="${margin.top + 2}">${escapeHtml(upLabel)}</text>
+      <text class="safety-tick-label safety-zero-label" x="${margin.left - 8}" y="${centerY.toFixed(2)}">0</text>
+      <text class="safety-tick-label" x="${margin.left - 8}" y="${height - margin.bottom - 2}">${escapeHtml(downLabel)}</text>
+      <path class="safety-frequency-area up" d="${frequencyAreaPath(points, (point) => point.frequency_max, xAt, yAt, centerY)}"></path>
+      <path class="safety-frequency-area down" d="${frequencyAreaPath(points, (point) => point.frequency_min, xAt, yAt, centerY)}"></path>
+      <path class="safety-frequency-line up" d="${maxPath}"></path>
+      <path class="safety-frequency-line down" d="${minPath}"></path>
+      ${renderSafetyXAxis(points, xAt, centerY, height - margin.bottom, width)}
+      <line class="chart-hover-line" data-chart-hover-line="safety" x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${height - margin.bottom}" hidden></line>
+      <rect class="chart-hover-capture" data-chart-hover="safety" x="${margin.left}" y="${margin.top}" width="${plotWidth}" height="${plotHeight}"></rect>
+    </svg>
+    <div class="chart-hover-tooltip" data-chart-hover-tooltip="safety" hidden></div>`;
+}
+
+function linePath(points, valueAccessor, xAt, yAt) {
+  return points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${xAt(index).toFixed(2)} ${yAt(valueAccessor(point)).toFixed(2)}`)
+    .join(" ");
+}
+
+function frequencyAreaPath(points, valueAccessor, xAt, yAt, centerY) {
+  const line = points.map((point, index) => `${index === 0 ? "M" : "L"} ${xAt(index).toFixed(2)} ${yAt(valueAccessor(point)).toFixed(2)}`).join(" ");
+  const lastX = xAt(points.length - 1).toFixed(2);
+  const firstX = xAt(0).toFixed(2);
+  return `${line} L ${lastX} ${centerY.toFixed(2)} L ${firstX} ${centerY.toFixed(2)} Z`;
+}
+
+function renderSafetyXAxis(points, xAt, centerY, bottomY, width) {
+  const tickIndexes = chartTickIndexes(points, width);
+  return tickIndexes
+    .map((index) => {
+      const x = xAt(index);
+      const day = points[index]?.day ?? index + 1;
+      return `
+        <line class="safety-x-tick" x1="${x.toFixed(2)}" y1="${centerY.toFixed(2)}" x2="${x.toFixed(2)}" y2="${bottomY}"></line>
+        <text class="safety-x-label" x="${x.toFixed(2)}" y="${bottomY + 14}">${escapeHtml(day)}</text>`;
+    })
+    .join("");
 }
 
 function renderGreenStackedAreas(points, seriesList, xAt, yAt) {
@@ -406,15 +542,15 @@ function renderGreenTick(tick, left, right) {
     <text class="green-tick-label" x="${left - 8}" y="${tick.y.toFixed(2)}">${escapeHtml(tick.label)}</text>`;
 }
 
-function renderGreenXAxis(points, xAt, zeroY, bottomY) {
-  const tickIndexes = [0, 90, 181, 272, points.length - 1].filter((index, position, values) => index >= 0 && index < points.length && values.indexOf(index) === position);
+function renderGreenXAxis(points, xAt, zeroY, bottomY, width) {
+  const tickIndexes = chartTickIndexes(points, width);
   return tickIndexes
     .map((index) => {
       const x = xAt(index);
       const day = points[index]?.day ?? index + 1;
       return `
         <line class="green-x-tick" x1="${x.toFixed(2)}" y1="${zeroY.toFixed(2)}" x2="${x.toFixed(2)}" y2="${bottomY}"></line>
-        <text class="green-x-label" x="${x.toFixed(2)}" y="${bottomY + 24}">${escapeHtml(`第${day}日`)}</text>`;
+        <text class="green-x-label" x="${x.toFixed(2)}" y="${bottomY + 14}">${escapeHtml(day)}</text>`;
     })
     .join("");
 }
@@ -430,6 +566,11 @@ function renderResultTable(rows) {
 function numericValue(value) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function numericFrequency(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 50;
 }
 
 function renderMiniBars(points) {
@@ -456,6 +597,25 @@ function formatAxisNumber(value) {
   return Math.round(number).toLocaleString("zh-CN");
 }
 
+function formatFrequency(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number.toFixed(2)} Hz`;
+}
+
+function formatFrequencyDeviation(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return number.toFixed(2);
+}
+
+function formatSignedDeviation(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  const sign = number >= 0 ? "+" : "";
+  return `${sign}${number.toFixed(2)}`;
+}
+
 function renderOptimizationLogs(logs) {
   const box = document.getElementById("optimizationLogs");
   if (!logs.length) {
@@ -466,6 +626,274 @@ function renderOptimizationLogs(logs) {
     .map((item) => `<div class="log-line ${escapeHtml(item.level || "")}"><span>${escapeHtml(item.time || "")}</span><strong>${escapeHtml(item.message || "")}</strong></div>`)
     .join("");
   box.scrollTop = box.scrollHeight;
+}
+
+function bindAdaptiveResultCharts() {
+  if (!("ResizeObserver" in window)) {
+    window.requestAnimationFrame(refreshAdaptiveResultCharts);
+    return;
+  }
+  if (!state.resultChartResizeObserver) {
+    state.resultChartResizeObserver = new ResizeObserver((entries) => {
+      entries.forEach((entry) => updateResultChartSize(entry.target, entry.contentRect));
+    });
+  }
+  state.resultChartResizeObserver.disconnect();
+  document.querySelectorAll("[data-result-chart-viewport]").forEach((viewport) => {
+    state.resultChartResizeObserver.observe(viewport);
+  });
+  window.requestAnimationFrame(refreshAdaptiveResultCharts);
+}
+
+function refreshAdaptiveResultCharts() {
+  document.querySelectorAll("[data-result-chart-viewport]").forEach((viewport) => updateResultChartSize(viewport));
+}
+
+function updateResultChartSize(viewport, rect = viewport.getBoundingClientRect()) {
+  const kind = viewport.dataset.resultChartViewport;
+  if (kind !== "green" && kind !== "safety") return;
+  const width = Math.round(rect.width || 0);
+  const height = Math.round(rect.height || 0);
+  if (width < 80 || height < 80) return;
+
+  const sizeKey = `${kind}ChartSize`;
+  const previous = state[sizeKey] || {};
+  if (Math.abs((previous.width || 0) - width) <= 2 && Math.abs((previous.height || 0) - height) <= 2) return;
+
+  state[sizeKey] = { width, height };
+  renderAdaptiveResultChart(kind, viewport);
+}
+
+function renderAdaptiveResultChart(kind, viewport = document.querySelector(`[data-result-chart-viewport="${kind}"]`)) {
+  if (!viewport) return;
+  if (kind === "green") {
+    viewport.innerHTML = renderGreenDailyChart(state.greenDailyPoints || []);
+  } else if (kind === "safety") {
+    viewport.innerHTML = renderSafetyDailyChart(state.safetyDailyPoints || []);
+  }
+  bindChartHoverCursors();
+}
+
+function bindChartHoverCursors() {
+  document.querySelectorAll("[data-chart-hover]").forEach((capture) => {
+    if (capture.dataset.hoverBound === "true") return;
+    capture.dataset.hoverBound = "true";
+    capture.addEventListener("pointerenter", (event) => updateChartHoverCursor(event, capture));
+    capture.addEventListener("pointermove", (event) => updateChartHoverCursor(event, capture));
+    capture.addEventListener("pointerleave", () => hideChartHoverCursor(capture));
+    capture.addEventListener("pointercancel", () => hideChartHoverCursor(capture));
+  });
+}
+
+function updateChartHoverCursor(event, capture = event.currentTarget) {
+  const kind = capture?.dataset?.chartHover;
+  const points = kind === "green" ? state.greenDailyPoints : kind === "safety" ? state.safetyDailyPoints : [];
+  if (!kind || !points.length) return;
+
+  const svg = capture.ownerSVGElement;
+  const viewport = capture.closest("[data-result-chart-viewport]");
+  const line = svg?.querySelector(`[data-chart-hover-line="${kind}"]`);
+  const tooltip = viewport?.querySelector(`[data-chart-hover-tooltip="${kind}"]`);
+  if (!svg || !viewport || !line || !tooltip) return;
+
+  const chartWidth = numericSvgAttribute(svg, "chartWidth", "width");
+  const plotLeft = numericSvgAttribute(svg, "plotLeft", "left");
+  const plotRight = numericSvgAttribute(svg, "plotRight", "right");
+  const svgRect = svg.getBoundingClientRect();
+  if (!chartWidth || !svgRect.width || plotRight <= plotLeft) return;
+
+  const pointerX = ((event.clientX - svgRect.left) / svgRect.width) * chartWidth;
+  const clampedX = Math.min(Math.max(pointerX, plotLeft), plotRight);
+  const ratio = (clampedX - plotLeft) / (plotRight - plotLeft);
+  const index = Math.min(points.length - 1, Math.max(0, Math.round(ratio * (points.length - 1))));
+  const snappedX = plotLeft + (points.length === 1 ? (plotRight - plotLeft) / 2 : (index / (points.length - 1)) * (plotRight - plotLeft));
+
+  line.setAttribute("x1", snappedX.toFixed(2));
+  line.setAttribute("x2", snappedX.toFixed(2));
+  line.removeAttribute("hidden");
+
+  tooltip.innerHTML = kind === "green" ? renderGreenHoverTooltip(points[index], index) : renderSafetyHoverTooltip(points[index], index);
+  tooltip.removeAttribute("hidden");
+  positionChartHoverTooltip(tooltip, viewport, event);
+}
+
+function hideChartHoverCursor(capture) {
+  const kind = capture?.dataset?.chartHover;
+  const svg = capture?.ownerSVGElement;
+  const viewport = capture?.closest("[data-result-chart-viewport]");
+  svg?.querySelector(`[data-chart-hover-line="${kind}"]`)?.setAttribute("hidden", "");
+  viewport?.querySelector(`[data-chart-hover-tooltip="${kind}"]`)?.setAttribute("hidden", "");
+}
+
+function positionChartHoverTooltip(tooltip, viewport, event) {
+  const viewportRect = viewport.getBoundingClientRect();
+  const offset = 14;
+  const padding = 8;
+  const localX = event.clientX - viewportRect.left;
+  const localY = event.clientY - viewportRect.top;
+  const width = tooltip.offsetWidth || 180;
+  const height = tooltip.offsetHeight || 120;
+  let left = localX + offset;
+  let top = localY + offset;
+
+  if (left + width + padding > viewport.clientWidth) left = localX - width - offset;
+  if (top + height + padding > viewport.clientHeight) top = localY - height - offset;
+
+  tooltip.style.left = `${Math.max(padding, Math.min(left, viewport.clientWidth - width - padding))}px`;
+  tooltip.style.top = `${Math.max(padding, Math.min(top, viewport.clientHeight - height - padding))}px`;
+}
+
+function renderGreenHoverTooltip(point, index) {
+  const day = point?.day ?? index + 1;
+  const rows = greenDailySeries
+    .map((series) => {
+      const value = formatNumber(numericValue(point?.[series.key]));
+      return `<div><span>${escapeHtml(series.label)}</span><strong>${escapeHtml(value)} kWh</strong></div>`;
+    })
+    .join("");
+  return `<h3>第 ${escapeHtml(day)} 天</h3>${rows}`;
+}
+
+function renderSafetyHoverTooltip(point, index) {
+  const day = point?.day ?? index + 1;
+  const maxFrequency = numericFrequency(point?.frequency_max);
+  const minFrequency = numericFrequency(point?.frequency_min);
+  return `
+    <h3>第 ${escapeHtml(day)} 天</h3>
+    <div><span>向上频率最大值</span><strong>${escapeHtml(formatFrequency(maxFrequency))} (${escapeHtml(formatSignedDeviation(maxFrequency - 50))})</strong></div>
+    <div><span>向下频率最小值</span><strong>${escapeHtml(formatFrequency(minFrequency))} (${escapeHtml(formatSignedDeviation(minFrequency - 50))})</strong></div>`;
+}
+
+function numericSvgAttribute(svg, dataKey, fallbackName) {
+  const dataValue = Number(svg.dataset[dataKey]);
+  if (Number.isFinite(dataValue)) return dataValue;
+  const attrValue = Number(svg.getAttribute(fallbackName));
+  return Number.isFinite(attrValue) ? attrValue : 0;
+}
+
+function resultChartSize(kind, fallbackWidth, fallbackHeight) {
+  const size = state[`${kind}ChartSize`] || {};
+  return {
+    width: Math.max(260, Math.round(size.width || fallbackWidth)),
+    height: Math.max(160, Math.round(size.height || fallbackHeight)),
+  };
+}
+
+function resultChartMargins(width, height) {
+  const compactWidth = width < 620;
+  return {
+    top: 18,
+    right: compactWidth ? 36 : 48,
+    bottom: height >= 200 ? 34 : 42,
+    left: compactWidth ? 62 : 72,
+  };
+}
+
+function chartTickIndexes(points, width) {
+  const lastIndex = points.length - 1;
+  const indexes = width < 620 ? [0, Math.round(lastIndex / 2), lastIndex] : [0, 90, 181, 272, lastIndex];
+  return indexes.filter((index, position, values) => index >= 0 && index < points.length && values.indexOf(index) === position);
+}
+
+function bindResultColumnResizeHandles() {
+  document.querySelectorAll("[data-result-column-resize]").forEach((handle) => {
+    if (handle.dataset.resizeBound === "true") return;
+    const kind = handle.dataset.resultColumnResize;
+    const config = resultColumnResizeConfig[kind];
+    if (!config) return;
+    handle.dataset.resizeBound = "true";
+
+    const applyWidth = (width) => setResultColumnTableWidth(kind, width, handle);
+    const currentWidth = () => currentResultColumnTableWidth(kind, handle);
+
+    handle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidth = currentWidth();
+      handle.classList.add("dragging");
+      handle.setPointerCapture?.(event.pointerId);
+
+      const onMove = (moveEvent) => {
+        applyWidth(startWidth + moveEvent.clientX - startX);
+      };
+      const onDone = () => {
+        handle.classList.remove("dragging");
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onDone);
+        window.removeEventListener("pointercancel", onDone);
+      };
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onDone);
+      window.addEventListener("pointercancel", onDone);
+    });
+
+    handle.addEventListener("keydown", (event) => {
+      const keySteps = {
+        ArrowLeft: -24,
+        ArrowRight: 24,
+        PageDown: -96,
+        PageUp: 96,
+      };
+      if (event.key in keySteps) {
+        event.preventDefault();
+        applyWidth(currentWidth() + keySteps[event.key]);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        applyWidth(resultColumnWidthBounds(kind, handle).min);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        applyWidth(resultColumnWidthBounds(kind, handle).max);
+      }
+    });
+
+    handle.setAttribute("aria-valuenow", String(Math.round(currentWidth())));
+    const bounds = resultColumnWidthBounds(kind, handle);
+    handle.setAttribute("aria-valuemin", String(Math.round(bounds.min)));
+    handle.setAttribute("aria-valuemax", String(Math.round(bounds.max)));
+  });
+}
+
+function setResultColumnTableWidth(kind, width, handle) {
+  const config = resultColumnResizeConfig[kind];
+  if (!config) return;
+  const bounds = resultColumnWidthBounds(kind, handle);
+  const numericWidth = Number(width);
+  const safeWidth = Math.min(Math.max(Number.isFinite(numericWidth) ? numericWidth : bounds.min, bounds.min), bounds.max);
+  const roundedWidth = Math.round(safeWidth);
+  state[config.stateKey] = roundedWidth;
+  document.documentElement.style.setProperty(config.cssVariable, `${roundedWidth}px`);
+  handle?.setAttribute("aria-valuenow", String(roundedWidth));
+  handle?.setAttribute("aria-valuemin", String(Math.round(bounds.min)));
+  handle?.setAttribute("aria-valuemax", String(Math.round(bounds.max)));
+}
+
+function currentResultColumnTableWidth(kind, handle) {
+  const config = resultColumnResizeConfig[kind];
+  if (!config) return 360;
+  const layout = resultColumnLayout(kind, handle);
+  const table = layout?.querySelector(config.tableSelector);
+  return state[config.stateKey] || table?.getBoundingClientRect().width || 360;
+}
+
+function resultColumnWidthBounds(kind, handle) {
+  const layout = resultColumnLayout(kind, handle);
+  if (!layout) return { min: 260, max: 620 };
+  const style = window.getComputedStyle(layout);
+  const gap = cssNumber(style.columnGap || style.gap);
+  const handleWidth = handle?.getBoundingClientRect().width || 10;
+  const minTableWidth = 260;
+  const minChartWidth = 320;
+  const maxTableWidth = layout.clientWidth - gap * 2 - handleWidth - minChartWidth;
+  return {
+    min: minTableWidth,
+    max: Math.max(minTableWidth, maxTableWidth),
+  };
+}
+
+function resultColumnLayout(kind, handle) {
+  const config = resultColumnResizeConfig[kind];
+  return config ? handle?.closest(config.layoutSelector) : null;
 }
 
 function bindOptimizationResultResizeHandle() {

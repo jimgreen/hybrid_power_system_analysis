@@ -251,6 +251,7 @@ class OptimizationRuntime:
         wind_energy_kwh = wind_energy * 1000
         pv_energy_kwh = pv_energy * 1000
         storage_energy_kwh = storage_energy * 1000
+        storage_charge_energy_kwh = round(storage_energy_kwh / 0.9, 1)
         fuel_cell_energy_kwh = fuel_cell_energy * 1000
         hydrogen_production_nm3 = hydrogen_production * 10000
         hydrogen_production_energy_kwh = hydrogen_production_nm3 / 0.2
@@ -261,7 +262,15 @@ class OptimizationRuntime:
             pv_energy_kwh,
             fuel_cell_energy_kwh,
             hydrogen_production_energy_kwh,
+            storage_energy_kwh,
+            storage_charge_energy_kwh,
         )
+        safety_daily = self._safety_daily_frequency_curve_unlocked()
+        highest_frequency = max(point["frequency_max"] for point in safety_daily)
+        lowest_frequency = min(point["frequency_min"] for point in safety_daily)
+        upward_disturbance = round(max(860.0, 1480.0 - self.progress * 5.8), 1)
+        downward_disturbance = round(max(720.0, 1310.0 - self.progress * 5.1), 1)
+        frequency_risk_hours = max(0, int(round(68 - self.progress * 0.55)))
         return {
             "overview_tables": [
                 {
@@ -342,6 +351,13 @@ class OptimizationRuntime:
                 {"指标": "频率安全裕度", "数值": frequency_margin, "单位": "p.u.", "说明": "频率约束裕度"},
                 {"指标": "N-1校核", "数值": "通过" if self.progress >= 35 else "计算中", "单位": "", "说明": "新能源 N-1 约束校核"},
             ],
+            "safety_table": [
+                {"指标": "向上扰动最大量", "数值": upward_disturbance, "单位": "kW"},
+                {"指标": "向下扰动最大量", "数值": downward_disturbance, "单位": "kW"},
+                {"指标": "最高频率", "数值": highest_frequency, "单位": "Hz"},
+                {"指标": "最低频率", "数值": lowest_frequency, "单位": "Hz"},
+                {"指标": "频率安全风险小时数", "数值": frequency_risk_hours, "单位": "h"},
+            ],
             "curves": {
                 "overview": [
                     {"label": "20%", "value": round(cost + 0.08, 3)},
@@ -362,6 +378,7 @@ class OptimizationRuntime:
                     {"label": "频率", "value": round(frequency_margin * 10, 2)},
                     {"label": "N-1", "value": 100 if self.progress >= 35 else max(10, self.progress)},
                 ],
+                "safety_daily": safety_daily,
             },
         }
 
@@ -373,6 +390,8 @@ class OptimizationRuntime:
         pv_total: float,
         hydrogen_total: float,
         hydrogen_production_total: float,
+        storage_discharge_total: float,
+        storage_charge_total: float,
     ) -> list[dict[str, float | int]]:
         days = list(range(1, 366))
 
@@ -387,6 +406,8 @@ class OptimizationRuntime:
             "pv_energy": [seasonal(day, -1.15, 0.34, 0.04) for day in days],
             "hydrogen_energy": [seasonal(day, 0.35, 0.16, 0.03) for day in days],
             "hydrogen_production_energy": [seasonal(day, -0.75, 0.2, 0.04) for day in days],
+            "storage_discharge_energy": [seasonal(day, 0.1, 0.11, 0.06) for day in days],
+            "storage_charge_energy": [seasonal(day, -0.9, 0.18, 0.05) for day in days],
         }
         totals = {
             "load_energy": load_total,
@@ -395,6 +416,8 @@ class OptimizationRuntime:
             "pv_energy": pv_total,
             "hydrogen_energy": hydrogen_total,
             "hydrogen_production_energy": hydrogen_production_total,
+            "storage_discharge_energy": storage_discharge_total,
+            "storage_charge_energy": storage_charge_total,
         }
         scaled: dict[str, list[float]] = {}
         for key, values in raw.items():
@@ -408,11 +431,31 @@ class OptimizationRuntime:
                 "wind_energy": scaled["wind_energy"][index],
                 "pv_energy": scaled["pv_energy"][index],
                 "hydrogen_energy": scaled["hydrogen_energy"][index],
+                "storage_discharge_energy": scaled["storage_discharge_energy"][index],
                 "load_energy": scaled["load_energy"][index],
                 "hydrogen_production_energy": scaled["hydrogen_production_energy"][index],
+                "storage_charge_energy": scaled["storage_charge_energy"][index],
             }
             for index, day in enumerate(days)
         ]
+
+    def _safety_daily_frequency_curve_unlocked(self) -> list[dict[str, float | int]]:
+        days = list(range(1, 366))
+        max_deviation_base = max(0.07, 0.22 - self.progress * 0.0012)
+        min_deviation_base = max(0.06, 0.2 - self.progress * 0.001)
+        points = []
+        for day in days:
+            phase = 2 * math.pi * (day - 1) / 365
+            frequency_max = 50 + max_deviation_base + 0.035 * math.sin(phase + 0.7) + 0.012 * math.sin(phase * 2.4)
+            frequency_min = 50 - min_deviation_base - 0.032 * math.cos(phase - 0.25) - 0.01 * math.sin(phase * 2.1)
+            points.append(
+                {
+                    "day": day,
+                    "frequency_max": round(frequency_max, 3),
+                    "frequency_min": round(frequency_min, 3),
+                }
+            )
+        return points
 
     def _append_log_unlocked(self, level: str, message: str) -> None:
         self._logs.append({"time": _now_text(), "level": level, "message": message})
