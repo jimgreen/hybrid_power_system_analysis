@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>南极秦岭站综合能量管理系统</title>
+  <title>考察站风-光-氢-储-柴联合规划系统</title>
+  <link rel="icon" href="data:,">
   <style>
     * { box-sizing: border-box; }
 
@@ -23,11 +24,21 @@
       width: 100vw;
       height: 100vh;
       min-height: 720px;
-      background-image: url("assets/main-dashboard-bg.png");
-      background-position: center;
-      background-size: cover;
-      background-repeat: no-repeat;
+      overflow: hidden;
       isolation: isolate;
+    }
+
+    .screen::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image: url("assets/main-dashboard-bg.png?v=20260510-title-safe");
+      background-position: center;
+      background-size: contain;
+      background-repeat: no-repeat;
+      filter: saturate(1.08) brightness(0.74) contrast(1.08);
+      opacity: 1;
+      z-index: 0;
     }
 
     .screen::after {
@@ -36,78 +47,274 @@
       inset: 0;
       pointer-events: none;
       background:
-        linear-gradient(90deg, rgba(2, 10, 22, 0.32), transparent 18%, transparent 82%, rgba(2, 10, 22, 0.22)),
-        radial-gradient(circle at 50% 52%, transparent 0 48%, rgba(2, 10, 22, 0.18) 78%);
+        linear-gradient(180deg, rgba(0, 16, 45, 0.18), rgba(0, 10, 30, 0.46) 58%, rgba(0, 7, 20, 0.72)),
+        radial-gradient(circle at 50% 43%, rgba(13, 116, 204, 0.36), transparent 44%),
+        linear-gradient(90deg, rgba(2, 10, 22, 0.76), transparent 18%, transparent 82%, rgba(2, 10, 22, 0.76));
       z-index: 1;
     }
 
-    .hot-nav {
+    .home-user-status {
       position: absolute;
-      left: clamp(18px, 2.3vw, 40px);
-      top: clamp(190px, 26vh, 260px);
-      width: clamp(190px, 14vw, 260px);
-      display: grid;
-      gap: clamp(10px, 1.5vh, 16px);
-      z-index: 3;
-    }
-
-    .hot-nav a {
-      height: clamp(52px, 7.3vh, 70px);
-      display: flex;
+      top: 24px;
+      right: 32px;
+      z-index: 5;
+      display: inline-flex;
       align-items: center;
-      padding-left: clamp(76px, 5.4vw, 102px);
-      border: 1px solid rgba(21, 211, 255, 0.58);
-      border-radius: 6px;
-      background: linear-gradient(90deg, rgba(5, 34, 70, 0.74), rgba(4, 19, 42, 0.44));
-      color: #eff8ff;
-      font-size: clamp(17px, 1.35vw, 25px);
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid rgba(20, 190, 255, 0.58);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(3, 35, 84, 0.82), rgba(1, 14, 42, 0.9));
+      color: #bdeaff;
+      box-shadow: inset 0 0 18px rgba(24, 175, 255, 0.22), 0 0 24px rgba(0, 166, 255, 0.24);
+      font-size: 15px;
       font-weight: 800;
-      letter-spacing: 0;
-      box-shadow:
-        inset 0 0 18px rgba(24, 175, 255, 0.36),
-        0 0 18px rgba(0, 173, 255, 0.18);
-      text-shadow: 0 0 10px rgba(44, 183, 255, 0.74);
     }
 
-    .hot-nav a:hover,
-    .hot-nav a:focus-visible {
-      outline: none;
-      border-color: rgba(44, 230, 255, 0.92);
-      background: linear-gradient(90deg, rgba(7, 74, 130, 0.84), rgba(5, 32, 74, 0.62));
-      box-shadow:
-        inset 0 0 22px rgba(24, 175, 255, 0.56),
-        0 0 30px rgba(0, 173, 255, 0.42);
-      transform: translateX(3px);
+    .home-user-status[hidden],
+    [data-admin-only][hidden] {
+      display: none;
     }
 
-    .quick-links {
+    .home-user-status strong {
+      color: #21d5ff;
+    }
+
+    .home-user-status a,
+    .home-user-status button {
+      padding: 6px 9px;
+      border: 1px solid rgba(21, 211, 255, 0.48);
+      border-radius: 8px;
+      background: rgba(5, 34, 70, 0.7);
+      color: #eff8ff;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .feature-entry-grid {
       position: absolute;
-      right: clamp(30px, 4vw, 70px);
-      bottom: clamp(30px, 4.5vh, 58px);
-      display: flex;
-      gap: 12px;
+      left: 50%;
+      top: 50%;
+      width: min(1140px, calc(100vw - 260px));
+      min-height: clamp(320px, 41vh, 400px);
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: clamp(24px, 2.2vw, 40px);
+      padding: clamp(40px, 4.2vh, 58px) clamp(42px, 3.8vw, 68px);
+      transform: translate(-50%, -29%);
+      isolation: isolate;
       z-index: 3;
     }
 
-    .quick-links a {
-      min-width: 136px;
-      padding: 12px 16px;
-      border: 1px solid rgba(21, 211, 255, 0.52);
-      border-radius: 6px;
-      background: rgba(3, 18, 39, 0.72);
-      color: #bfeeff;
-      font-size: 14px;
-      font-weight: 700;
-      text-align: center;
-      box-shadow: inset 0 0 16px rgba(24, 175, 255, 0.24);
+    .feature-entry-grid::before,
+    .feature-entry-grid::after {
+      content: "";
+      position: absolute;
+      pointer-events: none;
+      z-index: -1;
     }
 
-    .quick-links a:hover,
-    .quick-links a:focus-visible {
+    .feature-entry-grid::before {
+      inset: 0;
+      border: 1px solid rgba(20, 190, 255, 0.64);
+      border-radius: 10px;
+      background:
+        linear-gradient(90deg, transparent 0 5%, rgba(25, 202, 255, 0.52) 5% 7%, transparent 7% 93%, rgba(25, 202, 255, 0.52) 93% 95%, transparent 95%),
+        linear-gradient(180deg, rgba(0, 90, 180, 0.2), rgba(0, 26, 68, 0.64));
+      box-shadow:
+        inset 0 0 42px rgba(23, 170, 255, 0.23),
+        inset 0 0 90px rgba(0, 56, 130, 0.3),
+        0 0 42px rgba(0, 166, 255, 0.4),
+        0 24px 80px rgba(0, 6, 20, 0.46);
+      clip-path: polygon(4% 0, 96% 0, 100% 16%, 100% 84%, 96% 100%, 4% 100%, 0 84%, 0 16%);
+    }
+
+    .feature-entry-grid::after {
+      left: 8%;
+      right: 8%;
+      bottom: 24px;
+      height: 2px;
+      background:
+        linear-gradient(90deg, transparent, rgba(35, 211, 255, 0.9), transparent),
+        repeating-linear-gradient(90deg, transparent 0 18px, rgba(35, 211, 255, 0.62) 18px 24px);
+      box-shadow: 0 0 16px rgba(35, 211, 255, 0.82);
+    }
+
+    .feature-entry {
+      position: relative;
+      min-height: clamp(248px, 32vh, 318px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: clamp(20px, 2.4vh, 30px);
+      padding: clamp(24px, 2.2vw, 34px);
+      border: 1px solid rgba(39, 202, 255, 0.82);
+      border-radius: 10px;
+      background:
+        radial-gradient(circle at 50% 28%, rgba(36, 210, 255, 0.16), transparent 36%),
+        linear-gradient(180deg, rgba(3, 35, 84, 0.78), rgba(1, 14, 42, 0.92));
+      box-shadow:
+        inset 0 0 0 1px rgba(69, 223, 255, 0.22),
+        inset 0 0 44px rgba(0, 143, 255, 0.24),
+        0 0 30px rgba(0, 166, 255, 0.32),
+        0 20px 54px rgba(0, 8, 28, 0.38);
+      backdrop-filter: blur(3px);
+      transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+    }
+
+    .feature-entry::before,
+    .feature-entry::after {
+      content: "";
+      position: absolute;
+      pointer-events: none;
+    }
+
+    .feature-entry::before {
+      inset: 12px;
+      border: 1px solid rgba(39, 202, 255, 0.54);
+      border-radius: 7px;
+      box-shadow:
+        inset 0 0 22px rgba(39, 202, 255, 0.22),
+        0 0 12px rgba(39, 202, 255, 0.18);
+      clip-path: polygon(7% 0, 93% 0, 100% 12%, 100% 88%, 93% 100%, 7% 100%, 0 88%, 0 12%);
+    }
+
+    .feature-entry::after {
+      left: 13%;
+      right: 13%;
+      bottom: 58px;
+      height: 2px;
+      background:
+        linear-gradient(90deg, transparent, rgba(47, 221, 255, 0.96), transparent),
+        repeating-linear-gradient(90deg, transparent 0 28px, rgba(47, 221, 255, 0.58) 28px 36px);
+      box-shadow: 0 0 12px rgba(47, 221, 255, 0.9);
+    }
+
+    .feature-entry:hover,
+    .feature-entry:focus-visible {
       outline: none;
-      color: #ffffff;
-      border-color: rgba(74, 255, 204, 0.82);
-      box-shadow: inset 0 0 18px rgba(74, 255, 204, 0.24), 0 0 22px rgba(0, 173, 255, 0.28);
+      transform: translateY(-8px);
+      border-color: rgba(108, 238, 255, 0.98);
+      background:
+        radial-gradient(circle at 50% 28%, rgba(44, 225, 255, 0.24), transparent 38%),
+        linear-gradient(180deg, rgba(3, 50, 112, 0.84), rgba(2, 21, 58, 0.94));
+      box-shadow:
+        inset 0 0 0 1px rgba(124, 241, 255, 0.26),
+        inset 0 0 44px rgba(0, 178, 255, 0.24),
+        0 0 42px rgba(0, 190, 255, 0.48),
+        0 24px 54px rgba(0, 13, 40, 0.5);
+    }
+
+    .feature-icon {
+      position: relative;
+      width: clamp(132px, 10vw, 176px);
+      height: clamp(132px, 10vw, 176px);
+      display: grid;
+      place-items: center;
+      color: #21d5ff;
+      filter:
+        drop-shadow(0 0 12px rgba(25, 205, 255, 0.92))
+        drop-shadow(0 0 26px rgba(0, 150, 255, 0.48));
+      z-index: 1;
+    }
+
+    .feature-icon svg {
+      width: 100%;
+      height: 100%;
+      stroke: currentColor;
+      stroke-width: 2.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: rgba(25, 205, 255, 0.12);
+    }
+
+    .feature-entry strong {
+      color: #eff8ff;
+      font-size: clamp(31px, 2.35vw, 43px);
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      text-shadow: 0 0 18px rgba(44, 183, 255, 0.95), 0 3px 3px rgba(0, 8, 20, 0.86);
+      z-index: 1;
+    }
+
+    .energy-side {
+      position: absolute;
+      top: 50%;
+      min-height: clamp(320px, 41vh, 400px);
+      display: grid;
+      align-content: space-around;
+      gap: 0;
+      color: #27d6ff;
+      transform: translateY(-29%);
+      z-index: 3;
+    }
+
+    .energy-left {
+      left: max(48px, calc(50% - 760px));
+    }
+
+    .energy-right {
+      right: max(48px, calc(50% - 760px));
+    }
+
+    .energy-side span {
+      position: relative;
+      width: clamp(64px, 5.8vw, 96px);
+      height: clamp(64px, 5.8vw, 96px);
+      display: grid;
+      place-items: center;
+      opacity: 0.9;
+      filter: drop-shadow(0 0 10px rgba(25, 205, 255, 0.78));
+    }
+
+    .energy-side svg {
+      width: 100%;
+      height: 100%;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: rgba(25, 205, 255, 0.1);
+    }
+
+    .energy-side span::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      width: clamp(62px, 7vw, 112px);
+      height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(39, 214, 255, 0.94));
+      box-shadow: 0 0 10px rgba(39, 214, 255, 0.9);
+    }
+
+    .energy-left span::after {
+      left: 100%;
+    }
+
+    .energy-right span::after {
+      right: 100%;
+      transform: rotate(180deg);
+    }
+
+    .energy-side span::before {
+      content: "";
+      position: absolute;
+      top: calc(50% - 4px);
+      width: 8px;
+      height: 8px;
+      border: 2px solid currentColor;
+      border-radius: 50%;
+      background: #04182f;
+      box-shadow: 0 0 12px rgba(39, 214, 255, 0.9);
+    }
+
+    .energy-left span::before {
+      left: calc(100% + clamp(58px, 6.5vw, 104px));
+    }
+
+    .energy-right span::before {
+      right: calc(100% + clamp(58px, 6.5vw, 104px));
     }
 
     @media (max-width: 980px) {
@@ -115,64 +322,188 @@
 
       .screen {
         min-height: 760px;
-        background-size: auto 100%;
       }
 
-      .hot-nav {
-        top: 190px;
-        width: 220px;
+      .feature-entry-grid {
+        left: 24px;
+        right: 24px;
+        top: 50%;
+        width: auto;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        transform: translateY(-30%);
       }
 
-      .quick-links {
-        left: 18px;
-        right: 18px;
-        bottom: 22px;
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
+      .feature-entry {
+        min-height: 170px;
+        padding: 16px;
       }
 
-      .quick-links a { min-width: 0; }
+      .energy-side {
+        display: none;
+      }
     }
 
     @media (max-width: 640px) {
       .screen {
         min-height: 820px;
+      }
+
+      .screen::before {
         background-position: center top;
       }
 
-      .hot-nav {
-        top: 210px;
-        width: 180px;
-      }
-
-      .hot-nav a {
-        height: 52px;
-        padding-left: 66px;
-        font-size: 16px;
-      }
-
-      .quick-links {
+      .feature-entry-grid {
+        left: 18px;
+        right: 18px;
+        top: 310px;
+        width: auto;
         grid-template-columns: 1fr;
+        transform: none;
+      }
+
+      .feature-entry {
+        min-height: 112px;
+        display: grid;
+        grid-template-columns: 74px minmax(0, 1fr);
+        grid-template-rows: auto;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .feature-icon {
+        width: 78px;
+        height: 78px;
+        grid-row: 1 / 3;
+      }
+
+      .feature-entry strong {
+        font-size: 25px;
       }
     }
   </style>
 </head>
 <body>
-  <main class="screen" aria-label="南极秦岭站综合能量管理系统首页">
-    <nav class="hot-nav" aria-label="系统主导航">
-      <a href="index.html">系统首页</a>
-      <a href="simu.html">SIMU监视</a>
-      <a href="scada.html">SCADA监视</a>
-      <a href="agc.html">AGC监视</a>
-      <a href="planning.html">参数维护</a>
-      <a href="planning.html">电网规划</a>
+  <main class="screen" aria-label="考察站风-光-氢-储-柴联合规划系统首页">
+    <div class="home-user-status" data-auth-user hidden>
+      <span>当前用户:</span><strong data-auth-username></strong><em data-auth-role></em>
+      <a href="users.html" data-admin-only hidden>用户管理</a>
+      <button type="button" data-logout>退出</button>
+    </div>
+    <div class="energy-side energy-left" aria-hidden="true">
+      <span>
+        <svg viewBox="0 0 64 64">
+          <path d="M32 30V8"></path>
+          <path d="M32 34l-21 12"></path>
+          <path d="M36 34l17 13"></path>
+          <circle cx="32" cy="32" r="5"></circle>
+          <path d="M24 56h16"></path>
+          <path d="M32 37v19"></path>
+        </svg>
+      </span>
+      <span>
+        <svg viewBox="0 0 64 64">
+          <path d="M16 30h32l5 24H11z"></path>
+          <path d="M22 30l-3 24"></path>
+          <path d="M32 30v24"></path>
+          <path d="M42 30l3 24"></path>
+          <path d="M14 42h36"></path>
+          <path d="M32 10v8"></path>
+          <path d="M18 16l6 6"></path>
+          <path d="M46 16l-6 6"></path>
+          <circle cx="32" cy="22" r="5"></circle>
+        </svg>
+      </span>
+      <span>
+        <svg viewBox="0 0 64 64">
+          <path d="M22 10h20"></path>
+          <path d="M26 10V6h12v4"></path>
+          <rect x="18" y="14" width="28" height="44" rx="5"></rect>
+          <path d="M32 24l-8 15h8l-3 12 11-18h-8z"></path>
+        </svg>
+      </span>
+    </div>
+
+    <div class="energy-side energy-right" aria-hidden="true">
+      <span>
+        <svg viewBox="0 0 64 64">
+          <circle cx="32" cy="24" r="17"></circle>
+          <circle cx="16" cy="44" r="8"></circle>
+          <circle cx="48" cy="44" r="8"></circle>
+          <path d="M24 30h16"></path>
+          <path d="M25 18v13"></path>
+          <path d="M39 18v13"></path>
+          <path d="M21 25h22"></path>
+        </svg>
+      </span>
+      <span>
+        <svg viewBox="0 0 64 64">
+          <path d="M22 8h20"></path>
+          <path d="M26 8V5h12v3"></path>
+          <rect x="17" y="12" width="30" height="46" rx="6"></rect>
+          <path d="M24 24h16"></path>
+          <path d="M24 34h16"></path>
+          <path d="M24 44h16"></path>
+        </svg>
+      </span>
+      <span>
+        <svg viewBox="0 0 64 64">
+          <rect x="12" y="20" width="34" height="26" rx="5"></rect>
+          <path d="M46 26h6v14h-6"></path>
+          <path d="M20 16h18"></path>
+          <path d="M25 16v-5h8v5"></path>
+          <path d="M29 25l-7 12h7l-2 9 10-15h-7z"></path>
+        </svg>
+      </span>
+    </div>
+
+    <nav class="feature-entry-grid" aria-label="规划功能快捷入口">
+      <a class="feature-entry" href="planning.html">
+        <i class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 64 64">
+            <path d="M12 18h28"></path>
+            <path d="M12 32h22"></path>
+            <path d="M12 46h28"></path>
+            <circle cx="40" cy="18" r="4"></circle>
+            <circle cx="28" cy="32" r="4"></circle>
+            <circle cx="34" cy="46" r="4"></circle>
+            <path d="M44 33l4-4 4 4 5-1 1 7 4 4-4 4-1 7-5-1-4 4-4-4-6 1-1-7-4-4 4-4 1-7z"></path>
+            <circle cx="48" cy="43" r="6"></circle>
+          </svg>
+        </i>
+        <strong>参数维护</strong>
+      </a>
+      <a class="feature-entry" href="optimize.html">
+        <i class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 64 64">
+            <circle cx="32" cy="32" r="23"></circle>
+            <path d="M27 22l18 10-18 10z"></path>
+            <circle cx="32" cy="9" r="4"></circle>
+            <circle cx="32" cy="55" r="4"></circle>
+            <circle cx="9" cy="32" r="4"></circle>
+            <circle cx="55" cy="32" r="4"></circle>
+          </svg>
+        </i>
+        <strong>算法启动</strong>
+      </a>
+      <a class="feature-entry" href="optimize.html#overviewResult">
+        <i class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 64 64">
+            <path d="M17 9h25l9 9v35a4 4 0 0 1-4 4H17a4 4 0 0 1-4-4V13a4 4 0 0 1 4-4z"></path>
+            <path d="M42 9v11h10"></path>
+            <path d="M21 26h16"></path>
+            <path d="M21 35h10"></path>
+            <path d="M22 48V39"></path>
+            <path d="M31 48V32"></path>
+            <path d="M40 48V27"></path>
+            <circle cx="47" cy="47" r="12"></circle>
+            <path d="M41 47l4 4 8-9"></path>
+          </svg>
+        </i>
+        <strong>结果评估</strong>
+      </a>
     </nav>
 
-    <nav class="quick-links" aria-label="在线监视快捷入口">
-      <a href="simu.html">SIMU在线监视</a>
-      <a href="scada.html">SCADA在线监视</a>
-      <a href="agc.html">AGC在线监视</a>
-    </nav>
   </main>
+  <script src="assets/auth.js?v=20260510-auth"></script>
 </body>
 </html>

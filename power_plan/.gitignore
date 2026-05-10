@@ -3,3 +3,5 @@ __pycache__/
 server*.log
 vendor/
 planning_schemes/
+*.sqlite
+*.sqlite3

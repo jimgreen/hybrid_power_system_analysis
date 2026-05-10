@@ -63,71 +63,186 @@ class PowerPlanServerTest(unittest.TestCase):
         server.DATA_SOURCE = self._original_data_source
         server.SIMU_RUNTIME = self._original_simu_runtime
 
-    def test_api_payload_contains_all_monitor_sections(self):
+    def test_api_payload_excludes_removed_monitor_sections(self):
         payload = server.build_snapshot()
 
-        self.assertEqual(payload["system"], "南极秦岭站综合能量管理系统")
-        self.assertIn("simu", payload)
-        self.assertIn("scada", payload)
-        self.assertIn("agc", payload)
+        self.assertEqual(payload["system"], "考察站风-光-氢-储-柴联合规划系统")
+        self.assertIn("timestamp", payload)
         self.assertIn("summary", payload)
+        self.assertNotIn("simu", payload)
+        self.assertNotIn("scada", payload)
+        self.assertNotIn("agc", payload)
+
+    def test_index_page_has_visual_planning_entry_buttons(self):
+        html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('background-image: url("assets/main-dashboard-bg.png?v=20260510-title-safe")', html)
+        self.assertIn("background-size: contain", html)
+        self.assertIn('<link rel="icon" href="data:,">', html)
+        self.assertIn(".screen::before", html)
+        self.assertIn("filter: saturate(1.08) brightness(0.74) contrast(1.08)", html)
+        self.assertIn(".energy-side", html)
+        self.assertIn(".energy-left", html)
+        self.assertIn(".energy-right", html)
+        energy_side_css = html.split(".energy-side {", 1)[1].split("}", 1)[0]
+        self.assertIn("top: 50%", energy_side_css)
+        self.assertIn("min-height: clamp(320px, 41vh, 400px)", energy_side_css)
+        self.assertIn("align-content: space-around", energy_side_css)
+        self.assertIn("transform: translateY(-29%)", energy_side_css)
+        self.assertIn("clip-path: polygon", html)
+        self.assertIn("box-shadow:", html)
+        self.assertIn("color: #21d5ff", html)
+        self.assertIn('class="feature-entry-grid"', html)
+        self.assertIn('aria-label="规划功能快捷入口"', html)
+        self.assertEqual(html.count('class="feature-entry"'), 3)
+        self.assertEqual(html.count('class="feature-icon"'), 3)
+        self.assertIn('class="energy-side energy-left"', html)
+        self.assertIn('class="energy-side energy-right"', html)
+        self.assertIn('<strong>参数维护</strong>', html)
+        self.assertIn('<strong>算法启动</strong>', html)
+        self.assertIn('<strong>结果评估</strong>', html)
+        self.assertNotIn("规划参数维护", html)
+        self.assertNotIn("规划算法启动", html)
+        self.assertNotIn("规划结果评估", html)
+        self.assertIn('href="planning.html"', html)
+        self.assertIn('href="optimize.html"', html)
+        self.assertIn('href="optimize.html#overviewResult"', html)
+        self.assertIn(".feature-entry-grid", html)
+        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", html)
+        self.assertIn("top: 50%", html)
+        self.assertIn("transform: translate(-50%, -29%)", html)
+        self.assertIn(".feature-icon svg", html)
+        self.assertNotIn("hot-nav", html)
+        self.assertNotIn("quick-links", html)
+        self.assertNotIn("系统主导航", html)
+        self.assertNotIn("在线监视快捷入口", html)
+        self.assertNotIn("SIMU在线监视", html)
+
+    def test_power_plan_pages_share_dark_hud_visual_theme(self):
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+        planning_html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        optimize_html = (WEB_ROOT / "optimize.html").read_text(encoding="utf-8")
+
+        self.assertIn("assets/planning.css?v=20260510-dark-hud", planning_html)
+        self.assertIn("assets/planning.css?v=20260510-dark-hud", optimize_html)
+        self.assertIn('url("main-dashboard-bg.png?v=20260510-title-safe")', css)
+        self.assertIn("--hud-cyan: #21d5ff", css)
+        self.assertIn("--hud-panel:", css)
+        self.assertIn("rgba(20, 190, 255, 0.64)", css)
+        self.assertIn(".scheme-rail,", css)
+        self.assertIn(".optimization-command-card,", css)
+        self.assertIn("background: var(--hud-panel)", css)
+        self.assertIn("color: var(--hud-text)", css)
+
+    def test_monitor_static_pages_are_removed(self):
+        for filename in ("simu.html", "scada.html", "agc.html"):
+            self.assertFalse((WEB_ROOT / filename).exists())
+
+    def test_auth_pages_and_topbars_include_user_controls(self):
+        login_html = (WEB_ROOT / "login.html").read_text(encoding="utf-8")
+        register_html = (WEB_ROOT / "register.html").read_text(encoding="utf-8")
+        users_html = (WEB_ROOT / "users.html").read_text(encoding="utf-8")
+        planning_html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        optimize_html = (WEB_ROOT / "optimize.html").read_text(encoding="utf-8")
+        index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="loginForm"', login_html)
+        self.assertIn('id="registerForm"', register_html)
+        self.assertIn('body data-admin-page="true"', users_html)
+        self.assertIn('id="usersTable"', users_html)
+        for html in (planning_html, optimize_html, index_html, users_html):
+            self.assertIn("data-auth-user", html)
+            self.assertIn("data-auth-username", html)
+            self.assertIn("data-logout", html)
+            self.assertIn("assets/auth.js", html)
+        self.assertIn("data-admin-only", planning_html)
+        self.assertIn("data-admin-only", optimize_html)
+        self.assertIn("data-admin-only", index_html)
+        self.assertIn(".user-status", css)
+        self.assertIn(".auth-card", css)
+        self.assertIn("font-size: 17px", css)
+
+    def test_sqlite_user_store_registers_first_user_as_admin_and_authenticates(self):
+        db_path = WEB_ROOT / "tests" / "tmp_users.sqlite3"
+        db_path.unlink(missing_ok=True)
+        try:
+            store = server.UserStore(db_path)
+            admin = store.create_user("adminA", "secret1")
+            normal = store.create_user("userA", "secret2")
+
+            self.assertEqual(admin["role"], "admin")
+            self.assertEqual(normal["role"], "user")
+            self.assertEqual(store.authenticate("adminA", "secret1")["id"], admin["id"])
+            with self.assertRaises(ValueError):
+                store.authenticate("adminA", "bad-password")
+            token = store.create_session(admin["id"])
+            self.assertEqual(store.user_for_session(token)["username"], "adminA")
+            store.delete_session(token)
+            self.assertIsNone(store.user_for_session(token))
+        finally:
+            db_path.unlink(missing_ok=True)
+
+    def test_auth_and_user_management_api_use_sqlite_sessions(self):
+        original_store = server.USER_STORE
+        db_path = WEB_ROOT / "tests" / "tmp_auth_api.sqlite3"
+        db_path.unlink(missing_ok=True)
+        server.USER_STORE = server.UserStore(db_path)
+        try:
+            status, headers, body = server.handle_auth_api_path(
+                "/api/auth/register",
+                "POST",
+                json.dumps({"username": "adminA", "password": "secret1"}).encode("utf-8"),
+            )
+            data = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(data["user"]["role"], "admin")
+            self.assertIn("Set-Cookie", headers)
+            token = headers["Set-Cookie"].split("=", 1)[1].split(";", 1)[0]
+
+            status, headers, body = server.handle_auth_api_path("/api/auth/me", "GET", token=token)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body.decode("utf-8"))["user"]["username"], "adminA")
+
+            status, headers, body = server.handle_users_api_path("/api/users", "GET", b"", {"id": 1, "username": "adminA", "role": "admin"})
+            self.assertEqual(status, 200)
+            self.assertEqual(len(json.loads(body.decode("utf-8"))["users"]), 1)
+
+            status, headers, body = server.handle_users_api_path("/api/users", "GET", b"", {"id": 2, "username": "userA", "role": "user"})
+            self.assertEqual(status, 403)
+        finally:
+            server.USER_STORE = original_store
+            db_path.unlink(missing_ok=True)
 
     def test_api_response_is_json_for_known_endpoint(self):
-        status, headers, body = server.handle_api_path("/api/scada")
+        status, headers, body = server.handle_api_path("/api/overview")
 
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
         data = json.loads(body.decode("utf-8"))
-        self.assertEqual(data["section"], "SCADA在线监视")
-        self.assertIn("metrics", data)
-        self.assertIn("alarms", data)
-        self.assertIn("charts", data)
+        self.assertEqual(data["system"], "考察站风-光-氢-储-柴联合规划系统")
         self.assertIn("summary", data)
+        self.assertNotIn("simu", data)
+        self.assertNotIn("scada", data)
+        self.assertNotIn("agc", data)
 
-    def test_monitor_pages_include_dynamic_rendering_blocks(self):
-        payload = server.build_snapshot()
+    def test_removed_monitor_api_endpoints_return_not_found(self):
+        for path in ("/api/simu", "/api/scada", "/api/agc"):
+            status, headers, body = server.handle_api_path(path)
+            data = json.loads(body.decode("utf-8"))
 
-        for key in ("simu", "scada", "agc"):
-            section = payload[key]
-            self.assertGreaterEqual(len(section["metrics"]), 4)
-            self.assertGreaterEqual(len(section["alarms"]), 4)
-            self.assertIsInstance(section["summary"], list)
-            self.assertGreaterEqual(len(section["summary"]), 4)
+            self.assertEqual(status, 404)
+            self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+            self.assertEqual(data["error"], "not_found")
+            self.assertEqual(data["path"], path)
 
-        self.assertIn("bars", payload["simu"]["charts"])
-        self.assertIn("daily", payload["simu"]["charts"])
-        self.assertIn("state", payload["simu"])
-        self.assertIn("topology", payload["simu"])
-        self.assertIn("columns", payload["scada"]["charts"])
-        self.assertIn("stations", payload["scada"])
-        self.assertIn("units", payload["agc"])
-        self.assertIn("reserve", payload["agc"])
-
-    def test_simu_page_has_four_daily_curves_and_state(self):
-        payload = server.build_snapshot(force_reload=True)
-        simu = payload["simu"]
-
-        curve_names = {curve["name"] for curve in simu["charts"]["daily"]}
-        self.assertEqual(curve_names, {"风速", "温度", "太阳辐射", "负荷"})
-        self.assertGreaterEqual(len(simu["charts"]["daily"][0]["points"]), 24)
-        self.assertEqual(simu["state"]["status"], "STOPPED")
-        self.assertIn("cursor_hour", simu["state"])
-
-    def test_simu_control_actions_update_runtime_state(self):
-        controller = server.SimuRuntime()
-
-        controller.apply("start")
-        self.assertEqual(controller.snapshot()["status"], "RUNNING")
-        controller.apply("faster")
-        self.assertEqual(controller.snapshot()["speed"], 2.0)
-        controller.apply("slower")
-        self.assertEqual(controller.snapshot()["speed"], 1.0)
-        controller.apply("stop")
-        self.assertEqual(controller.snapshot()["status"], "STOPPED")
-        controller.apply("reset")
-        state = controller.snapshot()
-        self.assertEqual(state["status"], "STOPPED")
-        self.assertEqual(state["cursor_hour"], 0.0)
+        status, headers, body = server.handle_control_path(
+            "/api/simu/control",
+            json.dumps({"action": "start"}).encode("utf-8"),
+        )
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 404)
+        self.assertEqual(data["error"], "not_found")
 
     def test_optimization_api_start_stop_and_logs(self):
         original_runtime = server.OPTIMIZATION_RUNTIME
@@ -269,18 +384,28 @@ class PowerPlanServerTest(unittest.TestCase):
         green_rows = payload["results"]["green_table"]
         metric_names = {row["指标"] for row in green_rows}
         for name in (
-            "负荷总电量(kWh)",
-            "柴发总电量(kWh)",
-            "风机总发电量(kWh)",
-            "光伏总发电量(kWh)",
-            "电储总发电量(kWh)",
-            "氢储总发电量(kWh)",
-            "新能源总弃电量(%)",
-            "柴油消耗(吨)",
-            "制氢总量(Nm3)",
+            "负荷总电量",
+            "柴发总电量",
+            "风机总发电量",
+            "光伏总发电量",
+            "电储总发电量",
+            "氢储总发电量",
+            "新能源总弃电量",
+            "柴油消耗",
+            "制氢总量",
         ):
             self.assertIn(name, metric_names)
-        self.assertTrue(all(set(row) == {"指标", "数值"} for row in green_rows))
+        self.assertTrue(all(set(row) == {"指标", "数值", "单位"} for row in green_rows))
+        units = {row["指标"]: row["单位"] for row in green_rows}
+        self.assertEqual(units["负荷总电量"], "kWh")
+        self.assertEqual(units["柴发总电量"], "kWh")
+        self.assertEqual(units["风机总发电量"], "kWh")
+        self.assertEqual(units["光伏总发电量"], "kWh")
+        self.assertEqual(units["电储总发电量"], "kWh")
+        self.assertEqual(units["氢储总发电量"], "kWh")
+        self.assertEqual(units["新能源总弃电量"], "%")
+        self.assertEqual(units["柴油消耗"], "吨")
+        self.assertEqual(units["制氢总量"], "Nm3")
 
         daily = payload["results"]["curves"]["green_daily"]
         self.assertEqual(len(daily), 365)
@@ -330,13 +455,14 @@ class PowerPlanServerTest(unittest.TestCase):
             self.assertIn(field, daily[0])
             self.assertIsInstance(daily[0][field], (int, float))
 
-    def test_snapshot_reads_values_from_csv_files(self):
+    def test_snapshot_reads_summary_from_csv_files(self):
         payload = server.build_snapshot(force_reload=True)
 
-        simu_load = next(item for item in payload["simu"]["metrics"] if item["label"] == "总有功负荷")
-        self.assertEqual(simu_load["value"], 486.2)
-        self.assertEqual(payload["simu"]["charts"]["bars"][0]["label"], "线路 L12")
-        self.assertEqual(payload["agc"]["reserve"]["score"], 97.4)
+        self.assertEqual(payload["system"], "考察站风-光-氢-储-柴联合规划系统")
+        self.assertIn("summary", payload)
+        self.assertNotIn("simu", payload)
+        self.assertNotIn("scada", payload)
+        self.assertNotIn("agc", payload)
 
     def test_snapshot_reloads_after_configured_interval(self):
         data_dir = WEB_ROOT / "tests" / "tmp_data_source"
@@ -345,61 +471,22 @@ class PowerPlanServerTest(unittest.TestCase):
         data_dir.mkdir(parents=True)
         try:
             (data_dir / "summary.csv").write_text("key,value,unit\nrunning_days,1,天\n", encoding="utf-8")
-            (data_dir / "metrics.csv").write_text(
-                "page,label,value,unit,status\nsimu,总有功负荷,100,MW,normal\n",
-                encoding="utf-8",
-            )
-            (data_dir / "alarms.csv").write_text("page,time,object,message,status\n", encoding="utf-8")
-            (data_dir / "simu_bars.csv").write_text("label,value,unit\n线路 L12,10,%\n", encoding="utf-8")
-            (data_dir / "simu_topology.csv").write_text("id,status,value\nBUS-101,ok,1.0 p.u.\n", encoding="utf-8")
-            (data_dir / "scada_columns.csv").write_text("label,value,unit\nNOW,20,%\n", encoding="utf-8")
-            (data_dir / "scada_stations.csv").write_text("name,status,detail\n主站 A,normal,延迟 1 ms\n", encoding="utf-8")
-            (data_dir / "agc_units.csv").write_text("name,percent,power,unit\nGEN-01,50,10,MW\n", encoding="utf-8")
-            (data_dir / "agc_reserve.csv").write_text("score,up,down,response,cycle\n88,1,2,3,4\n", encoding="utf-8")
-            (data_dir / "page_summary.csv").write_text("page,label,value,status\nsimu,刷新周期,1 s,normal\n", encoding="utf-8")
 
             reader = server.CsvDataSource(data_dir=data_dir, reload_interval=0)
             first = reader.snapshot()
-            (data_dir / "metrics.csv").write_text(
-                "page,label,value,unit,status\nsimu,总有功负荷,200,MW,normal\n",
-                encoding="utf-8",
-            )
+            (data_dir / "summary.csv").write_text("key,value,unit\nrunning_days,2,天\n", encoding="utf-8")
             second = reader.snapshot()
         finally:
             shutil.rmtree(data_dir, ignore_errors=True)
 
-        first_load = next(item for item in first["simu"]["metrics"] if item["label"] == "总有功负荷")
-        second_load = next(item for item in second["simu"]["metrics"] if item["label"] == "总有功负荷")
-        self.assertEqual(first_load["value"], 100)
-        self.assertEqual(second_load["value"], 200)
+        self.assertEqual(first["summary"]["running_days"], 1)
+        self.assertEqual(second["summary"]["running_days"], 2)
 
     def test_mysql_data_source_builds_snapshot_from_database_rows(self):
         rows = {
             "SELECT `key`, value, unit FROM overview_summary ORDER BY display_order, id": [
                 {"key": "running_days", "value": "449", "unit": "天"},
             ],
-            "SELECT page, label, value, unit, status FROM metrics ORDER BY page, display_order, id": [
-                {"page": "simu", "label": "总有功负荷", "value": "486.2", "unit": "MW", "status": "normal"},
-            ],
-            "SELECT page, time, object, message, status FROM alarms ORDER BY page, display_order, id": [],
-            "SELECT page, label, value, status FROM page_summary ORDER BY page, display_order, id": [
-                {"page": "simu", "label": "刷新周期", "value": "2 s", "status": "normal"},
-            ],
-            "SELECT label, value, unit FROM simu_bars ORDER BY display_order, id": [
-                {"label": "线路 L12", "value": "72", "unit": "%"},
-            ],
-            "SELECT id, status, value FROM simu_topology ORDER BY display_order, id": [
-                {"id": "BUS-101", "status": "ok", "value": "1.018 p.u."},
-            ],
-            "SELECT hour, wind_speed, temperature, solar_irradiance, load_value FROM simu_daily_curves ORDER BY hour": [
-                {"hour": "0", "wind_speed": "7.8", "temperature": "-18", "solar_irradiance": "0", "load_value": "138"},
-            ],
-            "SELECT label, value, unit FROM scada_columns ORDER BY display_order, id": [],
-            "SELECT name, status, detail FROM scada_stations ORDER BY display_order, id": [],
-            "SELECT name, percent, power, unit FROM agc_units ORDER BY display_order, id": [],
-            "SELECT score, up, down, response, cycle FROM agc_reserve ORDER BY id LIMIT 1": {
-                "score": "97.4", "up": "164", "down": "120", "response": "8.2", "cycle": "4",
-            },
         }
         fake_connection = FakeConnection(rows)
         source = server.MySqlDataSource(connector_factory=lambda config: fake_connection, reload_interval=0)
@@ -407,20 +494,13 @@ class PowerPlanServerTest(unittest.TestCase):
         payload = source.snapshot()
 
         self.assertEqual(payload["summary"]["running_days"], 449)
-        self.assertEqual(payload["simu"]["metrics"][0]["value"], 486.2)
-        self.assertEqual(payload["simu"]["charts"]["daily"][0]["name"], "风速")
-        self.assertEqual(payload["agc"]["reserve"]["score"], 97.4)
-
-    def test_mysql_data_source_persists_simu_state(self):
-        fake_connection = FakeConnection({})
-        source = server.MySqlDataSource(connector_factory=lambda config: fake_connection, reload_interval=0)
-
-        source.save_simu_state({"sim_time": "01:30", "speed": 2.0, "status": "RUNNING"})
-
-        executed_sql, params = fake_connection.cursor_obj.executed[-1]
-        self.assertIn("UPDATE simu_state", executed_sql)
-        self.assertEqual(params, ("01:30", 2.0, "RUNNING"))
-        self.assertTrue(fake_connection.committed)
+        self.assertNotIn("simu", payload)
+        self.assertNotIn("scada", payload)
+        self.assertNotIn("agc", payload)
+        self.assertEqual(
+            fake_connection.cursor_obj.executed,
+            [("SELECT `key`, value, unit FROM overview_summary ORDER BY display_order, id", ())],
+        )
 
     def test_unknown_api_path_returns_404_json(self):
         status, headers, body = server.handle_api_path("/api/not-found")
@@ -711,9 +791,10 @@ class PowerPlanServerTest(unittest.TestCase):
     def test_planning_page_uses_requested_product_and_time_series_labels(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
 
-        self.assertIn(">微电网风光氢储联合规划系统<", html)
+        self.assertIn(">考察站风-光-氢-储-柴联合规划系统<", html)
         self.assertIn(">时序数据<", html)
         self.assertNotIn(">电网规划系统<", html)
+        self.assertNotIn(">微电网风光氢储联合规划系统<", html)
         self.assertNotIn(">电网规划列表<", html)
         self.assertNotIn(">8760时序数据<", html)
 
@@ -722,7 +803,7 @@ class PowerPlanServerTest(unittest.TestCase):
         planning_html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
 
-        self.assertIn(">微电网风光氢储联合规划系统<", html)
+        self.assertIn(">考察站风-光-氢-储-柴联合规划系统<", html)
         self.assertIn('<a class="active" href="optimize.html">启动优化</a>', html)
         self.assertIn('<aside class="scheme-rail">', html)
         self.assertIn('<div class="scheme-list-title">方案列表</div>', html)
@@ -892,21 +973,23 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertNotIn("日曲线测试数据", script)
         self.assertNotIn("第${day}日", script)
         green_render_script = script.split("function renderGreenResult", 1)[1].split("function renderGreenDailyChart", 1)[0]
+        self.assertIn('"单位": row["单位"] || ""', green_render_script)
         self.assertLess(green_render_script.index("green-result-table"), green_render_script.index("green-chart-card"))
         for label in ("柴发日电量", "风电日电量", "光伏日电量", "氢能日电量", "储能放电量", "负荷电量", "制氢电量", "储能充电量"):
             self.assertIn(label, script)
         for metric in (
-            "负荷总电量(kWh)",
-            "柴发总电量(kWh)",
-            "风机总发电量(kWh)",
-            "光伏总发电量(kWh)",
-            "电储总发电量(kWh)",
-            "氢储总发电量(kWh)",
-            "新能源总弃电量(%)",
-            "柴油消耗(吨)",
-            "制氢总量(Nm3)",
+            '"指标": "负荷总电量", "数值": "-", "单位": "kWh"',
+            '"指标": "柴发总电量", "数值": "-", "单位": "kWh"',
+            '"指标": "风机总发电量", "数值": "-", "单位": "kWh"',
+            '"指标": "光伏总发电量", "数值": "-", "单位": "kWh"',
+            '"指标": "电储总发电量", "数值": "-", "单位": "kWh"',
+            '"指标": "氢储总发电量", "数值": "-", "单位": "kWh"',
+            '"指标": "新能源总弃电量", "数值": "-", "单位": "%"',
+            '"指标": "柴油消耗", "数值": "-", "单位": "吨"',
+            '"指标": "制氢总量", "数值": "-", "单位": "Nm3"',
         ):
             self.assertIn(metric, script)
+        self.assertNotIn("负荷总电量(kWh)", script)
 
         self.assertIn(".green-result-layout", css)
         green_layout_css = css.split(".green-result-layout {", 1)[1].split("}", 1)[0]
@@ -1429,7 +1512,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("selectedCurveSpec", script)
         self.assertIn('[data-curve][aria-pressed="true"]', script)
         self.assertIn("selectCurve", script)
-        self.assertIn("时间（月）", script)
+        self.assertNotIn("时间（月）", script)
         self.assertIn("monthRanges", script)
         self.assertIn("yTicks", script)
         self.assertIn('stroke="${color}"', script)

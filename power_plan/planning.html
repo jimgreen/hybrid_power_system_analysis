@@ -3,21 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>微电网风光氢储联合规划系统</title>
+  <title>考察站风-光-氢-储-柴联合规划系统</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="assets/planning.css?v=20260510-summary-row-height">
+  <link rel="stylesheet" href="assets/planning.css?v=20260510-dark-hud">
 </head>
 <body>
   <main class="planning-shell">
     <header class="topbar">
-      <a class="brand" href="index.html">微电网风光氢储联合规划系统</a>
+      <a class="brand" href="index.html">考察站风-光-氢-储-柴联合规划系统</a>
       <nav class="main-nav" aria-label="主功能导航">
         <a href="index.html">系统首页</a>
         <a class="active" href="planning.html">参数维护</a>
         <a href="optimize.html">启动优化</a>
+        <a href="users.html" data-admin-only hidden>用户管理</a>
         <button type="button" disabled>方案评估</button>
         <button type="button" disabled>结果比对</button>
       </nav>
+      <div class="user-status" data-auth-user hidden>
+        <span>当前用户:</span><strong data-auth-username></strong><em data-auth-role></em>
+        <button type="button" data-logout>退出</button>
+      </div>
     </header>
 
     <section class="workspace">
@@ -154,6 +159,7 @@
       </aside>
     </section>
   </main>
+  <script src="assets/auth.js?v=20260510-auth"></script>
   <script src="assets/planning.js?v=20260510-labels"></script>
 </body>
 </html>

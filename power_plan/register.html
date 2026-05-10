@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>用户注册 - 考察站风-光-氢-储-柴联合规划系统</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="assets/planning.css?v=20260510-dark-hud">
+</head>
+<body>
+  <main class="auth-shell">
+    <form id="registerForm" class="auth-card">
+      <h1>用户注册</h1>
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="new-password" minlength="6" required></label>
+      <button class="primary" type="submit">注册并登录</button>
+      <div class="auth-links"><a href="login.html">返回登录</a></div>
+      <div class="auth-status" data-auth-status role="status" aria-live="polite"></div>
+    </form>
+  </main>
+  <script src="assets/login.js?v=20260510-auth"></script>
+</body>
+</html>

@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import argparse
+from http.cookies import SimpleCookie
 import csv
+import hashlib
+import hmac
 import json
 import math
 import mimetypes
 import os
+import secrets
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -17,6 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
+from contextlib import closing
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, unquote, urlparse
 from urllib.request import urlopen
@@ -27,6 +33,9 @@ import planning_store
 WEB_ROOT = Path(__file__).resolve().parent
 DATA_DIR = WEB_ROOT / "data"
 VENDOR_DIR = WEB_ROOT / "vendor"
+USER_DB_PATH = Path(os.environ.get("POWER_PLAN_USER_DB", WEB_ROOT / "power_plan_users.sqlite3"))
+SESSION_COOKIE_NAME = "power_plan_session"
+SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 NASA_POWER_HOURLY_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
 AMAP_GEOCODING_URL = "https://restapi.amap.com/v3/geocode/geo"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -74,6 +83,10 @@ def _metric(label: str, value: float | int | str, unit: str, status: str = "norm
 
 def _summary(label: str, value: str, status: str = "normal") -> dict:
     return {"label": label, "value": value, "status": status}
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _time_to_hour(value: str) -> float:
@@ -139,7 +152,191 @@ class SimuRuntime:
         if self.status == "RUNNING":
             # One real second advances one simulated minute at speed=1.
             self.cursor_hour = (self.cursor_hour + elapsed * self.speed / 60) % 24
-        self._last_tick = now
+            self._last_tick = now
+
+
+class UserStore:
+    """SQLite-backed user and session store."""
+
+    def __init__(self, db_path: Path = USER_DB_PATH) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _connect(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _init_db(self) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    password_salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin', 'user')),
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.commit()
+
+    def user_count(self) -> int:
+        with closing(self._connect()) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+
+    def create_user(self, username: str, password: str, role: str | None = None) -> dict:
+        clean_username = self._clean_username(username)
+        if len(password or "") < 6:
+            raise ValueError("密码长度不能少于6位")
+        with self._lock:
+            user_role = role or ("admin" if self.user_count() == 0 else "user")
+            if user_role not in {"admin", "user"}:
+                raise ValueError("用户角色不合法")
+            salt, password_hash = self._hash_password(password)
+            try:
+                with closing(self._connect()) as connection:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO users (username, password_salt, password_hash, role, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (clean_username, salt, password_hash, user_role, _now_iso()),
+                    )
+                    connection.commit()
+                    user_id = int(cursor.lastrowid)
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("用户名已存在") from exc
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise ValueError("用户创建失败")
+        return user
+
+    def authenticate(self, username: str, password: str) -> dict:
+        clean_username = self._clean_username(username)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT id, username, password_salt, password_hash, role, created_at FROM users WHERE username = ?",
+                (clean_username,),
+            ).fetchone()
+        if not row or not self._verify_password(password or "", row["password_salt"], row["password_hash"]):
+            raise ValueError("用户名或密码错误")
+        return self._public_user(row)
+
+    def create_session(self, user_id: int) -> str:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (token, user_id, _now_iso(), now + SESSION_MAX_AGE_SECONDS),
+            )
+            connection.commit()
+        return token
+
+    def delete_session(self, token: str) -> None:
+        if not token:
+            return
+        with closing(self._connect()) as connection:
+            connection.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            connection.commit()
+
+    def user_for_session(self, token: str) -> dict | None:
+        if not token:
+            return None
+        now = time.time()
+        with closing(self._connect()) as connection:
+            connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+            row = connection.execute(
+                """
+                SELECT users.id, users.username, users.role, users.created_at
+                FROM sessions
+                JOIN users ON users.id = sessions.user_id
+                WHERE sessions.token = ? AND sessions.expires_at > ?
+                """,
+                (token, now),
+            ).fetchone()
+            connection.commit()
+        return self._public_user(row) if row else None
+
+    def list_users(self) -> list[dict]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, username, role, created_at FROM users ORDER BY id"
+            ).fetchall()
+        return [self._public_user(row) for row in rows]
+
+    def get_user_by_id(self, user_id: int) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT id, username, role, created_at FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return self._public_user(row) if row else None
+
+    def update_role(self, user_id: int, role: str) -> dict:
+        if role not in {"admin", "user"}:
+            raise ValueError("用户角色不合法")
+        with closing(self._connect()) as connection:
+            connection.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+            connection.commit()
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise FileNotFoundError("用户不存在")
+        return user
+
+    def delete_user(self, user_id: int, current_user_id: int | None = None) -> None:
+        if current_user_id is not None and int(user_id) == int(current_user_id):
+            raise ValueError("不能删除当前登录用户")
+        with closing(self._connect()) as connection:
+            cursor = connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            connection.commit()
+        if cursor.rowcount == 0:
+            raise FileNotFoundError("用户不存在")
+
+    @staticmethod
+    def _clean_username(username: str) -> str:
+        clean = str(username or "").strip()
+        if len(clean) < 2 or len(clean) > 32:
+            raise ValueError("用户名长度应为2-32位")
+        if any(ord(char) < 32 or char.isspace() for char in clean):
+            raise ValueError("用户名不能包含空格或不可见字符")
+        return clean
+
+    @staticmethod
+    def _hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+        password_salt = salt or secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(password_salt), 120_000)
+        return password_salt, digest.hex()
+
+    @classmethod
+    def _verify_password(cls, password: str, salt: str, expected_hash: str) -> bool:
+        _, actual_hash = cls._hash_password(password, salt)
+        return hmac.compare_digest(actual_hash, expected_hash)
+
+    @staticmethod
+    def _public_user(row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "username": row["username"],
+            "role": row["role"],
+            "created_at": row["created_at"],
+        }
 
 
 class OptimizationRuntime:
@@ -336,15 +533,15 @@ class OptimizationRuntime:
                 {"指标": "弃电率", "数值": round(max(1.0, 9.0 - self.progress * 0.04), 1), "单位": "%", "说明": "新能源未利用电量占比"},
             ],
             "green_table": [
-                {"指标": "负荷总电量(kWh)", "数值": round(load_energy_kwh, 1)},
-                {"指标": "柴发总电量(kWh)", "数值": round(diesel_energy_kwh, 1)},
-                {"指标": "风机总发电量(kWh)", "数值": round(wind_energy_kwh, 1)},
-                {"指标": "光伏总发电量(kWh)", "数值": round(pv_energy_kwh, 1)},
-                {"指标": "电储总发电量(kWh)", "数值": round(storage_energy_kwh, 1)},
-                {"指标": "氢储总发电量(kWh)", "数值": round(fuel_cell_energy_kwh, 1)},
-                {"指标": "新能源总弃电量(%)", "数值": curtailed_ratio},
-                {"指标": "柴油消耗(吨)", "数值": round(diesel_energy * 0.24, 1)},
-                {"指标": "制氢总量(Nm3)", "数值": round(hydrogen_production_nm3, 1)},
+                {"指标": "负荷总电量", "数值": round(load_energy_kwh, 1), "单位": "kWh"},
+                {"指标": "柴发总电量", "数值": round(diesel_energy_kwh, 1), "单位": "kWh"},
+                {"指标": "风机总发电量", "数值": round(wind_energy_kwh, 1), "单位": "kWh"},
+                {"指标": "光伏总发电量", "数值": round(pv_energy_kwh, 1), "单位": "kWh"},
+                {"指标": "电储总发电量", "数值": round(storage_energy_kwh, 1), "单位": "kWh"},
+                {"指标": "氢储总发电量", "数值": round(fuel_cell_energy_kwh, 1), "单位": "kWh"},
+                {"指标": "新能源总弃电量", "数值": curtailed_ratio, "单位": "%"},
+                {"指标": "柴油消耗", "数值": round(diesel_energy * 0.24, 1), "单位": "吨"},
+                {"指标": "制氢总量", "数值": round(hydrogen_production_nm3, 1), "单位": "Nm3"},
             ],
             "safety": [
                 {"指标": "备用裕度", "数值": reserve_margin, "单位": "%", "说明": "负荷扰动后的可用备用"},
@@ -545,52 +742,10 @@ class CsvDataSource:
         return [row for row in rows if row.get("page") == page]
 
     def _load_snapshot(self) -> dict:
-        metrics = self._rows("metrics.csv")
-        alarms = self._rows("alarms.csv")
-        page_summary = self._rows("page_summary.csv")
-        agc_units = [
-            {
-                "name": row.get("name", ""),
-                "percent": _coerce_value(row.get("percent", "")),
-                "power": _coerce_value(row.get("power", "")),
-                "unit": row.get("unit", ""),
-            }
-            for row in self._rows("agc_units.csv")
-        ]
-
         return {
-            "system": "南极秦岭站综合能量管理系统",
+            "system": "考察站风-光-氢-储-柴联合规划系统",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "summary": self._load_overview_summary(),
-            "simu": {
-                "section": "SIMU在线监视",
-                "metrics": self._load_metrics(metrics, "simu"),
-                "alarms": self._load_alarms(alarms, "simu"),
-                "charts": {
-                    "bars": self._load_label_values("simu_bars.csv"),
-                    "daily": self._load_simu_daily_curves(),
-                },
-                "topology": self._load_topology(),
-                "summary": self._load_page_summary(page_summary, "simu"),
-                "state": SIMU_RUNTIME.snapshot(),
-            },
-            "scada": {
-                "section": "SCADA在线监视",
-                "metrics": self._load_metrics(metrics, "scada"),
-                "alarms": self._load_alarms(alarms, "scada"),
-                "charts": {"columns": self._load_label_values("scada_columns.csv")},
-                "stations": self._load_stations(),
-                "summary": self._load_page_summary(page_summary, "scada"),
-            },
-            "agc": {
-                "section": "AGC在线监视",
-                "metrics": self._load_metrics(metrics, "agc"),
-                "alarms": self._load_alarms(alarms, "agc"),
-                "charts": {"units": agc_units},
-                "units": agc_units,
-                "reserve": self._load_agc_reserve(),
-                "summary": self._load_page_summary(page_summary, "agc"),
-            },
         }
 
     def _load_overview_summary(self) -> dict:
@@ -773,56 +928,10 @@ class MySqlDataSource:
             connection.close()
 
     def _load_snapshot(self) -> dict:
-        metrics = self._query("SELECT page, label, value, unit, status FROM metrics ORDER BY page, display_order, id")
-        alarms = self._query("SELECT page, time, object, message, status FROM alarms ORDER BY page, display_order, id")
-        page_summary = self._query("SELECT page, label, value, status FROM page_summary ORDER BY page, display_order, id")
-        agc_units = [
-            {
-                "name": row.get("name", ""),
-                "percent": _coerce_value(str(row.get("percent", ""))),
-                "power": _coerce_value(str(row.get("power", ""))),
-                "unit": row.get("unit", ""),
-            }
-            for row in self._query("SELECT name, percent, power, unit FROM agc_units ORDER BY display_order, id")
-        ]
-
         return {
-            "system": "南极秦岭站综合能量管理系统",
+            "system": "考察站风-光-氢-储-柴联合规划系统",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "summary": self._load_overview_summary(),
-            "simu": {
-                "section": "SIMU在线监视",
-                "metrics": self._load_metrics(metrics, "simu"),
-                "alarms": self._load_alarms(alarms, "simu"),
-                "charts": {
-                    "bars": self._load_label_values("SELECT label, value, unit FROM simu_bars ORDER BY display_order, id"),
-                    "daily": self._load_simu_daily_curves(),
-                },
-                "topology": self._load_topology(),
-                "summary": self._load_page_summary(page_summary, "simu"),
-                "state": SIMU_RUNTIME.snapshot(),
-            },
-            "scada": {
-                "section": "SCADA在线监视",
-                "metrics": self._load_metrics(metrics, "scada"),
-                "alarms": self._load_alarms(alarms, "scada"),
-                "charts": {
-                    "columns": self._load_label_values(
-                        "SELECT label, value, unit FROM scada_columns ORDER BY display_order, id"
-                    )
-                },
-                "stations": self._load_stations(),
-                "summary": self._load_page_summary(page_summary, "scada"),
-            },
-            "agc": {
-                "section": "AGC在线监视",
-                "metrics": self._load_metrics(metrics, "agc"),
-                "alarms": self._load_alarms(alarms, "agc"),
-                "charts": {"units": agc_units},
-                "units": agc_units,
-                "reserve": self._load_agc_reserve(),
-                "summary": self._load_page_summary(page_summary, "agc"),
-            },
         }
 
     def _load_overview_summary(self) -> dict:
@@ -918,23 +1027,14 @@ class MySqlDataSource:
 
 
 def _load_initial_simu_runtime() -> SimuRuntime:
-    try:
-        row = MySqlDataSource(reload_interval=0)._query_one("SELECT sim_time, speed, status FROM simu_state WHERE id = 1")
-    except Exception:
-        row = None
-    if not row:
-        return SimuRuntime()
-    return SimuRuntime(
-        initial_time=row.get("sim_time", "00:00"),
-        speed=float(_coerce_value(row.get("speed", "1.0")) or 1.0),
-        status=row.get("status", "STOPPED"),
-    )
+    return SimuRuntime()
 
 
 SIMU_RUNTIME = _load_initial_simu_runtime()
 OPTIMIZATION_RUNTIME = OptimizationRuntimeManager()
-DATA_SOURCE = MySqlDataSource()
+DATA_SOURCE = CsvDataSource()
 PLANNING_STORE = planning_store.PlanningStore()
+USER_STORE = UserStore()
 
 
 def build_snapshot(force_reload: bool = False) -> dict:
@@ -942,12 +1042,15 @@ def build_snapshot(force_reload: bool = False) -> dict:
     return DATA_SOURCE.snapshot(force_reload=force_reload)
 
 
-def _json_response(payload: dict, status: int = 200) -> tuple[int, dict[str, str], bytes]:
+def _json_response(payload: dict, status: int = 200, extra_headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    return status, {
+    headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-store",
-    }, body
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return status, headers, body
 
 
 def _read_json_body(body: bytes) -> dict:
@@ -955,6 +1058,74 @@ def _read_json_body(body: bytes) -> dict:
         return json.loads(body.decode("utf-8") or "{}")
     except json.JSONDecodeError as exc:
         raise ValueError("请求体不是合法 JSON") from exc
+
+
+def _session_cookie(token: str, max_age: int = SESSION_MAX_AGE_SECONDS) -> str:
+    return f"{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+
+
+def _expired_session_cookie() -> str:
+    return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+
+def _session_token_from_cookie(cookie_header: str | None) -> str:
+    if not cookie_header:
+        return ""
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except Exception:
+        return ""
+    morsel = cookie.get(SESSION_COOKIE_NAME)
+    return morsel.value if morsel else ""
+
+
+def handle_auth_api_path(path: str, method: str, body: bytes = b"", token: str = "") -> tuple[int, dict[str, str], bytes]:
+    current_user = USER_STORE.user_for_session(token)
+    try:
+        if path == "/api/auth/me" and method == "GET":
+            if not current_user:
+                return _json_response({"error": "unauthorized", "message": "请先登录"}, HTTPStatus.UNAUTHORIZED)
+            return _json_response({"user": current_user})
+        if path == "/api/auth/register" and method == "POST":
+            payload = _read_json_body(body)
+            user = USER_STORE.create_user(str(payload.get("username", "")), str(payload.get("password", "")))
+            session_token = USER_STORE.create_session(user["id"])
+            return _json_response({"ok": True, "user": user}, extra_headers={"Set-Cookie": _session_cookie(session_token)})
+        if path == "/api/auth/login" and method == "POST":
+            payload = _read_json_body(body)
+            user = USER_STORE.authenticate(str(payload.get("username", "")), str(payload.get("password", "")))
+            session_token = USER_STORE.create_session(user["id"])
+            return _json_response({"ok": True, "user": user}, extra_headers={"Set-Cookie": _session_cookie(session_token)})
+        if path == "/api/auth/logout" and method == "POST":
+            USER_STORE.delete_session(token)
+            return _json_response({"ok": True}, extra_headers={"Set-Cookie": _expired_session_cookie()})
+    except ValueError as exc:
+        return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+    return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+
+def handle_users_api_path(path: str, method: str, body: bytes, current_user: dict | None) -> tuple[int, dict[str, str], bytes]:
+    if not current_user:
+        return _json_response({"error": "unauthorized", "message": "请先登录"}, HTTPStatus.UNAUTHORIZED)
+    if current_user.get("role") != "admin":
+        return _json_response({"error": "forbidden", "message": "需要管理员权限"}, HTTPStatus.FORBIDDEN)
+    try:
+        if path == "/api/users" and method == "GET":
+            return _json_response({"users": USER_STORE.list_users()})
+        if path.startswith("/api/users/"):
+            user_id = int(path.rsplit("/", 1)[1])
+            if method == "PUT":
+                payload = _read_json_body(body)
+                return _json_response({"user": USER_STORE.update_role(user_id, str(payload.get("role", "")))})
+            if method == "DELETE":
+                USER_STORE.delete_user(user_id, current_user_id=current_user["id"])
+                return _json_response({"ok": True})
+    except FileNotFoundError as exc:
+        return _json_response({"error": "not_found", "message": str(exc)}, HTTPStatus.NOT_FOUND)
+    except (TypeError, ValueError) as exc:
+        return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+    return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
 
 
 class WeatherHistoryError(RuntimeError):
@@ -1248,9 +1419,6 @@ def handle_api_path(path: str, query: str = "") -> tuple[int, dict[str, str], by
     routes = {
         "/api/health": {"ok": True, "timestamp": snapshot["timestamp"]},
         "/api/overview": snapshot,
-        "/api/simu": snapshot["simu"],
-        "/api/scada": snapshot["scada"],
-        "/api/agc": snapshot["agc"],
     }
     if path not in routes:
         return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
@@ -1269,17 +1437,15 @@ def handle_control_path(path: str, body: bytes) -> tuple[int, dict[str, str], by
         except (ValueError, json.JSONDecodeError) as exc:
             return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
         return _json_response({"ok": True, "state": state})
-    if path != "/api/simu/control":
-        return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
-    try:
-        payload = json.loads(body.decode("utf-8") or "{}")
-        action = str(payload.get("action", ""))
-        state = SIMU_RUNTIME.apply(action)
-        DATA_SOURCE.save_simu_state(state)
-    except (ValueError, json.JSONDecodeError) as exc:
-        return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
-    DATA_SOURCE.snapshot(force_reload=True)
-    return _json_response({"ok": True, "state": state})
+    return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
+
+
+def _unauthorized_response() -> tuple[int, dict[str, str], bytes]:
+    return _json_response({"error": "unauthorized", "message": "请先登录"}, HTTPStatus.UNAUTHORIZED)
+
+
+def _redirect_response(location: str) -> tuple[int, dict[str, str], bytes]:
+    return HTTPStatus.FOUND, {"Location": location, "Content-Type": "text/plain; charset=utf-8"}, b""
 
 
 def resolve_static_path(request_path: str) -> Path:
@@ -1299,9 +1465,27 @@ def resolve_static_path(request_path: str) -> Path:
 class PowerPlanHandler(BaseHTTPRequestHandler):
     server_version = "PowerPlan/1.0"
 
+    def _current_user(self) -> dict | None:
+        token = _session_token_from_cookie(self.headers.get("Cookie"))
+        return USER_STORE.user_for_session(token)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
+            token = _session_token_from_cookie(self.headers.get("Cookie"))
+            current_user = USER_STORE.user_for_session(token)
+            if parsed.path.startswith("/api/auth/"):
+                status, headers, body = handle_auth_api_path(parsed.path, "GET", b"", token)
+                self._send(status, headers, body)
+                return
+            if parsed.path.startswith("/api/users"):
+                status, headers, body = handle_users_api_path(parsed.path, "GET", b"", current_user)
+                self._send(status, headers, body)
+                return
+            if parsed.path != "/api/health" and not current_user:
+                status, headers, body = _unauthorized_response()
+                self._send(status, headers, body)
+                return
             status, headers, body = handle_api_path(parsed.path, parsed.query)
             self._send(status, headers, body)
             return
@@ -1316,6 +1500,20 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
             self._send_text(HTTPStatus.NOT_FOUND, "Not Found")
             return
 
+        if path.suffix == ".html":
+            current_user = self._current_user()
+            public_pages = {"login.html", "register.html"}
+            if path.name not in public_pages and not current_user:
+                next_path = parsed.path or "/index.html"
+                self._send(*_redirect_response(f"/login.html?next={urlencode({'next': next_path})[5:]}"))
+                return
+            if path.name == "users.html" and current_user and current_user.get("role") != "admin":
+                self._send_text(HTTPStatus.FORBIDDEN, "Forbidden")
+                return
+            if path.name in public_pages and current_user:
+                self._send(*_redirect_response("/index.html"))
+                return
+
         content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         no_cache_suffixes = {".html", ".css", ".js"}
         headers = {
@@ -1329,6 +1527,20 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
         if parsed.path.startswith("/api/"):
+            token = _session_token_from_cookie(self.headers.get("Cookie"))
+            current_user = USER_STORE.user_for_session(token)
+            if parsed.path.startswith("/api/auth/"):
+                status, headers, response_body = handle_auth_api_path(parsed.path, "POST", body, token)
+                self._send(status, headers, response_body)
+                return
+            if parsed.path.startswith("/api/users"):
+                status, headers, response_body = handle_users_api_path(parsed.path, "POST", body, current_user)
+                self._send(status, headers, response_body)
+                return
+            if not current_user:
+                status, headers, response_body = _unauthorized_response()
+                self._send(status, headers, response_body)
+                return
             if parsed.path.startswith("/api/planning/"):
                 status, headers, response_body = handle_planning_api_path(parsed.path, "POST", body)
                 self._send(status, headers, response_body)
@@ -1342,6 +1554,16 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
+        token = _session_token_from_cookie(self.headers.get("Cookie"))
+        current_user = USER_STORE.user_for_session(token)
+        if parsed.path.startswith("/api/users"):
+            status, headers, response_body = handle_users_api_path(parsed.path, "PUT", body, current_user)
+            self._send(status, headers, response_body)
+            return
+        if parsed.path.startswith("/api/") and not current_user:
+            status, headers, response_body = _unauthorized_response()
+            self._send(status, headers, response_body)
+            return
         if parsed.path.startswith("/api/planning/"):
             status, headers, response_body = handle_planning_api_path(parsed.path, "PUT", body)
             self._send(status, headers, response_body)
@@ -1350,6 +1572,16 @@ class PowerPlanHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        token = _session_token_from_cookie(self.headers.get("Cookie"))
+        current_user = USER_STORE.user_for_session(token)
+        if parsed.path.startswith("/api/users"):
+            status, headers, response_body = handle_users_api_path(parsed.path, "DELETE", b"", current_user)
+            self._send(status, headers, response_body)
+            return
+        if parsed.path.startswith("/api/") and not current_user:
+            status, headers, response_body = _unauthorized_response()
+            self._send(status, headers, response_body)
+            return
         if parsed.path.startswith("/api/planning/"):
             status, headers, response_body = handle_planning_api_path(parsed.path, "DELETE", b"")
             self._send(status, headers, response_body)
