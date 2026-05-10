@@ -4,11 +4,21 @@ const state = {
   optimization: null,
   pollTimer: null,
   pollDelay: 4000,
+  optimizationResultHeight: null,
+  optimizationLogHeight: null,
+};
+
+const resultTabLabels = {
+  overview: "结果概览",
+  green: "绿电结果",
+  safety: "安全结果",
 };
 
 document.addEventListener("DOMContentLoaded", () => {
   bindResultTabs();
   bindOptimizationActions();
+  bindOptimizationResultResizeHandle();
+  bindOptimizationLogResizeHandle();
   loadSchemes().catch(showError);
   refreshOptimizationStatus().catch(showError);
 });
@@ -124,9 +134,9 @@ function bindResultTabs() {
 
 function renderOptimization(data) {
   renderMetrics(data.metrics || []);
-  renderResultPanel("overview", "结果概览", data.results?.overview || [], data.results?.curves?.overview || []);
-  renderResultPanel("green", "绿电结果", data.results?.green || [], data.results?.curves?.green || []);
-  renderResultPanel("safety", "安全结果", data.results?.safety || [], data.results?.curves?.safety || []);
+  renderOverviewTables(data.results?.overview_tables || defaultOverviewTables());
+  renderResultPanel("green", resultTabLabels.green, data.results?.green || [], data.results?.curves?.green || []);
+  renderResultPanel("safety", resultTabLabels.safety, data.results?.safety || [], data.results?.curves?.safety || []);
   renderOptimizationLogs(data.logs || []);
 }
 
@@ -148,6 +158,27 @@ function setMetric(id, item) {
   }
   const unit = item.unit ? ` ${item.unit}` : "";
   element.textContent = `${item.value}${unit}`;
+}
+
+function defaultOverviewTables() {
+  return [
+    { title: "规划结果", rows: [{ "设备类型": "-", "设计台数": "-", "单台容量": "-", "总容量": "-", "单位": "" }] },
+    { title: "规划年指标", rows: [{ "指标": "-", "数值": "-", "单位": "" }] },
+    { title: "规划年效益", rows: [{ "指标": "-", "数值": "-", "单位": "" }] },
+  ];
+}
+
+function renderOverviewTables(tables) {
+  const panel = document.getElementById("overviewResult");
+  if (!panel) return;
+  const safeTables = tables.length ? tables : defaultOverviewTables();
+  panel.innerHTML = `<div class="optimization-overview-grid">${safeTables
+    .map((table) => `
+      <section class="overview-table-card">
+        <h2>${escapeHtml(table.title || "")}</h2>
+        <div class="data-table optimization-overview-table">${renderResultTable(table.rows || [])}</div>
+      </section>`)
+    .join("")}</div>`;
 }
 
 function renderResultPanel(key, title, rows, points) {
@@ -190,6 +221,131 @@ function renderOptimizationLogs(logs) {
     .map((item) => `<div class="log-line ${escapeHtml(item.level || "")}"><span>${escapeHtml(item.time || "")}</span><strong>${escapeHtml(item.message || "")}</strong></div>`)
     .join("");
   box.scrollTop = box.scrollHeight;
+}
+
+function bindOptimizationResultResizeHandle() {
+  const handle = document.getElementById("optimizationResultResizeHandle");
+  const resultCard = document.querySelector(".optimization-result-card");
+  if (!handle || !resultCard) return;
+
+  const applyHeight = (height) => {
+    const safeHeight = clampOptimizationResultHeight(height);
+    state.optimizationResultHeight = safeHeight;
+    document.documentElement.style.setProperty("--optimization-result-height", `${Math.round(safeHeight)}px`);
+    handle.setAttribute("aria-valuenow", String(Math.round(safeHeight)));
+  };
+
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = resultCard.getBoundingClientRect().height || 360;
+    handle.classList.add("dragging");
+    handle.setPointerCapture?.(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      applyHeight(startHeight + moveEvent.clientY - startY);
+    };
+    const onDone = () => {
+      handle.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onDone);
+      window.removeEventListener("pointercancel", onDone);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onDone);
+    window.addEventListener("pointercancel", onDone);
+  });
+
+  bindResizeHandleKeys(handle, () => state.optimizationResultHeight || resultCard.getBoundingClientRect().height || 360, applyHeight, optimizationResultHeightBounds);
+  handle.setAttribute("aria-valuenow", String(Math.round(resultCard.getBoundingClientRect().height || 360)));
+}
+
+function bindOptimizationLogResizeHandle() {
+  const handle = document.getElementById("optimizationLogResizeHandle");
+  const logCard = document.querySelector(".optimization-log-card");
+  if (!handle || !logCard) return;
+
+  const applyHeight = (height) => {
+    const safeHeight = clampOptimizationLogHeight(height);
+    state.optimizationLogHeight = safeHeight;
+    document.documentElement.style.setProperty("--optimization-log-height", `${Math.round(safeHeight)}px`);
+    handle.setAttribute("aria-valuenow", String(Math.round(safeHeight)));
+  };
+
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = logCard.getBoundingClientRect().height || 180;
+    handle.classList.add("dragging");
+    handle.setPointerCapture?.(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      applyHeight(startHeight - (moveEvent.clientY - startY));
+    };
+    const onDone = () => {
+      handle.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onDone);
+      window.removeEventListener("pointercancel", onDone);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onDone);
+    window.addEventListener("pointercancel", onDone);
+  });
+
+  bindResizeHandleKeys(handle, () => state.optimizationLogHeight || logCard.getBoundingClientRect().height || 180, applyHeight, optimizationLogHeightBounds);
+  handle.setAttribute("aria-valuenow", String(Math.round(logCard.getBoundingClientRect().height || 180)));
+}
+
+function bindResizeHandleKeys(handle, currentHeight, applyHeight, boundsFactory) {
+  handle.addEventListener("keydown", (event) => {
+    const keySteps = {
+      ArrowUp: 16,
+      ArrowDown: -16,
+      PageUp: 64,
+      PageDown: -64,
+    };
+    if (event.key in keySteps) {
+      event.preventDefault();
+      applyHeight(currentHeight() + keySteps[event.key]);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      applyHeight(boundsFactory().min);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      applyHeight(boundsFactory().max);
+    }
+  });
+}
+
+function clampOptimizationResultHeight(height) {
+  const bounds = optimizationResultHeightBounds();
+  return Math.min(Math.max(Number(height) || bounds.min, bounds.min), bounds.max);
+}
+
+function clampOptimizationLogHeight(height) {
+  const bounds = optimizationLogHeightBounds();
+  return Math.min(Math.max(Number(height) || bounds.min, bounds.min), bounds.max);
+}
+
+function optimizationResultHeightBounds() {
+  const panel = document.querySelector(".optimization-panel");
+  const panelHeight = panel?.clientHeight || Math.max(620, window.innerHeight - 120);
+  return {
+    min: 220,
+    max: Math.max(320, Math.min(760, panelHeight - 260)),
+  };
+}
+
+function optimizationLogHeightBounds() {
+  const panel = document.querySelector(".optimization-panel");
+  const panelHeight = panel?.clientHeight || Math.max(520, window.innerHeight - 120);
+  return {
+    min: 120,
+    max: Math.max(180, Math.min(520, panelHeight - 260)),
+  };
 }
 
 function escapeHtml(value) {

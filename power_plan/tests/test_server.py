@@ -191,6 +191,47 @@ class PowerPlanServerTest(unittest.TestCase):
         finally:
             server.OPTIMIZATION_RUNTIME = original_runtime
 
+    def test_optimization_overview_results_are_three_requested_tables(self):
+        runtime = server.OptimizationRuntime()
+        payload = runtime.apply("start", scheme="方案A")
+
+        tables = payload["results"]["overview_tables"]
+        self.assertEqual([table["title"] for table in tables], ["规划结果", "规划年指标", "规划年效益"])
+        self.assertEqual(len(tables), 3)
+        self.assertTrue(any(row["设备类型"] == "柴发" and "设计台数" in row for row in tables[0]["rows"]))
+        self.assertTrue(any(row["设备类型"] == "储能" and "设计台数" in row for row in tables[0]["rows"]))
+        annual_metric_names = {row["指标"] for row in tables[1]["rows"]}
+        for name in (
+            "柴发总容量",
+            "风电总容量",
+            "光伏总容量",
+            "氢能总容量",
+            "储能总容量",
+            "负荷总电量",
+            "柴发总电量",
+            "风能总电量",
+            "光伏总电量",
+            "弃电量",
+            "储能总电量",
+            "制氢总量",
+            "燃料电池发电量",
+        ):
+            self.assertIn(name, annual_metric_names)
+        benefit_names = {row["指标"] for row in tables[2]["rows"]}
+        for name in (
+            "总成本",
+            "度电成本",
+            "建设成本",
+            "柴油消耗量",
+            "运行成本",
+            "绿电占比",
+            "弃电占比",
+            "最高频率",
+            "最低频率",
+            "频率安全风险点",
+        ):
+            self.assertIn(name, benefit_names)
+
     def test_snapshot_reads_values_from_csv_files(self):
         payload = server.build_snapshot(force_reload=True)
 
@@ -603,7 +644,7 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn('assets/optimize.js', html)
         self.assertIn('href="optimize.html">启动优化</a>', planning_html)
         self.assertIn(".optimization-panel", css)
-        self.assertIn("grid-template-rows: auto minmax(0, 1fr) minmax(120px, 24vh)", css)
+        self.assertIn("grid-template-rows: auto 14px minmax(220px, var(--optimization-result-height, 1fr)) 14px minmax(120px, var(--optimization-log-height, 24vh))", css)
 
     def test_optimization_frontend_polls_status_and_binds_controls(self):
         script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
@@ -625,6 +666,48 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("结果概览", script)
         self.assertIn("绿电结果", script)
         self.assertIn("安全结果", script)
+
+    def test_optimization_page_has_draggable_result_and_log_resize_handles(self):
+        html = (WEB_ROOT / "optimize.html").read_text(encoding="utf-8")
+        script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="optimizationResultResizeHandle"', html)
+        self.assertIn('id="optimizationLogResizeHandle"', html)
+        self.assertIn('role="separator"', html)
+        self.assertIn('aria-label="调整规划结果高度"', html)
+        self.assertIn('aria-label="调整运行日志高度"', html)
+        self.assertIn('aria-orientation="horizontal"', html)
+        self.assertIn("bindOptimizationResultResizeHandle", script)
+        self.assertIn("bindOptimizationLogResizeHandle", script)
+        self.assertIn("optimizationResultHeight", script)
+        self.assertIn("optimizationLogHeight", script)
+        self.assertIn("--optimization-result-height", script)
+        self.assertIn("--optimization-log-height", script)
+        self.assertIn("pointerdown", script)
+        self.assertIn("setPointerCapture", script)
+        self.assertIn("ArrowUp", script)
+        self.assertIn("ArrowDown", script)
+        self.assertIn(".optimization-result-resize-handle", css)
+        self.assertIn(".optimization-log-resize-handle", css)
+        self.assertIn("cursor: row-resize", css)
+        self.assertIn("--optimization-result-height", css)
+        self.assertIn("--optimization-log-height", css)
+
+    def test_optimization_overview_frontend_renders_three_parallel_tables(self):
+        script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn("renderOverviewTables", script)
+        self.assertIn("overview_tables", script)
+        self.assertIn("optimization-overview-grid", script)
+        for title in ("规划结果", "规划年指标", "规划年效益"):
+            self.assertIn(title, script)
+        for field in ("设备类型", "设计台数", "指标", "数值", "单位"):
+            self.assertIn(field, script)
+        self.assertIn(".optimization-overview-grid", css)
+        self.assertIn("grid-template-columns: repeat(3, minmax(260px, 1fr))", css)
+        self.assertIn(".overview-table-card", css)
 
     def test_planning_scheme_rail_only_shows_scheme_list_title(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")

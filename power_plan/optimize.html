@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>微电网风光氢储联合规划系统</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="assets/planning.css?v=20260510-optimization">
+  <link rel="stylesheet" href="assets/planning.css?v=20260510-optimization-resize">
 </head>
 <body>
   <main class="planning-shell">
@@ -44,6 +44,8 @@
           </div>
         </section>
 
+        <div id="optimizationResultResizeHandle" class="optimization-result-resize-handle" role="separator" tabindex="0" aria-label="调整规划结果高度" aria-orientation="horizontal" aria-valuemin="220" aria-valuemax="720" aria-valuenow="0"></div>
+
         <section class="optimization-result-card">
           <div class="result-tabs" role="tablist" aria-label="优化规划结果切换">
             <button class="result-tab active" data-result-tab="overview" type="button" aria-selected="true">结果概览</button>
@@ -55,6 +57,8 @@
           <div id="safetyResult" class="result-panel" data-result-panel="safety" role="tabpanel" hidden></div>
         </section>
 
+        <div id="optimizationLogResizeHandle" class="optimization-log-resize-handle" role="separator" tabindex="0" aria-label="调整运行日志高度" aria-orientation="horizontal" aria-valuemin="120" aria-valuemax="520" aria-valuenow="0"></div>
+
         <section class="optimization-log-card">
           <div class="optimization-log-title">运行日志</div>
           <div id="optimizationLogs" class="optimization-logs" aria-live="polite"></div>
@@ -62,6 +66,6 @@
       </section>
     </section>
   </main>
-  <script src="assets/optimize.js?v=20260510-optimization"></script>
+  <script src="assets/optimize.js?v=20260510-optimization-resize"></script>
 </body>
 </html>
