@@ -354,6 +354,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
     def test_state_estimator_reads_algorithm_parameters_from_se_para(self):
         from algorithm_parameters import load_se_parameters
+        from model.meas_model import is_pseudo_measurement
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -398,9 +399,9 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             pseudo_weights = {
                 meas.weight
                 for meas in estimator.active_measurements
-                if meas.name.startswith("pseudo_")
+                if is_pseudo_measurement(meas)
             }
-            self.assertEqual({0.002}, pseudo_weights)
+            self.assertEqual({0.002, 0.002 * 1e-4}, pseudo_weights)
 
 
 if __name__ == "__main__":

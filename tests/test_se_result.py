@@ -4,7 +4,7 @@ import tempfile
 
 import numpy as np
 
-from model.meas_model import BadDataItem, EstimateResult, Measurement, ObservabilityResult
+from model.meas_model import BadDataItem, EstimateResult, MEAS_STATUS_PSEUDO, Measurement, ObservabilityResult
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -58,7 +58,7 @@ class SEResultTest(unittest.TestCase):
         from secore.se_result import SEResult
 
         good = Measurement(1, "v_n1", "DCNode", "n1", "V", 1.0, True, 1.0)
-        pseudo = Measurement(2, "pseudo_v_n2", "DCNode", "n2", "V", 1e-6, True, 1.0)
+        pseudo = Measurement(2, "status_pseudo_v_n2", "DCNode", "n2", "V", 1e-6, True, 1.0, MEAS_STATUS_PSEUDO)
         filtered = Measurement(3, "v_off", "DCNode", "n3", "V", 1.0, False, 0.0)
         bad_meas = Measurement(4, "v_bad", "DCNode", "n4", "V", 1.0, True, 2.0)
         obs = ObservabilityResult(
@@ -107,10 +107,46 @@ class SEResultTest(unittest.TestCase):
         self.assertEqual(1, result.statistics.bad_data_count)
         self.assertEqual(1, result.statistics.normal_measurement_count)
         self.assertEqual("invalid row", result.prefiltered_measurements[0].reason)
-        self.assertEqual("pseudo_v_n2", result.pseudo_measurements[0].name)
+        self.assertEqual("status_pseudo_v_n2", result.pseudo_measurements[0].name)
         self.assertEqual("v_bad", result.bad_data[0].name)
         self.assertEqual(4.0, result.bad_data[0].normalized_residual)
         self.assertEqual("v_n1", result.normal_measurements[0].name)
+
+    def test_pseudo_classification_uses_status_not_name(self):
+        from secore.se_result import SEResult
+
+        pseudo_named_real = Measurement(1, "pseudo_v_n1", "DCNode", "n1", "V", 1.0, True, 1.0)
+        normal_named_pseudo = Measurement(
+            2,
+            "v_n2",
+            "DCNode",
+            "n2",
+            "V",
+            1.0,
+            True,
+            1.0,
+            MEAS_STATUS_PSEUDO,
+        )
+        obs = ObservabilityResult(True, 2, 2, 2, 0, np.array([2.0, 1.0]), [])
+        estimate = EstimateResult(
+            converged=True,
+            iterations=1,
+            objective=0.0,
+            max_correction=0.0,
+            residual_inf=0.0,
+            x=np.array([1.0, 1.0]),
+            z_est=np.array([1.0, 1.0]),
+            residual=np.array([0.0, 0.0]),
+            H=None,
+            gain=None,
+            measurements=[pseudo_named_real, normal_named_pseudo],
+            observability=obs,
+        )
+
+        result = SEResult.from_estimate_result(estimate)
+
+        self.assertEqual(["v_n2"], [row.name for row in result.pseudo_measurements])
+        self.assertEqual(["pseudo_v_n1"], [row.name for row in result.normal_measurements])
 
     def test_state_estimators_build_se_result_after_estimation(self):
         from secore.ac_se import ACStateEstimator
@@ -119,7 +155,7 @@ class SEResultTest(unittest.TestCase):
         from secore.se_result import SEResult
 
         good = Measurement(1, "v_n1", "DCNode", "n1", "V", 1.0, True, 1.0)
-        pseudo = Measurement(2, "pseudo_v_n2", "DCNode", "n2", "V", 1e-4, True, 1.0)
+        pseudo = Measurement(2, "status_pseudo_v_n2", "DCNode", "n2", "V", 1e-4, True, 1.0, MEAS_STATUS_PSEUDO)
         filtered = Measurement(3, "v_off", "DCNode", "n3", "V", 1.0, False, 0.0)
         bad_meas = Measurement(4, "v_bad", "DCNode", "n4", "V", 1.0, True, 2.0)
         obs = ObservabilityResult(True, 2, 2, 3, 0, np.array([2.0, 1.0]), [])
@@ -227,12 +263,22 @@ class SEResultTest(unittest.TestCase):
         def observability_analysis():
             observability_calls.append(1)
             if len(observability_calls) == 1:
-                return ObservabilityResult(False, 1, 2, 1, 1, np.array([]), [("AC_I_RE:zbr_1", 0.0)])
+                return ObservabilityResult(False, 1, 2, 1, 1, np.array([]), [(0, 0.0)])
             return ObservabilityResult(True, 2, 2, 2, 0, np.array([]), [])
 
-        def append_targeted(next_idx, state_label, existing_keys, existing_names, max_add):
-            self.assertEqual("AC_I_RE:zbr_1", state_label)
-            pseudo = Measurement(next_idx, f"pseudo_obs_{next_idx}", "ACZeroBranch", "zbr_1", "P_FROM", 1e-4, True, 0.0)
+        def append_targeted(next_idx, state_idx, existing_keys, existing_names, max_add):
+            self.assertEqual(0, state_idx)
+            pseudo = Measurement(
+                next_idx,
+                f"pseudo_obs_{next_idx}",
+                "ACZeroBranch",
+                "zbr_1",
+                "P_FROM",
+                1e-4,
+                True,
+                0.0,
+                MEAS_STATUS_PSEUDO,
+            )
             estimator.measurements.append(pseudo)
             existing_keys.add((pseudo.device_type, pseudo.device_name, pseudo.meas_type))
             existing_names.add(pseudo.name)

@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -10,6 +11,73 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class DCStateEstimationTest(unittest.TestCase):
+    def test_summary_cache_uses_table_and_primes_voltage_observation_cache(self):
+        from model.meas_model import (
+            MEAS_STATUS_PSEUDO,
+            Measurement,
+            MeasurementList,
+            measurement_table_from_measurements,
+        )
+        from secore.dc_se import DCStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("summary cache should use the cached table")
+
+        rows = [
+            Measurement(1, "node_v", "DCNode", "n1", "V", 2.0, True, 1.02),
+            Measurement(2, "node_v_status_pseudo", "DCNode", "n2", "V", 3.0, True, 0.99, MEAS_STATUS_PSEUDO),
+        ]
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.measurements = NoIterMeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator.node_by_name = {"n1": SimpleNamespace(idx=1), "n2": SimpleNamespace(idx=2)}
+        estimator.node_pos = {1: 0, 2: 1}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {}
+        estimator.branch_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.break_by_name = {}
+        estimator.dcdc_by_name = {}
+
+        estimator._refresh_measurement_summary_cache()
+
+        self.assertEqual({("DCNode", "n1"), ("DCNode", "n2")}, estimator._active_device_key_cache)
+        self.assertEqual(2, estimator._max_measurement_idx)
+        self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
+        self.assertEqual({1: 1.02}, estimator._real_voltage_observation_nodes())
+
+    def test_conversion_primes_summary_and_voltage_observation_cache(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.dc_se import DCStateEstimator
+
+        rows = [Measurement(1, "node_v", "DCNode", "n1", "V", 2.0, True, 10.2)]
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.measurements = MeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator._node_measurement_scale_by_name = {"n1": 10.0}
+        estimator._branch_measurement_scale_by_name = {}
+        estimator._break_measurement_scale_by_name = {}
+        estimator._zero_branch_measurement_scale_by_name = {}
+        estimator._dcdc_measurement_scale_by_name = {}
+        estimator._generator_measurement_scale_by_name = {}
+        estimator._load_measurement_scale_by_name = {}
+        estimator._constraint_measurement_scale_by_name = {}
+        estimator.node_by_name = {"n1": SimpleNamespace(idx=1)}
+        estimator.node_pos = {1: 0}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {}
+        estimator.branch_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.break_by_name = {}
+        estimator.dcdc_by_name = {}
+
+        estimator._convert_measurements_to_pu()
+
+        self.assertEqual({("DCNode", "n1")}, estimator._active_device_key_cache)
+        self.assertEqual({("DCNode", "n1", "V")}, estimator._active_measurement_key_cache)
+        self.assertEqual(1, estimator._max_measurement_idx)
+        self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
+        self.assertEqual({1: 1.02}, estimator._real_voltage_observation_nodes())
+
     def test_dc_topology_contracts_closed_switches_to_buses_before_islands(self):
         from model.dc_model import DCPowerNetwork as ObjectDCPowerNetwork
 
@@ -302,17 +370,22 @@ class DCStateEstimationTest(unittest.TestCase):
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
         existing_keys = set()
         existing_names = set()
+        target_col, target_meta = next(
+            (idx, meta)
+            for idx, meta in enumerate(estimator.state_meta)
+            if meta.kind == "voltage" and meta.device_type == "DCNode"
+        )
 
         _, added = estimator._append_targeted_observability_pseudo(
             next_idx,
-            "V:nd_2",
+            target_col,
             existing_keys,
             existing_names,
             1,
         )
 
         self.assertEqual(1, added)
-        self.assertIn(("DCNode", "nd_2", "V"), existing_keys)
+        self.assertIn(("DCNode", target_meta.device_name, "V"), existing_keys)
 
     def test_pseudo_measurements_are_device_level_for_dc_sources_loads_and_converters(self):
         from secore.dc_se import DCStateEstimator
@@ -803,6 +876,9 @@ class DCStateEstimationTest(unittest.TestCase):
             singular_values=np.ones(1, dtype=np.float64),
             weak_states=[],
         )
+        target_pos = int(np.flatnonzero(estimator.voltage_col >= 0)[0])
+        target_col = int(estimator.voltage_col[target_pos])
+        estimator.state_labels = [f"opaque_state_{idx}" for idx in range(estimator.n_state)]
         non_observable_result = ObservabilityResult(
             observable=False,
             rank=max(estimator.n_state - 1, 0),
@@ -810,7 +886,7 @@ class DCStateEstimationTest(unittest.TestCase):
             measurement_count=len(estimator.active_measurements),
             deficiency=1,
             singular_values=np.ones(1, dtype=np.float64),
-            weak_states=[("V:dc1", 1.0)],
+            weak_states=[(target_col, 1.0)],
         )
         results = [non_observable_result, observable_result]
         estimator.observability_analysis = lambda: results.pop(0) if results else observable_result

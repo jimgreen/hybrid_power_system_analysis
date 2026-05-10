@@ -36,12 +36,20 @@ from model.meas_model import (
     GEN_CONTROL_KIND,
     GEN_MEASUREMENT_KIND,
     LOAD_MEASUREMENT_KIND,
+    MEAS_STATUS_INVALID,
+    MEAS_STATUS_PSEUDO,
     Measurement,
     MeasurementList,
     MeasurementTable,
     ObservabilityResult,
     TERMINAL_MEASUREMENT_KIND,
+    is_pseudo_measurement,
+    mark_measurement_invalid,
+    mark_measurement_pseudo,
+    measurement_status_is_active,
     measurement_table_from_measurements,
+    measurement_table_status_code,
+    normalize_measurement_status,
     print_iteration as _print_iteration,
     print_iteration_header as _print_iteration_header,
 )
@@ -60,6 +68,7 @@ from secore.se_math import (
     observability_weak_direction,
     targeted_redundancy_count,
 )
+from secore.state_metadata import StateMeta, state_labels_from_metadata, state_meta_at
 from secore.se_array_plan import (
     append_active_measurement_view,
     build_active_measurement_view,
@@ -101,6 +110,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     valid_values = []
     value_values = []
     device_type_code_values = []
+    status_values = []
     append_idx = idx_values.append
     append_name = name_values.append
     append_device_type = device_type_values.append
@@ -110,6 +120,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     append_valid = valid_values.append
     append_value = value_values.append
     append_device_type_code = device_type_code_values.append
+    append_status = status_values.append
     in_measurement = False
     found_measurement_block = False
     header = None
@@ -122,7 +133,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     device_type_cache_get = device_type_cache.get
     meas_type_cache_get = meas_type_cache.get
     device_type_code_get = _DEVICE_TYPE_CODES.get
-    idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = -1
+    idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = status_col = -1
 
     with Path(meas_file).open("r", encoding="utf-8") as handle:
         for line_no, raw_line in enumerate(handle, start=1):
@@ -152,6 +163,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
                 weight_col = header["weight"]
                 valid_col = header["valid"]
                 value_col = header["value"]
+                status_col = header.get("status", -1)
                 continue
             if first != "#":
                 raise SyntaxError(f"Invalid Measurement row at line {line_no} in {meas_file}")
@@ -179,6 +191,13 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
             weight = float(fields[weight_col])
             valid = bool(int(fields[valid_col]))
             value = float(fields[value_col])
+            status = (
+                normalize_measurement_status(fields[status_col], valid=valid)
+                if status_col >= 0
+                else normalize_measurement_status(None, valid=valid)
+            )
+            if not measurement_status_is_active(status):
+                valid = False
 
             meas = new_measurement(Measurement)
             meas.idx = idx
@@ -189,6 +208,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
             meas.weight = weight
             meas.valid = valid
             meas.value = value
+            meas.status = status
             append_measurement(meas)
             append_idx(idx)
             append_name(name)
@@ -199,6 +219,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
             append_valid(valid)
             append_value(value)
             append_device_type_code(device_type_code_get(device_type, 0))
+            append_status(status)
 
     if not found_measurement_block:
         raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
@@ -215,6 +236,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
         value=np.asarray(value_values, dtype=np.float64),
         device_type_code=np.asarray(device_type_code_values, dtype=np.int16),
         angle_mask=np.zeros(len(measurements), dtype=bool),
+        status_code=np.asarray(status_values, dtype=np.int16),
     )
     return MeasurementList(measurements, table)
 
@@ -272,7 +294,11 @@ class DCStateEstimator:
         self.normalized_residual = np.array([], dtype=np.float64)
         self.se_result = None
         if auto_prepare:
-            self.prepare()
+            self.prepare(
+                network=network,
+                measurements=measurements,
+                prepare_active_measurements=prepare_active_measurements,
+            )
 
     def prepare(
         self,
@@ -456,13 +482,32 @@ class DCStateEstimator:
         self.v_generator_start = self.dcdc_start + self.n_dcdc_power
         self.n_state = self.v_generator_start + self.n_v_generator
 
-        self.state_labels = [f"V:{self.nodes[pos].name}" for pos in self.voltage_state_pos]
-        self.state_labels.extend(f"I_ZERO:{zbr.name}" for zbr in self.zero_branches if zbr.name in self.zero_branch_pos)
-        self.state_labels.extend(f"I_BREAK:{brk.name}" for brk in self.breakers)
+        state_meta: List[StateMeta] = [
+            StateMeta("dc", "voltage", "DCNode", self.nodes[pos].name, component="magnitude", legacy_label=f"V:{self.nodes[pos].name}")
+            for pos in self.voltage_state_pos
+        ]
+        state_meta.extend(
+            StateMeta("dc", "zero_current", "DCZeroBranch", zbr.name, component="current", legacy_label=f"I_ZERO:{zbr.name}")
+            for zbr in self.zero_branches
+            if zbr.name in self.zero_branch_pos
+        )
+        state_meta.extend(
+            StateMeta("dc", "break_current", "DCBreak", brk.name, component="current", legacy_label=f"I_BREAK:{brk.name}")
+            for brk in self.breakers
+        )
         for conv in self.dcdc_converters:
-            self.state_labels.append(f"P_DCDC_FROM:{conv.name}")
-            self.state_labels.append(f"P_DCDC_TO:{conv.name}")
-        self.state_labels.extend(f"P_VGEN:{gen.name}" for gen in self.v_generators)
+            state_meta.append(
+                StateMeta("dc", "dcdc_p_from", "DCDCConverter", conv.name, terminal="from", component="p", legacy_label=f"P_DCDC_FROM:{conv.name}")
+            )
+            state_meta.append(
+                StateMeta("dc", "dcdc_p_to", "DCDCConverter", conv.name, terminal="to", component="p", legacy_label=f"P_DCDC_TO:{conv.name}")
+            )
+        state_meta.extend(
+            StateMeta("dc", "v_generator_p", "DCGenerator", gen.name, component="p", legacy_label=f"P_VGEN:{gen.name}")
+            for gen in self.v_generators
+        )
+        self.state_meta = state_meta
+        self.state_labels = state_labels_from_metadata(self.state_meta)
         self._build_apply_state_index()
         self._build_measurement_plan_device_cache()
         self._record_profile_time("init.state_layout", time.perf_counter() - stage_start)
@@ -728,6 +773,7 @@ class DCStateEstimator:
         }
         table = getattr(self.measurements, "table", None)
         table_valid = table.valid if table is not None and len(table.valid) == len(self.measurements) else None
+        table_status = measurement_table_status_code(table) if table_valid is not None else None
         for pos, meas in enumerate(self.measurements):
             if not meas.valid or meas.weight <= 0.0:
                 continue
@@ -741,12 +787,17 @@ class DCStateEstimator:
                 if devices is None or meas.device_name not in devices:
                     keep_valid = False
             if not keep_valid:
-                meas.valid = False
+                mark_measurement_invalid(meas)
                 if table_valid is not None:
                     table_valid[pos] = False
+                if table_status is not None:
+                    table_status[pos] = MEAS_STATUS_INVALID
 
     def _node_voltage_measurements(self) -> Dict[int, float]:
         """Return valid real DCNode voltage measurements keyed by DC node index."""
+        cached = getattr(self, "_node_voltage_measurement_cache", None)
+        if cached is not None:
+            return dict(cached)
         best: Dict[int, Tuple[float, float]] = {}
         for meas in self.measurements:
             if (
@@ -754,7 +805,7 @@ class DCStateEstimator:
                 or meas.weight <= 0.0
                 or meas.device_type != "DCNode"
                 or meas.meas_type != "V"
-                or meas.name.startswith("pseudo_")
+                or is_pseudo_measurement(meas)
                 or meas.device_name not in self.node_by_name
             ):
                 continue
@@ -809,7 +860,7 @@ class DCStateEstimator:
             return cache
         best: Dict[int, Tuple[float, float]] = {}
         for meas in self.measurements:
-            if not meas.valid or meas.weight <= 0.0 or meas.name.startswith("pseudo_"):
+            if not meas.valid or meas.weight <= 0.0 or is_pseudo_measurement(meas):
                 continue
             node_idx = self._voltage_measurement_node_idx(meas.device_type, meas.device_name, meas.meas_type)
             if node_idx is None or node_idx not in self.node_pos:
@@ -1802,6 +1853,7 @@ class DCStateEstimator:
     def _convert_measurements_to_pu(self) -> None:
         """Normalize file measurement values to the internal state-estimation units."""
         if getattr(self.measurements, "normalized", False):
+            self._refresh_measurement_summary_cache()
             seed_rows = []
             for meas in self.measurements:
                 if not meas.valid or meas.weight <= 0.0:
@@ -1844,15 +1896,24 @@ class DCStateEstimator:
         load_scale = self._load_measurement_scale_by_name.__getitem__
         constraint_scale = self._constraint_measurement_scale_by_name.__getitem__
         seed_rows = []
+        active_device_keys = set()
+        active_measurement_keys = set()
+        node_voltage_best: Dict[int, Tuple[float, float]] = {}
+        real_voltage_best: Dict[int, Tuple[float, float]] = {}
+        max_idx = 0
         table = getattr(self.measurements, "table", None)
         table_value = table.value if table is not None and len(table.value) == len(self.measurements) else None
 
         for pos, meas in enumerate(self.measurements):
+            if meas.idx > max_idx:
+                max_idx = int(meas.idx)
             if not meas.valid or meas.weight <= 0.0:
                 continue
             scale = 1.0
             mtype = meas.meas_type
             device_name = meas.device_name
+            active_device_keys.add((meas.device_type, device_name))
+            active_measurement_keys.add((meas.device_type, device_name, mtype))
             if meas.device_type == "DCNode":
                 if mtype == "V":
                     scale = node_scale(device_name)
@@ -1889,6 +1950,17 @@ class DCStateEstimator:
             meas.value = float(meas.value) / scale
             if table_value is not None:
                 table_value[pos] = meas.value
+            if not is_pseudo_measurement(meas):
+                node_idx = self._voltage_measurement_node_idx(meas.device_type, device_name, mtype)
+                if node_idx is not None and node_idx in self.node_pos:
+                    current = real_voltage_best.get(node_idx)
+                    if current is None or float(meas.weight) > current[0]:
+                        real_voltage_best[node_idx] = (float(meas.weight), float(meas.value))
+                if meas.device_type == "DCNode" and mtype == "V" and device_name in self.node_by_name:
+                    node_idx = int(self.node_by_name[device_name].idx)
+                    current = node_voltage_best.get(node_idx)
+                    if current is None or float(meas.weight) > current[0]:
+                        node_voltage_best[node_idx] = (float(meas.weight), float(meas.value))
             if (
                 (meas.device_type == "DCNode" and mtype == "V")
                 or (meas.device_type == "DCGenerator" and mtype in ("P_GEN", "V_GEN", "I_GEN"))
@@ -1912,6 +1984,15 @@ class DCStateEstimator:
                 )
             ):
                 seed_rows.append((meas.device_type, device_name, mtype, float(meas.value)))
+        self._active_device_key_cache = active_device_keys
+        self._active_measurement_key_cache = active_measurement_keys
+        self._max_measurement_idx = max_idx
+        self._node_voltage_measurement_cache = {
+            node_idx: value for node_idx, (_weight, value) in node_voltage_best.items()
+        }
+        self._real_voltage_observation_node_cache = {
+            node_idx: value for node_idx, (_weight, value) in real_voltage_best.items()
+        }
         self._power_flow_seed_rows = seed_rows
 
     def _active_device_keys(self) -> set:
@@ -1935,16 +2016,64 @@ class DCStateEstimator:
         """Cache active measurement key sets and max row id for initialization scans."""
         active_device_keys = set()
         active_measurement_keys = set()
-        max_idx = 0
-        for meas in self.measurements:
-            if meas.idx > max_idx:
-                max_idx = int(meas.idx)
-            if meas.valid and meas.weight > 0.0:
-                active_device_keys.add((meas.device_type, meas.device_name))
-                active_measurement_keys.add((meas.device_type, meas.device_name, meas.meas_type))
+        node_voltage_best: Dict[int, Tuple[float, float]] = {}
+        real_voltage_best: Dict[int, Tuple[float, float]] = {}
+        table = getattr(self.measurements, "table", None)
+        if table is not None and len(table.idx) == len(self.measurements):
+            max_idx = int(table.idx.max()) if table.idx.size else 0
+            active_rows = np.flatnonzero(table.valid & (table.weight > 0.0))
+            status_code = measurement_table_status_code(table)
+            for row in active_rows:
+                device_type = str(table.device_type[row])
+                device_name = str(table.device_name[row])
+                meas_type = str(table.meas_type[row])
+                weight = float(table.weight[row])
+                value = float(table.value[row])
+                active_device_keys.add((device_type, device_name))
+                active_measurement_keys.add((device_type, device_name, meas_type))
+                if int(status_code[row]) == MEAS_STATUS_PSEUDO:
+                    continue
+                if device_type == "DCNode" and meas_type == "V" and device_name in self.node_by_name:
+                    node_idx = int(self.node_by_name[device_name].idx)
+                    current = node_voltage_best.get(node_idx)
+                    if current is None or weight > current[0]:
+                        node_voltage_best[node_idx] = (weight, value)
+                node_idx = self._voltage_measurement_node_idx(device_type, device_name, meas_type)
+                if node_idx is not None and node_idx in self.node_pos:
+                    current = real_voltage_best.get(node_idx)
+                    if current is None or weight > current[0]:
+                        real_voltage_best[node_idx] = (weight, value)
+        else:
+            max_idx = 0
+            for meas in self.measurements:
+                if meas.idx > max_idx:
+                    max_idx = int(meas.idx)
+                if meas.valid and meas.weight > 0.0:
+                    active_device_keys.add((meas.device_type, meas.device_name))
+                    active_measurement_keys.add((meas.device_type, meas.device_name, meas.meas_type))
+                    if is_pseudo_measurement(meas):
+                        continue
+                    weight = float(meas.weight)
+                    value = float(meas.value)
+                    if meas.device_type == "DCNode" and meas.meas_type == "V" and meas.device_name in self.node_by_name:
+                        node_idx = int(self.node_by_name[meas.device_name].idx)
+                        current = node_voltage_best.get(node_idx)
+                        if current is None or weight > current[0]:
+                            node_voltage_best[node_idx] = (weight, value)
+                    node_idx = self._voltage_measurement_node_idx(meas.device_type, meas.device_name, meas.meas_type)
+                    if node_idx is not None and node_idx in self.node_pos:
+                        current = real_voltage_best.get(node_idx)
+                        if current is None or weight > current[0]:
+                            real_voltage_best[node_idx] = (weight, value)
         self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
         self._max_measurement_idx = max_idx
+        self._node_voltage_measurement_cache = {
+            node_idx: value for node_idx, (_weight, value) in node_voltage_best.items()
+        }
+        self._real_voltage_observation_node_cache = {
+            node_idx: value for node_idx, (_weight, value) in real_voltage_best.items()
+        }
 
     def _record_measurement_summary(self, meas: Measurement) -> None:
         if not hasattr(self, "_max_measurement_idx"):
@@ -1975,6 +2104,7 @@ class DCStateEstimator:
         measurement.weight = self.pseudo_measurement_weight
         measurement.valid = True
         measurement.value = float(value)
+        mark_measurement_pseudo(measurement)
         self.measurements.append(measurement)
         if record_summary:
             self._record_measurement_summary(measurement)
@@ -2179,12 +2309,12 @@ class DCStateEstimator:
             refreshed = False
             measurement_count_before = len(self.measurements)
             remaining = batch_limit
-            for label, _score in observability.weak_states:
+            for state_idx, _score in observability.weak_states:
                 if added >= remaining:
                     break
                 next_idx, added_count = self._append_targeted_observability_pseudo(
                     next_idx,
-                    label,
+                    state_idx,
                     existing_keys,
                     existing_names,
                     remaining - added,
@@ -2260,6 +2390,7 @@ class DCStateEstimator:
                     self.pseudo_measurement_weight,
                     True,
                     float(value),
+                    MEAS_STATUS_PSEUDO,
                 )
             )
             existing_keys.add(key)
@@ -2295,7 +2426,7 @@ class DCStateEstimator:
         x = self.initial_state()
         cache = self._observability_matrix_cache_for(observability, self.active_measurements, x)
         H = cache.get("H") if cache is not None else self.jacobian_sparse(x, self.active_measurements)
-        direction = observability_weak_direction(H, self.state_labels, observability.weak_states)
+        direction = observability_weak_direction(H, self.n_state, observability.weak_states)
         if direction.size != self.n_state or not np.any(direction):
             return list(candidates[:max_add])
         candidate_h = self.jacobian_sparse(x, candidates)
@@ -2310,15 +2441,16 @@ class DCStateEstimator:
     def _append_targeted_observability_pseudo(
         self,
         next_idx: int,
-        state_label: str,
+        state_idx: int,
         existing_keys: set,
         existing_names: set,
         max_add: int,
     ) -> Tuple[int, int]:
         """Translate a weak compact DC state into the smallest useful pseudo measurement."""
-        if ":" not in state_label:
+        meta = state_meta_at(self.state_meta, state_idx)
+        if meta is None:
             return next_idx, 0
-        prefix, name = state_label.split(":", 1)
+        name = meta.device_name
         added_total = 0
 
         def add(device_type: str, device_name: str, meas_type: str, value: float) -> Tuple[int, int]:
@@ -2344,20 +2476,20 @@ class DCStateEstimator:
             added_total += 1
             return new_idx, 1
 
-        if prefix == "V" and name in self.node_by_name:
+        if meta.kind == "voltage" and meta.device_type == "DCNode" and name in self.node_by_name:
             node = self.node_by_name[name]
             return add("DCNode", name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
-        if prefix == "I_ZERO" and name in self.zero_branch_by_name:
+        if meta.kind == "zero_current" and meta.device_type == "DCZeroBranch" and name in self.zero_branch_by_name:
             dev = self.zero_branch_by_name[name]
             return add("DCZeroBranch", name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
-        if prefix == "I_BREAK" and name in self.break_by_name:
+        if meta.kind == "break_current" and meta.device_type == "DCBreak" and name in self.break_by_name:
             dev = self.break_by_name[name]
             return add("DCBreak", name, "I_FROM", float(getattr(dev, "current", 0.0) or 0.0))
-        if prefix == "P_DCDC_FROM" and name in self.dcdc_by_name:
+        if meta.kind == "dcdc_p_from" and name in self.dcdc_by_name:
             return add("DCDCConverter", name, "P_FROM", float(getattr(self.dcdc_by_name[name], "i_p", 0.0) or 0.0))
-        if prefix == "P_DCDC_TO" and name in self.dcdc_by_name:
+        if meta.kind == "dcdc_p_to" and name in self.dcdc_by_name:
             return add("DCDCConverter", name, "P_TO", float(getattr(self.dcdc_by_name[name], "j_p", 0.0) or 0.0))
-        if prefix == "P_VGEN" and name in self.generator_by_name:
+        if meta.kind == "v_generator_p" and name in self.generator_by_name:
             return add("DCGenerator", name, "P_GEN", self._generator_pseudo_power(self.generator_by_name[name]))
         return next_idx, 0
 
@@ -2393,6 +2525,7 @@ class DCStateEstimator:
             measurement.weight = weight
             measurement.valid = True
             measurement.value = 0.0
+            measurement.status = normalize_measurement_status(None, valid=True)
             self.measurements.append(measurement)
             self._record_measurement_summary(measurement)
             existing.add(key)
@@ -3365,7 +3498,7 @@ class DCStateEstimator:
 
         rank, deficiency, s, weak_states = observability_rank_details(
             H,
-            self.state_labels,
+            self.n_state,
             normal_matrix=normal_matrix,
             normal_factor_diag=normal_factor_diag,
         )

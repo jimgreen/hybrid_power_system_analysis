@@ -39,21 +39,23 @@ def targeted_redundancy_count(state_count: int, ratio: float) -> int:
 
 def observability_weak_direction(
     H,
-    state_labels: Sequence[str],
-    weak_states: Sequence[Tuple[str, float]] = (),
+    state_count: int,
+    weak_states: Sequence[Tuple[int, float]] = (),
     dense_svd_limit: int = 2000,
 ) -> np.ndarray:
     """Return a normalized state-space direction that is currently weakest."""
-    state_count = len(state_labels)
+    state_count = int(state_count)
     if state_count <= 0:
         return np.array([], dtype=np.float64)
 
     direction = np.zeros(state_count, dtype=np.float64)
     if weak_states:
-        label_to_pos = {label: pos for pos, label in enumerate(state_labels)}
-        for label, score in weak_states:
-            pos = label_to_pos.get(label)
-            if pos is not None:
+        for state_idx, score in weak_states:
+            try:
+                pos = int(state_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= pos < state_count:
                 direction[pos] = max(abs(float(score)), direction[pos])
         norm = float(np.linalg.norm(direction))
         if norm > 0.0:
@@ -570,11 +572,11 @@ def _rank_from_singular_values(singular_values: np.ndarray, shape: Tuple[int, in
 
 def observability_rank_details(
     H: np.ndarray,
-    state_labels: Sequence[str],
+    state_count: int,
     normal_matrix: np.ndarray = None,
     normal_factor_diag: np.ndarray = None,
     dense_svd_limit: int = 2000,
-) -> Tuple[int, int, np.ndarray, List[Tuple[str, float]]]:
+) -> Tuple[int, int, np.ndarray, List[Tuple[int, float]]]:
     """Fast rank analysis for tall state-estimation Jacobians.
 
     Well-conditioned observable systems are the common path; a Cholesky factor of
@@ -585,12 +587,12 @@ def observability_rank_details(
     deficient or numerically marginal cases so weak-state reporting remains
     available.
     """
-    state_count = len(state_labels)
+    state_count = int(state_count)
     measurement_count = int(H.shape[0])
     min_deficiency = max(0, state_count - measurement_count)
     full_column_rank_possible = measurement_count >= state_count
     gram = H.T @ H if normal_matrix is None else normal_matrix
-    weak_states: List[Tuple[str, float]] = []
+    weak_states: List[Tuple[int, float]] = []
 
     if is_sparse_matrix(gram):
         diag_values = gram.diagonal()
@@ -643,7 +645,7 @@ def observability_rank_details(
         if diag_values.size:
             weak_count = min(10, diag_values.size)
             weak_idx = np.argsort(diag_values)[:weak_count]
-            weak_states = [(state_labels[int(idx)], float(diag_values[int(idx)])) for idx in weak_idx]
+            weak_states = [(int(idx), float(diag_values[int(idx)])) for idx in weak_idx]
             near_zero = int(np.count_nonzero(diag_values <= max(tol * tol, 1e-24)))
             deficiency = max(1, near_zero, min_deficiency)
         else:
@@ -660,17 +662,16 @@ def observability_rank_details(
         null_vectors = vh[-deficiency:, :]
         scores = np.max(np.abs(null_vectors), axis=0)
         top = np.argsort(scores)[::-1][: min(10, scores.size)]
-        weak_states = [(state_labels[idx], float(scores[idx])) for idx in top]
+        weak_states = [(int(idx), float(scores[idx])) for idx in top]
 
     return rank, max(0, deficiency), singular_values, weak_states
 
 
-def unanchored_angle_state_labels(
+def unanchored_angle_state_indices(
     H: np.ndarray,
-    state_labels: Sequence[str],
-    angle_prefix: str,
+    angle_cols: Sequence[int],
     tol: float = 1e-12,
-) -> List[str]:
+) -> List[int]:
     """Find AC angle components whose measurement rows only define relative angles.
 
     Large sparse cases can have a tiny rank deficiency even though every node has
@@ -680,7 +681,7 @@ def unanchored_angle_state_labels(
     while rows with a nonzero sum provide an absolute anchor through a reference
     angle or a direct angle measurement.
     """
-    angle_cols = [idx for idx, label in enumerate(state_labels) if label.startswith(angle_prefix)]
+    angle_cols = [int(idx) for idx in angle_cols]
     if not angle_cols:
         return []
 
@@ -741,15 +742,15 @@ def unanchored_angle_state_labels(
     for local_col in range(n):
         components.setdefault(find(local_col), []).append(local_col)
 
-    labels = []
+    state_indices = []
     for root, local_cols in components.items():
         root = find(root)
         if anchored[root]:
             continue
         representative = max(local_cols, key=lambda col: (int(degree[col]), -int(angle_cols[col])))
-        labels.append((len(local_cols), state_labels[int(angle_cols[representative])]))
-    labels.sort(key=lambda item: (-item[0], item[1]))
-    return [label for _, label in labels]
+        state_indices.append((len(local_cols), int(angle_cols[representative])))
+    state_indices.sort(key=lambda item: (-item[0], item[1]))
+    return [idx for _, idx in state_indices]
 
 
 class NormalEquationSolver:

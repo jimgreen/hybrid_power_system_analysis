@@ -3,7 +3,13 @@ from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from model.meas_model import Measurement, MeasurementList, MeasurementTable, measurement_table_from_measurements
+from model.meas_model import (
+    Measurement,
+    MeasurementList,
+    MeasurementTable,
+    measurement_table_from_measurements,
+    measurement_table_status_code,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,7 @@ def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) ->
         value=np.concatenate((head.value, tail.value)),
         device_type_code=np.concatenate((head.device_type_code, tail.device_type_code)),
         angle_mask=np.concatenate((head.angle_mask, tail.angle_mask)),
+        status_code=np.concatenate((measurement_table_status_code(head), measurement_table_status_code(tail))),
     )
 
 
@@ -63,6 +70,7 @@ def measurement_table_take(table: MeasurementTable, rows: Sequence[int]) -> Meas
         value=table.value[row_idx],
         device_type_code=table.device_type_code[row_idx],
         angle_mask=table.angle_mask[row_idx],
+        status_code=measurement_table_status_code(table)[row_idx],
     )
 
 
@@ -259,6 +267,7 @@ def partition_measurements_by_code(
     *,
     side_by_device_type: Optional[Mapping[str, str]] = None,
     table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
+    rows_by_device_type_code: Optional[Mapping[int, Sequence[int]]] = None,
     sides: Tuple[str, ...],
 ) -> MeasurementPartitions:
     table = measurement_table_for(measurements, table_builder)
@@ -266,27 +275,37 @@ def partition_measurements_by_code(
         measurements.table = table
     except AttributeError:
         pass
-    rows: Dict[str, list] = {side: [] for side in sides}
+    row_chunks: Dict[str, list] = {side: [] for side in sides}
     fallback = side_by_device_type or {}
-    if len(table.idx) == len(measurements):
-        for row, code in enumerate(table.device_type_code):
-            side = side_by_device_type_code.get(int(code))
-            if side is None and fallback:
-                side = fallback.get(str(table.device_type[row]))
-            if side in rows:
-                rows[side].append(row)
-    else:
-        for row, meas in enumerate(measurements):
-            side = side_by_device_type_code.get(int(table.device_type_code[row]))
-            if side is None and fallback:
-                side = fallback.get(meas.device_type)
-            if side in rows:
-                rows[side].append(row)
+    code_rows = (
+        rows_by_device_type_code
+        if rows_by_device_type_code is not None
+        else globals()["rows_by_device_type_code"](table)
+    )
+    for code, code_row_values in code_rows.items():
+        code_row_array = np.asarray(code_row_values, dtype=np.int64)
+        if code_row_array.size == 0:
+            continue
+        side = side_by_device_type_code.get(int(code))
+        if side in row_chunks:
+            row_chunks[side].append(code_row_array)
+            continue
+        if not fallback:
+            continue
+        device_types = np.asarray(table.device_type, dtype=object)[code_row_array]
+        for device_type in np.unique(device_types):
+            fallback_side = fallback.get(str(device_type))
+            if fallback_side in row_chunks:
+                row_chunks[fallback_side].append(code_row_array[device_types == device_type])
     normalized = getattr(measurements, "normalized", False)
     measurement_views: Dict[str, MeasurementList] = {}
     row_arrays: Dict[str, np.ndarray] = {}
     for side in sides:
-        row_array = np.asarray(rows[side], dtype=np.int64)
+        if row_chunks[side]:
+            row_array = np.concatenate(row_chunks[side]).astype(np.int64, copy=False)
+            row_array.sort()
+        else:
+            row_array = np.array([], dtype=np.int64)
         row_arrays[side] = row_array
         measurement_views[side] = MeasurementList(
             [measurements[int(row)] for row in row_array],

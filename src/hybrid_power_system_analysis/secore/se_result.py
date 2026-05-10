@@ -4,7 +4,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from model.meas_model import BadDataItem, EstimateResult, Measurement
+from model.meas_model import BadDataItem, EstimateResult, Measurement, is_pseudo_measurement
 
 
 def normalize_seresult_return_mode(return_mode: str) -> str:
@@ -234,7 +234,7 @@ class SEResult:
 
     @staticmethod
     def _is_pseudo_measurement(measurement: Measurement) -> bool:
-        return str(measurement.name).startswith("pseudo_")
+        return is_pseudo_measurement(measurement)
 
     @staticmethod
     def _prefiltered_reason(measurement: Measurement) -> str:

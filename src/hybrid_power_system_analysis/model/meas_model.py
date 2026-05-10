@@ -33,10 +33,61 @@ DEVICE_TYPE_CODES = {
     "DCBreakConstraint": 25,
 }
 
+MEAS_STATUS_NORMAL = 0
+MEAS_STATUS_INVALID = 1
+MEAS_STATUS_PSEUDO = 2
+MEAS_STATUS_REMOVED = 3
+MEAS_STATUS_INACTIVE = frozenset((MEAS_STATUS_INVALID, MEAS_STATUS_REMOVED))
+MEAS_STATUS_BY_NAME = {
+    "NORMAL": MEAS_STATUS_NORMAL,
+    "REAL": MEAS_STATUS_NORMAL,
+    "VALID": MEAS_STATUS_NORMAL,
+    "INVALID": MEAS_STATUS_INVALID,
+    "DISABLED": MEAS_STATUS_INVALID,
+    "PSEUDO": MEAS_STATUS_PSEUDO,
+    "BAD": MEAS_STATUS_REMOVED,
+    "REMOVED": MEAS_STATUS_REMOVED,
+}
+
 TERMINAL_MEASUREMENT_KIND = {"P_FROM": 0, "V_FROM": 1, "I_FROM": 2, "P_TO": 3, "V_TO": 4, "I_TO": 5}
 LOAD_MEASUREMENT_KIND = {"P_LOAD": 0, "V_LOAD": 1, "I_LOAD": 2}
 GEN_MEASUREMENT_KIND = {"P_GEN": 0, "V_GEN": 1, "I_GEN": 2}
 GEN_CONTROL_KIND = {"V": 0, "P": 1, "I": 2}
+
+
+def measurement_status_from_valid(valid: bool) -> int:
+    return MEAS_STATUS_NORMAL if bool(valid) else MEAS_STATUS_INVALID
+
+
+def normalize_measurement_status(status=None, *, valid: bool = True) -> int:
+    if status is None:
+        return measurement_status_from_valid(valid)
+    if isinstance(status, str):
+        text = status.strip().upper()
+        if not text:
+            return measurement_status_from_valid(valid)
+        if text in MEAS_STATUS_BY_NAME:
+            return MEAS_STATUS_BY_NAME[text]
+        return int(text)
+    return int(status)
+
+
+def measurement_status_is_active(status: int) -> bool:
+    return int(status) not in MEAS_STATUS_INACTIVE
+
+
+def is_pseudo_measurement(measurement) -> bool:
+    status = getattr(measurement, "status", measurement_status_from_valid(getattr(measurement, "valid", True)))
+    return int(status) == MEAS_STATUS_PSEUDO
+
+
+def mark_measurement_invalid(measurement) -> None:
+    measurement.valid = False
+    measurement.status = MEAS_STATUS_INVALID
+
+
+def mark_measurement_pseudo(measurement) -> None:
+    measurement.status = MEAS_STATUS_PSEUDO
 
 
 @dataclass(init=False, slots=True)
@@ -49,6 +100,7 @@ class Measurement:
     weight: float
     valid: bool
     value: float
+    status: int
 
     def __init__(
         self,
@@ -60,6 +112,7 @@ class Measurement:
         weight: float,
         valid: bool,
         value: float,
+        status=None,
     ) -> None:
         self.idx = idx
         self.name = name
@@ -69,6 +122,9 @@ class Measurement:
         self.weight = weight
         self.valid = valid
         self.value = value
+        self.status = normalize_measurement_status(status, valid=valid)
+        if not measurement_status_is_active(self.status):
+            self.valid = False
 
     @property
     def device(self) -> str:
@@ -96,6 +152,7 @@ class MeasurementTable:
     value: np.ndarray
     device_type_code: np.ndarray
     angle_mask: np.ndarray
+    status_code: Optional[np.ndarray] = None
 
 
 class MeasurementList(list):
@@ -105,6 +162,19 @@ class MeasurementList(list):
         super().__init__(measurements)
         self.table = table
         self.normalized = bool(normalized)
+
+
+def measurement_status_from_measurement(measurement: Measurement) -> int:
+    return normalize_measurement_status(getattr(measurement, "status", None), valid=getattr(measurement, "valid", True))
+
+
+def measurement_table_status_code(table: MeasurementTable) -> np.ndarray:
+    if table.status_code is None:
+        table.status_code = np.where(np.asarray(table.valid, dtype=bool), MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID).astype(
+            np.int16,
+            copy=False,
+        )
+    return table.status_code
 
 
 def measurement_table_from_measurements(
@@ -118,6 +188,7 @@ def measurement_table_from_measurements(
         table_size = int(table.idx.size)
         measurement_count = len(measurements)
         if measurement_count == table_size:
+            measurement_table_status_code(table)
             return table
         if table_size < measurement_count:
             tail_table = measurement_table_from_measurements(
@@ -136,6 +207,7 @@ def measurement_table_from_measurements(
                 value=np.concatenate((table.value, tail_table.value)),
                 device_type_code=np.concatenate((table.device_type_code, tail_table.device_type_code)),
                 angle_mask=np.concatenate((table.angle_mask, tail_table.angle_mask)),
+                status_code=np.concatenate((measurement_table_status_code(table), measurement_table_status_code(tail_table))),
             )
             try:
                 measurements.table = table
@@ -154,6 +226,7 @@ def measurement_table_from_measurements(
     value = np.empty(count, dtype=np.float64)
     device_type_code = np.empty(count, dtype=np.int16)
     angle_mask = np.empty(count, dtype=bool)
+    status_code = np.empty(count, dtype=np.int16)
     for pos, meas in enumerate(measurements):
         idx[pos] = int(meas.idx)
         name[pos] = meas.name
@@ -165,6 +238,7 @@ def measurement_table_from_measurements(
         value[pos] = float(meas.value)
         device_type_code[pos] = device_type_codes.get(meas.device_type, 0)
         angle_mask[pos] = meas.meas_type in angle_measurement_types
+        status_code[pos] = measurement_status_from_measurement(meas)
     return MeasurementTable(
         idx=idx,
         name=name,
@@ -176,6 +250,7 @@ def measurement_table_from_measurements(
         value=value,
         device_type_code=device_type_code,
         angle_mask=angle_mask,
+        status_code=status_code,
     )
 
 
@@ -187,7 +262,7 @@ class ObservabilityResult:
     measurement_count: int
     deficiency: int
     singular_values: np.ndarray
-    weak_states: List[Tuple[str, float]]
+    weak_states: List[Tuple[int, float]]
 
 
 @dataclass

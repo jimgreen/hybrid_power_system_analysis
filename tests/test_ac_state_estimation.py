@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -23,6 +24,68 @@ class ACStateEstimationTest(unittest.TestCase):
             lines.append(line)
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return target
+
+    def test_summary_cache_uses_table_and_primes_voltage_observation_cache(self):
+        from model.meas_model import (
+            MEAS_STATUS_PSEUDO,
+            Measurement,
+            MeasurementList,
+            measurement_table_from_measurements,
+        )
+        from secore.ac_se import ACStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("summary cache should use the cached table")
+
+        rows = [
+            Measurement(1, "node_v", "ACNode", "n1", "V", 2.0, True, 1.02),
+            Measurement(2, "node_v_status_pseudo", "ACNode", "n2", "V", 3.0, True, 0.99, MEAS_STATUS_PSEUDO),
+        ]
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.measurements = NoIterMeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator.node_by_name = {"n1": SimpleNamespace(idx=1), "n2": SimpleNamespace(idx=2)}
+        estimator.node_pos = {1: 0, 2: 1}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {}
+        estimator.branch_by_name = {}
+        estimator.transformer_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.break_by_name = {}
+
+        estimator._refresh_measurement_summary_cache()
+
+        self.assertEqual({("ACNode", "n1"), ("ACNode", "n2")}, estimator._active_device_key_cache)
+        self.assertEqual(2, estimator._max_measurement_idx)
+        self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
+        self.assertEqual({1: 1.02}, estimator._real_voltage_observation_nodes())
+
+    def test_conversion_primes_voltage_observation_cache(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.ac_se import ACStateEstimator
+
+        rows = [Measurement(1, "node_v", "ACNode", "n1", "V", 2.0, True, 10.2)]
+        estimator = ACStateEstimator.__new__(ACStateEstimator)
+        estimator.measurements = MeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator.flat_start = False
+        estimator.p_base = 100.0
+        estimator.p_base_kW = 100.0
+        estimator.u_scale = 1.0
+        estimator.i_scale = 1.0
+        estimator.network = SimpleNamespace(node_dict={1: SimpleNamespace(vbase=10.0)})
+        estimator.node_by_name = {"n1": SimpleNamespace(idx=1)}
+        estimator.node_pos = {1: 0}
+        estimator.branch_by_name = {}
+        estimator.transformer_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.break_by_name = {}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {}
+
+        estimator._convert_measurements_to_pu()
+
+        self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
+        self.assertEqual({1: 1.02}, estimator._real_voltage_observation_node_cache)
 
     def test_build_normal_equations_accepts_sparse_jacobian(self):
         from scipy.sparse import csr_matrix
@@ -1390,10 +1453,15 @@ class ACStateEstimationTest(unittest.TestCase):
             ("ACZeroBranch", device_name, "Q_FROM"),
         }
         existing_names = set()
+        target_col = next(
+            idx
+            for idx, meta in enumerate(estimator.state_meta)
+            if meta.device_type == "ACZeroBranch" and meta.device_name == device_name and meta.component == "re"
+        )
 
         _, added = estimator._append_targeted_observability_pseudo(
             next_idx,
-            f"I_Z_RE:{device_name}",
+            target_col,
             existing_keys,
             existing_names,
             2,
@@ -1428,17 +1496,22 @@ class ACStateEstimationTest(unittest.TestCase):
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
         existing_keys = set()
         existing_names = set()
+        target_col, target_meta = next(
+            (idx, meta)
+            for idx, meta in enumerate(estimator.state_meta)
+            if meta.kind == "voltage" and meta.device_type == "ACNode"
+        )
 
         _, added = estimator._append_targeted_observability_pseudo(
             next_idx,
-            "V:nd_2",
+            target_col,
             existing_keys,
             existing_names,
             1,
         )
 
         self.assertEqual(1, added)
-        self.assertIn(("ACNode", "nd_2", "V"), existing_keys)
+        self.assertIn(("ACNode", target_meta.device_name, "V"), existing_keys)
 
     def test_ieee3w_adds_rank_restoring_pseudos_without_node_voltage_or_angles(self):
         from secore.ac_se import ACStateEstimator
@@ -2775,7 +2848,6 @@ class ACStateEstimationTest(unittest.TestCase):
 
         n_state = 2100
         H = eye(n_state, format="csr")[:-1, :]
-        labels = [f"x{i}" for i in range(n_state)]
         normal = H.T @ H
 
         original_svd = np.linalg.svd
@@ -2787,7 +2859,7 @@ class ACStateEstimationTest(unittest.TestCase):
         try:
             rank, deficiency, singular_values, weak_states = observability_rank_details(
                 H,
-                labels,
+                n_state,
                 normal_matrix=normal,
             )
         finally:
@@ -2806,7 +2878,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
         rank, deficiency, _singular_values, _weak_states = observability_rank_details(
             H,
-            ["x0", "x1", "x2"],
+            3,
             normal_factor_diag=np.ones(3),
         )
 
@@ -3326,6 +3398,10 @@ class ACStateEstimationTest(unittest.TestCase):
             singular_values=np.ones(1, dtype=np.float64),
             weak_states=[],
         )
+        target_node = estimator.node_by_name["bus_2"]
+        target_pos = estimator.node_pos[target_node.idx]
+        target_col = int(estimator.voltage_col[target_pos])
+        estimator.state_labels = [f"opaque_state_{idx}" for idx in range(estimator.n_state)]
         non_observable_result = ObservabilityResult(
             observable=False,
             rank=max(estimator.n_state - 1, 0),
@@ -3333,7 +3409,7 @@ class ACStateEstimationTest(unittest.TestCase):
             measurement_count=len(estimator.active_measurements),
             deficiency=1,
             singular_values=np.ones(1, dtype=np.float64),
-            weak_states=[("V:bus_2", 1.0)],
+            weak_states=[(target_col, 1.0)],
         )
         results = [non_observable_result, observable_result]
         estimator.observability_analysis = lambda: results.pop(0) if results else observable_result
@@ -3556,7 +3632,7 @@ class ACStateEstimationTest(unittest.TestCase):
         try:
             rank, deficiency, _singular_values, _weak_states = se_math.observability_rank_details(
                 eye(2, format="csr"),
-                ["x0", "x1"],
+                2,
             )
         finally:
             se_math.SP_SPLU = original_splu

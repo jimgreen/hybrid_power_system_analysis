@@ -2,7 +2,17 @@ import unittest
 
 import numpy as np
 
-from model.meas_model import DEVICE_TYPE_CODES, Measurement, MeasurementList, measurement_table_from_measurements
+from model.meas_model import (
+    DEVICE_TYPE_CODES,
+    MEAS_STATUS_INVALID,
+    MEAS_STATUS_NORMAL,
+    MEAS_STATUS_PSEUDO,
+    Measurement,
+    MeasurementList,
+    is_pseudo_measurement,
+    measurement_table_from_measurements,
+    measurement_table_status_code,
+)
 
 
 class SEArrayPlanTest(unittest.TestCase):
@@ -77,6 +87,29 @@ class SEArrayPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(partitions.rows["ac"], np.array([0, 3], dtype=np.int64))
         np.testing.assert_array_equal(partitions.measurements["ac"].table.idx, np.array([1, 4], dtype=np.int64))
 
+    def test_measurement_status_is_explicit_and_preserved_in_table_slices(self):
+        from secore.se_array_plan import measurement_table_take
+
+        rows = [
+            Measurement(1, "pseudo_named_real", "ACNode", "n1", "V", 1.0, True, 1.0, MEAS_STATUS_NORMAL),
+            Measurement(2, "normal_named_pseudo", "ACNode", "n2", "V", 1.0, True, 1.0, MEAS_STATUS_PSEUDO),
+            Measurement(3, "invalid", "ACNode", "n3", "V", 1.0, True, 1.0, MEAS_STATUS_INVALID),
+        ]
+        table = measurement_table_from_measurements(rows)
+        sliced = measurement_table_take(table, np.array([0, 2], dtype=np.int64))
+
+        self.assertFalse(is_pseudo_measurement(rows[0]))
+        self.assertTrue(is_pseudo_measurement(rows[1]))
+        self.assertFalse(rows[2].valid)
+        np.testing.assert_array_equal(
+            measurement_table_status_code(table),
+            np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_PSEUDO, MEAS_STATUS_INVALID], dtype=np.int16),
+        )
+        np.testing.assert_array_equal(
+            measurement_table_status_code(sliced),
+            np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID], dtype=np.int16),
+        )
+
     def test_partition_measurements_by_code_can_fallback_to_device_type(self):
         from secore.se_array_plan import partition_measurements_by_code
 
@@ -95,6 +128,29 @@ class SEArrayPlanTest(unittest.TestCase):
 
         self.assertEqual(["dc_balance"], [meas.name for meas in partitions.measurements["dc"]])
         np.testing.assert_array_equal(partitions.rows["dc"], np.array([0], dtype=np.int64))
+
+    def test_partition_measurements_by_code_reuses_precomputed_code_rows(self):
+        from secore.se_array_plan import build_active_measurement_view, partition_measurements_by_code
+
+        measurements = self._measurements()
+        view = build_active_measurement_view(measurements)
+        side_by_code = {
+            DEVICE_TYPE_CODES["ACNode"]: "ac",
+            DEVICE_TYPE_CODES["DCACConverter"]: "hybrid",
+        }
+
+        partitions = partition_measurements_by_code(
+            view.measurements,
+            side_by_code,
+            rows_by_device_type_code=view.rows_by_device_type_code,
+            sides=("ac", "dc", "hybrid"),
+        )
+
+        self.assertEqual(["ac_v"], [meas.name for meas in partitions.measurements["ac"]])
+        self.assertEqual([], [meas.name for meas in partitions.measurements["dc"]])
+        self.assertEqual(["conv_p"], [meas.name for meas in partitions.measurements["hybrid"]])
+        np.testing.assert_array_equal(partitions.rows["ac"], np.array([0], dtype=np.int64))
+        np.testing.assert_array_equal(partitions.rows["hybrid"], np.array([1], dtype=np.int64))
 
     def test_build_measurement_plan_table_uses_cached_table_without_iterating(self):
         from model.meas_model import MeasurementTable
