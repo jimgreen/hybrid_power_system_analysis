@@ -28,7 +28,12 @@ class ACNode:
 class ACBus:
     def __init__(self, idx, nodes=None):
         self.idx = idx
-        self.nodes = list(nodes or [])
+        if nodes is None:
+            self.nodes = []
+        elif isinstance(nodes, list):
+            self.nodes = nodes
+        else:
+            self.nodes = list(nodes)
         ref = self.nodes[0] if self.nodes else None
         self.name = getattr(ref, "name", f"bus_{idx}")
         self.vbase = getattr(ref, "vbase", 0.0)
@@ -432,12 +437,19 @@ class ACPowerNetwork:
         self.transformers.append(trfm)
         return trfm
 
-    def _load_from_model(self):
-        self.p_base = normalize_model_named_units(self.model)
-        self.p_base_kW = float(self.model.p_base_kW)
-        self.u_scale = float(self.model.u_scale)
-        self.p_scale = float(self.model.p_scale)
-        self.i_scale = float(self.model.i_scale)
+    def _load_from_model(self, *, units_already_normalized: bool = False):
+        if units_already_normalized:
+            self.p_base = float(self.model.p_base)
+            self.p_base_kW = float(self.model.p_base_kW)
+            self.u_scale = float(self.model.u_scale)
+            self.p_scale = float(self.model.p_scale)
+            self.i_scale = float(self.model.i_scale)
+        else:
+            self.p_base = normalize_model_named_units(self.model)
+            self.p_base_kW = float(self.model.p_base_kW)
+            self.u_scale = float(self.model.u_scale)
+            self.p_scale = float(self.model.p_scale)
+            self.i_scale = float(self.model.i_scale)
         self.branches = _coerce_ac_rows(getattr(self.model, 'ACBranch', []), "ACBranch")
         self.nodes = _coerce_ac_rows(getattr(self.model, 'ACNode', []), "ACNode")
         self.generators = _coerce_ac_rows(getattr(self.model, 'ACGenerator', []), "ACGenerator")
@@ -554,112 +566,9 @@ class ACPowerNetwork:
                 zbr.j_node_obj.zero_branches.append(zbr)
 
     def topo(self):
+        from model import topology as network_topology
 
-        if len(self.node_dict) == 0:
-            self.format_assoc()
-
-        # 重置所有节点的拓扑岛号和母线归属。
-        for node in self.nodes:
-            node.isl = 0
-            node.isl_obj = None
-            node.bus = None
-            node.bus_obj = None
-            node.is_alive = False
-
-        running_nodes = [node for node in self.nodes if node.run_stat == 1]
-        running_node_ids = {node.idx for node in running_nodes}
-        bus_parent = {node.idx: node.idx for node in running_nodes}
-
-        def find(parent, node_idx):
-            root = node_idx
-            while parent[root] != root:
-                root = parent[root]
-            while parent[node_idx] != node_idx:
-                next_idx = parent[node_idx]
-                parent[node_idx] = root
-                node_idx = next_idx
-            return root
-
-        def union(parent, left, right):
-            root_l = find(parent, left)
-            root_r = find(parent, right)
-            if root_l != root_r:
-                parent[root_r] = root_l
-
-        def live_terminal_pair(dev, require_closed=False):
-            if (
-                dev.run_stat == 1
-                and (not require_closed or getattr(dev, "status", 1) == 1)
-                and dev.i_node in running_node_ids
-                and dev.j_node in running_node_ids
-                and dev.i_node != dev.j_node
-            ):
-                return dev.i_node, dev.j_node
-            return None
-
-        if self.switches:
-            for dev in self.switches:
-                pair = live_terminal_pair(dev, require_closed=True)
-                if pair is not None:
-                    union(bus_parent, pair[0], pair[1])
-
-        root_to_nodes = {}
-        for node in running_nodes:
-            root_to_nodes.setdefault(find(bus_parent, node.idx), []).append(node)
-        self.buses = []
-        self.bus_dict = {}
-        self.node_to_bus = {}
-        for nodes in sorted(root_to_nodes.values(), key=lambda group: min(node.idx for node in group)):
-            nodes.sort(key=lambda item: item.idx)
-            bus = ACBus(nodes[0].idx, nodes)
-            self.buses.append(bus)
-            self.bus_dict[bus.idx] = bus
-            for node in nodes:
-                node.bus = bus.idx
-                node.bus_obj = bus
-                self.node_to_bus[node.idx] = bus
-
-        bus_parent = {bus.idx: bus.idx for bus in self.buses}
-
-        def add_bus_edge(dev, require_closed=False):
-            pair = live_terminal_pair(dev, require_closed=require_closed)
-            if pair is None:
-                return
-            i_bus = self.node_to_bus.get(pair[0])
-            j_bus = self.node_to_bus.get(pair[1])
-            if i_bus is not None and j_bus is not None and i_bus.idx != j_bus.idx:
-                union(bus_parent, i_bus.idx, j_bus.idx)
-
-        for dev in self.branches:
-            add_bus_edge(dev)
-        for dev in self.transformers:
-            add_bus_edge(dev)
-        for dev in self.zero_branches:
-            add_bus_edge(dev)
-        for dev in self.breakers:
-            add_bus_edge(dev, require_closed=True)
-
-        self.islands = []
-
-        island_idx = 0
-        root_to_island = {}
-        for bus in self.buses:
-            root = find(bus_parent, bus.idx)
-            island = root_to_island.get(root)
-            if island is None:
-                island_idx += 1
-                island = ACIsl(island_idx, True)
-                root_to_island[root] = island
-                self.islands.append(island)
-            bus.isl = island.idx
-            bus.isl_obj = island
-            for node in bus.nodes:
-                node.isl = island.idx
-                node.isl_obj = island
-
-        self.det_isl_alive_stat()
-        # Cold-start state estimation does not reuse module-level topology templates.
-        # Avoid the extra full-model scan needed to build the warm-cache template.
+        network_topology.prepare_ac_topology(self)
 
     def det_isl_alive_stat(self):
 

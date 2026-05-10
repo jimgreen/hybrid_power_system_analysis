@@ -77,6 +77,15 @@ def _scale_power_attrs_in_dict(obj, attrs, p_base: float) -> None:
             values[attr] = float(value) / p_base
 
 
+def _any_attr_value(devices, attrs) -> bool:
+    for obj in devices:
+        values = getattr(obj, "__dict__", {})
+        for attr in attrs:
+            if values.get(attr) is not None:
+                return True
+    return False
+
+
 def _scale_voltage_attr(obj, attr: str, node, settings: UnitSettings) -> None:
     if node is None:
         return
@@ -116,14 +125,16 @@ def normalize_model_named_units(model) -> float:
         for node_idx, node in ac_nodes.items()
     }
 
-    for br in getattr(model, "ACBranch", []):
-        _scale_power_attrs_in_dict(br, ("i_p", "i_q", "j_p", "j_q"), p_base)
-        i_scale_base = ac_current_scales.get(br.i_node)
-        if i_scale_base is not None:
-            _scale_attr_in_dict(br, "i_c", i_scale_base)
-        j_scale_base = ac_current_scales.get(br.j_node)
-        if j_scale_base is not None:
-            _scale_attr_in_dict(br, "j_c", j_scale_base)
+    ac_branches = getattr(model, "ACBranch", [])
+    if _any_attr_value(ac_branches, ("i_p", "i_q", "j_p", "j_q", "i_c", "j_c")):
+        for br in ac_branches:
+            _scale_power_attrs_in_dict(br, ("i_p", "i_q", "j_p", "j_q"), p_base)
+            i_scale_base = ac_current_scales.get(br.i_node)
+            if i_scale_base is not None:
+                _scale_attr_in_dict(br, "i_c", i_scale_base)
+            j_scale_base = ac_current_scales.get(br.j_node)
+            if j_scale_base is not None:
+                _scale_attr_in_dict(br, "j_c", j_scale_base)
 
     for tr in getattr(model, "ACTransformer", []):
         if not hasattr(tr, "gt"):
@@ -164,11 +175,13 @@ def normalize_model_named_units(model) -> float:
         if scale_base is not None:
             _scale_attr_in_dict(sc, "current", scale_base)
 
-    for dev in [*getattr(model, "ACZeroBranch", []), *getattr(model, "ACSwitch", [])]:
-        _scale_power_attrs_in_dict(dev, ("p", "q"), p_base)
-        scale_base = ac_current_scales.get(dev.i_node)
-        if scale_base is not None:
-            _scale_attr_in_dict(dev, "current", scale_base)
+    ac_zero_switches = [*getattr(model, "ACZeroBranch", []), *getattr(model, "ACSwitch", [])]
+    if _any_attr_value(ac_zero_switches, ("p", "q", "current")):
+        for dev in ac_zero_switches:
+            _scale_power_attrs_in_dict(dev, ("p", "q"), p_base)
+            scale_base = ac_current_scales.get(dev.i_node)
+            if scale_base is not None:
+                _scale_attr_in_dict(dev, "current", scale_base)
 
     for node in dc_nodes.values():
         _scale_attr_in_dict(node, "vbase", u_scale)
@@ -178,11 +191,13 @@ def normalize_model_named_units(model) -> float:
         for node_idx, node in dc_nodes.items()
     }
 
-    for br in getattr(model, "DCBranch", []):
-        _scale_power_attrs_in_dict(br, ("i_p", "j_p"), p_base)
-        scale_base = dc_current_scales.get(br.i_node)
-        if scale_base is not None:
-            _scale_attr_in_dict(br, "current", scale_base)
+    dc_branches = getattr(model, "DCBranch", [])
+    if _any_attr_value(dc_branches, ("i_p", "j_p", "current")):
+        for br in dc_branches:
+            _scale_power_attrs_in_dict(br, ("i_p", "j_p"), p_base)
+            scale_base = dc_current_scales.get(br.i_node)
+            if scale_base is not None:
+                _scale_attr_in_dict(br, "current", scale_base)
 
     for load in getattr(model, "DCLoad", []):
         if not hasattr(load, "pbase"):
@@ -201,11 +216,13 @@ def normalize_model_named_units(model) -> float:
             _scale_attr_in_dict(gen, "i_set", scale_base)
             _scale_attr_in_dict(gen, "current", scale_base)
 
-    for dev in [*getattr(model, "DCZeroBranch", []), *getattr(model, "DCSwitch", [])]:
-        _scale_power_attrs_in_dict(dev, ("p",), p_base)
-        scale_base = dc_current_scales.get(dev.i_node)
-        if scale_base is not None:
-            _scale_attr_in_dict(dev, "current", scale_base)
+    dc_zero_switches = [*getattr(model, "DCZeroBranch", []), *getattr(model, "DCSwitch", [])]
+    if _any_attr_value(dc_zero_switches, ("p", "current")):
+        for dev in dc_zero_switches:
+            _scale_power_attrs_in_dict(dev, ("p",), p_base)
+            scale_base = dc_current_scales.get(dev.i_node)
+            if scale_base is not None:
+                _scale_attr_in_dict(dev, "current", scale_base)
 
     for conv in getattr(model, "DCDCConverter", []):
         i_node = dc_nodes.get(conv.i_node)

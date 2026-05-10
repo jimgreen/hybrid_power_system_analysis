@@ -415,7 +415,7 @@ class HybridPowerFlowCalc:
         self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
-        sub_result_mode = "full" if self.result_mode == "array" else self.result_mode
+        sub_result_mode = self.result_mode
         self.ac_calc = (
             ACPowerFlowCalc(
                 network._ac_ppc,
@@ -508,7 +508,7 @@ class HybridPowerFlowCalc:
         return aliases[mode]
 
     def _sync_sub_result_modes(self) -> None:
-        sub_result_mode = "full" if self.result_mode == "array" else self.result_mode
+        sub_result_mode = self.result_mode
         if self.ac_calc is not None:
             self.ac_calc.result_mode = sub_result_mode
         if self.dc_calc is not None:

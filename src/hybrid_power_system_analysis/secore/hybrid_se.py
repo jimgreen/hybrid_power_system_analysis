@@ -3748,23 +3748,31 @@ class HybridStateEstimator:
         solve_profile_start = time.perf_counter() if self.profile_enabled else None
         delegate = self._delegate()
         if delegate is not None:
+            array_only_result = bool(getattr(self, "_array_only_estimate_result", False))
+            previous_delegate_array_only = bool(getattr(delegate, "_array_only_estimate_result", False))
+            delegate._array_only_estimate_result = array_only_result
             try:
-                result = delegate.estimate(
-                    measurements,
-                    x0,
-                    verbose=verbose,
-                    final_diagnostics=final_diagnostics,
-                    observability=observability,
-                )
-            except TypeError as exc:
-                if "final_diagnostics" not in str(exc):
-                    raise
-                result = delegate.estimate(
-                    measurements,
-                    x0,
-                    verbose=verbose,
-                    observability=observability,
-                )
+                try:
+                    result = delegate.estimate(
+                        measurements,
+                        x0,
+                        verbose=verbose,
+                        final_diagnostics=final_diagnostics,
+                        observability=observability,
+                    )
+                except TypeError as exc:
+                    if "final_diagnostics" not in str(exc):
+                        raise
+                    result = delegate.estimate(
+                        measurements,
+                        x0,
+                        verbose=verbose,
+                        observability=observability,
+                    )
+            finally:
+                delegate._array_only_estimate_result = previous_delegate_array_only
+            if array_only_result:
+                result.measurements = []
             if solve_profile_start is not None:
                 self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
             return result
@@ -3897,6 +3905,7 @@ class HybridStateEstimator:
             gain = None
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
+        array_only_result = bool(getattr(self, "_array_only_estimate_result", False))
         return EstimateResult(
             converged=converged,
             iterations=iteration,
@@ -3908,7 +3917,9 @@ class HybridStateEstimator:
             residual=residual,
             H=H,
             gain=gain,
-            measurements=measurements if isinstance(measurements, MeasurementList) else list(measurements),
+            measurements=[] if array_only_result else (
+                measurements if isinstance(measurements, MeasurementList) else list(measurements)
+            ),
             observability=observability,
         )
 
@@ -3998,23 +4009,30 @@ class HybridStateEstimator:
         mode = normalize_seresult_return_mode(return_mode)
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
         array_only = mode == "array"
+        if array_only and remove_bad_data:
+            raise ValueError("return_mode='array' cannot be combined with remove_bad_data=True")
         needs_bad_data = (not skip_bad_data) and not array_only
         if observability is None:
             observability = self.observability_analysis()
         self.observability_result = observability
         removed: List[BadDataItem] = []
-        if remove_bad_data:
-            result, removed = self.estimate_with_bad_data_removal(
-                threshold=threshold,
-                max_remove=max_remove,
-                verbose=verbose,
-            )
-        else:
-            result = self.estimate(
-                verbose=verbose,
-                final_diagnostics=final_diagnostics and needs_bad_data,
-                observability=observability,
-            )
+        previous_array_only = bool(getattr(self, "_array_only_estimate_result", False))
+        self._array_only_estimate_result = array_only
+        try:
+            if remove_bad_data:
+                result, removed = self.estimate_with_bad_data_removal(
+                    threshold=threshold,
+                    max_remove=max_remove,
+                    verbose=verbose,
+                )
+            else:
+                result = self.estimate(
+                    verbose=verbose,
+                    final_diagnostics=final_diagnostics and needs_bad_data,
+                    observability=observability,
+                )
+        finally:
+            self._array_only_estimate_result = previous_array_only
         self.estimate_result = result
         self.removed_bad_data = removed
         if skip_bad_data or array_only:

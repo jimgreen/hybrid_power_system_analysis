@@ -22,6 +22,7 @@ for path in (ROOT_DIR, MODEL_DIR):
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
+from model import topology as network_topology
 from ac_array_model import (
     BRANCH_COLS,
     BUS_COLS,
@@ -324,7 +325,10 @@ class ACPowerFlowCalc:
         else:
             self.ppc = None
         self.array_mode = self.ppc is not None
-        self.keep_node_objects = bool(keep_node_objects)
+        self.result_mode = self._normalize_result_mode(result_mode)
+        self.keep_node_objects = bool(keep_node_objects) and (
+            not self.array_mode or self.result_mode == "full"
+        )
         self.net = self._network_writeback if self._network_writeback is not None else (None if self.array_mode else network)
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
@@ -332,7 +336,6 @@ class ACPowerFlowCalc:
         self.algorithm = algorithm
         self.used_algorithm = algorithm
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
-        self.result_mode = self._normalize_result_mode(result_mode)
         self.verbose = bool(verbose)
         self.target_island = island
         self.skipped_islands: List = []
@@ -833,46 +836,12 @@ class ACPowerFlowCalc:
         bus_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
         self._ppc_sequential_node_ids = bool(np.array_equal(bus_ids, np.arange(n_bus_all)))
         self._ppc_node_row_by_id = {} if self._ppc_sequential_node_ids else {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
-        running_bus = bus[:, BUS_COLS["run_stat"]] == 1
-
-        edge_i_parts = []
-        edge_j_parts = []
-
-        def collect_device_edges(dev_array, cols, require_closed=False):
-            if dev_array.size == 0:
-                return
-            i_rows = self._ppc_node_rows(dev_array[:, cols["i_node"]])
-            j_rows = self._ppc_node_rows(dev_array[:, cols["j_node"]])
-            mask = (dev_array[:, cols["run_stat"]] == 1) & running_bus[i_rows] & running_bus[j_rows] & (i_rows != j_rows)
-            if require_closed:
-                mask &= dev_array[:, cols["status"]] == 1
-            if np.any(mask):
-                edge_i_parts.append(i_rows[mask])
-                edge_j_parts.append(j_rows[mask])
-
-        collect_device_edges(branch, BRANCH_COLS)
-        collect_device_edges(transformer, TRANSFORMER_COLS)
-        collect_device_edges(zero_branch, ZERO_BRANCH_COLS)
-        collect_device_edges(breaker, SWITCH_COLS, require_closed=True)
-        collect_device_edges(switch, SWITCH_COLS, require_closed=True)
-
-        if edge_i_parts:
-            graph_rows = np.concatenate(edge_i_parts + edge_j_parts).astype(np.int32, copy=False)
-            graph_cols = np.concatenate(edge_j_parts + edge_i_parts).astype(np.int32, copy=False)
-            graph_data = np.ones(graph_rows.size, dtype=np.int8)
-            graph = coo_matrix((graph_data, (graph_rows, graph_cols)), shape=(n_bus_all, n_bus_all)).tocsr()
-            _, comp_labels = connected_components(graph, directed=False, return_labels=True)
-        else:
-            comp_labels = np.arange(n_bus_all, dtype=np.int32)
-
-        slack_components = np.array([], dtype=comp_labels.dtype)
-        if gen.size:
-            gen_rows = self._ppc_node_rows(gen[:, GEN_COLS["node"]])
-            gen_live = (gen[:, GEN_COLS["run_stat"]] == 1) & running_bus[gen_rows]
-            slack_live = gen_live & (gen[:, GEN_COLS["control_type"]] == CTRL_SLACK)
-            slack_components = np.unique(comp_labels[gen_rows[slack_live]])
-
-        active_bus = running_bus & np.isin(comp_labels, slack_components)
+        topology = ppc.get("_topology_arrays")
+        if topology is None:
+            topology = network_topology.prepare_ac_topology_ppc(ppc)
+            ppc["_topology_arrays"] = topology
+        self._ppc_topology = topology
+        active_bus = np.asarray(topology.node_alive_mask, dtype=bool)
         if not np.any(active_bus):
             raise RuntimeError("电网中无带平衡节点的存活拓扑岛，无法进行潮流计算")
 
@@ -1119,7 +1088,7 @@ class ACPowerFlowCalc:
             ]
         else:
             self.node_list = []
-        self.node_pos = static["node_pos"]
+        self.node_pos = static["node_pos"] if self.keep_node_objects else {}
         if self.keep_node_objects and not self.node_pos:
             self.node_pos = {int(idx): pos for pos, idx in enumerate(self.ppc_node_idx)}
         for name in (
@@ -1988,7 +1957,7 @@ class ACPowerFlowCalc:
 
         if self.target_island is None:
             if not getattr(self.net, 'islands', None):
-                self.net.topo()
+                network_topology.prepare_ac_topology(self.net)
 
             self.calc_islands = [isl for isl in self.net.islands if isl.is_alive]
             self.skipped_islands = [isl for isl in self.net.islands if not isl.is_alive]
@@ -3046,6 +3015,10 @@ class ACPowerFlowCalc:
         """执行所选潮流算法。"""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
+            if self.array_mode and self.result_mode != "full":
+                self.keep_node_objects = False
+                self.node_list = []
+                self.node_pos = {}
         if self.algorithm == "pq" and self.N_phi == 0 and self.pq_Bp is not None and self.pq_Bpp is not None:
             return self._run_pq_decoupled()
         if self.algorithm == "pq":

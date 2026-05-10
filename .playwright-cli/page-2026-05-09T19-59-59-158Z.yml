@@ -1,0 +1,79 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - link "电网规划系统" [ref=e4] [cursor=pointer]:
+      - /url: index.html
+    - navigation "主功能导航" [ref=e5]:
+      - link "系统首页" [ref=e6] [cursor=pointer]:
+        - /url: index.html
+      - link "参数维护" [ref=e7] [cursor=pointer]:
+        - /url: planning.html
+      - button "启动优化" [disabled] [ref=e8]
+      - button "方案评估" [disabled] [ref=e9]
+      - button "结果比对" [disabled] [ref=e10]
+  - generic [ref=e11]:
+    - complementary [ref=e12]:
+      - generic [ref=e13]: 方案列表
+      - generic [ref=e14]:
+        - button "1111" [ref=e15] [cursor=pointer]
+        - button "222" [ref=e16] [cursor=pointer]
+        - button "2222" [ref=e17] [cursor=pointer]
+        - button "aaa" [ref=e18] [cursor=pointer]
+        - button "aaa_bbb_ccc" [ref=e19] [cursor=pointer]
+        - button "aaa_bbb_ccc_副本" [ref=e20] [cursor=pointer]
+    - generic [ref=e21]:
+      - generic [ref=e22]:
+        - generic [ref=e24]:
+          - generic [ref=e25]: "当前方案:"
+          - strong [ref=e26]: 未选择方案
+        - tablist "参数维护标签" [ref=e27]:
+          - button "8760时序数据" [ref=e28] [cursor=pointer]
+          - button "设备参数" [ref=e29] [cursor=pointer]
+          - button "规划参数" [ref=e30] [cursor=pointer]
+          - button "方案概览" [ref=e31] [cursor=pointer]
+        - generic "方案操作" [ref=e32]:
+          - button "新建方案" [ref=e33] [cursor=pointer]
+          - button "复制方案" [ref=e34] [cursor=pointer]
+          - button "修改名称" [ref=e35] [cursor=pointer]
+          - button "保存方案" [ref=e36] [cursor=pointer]
+          - button "删除方案" [ref=e37] [cursor=pointer]
+      - generic [ref=e38]:
+        - generic [ref=e39]:
+          - generic "历史气象数据获取" [ref=e40]:
+            - generic [ref=e41]:
+              - text: 地名
+              - textbox "地名" [ref=e42]:
+                - /placeholder: 例如：秦岭站
+            - button "获取坐标" [ref=e43] [cursor=pointer]
+            - button "地图选点" [ref=e44] [cursor=pointer]
+            - generic [ref=e45]:
+              - text: 纬度
+              - spinbutton "纬度" [ref=e46]
+            - generic [ref=e47]:
+              - text: 经度
+              - spinbutton "经度" [ref=e48]
+            - generic [ref=e49]:
+              - text: 历史数据年
+              - spinbutton "历史数据年" [ref=e50]
+            - button "获取历史气象" [ref=e51] [cursor=pointer]
+            - status
+          - generic "曲线切换显示" [ref=e52]:
+            - generic [ref=e53]:
+              - generic [ref=e54]:
+                - radio "风速" [checked] [ref=e55]
+                - text: 风速
+              - generic [ref=e56]:
+                - radio "太阳辐照" [ref=e57]
+                - text: 太阳辐照
+              - generic [ref=e58]:
+                - radio "温度" [ref=e59]
+                - text: 温度
+              - generic [ref=e60]:
+                - radio "负荷" [ref=e61]
+                - text: 负荷
+          - img "8760点风光温荷曲线" [ref=e62]
+        - separator "调整时序图高度" [ref=e63]
+        - generic [ref=e65]:
+          - generic "小时级数据月份分页" [ref=e66]
+          - generic [ref=e67]: 未加载
+    - complementary [ref=e69]:
+      - generic [ref=e70]: 校验与摘要

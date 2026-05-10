@@ -59,6 +59,7 @@ for path in (ROOT_DIR,):
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
+from model import topology as network_topology
 from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BUS_COLS as DC_BUS_COLS,
@@ -100,7 +101,7 @@ def load_dc_ppc_from_e_file(file_name) -> Dict:
 
 def _dc_network_from_ppc(ppc):
     network = build_dc_network_from_ppc(ppc)
-    network.topo()
+    network_topology.prepare_dc_topology(network)
     return network
 
 
@@ -368,9 +369,11 @@ class DCPowerFlowCalc:
         self.algorithm = algorithm
         self.used_algorithm = algorithm
         self.target_island = island
-        self.keep_node_objects = bool(keep_node_objects)
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self.result_mode = self._normalize_result_mode(result_mode)
+        self.keep_node_objects = bool(keep_node_objects) and (
+            not self.array_mode or self.result_mode == "full"
+        )
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -565,82 +568,21 @@ class DCPowerFlowCalc:
     def _prepare_direct_ppc_topology(self):
         """Build active DC solver-node mapping directly from dc_ppc_v1 arrays."""
         ppc = self.ppc
-        bus = ppc["bus"]
-        running_mask = bus[:, DC_BUS_COLS["run_stat"]] == 1
-        running_node_ids = bus[running_mask, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)
-        n_running = int(running_node_ids.size)
-        if n_running == 0:
+        topology = ppc.get("_topology_arrays")
+        if topology is None:
+            topology = network_topology.prepare_dc_topology_ppc(ppc)
+            ppc["_topology_arrays"] = topology
+        self._ppc_topology = topology
+        if not np.any(topology.node_alive_mask):
             self.alive_nodes = []
             self.alive_node_dict = {}
             self.alive_node_ids = np.array([], dtype=np.int32)
             self.N = 0
+            self._alive_node_lookup = np.array([], dtype=np.int32)
             return
 
-        dense_lookup, dict_lookup = self._direct_node_position_lookup(running_node_ids)
-        switch_i, switch_j = self._direct_ppc_pair_positions(
-            ppc["switch"],
-            DC_SWITCH_COLS,
-            dense_lookup,
-            dict_lookup,
-            status_col=DC_SWITCH_COLS["status"],
-        )
-        branch_i, branch_j = self._direct_ppc_pair_positions(
-            ppc["branch"],
-            DC_BRANCH_COLS,
-            dense_lookup,
-            dict_lookup,
-        )
-        zero_i, zero_j = self._direct_ppc_pair_positions(
-            ppc["zero_branch"],
-            DC_ZERO_BRANCH_COLS,
-            dense_lookup,
-            dict_lookup,
-        )
-        break_i, break_j = self._direct_ppc_pair_positions(
-            ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)),
-            DC_BREAK_COLS,
-            dense_lookup,
-            dict_lookup,
-            status_col=DC_BREAK_COLS["status"],
-        )
-
-        # 闭合开关会把多个物理节点合并为同一个电气计算节点；普通支路、
-        # 零阻抗支路和闭合刀闸只用于判断包含定压源的可计算拓扑岛。
-        switch_labels = self._component_labels_from_edges(n_running, ((switch_i, switch_j),))
-        full_labels = self._component_labels_from_edges(
-            n_running,
-            ((switch_i, switch_j), (branch_i, branch_j), (zero_i, zero_j), (break_i, break_j)),
-        )
-
-        alive_components = np.zeros(int(full_labels.max()) + 1, dtype=bool)
-        gen = ppc["gen"]
-        if gen.size:
-            gen_pos = self._map_direct_node_positions(gen[:, DC_GEN_COLS["node"]], dense_lookup, dict_lookup)
-            v_mask = (
-                (gen[:, DC_GEN_COLS["run_stat"]] == 1)
-                & (gen[:, DC_GEN_COLS["control_type"]] == DC_CTRL_V)
-                & (gen_pos >= 0)
-            )
-            if np.any(v_mask):
-                alive_components[full_labels[gen_pos[v_mask]]] = True
-
-        dcdc = ppc["dcdc"]
-        if dcdc.size:
-            dcdc_i_pos = self._map_direct_node_positions(dcdc[:, DC_DCDC_COLS["i_node"]], dense_lookup, dict_lookup)
-            dcdc_j_pos = self._map_direct_node_positions(dcdc[:, DC_DCDC_COLS["j_node"]], dense_lookup, dict_lookup)
-            dcdc_v_mask = (
-                (dcdc[:, DC_DCDC_COLS["run_stat"]] == 1)
-                & (dcdc[:, DC_DCDC_COLS["control_type"]] == DC_CTRL_V)
-                & (dcdc_i_pos >= 0)
-                & (dcdc_j_pos >= 0)
-                & (dcdc_i_pos != dcdc_j_pos)
-            )
-            if np.any(dcdc_v_mask):
-                alive_components[full_labels[dcdc_i_pos[dcdc_v_mask]]] = True
-
-        alive_pos_mask = alive_components[full_labels]
         if self.keep_node_objects:
-            solver_node_ids = running_node_ids[alive_pos_mask].astype(np.int32, copy=False)
+            solver_node_ids = topology.node_ids[topology.node_alive_mask].astype(np.int32, copy=False)
             self.alive_node_dict = {int(node_id): int(pos) for pos, node_id in enumerate(solver_node_ids)}
             self.alive_node_ids = solver_node_ids.copy()
             self.N = int(solver_node_ids.size)
@@ -650,27 +592,21 @@ class DCPowerFlowCalc:
             else:
                 self._alive_node_lookup = np.array([], dtype=np.int32)
         else:
-            active_pos = np.nonzero(alive_pos_mask)[0].astype(np.int32)
-            active_labels = switch_labels[active_pos]
-            active_node_ids = running_node_ids[active_pos]
-            order = np.lexsort((active_node_ids, active_labels))
-            labels_sorted = active_labels[order]
-            nodes_sorted = active_node_ids[order].astype(np.int32, copy=False)
-            if labels_sorted.size:
-                starts = np.r_[0, np.flatnonzero(labels_sorted[1:] != labels_sorted[:-1]) + 1]
-                ends = np.r_[starts[1:], labels_sorted.size]
-                group_order = np.argsort(nodes_sorted[starts], kind="stable")
+            active_bus_pos = np.flatnonzero(topology.bus_alive_mask).astype(np.int32)
+            if active_bus_pos.size:
                 self.alive_node_dict = {}
                 alive_ids = []
                 alive_pos_values = []
-                for solver_pos, group_idx in enumerate(group_order):
-                    group_nodes = nodes_sorted[starts[group_idx]:ends[group_idx]]
+                for solver_pos, bus_pos in enumerate(active_bus_pos):
+                    start = int(topology.bus_node_offsets[bus_pos])
+                    end = int(topology.bus_node_offsets[bus_pos + 1])
+                    group_nodes = topology.node_ids[topology.bus_node_indices[start:end]].astype(np.int32, copy=False)
                     alive_ids.extend(int(node_id) for node_id in group_nodes)
                     alive_pos_values.extend([int(solver_pos)] * int(group_nodes.size))
                     for node_id in group_nodes:
                         self.alive_node_dict[int(node_id)] = int(solver_pos)
                 self.alive_node_ids = np.asarray(alive_ids, dtype=np.int32)
-                self.N = int(group_order.size)
+                self.N = int(active_bus_pos.size)
                 if self.alive_node_ids.size and np.all(self.alive_node_ids >= 0):
                     self._alive_node_lookup = np.full(int(self.alive_node_ids.max()) + 1, -1, dtype=np.int32)
                     self._alive_node_lookup[self.alive_node_ids.astype(np.intp)] = np.asarray(alive_pos_values, dtype=np.int32)
@@ -2294,6 +2230,9 @@ class DCPowerFlowCalc:
 
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
+            if self.array_mode and self.result_mode != "full":
+                self.keep_node_objects = False
+                self.alive_nodes = []
         params = self.params.with_overrides(
             tol=tol,
             max_iter=max_iter,

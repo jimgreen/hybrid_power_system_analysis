@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -153,6 +153,7 @@ class MeasurementTable:
     device_type_code: np.ndarray
     angle_mask: np.ndarray
     status_code: Optional[np.ndarray] = None
+    rows_by_device_type_code: Optional[Dict[int, np.ndarray]] = None
 
 
 class MeasurementList(list):
@@ -162,6 +163,51 @@ class MeasurementList(list):
         super().__init__(measurements)
         self.table = table
         self.normalized = bool(normalized)
+
+
+class MeasurementView(MeasurementList):
+    """A table-backed row view over an existing measurement sequence."""
+
+    __slots__ = ("source", "rows")
+
+    def __init__(
+        self,
+        source: Sequence[Measurement],
+        rows: Sequence[int],
+        table: Optional[MeasurementTable] = None,
+        normalized: bool = False,
+    ):
+        list.__init__(self)
+        self.source = source
+        self.rows = np.asarray(rows, dtype=np.int64)
+        self.table = table
+        self.normalized = bool(normalized)
+
+    def __len__(self) -> int:
+        return int(self.rows.size)
+
+    def __iter__(self):
+        source = self.source
+        for row in self.rows:
+            yield source[int(row)]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self.source[int(row)] for row in self.rows[index]]
+        return self.source[int(self.rows[index])]
+
+    def __contains__(self, item) -> bool:
+        return any(measurement is item or measurement == item for measurement in self)
+
+    def index(self, item, start=0, stop=None) -> int:
+        size = len(self)
+        start = max(0, int(start))
+        stop = size if stop is None else min(size, int(stop))
+        for pos in range(start, stop):
+            measurement = self[pos]
+            if measurement is item or measurement == item:
+                return pos
+        raise ValueError(f"{item!r} is not in measurement view")
 
 
 def measurement_status_from_measurement(measurement: Measurement) -> int:
@@ -208,6 +254,7 @@ def measurement_table_from_measurements(
                 device_type_code=np.concatenate((table.device_type_code, tail_table.device_type_code)),
                 angle_mask=np.concatenate((table.angle_mask, tail_table.angle_mask)),
                 status_code=np.concatenate((measurement_table_status_code(table), measurement_table_status_code(tail_table))),
+                rows_by_device_type_code=None,
             )
             try:
                 measurements.table = table

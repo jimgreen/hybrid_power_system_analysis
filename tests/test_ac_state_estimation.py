@@ -1161,6 +1161,28 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(estimator.nodes)
 
+    def test_estimator_load_network_uses_ppc_topology_arrays_without_object_topology(self):
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        original_prepare_topology = ac_se.network_topology.prepare_ac_topology
+
+        def reject_object_topology(*_args, **_kwargs):
+            raise AssertionError("AC SE array load should apply ppc topology arrays directly")
+
+        ac_se.network_topology.prepare_ac_topology = reject_object_topology
+        try:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+                flat_start=True,
+            )
+        finally:
+            ac_se.network_topology.prepare_ac_topology = original_prepare_topology
+
+        self.assertTrue(estimator.nodes)
+        self.assertIsNotNone(getattr(estimator.network, "_topology_arrays", None))
+
     def test_measurement_unit_conversion_uses_precomputed_node_scales(self):
         from secore.ac_se import ACStateEstimator, Measurement
 
@@ -2845,7 +2867,8 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, len(se_result.bad_data))
         self.assertEqual(0, len(se_result.normal_measurements))
 
-    def test_run_array_return_mode_skips_full_seresult_tables(self):
+    def test_run_array_return_mode_keeps_estimate_arrays_only(self):
+        import secore.ac_se as ac_se_module
         from secore.ac_se import ACStateEstimator
         from secore.se_result import SEResult
 
@@ -2855,33 +2878,53 @@ class ACStateEstimationTest(unittest.TestCase):
             auto_prepare=False,
         )
         estimator.prepare()
+        original_build = ACStateEstimator.build_se_result
+        original_summary = ac_se_module.build_seresult_summary
+        original_identify = ACStateEstimator.identify_bad_data
         original_from_estimate = SEResult.from_estimate_result
+        original_apply_state = ACStateEstimator.apply_state
+
+        def reject_seresult_path(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not build SEResult payloads")
+
+        def reject_bad_data(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not run post-estimation bad-data analysis")
+
+        def reject_apply_state(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not write estimated state back to model objects")
 
         def reject_full_tables(*_args, **_kwargs):
             raise AssertionError("array return_mode should not build full SEResult measurement tables")
 
+        ACStateEstimator.build_se_result = reject_seresult_path
+        ac_se_module.build_seresult_summary = reject_seresult_path
+        ACStateEstimator.identify_bad_data = reject_bad_data
+        ACStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
         try:
             se_result = estimator.run(
                 return_mode="array",
                 verbose=False,
-                skip_bad_data=True,
-                final_diagnostics=False,
             )
         finally:
+            ACStateEstimator.build_se_result = original_build
+            ac_se_module.build_seresult_summary = original_summary
+            ACStateEstimator.identify_bad_data = original_identify
+            ACStateEstimator.apply_state = original_apply_state
             SEResult.from_estimate_result = original_from_estimate
         result = estimator.estimate_result
 
-        self.assertIs(se_result, estimator.se_result)
+        self.assertIsNone(se_result)
+        self.assertIsNone(estimator.se_result)
         self.assertTrue(result.converged)
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
-        self.assertGreater(se_result.statistics.normal_measurement_count, 0)
-        self.assertEqual(0, len(se_result.prefiltered_measurements))
-        self.assertEqual(0, len(se_result.pseudo_measurements))
-        self.assertEqual(0, len(se_result.bad_data))
-        self.assertEqual(0, len(se_result.normal_measurements))
+        self.assertIsNone(result.H)
+        self.assertIsNone(result.gain)
+        self.assertEqual(0, len(result.measurements))
+        self.assertEqual([], estimator.bad_items)
+        self.assertEqual(0, estimator.normalized_residual.size)
 
     def test_estimate_uses_cholesky_solver_when_available(self):
         import secore.se_math as se_math

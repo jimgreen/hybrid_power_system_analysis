@@ -1,8 +1,8 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StateMeta:
     """Structured description for one state vector column."""
 
@@ -42,4 +42,12 @@ def state_meta_at(state_meta: Sequence[StateMeta], state_idx) -> Optional[StateM
 
 
 def with_legacy_label(meta: StateMeta, legacy_label: str, side: Optional[str] = None) -> StateMeta:
-    return replace(meta, legacy_label=legacy_label, side=meta.side if side is None else side)
+    return StateMeta(
+        meta.side if side is None else side,
+        meta.kind,
+        meta.device_type,
+        meta.device_name,
+        terminal=meta.terminal,
+        component=meta.component,
+        legacy_label=legacy_label,
+    )

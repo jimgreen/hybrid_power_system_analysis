@@ -3698,6 +3698,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertGreater(result.residual.size, 0)
         self.assertIsNone(result.H)
         self.assertIsNone(result.gain)
+        self.assertEqual(0, len(result.measurements))
         self.assertEqual([], estimator.bad_items)
         self.assertEqual(0, estimator.normalized_residual.size)
 

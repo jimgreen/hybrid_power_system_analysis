@@ -1828,6 +1828,7 @@ class DCStateEstimationTest(unittest.TestCase):
         original_summary = dc_se_module.build_seresult_summary
         original_identify = DCStateEstimator.identify_bad_data
         original_from_estimate = SEResult.from_estimate_result
+        original_apply_state = DCStateEstimator.apply_state
 
         def reject_seresult_path(*_args, **_kwargs):
             raise AssertionError("array return_mode should not build SEResult payloads")
@@ -1835,12 +1836,16 @@ class DCStateEstimationTest(unittest.TestCase):
         def reject_bad_data(*_args, **_kwargs):
             raise AssertionError("array return_mode should not run post-estimation bad-data analysis")
 
+        def reject_apply_state(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not write estimated state back to model objects")
+
         def reject_full_tables(*_args, **_kwargs):
             raise AssertionError("array return_mode should not build full SEResult measurement tables")
 
         DCStateEstimator.build_se_result = reject_seresult_path
         dc_se_module.build_seresult_summary = reject_seresult_path
         DCStateEstimator.identify_bad_data = reject_bad_data
+        DCStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
         try:
             se_result = estimator.run(return_mode="array", verbose=False)
@@ -1848,6 +1853,7 @@ class DCStateEstimationTest(unittest.TestCase):
             DCStateEstimator.build_se_result = original_build
             dc_se_module.build_seresult_summary = original_summary
             DCStateEstimator.identify_bad_data = original_identify
+            DCStateEstimator.apply_state = original_apply_state
             SEResult.from_estimate_result = original_from_estimate
         result = estimator.estimate_result
 
@@ -1859,6 +1865,7 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertGreater(result.residual.size, 0)
         self.assertIsNone(result.H)
         self.assertIsNone(result.gain)
+        self.assertEqual(0, len(result.measurements))
         self.assertEqual([], estimator.bad_items)
         self.assertEqual(0, estimator.normalized_residual.size)
 
