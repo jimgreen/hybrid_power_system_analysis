@@ -862,6 +862,26 @@ class DCStateEstimationTest(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
 
+    def test_evaluate_returns_after_full_vectorized_fill_without_iterating_measurements(self):
+        from model.meas_model import MeasurementList
+        from secore.dc_se import DCStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("fully vectorized DC evaluate should not iterate measurement objects")
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+        )
+        x = estimator.initial_state()
+        expected = estimator.evaluate(x)
+        wrapped = NoIterMeasurementList(estimator.active_measurements, estimator.active_measurements.table)
+
+        actual = estimator.evaluate(x, wrapped)
+
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
     def test_sparse_jacobian_batches_device_measurements(self):
         from scipy.sparse import issparse
         from secore.dc_se import DCStateEstimator

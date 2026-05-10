@@ -1721,7 +1721,125 @@ class HybridStateEstimator:
             if self._dc_sub_estimator is not None
             else np.array([], dtype=np.int32)
         )
+        self._build_hybrid_converter_array_cache()
         self._partition_state_variables()
+
+    def _build_hybrid_converter_array_cache(self) -> None:
+        self._dcac_count = len(self.dcac_converters)
+        self._acac_count = len(self.acac_converters)
+        self._dcac_dc_node = np.asarray([int(conv.dc_node) for conv in self.dcac_converters], dtype=np.int64)
+        self._dcac_ac_node = np.asarray([int(conv.ac_node) for conv in self.dcac_converters], dtype=np.int64)
+        self._acac_i_node = np.asarray([int(conv.i_node) for conv in self.acac_converters], dtype=np.int64)
+        self._acac_j_node = np.asarray([int(conv.j_node) for conv in self.acac_converters], dtype=np.int64)
+        self._dcac_dc_v_col_by_pos = np.fromiter(
+            (self._dc_voltage_col_for_node(int(node)) for node in self._dcac_dc_node),
+            dtype=np.int32,
+            count=self._dcac_count,
+        )
+        self._dcac_ac_v_col_by_pos = np.fromiter(
+            (self._ac_voltage_col_for_node(int(node)) for node in self._dcac_ac_node),
+            dtype=np.int32,
+            count=self._dcac_count,
+        )
+        self._dcac_dc_v_default_by_pos = np.fromiter(
+            (self._dc_voltage_default_for_node(int(node)) for node in self._dcac_dc_node),
+            dtype=np.float64,
+            count=self._dcac_count,
+        )
+        self._dcac_ac_v_default_by_pos = np.fromiter(
+            (self._ac_voltage_default_for_node(int(node)) for node in self._dcac_ac_node),
+            dtype=np.float64,
+            count=self._dcac_count,
+        )
+        self._acac_from_v_col_by_pos = np.fromiter(
+            (self._ac_voltage_col_for_node(int(node)) for node in self._acac_i_node),
+            dtype=np.int32,
+            count=self._acac_count,
+        )
+        self._acac_to_v_col_by_pos = np.fromiter(
+            (self._ac_voltage_col_for_node(int(node)) for node in self._acac_j_node),
+            dtype=np.int32,
+            count=self._acac_count,
+        )
+        self._acac_from_v_default_by_pos = np.fromiter(
+            (self._ac_voltage_default_for_node(int(node)) for node in self._acac_i_node),
+            dtype=np.float64,
+            count=self._acac_count,
+        )
+        self._acac_to_v_default_by_pos = np.fromiter(
+            (self._ac_voltage_default_for_node(int(node)) for node in self._acac_j_node),
+            dtype=np.float64,
+            count=self._acac_count,
+        )
+        flat_parts = []
+        nonflat_parts = []
+        if self._dcac_count:
+            dcac_flat = np.zeros(3 * self._dcac_count, dtype=np.float64)
+            dcac_flat[1::3] = np.asarray(
+                [float(getattr(conv, "p_ac_set", 0.0) or 0.0) for conv in self.dcac_converters],
+                dtype=np.float64,
+            )
+            dcac_flat[2::3] = np.asarray(
+                [float(getattr(conv, "q_ac_set", 0.0) or 0.0) for conv in self.dcac_converters],
+                dtype=np.float64,
+            )
+            dcac_nonflat = np.empty(3 * self._dcac_count, dtype=np.float64)
+            dcac_nonflat[0::3] = np.asarray(
+                [float(getattr(conv, "dc_p", 0.0) or 0.0) for conv in self.dcac_converters],
+                dtype=np.float64,
+            )
+            dcac_nonflat[1::3] = np.asarray(
+                [float(getattr(conv, "ac_p", 0.0) or 0.0) for conv in self.dcac_converters],
+                dtype=np.float64,
+            )
+            dcac_nonflat[2::3] = np.asarray(
+                [float(getattr(conv, "ac_q", 0.0) or 0.0) for conv in self.dcac_converters],
+                dtype=np.float64,
+            )
+            flat_parts.append(dcac_flat)
+            nonflat_parts.append(dcac_nonflat)
+        if self._acac_count:
+            p_set = np.asarray([float(getattr(conv, "p_set", 0.0) or 0.0) for conv in self.acac_converters], dtype=np.float64)
+            acac_flat = np.empty(4 * self._acac_count, dtype=np.float64)
+            acac_flat[0::4] = p_set
+            acac_flat[1::4] = np.asarray(
+                [float(getattr(conv, "i_q_set", 0.0) or 0.0) for conv in self.acac_converters],
+                dtype=np.float64,
+            )
+            acac_flat[2::4] = -p_set
+            acac_flat[3::4] = np.asarray(
+                [float(getattr(conv, "j_q_set", 0.0) or 0.0) for conv in self.acac_converters],
+                dtype=np.float64,
+            )
+            acac_nonflat = np.empty(4 * self._acac_count, dtype=np.float64)
+            acac_nonflat[0::4] = np.asarray(
+                [float(getattr(conv, "i_p", 0.0) or 0.0) for conv in self.acac_converters],
+                dtype=np.float64,
+            )
+            acac_nonflat[1::4] = np.asarray(
+                [float(getattr(conv, "i_q", 0.0) or 0.0) for conv in self.acac_converters],
+                dtype=np.float64,
+            )
+            acac_nonflat[2::4] = np.asarray(
+                [float(getattr(conv, "j_p", 0.0) or 0.0) for conv in self.acac_converters],
+                dtype=np.float64,
+            )
+            acac_nonflat[3::4] = np.asarray(
+                [float(getattr(conv, "j_q", 0.0) or 0.0) for conv in self.acac_converters],
+                dtype=np.float64,
+            )
+            flat_parts.append(acac_flat)
+            nonflat_parts.append(acac_nonflat)
+        self._hybrid_seed_flat_base = (
+            np.concatenate(flat_parts).astype(np.float64, copy=False)
+            if flat_parts
+            else np.zeros(self.hybrid_n_state, dtype=np.float64)
+        )
+        self._hybrid_seed_nonflat_base = (
+            np.concatenate(nonflat_parts).astype(np.float64, copy=False)
+            if nonflat_parts
+            else np.zeros(self.hybrid_n_state, dtype=np.float64)
+        )
 
     def _refresh_active_measurement_state_layout(self) -> None:
         self._invalidate_measurement_activity_summary()
@@ -1780,6 +1898,7 @@ class HybridStateEstimator:
         self.active_weights_are_uniform = self.active_uniform_weight is not None
         self._active_normal_pattern = None
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
         self._invalidate_real_voltage_seed_cache()
@@ -1864,6 +1983,7 @@ class HybridStateEstimator:
         self.active_weights_are_uniform = self.active_uniform_weight is not None
         self._active_normal_pattern = None
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
         if self._has_real_voltage_seed_measurement(appended_measurements):
@@ -1946,6 +2066,7 @@ class HybridStateEstimator:
         if not hasattr(self, "n_state"):
             return self.active_measurements
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
         self._active_normal_pattern = None
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
@@ -1979,31 +2100,13 @@ class HybridStateEstimator:
         dcac_pos = plan_table.device_pos[dcac_mask].astype(np.int32, copy=False)
         dcac_rows = block.rows[dcac_local_rows].astype(np.int32, copy=False)
         dcac_codes = plan_table.meas_kind[dcac_mask].astype(np.int8, copy=False)
-        dcac_dc_v_col = np.fromiter(
-            (self._dc_voltage_col_for_node(self.dcac_converters[int(pos)].dc_node) for pos in dcac_pos),
-            dtype=np.int32,
-            count=dcac_pos.size,
+        dcac_dc_v_col = self._dcac_dc_v_col_by_pos[dcac_pos] if dcac_pos.size else np.array([], dtype=np.int32)
+        dcac_ac_v_col = self._dcac_ac_v_col_by_pos[dcac_pos] if dcac_pos.size else np.array([], dtype=np.int32)
+        dcac_dc_v_default = (
+            self._dcac_dc_v_default_by_pos[dcac_pos] if dcac_pos.size else np.array([], dtype=np.float64)
         )
-        dcac_ac_v_col = np.fromiter(
-            (self._ac_voltage_col_for_node(self.dcac_converters[int(pos)].ac_node) for pos in dcac_pos),
-            dtype=np.int32,
-            count=dcac_pos.size,
-        )
-        dcac_dc_v_default = np.fromiter(
-            (
-                self._dc_voltage_default_for_node(int(self.dcac_converters[int(pos)].dc_node))
-                for pos in dcac_pos
-            ),
-            dtype=np.float64,
-            count=dcac_pos.size,
-        )
-        dcac_ac_v_default = np.fromiter(
-            (
-                self._ac_voltage_default_for_node(int(self.dcac_converters[int(pos)].ac_node))
-                for pos in dcac_pos
-            ),
-            dtype=np.float64,
-            count=dcac_pos.size,
+        dcac_ac_v_default = (
+            self._dcac_ac_v_default_by_pos[dcac_pos] if dcac_pos.size else np.array([], dtype=np.float64)
         )
 
         acac_mask = plan_table.handled & (plan_table.device_type_code == acac_code)
@@ -2011,31 +2114,13 @@ class HybridStateEstimator:
         acac_pos = plan_table.device_pos[acac_mask].astype(np.int32, copy=False)
         acac_rows = block.rows[acac_local_rows].astype(np.int32, copy=False)
         acac_codes = plan_table.meas_kind[acac_mask].astype(np.int8, copy=False)
-        acac_from_v_col = np.fromiter(
-            (self._ac_voltage_col_for_node(self.acac_converters[int(pos)].i_node) for pos in acac_pos),
-            dtype=np.int32,
-            count=acac_pos.size,
+        acac_from_v_col = self._acac_from_v_col_by_pos[acac_pos] if acac_pos.size else np.array([], dtype=np.int32)
+        acac_to_v_col = self._acac_to_v_col_by_pos[acac_pos] if acac_pos.size else np.array([], dtype=np.int32)
+        acac_from_v_default = (
+            self._acac_from_v_default_by_pos[acac_pos] if acac_pos.size else np.array([], dtype=np.float64)
         )
-        acac_to_v_col = np.fromiter(
-            (self._ac_voltage_col_for_node(self.acac_converters[int(pos)].j_node) for pos in acac_pos),
-            dtype=np.int32,
-            count=acac_pos.size,
-        )
-        acac_from_v_default = np.fromiter(
-            (
-                self._ac_voltage_default_for_node(int(self.acac_converters[int(pos)].i_node))
-                for pos in acac_pos
-            ),
-            dtype=np.float64,
-            count=acac_pos.size,
-        )
-        acac_to_v_default = np.fromiter(
-            (
-                self._ac_voltage_default_for_node(int(self.acac_converters[int(pos)].j_node))
-                for pos in acac_pos
-            ),
-            dtype=np.float64,
-            count=acac_pos.size,
+        acac_to_v_default = (
+            self._acac_to_v_default_by_pos[acac_pos] if acac_pos.size else np.array([], dtype=np.float64)
         )
 
         return self._HybridMeasurementPlan(
@@ -2098,7 +2183,7 @@ class HybridStateEstimator:
         )
         acac_rows = plan_table.row[acac_mask].astype(np.int64, copy=False)
         acac_state_col = (
-            3 * len(self.dcac_converters)
+            3 * self._dcac_count
             + 4 * plan_table.device_pos[acac_mask].astype(np.int64, copy=False)
             + plan_table.meas_kind[acac_mask].astype(np.int64, copy=False)
         )
@@ -2171,25 +2256,8 @@ class HybridStateEstimator:
 
     def _hybrid_seed_vector(self, flat: Optional[bool] = None) -> np.ndarray:
         flat = self.flat_start if flat is None else bool(flat)
-        x = np.zeros(self.hybrid_n_state, dtype=np.float64)
-        offset = 0
-        for conv in self.dcac_converters:
-            defaults = (
-                0.0 if flat else float(getattr(conv, "dc_p", 0.0) or 0.0),
-                float(getattr(conv, "p_ac_set", 0.0) or 0.0) if flat else float(getattr(conv, "ac_p", 0.0) or 0.0),
-                float(getattr(conv, "q_ac_set", 0.0) or 0.0) if flat else float(getattr(conv, "ac_q", 0.0) or 0.0),
-            )
-            x[offset : offset + 3] = defaults
-            offset += 3
-        for conv in self.acac_converters:
-            defaults = (
-                float(getattr(conv, "p_set", 0.0) or 0.0) if flat else float(getattr(conv, "i_p", 0.0) or 0.0),
-                float(getattr(conv, "i_q_set", 0.0) or 0.0) if flat else float(getattr(conv, "i_q", 0.0) or 0.0),
-                -float(getattr(conv, "p_set", 0.0) or 0.0) if flat else float(getattr(conv, "j_p", 0.0) or 0.0),
-                float(getattr(conv, "j_q_set", 0.0) or 0.0) if flat else float(getattr(conv, "j_q", 0.0) or 0.0),
-            )
-            x[offset : offset + 4] = defaults
-            offset += 4
+        base = self._hybrid_seed_flat_base if flat else self._hybrid_seed_nonflat_base
+        x = base.copy()
         self._seed_hybrid_power_states_from_measurements(x)
         return x
 
@@ -2216,7 +2284,7 @@ class HybridStateEstimator:
                 rows.append(plan.acac_rows[acac_mask].astype(np.int64, copy=False))
                 cols.append(
                     (
-                        3 * len(self.dcac_converters)
+                        3 * self._dcac_count
                         + 4 * plan.acac_pos[acac_mask].astype(np.int64, copy=False)
                         + plan.acac_codes[acac_mask].astype(np.int64, copy=False)
                         - 1
@@ -2329,6 +2397,10 @@ class HybridStateEstimator:
         cached = self._real_voltage_seed_cache.get(key)
         if cached is not None:
             return cached
+        if measurements is getattr(self, "hybrid_meas", None) and hasattr(self, "_active_hybrid_measurement_plan"):
+            result = self._real_voltage_seed_arrays_from_active_hybrid_plan()
+            self._real_voltage_seed_cache[key] = result
+            return result
         best: Dict[int, Tuple[float, float]] = {}
         voltage_types = {"V", "V_FROM", "V_TO", "V_GEN", "V_LOAD", "V_DC", "V_AC"}
         for meas in measurements:
@@ -2365,6 +2437,59 @@ class HybridStateEstimator:
             values = np.array([], dtype=np.float64)
         self._real_voltage_seed_cache[key] = (cols, values)
         return cols, values
+
+    def _real_voltage_seed_arrays_from_active_hybrid_plan(self) -> Tuple[np.ndarray, np.ndarray]:
+        plan = self._active_hybrid_measurement_plan
+        active_table = getattr(self.active_measurements, "table", None)
+        status_code = (
+            measurement_table_status_code(active_table)
+            if active_table is not None and len(active_table.idx) == len(self.active_measurements)
+            else None
+        )
+        row_chunks = []
+        col_chunks = []
+
+        def append_rows(mask: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> None:
+            if status_code is not None and np.any(mask):
+                selected_rows = rows[mask]
+                mask_indices = np.flatnonzero(mask)
+                real_mask = status_code[selected_rows.astype(np.int64, copy=False)] != MEAS_STATUS_PSEUDO
+                selected_rows = selected_rows[real_mask]
+                selected_cols = cols[mask_indices[real_mask]]
+            else:
+                selected_rows = rows[mask]
+                selected_cols = cols[mask]
+            valid_col = selected_cols >= 0
+            if np.any(valid_col):
+                row_chunks.append(selected_rows[valid_col].astype(np.int64, copy=False))
+                col_chunks.append(selected_cols[valid_col].astype(np.int32, copy=False))
+
+        append_rows(plan.dcac_codes == self._DCAC_MEASUREMENT_CODE["V_DC"], plan.dcac_rows, plan.dcac_dc_v_col)
+        append_rows(plan.dcac_codes == self._DCAC_MEASUREMENT_CODE["V_AC"], plan.dcac_rows, plan.dcac_ac_v_col)
+        append_rows(plan.acac_codes == self._ACAC_MEASUREMENT_CODE["V_FROM"], plan.acac_rows, plan.acac_from_v_col)
+        append_rows(plan.acac_codes == self._ACAC_MEASUREMENT_CODE["V_TO"], plan.acac_rows, plan.acac_to_v_col)
+        if not row_chunks:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float64)
+
+        rows = np.concatenate(row_chunks).astype(np.int64, copy=False)
+        cols = np.concatenate(col_chunks).astype(np.int32, copy=False)
+        order = np.argsort(rows, kind="stable")
+        rows = rows[order]
+        cols = cols[order]
+        values = self.active_z[rows]
+        weights = self.active_weight[rows]
+        best: Dict[int, Tuple[float, float]] = {}
+        for col, weight, value in zip(cols, weights, values):
+            col_int = int(col)
+            current = best.get(col_int)
+            if current is None or float(weight) > current[0]:
+                best[col_int] = (float(weight), float(value))
+        if not best:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.float64)
+        return (
+            np.fromiter(best.keys(), dtype=np.int32, count=len(best)),
+            np.fromiter((item[1] for item in best.values()), dtype=np.float64, count=len(best)),
+        )
 
     def _split_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         x = np.asarray(x, dtype=np.float64)

@@ -3251,6 +3251,8 @@ class DCStateEstimator:
             dcdc_power,
             v_generator_power,
         )
+        if np.all(vectorized_rows):
+            return values
 
         for row, meas in enumerate(measurements):
             if vectorized_rows[row]:

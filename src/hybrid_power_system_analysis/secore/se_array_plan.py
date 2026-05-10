@@ -7,6 +7,7 @@ from model.meas_model import (
     Measurement,
     MeasurementList,
     MeasurementTable,
+    MeasurementView,
     measurement_table_from_measurements,
     measurement_table_status_code,
 )
@@ -54,11 +55,61 @@ def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) ->
         device_type_code=np.concatenate((head.device_type_code, tail.device_type_code)),
         angle_mask=np.concatenate((head.angle_mask, tail.angle_mask)),
         status_code=np.concatenate((measurement_table_status_code(head), measurement_table_status_code(tail))),
+        rows_by_device_type_code=None,
     )
 
 
-def measurement_table_take(table: MeasurementTable, rows: Sequence[int]) -> MeasurementTable:
+def _slice_cached_rows_by_device_type_code(
+    cached_rows: Optional[Mapping[int, Sequence[int]]],
+    row_idx: np.ndarray,
+) -> Optional[Dict[int, np.ndarray]]:
+    if cached_rows is None:
+        return None
+    row_idx = np.asarray(row_idx, dtype=np.int64)
+    if row_idx.size == 0:
+        return {}
+    max_row = int(np.max(row_idx))
+    if max_row <= max(1024, row_idx.size * 4):
+        row_to_pos = np.full(max_row + 1, -1, dtype=np.int64)
+        row_to_pos[row_idx] = np.arange(row_idx.size, dtype=np.int64)
+        result: Dict[int, np.ndarray] = {}
+        for code, source_rows in cached_rows.items():
+            source = np.asarray(source_rows, dtype=np.int64)
+            if source.size == 0:
+                continue
+            source = source[source <= max_row]
+            if source.size == 0:
+                continue
+            positions = row_to_pos[source]
+            positions = positions[positions >= 0]
+            if positions.size:
+                positions.sort()
+                result[int(code)] = positions
+        return result
+    row_to_pos = {int(row): pos for pos, row in enumerate(row_idx)}
+    result = {}
+    for code, source_rows in cached_rows.items():
+        positions = [row_to_pos[int(row)] for row in source_rows if int(row) in row_to_pos]
+        if positions:
+            positions.sort()
+            result[int(code)] = np.asarray(positions, dtype=np.int64)
+    return result
+
+
+def measurement_table_take(
+    table: MeasurementTable,
+    rows: Sequence[int],
+    rows_by_device_type_code: Optional[Mapping[int, Sequence[int]]] = None,
+) -> MeasurementTable:
     row_idx = np.asarray(rows, dtype=np.int64)
+    code_rows = (
+        {int(code): np.asarray(values, dtype=np.int64) for code, values in rows_by_device_type_code.items()}
+        if rows_by_device_type_code is not None
+        else _slice_cached_rows_by_device_type_code(
+            getattr(table, "rows_by_device_type_code", None),
+            row_idx,
+        )
+    )
     return MeasurementTable(
         idx=table.idx[row_idx],
         name=table.name[row_idx],
@@ -71,6 +122,7 @@ def measurement_table_take(table: MeasurementTable, rows: Sequence[int]) -> Meas
         device_type_code=table.device_type_code[row_idx],
         angle_mask=table.angle_mask[row_idx],
         status_code=measurement_table_status_code(table)[row_idx],
+        rows_by_device_type_code=code_rows,
     )
 
 
@@ -91,21 +143,36 @@ def copy_measurement_view(measurements: Sequence[Measurement]) -> MeasurementLis
     return MeasurementList(list(measurements), normalized=normalized)
 
 
-def take_measurement_view(measurements: Sequence[Measurement], rows: Sequence[int]) -> MeasurementList:
+def take_measurement_view(
+    measurements: Sequence[Measurement],
+    rows: Sequence[int],
+    rows_by_device_type_code: Optional[Mapping[int, Sequence[int]]] = None,
+) -> MeasurementList:
     table = measurement_table_for(measurements)
     row_array = np.asarray(rows, dtype=np.int64)
-    return MeasurementList(
-        [measurements[int(row)] for row in row_array],
-        measurement_table_take(table, row_array),
+    if isinstance(measurements, MeasurementView):
+        source = measurements.source
+        source_rows = measurements.rows[row_array]
+    else:
+        source = measurements
+        source_rows = row_array
+    return MeasurementView(
+        source,
+        source_rows,
+        measurement_table_take(table, row_array, rows_by_device_type_code=rows_by_device_type_code),
         normalized=getattr(measurements, "normalized", False),
     )
 
 
 def rows_by_device_type_code(table: MeasurementTable) -> Dict[int, np.ndarray]:
+    cached = getattr(table, "rows_by_device_type_code", None)
+    if cached is not None:
+        return cached
     codes = np.asarray(table.device_type_code, dtype=np.int16)
     result: Dict[int, np.ndarray] = {}
     for code in np.unique(codes):
         result[int(code)] = np.flatnonzero(codes == code)
+    table.rows_by_device_type_code = result
     return result
 
 
@@ -125,24 +192,17 @@ def build_measurement_plan_table(
     device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
     meas_kind = np.empty(row.size, dtype=np.int16)
     meas_kind.fill(-1)
-    device_pos = np.empty(row.size, dtype=np.int64)
-    device_pos.fill(-1)
+    device_pos = _cached_measurement_device_pos(table, device_pos_by_type_code)
 
-    for code in np.unique(device_type_code):
-        code_int = int(code)
-        rows = np.flatnonzero(device_type_code == code)
+    for code_int, code_rows in rows_by_device_type_code(table).items():
+        rows = np.asarray(code_rows, dtype=np.int64)
+        if rows.size == 0:
+            continue
         kind_map = meas_kind_by_type_code.get(code_int)
         if kind_map:
             meas_kind[rows] = np.fromiter(
-                (kind_map.get(str(meas_type), -1) for meas_type in table.meas_type[rows]),
+                (kind_map.get(meas_type, -1) for meas_type in table.meas_type[rows]),
                 dtype=np.int16,
-                count=rows.size,
-            )
-        pos_map = device_pos_by_type_code.get(code_int)
-        if pos_map:
-            device_pos[rows] = np.fromiter(
-                (pos_map.get(str(device_name), -1) for device_name in table.device_name[rows]),
-                dtype=np.int64,
                 count=rows.size,
             )
 
@@ -154,6 +214,42 @@ def build_measurement_plan_table(
         device_pos=device_pos,
         handled=(meas_kind >= 0) & (device_pos >= 0),
     )
+
+
+def _mapping_identity_key(mapping: Mapping[int, Mapping[str, int]]) -> Tuple[Tuple[int, int], ...]:
+    return tuple(sorted((int(code), id(values)) for code, values in mapping.items()))
+
+
+def _cached_measurement_device_pos(
+    table: MeasurementTable,
+    device_pos_by_type_code: Mapping[int, Mapping[str, int]],
+) -> np.ndarray:
+    key = _mapping_identity_key(device_pos_by_type_code)
+    cache = getattr(table, "_device_pos_plan_cache", None)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None and cached.size == table.idx.size:
+            return cached
+    device_pos = np.empty(table.idx.size, dtype=np.int64)
+    device_pos.fill(-1)
+    for code_int, code_rows in rows_by_device_type_code(table).items():
+        rows = np.asarray(code_rows, dtype=np.int64)
+        if rows.size == 0:
+            continue
+        pos_map = device_pos_by_type_code.get(code_int)
+        if pos_map:
+            device_pos[rows] = np.fromiter(
+                (pos_map.get(device_name, -1) for device_name in table.device_name[rows]),
+                dtype=np.int64,
+                count=rows.size,
+            )
+    if cache is None:
+        cache = {}
+        setattr(table, "_device_pos_plan_cache", cache)
+    if len(cache) > 16:
+        cache.clear()
+    cache[key] = device_pos
+    return device_pos
 
 
 def build_active_measurement_view(
@@ -181,12 +277,8 @@ def build_active_measurement_view(
             )
     else:
         source_rows = np.flatnonzero(active_mask)
-        active_table = measurement_table_take(table, source_rows)
-        active_measurements = MeasurementList(
-            [measurements[int(row)] for row in source_rows],
-            active_table,
-            normalized=getattr(measurements, "normalized", False),
-        )
+        active_measurements = take_measurement_view(measurements, source_rows)
+        active_table = active_measurements.table
     return ActiveMeasurementView(
         source_table=table,
         measurements=active_measurements,
@@ -268,6 +360,7 @@ def partition_measurements_by_code(
     side_by_device_type: Optional[Mapping[str, str]] = None,
     table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
     rows_by_device_type_code: Optional[Mapping[int, Sequence[int]]] = None,
+    as_view: bool = False,
     sides: Tuple[str, ...],
 ) -> MeasurementPartitions:
     table = measurement_table_for(measurements, table_builder)
@@ -276,6 +369,7 @@ def partition_measurements_by_code(
     except AttributeError:
         pass
     row_chunks: Dict[str, list] = {side: [] for side in sides}
+    code_row_chunks: Dict[str, Dict[int, list]] = {side: {} for side in sides}
     fallback = side_by_device_type or {}
     code_rows = (
         rows_by_device_type_code
@@ -289,6 +383,7 @@ def partition_measurements_by_code(
         side = side_by_device_type_code.get(int(code))
         if side in row_chunks:
             row_chunks[side].append(code_row_array)
+            code_row_chunks[side].setdefault(int(code), []).append(code_row_array)
             continue
         if not fallback:
             continue
@@ -296,7 +391,9 @@ def partition_measurements_by_code(
         for device_type in np.unique(device_types):
             fallback_side = fallback.get(str(device_type))
             if fallback_side in row_chunks:
-                row_chunks[fallback_side].append(code_row_array[device_types == device_type])
+                fallback_rows = code_row_array[device_types == device_type]
+                row_chunks[fallback_side].append(fallback_rows)
+                code_row_chunks[fallback_side].setdefault(int(code), []).append(fallback_rows)
     normalized = getattr(measurements, "normalized", False)
     measurement_views: Dict[str, MeasurementList] = {}
     row_arrays: Dict[str, np.ndarray] = {}
@@ -307,11 +404,39 @@ def partition_measurements_by_code(
         else:
             row_array = np.array([], dtype=np.int64)
         row_arrays[side] = row_array
-        measurement_views[side] = MeasurementList(
-            [measurements[int(row)] for row in row_array],
-            measurement_table_take(table, row_array),
-            normalized=normalized,
-        )
+        local_rows_by_code: Dict[int, np.ndarray] = {}
+        if row_array.size:
+            for code, chunks in code_row_chunks[side].items():
+                if not chunks:
+                    continue
+                source_rows = (
+                    np.concatenate(chunks).astype(np.int64, copy=False)
+                    if len(chunks) > 1
+                    else np.asarray(chunks[0], dtype=np.int64)
+                )
+                if source_rows.size == 0:
+                    continue
+                local_pos = np.searchsorted(row_array, source_rows)
+                in_range = local_pos < row_array.size
+                valid = np.zeros(local_pos.shape, dtype=bool)
+                if np.any(in_range):
+                    valid[in_range] = row_array[local_pos[in_range]] == source_rows[in_range]
+                local_pos = local_pos[valid].astype(np.int64, copy=False)
+                if local_pos.size:
+                    local_pos.sort()
+                    local_rows_by_code[int(code)] = local_pos
+        if as_view:
+            measurement_views[side] = take_measurement_view(
+                measurements,
+                row_array,
+                rows_by_device_type_code=local_rows_by_code,
+            )
+        else:
+            measurement_views[side] = MeasurementList(
+                [measurements[int(row)] for row in row_array],
+                measurement_table_take(table, row_array, rows_by_device_type_code=local_rows_by_code),
+                normalized=normalized,
+            )
     return MeasurementPartitions(measurements=measurement_views, rows=row_arrays)
 
 

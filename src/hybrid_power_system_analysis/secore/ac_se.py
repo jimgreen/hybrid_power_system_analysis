@@ -225,6 +225,103 @@ def _file_cache_key(file_name: Path) -> Tuple[Path, int, int]:
     return path, int(stat.st_mtime_ns), int(stat.st_size)
 
 
+def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str], measurement_cls):
+    count = len(data_lines)
+    measurements = [None] * count
+    idx_values = np.empty(count, dtype=np.int64)
+    name_values = np.empty(count, dtype=object)
+    device_type_values = np.empty(count, dtype=object)
+    device_name_values = np.empty(count, dtype=object)
+    meas_type_values = np.empty(count, dtype=object)
+    weight_values = np.empty(count, dtype=np.float64)
+    valid_values = np.empty(count, dtype=bool)
+    value_values = np.empty(count, dtype=np.float64)
+    device_type_code_values = np.empty(count, dtype=np.int16)
+    angle_mask_values = np.empty(count, dtype=bool)
+    status_values = np.empty(count, dtype=np.int16)
+
+    new_measurement = measurement_cls.__new__
+    device_type_code_get = _DEVICE_TYPE_CODES.get
+    angle_types = ANGLE_MEASUREMENT_TYPES
+    intern = sys.intern
+    device_type_cache = {}
+    measurement_type_cache = {}
+
+    for row_pos, raw_line in enumerate(data_lines):
+        row = raw_line[1:].split()
+        if len(row) < 8:
+            raise RuntimeError(f"Malformed Measurement row at line {row_pos + 1} in {file_name}")
+        idx = int(row[0])
+        name = row[1]
+        raw_device_type = row[2]
+        device_type_entry = device_type_cache.get(raw_device_type)
+        if device_type_entry is None:
+            device_type = intern(raw_device_type)
+            device_type_code = int(device_type_code_get(device_type, 0))
+            device_type_entry = (device_type, device_type_code)
+            device_type_cache[raw_device_type] = device_type_entry
+        device_type, device_type_code = device_type_entry
+
+        raw_meas_type = row[4]
+        meas_type_entry = measurement_type_cache.get(raw_meas_type)
+        if meas_type_entry is None:
+            if raw_meas_type and "a" <= raw_meas_type[0] <= "z":
+                meas_type = intern(raw_meas_type.upper())
+            else:
+                meas_type = intern(raw_meas_type)
+            meas_type_entry = (meas_type, meas_type in angle_types)
+            measurement_type_cache[raw_meas_type] = meas_type_entry
+        meas_type, is_angle_measurement = meas_type_entry
+
+        weight = float(row[5])
+        valid = row[6] == "1"
+        value = float(row[7])
+        status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+        meas = new_measurement(measurement_cls)
+        meas.idx = idx
+        meas.name = name
+        meas.device_type = device_type
+        meas.device_name = row[3]
+        meas.meas_type = meas_type
+        meas.weight = weight
+        meas.valid = valid
+        meas.value = value
+        meas.status = status
+
+        measurements[row_pos] = meas
+        idx_values[row_pos] = idx
+        name_values[row_pos] = name
+        device_type_values[row_pos] = device_type
+        device_name_values[row_pos] = meas.device_name
+        meas_type_values[row_pos] = meas_type
+        weight_values[row_pos] = weight
+        valid_values[row_pos] = valid
+        value_values[row_pos] = value
+        device_type_code_values[row_pos] = device_type_code
+        angle_mask_values[row_pos] = is_angle_measurement
+        status_values[row_pos] = status
+
+    rows_by_code = {
+        int(code): np.flatnonzero(device_type_code_values == code).astype(np.int64, copy=False)
+        for code in np.unique(device_type_code_values)
+    }
+    table = MeasurementTable(
+        idx=idx_values,
+        name=name_values,
+        device_type=device_type_values,
+        device_name=device_name_values,
+        meas_type=meas_type_values,
+        weight=weight_values,
+        valid=valid_values,
+        value=value_values,
+        device_type_code=device_type_code_values,
+        angle_mask=angle_mask_values,
+        status_code=status_values,
+        rows_by_device_type_code=rows_by_code,
+    )
+    return MeasurementList(measurements, table, normalized=False)
+
+
 def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=None):
     required_columns = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
     header = None
@@ -300,6 +397,20 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
             if first == "#":
                 if header is None or column_index is None:
                     raise RuntimeError(f"{file_name} Measurement data appears before the header")
+                if standard_header and scale_context is None:
+                    data_lines = [raw_line]
+                    for raw_line in fp:
+                        first = raw_line[0] if raw_line else ""
+                        if first == "#":
+                            data_lines.append(raw_line)
+                            continue
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        if line == "</Measurement>":
+                            return _read_standard_measurement_lines(file_name, data_lines, measurement_cls)
+                        raise SyntaxError(f"Invalid Measurement row at line {line_no} in {file_name}")
+                    return _read_standard_measurement_lines(file_name, data_lines, measurement_cls)
                 if standard_header:
                     row = raw_line[1:].split()
                     if len(row) < header_len:
