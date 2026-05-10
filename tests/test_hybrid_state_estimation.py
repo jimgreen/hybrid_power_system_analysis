@@ -145,7 +145,7 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(before_count, len(estimator.measurements))
 
-    def test_hybrid_pseudo_measurements_use_measurement_summary_helper(self):
+    def test_hybrid_pseudo_measurements_use_hybrid_partition_not_full_summary(self):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
@@ -153,17 +153,12 @@ class HybridStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
             flat_start=True,
         )
-        calls = {"count": 0}
-        original = estimator._measurement_activity_summary
 
-        def counted():
-            calls["count"] += 1
-            return original()
+        def fail_full_summary():
+            raise AssertionError("hybrid converter pseudo rows should not rebuild the full activity summary")
 
-        estimator._measurement_activity_summary = counted
+        estimator._measurement_activity_summary = fail_full_summary
         estimator._add_hybrid_pseudo_measurements()
-
-        self.assertGreater(calls["count"], 0)
 
     def test_active_measurement_keys_use_measurement_summary_helper(self):
         from secore.hybrid_se import HybridStateEstimator
@@ -208,6 +203,38 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertIsNot(summary1, summary3)
         self.assertIn(("ACNode", "wt02_src", "V"), summary3.active_keys)
 
+    def test_measurement_activity_summary_reuses_active_table_when_current(self):
+        from model.meas_model import MeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class PoisonArray:
+            def __array__(self, _dtype=None):
+                raise AssertionError("summary should not rebuild active mask from the full table")
+
+        rows = [
+            Measurement(1, "node_v", "ACNode", "n1", "V", 1.0, True, 1.0),
+            Measurement(2, "load_p", "ACLoad", "load_1", "P_LOAD", 0.0, False, 0.0),
+            Measurement(3, "conv_p", "DCACConverter", "conv_1", "P_AC", 1.0, True, 0.1),
+        ]
+        full_table = measurement_table_from_measurements(rows)
+        full_table.valid = PoisonArray()
+        full_table.weight = PoisonArray()
+        active_rows = [rows[0], rows[2]]
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = MeasurementList(rows, full_table)
+        estimator.active_measurements = MeasurementList(active_rows, measurement_table_from_measurements(active_rows))
+        estimator._active_measurement_source_count = len(rows)
+        estimator._active_measurement_source_table = full_table
+
+        summary = estimator._measurement_activity_summary()
+
+        self.assertEqual(3, summary.max_idx)
+        self.assertEqual({("ACNode", "n1"), ("DCACConverter", "conv_1")}, summary.measured_devices)
+        self.assertEqual(
+            {("ACNode", "n1", "V"), ("DCACConverter", "conv_1", "P_AC")},
+            summary.active_keys,
+        )
+
     def test_hybrid_measurement_loader_reuses_table_backed_parser(self):
         from model.meas_model import MeasurementList
         from secore.hybrid_se import HybridStateEstimator
@@ -242,6 +269,33 @@ class HybridStateEstimationTest(unittest.TestCase):
         before_count = len(sources["ac"])
         ac_for_sub.append(Measurement(-1, "pseudo_probe", "ACNode", "n", "V", 1.0, True, 1.0))
         self.assertEqual(before_count, len(sources["ac"]))
+
+    def test_shared_sub_measurements_reuse_cached_side_partition(self):
+        from types import SimpleNamespace
+
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator
+
+        rows = [
+            Measurement(1, "ac_v", "ACNode", "ac_bus", "V", 1.0, True, 1.0),
+            Measurement(2, "dc_v", "DCNode", "dc_bus", "V", 1.0, True, 1.0),
+        ]
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.network = SimpleNamespace(
+            ac=SimpleNamespace(nodes=[object()]),
+            dc=SimpleNamespace(nodes=[object()]),
+            dcac_converters=[object()],
+            acac_converters=[],
+        )
+        estimator.measurements = MeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator._sub_measurement_sources_by_side = None
+        estimator._sub_measurement_source_rows_by_side = None
+
+        sources = estimator._initial_measurement_sources_by_side()
+        ac_for_sub = estimator._measurements_for_sub_estimator("ac", share_measurements=True)
+
+        self.assertIs(ac_for_sub, sources["ac"])
+        self.assertIs(ac_for_sub.table, sources["ac"].table)
 
     def test_measurement_vectors_use_table_slice_for_non_active_subset(self):
         from model.meas_model import MeasurementList, measurement_table_from_measurements
@@ -1237,6 +1291,72 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertEqual({("ACNode", "n1"), ("ACNode", "n2")}, attrs["_active_device_key_cache"])
         self.assertEqual({1: 1.02}, attrs["_real_voltage_observation_node_cache"])
+
+    def test_sub_measurement_summary_maps_only_voltage_rows(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("sub summary should use the cached table")
+
+        rows = [
+            Measurement(1, "node_v", "ACNode", "n1", "V", 2.0, True, 1.02),
+            Measurement(2, "load_p", "ACLoad", "load_1", "P_LOAD", 2.0, True, 0.5),
+            Measurement(3, "load_q", "ACLoad", "load_1", "Q_LOAD", 2.0, True, 0.2),
+        ]
+        measurements = NoIterMeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        mapped = []
+
+        def voltage_mapper(_device_type, device_name, meas_type):
+            if not str(meas_type).startswith("V"):
+                raise AssertionError("power rows should not be passed to the voltage mapper")
+            mapped.append((device_name, meas_type))
+            return {"n1": 1}.get(device_name)
+
+        attrs = estimator._sub_measurement_summary_attrs(
+            measurements,
+            max_idx=3,
+            voltage_node_mapper=voltage_mapper,
+        )
+
+        self.assertEqual([("n1", "V")], mapped)
+        self.assertEqual({1: 1.02}, attrs["_real_voltage_observation_node_cache"])
+        self.assertIn(("ACLoad", "load_1", "P_LOAD"), attrs["_active_measurement_key_cache"])
+
+    def test_real_voltage_observation_uses_table_and_maps_only_voltage_rows(self):
+        from types import SimpleNamespace
+
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.hybrid_se import HybridStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("real voltage observation should use the cached table")
+
+        rows = [
+            Measurement(1, "node_v", "ACNode", "n1", "V", 2.0, True, 1.02),
+            Measurement(2, "load_p", "ACLoad", "load_1", "P_LOAD", 2.0, True, 0.5),
+            Measurement(3, "load_q", "ACLoad", "load_1", "Q_LOAD", 2.0, True, 0.2),
+        ]
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = NoIterMeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator._ac_sub_estimator = SimpleNamespace(node_pos={1: 0})
+        mapped = []
+
+        def voltage_mapper(_device_type, device_name, meas_type):
+            if not str(meas_type).startswith("V"):
+                raise AssertionError("power rows should not be passed to the voltage mapper")
+            mapped.append((device_name, meas_type))
+            return {"n1": 1}.get(device_name)
+
+        estimator._ac_voltage_measurement_node_idx = voltage_mapper
+
+        observed = estimator._real_voltage_observation_nodes("ac")
+
+        self.assertEqual([("n1", "V")], mapped)
+        self.assertEqual({1: 1.02}, observed)
 
     def test_converter_pseudo_and_candidate_share_facade(self):
         from secore.hybrid_se import HybridStateEstimator

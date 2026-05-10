@@ -46,6 +46,76 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
         self.assertEqual({1: 1.02}, estimator._real_voltage_observation_nodes())
 
+    def test_summary_cache_maps_only_voltage_rows(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.dc_se import DCStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("summary cache should use the cached table")
+
+        rows = [
+            Measurement(1, "node_v", "DCNode", "n1", "V", 2.0, True, 1.02),
+            Measurement(2, "load_p", "DCLoad", "load_1", "P_LOAD", 2.0, True, 0.5),
+            Measurement(3, "load_i", "DCLoad", "load_1", "I_LOAD", 2.0, True, 0.2),
+        ]
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.measurements = NoIterMeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator.node_by_name = {"n1": SimpleNamespace(idx=1)}
+        estimator.node_pos = {1: 0}
+        estimator.generator_by_name = {}
+        estimator.load_by_name = {"load_1": SimpleNamespace(node=1)}
+        estimator.branch_by_name = {}
+        estimator.zero_branch_by_name = {}
+        estimator.break_by_name = {}
+        estimator.dcdc_by_name = {}
+        mapped = []
+
+        def voltage_mapper(_device_type, device_name, meas_type):
+            if not str(meas_type).startswith("V"):
+                raise AssertionError("non-voltage rows should not be passed to the voltage mapper")
+            mapped.append((device_name, meas_type))
+            return {"n1": 1}.get(device_name)
+
+        estimator._voltage_measurement_node_idx = voltage_mapper
+
+        estimator._refresh_measurement_summary_cache()
+
+        self.assertEqual([("n1", "V")], mapped)
+        self.assertEqual({1: 1.02}, estimator._real_voltage_observation_node_cache)
+        self.assertIn(("DCLoad", "load_1", "P_LOAD"), estimator._active_measurement_key_cache)
+
+    def test_real_voltage_observation_uses_table_and_maps_only_voltage_rows(self):
+        from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
+        from secore.dc_se import DCStateEstimator
+
+        class NoIterMeasurementList(MeasurementList):
+            def __iter__(self):
+                raise AssertionError("real voltage observation should use the cached table")
+
+        rows = [
+            Measurement(1, "node_v", "DCNode", "n1", "V", 2.0, True, 1.02),
+            Measurement(2, "load_p", "DCLoad", "load_1", "P_LOAD", 2.0, True, 0.5),
+            Measurement(3, "load_i", "DCLoad", "load_1", "I_LOAD", 2.0, True, 0.2),
+        ]
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.measurements = NoIterMeasurementList(rows, measurement_table_from_measurements(rows))
+        estimator.node_pos = {1: 0}
+        mapped = []
+
+        def voltage_mapper(_device_type, device_name, meas_type):
+            if not str(meas_type).startswith("V"):
+                raise AssertionError("non-voltage rows should not be passed to the voltage mapper")
+            mapped.append((device_name, meas_type))
+            return {"n1": 1}.get(device_name)
+
+        estimator._voltage_measurement_node_idx = voltage_mapper
+
+        observed = estimator._real_voltage_observation_nodes()
+
+        self.assertEqual([("n1", "V")], mapped)
+        self.assertEqual({1: 1.02}, observed)
+
     def test_conversion_primes_summary_and_voltage_observation_cache(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.dc_se import DCStateEstimator

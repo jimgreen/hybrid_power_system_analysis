@@ -107,6 +107,8 @@ DEFAULT_MEAS = measurement_file("ac", "ieee39.meas")
 _DEVICE_TYPE_CODES = DEVICE_TYPE_CODES
 
 _TERMINAL_POWER_MEASUREMENT_TYPES = frozenset(("P_FROM", "Q_FROM", "P_TO", "Q_TO"))
+_VOLTAGE_MEASUREMENT_TYPES = frozenset(("V", "V_FROM", "V_TO", "V_GEN", "V_LOAD"))
+_VOLTAGE_MEASUREMENT_TYPE_TUPLE = tuple(_VOLTAGE_MEASUREMENT_TYPES)
 _AC_TERMINAL_MEASUREMENT_KIND = {
     "P_FROM": 0,
     "Q_FROM": 1,
@@ -2906,7 +2908,7 @@ class ACStateEstimator:
             converted_value = float(value_array[pos]) / scale
             value_array[pos] = converted_value
             meas.value = converted_value
-            if not is_pseudo_measurement(meas):
+            if not is_pseudo_measurement(meas) and mtype in _VOLTAGE_MEASUREMENT_TYPES:
                 node_idx = self._voltage_measurement_node_idx(device_type, device_name, mtype)
                 if node_idx is not None and node_idx in node_pos:
                     current = real_voltage_best.get(node_idx)
@@ -2978,18 +2980,35 @@ class ACStateEstimator:
         table = getattr(self.measurements, "table", None)
         if table is not None and len(table.idx) == len(self.measurements):
             max_idx = int(table.idx.max()) if table.idx.size else 0
-            active_rows = np.flatnonzero(table.valid & (table.weight > 0.0))
+            active = table.valid & (table.weight > 0.0)
+            device_type_array = np.asarray(table.device_type, dtype=object)
+            device_name_array = np.asarray(table.device_name, dtype=object)
+            meas_type_array = np.asarray(table.meas_type, dtype=object)
+            active_device_keys = set(zip(device_type_array[active].tolist(), device_name_array[active].tolist()))
+            active_measurement_keys = set(
+                zip(
+                    device_type_array[active].tolist(),
+                    device_name_array[active].tolist(),
+                    meas_type_array[active].tolist(),
+                )
+            )
             status_code = measurement_table_status_code(table)
-            for row in active_rows:
-                device_type = str(table.device_type[row])
-                device_name = str(table.device_name[row])
-                meas_type = str(table.meas_type[row])
+            voltage_mask = (
+                active
+                & (status_code != MEAS_STATUS_PSEUDO)
+                & np.isin(meas_type_array, _VOLTAGE_MEASUREMENT_TYPE_TUPLE)
+            )
+            for row, device_type_value, device_name_value, meas_type_value in zip(
+                np.flatnonzero(voltage_mask),
+                device_type_array[voltage_mask],
+                device_name_array[voltage_mask],
+                meas_type_array[voltage_mask],
+            ):
+                device_type = str(device_type_value)
+                device_name = str(device_name_value)
+                meas_type = str(meas_type_value)
                 weight = float(table.weight[row])
                 value = float(table.value[row])
-                active_device_keys.add((device_type, device_name))
-                active_measurement_keys.add((device_type, device_name, meas_type))
-                if int(status_code[row]) == MEAS_STATUS_PSEUDO:
-                    continue
                 if device_type == "ACNode" and meas_type == "V" and device_name in self.node_by_name:
                     node_idx = int(self.node_by_name[device_name].idx)
                     current = node_voltage_best.get(node_idx)
@@ -3009,6 +3028,8 @@ class ACStateEstimator:
                     active_device_keys.add((meas.device_type, meas.device_name))
                     active_measurement_keys.add((meas.device_type, meas.device_name, meas.meas_type))
                     if is_pseudo_measurement(meas):
+                        continue
+                    if str(meas.meas_type).upper() not in _VOLTAGE_MEASUREMENT_TYPES:
                         continue
                     weight = float(meas.weight)
                     value = float(meas.value)
@@ -3170,15 +3191,50 @@ class ACStateEstimator:
         if cache is not None:
             return cache
         best: Dict[int, Tuple[float, float]] = {}
-        for meas in self.measurements:
-            if not meas.valid or meas.weight <= 0.0 or is_pseudo_measurement(meas):
-                continue
-            node_idx = self._voltage_measurement_node_idx(meas.device_type, meas.device_name, meas.meas_type)
-            if node_idx is None or node_idx not in self.node_pos:
-                continue
-            current = best.get(node_idx)
-            if current is None or float(meas.weight) > current[0]:
-                best[node_idx] = (float(meas.weight), float(meas.value))
+        table = getattr(self.measurements, "table", None)
+        if table is not None and len(table.idx) == len(self.measurements):
+            meas_type_array = np.asarray(table.meas_type, dtype=object)
+            status_code = measurement_table_status_code(table)
+            voltage_mask = (
+                np.asarray(table.valid, dtype=bool)
+                & (np.asarray(table.weight, dtype=np.float64) > 0.0)
+                & (status_code != MEAS_STATUS_PSEUDO)
+                & np.isin(meas_type_array, _VOLTAGE_MEASUREMENT_TYPE_TUPLE)
+            )
+            device_type_array = np.asarray(table.device_type, dtype=object)
+            device_name_array = np.asarray(table.device_name, dtype=object)
+            for row, device_type_value, device_name_value, meas_type_value in zip(
+                np.flatnonzero(voltage_mask),
+                device_type_array[voltage_mask],
+                device_name_array[voltage_mask],
+                meas_type_array[voltage_mask],
+            ):
+                node_idx = self._voltage_measurement_node_idx(
+                    str(device_type_value),
+                    str(device_name_value),
+                    str(meas_type_value),
+                )
+                if node_idx is None or node_idx not in self.node_pos:
+                    continue
+                weight = float(table.weight[row])
+                current = best.get(int(node_idx))
+                if current is None or weight > current[0]:
+                    best[int(node_idx)] = (weight, float(table.value[row]))
+        else:
+            for meas in self.measurements:
+                if (
+                    not meas.valid
+                    or meas.weight <= 0.0
+                    or is_pseudo_measurement(meas)
+                    or str(meas.meas_type).upper() not in _VOLTAGE_MEASUREMENT_TYPES
+                ):
+                    continue
+                node_idx = self._voltage_measurement_node_idx(meas.device_type, meas.device_name, meas.meas_type)
+                if node_idx is None or node_idx not in self.node_pos:
+                    continue
+                current = best.get(node_idx)
+                if current is None or float(meas.weight) > current[0]:
+                    best[node_idx] = (float(meas.weight), float(meas.value))
         cache = {node_idx: value for node_idx, (_weight, value) in best.items()}
         self._real_voltage_observation_node_cache = cache
         return cache
