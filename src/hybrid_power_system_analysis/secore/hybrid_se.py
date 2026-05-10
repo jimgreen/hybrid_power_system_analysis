@@ -368,14 +368,14 @@ class HybridStateEstimator:
                 ac_topology = network_topology.prepare_ac_topology_ppc(ppc["ac"])
                 ppc["ac"]["_topology_arrays"] = ac_topology
             network.ac._topology_arrays = ac_topology
-            network_topology.apply_ac_topology_arrays(network.ac, ac_topology, compact=True)
+            network_topology.apply_ac_topology_arrays(network.ac, ac_topology, compact=True, build_alive_maps=False)
         if isinstance(ppc.get("dc"), dict) and "bus" in ppc["dc"]:
             dc_topology = ppc["dc"].get("_topology_arrays")
             if dc_topology is None:
                 dc_topology = network_topology.prepare_dc_topology_ppc(ppc["dc"])
                 ppc["dc"]["_topology_arrays"] = dc_topology
             network.dc._topology_arrays = dc_topology
-            network_topology.apply_dc_topology_arrays(network.dc, dc_topology, compact=True)
+            network_topology.apply_dc_topology_arrays(network.dc, dc_topology, compact=True, build_alive_maps=False)
         network.ppc = ppc
         network._ac_ppc = ppc["ac"]
         network._dc_ppc = ppc["dc"]

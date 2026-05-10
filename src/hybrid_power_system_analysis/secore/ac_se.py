@@ -246,6 +246,7 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
     intern = sys.intern
     device_type_cache = {}
     measurement_type_cache = {}
+    rows_by_code_values = {}
 
     for row_pos, raw_line in enumerate(data_lines):
         row = raw_line[1:].split()
@@ -258,9 +259,13 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
         if device_type_entry is None:
             device_type = intern(raw_device_type)
             device_type_code = int(device_type_code_get(device_type, 0))
-            device_type_entry = (device_type, device_type_code)
+            code_rows = rows_by_code_values.get(device_type_code)
+            if code_rows is None:
+                code_rows = []
+                rows_by_code_values[device_type_code] = code_rows
+            device_type_entry = (device_type, device_type_code, code_rows)
             device_type_cache[raw_device_type] = device_type_entry
-        device_type, device_type_code = device_type_entry
+        device_type, device_type_code, code_rows = device_type_entry
 
         raw_meas_type = row[4]
         meas_type_entry = measurement_type_cache.get(raw_meas_type)
@@ -300,10 +305,11 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
         device_type_code_values[row_pos] = device_type_code
         angle_mask_values[row_pos] = is_angle_measurement
         status_values[row_pos] = status
+        code_rows.append(row_pos)
 
     rows_by_code = {
-        int(code): np.flatnonzero(device_type_code_values == code).astype(np.int64, copy=False)
-        for code in np.unique(device_type_code_values)
+        int(code): np.asarray(rows, dtype=np.int64)
+        for code, rows in rows_by_code_values.items()
     }
     table = MeasurementTable(
         idx=idx_values,
@@ -833,7 +839,7 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
         append_shunt(shunt)
     network._array_model = ppc
     network._topology_arrays = topology_arrays
-    network_topology.apply_ac_topology_arrays(network, topology_arrays, compact=True)
+    network_topology.apply_ac_topology_arrays(network, topology_arrays, compact=True, build_alive_maps=False)
     return network
 
 
@@ -2783,11 +2789,7 @@ class ACStateEstimator:
         def mark_named_rows(rows: np.ndarray, mapping: Dict[str, object]) -> np.ndarray:
             if rows.size == 0:
                 return rows
-            found = np.fromiter(
-                (str(device_name_array[int(row)]) in mapping for row in rows),
-                dtype=bool,
-                count=rows.size,
-            )
+            found = np.asarray([str(device_name_array[int(row)]) in mapping for row in rows], dtype=bool)
             available = rows[found]
             unavailable_mask[available] = False
             return available
@@ -2795,10 +2797,9 @@ class ACStateEstimator:
         node_rows = mark_named_rows(rows_for_type("ACNode"), node_voltage_scale_by_name)
         node_v_rows = node_rows[meas_type_array[node_rows] == "V"]
         if node_v_rows.size:
-            scale_array[node_v_rows] = np.fromiter(
-                (float(node_voltage_scale_by_name[str(device_name_array[int(row)])]) for row in node_v_rows),
+            scale_array[node_v_rows] = np.asarray(
+                [float(node_voltage_scale_by_name[str(device_name_array[int(row)])]) for row in node_v_rows],
                 dtype=np.float64,
-                count=node_v_rows.size,
             )
 
         for terminal_type, scale_by_name in terminal_maps.items():

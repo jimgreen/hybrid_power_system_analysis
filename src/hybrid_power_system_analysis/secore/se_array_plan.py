@@ -190,21 +190,8 @@ def build_measurement_plan_table(
         pass
     row = np.arange(len(table.idx), dtype=np.int64)
     device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
-    meas_kind = np.empty(row.size, dtype=np.int16)
-    meas_kind.fill(-1)
+    meas_kind = _cached_measurement_kind(table, meas_kind_by_type_code)
     device_pos = _cached_measurement_device_pos(table, device_pos_by_type_code)
-
-    for code_int, code_rows in rows_by_device_type_code(table).items():
-        rows = np.asarray(code_rows, dtype=np.int64)
-        if rows.size == 0:
-            continue
-        kind_map = meas_kind_by_type_code.get(code_int)
-        if kind_map:
-            meas_kind[rows] = np.fromiter(
-                (kind_map.get(meas_type, -1) for meas_type in table.meas_type[rows]),
-                dtype=np.int16,
-                count=rows.size,
-            )
 
     return MeasurementPlanTable(
         table=table,
@@ -250,6 +237,38 @@ def _cached_measurement_device_pos(
         cache.clear()
     cache[key] = device_pos
     return device_pos
+
+
+def _cached_measurement_kind(
+    table: MeasurementTable,
+    meas_kind_by_type_code: Mapping[int, Mapping[str, int]],
+) -> np.ndarray:
+    key = _mapping_identity_key(meas_kind_by_type_code)
+    cache = getattr(table, "_meas_kind_plan_cache", None)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None and cached.size == table.idx.size:
+            return cached
+    meas_kind = np.empty(table.idx.size, dtype=np.int16)
+    meas_kind.fill(-1)
+    for code_int, code_rows in rows_by_device_type_code(table).items():
+        rows = np.asarray(code_rows, dtype=np.int64)
+        if rows.size == 0:
+            continue
+        kind_map = meas_kind_by_type_code.get(code_int)
+        if kind_map:
+            meas_kind[rows] = np.fromiter(
+                (kind_map.get(meas_type, -1) for meas_type in table.meas_type[rows]),
+                dtype=np.int16,
+                count=rows.size,
+            )
+    if cache is None:
+        cache = {}
+        setattr(table, "_meas_kind_plan_cache", cache)
+    if len(cache) > 16:
+        cache.clear()
+    cache[key] = meas_kind
+    return meas_kind
 
 
 def build_active_measurement_view(

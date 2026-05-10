@@ -374,6 +374,76 @@ class SEArrayPlanTest(unittest.TestCase):
         np.testing.assert_array_equal(second.device_pos, first.device_pos)
         np.testing.assert_array_equal(second.meas_kind, np.array([-1, 1, 2], dtype=np.int16))
 
+    def test_build_measurement_plan_table_reuses_cached_measurement_kinds(self):
+        from model.meas_model import MeasurementTable
+        from secore.se_array_plan import build_measurement_plan_table
+
+        class TableBackedSequence:
+            def __init__(self, table):
+                self.table = table
+
+            def __len__(self):
+                return len(self.table.idx)
+
+        class FailAfterFirstMap(dict):
+            def __init__(self, values):
+                super().__init__(values)
+                self.fail = False
+
+            def get(self, key, default=None):
+                if self.fail:
+                    raise AssertionError("measurement kinds should be cached for the same table and map")
+                return super().get(key, default)
+
+        table = MeasurementTable(
+            idx=np.array([1, 2, 3], dtype=np.int64),
+            name=np.array(["v1", "p1", "bad"], dtype=object),
+            device_type=np.array(["ACNode", "ACLoad", "ACNode"], dtype=object),
+            device_name=np.array(["n1", "l1", "n2"], dtype=object),
+            meas_type=np.array(["V", "P_LOAD", "BAD"], dtype=object),
+            weight=np.ones(3, dtype=np.float64),
+            valid=np.ones(3, dtype=bool),
+            value=np.ones(3, dtype=np.float64),
+            device_type_code=np.array(
+                [DEVICE_TYPE_CODES["ACNode"], DEVICE_TYPE_CODES["ACLoad"], DEVICE_TYPE_CODES["ACNode"]],
+                dtype=np.int16,
+            ),
+            angle_mask=np.zeros(3, dtype=bool),
+            rows_by_device_type_code={
+                DEVICE_TYPE_CODES["ACNode"]: np.array([0, 2], dtype=np.int64),
+                DEVICE_TYPE_CODES["ACLoad"]: np.array([1], dtype=np.int64),
+            },
+        )
+        node_kind = FailAfterFirstMap({"V": 0})
+        load_kind = FailAfterFirstMap({"P_LOAD": 1})
+        measurements = TableBackedSequence(table)
+        meas_kind_by_code = {
+            DEVICE_TYPE_CODES["ACNode"]: node_kind,
+            DEVICE_TYPE_CODES["ACLoad"]: load_kind,
+        }
+
+        first = build_measurement_plan_table(
+            measurements,
+            device_pos_by_type_code={
+                DEVICE_TYPE_CODES["ACNode"]: {"n1": 10, "n2": 11},
+                DEVICE_TYPE_CODES["ACLoad"]: {"l1": 20},
+            },
+            meas_kind_by_type_code=meas_kind_by_code,
+        )
+        node_kind.fail = True
+        load_kind.fail = True
+        second = build_measurement_plan_table(
+            measurements,
+            device_pos_by_type_code={
+                DEVICE_TYPE_CODES["ACNode"]: {"n1": 10, "n2": 11},
+                DEVICE_TYPE_CODES["ACLoad"]: {"l1": 20},
+            },
+            meas_kind_by_type_code=meas_kind_by_code,
+        )
+
+        np.testing.assert_array_equal(first.meas_kind, np.array([0, 1, -1], dtype=np.int16))
+        np.testing.assert_array_equal(second.meas_kind, first.meas_kind)
+
     def test_append_active_measurement_view_extends_active_table_and_rows(self):
         from secore.se_array_plan import append_active_measurement_view, build_active_measurement_view
 

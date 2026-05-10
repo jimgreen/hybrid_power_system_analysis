@@ -1405,7 +1405,7 @@ class DCStateEstimator:
             ppc["_topology_arrays"] = topology_arrays
         network = build_dc_network_from_ppc(ppc)
         network._topology_arrays = topology_arrays
-        network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True)
+        network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, build_alive_maps=False)
         return network
 
     @staticmethod
@@ -2037,34 +2037,25 @@ class DCStateEstimator:
             if rows.size == 0:
                 return
             if allowed_type is None:
-                scale[rows] = np.fromiter(
-                    (float(scale_by_name[str(name[int(row)])]) for row in rows),
-                    dtype=np.float64,
-                    count=rows.size,
-                )
+                scale[rows] = np.asarray([float(scale_by_name[str(name[int(row)])]) for row in rows], dtype=np.float64)
                 return
             selected = rows[mtype[rows] == allowed_type]
             if selected.size:
-                scale[selected] = np.fromiter(
-                    (float(scale_by_name[str(name[int(row)])]) for row in selected),
+                scale[selected] = np.asarray(
+                    [float(scale_by_name[str(name[int(row)])]) for row in selected],
                     dtype=np.float64,
-                    count=selected.size,
                 )
 
         def fill_tuple(rows: np.ndarray, scale_by_name: Dict[str, Tuple[float, ...]], kind_by_type: Dict[str, int]) -> None:
             if rows.size == 0:
                 return
-            kinds = np.fromiter((kind_by_type.get(str(item), -1) for item in mtype[rows]), dtype=np.int16, count=rows.size)
+            kinds = np.asarray([kind_by_type.get(str(item), -1) for item in mtype[rows]], dtype=np.int16)
             selected = rows[kinds >= 0]
             selected_kinds = kinds[kinds >= 0]
             if selected.size:
-                scale[selected] = np.fromiter(
-                    (
-                        float(scale_by_name[str(name[int(row)])][int(kind)])
-                        for row, kind in zip(selected, selected_kinds)
-                    ),
+                scale[selected] = np.asarray(
+                    [float(scale_by_name[str(name[int(row)])][int(kind)]) for row, kind in zip(selected, selected_kinds)],
                     dtype=np.float64,
-                    count=selected.size,
                 )
 
         node_rows = np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCNode"]))

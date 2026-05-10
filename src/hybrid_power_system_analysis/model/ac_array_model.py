@@ -190,29 +190,22 @@ def _int_cell(row, col, default: int = 0) -> int:
 
 def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.ndarray:
     col = columns.get(attr)
-    return np.fromiter(
-        (_float_cell(row, col, default) for row in table_rows),
-        dtype=np.float64,
-        count=len(table_rows),
-    )
+    return np.asarray([_float_cell(row, col, default) for row in table_rows], dtype=np.float64)
 
 
 def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
     col = columns.get(attr)
-    return np.fromiter(
-        (_int_cell(row, col, default) for row in table_rows),
-        dtype=np.float64,
-        count=len(table_rows),
-    )
+    return np.asarray([_int_cell(row, col, default) for row in table_rows], dtype=np.float64)
 
 
 def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:
     col = columns.get(attr)
     default = mapping[default_label]
-    return np.fromiter(
-        (_code_value(_cell(row, col, default_label), mapping, default_label) if col is not None else default for row in table_rows),
+    if col is None:
+        return np.full(len(table_rows), float(default), dtype=np.float64)
+    return np.asarray(
+        [_code_value(_cell(row, col, default_label), mapping, default_label) for row in table_rows],
         dtype=np.float64,
-        count=len(table_rows),
     )
 
 
@@ -248,19 +241,11 @@ def _base_from_rows(data: Dict) -> Tuple[float, float, float, float, float]:
 
 
 def _scale_by_node(node_values: np.ndarray, scales_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.fromiter(
-        (scales_by_idx.get(int(node), 1.0) for node in node_values),
-        dtype=np.float64,
-        count=node_values.size,
-    )
+    return np.asarray([scales_by_idx.get(int(node), 1.0) for node in node_values], dtype=np.float64)
 
 
 def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.fromiter(
-        (raw_vbase_by_idx.get(int(node), 0.0) for node in node_values),
-        dtype=np.float64,
-        count=node_values.size,
-    )
+    return np.asarray([raw_vbase_by_idx.get(int(node), 0.0) for node in node_values], dtype=np.float64)
 
 
 def _assign_power_if_present(out: np.ndarray, col: int, table_rows, columns, attr: str, p_base: float) -> None:

@@ -60,6 +60,70 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
         self.assertEqual({1: 1.02}, estimator._real_voltage_observation_nodes())
 
+    def test_standard_measurement_parser_uses_status_fast_path_without_status_column(self):
+        import secore.ac_se as ac_se
+        from model.meas_model import MEAS_STATUS_INVALID, MEAS_STATUS_NORMAL, Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@idx name dev_type dev_name meas_type weight valid value",
+                        "#1 v1 ACNode n1 V 2.0 1 1.01",
+                        "#2 v2 ACNode n2 V 2.0 0 0.99",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_normalize = ac_se.normalize_measurement_status
+
+            def fail_normalize(*_args, **_kwargs):
+                raise AssertionError("standard rows without status should use direct status codes")
+
+            ac_se.normalize_measurement_status = fail_normalize
+            try:
+                measurements = ac_se._read_measurements_direct(meas_file, Measurement)
+            finally:
+                ac_se.normalize_measurement_status = original_normalize
+
+        self.assertEqual([MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID], [meas.status for meas in measurements])
+        np.testing.assert_array_equal(measurements.table.status_code, np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID]))
+        np.testing.assert_array_equal(measurements.table.valid, np.array([True, False]))
+
+    def test_standard_measurement_parser_builds_device_type_rows_while_reading(self):
+        from unittest.mock import patch
+
+        import secore.ac_se as ac_se
+        from model.meas_model import DEVICE_TYPE_CODES, Measurement
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 v1 ACNode n1 V 1.0 1 10.0",
+                        "# 2 p1 ACLoad load P_LOAD 1.0 1 20.0",
+                        "# 3 v2 ACNode n2 V 1.0 1 11.0",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(ac_se.np, "unique", side_effect=AssertionError("row cache should be built during parsing")):
+                measurements = ac_se._read_measurements_direct(meas_file, Measurement)
+
+        cache = measurements.table.rows_by_device_type_code
+        np.testing.assert_array_equal(cache[DEVICE_TYPE_CODES["ACNode"]], np.array([0, 2], dtype=np.int64))
+        np.testing.assert_array_equal(cache[DEVICE_TYPE_CODES["ACLoad"]], np.array([1], dtype=np.int64))
+
     def test_summary_cache_maps_only_voltage_rows(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.ac_se import ACStateEstimator
