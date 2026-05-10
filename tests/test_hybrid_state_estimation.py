@@ -242,6 +242,85 @@ class HybridStateEstimationTest(unittest.TestCase):
             estimator._active_hybrid_converter_measurement_devices(),
         )
 
+    def test_disable_angle_measurements_updates_table_without_iterating_measurements(self):
+        from model.meas_model import (
+            MEAS_STATUS_INVALID,
+            TableBackedMeasurementList,
+            measurement_table_from_measurements,
+            measurement_table_status_code,
+        )
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class NonIterableTableMeasurements(TableBackedMeasurementList):
+            def __iter__(self):
+                raise AssertionError("angle invalidation should not materialize table-backed rows")
+
+        rows = [
+            Measurement(1, "theta_1", "ACNode", "n1", "ANGLE", 1.0, True, 30.0),
+            Measurement(2, "v_1", "ACNode", "n1", "V", 1.0, True, 1.0),
+        ]
+        table = measurement_table_from_measurements(rows)
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = NonIterableTableMeasurements(table)
+        estimator.flat_start = True
+
+        estimator._disable_angle_measurements()
+
+        status = measurement_table_status_code(table)
+        self.assertFalse(bool(table.valid[0]))
+        self.assertEqual(0.0, float(table.value[0]))
+        self.assertEqual(MEAS_STATUS_INVALID, int(status[0]))
+        self.assertTrue(bool(table.valid[1]))
+
+    def test_disable_unavailable_measurements_updates_table_without_iterating_measurements(self):
+        from model.meas_model import (
+            MEAS_STATUS_INVALID,
+            TableBackedMeasurementList,
+            measurement_table_from_measurements,
+            measurement_table_status_code,
+        )
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        class NonIterableTableMeasurements(TableBackedMeasurementList):
+            def __iter__(self):
+                raise AssertionError("availability invalidation should not materialize table-backed rows")
+
+        rows = [
+            Measurement(1, "v_1", "ACNode", "n1", "V", 1.0, True, 1.0),
+            Measurement(2, "p_missing", "ACLoad", "missing_load", "P_LOAD", 1.0, True, 0.0),
+            Measurement(3, "p_switch", "ACSwitch", "sw_1", "P_FROM", 1.0, True, 0.0),
+            Measurement(4, "p_gen", "ACGenerator", "gen_1", "P_GEN", 1.0, True, 0.0),
+        ]
+        table = measurement_table_from_measurements(rows)
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = NonIterableTableMeasurements(table)
+        estimator.ac_node_by_name = {"n1": object()}
+        estimator.ac_branch_by_name = {}
+        estimator.ac_transformer_by_name = {}
+        estimator.ac_break_by_name = {}
+        estimator.ac_zero_branch_by_name = {}
+        estimator.ac_generator_by_name = {"gen_1": object()}
+        estimator.ac_load_by_name = {}
+        estimator.dc_node_by_name = {}
+        estimator.dc_branch_by_name = {}
+        estimator.dc_break_by_name = {}
+        estimator.dc_zero_branch_by_name = {}
+        estimator.dc_generator_by_name = {}
+        estimator.dc_load_by_name = {}
+        estimator.dcdc_by_name = {}
+        estimator.dcac_by_name = {}
+        estimator.acac_by_name = {}
+
+        estimator._disable_unavailable_measurements()
+
+        status = measurement_table_status_code(table)
+        self.assertTrue(bool(table.valid[0]))
+        self.assertFalse(bool(table.valid[1]))
+        self.assertFalse(bool(table.valid[2]))
+        self.assertTrue(bool(table.valid[3]))
+        self.assertEqual(MEAS_STATUS_INVALID, int(status[1]))
+        self.assertEqual(MEAS_STATUS_INVALID, int(status[2]))
+
     def test_active_measurement_keys_use_measurement_summary_helper(self):
         from secore.hybrid_se import HybridStateEstimator
 

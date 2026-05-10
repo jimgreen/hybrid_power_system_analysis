@@ -944,20 +944,37 @@ class HybridStateEstimator:
 
     def _disable_angle_measurements(self) -> None:
         table = getattr(self.measurements, "table", None)
-        table_valid = table.valid if table is not None and len(table.valid) == len(self.measurements) else None
-        table_value = table.value if table is not None and len(table.value) == len(self.measurements) else None
-        table_status = measurement_table_status_code(table) if table_valid is not None else None
-        for pos, meas in enumerate(self.measurements):
+        if table is not None:
+            table_size = int(table.idx.size)
+            if table_size:
+                angle_mask = np.asarray(getattr(table, "angle_mask", np.zeros(table_size, dtype=bool)), dtype=bool)
+                if angle_mask.size != table_size:
+                    angle_mask = np.isin(np.asarray(table.meas_type, dtype=object), tuple(ANGLE_MEASUREMENT_TYPES))
+                elif not np.any(angle_mask):
+                    angle_mask = np.isin(np.asarray(table.meas_type, dtype=object), tuple(ANGLE_MEASUREMENT_TYPES))
+                if np.any(angle_mask):
+                    table.valid[angle_mask] = False
+                    measurement_table_status_code(table)[angle_mask] = MEAS_STATUS_INVALID
+                    if self.flat_start:
+                        table.value[angle_mask] = 0.0
+                    if list.__len__(self.measurements) == table_size:
+                        for pos in np.flatnonzero(angle_mask):
+                            meas = list.__getitem__(self.measurements, int(pos))
+                            mark_measurement_invalid(meas)
+                            if self.flat_start:
+                                meas.value = 0.0
+            if table_size < len(self.measurements):
+                for meas in self._iter_measurements_from(self.measurements, table_size):
+                    if meas.meas_type in ANGLE_MEASUREMENT_TYPES:
+                        mark_measurement_invalid(meas)
+                        if self.flat_start:
+                            meas.value = 0.0
+            return
+        for meas in self.measurements:
             if meas.meas_type in ANGLE_MEASUREMENT_TYPES:
                 mark_measurement_invalid(meas)
-                if table_valid is not None:
-                    table_valid[pos] = False
-                if table_status is not None:
-                    table_status[pos] = MEAS_STATUS_INVALID
                 if self.flat_start:
                     meas.value = 0.0
-                    if table_value is not None:
-                        table_value[pos] = 0.0
 
     def _disable_unavailable_measurements(self) -> None:
         device_maps = {
@@ -984,25 +1001,83 @@ class HybridStateEstimator:
         }
         unsupported_switch_rows = {"ACSwitch", "ACSwitchConstraint", "DCSwitch", "DCSwitchConstraint"}
         table = getattr(self.measurements, "table", None)
-        table_valid = table.valid if table is not None and len(table.valid) == len(self.measurements) else None
-        table_status = measurement_table_status_code(table) if table_valid is not None else None
-        for pos, meas in enumerate(self.measurements):
+        if table is not None:
+            table_size = int(table.idx.size)
+            disabled_rows = []
+            if table_size:
+                valid = np.asarray(table.valid, dtype=bool)
+                weight = np.asarray(table.weight, dtype=np.float64)
+                active = valid & (weight > 0.0)
+                known = np.zeros(table_size, dtype=bool)
+                rows_by_code = getattr(table, "rows_by_device_type_code", None) or {}
+                device_type = np.asarray(table.device_type, dtype=object)
+                device_name = np.asarray(table.device_name, dtype=object)
+
+                def rows_for_device_type(device_type_name: str) -> np.ndarray:
+                    code = DEVICE_TYPE_CODES.get(device_type_name)
+                    rows = rows_by_code.get(code) if code is not None else None
+                    if rows is None:
+                        rows = np.flatnonzero(device_type == device_type_name)
+                    return np.asarray(rows, dtype=np.int64)
+
+                for device_type_name in unsupported_switch_rows:
+                    rows = rows_for_device_type(device_type_name)
+                    if rows.size:
+                        rows = rows[active[rows]]
+                        if rows.size:
+                            known[rows] = True
+                            disabled_rows.append(rows)
+
+                for device_type_name, devices in device_maps.items():
+                    rows = rows_for_device_type(device_type_name)
+                    if rows.size == 0:
+                        continue
+                    rows = rows[active[rows]]
+                    if rows.size == 0:
+                        continue
+                    known[rows] = True
+                    if not devices:
+                        disabled_rows.append(rows)
+                        continue
+                    available = np.fromiter(
+                        (str(device_name[int(row)]) in devices for row in rows),
+                        dtype=bool,
+                        count=int(rows.size),
+                    )
+                    if not np.all(available):
+                        disabled_rows.append(rows[~available])
+
+                unknown_active = np.flatnonzero(active & ~known)
+                if unknown_active.size:
+                    disabled_rows.append(unknown_active)
+
+                if disabled_rows:
+                    rows = np.concatenate(disabled_rows).astype(np.int64, copy=False)
+                    table.valid[rows] = False
+                    measurement_table_status_code(table)[rows] = MEAS_STATUS_INVALID
+                    if list.__len__(self.measurements) == table_size:
+                        for row in rows:
+                            mark_measurement_invalid(list.__getitem__(self.measurements, int(row)))
+            if table_size < len(self.measurements):
+                for meas in self._iter_measurements_from(self.measurements, table_size):
+                    if not meas.valid or meas.weight <= 0.0:
+                        continue
+                    if meas.device_type in unsupported_switch_rows:
+                        mark_measurement_invalid(meas)
+                        continue
+                    devices = device_maps.get(meas.device_type)
+                    if devices is None or meas.device_name not in devices:
+                        mark_measurement_invalid(meas)
+            return
+        for meas in self.measurements:
             if not meas.valid or meas.weight <= 0.0:
                 continue
             if meas.device_type in unsupported_switch_rows:
                 mark_measurement_invalid(meas)
-                if table_valid is not None:
-                    table_valid[pos] = False
-                if table_status is not None:
-                    table_status[pos] = MEAS_STATUS_INVALID
                 continue
             devices = device_maps.get(meas.device_type)
             if devices is None or meas.device_name not in devices:
                 mark_measurement_invalid(meas)
-                if table_valid is not None:
-                    table_valid[pos] = False
-                if table_status is not None:
-                    table_status[pos] = MEAS_STATUS_INVALID
 
     def _sub_attrs_snapshot(self, estimator) -> Dict[str, object]:
         names = (

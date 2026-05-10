@@ -2378,8 +2378,6 @@ class ACStateEstimator:
             ("j_q", "j_q"),
             ("j_c", "j_c"),
         )
-        apply_devices(getattr(network, "branches", []), "branch", BRANCH_COLS, terminal_attrs)
-        apply_devices(getattr(network, "transformers", []), "transformer", TRANSFORMER_COLS, terminal_attrs)
         apply_devices(getattr(network, "generators", []), "gen", GEN_COLS, (("p", "p"), ("q", "q"), ("current", "current")))
         apply_devices(getattr(network, "loads", []), "load", LOAD_COLS, (("p", "p"), ("q", "q"), ("current", "current")))
         apply_devices(
@@ -2388,6 +2386,13 @@ class ACStateEstimator:
             SHUNT_COLS,
             (("p", "p"), ("q", "q"), ("current", "current")),
         )
+        if getattr(network, "_se_lightweight", False):
+            network.ppc = ppc
+            if hasattr(network, "_array_model"):
+                network._array_model = ppc
+            return
+        apply_devices(getattr(network, "branches", []), "branch", BRANCH_COLS, terminal_attrs)
+        apply_devices(getattr(network, "transformers", []), "transformer", TRANSFORMER_COLS, terminal_attrs)
         zero_attrs = (("p", "p"), ("q", "q"), ("current", "current"))
         apply_devices(getattr(network, "zero_branches", []), "zero_branch", ZERO_BRANCH_COLS, zero_attrs)
         apply_devices(getattr(network, "switches", []), "switch", SWITCH_COLS, zero_attrs)

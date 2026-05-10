@@ -1662,6 +1662,75 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(tuple(estimator._power_flow_seed_rows), estimator.network._se_power_flow_seed_rows)
 
+    def test_lightweight_power_flow_seed_writeback_skips_terminal_device_scans(self):
+        from types import SimpleNamespace
+
+        import numpy as np
+        import secore.ac_se as ac_se
+        from secore.ac_se import ACStateEstimator
+
+        class NonIterableDevices:
+            def __bool__(self):
+                return True
+
+            def __iter__(self):
+                raise AssertionError("lightweight seed writeback should not scan terminal devices")
+
+        bus = np.zeros((1, len(ac_se.BUS_COLS)), dtype=np.float64)
+        bus[0, ac_se.BUS_COLS["idx"]] = 1
+        bus[0, ac_se.BUS_COLS["voltage"]] = 1.08
+        bus[0, ac_se.BUS_COLS["angle"]] = 0.02
+        gen = np.zeros((1, len(ac_se.GEN_COLS)), dtype=np.float64)
+        gen[0, ac_se.GEN_COLS["idx"]] = 1
+        gen[0, ac_se.GEN_COLS["p"]] = 0.7
+        gen[0, ac_se.GEN_COLS["q"]] = 0.2
+        load = np.zeros((1, len(ac_se.LOAD_COLS)), dtype=np.float64)
+        load[0, ac_se.LOAD_COLS["idx"]] = 1
+        load[0, ac_se.LOAD_COLS["p"]] = 0.3
+        load[0, ac_se.LOAD_COLS["q"]] = 0.1
+        shunt = np.zeros((1, len(ac_se.SHUNT_COLS)), dtype=np.float64)
+        shunt[0, ac_se.SHUNT_COLS["idx"]] = 1
+        shunt[0, ac_se.SHUNT_COLS["q"]] = -0.05
+        ppc = {
+            "bus": bus,
+            "gen": gen,
+            "load": load,
+            "shunt": shunt,
+            "branch": np.zeros((1, len(ac_se.BRANCH_COLS)), dtype=np.float64),
+            "transformer": np.zeros((1, len(ac_se.TRANSFORMER_COLS)), dtype=np.float64),
+            "zero_branch": np.zeros((1, len(ac_se.ZERO_BRANCH_COLS)), dtype=np.float64),
+            "switch": np.zeros((1, len(ac_se.SWITCH_COLS)), dtype=np.float64),
+            "break": np.zeros((1, len(ac_se.BREAK_COLS)), dtype=np.float64),
+        }
+        node = SimpleNamespace(idx=1, voltage=1.0, angle=0.0)
+        bus_obj = SimpleNamespace(nodes=[node], voltage=1.0, angle=0.0)
+        gen_obj = SimpleNamespace(idx=1, p=0.0, q=0.0, current=0.0)
+        load_obj = SimpleNamespace(idx=1, p=0.0, q=0.0, current=0.0)
+        shunt_obj = SimpleNamespace(idx=1, p=0.0, q=0.0, current=0.0)
+        network = SimpleNamespace(
+            _se_lightweight=True,
+            nodes=[node],
+            buses=[bus_obj],
+            generators=[gen_obj],
+            loads=[load_obj],
+            shunt_compensators=[shunt_obj],
+            branches=NonIterableDevices(),
+            transformers=NonIterableDevices(),
+            zero_branches=NonIterableDevices(),
+            switches=NonIterableDevices(),
+            breakers=NonIterableDevices(),
+        )
+
+        ACStateEstimator._apply_power_flow_seed_ppc_to_network(network, ppc)
+
+        self.assertAlmostEqual(1.08, node.voltage)
+        self.assertAlmostEqual(0.02, node.angle)
+        self.assertAlmostEqual(0.7, gen_obj.p)
+        self.assertAlmostEqual(0.2, gen_obj.q)
+        self.assertAlmostEqual(0.3, load_obj.p)
+        self.assertAlmostEqual(0.1, load_obj.q)
+        self.assertAlmostEqual(-0.05, shunt_obj.q)
+
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
         from secore.ac_se import ACStateEstimator
 
