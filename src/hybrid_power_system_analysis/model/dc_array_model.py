@@ -6,8 +6,9 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-from efile_read import efile_factory_from_file, efile_factory_from_rows
+from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
 from paths import resolve_project_file
+from unit_system import dc_current_base_ka
 
 MODEL_DIR = Path(__file__).resolve().parent
 for path in (MODEL_DIR,):
@@ -120,6 +121,310 @@ def _empty(width: int) -> np.ndarray:
     return np.zeros((0, width), dtype=np.float64)
 
 
+def _rows_for(data: Dict, table_name: str):
+    table = data.get(table_name)
+    if not table:
+        return {}, []
+    return {str(name): pos for pos, name in enumerate(table.get("header_list", []))}, table.get("rows", [])
+
+
+def _cell(row, col, default=""):
+    if col is None or col >= len(row):
+        return default
+    value = row[col]
+    return default if value in (None, "") else value
+
+
+def _float_cell(row, col, default: float = 0.0) -> float:
+    return float(_cell(row, col, default))
+
+
+def _int_cell(row, col, default: int = 0) -> int:
+    return int(float(_cell(row, col, default)))
+
+
+def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.ndarray:
+    col = columns.get(attr)
+    return np.fromiter(
+        (_float_cell(row, col, default) for row in table_rows),
+        dtype=np.float64,
+        count=len(table_rows),
+    )
+
+
+def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
+    col = columns.get(attr)
+    return np.fromiter(
+        (_int_cell(row, col, default) for row in table_rows),
+        dtype=np.float64,
+        count=len(table_rows),
+    )
+
+
+def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:
+    col = columns.get(attr)
+    default = mapping[default_label]
+    return np.fromiter(
+        (_code_value(_cell(row, col, default_label), mapping, default_label) if col is not None else default for row in table_rows),
+        dtype=np.float64,
+        count=len(table_rows),
+    )
+
+
+def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -> np.ndarray:
+    name_col = columns.get("name")
+    if name_col is None:
+        return np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
+    return np.asarray(
+        [
+            str(_cell(row, name_col, "") or f"{prefix}_{int(idx_values[pos])}")
+            for pos, row in enumerate(table_rows)
+        ],
+        dtype=object,
+    )
+
+
+def _base_from_rows(data: Dict) -> Tuple[float, float, float, float, float]:
+    columns, table_rows = _rows_for(data, "PowerBase")
+    if not table_rows:
+        raise RuntimeError("E file must define <PowerBase> with p_base, u_scale, p_scale, and i_scale")
+    row = table_rows[0]
+    required = {}
+    for attr in ("p_base", "u_scale", "p_scale", "i_scale"):
+        if attr not in columns:
+            raise RuntimeError("E file <PowerBase> must define p_base, u_scale, p_scale, and i_scale")
+        value = float(_cell(row, columns[attr], 0.0))
+        if value <= 0.0:
+            raise RuntimeError(f"Invalid {attr} in <PowerBase>: {value}")
+        required[attr] = value
+    p_base = required["p_base"]
+    p_scale = required["p_scale"]
+    return p_base, required["u_scale"], p_scale, required["i_scale"], p_base / p_scale
+
+
+def _scale_by_node(node_values: np.ndarray, scales_by_idx: Dict[int, float]) -> np.ndarray:
+    return np.fromiter(
+        (scales_by_idx.get(int(node), 1.0) for node in node_values),
+        dtype=np.float64,
+        count=node_values.size,
+    )
+
+
+def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
+    return np.fromiter(
+        (raw_vbase_by_idx.get(int(node), 0.0) for node in node_values),
+        dtype=np.float64,
+        count=node_values.size,
+    )
+
+
+def _assign_power_if_present(out: np.ndarray, col: int, table_rows, columns, attr: str, p_base: float) -> None:
+    if attr in columns:
+        out[:, col] = _float_column(table_rows, columns, attr) / p_base
+
+
+def _assign_current_if_present(
+    out: np.ndarray,
+    col: int,
+    table_rows,
+    columns,
+    attr: str,
+    node_values: np.ndarray,
+    current_scale_by_node: Dict[int, float],
+) -> None:
+    if attr not in columns:
+        return
+    scales = _scale_by_node(node_values.astype(np.int64, copy=False), current_scale_by_node)
+    raw = _float_column(table_rows, columns, attr)
+    out[:, col] = np.divide(raw, scales, out=np.zeros_like(raw), where=np.abs(scales) > 1e-12)
+
+
+def _voltage_set_column(table_rows, columns, attr: str, node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
+    if attr not in columns:
+        return np.ones(len(table_rows), dtype=np.float64)
+    raw = _float_column(table_rows, columns, attr, 1.0)
+    raw_vbase = _raw_vbase_by_node(node_values.astype(np.int64, copy=False), raw_vbase_by_idx)
+    return np.divide(raw, raw_vbase, out=np.ones_like(raw), where=np.abs(raw_vbase) > 1e-12)
+
+
+def _build_switch_like_from_rows(
+    table_rows,
+    columns,
+    current_scale_by_node: Dict[int, float],
+    *,
+    prefix: str,
+    scale_optional_power: bool = True,
+    p_base: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    out = np.zeros((len(table_rows), len(SWITCH_COLS)), dtype=np.float64)
+    if not table_rows:
+        return out, np.asarray([], dtype=object)
+    out[:, SWITCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+    out[:, SWITCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
+    out[:, SWITCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
+    out[:, SWITCH_COLS["status"]] = _float_column(table_rows, columns, "status", 1.0)
+    out[:, SWITCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+    if scale_optional_power:
+        _assign_power_if_present(out, SWITCH_COLS["p"], table_rows, columns, "p", p_base)
+        _assign_current_if_present(
+            out,
+            SWITCH_COLS["current"],
+            table_rows,
+            columns,
+            "current",
+            out[:, SWITCH_COLS["i_node"]],
+            current_scale_by_node,
+        )
+    else:
+        if "p" in columns:
+            out[:, SWITCH_COLS["p"]] = _float_column(table_rows, columns, "p")
+        if "current" in columns:
+            out[:, SWITCH_COLS["current"]] = _float_column(table_rows, columns, "current")
+    return out, _names_from_rows(table_rows, columns, prefix, out[:, SWITCH_COLS["idx"]])
+
+
+def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
+    p_base, u_scale, p_scale, i_scale, p_base_kW = _base_from_rows(rows)
+
+    columns, table_rows = _rows_for(rows, "DCNode")
+    bus = np.zeros((len(table_rows), len(BUS_COLS)), dtype=np.float64)
+    if table_rows:
+        raw_vbase = _float_column(table_rows, columns, "vbase")
+        bus[:, BUS_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+        bus[:, BUS_COLS["vbase"]] = raw_vbase / u_scale
+        raw_voltage = _float_column(table_rows, columns, "voltage", 1.0)
+        bus[:, BUS_COLS["voltage"]] = np.divide(
+            raw_voltage,
+            raw_vbase,
+            out=np.ones_like(raw_voltage),
+            where=np.abs(raw_vbase) > 1e-12,
+        )
+        bus[:, BUS_COLS["isl"]] = _float_column(table_rows, columns, "isl", 0.0)
+        bus[:, BUS_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+    bus_names = _names_from_rows(table_rows, columns, "bus", bus[:, BUS_COLS["idx"]])
+    raw_vbase_by_idx = {
+        int(idx): float(vbase)
+        for idx, vbase in zip(bus[:, BUS_COLS["idx"]], raw_vbase if table_rows else [])
+    }
+    current_scale_by_node = {
+        int(row[BUS_COLS["idx"]]): i_scale * dc_current_base_ka(p_base_kW, float(row[BUS_COLS["vbase"]]))
+        for row in bus
+    }
+
+    columns, table_rows = _rows_for(rows, "DCBranch")
+    branch = np.zeros((len(table_rows), len(BRANCH_COLS)), dtype=np.float64)
+    if table_rows:
+        branch[:, BRANCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+        branch[:, BRANCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
+        branch[:, BRANCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
+        branch[:, BRANCH_COLS["r"]] = _float_column(table_rows, columns, "r")
+        branch[:, BRANCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+        _assign_power_if_present(branch, BRANCH_COLS["i_p"], table_rows, columns, "i_p", p_base)
+        _assign_power_if_present(branch, BRANCH_COLS["j_p"], table_rows, columns, "j_p", p_base)
+        _assign_current_if_present(branch, BRANCH_COLS["current"], table_rows, columns, "current", branch[:, BRANCH_COLS["i_node"]], current_scale_by_node)
+    branch_names = _names_from_rows(table_rows, columns, "branch", branch[:, BRANCH_COLS["idx"]])
+
+    columns, table_rows = _rows_for(rows, "DCLoad")
+    load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64)
+    if table_rows:
+        load[:, LOAD_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+        load[:, LOAD_COLS["node"]] = _int_column(table_rows, columns, "node")
+        load[:, LOAD_COLS["pbase"]] = _float_column(table_rows, columns, "pbase", 1.0) / p_base
+        load[:, LOAD_COLS["pv0"]] = _float_column(table_rows, columns, "pv0")
+        load[:, LOAD_COLS["pv1"]] = _float_column(table_rows, columns, "pv1")
+        load[:, LOAD_COLS["pv2"]] = _float_column(table_rows, columns, "pv2")
+        load[:, LOAD_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+        _assign_power_if_present(load, LOAD_COLS["p"], table_rows, columns, "p", p_base)
+        _assign_current_if_present(load, LOAD_COLS["current"], table_rows, columns, "current", load[:, LOAD_COLS["node"]], current_scale_by_node)
+    load_names = _names_from_rows(table_rows, columns, "load", load[:, LOAD_COLS["idx"]])
+
+    columns, table_rows = _rows_for(rows, "DCGenerator")
+    gen = np.zeros((len(table_rows), len(GEN_COLS)), dtype=np.float64)
+    if table_rows:
+        gen[:, GEN_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+        gen[:, GEN_COLS["node"]] = _int_column(table_rows, columns, "node")
+        gen[:, GEN_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", CTRL_CODE, "P")
+        gen[:, GEN_COLS["p_set"]] = _float_column(table_rows, columns, "p_set") / p_base
+        gen[:, GEN_COLS["v_set"]] = _voltage_set_column(table_rows, columns, "v_set", gen[:, GEN_COLS["node"]], raw_vbase_by_idx)
+        _assign_current_if_present(gen, GEN_COLS["i_set"], table_rows, columns, "i_set", gen[:, GEN_COLS["node"]], current_scale_by_node)
+        gen[:, GEN_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+        _assign_power_if_present(gen, GEN_COLS["p"], table_rows, columns, "p", p_base)
+        _assign_current_if_present(gen, GEN_COLS["current"], table_rows, columns, "current", gen[:, GEN_COLS["node"]], current_scale_by_node)
+    gen_names = _names_from_rows(table_rows, columns, "gen", gen[:, GEN_COLS["idx"]])
+
+    columns, table_rows = _rows_for(rows, "DCZeroBranch")
+    zero_branch = np.zeros((len(table_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64)
+    if table_rows:
+        zero_branch[:, ZERO_BRANCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+        zero_branch[:, ZERO_BRANCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
+        zero_branch[:, ZERO_BRANCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
+        zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+        _assign_power_if_present(zero_branch, ZERO_BRANCH_COLS["p"], table_rows, columns, "p", p_base)
+        _assign_current_if_present(zero_branch, ZERO_BRANCH_COLS["current"], table_rows, columns, "current", zero_branch[:, ZERO_BRANCH_COLS["i_node"]], current_scale_by_node)
+    zero_branch_names = _names_from_rows(table_rows, columns, "zero_branch", zero_branch[:, ZERO_BRANCH_COLS["idx"]])
+
+    sw_columns, sw_rows = _rows_for(rows, "DCSwitch")
+    switch, switch_names = _build_switch_like_from_rows(sw_rows, sw_columns, current_scale_by_node, prefix="switch", p_base=p_base)
+    br_columns, br_rows = _rows_for(rows, "DCBreak")
+    breaker, breaker_names = _build_switch_like_from_rows(
+        br_rows,
+        br_columns,
+        current_scale_by_node,
+        prefix="break",
+        scale_optional_power=False,
+        p_base=p_base,
+    )
+
+    columns, table_rows = _rows_for(rows, "DCDCConverter")
+    dcdc = np.zeros((len(table_rows), len(DCDC_COLS)), dtype=np.float64)
+    if table_rows:
+        dcdc[:, DCDC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+        dcdc[:, DCDC_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
+        dcdc[:, DCDC_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
+        dcdc[:, DCDC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
+        dcdc[:, DCDC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
+        dcdc[:, DCDC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", CTRL_CODE, "P")
+        dcdc[:, DCDC_COLS["p_set"]] = _float_column(table_rows, columns, "p_set") / p_base
+        _assign_current_if_present(dcdc, DCDC_COLS["i_set"], table_rows, columns, "i_set", dcdc[:, DCDC_COLS["i_node"]], current_scale_by_node)
+        dcdc[:, DCDC_COLS["v_set"]] = _voltage_set_column(table_rows, columns, "v_set", dcdc[:, DCDC_COLS["i_node"]], raw_vbase_by_idx)
+        dcdc[:, DCDC_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+        _assign_power_if_present(dcdc, DCDC_COLS["i_p"], table_rows, columns, "i_p", p_base)
+        _assign_power_if_present(dcdc, DCDC_COLS["j_p"], table_rows, columns, "j_p", p_base)
+        _assign_current_if_present(dcdc, DCDC_COLS["i_c"], table_rows, columns, "i_c", dcdc[:, DCDC_COLS["i_node"]], current_scale_by_node)
+        _assign_current_if_present(dcdc, DCDC_COLS["j_c"], table_rows, columns, "j_c", dcdc[:, DCDC_COLS["j_node"]], current_scale_by_node)
+    dcdc_names = _names_from_rows(table_rows, columns, "dcdc", dcdc[:, DCDC_COLS["idx"]])
+
+    ppc = {
+        "format": "dc_ppc_v1",
+        "source": str(source),
+        "base": {
+            "p_base": p_base,
+            "u_scale": u_scale,
+            "p_scale": p_scale,
+            "i_scale": i_scale,
+            "p_base_kW": p_base_kW,
+        },
+        "bus": bus,
+        "branch": branch,
+        "load": load,
+        "gen": gen,
+        "zero_branch": zero_branch,
+        "switch": switch,
+        "break": breaker,
+        "dcdc": dcdc,
+        "node_pos": _node_maps(bus) if len(bus) else {},
+        "bus_name": bus_names,
+        "branch_name": branch_names,
+        "load_name": load_names,
+        "gen_name": gen_names,
+        "zero_branch_name": zero_branch_names,
+        "switch_name": switch_names,
+        "break_name": breaker_names,
+        "dcdc_name": dcdc_names,
+    }
+    return ppc
+
+
 class _ArrayDevice(SimpleNamespace):
     __hash__ = object.__hash__
 
@@ -147,8 +452,7 @@ def build_dc_ppc_from_e_file(file_path) -> Dict:
         if cached is not None and cached[0] == file_key:
             return cached[1]
 
-    model = efile_factory_from_file(file_key[0])
-    _network, ppc = build_dc_ppc_from_model(model)
+    ppc = _build_dc_ppc_from_rows_dict(_read_efile_rows(file_key[0]), file_key[0])
     ppc["source"] = str(file_key[0])
     with _DC_PPC_CACHE_LOCK:
         _DC_PPC_CACHE[file_key[0]] = (file_key, ppc)
@@ -158,10 +462,7 @@ def build_dc_ppc_from_e_file(file_path) -> Dict:
 def build_dc_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build DC ppc from E rows that are already loaded in memory."""
     path = resolve_project_file(file_path).resolve()
-    model = efile_factory_from_rows(rows)
-    _network, ppc = build_dc_ppc_from_model(model)
-    ppc["source"] = str(path)
-    return ppc
+    return _build_dc_ppc_from_rows_dict(rows, path)
 
 
 def _value(obj, attr: str, default=0.0):
@@ -199,11 +500,29 @@ _VALUE_INT = 1
 _VALUE_CTRL = 2
 
 
-def _device_array(devices, width: int, specs) -> np.ndarray:
+def _has_value(devices, attr: str) -> bool:
+    return any(getattr(dev, attr, None) not in (None, "") for dev in devices)
+
+
+def _device_array(devices, width: int, specs, optional_specs=()) -> np.ndarray:
     out = np.zeros((len(devices), width), dtype=np.float64)
     for row, dev in enumerate(devices):
         values = getattr(dev, "__dict__", {})
         for col, attr, default, kind in specs:
+            value = values[attr] if attr in values else getattr(dev, attr, default)
+            if value is None or value == "":
+                value = default
+            if kind == _VALUE_INT:
+                out[row, col] = int(float(value))
+            elif kind == _VALUE_CTRL:
+                out[row, col] = _code_value(value, CTRL_CODE, default)
+            else:
+                out[row, col] = float(value)
+    for col, attr, default, kind in optional_specs:
+        if not _has_value(devices, attr):
+            continue
+        for row, dev in enumerate(devices):
+            values = getattr(dev, "__dict__", {})
             value = values[attr] if attr in values else getattr(dev, attr, default)
             if value is None or value == "":
                 value = default
@@ -254,6 +573,8 @@ def build_dc_ppc_from_network(network) -> Dict:
             (BRANCH_COLS["j_node"], "j_node", 0, _VALUE_INT),
             (BRANCH_COLS["r"], "r", 0.0, _VALUE_FLOAT),
             (BRANCH_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+        ),
+        (
             (BRANCH_COLS["i_p"], "i_p", 0.0, _VALUE_FLOAT),
             (BRANCH_COLS["j_p"], "j_p", 0.0, _VALUE_FLOAT),
             (BRANCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
@@ -271,6 +592,8 @@ def build_dc_ppc_from_network(network) -> Dict:
             (LOAD_COLS["pv1"], "pv1", 0.0, _VALUE_FLOAT),
             (LOAD_COLS["pv2"], "pv2", 0.0, _VALUE_FLOAT),
             (LOAD_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+        ),
+        (
             (LOAD_COLS["p"], "p", 0.0, _VALUE_FLOAT),
             (LOAD_COLS["current"], "current", 0.0, _VALUE_FLOAT),
         ),
@@ -287,6 +610,8 @@ def build_dc_ppc_from_network(network) -> Dict:
             (GEN_COLS["v_set"], "v_set", 1.0, _VALUE_FLOAT),
             (GEN_COLS["i_set"], "i_set", 0.0, _VALUE_FLOAT),
             (GEN_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+        ),
+        (
             (GEN_COLS["p"], "p", 0.0, _VALUE_FLOAT),
             (GEN_COLS["current"], "current", 0.0, _VALUE_FLOAT),
         ),
@@ -300,6 +625,8 @@ def build_dc_ppc_from_network(network) -> Dict:
             (ZERO_BRANCH_COLS["i_node"], "i_node", 0, _VALUE_INT),
             (ZERO_BRANCH_COLS["j_node"], "j_node", 0, _VALUE_INT),
             (ZERO_BRANCH_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+        ),
+        (
             (ZERO_BRANCH_COLS["p"], "p", 0.0, _VALUE_FLOAT),
             (ZERO_BRANCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
         ),
@@ -315,6 +642,8 @@ def build_dc_ppc_from_network(network) -> Dict:
                 (SWITCH_COLS["j_node"], "j_node", 0, _VALUE_INT),
                 (SWITCH_COLS["status"], "status", 1.0, _VALUE_FLOAT),
                 (SWITCH_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+            ),
+            (
                 (SWITCH_COLS["p"], "p", 0.0, _VALUE_FLOAT),
                 (SWITCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
             ),
@@ -334,6 +663,8 @@ def build_dc_ppc_from_network(network) -> Dict:
             (DCDC_COLS["i_set"], "i_set", 0.0, _VALUE_FLOAT),
             (DCDC_COLS["v_set"], "v_set", 1.0, _VALUE_FLOAT),
             (DCDC_COLS["run_stat"], "run_stat", 1.0, _VALUE_FLOAT),
+        ),
+        (
             (DCDC_COLS["i_p"], "i_p", 0.0, _VALUE_FLOAT),
             (DCDC_COLS["j_p"], "j_p", 0.0, _VALUE_FLOAT),
             (DCDC_COLS["i_c"], "i_c", 0.0, _VALUE_FLOAT),
@@ -373,15 +704,19 @@ def build_dc_ppc_from_network(network) -> Dict:
     return ppc
 
 
-def build_dc_ppc_from_model(model):
+def _build_dc_ppc_from_model(model, *, units_already_normalized: bool = False):
     from dc_model import DCPowerNetwork as ObjectDCPowerNetwork
 
     network = ObjectDCPowerNetwork()
     network.model = model
-    network._load_from_model()
+    network._load_from_model(units_already_normalized=units_already_normalized)
     ppc = build_dc_ppc_from_network(network)
     network.ppc = ppc
     return network, ppc
+
+
+def build_dc_ppc_from_model(model):
+    return _build_dc_ppc_from_model(model)
 
 
 
@@ -802,124 +1137,9 @@ class DCPowerNetwork:
                 zbr.j_node_obj.zero_branches.append(zbr)
 
     def topo(self):
-        if len(self.node_dict) == 0:
-            self.format_assoc()
-        for node in self.nodes:
-            node.isl = 0
-            node.isl_obj = None
-            node.bus = None
-            node.bus_obj = None
-            node.is_alive = False
+        from model import topology as network_topology
 
-        running_nodes = [node for node in self.nodes if node.run_stat == 1]
-        running_node_ids = {node.idx for node in running_nodes}
-        parent = {node.idx: node.idx for node in running_nodes}
-
-        def find(parents, node_idx):
-            root = node_idx
-            while parents[root] != root:
-                root = parents[root]
-            while parents[node_idx] != node_idx:
-                next_idx = parents[node_idx]
-                parents[node_idx] = root
-                node_idx = next_idx
-            return root
-
-        def union(parents, left, right):
-            root_l = find(parents, left)
-            root_r = find(parents, right)
-            if root_l != root_r:
-                parents[root_r] = root_l
-
-        def live_terminal_pair(dev, require_closed=False):
-            if (
-                dev.run_stat == 1
-                and (not require_closed or getattr(dev, "status", 1) == 1)
-                and dev.i_node in running_node_ids
-                and dev.j_node in running_node_ids
-                and dev.i_node != dev.j_node
-            ):
-                return dev.i_node, dev.j_node
-            return None
-
-        if self.switches:
-            for dev in self.switches:
-                pair = live_terminal_pair(dev, require_closed=True)
-                if pair is not None:
-                    union(parent, pair[0], pair[1])
-
-        root_to_nodes = {}
-        for node in running_nodes:
-            root_to_nodes.setdefault(find(parent, node.idx), []).append(node)
-        self.buses = []
-        self.bus_dict = {}
-        self.node_to_bus = {}
-        for nodes in sorted(root_to_nodes.values(), key=lambda group: min(node.idx for node in group)):
-            nodes.sort(key=lambda item: item.idx)
-            bus = _device(
-                nodes[0].idx,
-                getattr(nodes[0], "name", f"bus_{nodes[0].idx}"),
-                nodes=list(nodes),
-                vbase=float(getattr(nodes[0], "vbase", 0.0)),
-                voltage=float(getattr(nodes[0], "voltage", 1.0)),
-                run_stat=1,
-                isl=0,
-                isl_obj=None,
-                v_set=1.0,
-                v_gens=[],
-                v_dcdcs=[],
-                is_slack=False,
-                generators=[],
-                loads=[],
-                branches=[],
-                switches=[],
-                breakers=[],
-                dcdc_converters=[],
-                zero_branches=[],
-            )
-            self.buses.append(bus)
-            self.bus_dict[bus.idx] = bus
-            for node in nodes:
-                node.bus = bus.idx
-                node.bus_obj = bus
-                self.node_to_bus[node.idx] = bus
-
-        bus_parent = {bus.idx: bus.idx for bus in self.buses}
-
-        def add_bus_edge(dev, require_closed=False):
-            pair = live_terminal_pair(dev, require_closed=require_closed)
-            if pair is None:
-                return
-            i_bus = self.node_to_bus.get(pair[0])
-            j_bus = self.node_to_bus.get(pair[1])
-            if i_bus is not None and j_bus is not None and i_bus.idx != j_bus.idx:
-                union(bus_parent, i_bus.idx, j_bus.idx)
-
-        for dev in self.branches:
-            add_bus_edge(dev)
-        for dev in self.zero_branches:
-            add_bus_edge(dev)
-        for dev in self.breakers:
-            add_bus_edge(dev, require_closed=True)
-
-        self.islands = []
-        island_idx = 0
-        root_to_island = {}
-        for bus in self.buses:
-            root = find(bus_parent, bus.idx)
-            island = root_to_island.get(root)
-            if island is None:
-                island_idx += 1
-                island = DCIsl(island_idx, True)
-                root_to_island[root] = island
-                self.islands.append(island)
-            bus.isl = island.idx
-            bus.isl_obj = island
-            for node in bus.nodes:
-                node.isl = island.idx
-                node.isl_obj = island
-
-        self.det_isl_alive_stat()
+        network_topology.prepare_dc_topology(self)
 
     def det_isl_alive_stat(self):
         for isl in self.islands:

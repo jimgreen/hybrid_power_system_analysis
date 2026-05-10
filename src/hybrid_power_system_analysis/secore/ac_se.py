@@ -28,6 +28,7 @@ from ac_lf import (
 )
 from ac_model import ACPowerNetwork
 from efile_read import EBook
+from model import topology as network_topology
 from ac_array_model import (
     BRANCH_COLS,
     BUS_COLS,
@@ -54,6 +55,7 @@ from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
     MEAS_STATUS_INVALID,
+    MEAS_STATUS_NORMAL,
     MEAS_STATUS_PSEUDO,
     EstimateResult,
     Measurement,
@@ -243,6 +245,7 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
     device_type_code_values = []
     angle_mask_values = []
     status_values = []
+    rows_by_code_values = {}
     append_idx = idx_values.append
     append_name = name_values.append
     append_device_type = device_type_values.append
@@ -259,9 +262,11 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
     float_cell = float
     device_type_code_get = _DEVICE_TYPE_CODES.get
     angle_types = ANGLE_MEASUREMENT_TYPES
+    intern = sys.intern
     device_type_cache = {}
     measurement_type_cache = {}
     in_measurement = False
+    row_pos = 0
     with open(file_name, mode="rt", encoding="utf8") as fp:
         for line_no, raw_line in enumerate(fp, start=1):
             first = raw_line[0] if raw_line else ""
@@ -296,25 +301,34 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                 if header is None or column_index is None:
                     raise RuntimeError(f"{file_name} Measurement data appears before the header")
                 if standard_header:
-                    row = raw_line[1:].split(maxsplit=7)
+                    row = raw_line[1:].split()
                     if len(row) < header_len:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
                     idx_text = row[0]
                     name = row[1]
                     raw_device_type = row[2]
-                    device_type = device_type_cache.get(raw_device_type)
-                    if device_type is None:
-                        device_type = raw_device_type
-                        device_type_cache[raw_device_type] = device_type
+                    device_type_entry = device_type_cache.get(raw_device_type)
+                    if device_type_entry is None:
+                        device_type = intern(raw_device_type)
+                        device_type_code = int(device_type_code_get(device_type, 0))
+                        code_rows = rows_by_code_values.get(device_type_code)
+                        if code_rows is None:
+                            code_rows = []
+                            rows_by_code_values[device_type_code] = code_rows
+                        device_type_entry = (device_type, device_type_code, code_rows)
+                        device_type_cache[raw_device_type] = device_type_entry
+                    device_type, device_type_code, code_rows = device_type_entry
                     device_name = row[3]
                     raw_meas_type = row[4]
-                    meas_type = measurement_type_cache.get(raw_meas_type)
-                    if meas_type is None:
+                    meas_type_entry = measurement_type_cache.get(raw_meas_type)
+                    if meas_type_entry is None:
                         if raw_meas_type and "a" <= raw_meas_type[0] <= "z":
-                            meas_type = raw_meas_type.upper()
+                            meas_type = intern(raw_meas_type.upper())
                         else:
-                            meas_type = raw_meas_type
-                        measurement_type_cache[raw_meas_type] = meas_type
+                            meas_type = intern(raw_meas_type)
+                        meas_type_entry = (meas_type, meas_type in angle_types)
+                        measurement_type_cache[raw_meas_type] = meas_type_entry
+                    meas_type, is_angle_measurement = meas_type_entry
                     weight_text = row[5]
                     valid_text = row[6]
                     value_text = row[7]
@@ -322,21 +336,30 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                     weight = float_cell(weight_text)
                     valid = valid_text == "1"
                     value = float_cell(value_text)
-                    status = normalize_measurement_status(None, valid=valid)
+                    status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
                 else:
                     row = raw_line[1:].split(maxsplit=header_len - 1)
                     if len(row) < header_len:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {file_name}")
                     raw_device_type = row[dev_type_col]
-                    device_type = device_type_cache.get(raw_device_type)
-                    if device_type is None:
-                        device_type = raw_device_type
-                        device_type_cache[raw_device_type] = device_type
+                    device_type_entry = device_type_cache.get(raw_device_type)
+                    if device_type_entry is None:
+                        device_type = intern(raw_device_type)
+                        device_type_code = int(device_type_code_get(device_type, 0))
+                        code_rows = rows_by_code_values.get(device_type_code)
+                        if code_rows is None:
+                            code_rows = []
+                            rows_by_code_values[device_type_code] = code_rows
+                        device_type_entry = (device_type, device_type_code, code_rows)
+                        device_type_cache[raw_device_type] = device_type_entry
+                    device_type, device_type_code, code_rows = device_type_entry
                     raw_meas_type = row[meas_type_col]
-                    meas_type = measurement_type_cache.get(raw_meas_type)
-                    if meas_type is None:
-                        meas_type = raw_meas_type.upper()
-                        measurement_type_cache[raw_meas_type] = meas_type
+                    meas_type_entry = measurement_type_cache.get(raw_meas_type)
+                    if meas_type_entry is None:
+                        meas_type = intern(raw_meas_type.upper())
+                        meas_type_entry = (meas_type, meas_type in angle_types)
+                        measurement_type_cache[raw_meas_type] = meas_type_entry
+                    meas_type, is_angle_measurement = meas_type_entry
                     idx = int_cell(row[idx_col])
                     name = row[name_col]
                     device_name = row[dev_name_col]
@@ -346,7 +369,7 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                     status = (
                         normalize_measurement_status(row[status_col], valid=valid)
                         if status_col >= 0
-                        else normalize_measurement_status(None, valid=valid)
+                        else MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
                     )
                     if not measurement_status_is_active(status):
                         valid = False
@@ -361,7 +384,7 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                 meas.value = value
                 meas.status = status
                 if scale_context is not None:
-                    if meas.meas_type in ANGLE_MEASUREMENT_TYPES:
+                    if is_angle_measurement:
                         mark_measurement_invalid(meas)
                         meas.value = 0.0 if getattr(scale_context, "flat_start", False) else math.radians(float(meas.value))
                     else:
@@ -379,9 +402,11 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
                 append_weight(weight)
                 append_valid(meas.valid)
                 append_value(meas.value if scale_context is not None else value)
-                append_device_type_code(device_type_code_get(device_type, 0))
-                append_angle_mask(meas_type in angle_types)
+                append_device_type_code(device_type_code)
+                append_angle_mask(is_angle_measurement)
                 append_status(meas.status)
+                code_rows.append(row_pos)
+                row_pos += 1
                 continue
             line = raw_line.strip()
             if not line:
@@ -394,6 +419,11 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
         raise RuntimeError(f"{file_name} does not contain a <Measurement> block")
     if header is None:
         raise RuntimeError(f"{file_name} Measurement block does not contain a header")
+    device_type_code_array = np.asarray(device_type_code_values, dtype=np.int16)
+    rows_by_code = {
+        int(code): np.asarray(rows, dtype=np.int64)
+        for code, rows in rows_by_code_values.items()
+    }
     table = MeasurementTable(
         idx=np.asarray(idx_values, dtype=np.int64),
         name=np.asarray(name_values, dtype=object),
@@ -403,9 +433,10 @@ def _read_measurements_direct(file_name: Path, measurement_cls, scale_context=No
         weight=np.asarray(weight_values, dtype=np.float64),
         valid=np.asarray(valid_values, dtype=bool),
         value=np.asarray(value_values, dtype=np.float64),
-        device_type_code=np.asarray(device_type_code_values, dtype=np.int16),
+        device_type_code=device_type_code_array,
         angle_mask=np.asarray(angle_mask_values, dtype=bool),
         status_code=np.asarray(status_values, dtype=np.int16),
+        rows_by_device_type_code=rows_by_code,
     )
     return MeasurementList(measurements, table, normalized=scale_context is not None)
 
@@ -518,261 +549,14 @@ def _normalize_measurement_value(scale_context, meas: "Measurement") -> Optional
     return float(meas.value) / scale
 
 
-def _fast_topo_network(network: ACPowerNetwork) -> None:
-    """Build the AC topology fields needed by state estimation with one compact scan."""
-    nodes = network.nodes
-    node_dict = {node.idx: node for node in nodes}
-    network.node_dict = node_dict
-    network.branch_dict = {dev.idx: dev for dev in network.branches}
-    network.transformer_dict = {dev.idx: dev for dev in network.transformers}
-    network.generator_dict = {dev.idx: dev for dev in network.generators}
-    network.load_dict = {dev.idx: dev for dev in network.loads}
-    network.shunt_compensator_dict = {dev.idx: dev for dev in network.shunt_compensators}
-    network.zero_branch_dict = {dev.idx: dev for dev in network.zero_branches}
-    network.switch_dict = {dev.idx: dev for dev in network.switches}
-    network.break_dict = {dev.idx: dev for dev in getattr(network, "breakers", [])}
-
-    for node in nodes:
-        node.isl = 0
-        node.isl_obj = None
-        node.bus = None
-        node.bus_obj = None
-        node.is_alive = False
-        node.generators = []
-        node.loads = []
-        node.branches = []
-        node.switches = []
-        node.breakers = []
-        node.zero_branches = []
-        node.transformers = []
-        node.shunt_compensators = []
-        node.v_gens = []
-
-    running_nodes = [node for node in nodes if node.run_stat == 1]
-    running_ids = {node.idx for node in running_nodes}
-    parent = {node_idx: node_idx for node_idx in running_ids}
-
-    def find(parents, node_idx):
-        root = node_idx
-        while parents[root] != root:
-            root = parents[root]
-        while parents[node_idx] != node_idx:
-            next_idx = parents[node_idx]
-            parents[node_idx] = root
-            node_idx = next_idx
-        return root
-
-    def union(parents, left, right):
-        left_root = find(parents, left)
-        right_root = find(parents, right)
-        if left_root != right_root:
-            parents[right_root] = left_root
-
-    def live_terminal_pair(dev, require_closed=False):
-        left = int(dev.i_node)
-        right = int(dev.j_node)
-        if (
-            dev.run_stat == 1
-            and (not require_closed or getattr(dev, "status", 1) == 1)
-            and left in running_ids
-            and right in running_ids
-            and left != right
-        ):
-            return left, right
-        return None
-
-    if network.switches:
-        for dev in network.switches:
-            pair = live_terminal_pair(dev, require_closed=True)
-            if pair is not None:
-                union(parent, pair[0], pair[1])
-
-    root_to_nodes = {}
-    for node in running_nodes:
-        root_to_nodes.setdefault(find(parent, node.idx), []).append(node)
-    network.buses = []
-    network.bus_dict = {}
-    network.node_to_bus = {}
-    for grouped_nodes in sorted(root_to_nodes.values(), key=lambda group: min(node.idx for node in group)):
-        grouped_nodes.sort(key=lambda item: item.idx)
-        ref = grouped_nodes[0]
-        bus = SimpleNamespace(
-            idx=ref.idx,
-            name=ref.name,
-            nodes=list(grouped_nodes),
-            vbase=ref.vbase,
-            voltage=ref.voltage,
-            angle=ref.angle,
-            run_stat=1,
-            isl=0,
-            isl_obj=None,
-            is_alive=False,
-            generators=[],
-            loads=[],
-            branches=[],
-            switches=[],
-            breakers=[],
-            zero_branches=[],
-            transformers=[],
-            shunt_compensators=[],
-            v_gens=[],
-        )
-        network.buses.append(bus)
-        network.bus_dict[bus.idx] = bus
-        for node in grouped_nodes:
-            node.bus = bus.idx
-            node.bus_obj = bus
-            network.node_to_bus[node.idx] = bus
-
-    bus_parent = {bus.idx: bus.idx for bus in network.buses}
-
-    def connect_bus_device(dev, require_closed=False):
-        pair = live_terminal_pair(dev, require_closed=require_closed)
-        if pair is None:
-            return
-        i_bus = network.node_to_bus.get(pair[0])
-        j_bus = network.node_to_bus.get(pair[1])
-        if i_bus is not None and j_bus is not None and i_bus.idx != j_bus.idx:
-            union(bus_parent, i_bus.idx, j_bus.idx)
-
-    for dev in network.branches:
-        connect_bus_device(dev)
-    for dev in network.transformers:
-        connect_bus_device(dev)
-    for dev in network.zero_branches:
-        connect_bus_device(dev)
-    for dev in getattr(network, "breakers", []):
-        connect_bus_device(dev, require_closed=True)
-
-    root_to_island = {}
-    for bus in network.buses:
-        root = find(bus_parent, bus.idx)
-        island = root_to_island.get(root)
-        if island is None:
-            island = SimpleNamespace(
-                idx=len(root_to_island) + 1,
-                is_alive=False,
-                buses=[],
-                gens=[],
-                loads=[],
-                branches=[],
-                zero_branches=[],
-                switches=[],
-                breakers=[],
-                transformers=[],
-                shunt_compensators=[],
-                slack_nodes=[],
-                v_gens=[],
-            )
-            root_to_island[root] = island
-        bus.isl = island.idx
-        bus.isl_obj = island
-        island.buses.append(bus)
-        for node in bus.nodes:
-            node.isl = island.idx
-            node.isl_obj = island
-    network.islands = list(root_to_island.values())
-
-    for gen in network.generators:
-        gen.node_obj = node_dict.get(gen.node)
-        gen.is_alive = False
-        if gen.node_obj is None:
-            continue
-        gen.node_obj.generators.append(gen)
-        island = gen.node_obj.isl_obj
-        if gen.run_stat != 1 or island is None:
-            continue
-        island.gens.append(gen)
-        if gen.control_type in ("V", "SLACK", "PH"):
-            island.is_alive = True
-            gen.node_obj.v_gens.append(gen)
-            if gen.node_obj.bus_obj is not None:
-                gen.node_obj.bus_obj.v_gens.append(gen)
-            island.v_gens.append(gen)
-            slack_bus = gen.node_obj.bus_obj or gen.node_obj
-            if slack_bus not in island.slack_nodes:
-                island.slack_nodes.append(slack_bus)
-        elif gen.control_type == "PV":
-            gen.node_obj.v_gens.append(gen)
-            if gen.node_obj.bus_obj is not None:
-                gen.node_obj.bus_obj.v_gens.append(gen)
-            island.v_gens.append(gen)
-
-    for bus in network.buses:
-        bus.is_alive = bus.run_stat == 1 and bus.isl_obj is not None and bus.isl_obj.is_alive
-
-    for node in nodes:
-        node.is_alive = node.run_stat == 1 and node.isl_obj is not None and node.isl_obj.is_alive
-
-    for gen in network.generators:
-        gen.is_alive = gen.node_obj is not None and gen.run_stat == 1 and gen.node_obj.is_alive
-
-    for load in network.loads:
-        load.node_obj = node_dict.get(load.node)
-        load.is_alive = load.node_obj is not None and load.run_stat == 1 and load.node_obj.is_alive
-        if load.node_obj is not None:
-            load.node_obj.loads.append(load)
-            if load.is_alive:
-                load.node_obj.isl_obj.loads.append(load)
-
-    for shunt in network.shunt_compensators:
-        shunt.node_obj = node_dict.get(shunt.node)
-        shunt.is_alive = shunt.node_obj is not None and shunt.run_stat == 1 and shunt.node_obj.is_alive
-        if shunt.node_obj is not None:
-            shunt.node_obj.shunt_compensators.append(shunt)
-            if shunt.is_alive:
-                shunt.node_obj.isl_obj.shunt_compensators.append(shunt)
-
-    def finalize_branch_like(dev, attr_name, require_closed=False):
-        dev.i_node_obj = node_dict.get(dev.i_node)
-        dev.j_node_obj = node_dict.get(dev.j_node)
-        closed = (not require_closed) or getattr(dev, "status", 1) == 1
-        dev.is_alive = (
-            dev.i_node_obj is not None
-            and dev.j_node_obj is not None
-            and dev.run_stat == 1
-            and closed
-            and dev.i_node_obj.is_alive
-            and dev.j_node_obj.is_alive
-        )
-        if dev.i_node_obj is not None:
-            getattr(dev.i_node_obj, attr_name).append(dev)
-        if dev.j_node_obj is not None:
-            getattr(dev.j_node_obj, attr_name).append(dev)
-        if dev.is_alive and dev.i_node_obj.isl_obj is dev.j_node_obj.isl_obj:
-            getattr(dev.i_node_obj.isl_obj, attr_name).append(dev)
-
-    for dev in network.branches:
-        finalize_branch_like(dev, "branches")
-    for dev in network.transformers:
-        finalize_branch_like(dev, "transformers")
-    for dev in network.zero_branches:
-        finalize_branch_like(dev, "zero_branches")
-    for dev in getattr(network, "breakers", []):
-        finalize_branch_like(dev, "breakers", require_closed=True)
-    for dev in network.switches:
-        finalize_branch_like(dev, "switches", require_closed=True)
-
-    network.alive_nodes = [bus for bus in network.buses if bus.is_alive]
-    network.alive_buses = network.alive_nodes
-    network.alive_branch_by_name = {br.name: br for br in network.branches if br.is_alive}
-    network.alive_transformer_by_name = {tr.name: tr for tr in network.transformers if tr.is_alive}
-    network.alive_generator_by_name = {gen.name: gen for gen in network.generators if gen.is_alive}
-    network.alive_load_by_name = {load.name: load for load in network.loads if load.is_alive}
-    network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in network.zero_branches if zbr.is_alive}
-    network.alive_switch_by_name = {sw.name: sw for sw in network.switches if sw.is_alive}
-    network.alive_break_by_name = {brk.name: brk for brk in getattr(network, "breakers", []) if brk.is_alive}
-    network.alive_zero_branches = sorted(network.alive_zero_branch_by_name.values(), key=lambda item: item.idx)
-    network.alive_switches = sorted(network.alive_switch_by_name.values(), key=lambda item: item.idx)
-    network.alive_breakers = sorted(network.alive_break_by_name.values(), key=lambda item: item.idx)
-    network.alive_generator_order = sorted(network.alive_generator_by_name.values(), key=lambda item: item.idx)
-    network.alive_load_order = sorted(network.alive_load_by_name.values(), key=lambda item: item.idx)
-
-
 def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
     source = Path(e_file).resolve()
     ppc = build_ac_ppc_from_e_file(source)
     ppc["source"] = str(source)
+    topology_arrays = ppc.get("_topology_arrays")
+    if topology_arrays is None:
+        topology_arrays = network_topology.prepare_ac_topology_ppc(ppc)
+        ppc["_topology_arrays"] = topology_arrays
     network = ACPowerNetwork()
     base = ppc["base"]
     network.p_base = float(base[0])
@@ -936,8 +720,9 @@ def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
         shunt.q = None
         shunt.current = None
         append_shunt(shunt)
-    _fast_topo_network(network)
     network._array_model = ppc
+    network._topology_arrays = topology_arrays
+    network_topology.apply_ac_topology_arrays(network, topology_arrays, compact=True)
     return network
 
 
@@ -1052,13 +837,26 @@ class ACStateEstimator:
         self.p_scale = float(self.network.p_scale)
         self.i_scale = float(self.network.i_scale)
 
-        self.nodes = (
-            getattr(self.network, "alive_nodes", None)
-            or getattr(self.network, "alive_buses", None)
-            or [bus for bus in getattr(self.network, "buses", []) if getattr(bus, "is_alive", False)]
-            or [node for node in self.network.nodes if getattr(node, "is_alive", False)]
+        topology_arrays = getattr(self.network, "_topology_arrays", None)
+        if topology_arrays is None:
+            source_ppc = getattr(self.network, "_array_model", None)
+            topology_arrays = source_ppc.get("_topology_arrays") if isinstance(source_ppc, dict) else None
+        use_topology_arrays = (
+            topology_arrays is not None
+            and len(getattr(self.network, "buses", ())) == len(getattr(topology_arrays, "bus_ids", ()))
+            and len(getattr(self.network, "nodes", ())) == len(getattr(topology_arrays, "node_ids", ()))
         )
-        self.nodes = sorted(self.nodes, key=lambda item: item.idx)
+        if use_topology_arrays:
+            active_bus_pos = np.flatnonzero(topology_arrays.bus_alive_mask).astype(np.int32, copy=False)
+            self.nodes = [self.network.buses[int(pos)] for pos in active_bus_pos]
+        else:
+            self.nodes = (
+                getattr(self.network, "alive_nodes", None)
+                or getattr(self.network, "alive_buses", None)
+                or [bus for bus in getattr(self.network, "buses", []) if getattr(bus, "is_alive", False)]
+                or [node for node in self.network.nodes if getattr(node, "is_alive", False)]
+            )
+            self.nodes = sorted(self.nodes, key=lambda item: item.idx)
         if not self.nodes:
             raise RuntimeError("No alive AC nodes are available for state estimation")
         self.file_theta = np.asarray(
@@ -1073,16 +871,54 @@ class ACStateEstimator:
         self.node_pos = {}
         self.node_by_name = {}
         self.node_by_idx = {}
-        for pos, bus in enumerate(self.nodes):
-            members = getattr(bus, "nodes", None) or [bus]
-            for node in members:
-                self.node_pos[node.idx] = pos
-                self.node_by_name[node.name] = bus
-                self.node_by_idx[node.idx] = bus
-            self.node_pos.setdefault(bus.idx, pos)
-            self.node_by_name.setdefault(bus.name, bus)
-            self.node_by_idx.setdefault(bus.idx, bus)
-        if hasattr(self.network, "alive_branch_by_name"):
+        if use_topology_arrays:
+            bus_solver_pos = np.full(len(topology_arrays.bus_ids), -1, dtype=np.int32)
+            bus_solver_pos[active_bus_pos] = np.arange(active_bus_pos.size, dtype=np.int32)
+            for node_row, node in enumerate(self.network.nodes):
+                bus_pos = int(topology_arrays.node_to_bus_pos[node_row])
+                if bus_pos < 0:
+                    continue
+                solver_pos = int(bus_solver_pos[bus_pos])
+                if solver_pos < 0:
+                    continue
+                bus = self.nodes[solver_pos]
+                self.node_pos[int(node.idx)] = solver_pos
+                self.node_by_name[str(node.name)] = bus
+                self.node_by_idx[int(node.idx)] = bus
+            for pos, bus in enumerate(self.nodes):
+                self.node_pos.setdefault(int(bus.idx), pos)
+                self.node_by_name.setdefault(str(bus.name), bus)
+                self.node_by_idx.setdefault(int(bus.idx), bus)
+        else:
+            for pos, bus in enumerate(self.nodes):
+                members = getattr(bus, "nodes", None) or [bus]
+                for node in members:
+                    self.node_pos[node.idx] = pos
+                    self.node_by_name[node.name] = bus
+                    self.node_by_idx[node.idx] = bus
+                self.node_pos.setdefault(bus.idx, pos)
+                self.node_by_name.setdefault(bus.name, bus)
+                self.node_by_idx.setdefault(bus.idx, bus)
+        if use_topology_arrays:
+            devices = topology_arrays.devices
+
+            def alive_by_name(items, key):
+                mask = devices[key].alive_mask
+                return {dev.name: dev for dev, is_alive in zip(items, mask) if bool(is_alive)}
+
+            self.branch_by_name = alive_by_name(self.network.branches, "branch")
+            self.transformer_by_name = alive_by_name(self.network.transformers, "transformer")
+            self.generator_by_name = alive_by_name(self.network.generators, "gen")
+            self.load_by_name = alive_by_name(self.network.loads, "load")
+            self.zero_branch_by_name = alive_by_name(self.network.zero_branches, "zero_branch")
+            self.switch_by_name = alive_by_name(self.network.switches, "switch")
+            self.break_by_name = alive_by_name(getattr(self.network, "breakers", []), "break")
+            self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
+            self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
+            self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
+            self.generator_order = sorted(self.generator_by_name.values(), key=lambda item: item.idx)
+            self.load_order = sorted(self.load_by_name.values(), key=lambda item: item.idx)
+        elif hasattr(self.network, "alive_branch_by_name"):
             self.branch_by_name = self.network.alive_branch_by_name
             self.transformer_by_name = self.network.alive_transformer_by_name
             self.generator_by_name = self.network.alive_generator_by_name
@@ -1108,7 +944,9 @@ class ACStateEstimator:
             self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
             self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
             self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
-        if hasattr(self.network, "alive_generator_order"):
+        if use_topology_arrays:
+            pass
+        elif hasattr(self.network, "alive_generator_order"):
             self.generator_order = self.network.alive_generator_order
             self.load_order = self.network.alive_load_order
         else:
@@ -1315,7 +1153,8 @@ class ACStateEstimator:
             for shunt in self.voltage_control_shunt_order
         )
         self.state_meta = state_meta
-        self.state_labels = state_labels_from_metadata(self.state_meta)
+        labels = [meta.legacy_label for meta in state_meta]
+        self.state_labels = labels if all(labels) else state_labels_from_metadata(self.state_meta)
 
         self.branch_stamp_by_name = self._build_branch_stamp_map(list(self.branch_by_name.values()), False)
         self.transformer_stamp_by_name = self._build_branch_stamp_map(list(self.transformer_by_name.values()), True)
@@ -2061,7 +1900,7 @@ class ACStateEstimator:
         except (KeyError, ValueError, RuntimeError):
             network = ACPowerNetwork()
             network.read_from_file(e_file)
-            _fast_topo_network(network)
+            network_topology.prepare_ac_topology(network)
             return network
 
     @staticmethod
@@ -2824,6 +2663,71 @@ class ACStateEstimator:
         has_valid_angle_measurements = False
         node_pos = getattr(self, "node_pos", {})
 
+        scale_array = np.ones(value_array.size, dtype=np.float64)
+        unavailable_mask = np.ones(value_array.size, dtype=bool)
+
+        def rows_for_type(device_type: str) -> np.ndarray:
+            return np.flatnonzero(device_type_array == device_type)
+
+        def mark_named_rows(rows: np.ndarray, mapping: Dict[str, object]) -> np.ndarray:
+            if rows.size == 0:
+                return rows
+            found = np.fromiter(
+                (str(device_name_array[int(row)]) in mapping for row in rows),
+                dtype=bool,
+                count=rows.size,
+            )
+            available = rows[found]
+            unavailable_mask[available] = False
+            return available
+
+        node_rows = mark_named_rows(rows_for_type("ACNode"), node_voltage_scale_by_name)
+        node_v_rows = node_rows[meas_type_array[node_rows] == "V"]
+        if node_v_rows.size:
+            scale_array[node_v_rows] = np.fromiter(
+                (float(node_voltage_scale_by_name[str(device_name_array[int(row)])]) for row in node_v_rows),
+                dtype=np.float64,
+                count=node_v_rows.size,
+            )
+
+        for terminal_type, scale_by_name in terminal_maps.items():
+            terminal_rows = mark_named_rows(rows_for_type(terminal_type), scale_by_name)
+            for row in terminal_rows:
+                mtype = str(meas_type_array[int(row)])
+                terminal_scales = scale_by_name[str(device_name_array[int(row)])]
+                if mtype in _TERMINAL_POWER_MEASUREMENT_TYPES:
+                    scale_array[int(row)] = power_scale
+                elif mtype == "V_FROM":
+                    scale_array[int(row)] = terminal_scales[0]
+                elif mtype == "I_FROM":
+                    scale_array[int(row)] = terminal_scales[1]
+                elif mtype == "V_TO":
+                    scale_array[int(row)] = terminal_scales[2]
+                elif mtype == "I_TO":
+                    scale_array[int(row)] = terminal_scales[3]
+
+        gen_rows = mark_named_rows(rows_for_type("ACGenerator"), generator_node_scale_by_name)
+        for row in gen_rows:
+            mtype = str(meas_type_array[int(row)])
+            node_scales = generator_node_scale_by_name[str(device_name_array[int(row)])]
+            if mtype in ("P_GEN", "Q_GEN"):
+                scale_array[int(row)] = power_scale
+            elif mtype == "V_GEN":
+                scale_array[int(row)] = node_scales[0]
+            elif mtype == "I_GEN":
+                scale_array[int(row)] = node_scales[1]
+
+        load_rows = mark_named_rows(rows_for_type("ACLoad"), load_node_scale_by_name)
+        for row in load_rows:
+            mtype = str(meas_type_array[int(row)])
+            node_scales = load_node_scale_by_name[str(device_name_array[int(row)])]
+            if mtype in ("P_LOAD", "Q_LOAD"):
+                scale_array[int(row)] = power_scale
+            elif mtype == "V_LOAD":
+                scale_array[int(row)] = node_scales[0]
+            elif mtype == "I_LOAD":
+                scale_array[int(row)] = node_scales[1]
+
         def invalidate_measurement(pos: int, meas: Measurement) -> None:
             valid_array[pos] = False
             status_array[pos] = MEAS_STATUS_INVALID
@@ -2845,77 +2749,22 @@ class ACStateEstimator:
                 continue
             if not bool(valid_array[pos]) or weight <= 0.0:
                 continue
-            scale = 1.0
-            if device_type == "ACNode":
-                node_scale = node_voltage_scale_by_name.get(device_name)
-                if node_scale is None:
-                    invalidate_measurement(pos, meas)
-                    continue
-                if mtype == "V":
-                    scale = node_scale
-                elif mtype in ("ANGLE", "THETA"):
-                    has_valid_angle_measurements = True
-                    converted_value = math.radians(float(value_array[pos]))
-                    value_array[pos] = converted_value
-                    meas.value = converted_value
-                    continue
-            elif device_type in terminal_maps:
-                terminal_scales = terminal_maps[device_type].get(device_name)
-                if terminal_scales is None:
-                    invalidate_measurement(pos, meas)
-                    continue
-                if mtype in _TERMINAL_POWER_MEASUREMENT_TYPES:
-                    scale = power_scale
-                elif mtype == "V_FROM":
-                    scale = terminal_scales[0]
-                elif mtype == "I_FROM":
-                    scale = terminal_scales[1]
-                elif mtype == "V_TO":
-                    scale = terminal_scales[2]
-                elif mtype == "I_TO":
-                    scale = terminal_scales[3]
-            elif device_type == "ACZeroBranchConstraint":
+            if bool(unavailable_mask[pos]):
                 invalidate_measurement(pos, meas)
                 continue
-            elif device_type == "ACBreakConstraint":
-                invalidate_measurement(pos, meas)
-                continue
-            elif device_type == "ACGenerator":
-                node_scales = generator_node_scale_by_name.get(device_name)
-                if node_scales is None:
-                    invalidate_measurement(pos, meas)
-                    continue
-                if mtype in ("P_GEN", "Q_GEN"):
-                    scale = power_scale
-                elif mtype == "V_GEN":
-                    scale = node_scales[0]
-                elif mtype == "I_GEN":
-                    scale = node_scales[1]
-            elif device_type == "ACLoad":
-                node_scales = load_node_scale_by_name.get(device_name)
-                if node_scales is None:
-                    invalidate_measurement(pos, meas)
-                    continue
-                if mtype in ("P_LOAD", "Q_LOAD"):
-                    scale = power_scale
-                elif mtype == "V_LOAD":
-                    scale = node_scales[0]
-                elif mtype == "I_LOAD":
-                    scale = node_scales[1]
-            else:
-                invalidate_measurement(pos, meas)
-                continue
+            scale = float(scale_array[pos])
             converted_value = float(value_array[pos]) / scale
             value_array[pos] = converted_value
             meas.value = converted_value
-            if not is_pseudo_measurement(meas) and mtype in _VOLTAGE_MEASUREMENT_TYPES:
+            is_real_measurement = int(status_array[pos]) != MEAS_STATUS_PSEUDO
+            if is_real_measurement and mtype in _VOLTAGE_MEASUREMENT_TYPES:
                 node_idx = self._voltage_measurement_node_idx(device_type, device_name, mtype)
                 if node_idx is not None and node_idx in node_pos:
                     current = real_voltage_best.get(node_idx)
                     if current is None or weight > current[0]:
                         real_voltage_best[node_idx] = (weight, converted_value)
             if device_type == "ACNode" and mtype == "V":
-                if not is_pseudo_measurement(meas):
+                if is_real_measurement:
                     node_idx = self.node_by_name[device_name].idx
                     current = node_voltage_best.get(node_idx)
                     if current is None or weight > current[0]:
@@ -3282,7 +3131,7 @@ class ACStateEstimator:
             ("ACZeroBranch", self.zero_branches),
             ("ACBreak", self.breakers),
         ):
-            for dev in sorted(devices, key=lambda item: item.idx):
+            for dev in devices:
                 has_terminal_current = any(
                     (device_type, dev.name, meas_type) in measured_keys
                     for meas_type in ("I_FROM", "I_TO")
@@ -3373,7 +3222,7 @@ class ACStateEstimator:
                     )
                     added_keys.add(key)
 
-        for load in sorted(self.load_by_name.values(), key=lambda item: item.idx):
+        for load in getattr(self, "load_order", None) or sorted(self.load_by_name.values(), key=lambda item: item.idx):
             unmetered_load = ("ACLoad", load.name) not in measured_devices
             p, q = self._load_pseudo_power(load)
             voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
@@ -3592,7 +3441,7 @@ class ACStateEstimator:
             add("ACLoad", load.name, "Q_LOAD", q)
             add("ACLoad", load.name, "V_LOAD", voltage)
 
-        for gen in sorted(self.generator_by_name.values(), key=lambda item: item.idx):
+        for gen in getattr(self, "generator_order", None) or sorted(self.generator_by_name.values(), key=lambda item: item.idx):
             p, q = self._generator_pseudo_power(gen)
             voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
             add("ACGenerator", gen.name, "P_GEN", p)
@@ -3935,11 +3784,11 @@ class ACStateEstimator:
         weight = 10.0
         ideal_devices = [
             ("ACZeroBranchConstraint", zbr)
-            for zbr in sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
+            for zbr in self.zero_branches
         ]
         ideal_devices.extend(
             ("ACBreakConstraint", brk)
-            for brk in sorted(self.break_by_name.values(), key=lambda item: item.idx)
+            for brk in self.breakers
         )
         for device_type, dev in ideal_devices:
             for meas_type in ("V_DIFF",):
@@ -4125,31 +3974,40 @@ class ACStateEstimator:
             if root_l != root_r:
                 parent[root_r] = root_l
 
-        for dev in [*self.zero_branches, *self.switches, *self.breakers]:
-            if dev.i_node in self.node_pos and dev.j_node in self.node_pos:
-                union(self.node_pos[dev.i_node], self.node_pos[dev.j_node])
+        node_pos = self.node_pos
+        for devices in (self.zero_branches, self.switches, self.breakers):
+            for dev in devices:
+                i = node_pos.get(dev.i_node)
+                j = node_pos.get(dev.j_node)
+                if i is not None and j is not None:
+                    union(i, j)
 
         groups: Dict[int, List[int]] = {}
         for pos in range(n):
             groups.setdefault(find(pos), []).append(pos)
-        components = [sorted(group) for group in groups.values()]
+        components = list(groups.values())
         components.sort(key=lambda group: group[0])
         self.zero_tie_components = components
-        self.zero_tie_component_by_pos = np.empty(n, dtype=np.int32)
+        zero_tie_component_by_pos = np.empty(n, dtype=np.int32)
         for component_idx, component in enumerate(components):
-            self.zero_tie_component_by_pos[np.asarray(component, dtype=np.int32)] = component_idx
+            for pos in component:
+                zero_tie_component_by_pos[pos] = component_idx
+        self.zero_tie_component_by_pos = zero_tie_component_by_pos
 
         self.angle_col = np.full(n, -1, dtype=np.int32)
         self.voltage_col = np.full(n, -1, dtype=np.int32)
         self.angle_state_pos: List[int] = []
-        self.angle_state_nodes: List[np.ndarray] = []
+        self.angle_state_nodes: List[Sequence[int]] = []
         self.voltage_state_pos: List[int] = []
-        self.voltage_state_nodes: List[np.ndarray] = []
+        self.voltage_state_nodes: List[Sequence[int]] = []
         self.ref_angles: Dict[int, float] = {}
         self.ref_voltages: Dict[int, float] = {}
+        angle_unpack_nodes = []
+        angle_unpack_cols = []
+        voltage_unpack_nodes = []
+        voltage_unpack_cols = []
 
         for component in components:
-            component_array = np.asarray(component, dtype=np.int32)
             ref_positions = [pos for pos in component if pos in self.ref_idx]
             if ref_positions:
                 ref_pos = min(ref_positions, key=lambda pos: self.nodes[pos].idx)
@@ -4159,7 +4017,9 @@ class ACStateEstimator:
                 col = len(self.angle_state_pos)
                 rep_pos = component[0]
                 self.angle_state_pos.append(rep_pos)
-                self.angle_state_nodes.append(component_array)
+                self.angle_state_nodes.append(component)
+                angle_unpack_nodes.extend(component)
+                angle_unpack_cols.extend([col] * len(component))
                 for pos in component:
                     self.angle_col[pos] = col
 
@@ -4173,7 +4033,9 @@ class ACStateEstimator:
                 v_col = len(self.voltage_state_pos)
                 rep_pos = component[0]
                 self.voltage_state_pos.append(rep_pos)
-                self.voltage_state_nodes.append(component_array)
+                self.voltage_state_nodes.append(component)
+                voltage_unpack_nodes.extend(component)
+                voltage_unpack_cols.extend([v_col] * len(component))
                 for pos in component:
                     self.voltage_col[pos] = v_col
 
@@ -4189,28 +4051,10 @@ class ACStateEstimator:
             dtype=np.float64,
             count=len(self.ref_voltages),
         )
-        if self.angle_state_nodes:
-            self._angle_unpack_nodes = np.concatenate(self.angle_state_nodes).astype(np.int32, copy=False)
-            self._angle_unpack_cols = np.concatenate(
-                [
-                    np.full(nodes.size, col, dtype=np.int32)
-                    for col, nodes in enumerate(self.angle_state_nodes)
-                ]
-            )
-        else:
-            self._angle_unpack_nodes = np.array([], dtype=np.int32)
-            self._angle_unpack_cols = np.array([], dtype=np.int32)
-        if self.voltage_state_nodes:
-            self._voltage_unpack_nodes = np.concatenate(self.voltage_state_nodes).astype(np.int32, copy=False)
-            self._voltage_unpack_cols = np.concatenate(
-                [
-                    np.full(nodes.size, col, dtype=np.int32)
-                    for col, nodes in enumerate(self.voltage_state_nodes)
-                ]
-            )
-        else:
-            self._voltage_unpack_nodes = np.array([], dtype=np.int32)
-            self._voltage_unpack_cols = np.array([], dtype=np.int32)
+        self._angle_unpack_nodes = np.asarray(angle_unpack_nodes, dtype=np.int32)
+        self._angle_unpack_cols = np.asarray(angle_unpack_cols, dtype=np.int32)
+        self._voltage_unpack_nodes = np.asarray(voltage_unpack_nodes, dtype=np.int32)
+        self._voltage_unpack_cols = np.asarray(voltage_unpack_cols, dtype=np.int32)
         voltage_mask = self.voltage_col >= 0
         self.voltage_col[voltage_mask] = self.n_angle + self.voltage_col[voltage_mask]
 
@@ -7393,7 +7237,7 @@ class ACStateEstimator:
     ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
         mode = normalize_seresult_return_mode(return_mode)
-        if mode == "none":
+        if mode in ("none", "array"):
             self.se_result = None
             return None
         if bad_items is None or normalized_residual is None:
@@ -7402,7 +7246,7 @@ class ACStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
-        if mode in ("summary", "array"):
+        if mode == "summary":
             self.se_result = build_seresult_summary(
                 result,
                 bad_items=bad_items,
@@ -7432,6 +7276,8 @@ class ACStateEstimator:
         self._require_prepared("run()")
         mode = normalize_seresult_return_mode(return_mode)
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
+        array_only = mode == "array"
+        needs_bad_data = (not skip_bad_data) and not array_only
         if observability is None:
             observability = self.observability_analysis()
         self.observability_result = observability
@@ -7445,19 +7291,19 @@ class ACStateEstimator:
         else:
             result = self.estimate(
                 verbose=verbose,
-                final_diagnostics=final_diagnostics and not skip_bad_data,
+                final_diagnostics=final_diagnostics and needs_bad_data,
                 observability=observability,
             )
         self.estimate_result = result
         self.removed_bad_data = removed
-        if skip_bad_data:
+        if skip_bad_data or array_only:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:
             bad_items, normalized = self.identify_bad_data(result, threshold)
         self.bad_items = bad_items
         self.normalized_residual = normalized
-        if mode == "none":
+        if mode in ("none", "array"):
             self.se_result = None
             return None
         return self.build_se_result(
@@ -7575,7 +7421,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated node states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
-    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, or none.")
+    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 

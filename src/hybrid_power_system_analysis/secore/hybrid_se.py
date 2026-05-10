@@ -1,6 +1,4 @@
 import argparse
-import contextlib
-import io
 import sys
 import time
 from dataclasses import dataclass
@@ -19,7 +17,10 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from paths import measurement_file, model_file
 from ac_lf import matpower_branch_stamp
+from efile_read import _read_efile_rows
 from hybrid_lf import HybridPowerNetwork
+from model import topology as network_topology
+from model.hybrid_array_model import build_hybrid_ppc_from_efile_rows
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -67,7 +68,7 @@ from secore.se_math import (
     targeted_redundancy_count,
 )
 from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_return_mode
-from secore.state_metadata import StateMeta, state_labels_from_metadata, state_meta_at, state_sides_from_metadata, with_legacy_label
+from secore.state_metadata import StateMeta, state_labels_from_metadata, state_meta_at, with_legacy_label
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
@@ -171,6 +172,15 @@ class HybridStateEstimator:
         "V_TO": 7,
         "I_TO": 8,
     }
+    _SUB_MEASUREMENT_SUMMARY_ATTRS = (
+        "_active_device_key_cache",
+        "_active_measurement_key_cache",
+        "_max_measurement_idx",
+        "_node_voltage_measurement_cache",
+        "_real_voltage_observation_node_cache",
+        "_real_power_measurement_seed_cache",
+        "_has_valid_angle_measurements",
+    )
 
     @dataclass(frozen=True)
     class _MeasurementSideBlock:
@@ -287,6 +297,8 @@ class HybridStateEstimator:
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self._sub_measurement_sources_by_side = None
         self._sub_measurement_source_rows_by_side = None
+        self._sub_measurement_summary_attrs_by_side = {}
+        self._sub_measurement_global_summary_attrs = None
         self._sub_measurements_converted_by_side = {"ac": False, "dc": False}
         self._measurements_normalized = False
 
@@ -348,15 +360,34 @@ class HybridStateEstimator:
 
     @staticmethod
     def _load_network(e_file: Path) -> HybridPowerNetwork:
-        network = HybridPowerNetwork.read_from_file(e_file)
-        with contextlib.redirect_stdout(io.StringIO()):
-            ac_warnings, ac_errors, dc_warnings, dc_errors = network.prepare(verbose=False)
-        if ac_errors or dc_errors:
-            raise RuntimeError(
-                f"Topology check failed for {e_file}: "
-                f"ac_errors={ac_errors}, dc_errors={dc_errors}, "
-                f"ac_warnings={ac_warnings}, dc_warnings={dc_warnings}"
-            )
+        efile_rows = _read_efile_rows(e_file)
+        network, ppc = build_hybrid_ppc_from_efile_rows(e_file, efile_rows)
+        if isinstance(ppc.get("ac"), dict) and "bus" in ppc["ac"]:
+            ac_topology = ppc["ac"].get("_topology_arrays")
+            if ac_topology is None:
+                ac_topology = network_topology.prepare_ac_topology_ppc(ppc["ac"])
+                ppc["ac"]["_topology_arrays"] = ac_topology
+            network.ac._topology_arrays = ac_topology
+            network_topology.apply_ac_topology_arrays(network.ac, ac_topology, compact=True)
+        if isinstance(ppc.get("dc"), dict) and "bus" in ppc["dc"]:
+            dc_topology = ppc["dc"].get("_topology_arrays")
+            if dc_topology is None:
+                dc_topology = network_topology.prepare_dc_topology_ppc(ppc["dc"])
+                ppc["dc"]["_topology_arrays"] = dc_topology
+            network.dc._topology_arrays = dc_topology
+            network_topology.apply_dc_topology_arrays(network.dc, dc_topology, compact=True)
+        network.ppc = ppc
+        network._ac_ppc = ppc["ac"]
+        network._dc_ppc = ppc["dc"]
+        network.ac.ppc = ppc["ac"]
+        network.dc.ppc = ppc["dc"]
+        base = ppc["base"]
+        network.p_base = float(base[0])
+        network.u_scale = float(base[1])
+        network.p_scale = float(base[2])
+        network.i_scale = float(base[3])
+        network.p_base_kW = float(base[4])
+        network._build_hybrid_topo()
         return network
 
     def _initial_measurement_sources_by_side(self) -> Dict[str, List[Measurement]]:
@@ -368,6 +399,7 @@ class HybridStateEstimator:
                 self._MEASUREMENT_SIDE_BY_DEVICE_TYPE_CODE,
                 side_by_device_type=self._MEASUREMENT_SIDE_BY_DEVICE_TYPE,
                 table_builder=_measurement_table_from_measurements,
+                as_view=True,
                 sides=("ac", "dc", "hybrid"),
             )
             sources_by_side = partitions.measurements
@@ -380,7 +412,8 @@ class HybridStateEstimator:
         if share_measurements and self._is_uncoupled_single_side(side):
             return self.measurements
         sources = self._initial_measurement_sources_by_side().get(side, ())
-        if share_measurements:
+        defer_finalize = getattr(self, "network", None) is not None and self._defer_sub_prepare_finalize()
+        if share_measurements or defer_finalize:
             return sources
         return copy_measurement_view(sources)
 
@@ -724,6 +757,26 @@ class HybridStateEstimator:
         }
 
     def _partition_state_variables(self) -> None:
+        if (
+            getattr(self, "ac_n_state", None) is not None
+            and getattr(self, "dc_n_state", None) is not None
+            and getattr(self, "hybrid_n_state", None) is not None
+        ):
+            ac_n = int(self.ac_n_state)
+            dc_n = int(self.dc_n_state)
+            hybrid_n = int(self.hybrid_n_state)
+            dc_start = int(getattr(self, "dc_state_start", ac_n))
+            hybrid_start = int(getattr(self, "hybrid_state_start", dc_start + dc_n))
+            self.ac_state_cols = np.arange(ac_n, dtype=np.int32)
+            self.dc_state_cols = dc_start + np.arange(dc_n, dtype=np.int32)
+            self.hybrid_state_cols = hybrid_start + np.arange(hybrid_n, dtype=np.int32)
+            self.ac_vars = list(self.state_labels[:ac_n])
+            self.dc_vars = list(self.state_labels[dc_start : dc_start + dc_n])
+            self.hybrid_vars = list(self.state_labels[hybrid_start : hybrid_start + hybrid_n])
+            self.ac_state_slice = slice(0, ac_n)
+            self.dc_state_slice = slice(dc_start, dc_start + dc_n)
+            self.hybrid_state_slice = slice(hybrid_start, hybrid_start + hybrid_n)
+            return
         self.ac_state_cols = np.asarray(
             [idx for idx, side in enumerate(self.state_sides) if side == "ac"],
             dtype=np.int32,
@@ -855,6 +908,13 @@ class HybridStateEstimator:
         max_idx: Optional[int] = None,
         voltage_node_mapper=None,
     ) -> Dict[str, object]:
+        cached_attrs = self._cached_sub_measurement_summary_attrs(
+            measurements,
+            max_idx=max_idx,
+            voltage_node_mapper=voltage_node_mapper,
+        )
+        if cached_attrs is not None:
+            return cached_attrs
         active_device_keys = set()
         active_measurement_keys = set()
         voltage_best: Dict[int, Tuple[float, float]] = {}
@@ -915,6 +975,70 @@ class HybridStateEstimator:
             }
         return attrs
 
+    @staticmethod
+    def _copy_summary_attrs(attrs: Dict[str, object]) -> Dict[str, object]:
+        copied = {}
+        for name, value in attrs.items():
+            if isinstance(value, set):
+                copied[name] = set(value)
+            elif isinstance(value, dict):
+                copied[name] = dict(value)
+            else:
+                copied[name] = value
+        return copied
+
+    def _cache_sub_measurement_summary_attrs(self, side: str, attrs: Dict[str, object]) -> None:
+        if not attrs:
+            return
+        cache = getattr(self, "_sub_measurement_summary_attrs_by_side", None)
+        if cache is None:
+            cache = {}
+            self._sub_measurement_summary_attrs_by_side = cache
+        cache[side] = self._copy_summary_attrs(attrs)
+
+    def _cached_sub_measurement_summary_attrs(
+        self,
+        measurements: Sequence[Measurement],
+        *,
+        max_idx: Optional[int] = None,
+        voltage_node_mapper=None,
+    ) -> Optional[Dict[str, object]]:
+        cache_by_side = getattr(self, "_sub_measurement_summary_attrs_by_side", None)
+        sources_by_side = getattr(self, "_sub_measurement_sources_by_side", None)
+        if not cache_by_side or not sources_by_side:
+            return None
+        side = None
+        for candidate_side, source in sources_by_side.items():
+            if measurements is source:
+                side = candidate_side
+                break
+        if side is None:
+            return None
+        side_attrs = cache_by_side.get(side, {})
+        if voltage_node_mapper is not None and "_real_voltage_observation_node_cache" not in side_attrs:
+            return None
+        summary_attrs = getattr(self, "_sub_measurement_global_summary_attrs", None)
+        if summary_attrs is None:
+            summary = self._measurement_activity_summary()
+            summary_attrs = {
+                "source_count": len(self.measurements),
+                "active_device_keys": summary.measured_devices,
+                "active_measurement_keys": summary.active_keys,
+            }
+            self._sub_measurement_global_summary_attrs = summary_attrs
+        attrs = {
+            "_active_device_key_cache": summary_attrs["active_device_keys"],
+            "_active_measurement_key_cache": summary_attrs["active_measurement_keys"],
+            "_max_measurement_idx": (
+                int(max_idx)
+                if max_idx is not None
+                else self._max_measurement_idx_fast(self.measurements)
+            ),
+        }
+        if "_real_voltage_observation_node_cache" in side_attrs:
+            attrs["_real_voltage_observation_node_cache"] = dict(side_attrs["_real_voltage_observation_node_cache"])
+        return attrs
+
     def _sub_measurement_context(
         self,
         measurements: Sequence[Measurement],
@@ -956,6 +1080,8 @@ class HybridStateEstimator:
         method_names: Sequence[str],
         *args,
         preserve_max_idx: bool = False,
+        capture_attrs: Sequence[str] = (),
+        captured_attrs: Optional[Dict[str, object]] = None,
     ):
         if estimator is None:
             return None
@@ -972,6 +1098,15 @@ class HybridStateEstimator:
                     result = method(*args)
                 else:
                     method()
+            if captured_attrs is not None:
+                captured_attrs.clear()
+                captured_attrs.update(
+                    {
+                        name: getattr(estimator, name)
+                        for name in capture_attrs
+                        if hasattr(estimator, name)
+                    }
+                )
             max_idx = getattr(estimator, "_max_measurement_idx", None)
             return result
         finally:
@@ -989,6 +1124,8 @@ class HybridStateEstimator:
         preserve_max_idx: bool = False,
         summary_measurements: Optional[Sequence[Measurement]] = None,
         summary_max_idx: Optional[int] = None,
+        capture_attrs: Sequence[str] = (),
+        captured_attrs: Optional[Dict[str, object]] = None,
     ):
         context = self._sub_measurement_context(
             measurements,
@@ -1002,6 +1139,8 @@ class HybridStateEstimator:
             (method_name,),
             *args,
             preserve_max_idx=preserve_max_idx,
+            capture_attrs=capture_attrs,
+            captured_attrs=captured_attrs,
         )
 
     def _call_sub_sequence_with_measurements(
@@ -1015,6 +1154,8 @@ class HybridStateEstimator:
         summary_measurements: Optional[Sequence[Measurement]] = None,
         summary_max_idx: Optional[int] = None,
         summary_voltage_node_mapper=None,
+        capture_attrs: Sequence[str] = (),
+        captured_attrs: Optional[Dict[str, object]] = None,
     ) -> None:
         context = self._sub_measurement_context(
             measurements,
@@ -1028,6 +1169,8 @@ class HybridStateEstimator:
             context,
             tuple(method_names),
             preserve_max_idx=preserve_max_idx,
+            capture_attrs=capture_attrs,
+            captured_attrs=captured_attrs,
         )
 
     @staticmethod
@@ -1053,12 +1196,16 @@ class HybridStateEstimator:
         sources = self._initial_measurement_sources_by_side()
         converted_by_sub = getattr(self, "_sub_measurements_converted_by_side", {})
         if not converted_by_sub.get("ac", False):
+            captured_summary: Dict[str, object] = {}
             self._call_sub_with_measurements(
                 self._ac_sub_estimator,
                 sources["ac"],
                 "_convert_measurements_to_pu",
                 refresh_summary=False,
+                capture_attrs=self._SUB_MEASUREMENT_SUMMARY_ATTRS,
+                captured_attrs=captured_summary,
             )
+            self._cache_sub_measurement_summary_attrs("ac", captured_summary)
             if not self._sub_estimator_updates_measurement_table(self._ac_sub_estimator):
                 self._sync_partition_table_from_objects(sources["ac"])
             converted_by_sub["ac"] = True
@@ -1067,12 +1214,16 @@ class HybridStateEstimator:
             if self._ac_sub_estimator is not None and hasattr(self._ac_sub_estimator.measurements, "normalized"):
                 self._ac_sub_estimator.measurements.normalized = True
         if not converted_by_sub.get("dc", False):
+            captured_summary = {}
             self._call_sub_with_measurements(
                 self._dc_sub_estimator,
                 sources["dc"],
                 "_convert_measurements_to_pu",
                 refresh_summary=False,
+                capture_attrs=self._SUB_MEASUREMENT_SUMMARY_ATTRS,
+                captured_attrs=captured_summary,
             )
+            self._cache_sub_measurement_summary_attrs("dc", captured_summary)
             if not self._sub_estimator_updates_measurement_table(self._dc_sub_estimator):
                 self._sync_partition_table_from_objects(sources["dc"])
             converted_by_sub["dc"] = True
@@ -1124,19 +1275,84 @@ class HybridStateEstimator:
     def _convert_hybrid_measurements_to_pu(self, measurements: Sequence[Measurement]) -> None:
         table = getattr(measurements, "table", None)
         has_table = table is not None and len(table.idx) == len(measurements)
-        table_value = table.value if has_table else None
-        table_valid = table.valid if has_table else None
-        table_weight = table.weight if has_table else None
+        if not has_table:
+            for meas in measurements:
+                if not meas.valid or meas.weight <= 0.0:
+                    continue
+                scale = self._hybrid_measurement_scale(meas)
+                meas.value = float(meas.value) / scale
+            return
+
+        active = np.asarray(table.valid, dtype=bool) & (np.asarray(table.weight, dtype=np.float64) > 0.0)
+        if not np.any(active):
+            return
+        scale = np.ones(table.value.size, dtype=np.float64)
+        code = np.asarray(table.device_type_code, dtype=np.int16)
+        dcac_code = DEVICE_TYPE_CODES["DCACConverter"]
+        acac_code = DEVICE_TYPE_CODES["ACACConverter"]
+
+        dcac_rows = np.flatnonzero(active & (code == dcac_code))
+        if dcac_rows.size:
+            dcac_scales = {
+                name: (
+                    self._power_file_base(),
+                    self._dc_voltage_file_base(conv.dc_node),
+                    self._dc_current_base(conv.dc_node),
+                    self._ac_voltage_file_base(conv.ac_node),
+                    self._ac_current_base(conv.ac_node),
+                )
+                for name, conv in self.dcac_by_name.items()
+            }
+            for row in dcac_rows:
+                mtype = str(table.meas_type[row])
+                values = dcac_scales[str(table.device_name[row])]
+                if mtype in ("P_DC", "P_AC", "Q_AC"):
+                    scale[row] = values[0]
+                elif mtype == "V_DC":
+                    scale[row] = values[1]
+                elif mtype == "I_DC":
+                    scale[row] = values[2]
+                elif mtype == "V_AC":
+                    scale[row] = values[3]
+                elif mtype == "I_AC":
+                    scale[row] = values[4]
+
+        acac_rows = np.flatnonzero(active & (code == acac_code))
+        if acac_rows.size:
+            acac_scales = {
+                name: (
+                    self._power_file_base(),
+                    self._ac_voltage_file_base(conv.i_node),
+                    self._ac_current_base(conv.i_node),
+                    self._ac_voltage_file_base(conv.j_node),
+                    self._ac_current_base(conv.j_node),
+                )
+                for name, conv in self.acac_by_name.items()
+            }
+            for row in acac_rows:
+                mtype = str(table.meas_type[row])
+                values = acac_scales[str(table.device_name[row])]
+                if mtype.startswith(("P_", "Q_")):
+                    scale[row] = values[0]
+                elif mtype.endswith("_FROM"):
+                    if mtype.startswith("V_"):
+                        scale[row] = values[1]
+                    elif mtype.startswith("I_"):
+                        scale[row] = values[2]
+                elif mtype.endswith("_TO"):
+                    if mtype.startswith("V_"):
+                        scale[row] = values[3]
+                    elif mtype.startswith("I_"):
+                        scale[row] = values[4]
+
+        table.value[active] = np.divide(
+            table.value[active],
+            scale[active],
+            out=table.value[active].copy(),
+            where=np.abs(scale[active]) > 1e-12,
+        )
         for pos, meas in enumerate(measurements):
-            if table_valid is not None:
-                table_valid[pos] = bool(meas.valid)
-                table_weight[pos] = float(meas.weight)
-            if not meas.valid or meas.weight <= 0.0:
-                continue
-            scale = self._hybrid_measurement_scale(meas)
-            meas.value = float(meas.value) / scale
-            if table_value is not None:
-                table_value[pos] = meas.value
+            meas.value = float(table.value[pos])
 
     def _sync_measurement_table_from_partition_tables(
         self,
@@ -1251,19 +1467,19 @@ class HybridStateEstimator:
 
     def _add_pseudo_power_measurements(self) -> None:
         """Delegate AC/DC pseudo rows, then add missing converter-device pseudo rows."""
-        sources = self._initial_measurement_sources_by_side()
         if self._ac_sub_estimator is not None:
             add_balance = getattr(self._ac_sub_estimator, "_add_power_balance_constraint_measurements", None)
             methods = ["_add_pseudo_power_measurements"]
             if callable(add_balance):
                 methods.append("_add_power_balance_constraint_measurements")
+            max_idx = self._max_measurement_idx_fast(self.measurements)
             self._call_sub_sequence_with_measurements(
                 self._ac_sub_estimator,
                 self.measurements,
                 methods,
                 preserve_max_idx=True,
-                summary_measurements=sources["ac"],
-                summary_max_idx=self._max_measurement_idx_fast(self.measurements),
+                summary_measurements=self._initial_measurement_sources_by_side()["ac"],
+                summary_max_idx=max_idx,
                 summary_voltage_node_mapper=self._sub_voltage_node_mapper(self._ac_sub_estimator),
             )
             if callable(add_balance):
@@ -1273,12 +1489,13 @@ class HybridStateEstimator:
             methods = ["_add_pseudo_power_measurements"]
             if callable(add_constraints):
                 methods.append("_add_zero_branch_constraint_measurements")
+            max_idx = self._max_measurement_idx_fast(self.measurements)
             self._call_sub_sequence_with_measurements(
                 self._dc_sub_estimator,
                 self.measurements,
                 methods,
-                summary_measurements=sources["dc"],
-                summary_max_idx=self._max_measurement_idx_fast(self.measurements),
+                summary_measurements=self._initial_measurement_sources_by_side()["dc"],
+                summary_max_idx=max_idx,
                 summary_voltage_node_mapper=self._sub_voltage_node_mapper(self._dc_sub_estimator),
             )
         self._populate_side_device_pseudo_values()
@@ -1441,8 +1658,9 @@ class HybridStateEstimator:
         self.hybrid_state_start = ac_n + dc_n
         self.n_state = len(state_meta)
         self.state_meta = state_meta
-        self.state_labels = state_labels_from_metadata(self.state_meta)
-        self.state_sides = state_sides_from_metadata(self.state_meta)
+        labels = [meta.legacy_label for meta in state_meta]
+        self.state_labels = labels if all(labels) else state_labels_from_metadata(self.state_meta)
+        self.state_sides = ["ac"] * ac_n + ["dc"] * dc_n + ["hybrid"] * self.hybrid_n_state
         self.ac_state_labels = list(self._ac_sub_estimator.state_labels) if self._ac_sub_estimator is not None else []
         self.dc_state_labels = list(self._dc_sub_estimator.state_labels) if self._dc_sub_estimator is not None else []
         self.ac_state_layout = (
@@ -1451,13 +1669,7 @@ class HybridStateEstimator:
             else {"state_labels": [], "n_state": 0}
         )
         self.dc_state_layout = (
-            {
-                "state_labels": self._dc_sub_estimator.state_labels,
-                "state_meta": getattr(self._dc_sub_estimator, "state_meta", []),
-                "voltage_col": self._dc_sub_estimator.voltage_col,
-                "n_state": self._dc_sub_estimator.n_state,
-                "references": getattr(self._dc_sub_estimator, "references", []),
-            }
+            self._dc_sub_estimator.state_layout()
             if self._dc_sub_estimator is not None
             else {"state_labels": [], "n_state": 0}
         )
@@ -1523,6 +1735,7 @@ class HybridStateEstimator:
             side_by_device_type=self._MEASUREMENT_SIDE_BY_DEVICE_TYPE,
             table_builder=_measurement_table_from_measurements,
             rows_by_device_type_code=active_view.rows_by_device_type_code,
+            as_view=True,
             sides=("ac", "dc", "hybrid"),
         )
 
@@ -1982,6 +2195,35 @@ class HybridStateEstimator:
 
     def _seed_hybrid_power_states_from_measurements(self, x: np.ndarray) -> None:
         measurements = getattr(self, "hybrid_meas", None) or self.measurements
+        if measurements is getattr(self, "hybrid_meas", None) and hasattr(self, "_active_hybrid_measurement_plan"):
+            plan = self._active_hybrid_measurement_plan
+            dcac_mask = (plan.dcac_codes >= 1) & (plan.dcac_codes <= 3)
+            acac_mask = (plan.acac_codes >= 1) & (plan.acac_codes <= 4)
+            if not np.any(dcac_mask) and not np.any(acac_mask):
+                return
+            rows = []
+            cols = []
+            if np.any(dcac_mask):
+                rows.append(plan.dcac_rows[dcac_mask].astype(np.int64, copy=False))
+                cols.append(
+                    (
+                        3 * plan.dcac_pos[dcac_mask].astype(np.int64, copy=False)
+                        + plan.dcac_codes[dcac_mask].astype(np.int64, copy=False)
+                        - 1
+                    )
+                )
+            if np.any(acac_mask):
+                rows.append(plan.acac_rows[acac_mask].astype(np.int64, copy=False))
+                cols.append(
+                    (
+                        3 * len(self.dcac_converters)
+                        + 4 * plan.acac_pos[acac_mask].astype(np.int64, copy=False)
+                        + plan.acac_codes[acac_mask].astype(np.int64, copy=False)
+                        - 1
+                    )
+                )
+            x[np.concatenate(cols)] = self.active_z[np.concatenate(rows)]
+            return
         seed_plan = self._hybrid_seed_measurement_plan_for(measurements)
         if seed_plan.measurement_row.size == 0:
             return
@@ -2016,7 +2258,7 @@ class HybridStateEstimator:
             if cached.size == getattr(self, "n_state", 0):
                 return cached.copy()
         if hasattr(self, "active_measurements") and getattr(self, "n_state", 0) > 0:
-            self._rebuild_initial_state_cache()
+            self._rebuild_initial_state_cache(flat=flat)
             cached = self.flat_state if flat else self.power_flow_state
             if cached.size == getattr(self, "n_state", 0):
                 return cached.copy()
@@ -2044,10 +2286,13 @@ class HybridStateEstimator:
             self._seed_state_from_real_voltage_measurements(x)
         return x
 
-    def _rebuild_initial_state_cache(self) -> None:
+    def _rebuild_initial_state_cache(self, flat: Optional[bool] = None) -> None:
         self._initial_state_cache_ready = False
-        self.power_flow_state = self._build_initial_state(flat=False)
-        self.flat_state = self._build_initial_state(flat=True)
+        flat = self.flat_start if flat is None else bool(flat)
+        if flat:
+            self.flat_state = self._build_initial_state(flat=True)
+        else:
+            self.power_flow_state = self._build_initial_state(flat=False)
         self._initial_state_cache_ready = True
 
     def _invalidate_initial_state_cache(self) -> None:
@@ -2383,6 +2628,8 @@ class HybridStateEstimator:
     def _invalidate_measurement_activity_summary(self) -> None:
         if hasattr(self, "_measurement_activity_summary_cache"):
             delattr(self, "_measurement_activity_summary_cache")
+        if hasattr(self, "_sub_measurement_global_summary_attrs"):
+            self._sub_measurement_global_summary_attrs = None
         if hasattr(self, "_observability_pseudo_candidate_cache"):
             delattr(self, "_observability_pseudo_candidate_cache")
         if hasattr(self, "_ac_real_voltage_observation_node_cache"):
@@ -3502,23 +3749,27 @@ class HybridStateEstimator:
             residual = self._measurement_residual(z, z_est, measurements)
             objective = self._weighted_objective(weight, residual)
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            H = self.jacobian_sparse(x, measurements)
-            if normal_pattern is None and is_sparse_matrix(H):
-                normal_pattern = _normal_equation_structural_pattern(H)
-                if measurements is self.active_measurements:
-                    self._active_normal_pattern = normal_pattern
-            if weighted_residual is not None:
-                np.multiply(weight, residual, out=weighted_residual)
-            gain, _rhs = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=measurements is self.active_measurements,
-            )
+            if final_diagnostics:
+                H = self.jacobian_sparse(x, measurements)
+                if normal_pattern is None and is_sparse_matrix(H):
+                    normal_pattern = _normal_equation_structural_pattern(H)
+                    if measurements is self.active_measurements:
+                        self._active_normal_pattern = normal_pattern
+                if weighted_residual is not None:
+                    np.multiply(weight, residual, out=weighted_residual)
+                gain, _rhs = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    assume_normal_pattern_matches=measurements is self.active_measurements,
+                )
+        if not final_diagnostics:
+            H = None
+            gain = None
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         return EstimateResult(
@@ -3582,7 +3833,7 @@ class HybridStateEstimator:
     ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
         mode = normalize_seresult_return_mode(return_mode)
-        if mode == "none":
+        if mode in ("none", "array"):
             self.se_result = None
             return None
         if bad_items is None or normalized_residual is None:
@@ -3591,7 +3842,7 @@ class HybridStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
-        if mode in ("summary", "array"):
+        if mode == "summary":
             self.se_result = build_seresult_summary(
                 result,
                 bad_items=bad_items,
@@ -3621,6 +3872,8 @@ class HybridStateEstimator:
         self._require_prepared("run()")
         mode = normalize_seresult_return_mode(return_mode)
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
+        array_only = mode == "array"
+        needs_bad_data = (not skip_bad_data) and not array_only
         if observability is None:
             observability = self.observability_analysis()
         self.observability_result = observability
@@ -3634,19 +3887,19 @@ class HybridStateEstimator:
         else:
             result = self.estimate(
                 verbose=verbose,
-                final_diagnostics=final_diagnostics and not skip_bad_data,
+                final_diagnostics=final_diagnostics and needs_bad_data,
                 observability=observability,
             )
         self.estimate_result = result
         self.removed_bad_data = removed
-        if skip_bad_data:
+        if skip_bad_data or array_only:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:
             bad_items, normalized = self.identify_bad_data(result, threshold)
         self.bad_items = bad_items
         self.normalized_residual = normalized
-        if mode == "none":
+        if mode in ("none", "array"):
             self.se_result = None
             return None
         return self.build_se_result(
@@ -3788,7 +4041,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
-    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, or none.")
+    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 

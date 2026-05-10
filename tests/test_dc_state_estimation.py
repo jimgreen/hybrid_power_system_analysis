@@ -11,6 +11,36 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class DCStateEstimationTest(unittest.TestCase):
+    def test_dc_state_layout_and_nonflat_seed_use_cached_arrays(self):
+        import contextlib
+        import io
+
+        from secore.dc_se import DCStateEstimator
+
+        class NonIterable:
+            def __iter__(self):
+                raise AssertionError("DC initial_state should use cached seed arrays")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+                flat_start=False,
+            )
+        expected = estimator.initial_state()
+
+        layout = estimator.state_layout()
+        self.assertIs(layout["state_meta"], estimator.state_meta)
+        self.assertIs(layout["voltage_col"], estimator.voltage_col)
+        self.assertEqual(estimator.n_state, layout["n_state"])
+
+        estimator.voltage_state_pos = NonIterable()
+        estimator.zero_branches = NonIterable()
+        estimator.dcdc_converters = NonIterable()
+        estimator.v_generators = NonIterable()
+
+        np.testing.assert_allclose(estimator.initial_state(), expected, atol=0.0)
+
     def test_summary_cache_uses_table_and_primes_voltage_observation_cache(self):
         from model.meas_model import (
             MEAS_STATUS_PSEUDO,
@@ -45,6 +75,41 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual(2, estimator._max_measurement_idx)
         self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
         self.assertEqual({1: 1.02}, estimator._real_voltage_observation_nodes())
+
+    def test_measurement_parser_uses_status_fast_path_without_status_column(self):
+        import secore.dc_se as dc_se
+        from model.meas_model import MEAS_STATUS_INVALID, MEAS_STATUS_NORMAL
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@idx name dev_type dev_name meas_type weight valid value",
+                        "#1 v1 DCNode n1 V 2.0 1 1.01",
+                        "#2 v2 DCNode n2 V 2.0 0 0.99",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_normalize = dc_se.normalize_measurement_status
+
+            def fail_normalize(*_args, **_kwargs):
+                raise AssertionError("rows without status should use direct status codes")
+
+            dc_se.normalize_measurement_status = fail_normalize
+            try:
+                measurements = dc_se._read_measurements_direct(meas_file)
+            finally:
+                dc_se.normalize_measurement_status = original_normalize
+
+        self.assertEqual([MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID], [meas.status for meas in measurements])
+        np.testing.assert_array_equal(measurements.table.status_code, np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID]))
+        np.testing.assert_array_equal(measurements.table.valid, np.array([True, False]))
 
     def test_summary_cache_maps_only_voltage_rows(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
@@ -307,6 +372,28 @@ class DCStateEstimationTest(unittest.TestCase):
             dc_se.DCPowerNetwork.check_topo = original_check_topo
 
         self.assertTrue(estimator.nodes)
+
+    def test_estimator_load_network_uses_ppc_topology_arrays_without_object_topology(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+
+        original_prepare_topology = dc_se.network_topology.prepare_dc_topology
+
+        def reject_object_topology(*_args, **_kwargs):
+            raise AssertionError("DC SE array load should apply ppc topology arrays directly")
+
+        dc_se.network_topology.prepare_dc_topology = reject_object_topology
+        try:
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+            )
+        finally:
+            dc_se.network_topology.prepare_dc_topology = original_prepare_topology
+
+        self.assertTrue(estimator.nodes)
+        self.assertIsNotNone(getattr(estimator.network, "_topology_arrays", None))
 
     def test_adds_low_weight_pseudo_power_measurements_for_unmetered_generators_and_loads(self):
         from secore.dc_se import DCStateEstimator
@@ -1706,7 +1793,8 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, len(se_result.bad_data))
         self.assertEqual(0, len(se_result.normal_measurements))
 
-    def test_run_array_return_mode_skips_full_seresult_tables(self):
+    def test_run_array_return_mode_keeps_estimate_arrays_only(self):
+        import secore.dc_se as dc_se_module
         from secore.dc_se import DCStateEstimator
         from secore.se_result import SEResult
 
@@ -1716,28 +1804,43 @@ class DCStateEstimationTest(unittest.TestCase):
             auto_prepare=False,
         )
         estimator.prepare()
+        original_build = DCStateEstimator.build_se_result
+        original_summary = dc_se_module.build_seresult_summary
+        original_identify = DCStateEstimator.identify_bad_data
         original_from_estimate = SEResult.from_estimate_result
+
+        def reject_seresult_path(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not build SEResult payloads")
+
+        def reject_bad_data(*_args, **_kwargs):
+            raise AssertionError("array return_mode should not run post-estimation bad-data analysis")
 
         def reject_full_tables(*_args, **_kwargs):
             raise AssertionError("array return_mode should not build full SEResult measurement tables")
 
+        DCStateEstimator.build_se_result = reject_seresult_path
+        dc_se_module.build_seresult_summary = reject_seresult_path
+        DCStateEstimator.identify_bad_data = reject_bad_data
         SEResult.from_estimate_result = reject_full_tables
         try:
-            se_result = estimator.run(return_mode="array", verbose=False, skip_bad_data=True)
+            se_result = estimator.run(return_mode="array", verbose=False)
         finally:
+            DCStateEstimator.build_se_result = original_build
+            dc_se_module.build_seresult_summary = original_summary
+            DCStateEstimator.identify_bad_data = original_identify
             SEResult.from_estimate_result = original_from_estimate
         result = estimator.estimate_result
 
-        self.assertIs(se_result, estimator.se_result)
+        self.assertIsNone(se_result)
+        self.assertIsNone(estimator.se_result)
         self.assertTrue(result.converged)
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
-        self.assertGreater(se_result.statistics.normal_measurement_count, 0)
-        self.assertEqual(0, len(se_result.prefiltered_measurements))
-        self.assertEqual(0, len(se_result.pseudo_measurements))
-        self.assertEqual(0, len(se_result.bad_data))
-        self.assertEqual(0, len(se_result.normal_measurements))
+        self.assertIsNone(result.H)
+        self.assertIsNone(result.gain)
+        self.assertEqual([], estimator.bad_items)
+        self.assertEqual(0, estimator.normalized_residual.size)
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator

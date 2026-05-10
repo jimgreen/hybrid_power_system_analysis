@@ -328,26 +328,33 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             self.assertEqual(expected[key].shape, actual[key].shape)
             np.testing.assert_allclose(expected[key], actual[key], atol=0.0)
 
-    def test_build_dc_ppc_from_e_file_delegates_through_network_model(self):
+    def test_build_dc_ppc_from_e_file_builds_directly_from_loaded_rows(self):
         from model import dc_array_model
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         dc_array_model.clear_dc_ppc_cache(e_file)
-        original = dc_array_model.build_dc_ppc_from_network
-        calls = []
+        original_network_builder = dc_array_model.build_dc_ppc_from_network
+        original_model_builder = dc_array_model._build_dc_ppc_from_model
+        original_file_factory = dc_array_model.efile_factory_from_file
+        original_rows_factory = dc_array_model.efile_factory_from_rows
 
-        def counted_builder(network):
-            calls.append((network.__class__.__name__, len(network.nodes)))
-            return original(network)
+        def reject_object_path(*_args, **_kwargs):
+            raise AssertionError("DC E-file PPC load should not build dynamic model/network objects")
 
-        dc_array_model.build_dc_ppc_from_network = counted_builder
+        dc_array_model.build_dc_ppc_from_network = reject_object_path
+        dc_array_model._build_dc_ppc_from_model = reject_object_path
+        dc_array_model.efile_factory_from_file = reject_object_path
+        dc_array_model.efile_factory_from_rows = reject_object_path
         try:
             ppc = dc_array_model.build_dc_ppc_from_e_file(e_file)
         finally:
-            dc_array_model.build_dc_ppc_from_network = original
+            dc_array_model.build_dc_ppc_from_network = original_network_builder
+            dc_array_model._build_dc_ppc_from_model = original_model_builder
+            dc_array_model.efile_factory_from_file = original_file_factory
+            dc_array_model.efile_factory_from_rows = original_rows_factory
 
-        self.assertEqual([("DCPowerNetwork", 30)], calls)
         self.assertEqual("dc_ppc_v1", ppc["format"])
+        self.assertEqual(30, ppc["bus"].shape[0])
 
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np

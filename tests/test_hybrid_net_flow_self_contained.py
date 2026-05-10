@@ -274,62 +274,33 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(dc_network.dc.nodes)
         self.assertTrue(hybrid_network.dcac_converters or hybrid_network.acac_converters)
 
-    def test_hybrid_ppc_builds_sub_ppc_from_shared_model(self):
+    def test_hybrid_ppc_builds_sub_ppc_directly_from_loaded_rows(self):
         import model.hybrid_array_model as hybrid_array_model
 
         case_path = ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
         original_factory = hybrid_array_model.efile_factory_from_file
-        original_ac_builder = hybrid_array_model.build_ac_ppc_from_model
-        original_dc_builder = hybrid_array_model.build_dc_ppc_from_model
-        original_ac_file_builder = getattr(hybrid_array_model, "build_ac_ppc_from_e_file", None)
-        original_dc_file_builder = getattr(hybrid_array_model, "build_dc_ppc_from_e_file", None)
+        original_rows_factory = hybrid_array_model.efile_factory_from_rows
+        original_ac_builder = hybrid_array_model._build_ac_ppc_from_model
+        original_dc_builder = hybrid_array_model._build_dc_ppc_from_model
+        original_normalize = hybrid_array_model.normalize_model_named_units
 
-        calls = {"factory": 0, "ac_model": 0, "dc_model": 0}
+        def reject_object_path(*_args, **_kwargs):
+            raise AssertionError("hybrid E-file PPC load should not build dynamic model objects")
 
-        def counted_factory(*args, **kwargs):
-            calls["factory"] += 1
-            return original_factory(*args, **kwargs)
-
-        def counted_ac_builder(model, **kwargs):
-            calls["ac_model"] += 1
-            self.assertTrue(getattr(model, "ACNode", []))
-            return original_ac_builder(model, **kwargs)
-
-        def counted_dc_builder(model, **kwargs):
-            calls["dc_model"] += 1
-            self.assertTrue(getattr(model, "DCNode", []))
-            return original_dc_builder(model, **kwargs)
-
-        def reject_file_builder(*_args, **_kwargs):
-            raise AssertionError("hybrid ppc builder should use the shared model, not file-level sub builders")
-
-        hybrid_array_model.efile_factory_from_file = counted_factory
-        hybrid_array_model.build_ac_ppc_from_model = counted_ac_builder
-        hybrid_array_model.build_dc_ppc_from_model = counted_dc_builder
-        if original_ac_file_builder is not None:
-            hybrid_array_model.build_ac_ppc_from_e_file = reject_file_builder
-        if original_dc_file_builder is not None:
-            hybrid_array_model.build_dc_ppc_from_e_file = reject_file_builder
+        hybrid_array_model.efile_factory_from_file = reject_object_path
+        hybrid_array_model.efile_factory_from_rows = reject_object_path
+        hybrid_array_model._build_ac_ppc_from_model = reject_object_path
+        hybrid_array_model._build_dc_ppc_from_model = reject_object_path
+        hybrid_array_model.normalize_model_named_units = reject_object_path
         try:
             _network, ppc = hybrid_array_model.build_hybrid_ppc_from_e_file(case_path)
         finally:
             hybrid_array_model.efile_factory_from_file = original_factory
-            hybrid_array_model.build_ac_ppc_from_model = original_ac_builder
-            hybrid_array_model.build_dc_ppc_from_model = original_dc_builder
-            if original_ac_file_builder is None:
-                if hasattr(hybrid_array_model, "build_ac_ppc_from_e_file"):
-                    del hybrid_array_model.build_ac_ppc_from_e_file
-            else:
-                hybrid_array_model.build_ac_ppc_from_e_file = original_ac_file_builder
-            if original_dc_file_builder is None:
-                if hasattr(hybrid_array_model, "build_dc_ppc_from_e_file"):
-                    del hybrid_array_model.build_dc_ppc_from_e_file
-            else:
-                hybrid_array_model.build_dc_ppc_from_e_file = original_dc_file_builder
+            hybrid_array_model.efile_factory_from_rows = original_rows_factory
+            hybrid_array_model._build_ac_ppc_from_model = original_ac_builder
+            hybrid_array_model._build_dc_ppc_from_model = original_dc_builder
+            hybrid_array_model.normalize_model_named_units = original_normalize
 
-        self.assertEqual(1, calls["factory"])
-        self.assertEqual(1, calls["ac_model"])
-        self.assertEqual(1, calls["dc_model"])
         self.assertIs(ppc["ac_network"].ppc, ppc["ac"])
         self.assertIs(ppc["dc_network"].ppc, ppc["dc"])
         self.assertEqual(10, len(ppc["ac_network"].nodes))
@@ -677,7 +648,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         network.topo()
 
         from ac_model import ACPowerNetwork
-        from dc_model import DCPowerNetwork
+        from dc_array_model import DCPowerNetwork
 
         self.assertIsInstance(network.ac, ACPowerNetwork)
         self.assertIsInstance(network.dc, DCPowerNetwork)

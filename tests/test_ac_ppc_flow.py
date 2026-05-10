@@ -305,26 +305,33 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(ppc["bus"][1:], expected["bus"][1:])
         np.testing.assert_array_equal(ppc["bus_name"], expected["bus_name"])
 
-    def test_build_ac_ppc_from_e_file_delegates_through_network_model(self):
+    def test_build_ac_ppc_from_e_file_builds_directly_from_loaded_rows(self):
         import ac_array_model
 
         case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ac_array_model.clear_ac_ppc_cache(case_path)
-        original = ac_array_model.build_ac_ppc_from_network
-        calls = []
+        original_network_builder = ac_array_model.build_ac_ppc_from_network
+        original_model_builder = ac_array_model._build_ac_ppc_from_model
+        original_file_factory = ac_array_model.efile_factory_from_file
+        original_rows_factory = ac_array_model.efile_factory_from_rows
 
-        def counted_builder(network):
-            calls.append((network.__class__.__name__, len(network.nodes)))
-            return original(network)
+        def reject_object_path(*_args, **_kwargs):
+            raise AssertionError("AC E-file PPC load should not build dynamic model/network objects")
 
-        ac_array_model.build_ac_ppc_from_network = counted_builder
+        ac_array_model.build_ac_ppc_from_network = reject_object_path
+        ac_array_model._build_ac_ppc_from_model = reject_object_path
+        ac_array_model.efile_factory_from_file = reject_object_path
+        ac_array_model.efile_factory_from_rows = reject_object_path
         try:
             ppc = ac_array_model.build_ac_ppc_from_e_file(case_path)
         finally:
-            ac_array_model.build_ac_ppc_from_network = original
+            ac_array_model.build_ac_ppc_from_network = original_network_builder
+            ac_array_model._build_ac_ppc_from_model = original_model_builder
+            ac_array_model.efile_factory_from_file = original_file_factory
+            ac_array_model.efile_factory_from_rows = original_rows_factory
 
-        self.assertEqual([("ACPowerNetwork", 300)], calls)
         self.assertEqual("ac_ppc_v1", ppc["format"])
+        self.assertEqual(300, ppc["bus"].shape[0])
 
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
         source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
@@ -602,6 +609,7 @@ class ACPPCFlowTest(unittest.TestCase):
         array_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
         with contextlib.redirect_stdout(io.StringIO()):
             array_calc.prepare()
+        self.assertEqual([], array_calc.node_list)
         with contextlib.redirect_stdout(io.StringIO()):
             rc = array_calc.run()
 
@@ -611,7 +619,7 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertIn("branch", array_calc.result)
         self.assertIsNone(getattr(array_calc, "lf_result", None))
 
-    def test_ppc_prepare_uses_sparse_connected_components(self):
+    def test_ppc_prepare_uses_shared_ppc_topology(self):
         import ac_lf
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
@@ -619,23 +627,25 @@ class ACPPCFlowTest(unittest.TestCase):
         case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         ppc.pop("_pf_static", None)
+        ppc.pop("_topology_arrays", None)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
 
-        original_connected_components = ac_lf.connected_components
+        original_prepare_topology = ac_lf.network_topology.prepare_ac_topology_ppc
         calls = []
 
-        def wrapped_connected_components(*args, **kwargs):
-            calls.append(args[0].shape)
-            return original_connected_components(*args, **kwargs)
+        def wrapped_prepare_topology(arg):
+            calls.append(arg)
+            return original_prepare_topology(arg)
 
-        ac_lf.connected_components = wrapped_connected_components
+        ac_lf.network_topology.prepare_ac_topology_ppc = wrapped_prepare_topology
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 calc.prepare()
         finally:
-            ac_lf.connected_components = original_connected_components
+            ac_lf.network_topology.prepare_ac_topology_ppc = original_prepare_topology
 
-        self.assertEqual([(ppc["bus"].shape[0], ppc["bus"].shape[0])], calls)
+        self.assertEqual([ppc], calls)
+        self.assertIn("_topology_arrays", ppc)
         self.assertGreater(calc.N, 0)
 
     def test_ppc_prepare_reuses_static_cache_for_second_calc(self):

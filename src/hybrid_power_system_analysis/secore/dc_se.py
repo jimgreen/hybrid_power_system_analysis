@@ -17,6 +17,7 @@ for path in (ROOT_DIR,):
 
 from lfcore.dc_lf import DCPowerFlowCalc, load_dc_ppc_from_e_file
 from efile_read import EBook
+from model import topology as network_topology
 from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BREAK_COLS as DC_BREAK_COLS,
@@ -37,6 +38,7 @@ from model.meas_model import (
     GEN_MEASUREMENT_KIND,
     LOAD_MEASUREMENT_KIND,
     MEAS_STATUS_INVALID,
+    MEAS_STATUS_NORMAL,
     MEAS_STATUS_PSEUDO,
     Measurement,
     MeasurementList,
@@ -113,6 +115,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     value_values = []
     device_type_code_values = []
     status_values = []
+    rows_by_code_values = {}
     append_idx = idx_values.append
     append_name = name_values.append
     append_device_type = device_type_values.append
@@ -136,6 +139,7 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
     meas_type_cache_get = meas_type_cache.get
     device_type_code_get = _DEVICE_TYPE_CODES.get
     idx_col = name_col = dev_type_col = dev_name_col = meas_type_col = weight_col = valid_col = value_col = status_col = -1
+    row_pos = 0
 
     with Path(meas_file).open("r", encoding="utf-8") as handle:
         for line_no, raw_line in enumerate(handle, start=1):
@@ -177,26 +181,35 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
                 raise RuntimeError(f"Malformed Measurement row at line {line_no} in {meas_file}")
 
             raw_device_type = fields[dev_type_col]
-            device_type = device_type_cache_get(raw_device_type)
-            if device_type is None:
+            device_type_entry = device_type_cache_get(raw_device_type)
+            if device_type_entry is None:
                 device_type = intern(raw_device_type)
-                device_type_cache[raw_device_type] = device_type
+                device_type_code = int(device_type_code_get(device_type, 0))
+                code_rows = rows_by_code_values.get(device_type_code)
+                if code_rows is None:
+                    code_rows = []
+                    rows_by_code_values[device_type_code] = code_rows
+                device_type_entry = (device_type, device_type_code, code_rows)
+                device_type_cache[raw_device_type] = device_type_entry
+            device_type, device_type_code, code_rows = device_type_entry
             raw_meas_type = fields[meas_type_col]
-            meas_type = meas_type_cache_get(raw_meas_type)
-            if meas_type is None:
+            meas_type_entry = meas_type_cache_get(raw_meas_type)
+            if meas_type_entry is None:
                 meas_type = intern(raw_meas_type.upper())
-                meas_type_cache[raw_meas_type] = meas_type
+                meas_type_entry = meas_type
+                meas_type_cache[raw_meas_type] = meas_type_entry
+            meas_type = meas_type_entry
 
             idx = int(fields[idx_col])
             name = fields[name_col]
             device_name = fields[dev_name_col]
             weight = float(fields[weight_col])
-            valid = bool(int(fields[valid_col]))
+            valid = fields[valid_col] == "1"
             value = float(fields[value_col])
             status = (
                 normalize_measurement_status(fields[status_col], valid=valid)
                 if status_col >= 0
-                else normalize_measurement_status(None, valid=valid)
+                else MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
             )
             if not measurement_status_is_active(status):
                 valid = False
@@ -220,13 +233,20 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
             append_weight(weight)
             append_valid(valid)
             append_value(value)
-            append_device_type_code(device_type_code_get(device_type, 0))
+            append_device_type_code(device_type_code)
             append_status(status)
+            code_rows.append(row_pos)
+            row_pos += 1
 
     if not found_measurement_block:
         raise RuntimeError(f"{meas_file} does not contain a <Measurement> block")
     if header is None:
         raise RuntimeError(f"{meas_file} Measurement block does not contain a header")
+    device_type_code_array = np.asarray(device_type_code_values, dtype=np.int16)
+    rows_by_code = {
+        int(code): np.asarray(rows, dtype=np.int64)
+        for code, rows in rows_by_code_values.items()
+    }
     table = MeasurementTable(
         idx=np.asarray(idx_values, dtype=np.int64),
         name=np.asarray(name_values, dtype=object),
@@ -236,9 +256,10 @@ def _read_measurements_direct(meas_file: Path) -> MeasurementList:
         weight=np.asarray(weight_values, dtype=np.float64),
         valid=np.asarray(valid_values, dtype=bool),
         value=np.asarray(value_values, dtype=np.float64),
-        device_type_code=np.asarray(device_type_code_values, dtype=np.int16),
+        device_type_code=device_type_code_array,
         angle_mask=np.zeros(len(measurements), dtype=bool),
         status_code=np.asarray(status_values, dtype=np.int16),
+        rows_by_device_type_code=rows_by_code,
     )
     return MeasurementList(measurements, table)
 
@@ -359,46 +380,105 @@ class DCStateEstimator:
         stage_start = time.perf_counter()
         self._build_unit_scale_cache()
 
-        self.nodes = sorted(
-            getattr(self.network, "alive_buses", None)
-            or [bus for bus in getattr(self.network, "buses", []) if getattr(bus, "is_alive", False)]
-            or [node for node in self.network.nodes if getattr(node, "is_alive", False)],
-            key=lambda item: item.idx,
+        topology_arrays = getattr(self.network, "_topology_arrays", None)
+        if topology_arrays is None:
+            source_ppc = getattr(self.network, "ppc", None)
+            topology_arrays = source_ppc.get("_topology_arrays") if isinstance(source_ppc, dict) else None
+        use_topology_arrays = (
+            topology_arrays is not None
+            and len(getattr(self.network, "buses", ())) == len(getattr(topology_arrays, "bus_ids", ()))
+            and len(getattr(self.network, "nodes", ())) == len(getattr(topology_arrays, "node_ids", ()))
         )
+        if use_topology_arrays:
+            active_bus_pos = np.flatnonzero(topology_arrays.bus_alive_mask).astype(np.int32, copy=False)
+            self.nodes = [self.network.buses[int(pos)] for pos in active_bus_pos]
+        else:
+            self.nodes = sorted(
+                getattr(self.network, "alive_buses", None)
+                or [bus for bus in getattr(self.network, "buses", []) if getattr(bus, "is_alive", False)]
+                or [node for node in self.network.nodes if getattr(node, "is_alive", False)],
+                key=lambda item: item.idx,
+            )
         if not self.nodes:
             raise RuntimeError("No alive DC nodes are available for state estimation")
 
         self.node_pos = {}
         self.node_by_name = {}
         self.node_by_idx = {}
-        for pos, bus in enumerate(self.nodes):
-            members = getattr(bus, "nodes", None) or [bus]
-            for node in members:
-                self.node_pos[node.idx] = pos
-                self.node_by_name[node.name] = bus
-                self.node_by_idx[node.idx] = bus
-            self.node_pos.setdefault(bus.idx, pos)
-            self.node_by_name.setdefault(bus.name, bus)
-            self.node_by_idx.setdefault(bus.idx, bus)
-        self.branch_by_name = {br.name: br for br in self.network.branches if getattr(br, "is_alive", False)}
-        self.load_by_name = {load.name: load for load in self.network.loads if getattr(load, "is_alive", False)}
-        self.generator_by_name = {gen.name: gen for gen in self.network.generators if getattr(gen, "is_alive", False)}
-        self.switch_by_name = {sw.name: sw for sw in self.network.switches if getattr(sw, "is_alive", False)}
-        self.break_by_name = {brk.name: brk for brk in getattr(self.network, "breakers", []) if getattr(brk, "is_alive", False)}
-        self.zero_branch_by_name = {
-            zbr.name: zbr
-            for zbr in self.network.zero_branches
-            if getattr(zbr, "is_alive", False)
-        }
-        self.dcdc_by_name = {
-            conv.name: conv
-            for conv in self.network.dcdc_converters
-            if getattr(conv, "is_alive", False)
-        }
+        if use_topology_arrays:
+            bus_solver_pos = np.full(len(topology_arrays.bus_ids), -1, dtype=np.int32)
+            bus_solver_pos[active_bus_pos] = np.arange(active_bus_pos.size, dtype=np.int32)
+            for node_row, node in enumerate(self.network.nodes):
+                bus_pos = int(topology_arrays.node_to_bus_pos[node_row])
+                if bus_pos < 0:
+                    continue
+                solver_pos = int(bus_solver_pos[bus_pos])
+                if solver_pos < 0:
+                    continue
+                bus = self.nodes[solver_pos]
+                self.node_pos[int(node.idx)] = solver_pos
+                self.node_by_name[str(node.name)] = bus
+                self.node_by_idx[int(node.idx)] = bus
+            for pos, bus in enumerate(self.nodes):
+                self.node_pos.setdefault(int(bus.idx), pos)
+                self.node_by_name.setdefault(str(bus.name), bus)
+                self.node_by_idx.setdefault(int(bus.idx), bus)
+        else:
+            for pos, bus in enumerate(self.nodes):
+                members = getattr(bus, "nodes", None) or [bus]
+                for node in members:
+                    self.node_pos[node.idx] = pos
+                    self.node_by_name[node.name] = bus
+                    self.node_by_idx[node.idx] = bus
+                self.node_pos.setdefault(bus.idx, pos)
+                self.node_by_name.setdefault(bus.name, bus)
+                self.node_by_idx.setdefault(bus.idx, bus)
+        if use_topology_arrays:
+            devices = topology_arrays.devices
+
+            def alive_by_name(items, key):
+                mask = devices[key].alive_mask
+                return {dev.name: dev for dev, is_alive in zip(items, mask) if bool(is_alive)}
+
+            self.branch_by_name = alive_by_name(self.network.branches, "branch")
+            self.load_by_name = alive_by_name(self.network.loads, "load")
+            self.generator_by_name = alive_by_name(self.network.generators, "gen")
+            self.switch_by_name = alive_by_name(self.network.switches, "switch")
+            self.break_by_name = alive_by_name(getattr(self.network, "breakers", []), "break")
+            self.zero_branch_by_name = alive_by_name(self.network.zero_branches, "zero_branch")
+            self.dcdc_by_name = alive_by_name(self.network.dcdc_converters, "dcdc")
+        else:
+            self.branch_by_name = {br.name: br for br in self.network.branches if getattr(br, "is_alive", False)}
+            self.load_by_name = {load.name: load for load in self.network.loads if getattr(load, "is_alive", False)}
+            self.generator_by_name = {gen.name: gen for gen in self.network.generators if getattr(gen, "is_alive", False)}
+            self.switch_by_name = {sw.name: sw for sw in self.network.switches if getattr(sw, "is_alive", False)}
+            self.break_by_name = {brk.name: brk for brk in getattr(self.network, "breakers", []) if getattr(brk, "is_alive", False)}
+            self.zero_branch_by_name = {
+                zbr.name: zbr
+                for zbr in self.network.zero_branches
+                if getattr(zbr, "is_alive", False)
+            }
+            self.dcdc_by_name = {
+                conv.name: conv
+                for conv in self.network.dcdc_converters
+                if getattr(conv, "is_alive", False)
+            }
 
         self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
         self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
         self.zero_branches = sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
+        if use_topology_arrays:
+            self.generator_order = sorted(self.generator_by_name.values(), key=lambda item: item.idx)
+            self.load_order = sorted(self.load_by_name.values(), key=lambda item: item.idx)
+        else:
+            self.generator_order = getattr(self.network, "alive_generator_order", None) or sorted(
+                self.generator_by_name.values(),
+                key=lambda item: item.idx,
+            )
+            self.load_order = getattr(self.network, "alive_load_order", None) or sorted(
+                self.load_by_name.values(),
+                key=lambda item: item.idx,
+            )
         self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
         self._defer_prepare_finalize_pending = bool(defer_prepare_finalize)
         if defer_prepare_finalize:
@@ -509,8 +589,10 @@ class DCStateEstimator:
             for gen in self.v_generators
         )
         self.state_meta = state_meta
-        self.state_labels = state_labels_from_metadata(self.state_meta)
+        labels = [meta.legacy_label for meta in state_meta]
+        self.state_labels = labels if all(labels) else state_labels_from_metadata(self.state_meta)
         self._build_apply_state_index()
+        self._build_initial_state_seed_arrays()
         self._build_measurement_plan_device_cache()
         self._record_profile_time("init.state_layout", time.perf_counter() - stage_start)
         self.targeted_observability_pseudo_count = 0
@@ -993,23 +1075,29 @@ class DCStateEstimator:
             if root_l != root_r:
                 parent[root_r] = root_l
 
-        for dev in [*self.zero_branches, *self.switches, *self.breakers]:
-            if dev.i_node in self.node_pos and dev.j_node in self.node_pos:
-                union(self.node_pos[dev.i_node], self.node_pos[dev.j_node])
+        node_pos = self.node_pos
+        for devices in (self.zero_branches, self.switches, self.breakers):
+            for dev in devices:
+                i = node_pos.get(dev.i_node)
+                j = node_pos.get(dev.j_node)
+                if i is not None and j is not None:
+                    union(i, j)
 
         groups: Dict[int, List[int]] = {}
         for pos in range(n):
             groups.setdefault(find(pos), []).append(pos)
-        components = [sorted(group) for group in groups.values()]
+        components = list(groups.values())
         components.sort(key=lambda group: group[0])
         self.zero_tie_components = components
-        self.zero_tie_component_by_pos = np.empty(n, dtype=np.int32)
+        zero_tie_component_by_pos = np.empty(n, dtype=np.int32)
         for component_idx, component in enumerate(components):
-            self.zero_tie_component_by_pos[np.asarray(component, dtype=np.int32)] = component_idx
+            for pos in component:
+                zero_tie_component_by_pos[pos] = component_idx
+        self.zero_tie_component_by_pos = zero_tie_component_by_pos
 
         node_voltage_state = np.full(n, -1, dtype=np.int32)
         voltage_state_pos = []
-        self.voltage_state_nodes: List[np.ndarray] = []
+        self.voltage_state_nodes: List[Sequence[int]] = []
         self.ref_voltages: Dict[int, float] = {}
         reference_voltage_by_pos = {
             self.node_pos[node.idx]: self.node_voltage_measurements[node.idx]
@@ -1017,8 +1105,9 @@ class DCStateEstimator:
             if node.idx in self.node_pos and node.idx in self.node_voltage_measurements
         }
         state_col = 0
+        voltage_expand_pos = []
+        voltage_expand_col = []
         for component in components:
-            component_array = np.asarray(component, dtype=np.int32)
             fixed_pos = next((int(pos) for pos in component if int(pos) in reference_voltage_by_pos), None)
             if fixed_pos is not None:
                 fixed_voltage = max(float(reference_voltage_by_pos[fixed_pos]), self.voltage_floor)
@@ -1026,7 +1115,9 @@ class DCStateEstimator:
                     self.ref_voltages[int(pos)] = fixed_voltage
                 continue
             voltage_state_pos.append(component[0])
-            self.voltage_state_nodes.append(component_array)
+            self.voltage_state_nodes.append(component)
+            voltage_expand_pos.extend(component)
+            voltage_expand_col.extend([state_col] * len(component))
             for pos in component:
                 node_voltage_state[pos] = state_col
             state_col += 1
@@ -1035,17 +1126,8 @@ class DCStateEstimator:
         self.voltage_state_pos = np.asarray(voltage_state_pos, dtype=np.int32)
         self.voltage_col = node_voltage_state.copy()
         self.n_voltage = int(self.voltage_state_pos.size)
-        if self.voltage_state_nodes:
-            self._voltage_expand_pos = np.concatenate(self.voltage_state_nodes).astype(np.int64, copy=False)
-            self._voltage_expand_col = np.concatenate(
-                [
-                    np.full(nodes.size, state_col, dtype=np.int64)
-                    for state_col, nodes in enumerate(self.voltage_state_nodes)
-                ]
-            )
-        else:
-            self._voltage_expand_pos = np.array([], dtype=np.int64)
-            self._voltage_expand_col = np.array([], dtype=np.int64)
+        self._voltage_expand_pos = np.asarray(voltage_expand_pos, dtype=np.int64)
+        self._voltage_expand_col = np.asarray(voltage_expand_col, dtype=np.int64)
         if self.ref_voltages:
             refs = sorted(self.ref_voltages.items())
             self._ref_voltage_pos = np.asarray([pos for pos, _value in refs], dtype=np.int64)
@@ -1316,8 +1398,14 @@ class DCStateEstimator:
     @staticmethod
     def _load_network(e_file: Path) -> DCPowerNetwork:
         """Read the DC case and build topology references used by measurements."""
-        network = build_dc_network_from_ppc(load_dc_ppc_from_e_file(e_file))
-        network.topo()
+        ppc = load_dc_ppc_from_e_file(e_file)
+        topology_arrays = ppc.get("_topology_arrays")
+        if topology_arrays is None:
+            topology_arrays = network_topology.prepare_dc_topology_ppc(ppc)
+            ppc["_topology_arrays"] = topology_arrays
+        network = build_dc_network_from_ppc(ppc)
+        network._topology_arrays = topology_arrays
+        network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True)
         return network
 
     @staticmethod
@@ -1605,7 +1693,15 @@ class DCStateEstimator:
         if hasattr(calc, "x") and hasattr(calc, "N"):
             voltage = np.asarray(calc.x[: calc.N], dtype=np.float64)
             if isinstance(bus, np.ndarray) and bus.size:
-                bus[:, DC_BUS_COLS["voltage"]] = voltage
+                node_pos = getattr(calc, "alive_node_dict", None)
+                if isinstance(node_pos, dict):
+                    bus[:, DC_BUS_COLS["voltage"]] = 0.0
+                    for row, node_idx in enumerate(bus[:, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)):
+                        pos = node_pos.get(int(node_idx), -1)
+                        if 0 <= int(pos) < voltage.size:
+                            bus[row, DC_BUS_COLS["voltage"]] = voltage[int(pos)]
+                else:
+                    bus[:, DC_BUS_COLS["voltage"]] = voltage
             network.ppc = ppc
             if hasattr(network, "_array_model"):
                 network._array_model = ppc
@@ -1921,93 +2017,133 @@ class DCStateEstimator:
                     seed_rows.append((meas.device_type, meas.device_name, mtype, float(meas.value)))
             self._power_flow_seed_rows = seed_rows
             return
-        terminal_kind = _TERMINAL_KIND.get
-        load_kind = _LOAD_MEASUREMENT_KIND.get
-        gen_kind = _GEN_MEASUREMENT_KIND.get
-        node_scale = self._node_measurement_scale_by_name.__getitem__
-        branch_scale = self._branch_measurement_scale_by_name.__getitem__
-        break_scale = self._break_measurement_scale_by_name.__getitem__
-        zero_branch_scale = self._zero_branch_measurement_scale_by_name.__getitem__
-        dcdc_scale = self._dcdc_measurement_scale_by_name.__getitem__
-        gen_scale = self._generator_measurement_scale_by_name.__getitem__
-        load_scale = self._load_measurement_scale_by_name.__getitem__
-        constraint_scale = self._constraint_measurement_scale_by_name.__getitem__
-        seed_rows = []
-        active_device_keys = set()
-        active_measurement_keys = set()
+        table = _measurement_table_from_measurements(self.measurements)
+        self.measurement_table = table
+        try:
+            self.measurements.table = table
+        except AttributeError:
+            pass
+        value = table.value
+        valid = np.asarray(table.valid, dtype=bool)
+        weight = np.asarray(table.weight, dtype=np.float64)
+        active = valid & (weight > 0.0)
+        scale = np.ones(value.size, dtype=np.float64)
+        code = np.asarray(table.device_type_code, dtype=np.int16)
+        name = table.device_name
+        mtype = table.meas_type
+        status_code = measurement_table_status_code(table)
+
+        def fill_scalar(rows: np.ndarray, scale_by_name: Dict[str, float], allowed_type: Optional[str] = None) -> None:
+            if rows.size == 0:
+                return
+            if allowed_type is None:
+                scale[rows] = np.fromiter(
+                    (float(scale_by_name[str(name[int(row)])]) for row in rows),
+                    dtype=np.float64,
+                    count=rows.size,
+                )
+                return
+            selected = rows[mtype[rows] == allowed_type]
+            if selected.size:
+                scale[selected] = np.fromiter(
+                    (float(scale_by_name[str(name[int(row)])]) for row in selected),
+                    dtype=np.float64,
+                    count=selected.size,
+                )
+
+        def fill_tuple(rows: np.ndarray, scale_by_name: Dict[str, Tuple[float, ...]], kind_by_type: Dict[str, int]) -> None:
+            if rows.size == 0:
+                return
+            kinds = np.fromiter((kind_by_type.get(str(item), -1) for item in mtype[rows]), dtype=np.int16, count=rows.size)
+            selected = rows[kinds >= 0]
+            selected_kinds = kinds[kinds >= 0]
+            if selected.size:
+                scale[selected] = np.fromiter(
+                    (
+                        float(scale_by_name[str(name[int(row)])][int(kind)])
+                        for row, kind in zip(selected, selected_kinds)
+                    ),
+                    dtype=np.float64,
+                    count=selected.size,
+                )
+
+        node_rows = np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCNode"]))
+        fill_scalar(node_rows, self._node_measurement_scale_by_name, "V")
+        fill_tuple(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBranch"])),
+            self._branch_measurement_scale_by_name,
+            _TERMINAL_KIND,
+        )
+        fill_tuple(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreak"])),
+            self._break_measurement_scale_by_name,
+            _TERMINAL_KIND,
+        )
+        fill_tuple(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranch"])),
+            self._zero_branch_measurement_scale_by_name,
+            _TERMINAL_KIND,
+        )
+        fill_scalar(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranchConstraint"])),
+            self._constraint_measurement_scale_by_name,
+            "V_DIFF",
+        )
+        fill_scalar(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreakConstraint"])),
+            self._constraint_measurement_scale_by_name,
+            "V_DIFF",
+        )
+        fill_tuple(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCDCConverter"])),
+            self._dcdc_measurement_scale_by_name,
+            _TERMINAL_KIND,
+        )
+        fill_tuple(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCGenerator"])),
+            self._generator_measurement_scale_by_name,
+            _GEN_MEASUREMENT_KIND,
+        )
+        fill_tuple(
+            np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCLoad"])),
+            self._load_measurement_scale_by_name,
+            _LOAD_MEASUREMENT_KIND,
+        )
+        value[active] = np.divide(value[active], scale[active], out=value[active].copy(), where=np.abs(scale[active]) > 1e-12)
+        for pos, meas in enumerate(self.measurements):
+            meas.value = float(value[pos])
+
+        active_rows = np.flatnonzero(active)
+        active_device_keys = set(zip(table.device_type[active_rows], table.device_name[active_rows]))
+        active_measurement_keys = set(zip(table.device_type[active_rows], table.device_name[active_rows], table.meas_type[active_rows]))
         node_voltage_best: Dict[int, Tuple[float, float]] = {}
         real_voltage_best: Dict[int, Tuple[float, float]] = {}
-        max_idx = 0
-        table = getattr(self.measurements, "table", None)
-        table_value = table.value if table is not None and len(table.value) == len(self.measurements) else None
-
-        for pos, meas in enumerate(self.measurements):
-            if meas.idx > max_idx:
-                max_idx = int(meas.idx)
-            if not meas.valid or meas.weight <= 0.0:
-                continue
-            scale = 1.0
-            mtype = meas.meas_type
-            device_name = meas.device_name
-            active_device_keys.add((meas.device_type, device_name))
-            active_measurement_keys.add((meas.device_type, device_name, mtype))
-            if meas.device_type == "DCNode":
-                if mtype == "V":
-                    scale = node_scale(device_name)
-            elif meas.device_type == "DCBranch":
-                kind = terminal_kind(mtype)
-                if kind is not None:
-                    scale = branch_scale(device_name)[kind]
-            elif meas.device_type == "DCBreak":
-                kind = terminal_kind(mtype)
-                if kind is not None:
-                    scale = break_scale(device_name)[kind]
-            elif meas.device_type == "DCZeroBranch":
-                kind = terminal_kind(mtype)
-                if kind is not None:
-                    scale = zero_branch_scale(device_name)[kind]
-            elif meas.device_type == "DCZeroBranchConstraint":
-                if mtype == "V_DIFF":
-                    scale = constraint_scale(device_name)
-            elif meas.device_type == "DCBreakConstraint":
-                if mtype == "V_DIFF":
-                    scale = constraint_scale(device_name)
-            elif meas.device_type == "DCDCConverter":
-                kind = terminal_kind(mtype)
-                if kind is not None:
-                    scale = dcdc_scale(device_name)[kind]
-            elif meas.device_type == "DCGenerator":
-                kind = gen_kind(mtype)
-                if kind is not None:
-                    scale = gen_scale(device_name)[kind]
-            elif meas.device_type == "DCLoad":
-                kind = load_kind(mtype)
-                if kind is not None:
-                    scale = load_scale(device_name)[kind]
-            meas.value = float(meas.value) / scale
-            if table_value is not None:
-                table_value[pos] = meas.value
-            if not is_pseudo_measurement(meas):
-                if mtype not in _VOLTAGE_MEASUREMENT_TYPES:
-                    node_idx = None
-                else:
-                    node_idx = self._voltage_measurement_node_idx(meas.device_type, device_name, mtype)
+        seed_rows = []
+        for pos in active_rows:
+            device_type = str(table.device_type[pos])
+            device_name = str(table.device_name[pos])
+            row_type = str(table.meas_type[pos])
+            row_value = float(value[pos])
+            row_weight = float(weight[pos])
+            is_real_measurement = int(status_code[pos]) != MEAS_STATUS_PSEUDO
+            if is_real_measurement and row_type in _VOLTAGE_MEASUREMENT_TYPES:
+                node_idx = self._voltage_measurement_node_idx(device_type, device_name, row_type)
                 if node_idx is not None and node_idx in self.node_pos:
                     current = real_voltage_best.get(node_idx)
-                    if current is None or float(meas.weight) > current[0]:
-                        real_voltage_best[node_idx] = (float(meas.weight), float(meas.value))
-                if meas.device_type == "DCNode" and mtype == "V" and device_name in self.node_by_name:
+                    if current is None or row_weight > current[0]:
+                        real_voltage_best[node_idx] = (row_weight, row_value)
+                if device_type == "DCNode" and row_type == "V" and device_name in self.node_by_name:
                     node_idx = int(self.node_by_name[device_name].idx)
                     current = node_voltage_best.get(node_idx)
-                    if current is None or float(meas.weight) > current[0]:
-                        node_voltage_best[node_idx] = (float(meas.weight), float(meas.value))
+                    if current is None or row_weight > current[0]:
+                        node_voltage_best[node_idx] = (row_weight, row_value)
             if (
-                (meas.device_type == "DCNode" and mtype == "V")
-                or (meas.device_type == "DCGenerator" and mtype in ("P_GEN", "V_GEN", "I_GEN"))
-                or (meas.device_type == "DCLoad" and mtype in ("P_LOAD", "V_LOAD", "I_LOAD"))
+                (device_type == "DCNode" and row_type == "V")
+                or (device_type == "DCGenerator" and row_type in ("P_GEN", "V_GEN", "I_GEN"))
+                or (device_type == "DCLoad" and row_type in ("P_LOAD", "V_LOAD", "I_LOAD"))
                 or (
-                    meas.device_type == "DCDCConverter"
-                    and mtype
+                    device_type == "DCDCConverter"
+                    and row_type
                     in (
                         "P_FROM",
                         "P_DC",
@@ -2023,10 +2159,10 @@ class DCStateEstimator:
                     )
                 )
             ):
-                seed_rows.append((meas.device_type, device_name, mtype, float(meas.value)))
+                seed_rows.append((device_type, device_name, row_type, row_value))
         self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
-        self._max_measurement_idx = max_idx
+        self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache = {
             node_idx: value for node_idx, (_weight, value) in node_voltage_best.items()
         }
@@ -2211,7 +2347,7 @@ class DCStateEstimator:
             ("DCZeroBranch", self.zero_branches),
             ("DCBreak", self.breakers),
         ):
-            for dev in sorted(devices, key=lambda item: item.idx):
+            for dev in devices:
                 values = []
                 if not any(
                     (device_type, dev.name, meas_type) in measured_keys
@@ -2268,7 +2404,7 @@ class DCStateEstimator:
                     float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0),
                 )
 
-        for load in sorted(self.load_by_name.values(), key=lambda item: item.idx):
+        for load in self.load_order:
             if ("DCLoad", load.name) in measured_devices:
                 continue
             next_idx = self._append_pseudo_measurement(
@@ -2463,7 +2599,7 @@ class DCStateEstimator:
             add("DCLoad", load.name, "P_LOAD", self._load_pseudo_power(load))
             add("DCLoad", load.name, "V_LOAD", voltage)
 
-        for gen in sorted(self.generator_by_name.values(), key=lambda item: item.idx):
+        for gen in self.generator_order:
             voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
             add("DCGenerator", gen.name, "P_GEN", self._generator_pseudo_power(gen))
             add("DCGenerator", gen.name, "V_GEN", voltage)
@@ -2565,11 +2701,11 @@ class DCStateEstimator:
         weight = 10.0
         ideal_devices = [
             ("DCZeroBranchConstraint", zbr)
-            for zbr in sorted(self.zero_branch_by_name.values(), key=lambda item: item.idx)
+            for zbr in self.zero_branches
         ]
         ideal_devices.extend(
             ("DCBreakConstraint", brk)
-            for brk in sorted(self.break_by_name.values(), key=lambda item: item.idx)
+            for brk in self.breakers
         )
         for device_type, dev in ideal_devices:
             key = (device_type, dev.name, "V_DIFF")
@@ -2591,30 +2727,70 @@ class DCStateEstimator:
             next_idx += 1
 
     def initial_state(self) -> np.ndarray:
-        x = np.zeros(self.n_state, dtype=np.float64)
-        if self.flat_start:
-            x[: self.n_voltage] = 1.0
-            for gen in self.v_generators:
-                pos = self.v_generator_start + self.v_generator_pos[gen.name]
-                x[pos] = float(getattr(gen, "p_set", 0.0) or 0.0)
-            return x
+        seed = self._initial_state_flat if self.flat_start else self._initial_state_nonflat
+        return seed.copy()
 
-        for col, node_pos in enumerate(self.voltage_state_pos):
-            node = self.nodes[int(node_pos)]
-            x[col] = float(getattr(node, "voltage", 1.0) or 1.0)
-        for zbr in self.zero_branches:
-            if zbr.name not in self.zero_branch_pos:
-                continue
-            pos = self.switch_start + self.zero_branch_pos[zbr.name]
-            x[pos] = float(getattr(zbr, "current", 0.0) or 0.0)
-        for conv in self.dcdc_converters:
-            pos = self.dcdc_start + 2 * self.dcdc_pos[conv.name]
-            x[pos] = float(getattr(conv, "i_p", 0.0) or 0.0)
-            x[pos + 1] = float(getattr(conv, "j_p", 0.0) or 0.0)
-        for gen in self.v_generators:
-            pos = self.v_generator_start + self.v_generator_pos[gen.name]
-            x[pos] = float(getattr(gen, "p", 0.0) or 0.0)
-        return x
+    def state_layout(self) -> Dict[str, object]:
+        """Expose the canonical DC state layout for reuse by hybrid orchestration."""
+        return {
+            "state_labels": self.state_labels,
+            "state_meta": self.state_meta,
+            "voltage_col": self.voltage_col,
+            "n_state": self.n_state,
+            "references": self.references,
+            "voltage_state_pos": self.voltage_state_pos,
+            "zero_tie_component_by_pos": self.zero_tie_component_by_pos,
+            "zero_tie_components": self.zero_tie_components,
+        }
+
+    def _build_initial_state_seed_arrays(self) -> None:
+        flat = np.zeros(self.n_state, dtype=np.float64)
+        flat[: self.n_voltage] = 1.0
+        if self.n_v_generator:
+            flat[self.v_generator_start :] = np.fromiter(
+                (float(getattr(gen, "p_set", 0.0) or 0.0) for gen in self.v_generators),
+                dtype=np.float64,
+                count=self.n_v_generator,
+            )
+
+        nonflat = np.zeros(self.n_state, dtype=np.float64)
+        if self.n_voltage:
+            nonflat[: self.n_voltage] = np.fromiter(
+                (
+                    float(getattr(self.nodes[int(node_pos)], "voltage", 1.0) or 1.0)
+                    for node_pos in self.voltage_state_pos
+                ),
+                dtype=np.float64,
+                count=self.n_voltage,
+            )
+        if self.n_switch:
+            zero_current = np.zeros(self.n_switch, dtype=np.float64)
+            for zbr in self.zero_branches:
+                pos = self.zero_branch_pos.get(zbr.name)
+                if pos is not None:
+                    zero_current[int(pos)] = float(getattr(zbr, "current", 0.0) or 0.0)
+            nonflat[self.switch_start : self.dcdc_start] = zero_current
+        if self.n_dcdc_power:
+            nonflat[self.dcdc_start : self.v_generator_start] = np.fromiter(
+                (
+                    value
+                    for conv in self.dcdc_converters
+                    for value in (
+                        float(getattr(conv, "i_p", 0.0) or 0.0),
+                        float(getattr(conv, "j_p", 0.0) or 0.0),
+                    )
+                ),
+                dtype=np.float64,
+                count=self.n_dcdc_power,
+            )
+        if self.n_v_generator:
+            nonflat[self.v_generator_start :] = np.fromiter(
+                (float(getattr(gen, "p", 0.0) or 0.0) for gen in self.v_generators),
+                dtype=np.float64,
+                count=self.n_v_generator,
+            )
+        self._initial_state_flat = flat
+        self._initial_state_nonflat = nonflat
 
     def _unpack_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Split WLS state into node voltages, switch currents, converter powers and V-gen powers."""
@@ -3578,6 +3754,7 @@ class DCStateEstimator:
         measurements: Optional[Sequence[Measurement]] = None,
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
+        final_diagnostics: bool = True,
         observability: Optional[ObservabilityResult] = None,
     ) -> EstimateResult:
         """Solve the weighted least-squares DC state estimate with damped Newton steps."""
@@ -3689,23 +3866,27 @@ class DCStateEstimator:
             z_est = self.evaluate(x, measurements)
             residual = z - z_est
             objective = 0.5 * float(np.dot(weight * residual, residual))
-            H = self.jacobian_sparse(x, measurements)
-            if normal_pattern is None and is_sparse_matrix(H):
-                normal_pattern = _normal_equation_structural_pattern(H)
-                if measurements is self.active_measurements:
-                    self._active_normal_pattern = normal_pattern
-            if weighted_residual is not None:
-                np.multiply(weight, residual, out=weighted_residual)
-            gain, _ = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=measurements is self.active_measurements,
-            )
+            if final_diagnostics:
+                H = self.jacobian_sparse(x, measurements)
+                if normal_pattern is None and is_sparse_matrix(H):
+                    normal_pattern = _normal_equation_structural_pattern(H)
+                    if measurements is self.active_measurements:
+                        self._active_normal_pattern = normal_pattern
+                if weighted_residual is not None:
+                    np.multiply(weight, residual, out=weighted_residual)
+                gain, _ = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    assume_normal_pattern_matches=measurements is self.active_measurements,
+                )
+        if not final_diagnostics:
+            H = None
+            gain = None
         self.apply_state(x)
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
@@ -3726,6 +3907,13 @@ class DCStateEstimator:
 
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
         """Compute largest normalized residuals after accounting for measurement leverage."""
+        if result.H is None or result.gain is None:
+            result.H = self.jacobian_sparse(result.x, result.measurements)
+            result.gain, _ = build_normal_equations(
+                result.H,
+                result.residual,
+                np.asarray([meas.weight for meas in result.measurements], dtype=np.float64),
+            )
         threshold = self.params.bad_threshold if threshold is None else threshold
         weights = np.asarray([meas.weight for meas in result.measurements], dtype=np.float64)
         R_diag = 1.0 / weights
@@ -3762,7 +3950,7 @@ class DCStateEstimator:
     ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
         mode = normalize_seresult_return_mode(return_mode)
-        if mode == "none":
+        if mode in ("none", "array"):
             self.se_result = None
             return None
         if bad_items is None or normalized_residual is None:
@@ -3771,7 +3959,7 @@ class DCStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
-        if mode in ("summary", "array"):
+        if mode == "summary":
             self.se_result = build_seresult_summary(
                 result,
                 bad_items=bad_items,
@@ -3800,6 +3988,8 @@ class DCStateEstimator:
         self._require_prepared("run()")
         mode = normalize_seresult_return_mode(return_mode)
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
+        array_only = mode == "array"
+        needs_bad_data = (not skip_bad_data) and not array_only
         if observability is None:
             observability = self.observability_analysis()
         self.observability_result = observability
@@ -3811,17 +4001,21 @@ class DCStateEstimator:
                 verbose=verbose,
             )
         else:
-            result = self.estimate(verbose=verbose, observability=observability)
+            result = self.estimate(
+                verbose=verbose,
+                final_diagnostics=needs_bad_data,
+                observability=observability,
+            )
         self.estimate_result = result
         self.removed_bad_data = removed
-        if skip_bad_data:
+        if skip_bad_data or array_only:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:
             bad_items, normalized = self.identify_bad_data(result, threshold)
         self.bad_items = bad_items
         self.normalized_residual = normalized
-        if mode == "none":
+        if mode in ("none", "array"):
             self.se_result = None
             return None
         return self.build_se_result(
@@ -4040,7 +4234,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated DC states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
-    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, or none.")
+    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
