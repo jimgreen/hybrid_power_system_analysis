@@ -182,7 +182,7 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         e_file = Path("case.e")
         sentinel = object()
         original_read_rows = getattr(hybrid_se, "_read_efile_rows", sentinel)
-        original_build = getattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows", sentinel)
+        original_build = getattr(hybrid_se, "build_hybrid_ppc_with_topology_from_efile_rows", sentinel)
         original_build_network = getattr(hybrid_se, "_build_hybrid_se_network_from_ppc", sentinel)
         original_read_from_file = hybrid_se.HybridPowerNetwork.read_from_file
 
@@ -211,7 +211,7 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             raise AssertionError("Hybrid load should reuse in-memory E rows")
 
         hybrid_se._read_efile_rows = read_rows
-        hybrid_se.build_hybrid_ppc_only_from_efile_rows = build_from_rows
+        hybrid_se.build_hybrid_ppc_with_topology_from_efile_rows = build_from_rows
         hybrid_se._build_hybrid_se_network_from_ppc = build_network
         hybrid_se.HybridPowerNetwork.read_from_file = read_from_file_forbidden
         try:
@@ -222,9 +222,9 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             else:
                 hybrid_se._read_efile_rows = original_read_rows
             if original_build is sentinel:
-                delattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows")
+                delattr(hybrid_se, "build_hybrid_ppc_with_topology_from_efile_rows")
             else:
-                hybrid_se.build_hybrid_ppc_only_from_efile_rows = original_build
+                hybrid_se.build_hybrid_ppc_with_topology_from_efile_rows = original_build
             if original_build_network is sentinel:
                 delattr(hybrid_se, "_build_hybrid_se_network_from_ppc")
             else:
@@ -336,7 +336,7 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         }
 
         original_read_rows = hybrid_se._read_efile_rows
-        original_ppc_only = getattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows", None)
+        original_ppc_loader = getattr(hybrid_se, "build_hybrid_ppc_with_topology_from_efile_rows", None)
         original_full = getattr(hybrid_se, "build_hybrid_ppc_from_efile_rows", None)
 
         def read_rows(path):
@@ -351,16 +351,16 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             raise AssertionError("Hybrid SE array path should not build the full HybridPowerNetwork")
 
         hybrid_se._read_efile_rows = read_rows
-        hybrid_se.build_hybrid_ppc_only_from_efile_rows = build_ppc_only
+        hybrid_se.build_hybrid_ppc_with_topology_from_efile_rows = build_ppc_only
         hybrid_se.build_hybrid_ppc_from_efile_rows = reject_full_loader
         try:
             network = HybridStateEstimator._load_network(e_file)
         finally:
             hybrid_se._read_efile_rows = original_read_rows
-            if original_ppc_only is None:
-                delattr(hybrid_se, "build_hybrid_ppc_only_from_efile_rows")
+            if original_ppc_loader is None:
+                delattr(hybrid_se, "build_hybrid_ppc_with_topology_from_efile_rows")
             else:
-                hybrid_se.build_hybrid_ppc_only_from_efile_rows = original_ppc_only
+                hybrid_se.build_hybrid_ppc_with_topology_from_efile_rows = original_ppc_loader
             if original_full is None:
                 delattr(hybrid_se, "build_hybrid_ppc_from_efile_rows")
             else:

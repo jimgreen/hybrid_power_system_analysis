@@ -203,7 +203,9 @@ Vi^2 * Vj^2 * (P_i + P_j)
 | `summary` | 只保留节点电压、相角和收敛摘要 | 快速检查收敛和电压水平 |
 | `none` | 只保留 `calc.x`、迭代次数和残差，不做结果回填 | 批量性能测试或上层自行读取状态向量 |
 
-`array` 模式下，`run_hybrid_power_flow()` 仍返回 `HybridLFResult` 包装对象以保持 API 兼容；数组结果位于 `result.calc.result` 中。
+`array` 模式下，`run_hybrid_power_flow()` 直接返回数组结果字典，不构造 `HybridLFResult` 包装对象。返回键为
+`ac`、`dc`、`dcac`、`acac` 和 `summary`；其中 `ac`/`dc` 为子求解器数组结果字典，`dcac`/`acac`
+为换流器结果数组，`summary` 只包含收敛和规模摘要。
 
 ## 性能设计
 

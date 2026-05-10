@@ -316,11 +316,13 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
 
         self.assertFalse(hasattr(hybrid_lf, "_build_lf_ac_facade"))
-        self.assertTrue(hasattr(hybrid_lf, "_build_lf_ac_network"))
+        self.assertTrue(hasattr(hybrid_lf, "build_hybrid_ppc_with_topology_from_efile_rows"))
         self.assertTrue(getattr(network.ac, "_lf_lightweight", False))
         self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
         self.assertNotIn("ac_network", network.ppc)
         self.assertNotIn("dc_network", network.ppc)
+        self.assertIn("_topology_arrays", network.ppc["ac"])
+        self.assertIn("_topology_arrays", network.ppc["dc"])
         self.assertEqual(10, len(network.ac.nodes))
         self.assertGreater(len(network.dc.nodes), 0)
         self.assertGreater(len(network.dcac_converters), 0)
@@ -329,24 +331,87 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_lf_loader_does_not_rebuild_full_ac_dc_networks(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        original_ac_builder = hybrid_lf._build_lf_ac_network
-        original_dc_builder = hybrid_lf._build_lf_dc_network
+        original_ppc_loader = hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows
+        calls = []
 
-        def reject_rebuild(*_args, **_kwargs):
-            raise AssertionError("LF loader should stay on the PPC-only lightweight path")
+        def counted_ppc_loader(path, rows):
+            calls.append(Path(path).name)
+            return original_ppc_loader(path, rows)
 
-        hybrid_lf._build_lf_ac_network = reject_rebuild
-        hybrid_lf._build_lf_dc_network = reject_rebuild
+        hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows = counted_ppc_loader
         try:
             network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         finally:
-            hybrid_lf._build_lf_ac_network = original_ac_builder
-            hybrid_lf._build_lf_dc_network = original_dc_builder
+            hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows = original_ppc_loader
 
+        self.assertEqual(["hybrid_net_40.e"], calls)
         self.assertTrue(getattr(network.ac, "_lf_lightweight", False))
         self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
         self.assertIs(network._ac_ppc, network.ppc["ac"])
         self.assertIs(network._dc_ppc, network.ppc["dc"])
+
+    def test_hybrid_lf_array_path_keeps_converters_ppc_backed(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        original_array_device = hybrid_lf._array_device
+
+        def reject_converter_materialization(*_args, **_kwargs):
+            raise AssertionError("Hybrid LF array path should not materialize converter SimpleNamespace objects")
+
+        hybrid_lf._array_device = reject_converter_materialization
+        try:
+            network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
+            self.assertEqual(network.ppc["dcac"].shape[0], len(network.dcac_converters))
+            self.assertEqual(network.ppc["acac"].shape[0], len(network.acac_converters))
+            self.assertNotIsInstance(network.dcac_converters, list)
+            self.assertNotIsInstance(network.acac_converters, list)
+
+            calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="array")
+            with contextlib.redirect_stdout(io.StringIO()):
+                calc.prepare()
+                rc = calc.run(result_mode="array")
+        finally:
+            hybrid_lf._array_device = original_array_device
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual(network.ppc["dcac"].shape[0], calc.N_dcac)
+        self.assertEqual(network.ppc["acac"].shape[0], calc.N_acac)
+        self.assertEqual((calc.N_dcac, 5), calc.result["dcac"].shape)
+        self.assertEqual((calc.N_acac, 6), calc.result["acac"].shape)
+        self.assertFalse(calc.dcac_devices)
+        self.assertFalse(calc.acac_devices)
+
+    def test_hybrid_lf_full_result_builds_converter_entries_from_ppc(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        original_array_device = hybrid_lf._array_device
+
+        def reject_converter_materialization(*_args, **_kwargs):
+            raise AssertionError("Hybrid LF full result should not materialize converter SimpleNamespace objects")
+
+        hybrid_lf._array_device = reject_converter_materialization
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = hybrid_lf.run_hybrid_power_flow(
+                    ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+                    verbose=False,
+                    result_mode="full",
+                )
+        finally:
+            hybrid_lf._array_device = original_array_device
+
+        self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
+        self.assertTrue(result.dcac.dcac_converters)
+        self.assertTrue(result.acac.acac_converters)
+        self.assertFalse(result.calc.dcac_devices)
+        self.assertFalse(result.calc.acac_devices)
+        first_dcac = next(iter(result.dcac.dcac_converters.values()))
+        first_acac = next(iter(result.acac.acac_converters.values()))
+        self.assertGreater(first_dcac.i_v, 0.0)
+        self.assertGreater(first_dcac.j_v, 0.0)
+        self.assertGreater(first_acac.i_v, 0.0)
+        self.assertGreater(first_acac.j_v, 0.0)
 
     def test_hybrid_ppc_model_build_delegates_to_ac_dc_array_helpers(self):
         import model.hybrid_array_model as hybrid_array_model
@@ -466,7 +531,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
     def test_array_result_mode_keeps_arrays_without_hybrid_object_backfill(self):
         import numpy as np
-        from lfcore.hybrid_lf import HybridLFResult, HybridPowerFlowCalc, _read_lf_network_from_file, run_hybrid_power_flow
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file, run_hybrid_power_flow
 
         network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
@@ -490,13 +555,31 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
 
         result = run_hybrid_power_flow(
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            verbose=False,
+            result_mode="array",
+        )
+        self.assertIsInstance(result, dict)
+        self.assertEqual({"ac", "dc", "dcac", "acac", "summary"}, set(result))
+        self.assertNotIn("calc", result)
+        self.assertNotIn("network", result)
+        self.assertTrue(result["summary"]["converged"])
+        self.assertIsInstance(result["ac"]["bus"], np.ndarray)
+        self.assertIsInstance(result["dc"]["bus"], np.ndarray)
+        self.assertIsInstance(result["dcac"], np.ndarray)
+        self.assertIsInstance(result["acac"], np.ndarray)
+
+        ac_only_result = run_hybrid_power_flow(
             ROOT / "data" / "model" / "ac" / "ieee14.e",
             verbose=False,
             result_mode="array",
         )
-        self.assertIsInstance(result, HybridLFResult)
-        self.assertTrue(result.converged)
-        self.assertIn("ac", result.calc.result)
+        self.assertIsInstance(ac_only_result, dict)
+        self.assertTrue(ac_only_result["summary"]["converged"])
+        self.assertIn("bus", ac_only_result["ac"])
+        self.assertIsNone(ac_only_result["dc"])
+        self.assertEqual((0, 5), ac_only_result["dcac"].shape)
+        self.assertEqual((0, 6), ac_only_result["acac"].shape)
 
     def test_single_ac_hybrid_newton_uses_ac_solver_without_global_packaging(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
@@ -566,8 +649,8 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_pure_ac_hybrid_lf_load_uses_lightweight_ac_fast_path(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        original_builder = hybrid_lf.build_hybrid_ppc_from_e_file
-        original_ac_file_builder = hybrid_lf.build_ac_ppc_from_e_file
+        original_builder = hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows
+        original_ac_file_builder = hybrid_lf.build_ac_ppc_with_topology_from_e_file
         original_rows_reader = hybrid_lf._read_efile_rows
         row_reads = 0
 
@@ -582,27 +665,28 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             row_reads += 1
             return original_rows_reader(*args, **kwargs)
 
-        hybrid_lf.build_hybrid_ppc_from_e_file = reject_full_hybrid_builder
-        hybrid_lf.build_ac_ppc_from_e_file = reject_ac_file_builder
+        hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows = reject_full_hybrid_builder
+        hybrid_lf.build_ac_ppc_with_topology_from_e_file = reject_ac_file_builder
         hybrid_lf._read_efile_rows = counted_rows_reader
         try:
             network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "ac" / "ieee14.e")
         finally:
-            hybrid_lf.build_hybrid_ppc_from_e_file = original_builder
-            hybrid_lf.build_ac_ppc_from_e_file = original_ac_file_builder
+            hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows = original_builder
+            hybrid_lf.build_ac_ppc_with_topology_from_e_file = original_ac_file_builder
             hybrid_lf._read_efile_rows = original_rows_reader
 
         self.assertTrue(getattr(network.ac, "_lf_lightweight", False))
         self.assertTrue(hasattr(network, "_ac_ppc"))
         self.assertFalse(hasattr(network, "_dc_ppc"))
+        self.assertIn("_topology_arrays", network._ac_ppc)
         self.assertEqual(14, network.total_nodes)
         self.assertEqual(1, row_reads)
 
     def test_pure_dc_hybrid_lf_load_uses_loaded_rows_once(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        original_builder = hybrid_lf.build_hybrid_ppc_from_e_file
-        original_dc_file_builder = hybrid_lf.build_dc_ppc_from_e_file
+        original_builder = hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows
+        original_dc_file_builder = hybrid_lf.build_dc_ppc_with_topology_from_e_file
         original_rows_reader = hybrid_lf._read_efile_rows
         row_reads = 0
 
@@ -617,19 +701,20 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             row_reads += 1
             return original_rows_reader(*args, **kwargs)
 
-        hybrid_lf.build_hybrid_ppc_from_e_file = reject_full_hybrid_builder
-        hybrid_lf.build_dc_ppc_from_e_file = reject_dc_file_builder
+        hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows = reject_full_hybrid_builder
+        hybrid_lf.build_dc_ppc_with_topology_from_e_file = reject_dc_file_builder
         hybrid_lf._read_efile_rows = counted_rows_reader
         try:
             network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "dc" / "dc_net_30.e")
         finally:
-            hybrid_lf.build_hybrid_ppc_from_e_file = original_builder
-            hybrid_lf.build_dc_ppc_from_e_file = original_dc_file_builder
+            hybrid_lf.build_hybrid_ppc_with_topology_from_efile_rows = original_builder
+            hybrid_lf.build_dc_ppc_with_topology_from_e_file = original_dc_file_builder
             hybrid_lf._read_efile_rows = original_rows_reader
 
         self.assertTrue(getattr(network.dc, "_lf_lightweight", False))
         self.assertFalse(hasattr(network, "_ac_ppc"))
         self.assertTrue(hasattr(network, "_dc_ppc"))
+        self.assertIn("_topology_arrays", network._dc_ppc)
         self.assertEqual(30, network.total_nodes)
         self.assertEqual(1, row_reads)
 

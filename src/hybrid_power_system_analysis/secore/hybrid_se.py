@@ -19,15 +19,13 @@ from paths import measurement_file, model_file
 from ac_lf import matpower_branch_stamp
 from efile_read import _read_efile_rows
 from hybrid_lf import HybridPowerNetwork
-from model import topology as network_topology
 from model.hybrid_array_model import (
     ACAC_COLS,
     ACAC_CONTROL_LABEL,
     DCAC_COLS,
     DCAC_CONTROL_LABEL,
-    build_hybrid_ppc_from_efile_rows,
-    build_hybrid_ppc_only_from_efile_rows,
 )
+from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -527,7 +525,7 @@ class HybridStateEstimator:
     @staticmethod
     def _load_network(e_file: Path) -> HybridPowerNetwork:
         efile_rows = _read_efile_rows(e_file)
-        ppc = build_hybrid_ppc_only_from_efile_rows(e_file, efile_rows)
+        ppc = build_hybrid_ppc_with_topology_from_efile_rows(e_file, efile_rows)
         return _build_hybrid_se_network_from_ppc(ppc)
 
     def _initial_measurement_sources_by_side(self) -> Dict[str, List[Measurement]]:

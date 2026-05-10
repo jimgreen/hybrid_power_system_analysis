@@ -47,8 +47,8 @@ from ac_array_model import (
     SWITCH_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
-    build_ac_ppc_from_e_file,
 )
+from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from paths import measurement_file, model_file
 from model.meas_model import (
@@ -695,10 +695,8 @@ def _normalize_measurement_value(scale_context, meas: "Measurement") -> Optional
 def _build_ac_se_network_from_ppc_dict(ppc: Dict, source: Optional[Path] = None) -> ACPowerNetwork:
     if source is not None:
         ppc["source"] = str(Path(source).resolve())
-    topology_arrays = ppc.get("_topology_arrays")
-    if topology_arrays is None:
-        topology_arrays = network_topology.prepare_ac_topology_ppc(ppc)
-        ppc["_topology_arrays"] = topology_arrays
+    ensure_ac_ppc_topology(ppc)
+    topology_arrays = ppc["_topology_arrays"]
     network = ACPowerNetwork()
     network._se_lightweight = True
     network.ppc = ppc
@@ -872,7 +870,7 @@ def _build_ac_se_network_from_ppc_dict(ppc: Dict, source: Optional[Path] = None)
 
 def _build_ac_se_network_from_ppc(e_file: Path) -> ACPowerNetwork:
     source = Path(e_file).resolve()
-    ppc = build_ac_ppc_from_e_file(source)
+    ppc = build_ac_ppc_with_topology_from_e_file(source)
     return _build_ac_se_network_from_ppc_dict(ppc, source)
 
 

@@ -42,6 +42,7 @@ from ac_array_model import (
     ZERO_BRANCH_COLS,
     build_ac_ppc_from_network,
 )
+from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
 
 
 @dataclass
@@ -59,17 +60,8 @@ def _device_key(device) -> str:
 
 
 def load_ac_ppc_from_e_file(file_name) -> Dict:
-    """Read an AC E file via efile_read-backed array model loading."""
-    from ac_model import ACPowerNetwork
-
-    source = Path(file_name).resolve()
-    network = ACPowerNetwork()
-    network.source = str(source)
-    network.read_from_file(source)
-    network.source = str(source)
-    ppc = build_ac_ppc_from_network(network)
-    ppc["source"] = str(source)
-    return ppc
+    """Read an AC E file into PPC with topology arrays attached."""
+    return build_ac_ppc_with_topology_from_e_file(file_name)
 
 
 _SPARSE_SOLVER = None
@@ -836,10 +828,8 @@ class ACPowerFlowCalc:
         bus_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
         self._ppc_sequential_node_ids = bool(np.array_equal(bus_ids, np.arange(n_bus_all)))
         self._ppc_node_row_by_id = {} if self._ppc_sequential_node_ids else {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
-        topology = ppc.get("_topology_arrays")
-        if topology is None:
-            topology = network_topology.prepare_ac_topology_ppc(ppc)
-            ppc["_topology_arrays"] = topology
+        ensure_ac_ppc_topology(ppc)
+        topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
         active_bus = np.asarray(topology.node_alive_mask, dtype=bool)
         if not np.any(active_bus):

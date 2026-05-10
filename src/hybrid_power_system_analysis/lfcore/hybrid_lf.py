@@ -30,7 +30,6 @@ from ac_array_model import (
     TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
     ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
 )
-from ac_array_model import build_ac_network_from_ppc, build_ac_ppc_from_e_file, build_ac_ppc_from_efile_rows
 from dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BREAK_COLS as DC_BREAK_COLS,
@@ -41,16 +40,19 @@ from dc_array_model import (
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
 )
-from dc_array_model import build_dc_network_from_ppc, build_dc_ppc_from_e_file, build_dc_ppc_from_efile_rows
 from efile_read import _read_efile_rows
 from hybrid_array_model import (
     ACAC_COLS,
     ACAC_CONTROL_LABEL,
     DCAC_COLS,
     DCAC_CONTROL_LABEL,
-    build_hybrid_ppc_from_e_file,
-    build_hybrid_ppc_from_efile_rows,
-    build_hybrid_ppc_only_from_efile_rows,
+)
+from model.ppc_topology import (
+    build_ac_ppc_with_topology_from_e_file,
+    build_ac_ppc_with_topology_from_efile_rows,
+    build_dc_ppc_with_topology_from_e_file,
+    build_dc_ppc_with_topology_from_efile_rows,
+    build_hybrid_ppc_with_topology_from_efile_rows,
 )
 
 
@@ -76,14 +78,6 @@ LINEAR_SOLVER_HELP = (
 
 def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
-
-
-def _build_lf_ac_network(ac_ppc):
-    return build_ac_network_from_ppc(ac_ppc)
-
-
-def _build_lf_dc_network(dc_ppc):
-    return build_dc_network_from_ppc(dc_ppc)
 
 
 class _LightweightHybridNetwork(SimpleNamespace):
@@ -190,6 +184,59 @@ def _ppc_device(static_row, row, name, cols, node_by_idx):
     return _array_device(values.pop("idx", 0), name, **values)
 
 
+class _PpcConverterList:
+    def __init__(self, ppc, table_key, name_key, cols, label_map, field_specs):
+        self.ppc = ppc
+        self.table_key = table_key
+        self.name_key = name_key
+        self.cols = cols
+        self.label_map = label_map
+        self.field_specs = field_specs
+
+    def __len__(self):
+        table = self.ppc.get(self.table_key)
+        return 0 if table is None else int(table.shape[0])
+
+    def __bool__(self):
+        return len(self) > 0
+
+    def _item_at(self, pos):
+        table = self.ppc.get(self.table_key)
+        if table is None:
+            raise IndexError(pos)
+        size = int(table.shape[0])
+        if pos < 0:
+            pos += size
+        if pos < 0 or pos >= size:
+            raise IndexError(pos)
+        row = table[pos]
+        names = self.ppc.get(self.name_key)
+        name = None if names is None or pos >= len(names) else names[pos]
+        values = {}
+        for attr, col_name, kind in self.field_specs:
+            raw = row[self.cols[col_name]]
+            if kind == "int":
+                values[attr] = int(raw)
+            elif kind == "control":
+                values[attr] = self.label_map.get(int(raw), "")
+            elif kind == "none":
+                values[attr] = None
+            else:
+                values[attr] = float(raw)
+        values["is_alive"] = int(row[self.cols["run_stat"]]) == 1
+        return _array_device(row[self.cols["idx"]], name, **values)
+
+    def __iter__(self):
+        for pos in range(len(self)):
+            yield self._item_at(pos)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self._item_at(pos) for pos in range(start, stop, step)]
+        return self._item_at(int(index))
+
+
 def _lightweight_ac_network(ac_ppc):
     network = SimpleNamespace(
         _lf_lightweight=True,
@@ -264,11 +311,16 @@ def _detect_lf_rows_kind(rows) -> str:
 
 
 def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightHybridNetwork:
-    ac_ppc = build_ac_ppc_from_e_file(file_name) if rows is None else build_ac_ppc_from_efile_rows(file_name, rows)
+    ac_ppc = (
+        build_ac_ppc_with_topology_from_e_file(file_name)
+        if rows is None
+        else build_ac_ppc_with_topology_from_efile_rows(file_name, rows)
+    )
     base = ac_ppc["base"]
     ac_network = _lightweight_ac_network(ac_ppc)
     dc_network = _lightweight_dc_network()
     network = _LightweightHybridNetwork(
+        _lf_lightweight=True,
         ac=ac_network,
         dc=dc_network,
         dcac_converters=[],
@@ -286,7 +338,11 @@ def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightH
 
 
 def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightHybridNetwork:
-    dc_ppc = build_dc_ppc_from_e_file(file_name) if rows is None else build_dc_ppc_from_efile_rows(file_name, rows)
+    dc_ppc = (
+        build_dc_ppc_with_topology_from_e_file(file_name)
+        if rows is None
+        else build_dc_ppc_with_topology_from_efile_rows(file_name, rows)
+    )
     base = dc_ppc["base"]
     ac_network = _lightweight_ac_network(
         {
@@ -296,6 +352,7 @@ def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightH
     )
     dc_network = _lightweight_dc_network(dc_ppc)
     network = _LightweightHybridNetwork(
+        _lf_lightweight=True,
         ac=ac_network,
         dc=dc_network,
         dcac_converters=[],
@@ -313,15 +370,67 @@ def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightH
 
 
 def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNetwork:
-    ppc = build_hybrid_ppc_only_from_efile_rows(file_name, rows)
+    ppc = build_hybrid_ppc_with_topology_from_efile_rows(file_name, rows)
     ac_network = _lightweight_ac_network(ppc["ac"])
     dc_network = _lightweight_dc_network(ppc["dc"])
-    dcac, acac = _build_lf_converters(ppc)
     network = _LightweightHybridNetwork(
+        _lf_lightweight=True,
         ac=ac_network,
         dc=dc_network,
-        dcac_converters=dcac,
-        acac_converters=acac,
+        dcac_converters=_PpcConverterList(
+            ppc,
+            "dcac",
+            "dcac_name",
+            DCAC_COLS,
+            DCAC_CONTROL_LABEL,
+            (
+                ("ac_node", "ac_node", "int"),
+                ("dc_node", "dc_node", "int"),
+                ("r1", "r1", "float"),
+                ("r2", "r2", "float"),
+                ("control_type", "control_type", "control"),
+                ("p_ac_set", "p_ac_set", "float"),
+                ("q_ac_set", "q_ac_set", "float"),
+                ("v_ac_set", "v_ac_set", "float"),
+                ("v_dc_set", "v_dc_set", "float"),
+                ("run_stat", "run_stat", "int"),
+                ("dc_p", "dc_p", "float"),
+                ("ac_p", "ac_p", "float"),
+                ("ac_q", "ac_q", "float"),
+                ("dc_i", "dc_i", "float"),
+                ("ac_i", "ac_i", "float"),
+                ("ac_node_obj", "idx", "none"),
+                ("dc_node_obj", "idx", "none"),
+            ),
+        ),
+        acac_converters=_PpcConverterList(
+            ppc,
+            "acac",
+            "acac_name",
+            ACAC_COLS,
+            ACAC_CONTROL_LABEL,
+            (
+                ("i_node", "i_node", "int"),
+                ("j_node", "j_node", "int"),
+                ("r1", "r1", "float"),
+                ("r2", "r2", "float"),
+                ("control_type", "control_type", "control"),
+                ("p_set", "p_set", "float"),
+                ("i_q_set", "i_q_set", "float"),
+                ("j_q_set", "j_q_set", "float"),
+                ("i_v_set", "i_v_set", "float"),
+                ("j_v_set", "j_v_set", "float"),
+                ("run_stat", "run_stat", "int"),
+                ("i_p", "i_p", "float"),
+                ("i_q", "i_q", "float"),
+                ("j_p", "j_p", "float"),
+                ("j_q", "j_q", "float"),
+                ("i_i", "i_i", "float"),
+                ("j_i", "j_i", "float"),
+                ("i_node_obj", "idx", "none"),
+                ("j_node_obj", "idx", "none"),
+            ),
+        ),
         hybrid_islands=[],
     )
     network.ppc = ppc
@@ -334,60 +443,6 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
     network.i_scale = float(base[3])
     network.p_base_kW = float(base[4])
     return network
-
-
-def _build_lf_converters(ppc):
-    dcac = [
-        _array_device(
-            row[DCAC_COLS["idx"]],
-            ppc["dcac_name"][pos],
-            ac_node=int(row[DCAC_COLS["ac_node"]]),
-            dc_node=int(row[DCAC_COLS["dc_node"]]),
-            r1=float(row[DCAC_COLS["r1"]]),
-            r2=float(row[DCAC_COLS["r2"]]),
-            control_type=DCAC_CONTROL_LABEL.get(int(row[DCAC_COLS["control_type"]]), "DCV"),
-            p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
-            q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
-            v_ac_set=float(row[DCAC_COLS["v_ac_set"]]),
-            v_dc_set=float(row[DCAC_COLS["v_dc_set"]]),
-            run_stat=int(row[DCAC_COLS["run_stat"]]),
-            dc_p=float(row[DCAC_COLS["dc_p"]]),
-            ac_p=float(row[DCAC_COLS["ac_p"]]),
-            ac_q=float(row[DCAC_COLS["ac_q"]]),
-            dc_i=float(row[DCAC_COLS["dc_i"]]),
-            ac_i=float(row[DCAC_COLS["ac_i"]]),
-            ac_node_obj=None,
-            dc_node_obj=None,
-        )
-        for pos, row in enumerate(ppc["dcac"])
-    ]
-    acac = [
-        _array_device(
-            row[ACAC_COLS["idx"]],
-            ppc["acac_name"][pos],
-            i_node=int(row[ACAC_COLS["i_node"]]),
-            j_node=int(row[ACAC_COLS["j_node"]]),
-            r1=float(row[ACAC_COLS["r1"]]),
-            r2=float(row[ACAC_COLS["r2"]]),
-            control_type=ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
-            p_set=float(row[ACAC_COLS["p_set"]]),
-            i_q_set=float(row[ACAC_COLS["i_q_set"]]),
-            j_q_set=float(row[ACAC_COLS["j_q_set"]]),
-            i_v_set=float(row[ACAC_COLS["i_v_set"]]),
-            j_v_set=float(row[ACAC_COLS["j_v_set"]]),
-            run_stat=int(row[ACAC_COLS["run_stat"]]),
-            i_p=float(row[ACAC_COLS["i_p"]]),
-            i_q=float(row[ACAC_COLS["i_q"]]),
-            j_p=float(row[ACAC_COLS["j_p"]]),
-            j_q=float(row[ACAC_COLS["j_q"]]),
-            i_i=float(row[ACAC_COLS["i_i"]]),
-            j_i=float(row[ACAC_COLS["j_i"]]),
-            i_node_obj=None,
-            j_node_obj=None,
-        )
-        for pos, row in enumerate(ppc["acac"])
-    ]
-    return dcac, acac
 
 
 def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
@@ -550,8 +605,18 @@ class HybridPowerFlowCalc:
         self.dc_G = None
         self.last_jacobian_shape = (0, 0)
         self._residual_work = np.array([], dtype=np.float64)
-        needs_ac_node_lookup = bool(getattr(network, "dcac_converters", []) or getattr(network, "acac_converters", []))
-        needs_dc_node_lookup = bool(getattr(network, "dcac_converters", []))
+        self._converter_ppc_mode = bool(
+            getattr(network, "_lf_lightweight", False)
+            and isinstance(getattr(network, "ppc", None), dict)
+        )
+        needs_ac_node_lookup = (
+            not self._converter_ppc_mode
+            and bool(getattr(network, "dcac_converters", []) or getattr(network, "acac_converters", []))
+        )
+        needs_dc_node_lookup = (
+            not self._converter_ppc_mode
+            and bool(getattr(network, "dcac_converters", []))
+        )
         self._ac_node_obj_by_idx = (
             {int(node.idx): node for node in getattr(network.ac, "nodes", [])}
             if needs_ac_node_lookup
@@ -683,6 +748,9 @@ class HybridPowerFlowCalc:
         self._clear_dcac_arrays()
         if not self.has_ac or not self.has_dc:
             return
+        if self._converter_ppc_mode:
+            self._prepare_dcac_converters_from_ppc()
+            return
         for conv in self.network.dcac_converters:
             conv.is_alive = False
             if conv.run_stat != 1:
@@ -705,8 +773,87 @@ class HybridPowerFlowCalc:
         self.N_dcac = len(self.dcac_converters)
         self._cache_dcac_arrays()
 
+    def _ac_solver_pos(self, node_id: int) -> int:
+        node_id = int(node_id)
+        pos = self.ac_calc.node_pos.get(node_id) if getattr(self.ac_calc, "node_pos", None) else None
+        if pos is not None:
+            return int(pos)
+        active_ids = getattr(self.ac_calc, "ppc_node_idx", np.array([], dtype=np.int64))
+        if active_ids.size:
+            matches = np.flatnonzero(active_ids.astype(np.int64, copy=False) == node_id)
+            if matches.size:
+                return int(matches[0])
+        return -1
+
+    def _dc_solver_pos(self, node_id: int) -> int:
+        return int(self.dc_calc.alive_node_dict.get(int(node_id), -1))
+
+    def _prepare_dcac_converters_from_ppc(self):
+        table = self.network.ppc.get("dcac")
+        if table is None or table.size == 0:
+            return
+        rows = []
+        ac_pos = []
+        dc_pos = []
+        ctrl_code = []
+        for row_pos, row in enumerate(table):
+            if int(row[DCAC_COLS["run_stat"]]) != 1:
+                continue
+            ac_node = int(row[DCAC_COLS["ac_node"]])
+            dc_node = int(row[DCAC_COLS["dc_node"]])
+            ac_solver_pos = self._ac_solver_pos(ac_node)
+            if ac_solver_pos < 0:
+                continue
+            dc_solver_pos = self._dc_solver_pos(dc_node)
+            if dc_solver_pos < 0:
+                continue
+            if self.ac_calc.node_type[ac_solver_pos] != "PQ":
+                idx = int(row[DCAC_COLS["idx"]])
+                raise ValueError(
+                    f"DCACConverter[{idx}] 的 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[ac_solver_pos]}"
+                )
+            ctrl = int(row[DCAC_COLS["control_type"]])
+            if ctrl not in DCAC_CONTROL_LABEL:
+                raise ValueError(f"未知 DCACConverter 控制模式: {ctrl}")
+            rows.append(row_pos)
+            ac_pos.append(ac_solver_pos)
+            dc_pos.append(dc_solver_pos)
+            ctrl_code.append(ctrl)
+        self.N_dcac = len(rows)
+        if self.N_dcac == 0:
+            return
+        self.dcac_row_pos = np.asarray(rows, dtype=np.int32)
+        active = table[self.dcac_row_pos]
+        self.dcac_idx = active[:, DCAC_COLS["idx"]].astype(np.int32, copy=True)
+        names = self.network.ppc.get("dcac_name", np.asarray([], dtype=object))
+        self.dcac_names = np.asarray(names[self.dcac_row_pos], dtype=object) if len(names) else np.asarray(
+            [str(idx) for idx in self.dcac_idx],
+            dtype=object,
+        )
+        self.dcac_ac_pos = np.asarray(ac_pos, dtype=np.int32)
+        self.dcac_dc_pos = np.asarray(dc_pos, dtype=np.int32)
+        self.dcac_ctrl_code = np.asarray(ctrl_code, dtype=np.int8)
+        self.dcac_r1 = active[:, DCAC_COLS["r1"]].astype(np.float64, copy=True)
+        self.dcac_r2 = active[:, DCAC_COLS["r2"]].astype(np.float64, copy=True)
+        self.dcac_v_dc_set = active[:, DCAC_COLS["v_dc_set"]].astype(np.float64, copy=True)
+        self.dcac_v_ac_set = active[:, DCAC_COLS["v_ac_set"]].astype(np.float64, copy=True)
+        self.dcac_p_ac_set = active[:, DCAC_COLS["p_ac_set"]].astype(np.float64, copy=True)
+        self.dcac_q_ac_set = active[:, DCAC_COLS["q_ac_set"]].astype(np.float64, copy=True)
+        self.dcac_ac_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.dcac_ac_pos], dtype=np.int32)
+        self.dcac_ac_q_row = np.asarray(
+            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.dcac_ac_pos],
+            dtype=np.int32,
+        )
+        self.dcac_dc_eq = np.asarray([self.dc_calc.node_eq[int(pos)] for pos in self.dcac_dc_pos], dtype=np.int32)
+        self.dcac_dc_eq_mask = self.dcac_dc_eq >= 0
+        self.dcac_ac_v_col = self.dcac_ac_q_row.copy()
+        self.dcac_dc_v_col = self.ac_size + self.dcac_dc_pos
+
     def _clear_dcac_arrays(self):
         self.dcac_devices = []
+        self.dcac_row_pos = np.array([], dtype=np.int32)
+        self.dcac_idx = np.array([], dtype=np.int32)
+        self.dcac_names = np.array([], dtype=object)
         self.dcac_ac_pos = np.array([], dtype=np.int32)
         self.dcac_dc_pos = np.array([], dtype=np.int32)
         self.dcac_ctrl_code = np.array([], dtype=np.int8)
@@ -759,6 +906,9 @@ class HybridPowerFlowCalc:
         self._clear_acac_arrays()
         if not self.has_ac:
             return
+        if self._converter_ppc_mode:
+            self._prepare_acac_converters_from_ppc()
+            return
         for conv in self.network.acac_converters:
             conv.is_alive = False
             if conv.run_stat != 1:
@@ -785,8 +935,80 @@ class HybridPowerFlowCalc:
         self.N_acac = len(self.acac_converters)
         self._cache_acac_arrays()
 
+    def _prepare_acac_converters_from_ppc(self):
+        table = self.network.ppc.get("acac")
+        if table is None or table.size == 0:
+            return
+        rows = []
+        i_pos = []
+        j_pos = []
+        ctrl_code = []
+        for row_pos, row in enumerate(table):
+            if int(row[ACAC_COLS["run_stat"]]) != 1:
+                continue
+            i_solver_pos = self._ac_solver_pos(int(row[ACAC_COLS["i_node"]]))
+            if i_solver_pos < 0:
+                continue
+            j_solver_pos = self._ac_solver_pos(int(row[ACAC_COLS["j_node"]]))
+            if j_solver_pos < 0:
+                continue
+            idx = int(row[ACAC_COLS["idx"]])
+            if i_solver_pos == j_solver_pos:
+                raise ValueError(f"ACACConverter[{idx}] 两端不能连接同一个 AC 节点")
+            if self.ac_calc.node_type[i_solver_pos] != "PQ":
+                raise ValueError(
+                    f"ACACConverter[{idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[i_solver_pos]}"
+                )
+            if self.ac_calc.node_type[j_solver_pos] != "PQ":
+                raise ValueError(
+                    f"ACACConverter[{idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[j_solver_pos]}"
+                )
+            ctrl = int(row[ACAC_COLS["control_type"]])
+            if ctrl not in ACAC_CONTROL_LABEL:
+                raise ValueError(f"未知 ACACConverter 控制模式: {ctrl}")
+            rows.append(row_pos)
+            i_pos.append(i_solver_pos)
+            j_pos.append(j_solver_pos)
+            ctrl_code.append(ctrl)
+        self.N_acac = len(rows)
+        if self.N_acac == 0:
+            return
+        self.acac_row_pos = np.asarray(rows, dtype=np.int32)
+        active = table[self.acac_row_pos]
+        self.acac_idx = active[:, ACAC_COLS["idx"]].astype(np.int32, copy=True)
+        names = self.network.ppc.get("acac_name", np.asarray([], dtype=object))
+        self.acac_names = np.asarray(names[self.acac_row_pos], dtype=object) if len(names) else np.asarray(
+            [str(idx) for idx in self.acac_idx],
+            dtype=object,
+        )
+        self.acac_i_pos = np.asarray(i_pos, dtype=np.int32)
+        self.acac_j_pos = np.asarray(j_pos, dtype=np.int32)
+        self.acac_ctrl_code = np.asarray(ctrl_code, dtype=np.int8)
+        self.acac_r1 = active[:, ACAC_COLS["r1"]].astype(np.float64, copy=True)
+        self.acac_r2 = active[:, ACAC_COLS["r2"]].astype(np.float64, copy=True)
+        self.acac_p_set = active[:, ACAC_COLS["p_set"]].astype(np.float64, copy=True)
+        self.acac_i_q_set = active[:, ACAC_COLS["i_q_set"]].astype(np.float64, copy=True)
+        self.acac_j_q_set = active[:, ACAC_COLS["j_q_set"]].astype(np.float64, copy=True)
+        self.acac_i_v_set = active[:, ACAC_COLS["i_v_set"]].astype(np.float64, copy=True)
+        self.acac_j_v_set = active[:, ACAC_COLS["j_v_set"]].astype(np.float64, copy=True)
+        self.acac_i_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.acac_i_pos], dtype=np.int32)
+        self.acac_i_q_row = np.asarray(
+            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.acac_i_pos],
+            dtype=np.int32,
+        )
+        self.acac_j_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.acac_j_pos], dtype=np.int32)
+        self.acac_j_q_row = np.asarray(
+            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.acac_j_pos],
+            dtype=np.int32,
+        )
+        self.acac_i_v_col = self.acac_i_q_row.copy()
+        self.acac_j_v_col = self.acac_j_q_row.copy()
+
     def _clear_acac_arrays(self):
         self.acac_devices = []
+        self.acac_row_pos = np.array([], dtype=np.int32)
+        self.acac_idx = np.array([], dtype=np.int32)
+        self.acac_names = np.array([], dtype=object)
         self.acac_i_pos = np.array([], dtype=np.int32)
         self.acac_j_pos = np.array([], dtype=np.int32)
         self.acac_ctrl_code = np.array([], dtype=np.int8)
@@ -1062,7 +1284,7 @@ class HybridPowerFlowCalc:
         self.acac_j_v_col = self.acac_j_q_row.copy()
 
     def _initial_dcac_x(self):
-        if not self.dcac_converters:
+        if self.N_dcac == 0:
             return np.array([], dtype=np.float64)
         x = np.zeros(self.N_dcac * 3, dtype=np.float64)
         ac_p = np.where(self.dcac_ctrl_code == 2, self.dcac_p_ac_set, 0.0)
@@ -1072,7 +1294,7 @@ class HybridPowerFlowCalc:
         return x
 
     def _initial_acac_x(self):
-        if not self.acac_converters:
+        if self.N_acac == 0:
             return np.array([], dtype=np.float64)
         x = np.zeros(self.N_acac * 4, dtype=np.float64)
         x[0::4] = self.acac_p_set
@@ -1867,6 +2089,13 @@ class HybridPowerFlowCalc:
                 out=np.zeros_like(ac_p),
                 where=np.abs(ac_v) > self.params.min_voltage,
             )
+            if self._converter_ppc_mode and self.dcac_row_pos.size:
+                dcac_table = self.network.ppc["dcac"]
+                dcac_table[self.dcac_row_pos, DCAC_COLS["dc_p"]] = dc_p
+                dcac_table[self.dcac_row_pos, DCAC_COLS["ac_p"]] = ac_p
+                dcac_table[self.dcac_row_pos, DCAC_COLS["ac_q"]] = ac_q
+                dcac_table[self.dcac_row_pos, DCAC_COLS["dc_i"]] = dc_i
+                dcac_table[self.dcac_row_pos, DCAC_COLS["ac_i"]] = ac_i
             for conv, p_dc, p_ac, q_ac, i_dc, i_ac in zip(self.dcac_devices, dc_p, ac_p, ac_q, dc_i, ac_i):
                 conv.dc_p = float(p_dc)
                 conv.ac_p = float(p_ac)
@@ -1898,6 +2127,14 @@ class HybridPowerFlowCalc:
                 out=np.zeros_like(j_p),
                 where=np.abs(vj) > self.params.min_voltage,
             )
+            if self._converter_ppc_mode and self.acac_row_pos.size:
+                acac_table = self.network.ppc["acac"]
+                acac_table[self.acac_row_pos, ACAC_COLS["i_p"]] = i_p
+                acac_table[self.acac_row_pos, ACAC_COLS["i_q"]] = i_q
+                acac_table[self.acac_row_pos, ACAC_COLS["j_p"]] = j_p
+                acac_table[self.acac_row_pos, ACAC_COLS["j_q"]] = j_q
+                acac_table[self.acac_row_pos, ACAC_COLS["i_i"]] = i_i
+                acac_table[self.acac_row_pos, ACAC_COLS["j_i"]] = j_i
             for conv, p_i, q_i, p_j, q_j, cur_i, cur_j in zip(self.acac_devices, i_p, i_q, j_p, j_q, i_i, j_i):
                 conv.i_p = float(p_i)
                 conv.i_q = float(q_i)
@@ -1917,6 +2154,66 @@ class HybridPowerFlowCalc:
         else:
             self.lf_result = self._build_lf_result(ac_V, dc_V)
 
+    @staticmethod
+    def _ppc_converter_key(names, row_pos, idx) -> str:
+        if names is not None and row_pos < len(names):
+            name = str(names[row_pos])
+            if name:
+                return name
+        return str(int(idx))
+
+    def _build_ppc_converter_lf_result(self, result: HybridLFResult, ac_V=None, dc_V=None) -> None:
+        """Build converter full-result dictionaries directly from PPC result tables."""
+        ppc = getattr(self.network, "ppc", {}) or {}
+        if (self.N_dcac or self.N_acac) and (ac_V is None or dc_V is None):
+            ac_x, dc_x, _dcac_x, _acac_x = self._split_x(self.x)
+            _theta, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+
+        dcac_table = ppc.get("dcac")
+        if dcac_table is not None and dcac_table.size:
+            dc_v_by_row = np.zeros(dcac_table.shape[0], dtype=np.float64)
+            ac_v_by_row = np.zeros(dcac_table.shape[0], dtype=np.float64)
+            if self.dcac_row_pos.size and dc_V is not None and ac_V is not None:
+                dc_v_by_row[self.dcac_row_pos] = dc_V[self.dcac_dc_pos]
+                ac_v_by_row[self.dcac_row_pos] = ac_V[self.dcac_ac_pos]
+            names = ppc.get("dcac_name")
+            for row_pos, row in enumerate(dcac_table):
+                if int(row[DCAC_COLS["run_stat"]]) != 1:
+                    continue
+                key = self._ppc_converter_key(names, row_pos, row[DCAC_COLS["idx"]])
+                result.dcac.dcac_converters[key] = SimpleNamespace(
+                    i_p=float(row[DCAC_COLS["dc_p"]]),
+                    i_c=float(row[DCAC_COLS["dc_i"]]),
+                    i_v=float(dc_v_by_row[row_pos]),
+                    j_p=float(row[DCAC_COLS["ac_p"]]),
+                    j_q=float(row[DCAC_COLS["ac_q"]]),
+                    j_c=float(row[DCAC_COLS["ac_i"]]),
+                    j_v=float(ac_v_by_row[row_pos]),
+                )
+
+        acac_table = ppc.get("acac")
+        if acac_table is not None and acac_table.size:
+            i_v_by_row = np.zeros(acac_table.shape[0], dtype=np.float64)
+            j_v_by_row = np.zeros(acac_table.shape[0], dtype=np.float64)
+            if self.acac_row_pos.size and ac_V is not None:
+                i_v_by_row[self.acac_row_pos] = ac_V[self.acac_i_pos]
+                j_v_by_row[self.acac_row_pos] = ac_V[self.acac_j_pos]
+            names = ppc.get("acac_name")
+            for row_pos, row in enumerate(acac_table):
+                if int(row[ACAC_COLS["run_stat"]]) != 1:
+                    continue
+                key = self._ppc_converter_key(names, row_pos, row[ACAC_COLS["idx"]])
+                result.acac.acac_converters[key] = SimpleNamespace(
+                    i_p=float(row[ACAC_COLS["i_p"]]),
+                    i_q=float(row[ACAC_COLS["i_q"]]),
+                    i_c=float(row[ACAC_COLS["i_i"]]),
+                    i_v=float(i_v_by_row[row_pos]),
+                    j_p=float(row[ACAC_COLS["j_p"]]),
+                    j_q=float(row[ACAC_COLS["j_q"]]),
+                    j_c=float(row[ACAC_COLS["j_i"]]),
+                    j_v=float(j_v_by_row[row_pos]),
+                )
+
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
         result = HybridLFResult(
             network=self.network,
@@ -1929,6 +2226,10 @@ class HybridPowerFlowCalc:
             ac=getattr(self.ac_calc, "lf_result", None),
             dc=getattr(self.dc_calc, "lf_result", None),
         )
+        if self._converter_ppc_mode:
+            self._build_ppc_converter_lf_result(result, ac_V, dc_V)
+            return result
+
         for conv in getattr(self.network, "dcac_converters", []):
             if getattr(conv, "run_stat", 1) != 1:
                 continue
@@ -1968,25 +2269,32 @@ def _hybrid_result_from_calc(
     ac_errors=None,
     dc_warnings=None,
     dc_errors=None,
-) -> HybridLFResult:
+) -> Any:
+    mode = getattr(calc, "result_mode", "full")
+    if mode == "array":
+        result = getattr(calc, "result", None)
+        if isinstance(result, dict) and result:
+            return result
+        return {
+            "ac": None,
+            "dc": None,
+            "dcac": np.zeros((0, 5), dtype=np.float64),
+            "acac": np.zeros((0, 6), dtype=np.float64),
+            "summary": {
+                "converged": False,
+                "iterations": int(getattr(calc, "iterations", 0)),
+                "normF": float(getattr(calc, "normF", np.inf)),
+                "total_vars": int(getattr(calc, "total_vars", 0)),
+                "total_eq": int(getattr(calc, "total_eq", 0)),
+            },
+        }
+    if mode == "none":
+        return getattr(calc, "result", {})
+
     result = getattr(calc, "lf_result", None)
     if isinstance(result, dict):
         return result
     if result is None:
-        if getattr(calc, "result_mode", "full") != "full":
-            return HybridLFResult(
-                network=calc.network,
-                ac_network=calc.network.ac,
-                dc_network=calc.network.dc,
-                calc=calc,
-                ac_calc=getattr(calc, "ac_calc", None),
-                dc_calc=getattr(calc, "dc_calc", None),
-                rc=rc,
-                ac_warnings=list(ac_warnings or []),
-                ac_errors=list(ac_errors or []),
-                dc_warnings=list(dc_warnings or []),
-                dc_errors=list(dc_errors or []),
-            )
         result = calc._build_lf_result()
     network = getattr(calc, "network", None)
     if network is not None:
@@ -2014,7 +2322,7 @@ def run_hybrid_power_flow(
     parameters: Optional[PowerFlowParameters] = None,
     linear_solver: str = "scipy",
     result_mode: str = "full",
-) -> HybridLFResult:
+) -> Any:
     # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
     # topology diagnostics remain available through HybridPowerNetwork.prepare()
     # and check_topology(), but the Newton path avoids that duplicate object scan.

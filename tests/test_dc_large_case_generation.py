@@ -200,23 +200,30 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         case_path = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         original_loader = dc_lf._build_dc_ppc_from_e_file
+        original_common_loader = dc_lf.build_dc_ppc_with_topology_from_e_file
         calls = []
 
-        def counted_loader(file_name):
+        def counted_common_loader(file_name):
             calls.append(Path(file_name).name)
-            return original_loader(file_name)
+            return original_common_loader(file_name)
 
-        dc_lf._build_dc_ppc_from_e_file = counted_loader
+        def reject_direct_loader(*_args, **_kwargs):
+            raise AssertionError("DC LF should use the shared E-to-PPC topology loader")
+
+        dc_lf._build_dc_ppc_from_e_file = reject_direct_loader
+        dc_lf.build_dc_ppc_with_topology_from_e_file = counted_common_loader
         try:
             ppc = dc_lf.load_dc_ppc_from_e_file(case_path)
             network = dc_lf._dc_network_from_ppc(ppc)
             calc = DCPowerFlowCalc(network)
         finally:
             dc_lf._build_dc_ppc_from_e_file = original_loader
+            dc_lf.build_dc_ppc_with_topology_from_e_file = original_common_loader
 
         self.assertEqual(["dc_net_30.e"], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("dc_ppc_v1", calc.ppc["format"])
+        self.assertIn("_topology_arrays", calc.ppc)
 
     def test_update_meas_snapshot_supports_dc_breaker_measurements(self):
         import sys

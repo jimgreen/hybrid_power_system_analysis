@@ -975,22 +975,21 @@ class ACStateEstimationTest(unittest.TestCase):
 
     def test_ac_network_load_uses_ppc_file_loader(self):
         import secore.ac_se
-        from ac_array_model import build_ac_ppc_from_e_file as original_loader
         from secore.ac_se import ACStateEstimator
 
         previous_builder = getattr(secore.ac_se, "build_ac_ppc_from_network", None)
-        previous_file_loader = getattr(secore.ac_se, "build_ac_ppc_from_e_file", None)
+        previous_common_loader = secore.ac_se.build_ac_ppc_with_topology_from_e_file
         calls = []
 
-        def counted_file_loader(path):
+        def counted_common_loader(path):
             calls.append(Path(path).name)
-            return original_loader(path)
+            return previous_common_loader(path)
 
         def reject_builder(*_args, **_kwargs):
-            raise AssertionError("AC SE should load the ppc directly from the E file")
+            raise AssertionError("AC SE should use the shared E-to-PPC topology loader")
 
         secore.ac_se.build_ac_ppc_from_network = reject_builder
-        secore.ac_se.build_ac_ppc_from_e_file = counted_file_loader
+        secore.ac_se.build_ac_ppc_with_topology_from_e_file = counted_common_loader
         try:
             estimator = ACStateEstimator(
                 e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
@@ -1001,14 +1000,12 @@ class ACStateEstimationTest(unittest.TestCase):
                 del secore.ac_se.build_ac_ppc_from_network
             else:
                 secore.ac_se.build_ac_ppc_from_network = previous_builder
-            if previous_file_loader is not None:
-                secore.ac_se.build_ac_ppc_from_e_file = previous_file_loader
-            else:
-                del secore.ac_se.build_ac_ppc_from_e_file
+            secore.ac_se.build_ac_ppc_with_topology_from_e_file = previous_common_loader
 
         self.assertEqual(["ieee39.e"], calls)
         self.assertTrue(estimator.nodes)
         self.assertTrue(hasattr(estimator.network, "_array_model"))
+        self.assertIn("_topology_arrays", estimator.network.ppc)
 
     def test_refresh_active_measurements_reuses_all_active_measurement_table(self):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements

@@ -75,6 +75,7 @@ from model.dc_array_model import (
     build_dc_network_from_ppc,
     build_dc_ppc_from_e_file as _build_dc_ppc_from_e_file,
 )
+from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 
 
 @dataclass
@@ -92,16 +93,14 @@ def _device_key(device) -> str:
 
 
 def load_dc_ppc_from_e_file(file_name) -> Dict:
-    """Read a DC E file into a ppc dictionary."""
-    source = Path(file_name).resolve()
-    ppc = _build_dc_ppc_from_e_file(source)
-    ppc["source"] = str(source)
-    return ppc
+    """Read a DC E file into PPC with topology arrays attached."""
+    return build_dc_ppc_with_topology_from_e_file(file_name)
 
 
 def _dc_network_from_ppc(ppc):
+    ensure_dc_ppc_topology(ppc)
     network = build_dc_network_from_ppc(ppc)
-    network_topology.prepare_dc_topology(network)
+    network_topology.apply_dc_topology_arrays(network, ppc["_topology_arrays"])
     return network
 
 
@@ -568,10 +567,8 @@ class DCPowerFlowCalc:
     def _prepare_direct_ppc_topology(self):
         """Build active DC solver-node mapping directly from dc_ppc_v1 arrays."""
         ppc = self.ppc
-        topology = ppc.get("_topology_arrays")
-        if topology is None:
-            topology = network_topology.prepare_dc_topology_ppc(ppc)
-            ppc["_topology_arrays"] = topology
+        ensure_dc_ppc_topology(ppc)
+        topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
         if not np.any(topology.node_alive_mask):
             self.alive_nodes = []

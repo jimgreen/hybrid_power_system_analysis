@@ -16,7 +16,7 @@ for path in (ROOT_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from lfcore.dc_lf import DCPowerFlowCalc, load_dc_ppc_from_e_file
+from lfcore.dc_lf import DCPowerFlowCalc
 from efile_read import EBook
 from model import topology as network_topology
 from model.dc_array_model import (
@@ -34,6 +34,7 @@ from model.dc_array_model import (
     DCPowerNetwork,
     build_dc_network_from_ppc,
 )
+from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -333,11 +334,14 @@ def _ppc_name(names, pos: int, prefix: str, idx: int) -> str:
     return str(names[pos])
 
 
+def load_dc_ppc_from_e_file(file_name) -> Dict:
+    """Read a DC E file into PPC with topology arrays attached."""
+    return build_dc_ppc_with_topology_from_e_file(file_name)
+
+
 def _build_dc_se_network_from_ppc_dict(ppc: Dict) -> DCPowerNetwork:
-    topology_arrays = ppc.get("_topology_arrays")
-    if topology_arrays is None:
-        topology_arrays = network_topology.prepare_dc_topology_ppc(ppc)
-        ppc["_topology_arrays"] = topology_arrays
+    ensure_dc_ppc_topology(ppc)
+    topology_arrays = ppc["_topology_arrays"]
     base = ppc["base"]
     network = SimpleNamespace(
         _se_lightweight=True,

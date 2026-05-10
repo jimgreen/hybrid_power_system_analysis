@@ -219,24 +219,22 @@ class ACPPCFlowTest(unittest.TestCase):
 
     def test_ac_power_flow_can_load_e_file_through_efile_reader_path(self):
         import ac_lf
-        from ac_array_model import build_ac_ppc_from_network as original_builder
         from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         previous_builder = getattr(ac_lf, "build_ac_ppc_from_network", None)
-        previous_file_builder = getattr(ac_lf, "build_ac_ppc_from_e_file", None)
+        previous_common_loader = ac_lf.build_ac_ppc_with_topology_from_e_file
         calls = []
 
-        def counted_builder(network):
-            calls.append((network.__class__.__name__, len(network.nodes)))
-            return original_builder(network)
+        def counted_common_loader(path):
+            calls.append(Path(path).name)
+            return previous_common_loader(path)
 
-        def reject_file_builder(*_args, **_kwargs):
-            raise AssertionError("AC LF should build ppc from an already loaded ACPowerNetwork")
+        def reject_network_builder(*_args, **_kwargs):
+            raise AssertionError("AC LF should use the shared E-to-PPC topology loader")
 
-        ac_lf.build_ac_ppc_from_network = counted_builder
-        if previous_file_builder is not None:
-            ac_lf.build_ac_ppc_from_e_file = reject_file_builder
+        ac_lf.build_ac_ppc_from_network = reject_network_builder
+        ac_lf.build_ac_ppc_with_topology_from_e_file = counted_common_loader
         try:
             ppc = ac_lf.load_ac_ppc_from_e_file(case_path)
             calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
@@ -245,12 +243,12 @@ class ACPPCFlowTest(unittest.TestCase):
                 del ac_lf.build_ac_ppc_from_network
             else:
                 ac_lf.build_ac_ppc_from_network = previous_builder
-            if previous_file_builder is not None:
-                ac_lf.build_ac_ppc_from_e_file = previous_file_builder
+            ac_lf.build_ac_ppc_with_topology_from_e_file = previous_common_loader
 
-        self.assertEqual([("ACPowerNetwork", 300)], calls)
+        self.assertEqual(["ieee300.e"], calls)
         self.assertTrue(calc.array_mode)
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
+        self.assertIn("_topology_arrays", calc.ppc)
 
     def test_network_input_uses_array_kernel_and_writes_back_objects(self):
         from ac_array_model import BUS_COLS, GEN_COLS

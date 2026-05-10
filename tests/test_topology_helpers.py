@@ -258,6 +258,52 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertTrue(all(getattr(gen, "node_obj", None) is not None for gen in network.generators))
         self.assertTrue(all(getattr(branch, "i_node_obj", None) is not None for branch in network.branches))
 
+    def test_common_ppc_topology_builders_attach_topology_arrays(self):
+        from model.ppc_topology import (
+            build_ac_ppc_with_topology_from_e_file,
+            build_dc_ppc_with_topology_from_e_file,
+            build_hybrid_ppc_with_topology_from_efile_rows,
+        )
+        from efile_read import _read_efile_rows
+
+        root = Path(__file__).resolve().parents[1]
+
+        ac_ppc = build_ac_ppc_with_topology_from_e_file(root / "data" / "model" / "ac" / "ieee39.e")
+        self.assertIn("_topology_arrays", ac_ppc)
+        self.assertGreater(ac_ppc["_topology_arrays"].bus_ids.size, 0)
+
+        dc_ppc = build_dc_ppc_with_topology_from_e_file(root / "data" / "model" / "dc" / "dc_net_30.e")
+        self.assertIn("_topology_arrays", dc_ppc)
+        self.assertGreater(dc_ppc["_topology_arrays"].bus_ids.size, 0)
+
+        hybrid_file = root / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+        hybrid_ppc = build_hybrid_ppc_with_topology_from_efile_rows(hybrid_file, _read_efile_rows(hybrid_file))
+        self.assertIn("_topology_arrays", hybrid_ppc["ac"])
+        self.assertIn("_topology_arrays", hybrid_ppc["dc"])
+        self.assertGreater(hybrid_ppc["ac"]["_topology_arrays"].bus_ids.size, 0)
+        self.assertGreater(hybrid_ppc["dc"]["_topology_arrays"].bus_ids.size, 0)
+
+    def test_common_hybrid_ppc_topology_builder_keeps_ppc_only_path(self):
+        from unittest.mock import patch
+
+        import model.hybrid_array_model as hybrid_array_model
+        from efile_read import _read_efile_rows
+        from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+
+        root = Path(__file__).resolve().parents[1]
+        hybrid_file = root / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+
+        with patch.object(
+            hybrid_array_model,
+            "build_hybrid_ppc_from_efile_rows",
+            side_effect=AssertionError("common topology builder should not build full HybridPowerNetwork"),
+        ):
+            ppc = build_hybrid_ppc_with_topology_from_efile_rows(hybrid_file, _read_efile_rows(hybrid_file))
+
+        self.assertEqual("hybrid_ppc_v1", ppc["format"])
+        self.assertIn("_topology_arrays", ppc["ac"])
+        self.assertIn("_topology_arrays", ppc["dc"])
+
 
 if __name__ == "__main__":
     unittest.main()
