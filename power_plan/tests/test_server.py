@@ -129,6 +129,68 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertEqual(state["status"], "STOPPED")
         self.assertEqual(state["cursor_hour"], 0.0)
 
+    def test_optimization_api_start_stop_and_logs(self):
+        original_runtime = server.OPTIMIZATION_RUNTIME
+        server.OPTIMIZATION_RUNTIME = server.OptimizationRuntime()
+        try:
+            status, headers, body = server.handle_api_path("/api/optimization/status")
+            initial = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+            self.assertEqual(initial["status"], "待启动")
+            self.assertIn("metrics", initial)
+            self.assertIn("results", initial)
+            self.assertIn("logs", initial)
+
+            status, headers, body = server.handle_control_path(
+                "/api/optimization/control",
+                json.dumps({"action": "start", "scheme": "方案A"}, ensure_ascii=False).encode("utf-8"),
+            )
+            started = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(started["state"]["status"], "运行中")
+            self.assertEqual(started["state"]["scheme"], "方案A")
+            self.assertTrue(started["state"]["start_time"])
+            self.assertFalse(started["state"]["end_time"])
+            self.assertTrue(any("启动优化规划" in item["message"] for item in started["state"]["logs"]))
+
+            status, headers, body = server.handle_control_path(
+                "/api/optimization/control",
+                json.dumps({"action": "start", "scheme": "方案A"}, ensure_ascii=False).encode("utf-8"),
+            )
+            duplicate = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 409)
+            self.assertEqual(duplicate["error"], "running")
+            self.assertIn("正在运行，无法再次启动", duplicate["message"])
+
+            status, headers, body = server.handle_control_path(
+                "/api/optimization/control",
+                json.dumps({"action": "stop", "scheme": "方案A"}, ensure_ascii=False).encode("utf-8"),
+            )
+            stopped = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertEqual(stopped["state"]["status"], "已停止")
+            self.assertTrue(stopped["state"]["end_time"])
+            self.assertTrue(any("停止优化规划" in item["message"] for item in stopped["state"]["logs"]))
+
+            status, headers, body = server.handle_control_path(
+                "/api/optimization/control",
+                json.dumps({"action": "stop", "scheme": "方案A"}, ensure_ascii=False).encode("utf-8"),
+            )
+            not_running = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 409)
+            self.assertEqual(not_running["error"], "not_running")
+            self.assertIn("没有运行", not_running["message"])
+
+            status, headers, body = server.handle_control_path(
+                "/api/optimization/control",
+                json.dumps({"action": "bad"}).encode("utf-8"),
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(body.decode("utf-8"))["error"], "bad_request")
+        finally:
+            server.OPTIMIZATION_RUNTIME = original_runtime
+
     def test_snapshot_reads_values_from_csv_files(self):
         payload = server.build_snapshot(force_reload=True)
 
@@ -505,7 +567,64 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("justify-content: flex-start", css)
         self.assertIn("white-space: nowrap", css)
         self.assertIn("text-overflow: ellipsis", css)
-        self.assertLess(html.index('id="currentSchemeName"'), html.index(">8760时序数据<"))
+        self.assertLess(html.index('id="currentSchemeName"'), html.index(">时序数据<"))
+
+    def test_planning_page_uses_requested_product_and_time_series_labels(self):
+        html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+
+        self.assertIn(">微电网风光氢储联合规划系统<", html)
+        self.assertIn(">时序数据<", html)
+        self.assertNotIn(">电网规划系统<", html)
+        self.assertNotIn(">电网规划列表<", html)
+        self.assertNotIn(">8760时序数据<", html)
+
+    def test_optimization_page_has_requested_three_area_layout(self):
+        html = (WEB_ROOT / "optimize.html").read_text(encoding="utf-8")
+        planning_html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
+
+        self.assertIn(">微电网风光氢储联合规划系统<", html)
+        self.assertIn('<a class="active" href="optimize.html">启动优化</a>', html)
+        self.assertIn('<aside class="scheme-rail">', html)
+        self.assertIn('<div class="scheme-list-title">方案列表</div>', html)
+        self.assertIn('id="schemeList"', html)
+        self.assertIn('class="optimization-panel"', html)
+        self.assertIn('class="optimization-command-card"', html)
+        self.assertIn('id="startOptimization"', html)
+        self.assertIn('id="stopOptimization"', html)
+        for label in ("当前状态", "启动时刻", "结束时刻", "度电成本", "绿电占比"):
+            self.assertIn(label, html)
+        for tab in ("结果概览", "绿电结果", "安全结果"):
+            self.assertIn(tab, html)
+        self.assertIn('id="overviewResult"', html)
+        self.assertIn('id="greenResult"', html)
+        self.assertIn('id="safetyResult"', html)
+        self.assertIn('id="optimizationLogs"', html)
+        self.assertIn('assets/optimize.js', html)
+        self.assertIn('href="optimize.html">启动优化</a>', planning_html)
+        self.assertIn(".optimization-panel", css)
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr) minmax(120px, 24vh)", css)
+
+    def test_optimization_frontend_polls_status_and_binds_controls(self):
+        script = (WEB_ROOT / "assets" / "optimize.js").read_text(encoding="utf-8")
+
+        self.assertIn("/api/planning/schemes", script)
+        self.assertIn("/api/optimization/status", script)
+        self.assertIn("/api/optimization/control", script)
+        self.assertIn("startOptimization", script)
+        self.assertIn("stopOptimization", script)
+        self.assertIn("正在运行，无法再次启动", script)
+        self.assertIn("没有运行", script)
+        self.assertIn("alert(data.message", script)
+        self.assertIn("setInterval", script)
+        self.assertIn("scheduleOptimizationPolling", script)
+        self.assertIn("state.pollDelay = data.status === \"运行中\" ? 1000 : 4000", script)
+        self.assertIn("renderOptimizationLogs", script)
+        self.assertIn("scrollTop", script)
+        self.assertIn("data-result-tab", script)
+        self.assertIn("结果概览", script)
+        self.assertIn("绿电结果", script)
+        self.assertIn("安全结果", script)
 
     def test_planning_scheme_rail_only_shows_scheme_list_title(self):
         html = (WEB_ROOT / "planning.html").read_text(encoding="utf-8")
@@ -539,8 +658,8 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertNotIn("修改方案名", editor_header)
         self.assertNotIn('id="saveScheme"', topbar)
         self.assertNotIn('id="saveScheme"', rail)
-        self.assertLess(html.index('id="currentSchemeName"'), html.index(">8760时序数据<"))
-        self.assertLess(html.index(">8760时序数据<"), html.index('id="saveScheme"'))
+        self.assertLess(html.index('id="currentSchemeName"'), html.index(">时序数据<"))
+        self.assertLess(html.index(">时序数据<"), html.index('id="saveScheme"'))
 
     def test_planning_scheme_actions_are_horizontal(self):
         css = (WEB_ROOT / "assets" / "planning.css").read_text(encoding="utf-8")
@@ -781,7 +900,9 @@ class PowerPlanServerTest(unittest.TestCase):
         self.assertIn("shouldAutoLoadTimeSeries", script)
         self.assertIn("timeSeriesLoaded", script)
         self.assertIn("时序数据尚未加载", script)
+        self.assertIn("进入时序数据或方案概览", script)
         self.assertIn("自动加载", script)
+        self.assertNotIn("8760时序数据", script)
         self.assertNotIn("data-load-time-series", script)
         self.assertNotIn("点击加载", script)
 

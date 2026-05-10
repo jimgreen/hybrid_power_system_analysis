@@ -141,6 +141,156 @@ class SimuRuntime:
         self._last_tick = now
 
 
+class OptimizationRuntime:
+    """In-memory runtime state for the planning optimization page."""
+
+    def __init__(self) -> None:
+        self.status = "待启动"
+        self.scheme = ""
+        self.start_time = ""
+        self.end_time = ""
+        self.progress = 0
+        self._started_monotonic = 0.0
+        self._last_progress_log = -1
+        self._logs: list[dict[str, str]] = []
+        self._lock = threading.Lock()
+        self._append_log_unlocked("info", "优化规划待启动")
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            self._advance_locked()
+            return self._payload_unlocked()
+
+    def apply(self, action: str, scheme: str = "") -> dict:
+        with self._lock:
+            self._advance_locked()
+            target_scheme = str(scheme or self.scheme or "未选择方案").strip() or "未选择方案"
+            if action == "start":
+                if self.status == "运行中":
+                    if self.scheme == target_scheme:
+                        raise OptimizationStateError("running", f"方案“{target_scheme}”正在运行，无法再次启动")
+                    raise OptimizationStateError("running", f"方案“{self.scheme}”正在运行，无法启动方案“{target_scheme}”")
+                self.status = "运行中"
+                self.scheme = target_scheme
+                self.start_time = _now_text()
+                self.end_time = ""
+                self.progress = 0
+                self._started_monotonic = time.monotonic()
+                self._last_progress_log = -1
+                self._append_log_unlocked("ok", f"启动优化规划，方案：{self.scheme}")
+                self._append_log_unlocked("info", "后台优化规划程序已启动")
+            elif action == "stop":
+                if self.status != "运行中" or self.scheme != target_scheme:
+                    raise OptimizationStateError("not_running", f"方案“{target_scheme}”没有运行")
+                self.status = "已停止"
+                self.end_time = _now_text()
+                self._append_log_unlocked("warn", "停止优化规划")
+            else:
+                raise ValueError(f"unknown optimization action: {action}")
+            return self._payload_unlocked()
+
+    def _advance_locked(self) -> None:
+        if self.status != "运行中":
+            return
+        elapsed = max(0.0, time.monotonic() - self._started_monotonic)
+        self.progress = min(100, int(elapsed * 3))
+        progress_bucket = min(100, (self.progress // 10) * 10)
+        if progress_bucket >= 10 and progress_bucket != self._last_progress_log:
+            self._last_progress_log = progress_bucket
+            self._append_log_unlocked("info", f"优化迭代进度 {progress_bucket}%")
+        if self.progress >= 100:
+            self.status = "已完成"
+            self.end_time = _now_text()
+            self._append_log_unlocked("ok", "优化规划完成")
+
+    def _payload_unlocked(self) -> dict:
+        return {
+            "status": self.status,
+            "scheme": self.scheme,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "progress": self.progress,
+            "metrics": self._metrics_unlocked(),
+            "results": self._results_unlocked(),
+            "logs": list(self._logs),
+        }
+
+    def _metrics_unlocked(self) -> list[dict]:
+        if self.status == "待启动":
+            cost: float | str = "-"
+            green_ratio: float | str = "-"
+        else:
+            cost = round(max(0.42, 0.78 - self.progress * 0.002), 3)
+            green_ratio = round(min(92.0, 52.0 + self.progress * 0.34), 1)
+        return [
+            {"label": "当前状态", "value": self.status, "unit": ""},
+            {"label": "启动时刻", "value": self.start_time or "-", "unit": ""},
+            {"label": "结束时刻", "value": self.end_time or "-", "unit": ""},
+            {"label": "度电成本", "value": cost, "unit": "元/kWh"},
+            {"label": "绿电占比", "value": green_ratio, "unit": "%"},
+        ]
+
+    def _results_unlocked(self) -> dict:
+        cost = round(max(0.42, 0.78 - self.progress * 0.002), 3)
+        green_ratio = round(min(92.0, 52.0 + self.progress * 0.34), 1)
+        reserve_margin = round(max(12.0, 28.0 - self.progress * 0.05), 1)
+        frequency_margin = round(1.08 + min(0.12, self.progress * 0.001), 3)
+        return {
+            "overview": [
+                {"指标": "度电成本", "数值": cost, "单位": "元/kWh", "说明": "基于当前候选方案的综合成本估计"},
+                {"指标": "绿电占比", "数值": green_ratio, "单位": "%", "说明": "风光与氢储供电占比"},
+                {"指标": "优化进度", "数值": self.progress, "单位": "%", "说明": self.status},
+            ],
+            "green": [
+                {"指标": "风电消纳率", "数值": round(min(98.0, 82.0 + self.progress * 0.08), 1), "单位": "%", "说明": "风机出力消纳水平"},
+                {"指标": "光伏消纳率", "数值": round(min(98.5, 84.0 + self.progress * 0.07), 1), "单位": "%", "说明": "光伏出力消纳水平"},
+                {"指标": "弃电率", "数值": round(max(1.0, 9.0 - self.progress * 0.04), 1), "单位": "%", "说明": "新能源未利用电量占比"},
+            ],
+            "safety": [
+                {"指标": "备用裕度", "数值": reserve_margin, "单位": "%", "说明": "负荷扰动后的可用备用"},
+                {"指标": "频率安全裕度", "数值": frequency_margin, "单位": "p.u.", "说明": "频率约束裕度"},
+                {"指标": "N-1校核", "数值": "通过" if self.progress >= 35 else "计算中", "单位": "", "说明": "新能源 N-1 约束校核"},
+            ],
+            "curves": {
+                "overview": [
+                    {"label": "20%", "value": round(cost + 0.08, 3)},
+                    {"label": "40%", "value": round(cost + 0.05, 3)},
+                    {"label": "60%", "value": round(cost + 0.03, 3)},
+                    {"label": "80%", "value": round(cost + 0.01, 3)},
+                    {"label": "当前", "value": cost},
+                ],
+                "green": [
+                    {"label": "风电", "value": round(min(98.0, 82.0 + self.progress * 0.08), 1)},
+                    {"label": "光伏", "value": round(min(98.5, 84.0 + self.progress * 0.07), 1)},
+                    {"label": "氢储", "value": round(min(90.0, 66.0 + self.progress * 0.09), 1)},
+                    {"label": "总体", "value": green_ratio},
+                ],
+                "safety": [
+                    {"label": "备用", "value": reserve_margin},
+                    {"label": "频率", "value": round(frequency_margin * 10, 2)},
+                    {"label": "N-1", "value": 100 if self.progress >= 35 else max(10, self.progress)},
+                ],
+            },
+        }
+
+    def _append_log_unlocked(self, level: str, message: str) -> None:
+        self._logs.append({"time": _now_text(), "level": level, "message": message})
+        if len(self._logs) > 120:
+            del self._logs[:-120]
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class OptimizationStateError(RuntimeError):
+    """Raised when optimization start/stop violates the current runtime state."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class CsvDataSource:
     """Periodically reload dashboard data from CSV files."""
 
@@ -558,6 +708,7 @@ def _load_initial_simu_runtime() -> SimuRuntime:
 
 
 SIMU_RUNTIME = _load_initial_simu_runtime()
+OPTIMIZATION_RUNTIME = OptimizationRuntime()
 DATA_SOURCE = MySqlDataSource()
 PLANNING_STORE = planning_store.PlanningStore()
 
@@ -861,6 +1012,8 @@ def handle_planning_api_path(path: str, method: str = "GET", body: bytes = b"") 
 def handle_api_path(path: str) -> tuple[int, dict[str, str], bytes]:
     if path.startswith("/api/planning/"):
         return handle_planning_api_path(path, "GET", b"")
+    if path == "/api/optimization/status":
+        return _json_response(OPTIMIZATION_RUNTIME.snapshot())
     snapshot = build_snapshot()
     routes = {
         "/api/health": {"ok": True, "timestamp": snapshot["timestamp"]},
@@ -875,6 +1028,17 @@ def handle_api_path(path: str) -> tuple[int, dict[str, str], bytes]:
 
 
 def handle_control_path(path: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
+    if path == "/api/optimization/control":
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+            action = str(payload.get("action", ""))
+            scheme = str(payload.get("scheme", ""))
+            state = OPTIMIZATION_RUNTIME.apply(action, scheme=scheme)
+        except OptimizationStateError as exc:
+            return _json_response({"error": exc.code, "message": str(exc)}, HTTPStatus.CONFLICT)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return _json_response({"error": "bad_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+        return _json_response({"ok": True, "state": state})
     if path != "/api/simu/control":
         return _json_response({"error": "not_found", "path": path}, HTTPStatus.NOT_FOUND)
     try:

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>微电网风光氢储联合规划系统</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="assets/planning.css?v=20260510-optimization">
+</head>
+<body>
+  <main class="planning-shell">
+    <header class="topbar">
+      <a class="brand" href="index.html">微电网风光氢储联合规划系统</a>
+      <nav class="main-nav" aria-label="主功能导航">
+        <a href="index.html">系统首页</a>
+        <a href="planning.html">参数维护</a>
+        <a class="active" href="optimize.html">启动优化</a>
+        <button type="button" disabled>方案评估</button>
+        <button type="button" disabled>结果比对</button>
+      </nav>
+    </header>
+
+    <section class="workspace optimization-workspace">
+      <aside class="scheme-rail">
+        <div class="scheme-list-title">方案列表</div>
+        <div id="schemeList" class="scheme-list"></div>
+      </aside>
+
+      <section class="optimization-panel">
+        <section class="optimization-command-card">
+          <div class="optimization-command-row">
+            <div class="optimization-actions" aria-label="优化规划操作">
+              <button id="startOptimization" class="primary" type="button">启动规划</button>
+              <button id="stopOptimization" class="danger" type="button">停止规划</button>
+            </div>
+            <div id="optimizationCurrentScheme" class="optimization-current-scheme">当前方案: 未选择方案</div>
+          </div>
+          <div class="optimization-status-grid" aria-label="优化规划总体指标">
+            <div class="status-tile"><span>当前状态</span><strong id="optimizationStatus">待启动</strong></div>
+            <div class="status-tile"><span>启动时刻</span><strong id="optimizationStartTime">-</strong></div>
+            <div class="status-tile"><span>结束时刻</span><strong id="optimizationEndTime">-</strong></div>
+            <div class="status-tile"><span>度电成本</span><strong id="optimizationCost">-</strong></div>
+            <div class="status-tile"><span>绿电占比</span><strong id="optimizationGreenRatio">-</strong></div>
+          </div>
+        </section>
+
+        <section class="optimization-result-card">
+          <div class="result-tabs" role="tablist" aria-label="优化规划结果切换">
+            <button class="result-tab active" data-result-tab="overview" type="button" aria-selected="true">结果概览</button>
+            <button class="result-tab" data-result-tab="green" type="button" aria-selected="false">绿电结果</button>
+            <button class="result-tab" data-result-tab="safety" type="button" aria-selected="false">安全结果</button>
+          </div>
+          <div id="overviewResult" class="result-panel active" data-result-panel="overview" role="tabpanel"></div>
+          <div id="greenResult" class="result-panel" data-result-panel="green" role="tabpanel" hidden></div>
+          <div id="safetyResult" class="result-panel" data-result-panel="safety" role="tabpanel" hidden></div>
+        </section>
+
+        <section class="optimization-log-card">
+          <div class="optimization-log-title">运行日志</div>
+          <div id="optimizationLogs" class="optimization-logs" aria-live="polite"></div>
+        </section>
+      </section>
+    </section>
+  </main>
+  <script src="assets/optimize.js?v=20260510-optimization"></script>
+</body>
+</html>

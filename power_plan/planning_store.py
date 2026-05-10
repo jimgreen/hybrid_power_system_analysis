@@ -447,11 +447,11 @@ def validate_payload(payload: dict[str, Any], require_time_series: bool = True) 
     if require_time_series:
         time_series = payload.get("time_series", [])
         if len(time_series) != 8760:
-            messages.append({"level": "error", "message": f"8760时序数据行数应为8760，当前为{len(time_series)}"})
+            messages.append({"level": "error", "message": f"时序数据行数应为8760，当前为{len(time_series)}"})
         else:
-            messages.append({"level": "ok", "message": "8760时序数据行数正确"})
+            messages.append({"level": "ok", "message": "时序数据行数正确"})
     elif "time_series_count" in payload:
-        messages.append({"level": "ok", "message": f"8760时序数据延迟加载，当前行数为{payload['time_series_count']}"})
+        messages.append({"level": "ok", "message": f"时序数据延迟加载，当前行数为{payload['time_series_count']}"})
 
     for key in DEFAULT_DEVICE_ROWS:
         for index, row in enumerate(payload.get(key, []), start=1):

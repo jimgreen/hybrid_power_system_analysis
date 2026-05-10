@@ -207,6 +207,16 @@ class PlanningStoreTest(unittest.TestCase):
 
         self.assertTrue(any("数据上限不能小于数据下限" in item["message"] for item in messages))
 
+    def test_validate_time_series_messages_use_display_label(self):
+        payload = planning_store.default_payload("方案A")
+        payload["time_series"] = payload["time_series"][:12]
+
+        messages = planning_store.validate_payload(payload)
+
+        message_text = "\n".join(item["message"] for item in messages)
+        self.assertIn("时序数据行数应为8760", message_text)
+        self.assertNotIn("8760时序数据", message_text)
+
     def test_validate_planning_parameter_ranges(self):
         payload = planning_store.default_payload("方案A")
         payload["planning_parameters"][0]["planning_load_factor"] = 12

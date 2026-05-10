@@ -816,7 +816,7 @@ function renderTimeTable() {
   }
   if (!isTimeSeriesLoaded()) {
     document.getElementById("pageInfo").textContent = state.timeSeriesLoading ? "加载中" : "未加载";
-    container.innerHTML = `<div class="empty-summary">${state.timeSeriesLoading ? "时序数据加载中..." : "时序数据尚未加载，进入8760时序数据或方案概览时会自动加载。"}</div>`;
+    container.innerHTML = `<div class="empty-summary">${state.timeSeriesLoading ? "时序数据加载中..." : "时序数据尚未加载，进入时序数据或方案概览时会自动加载。"}</div>`;
     return;
   }
   const rows = state.payload.time_series || [];
@@ -1229,7 +1229,7 @@ function renderSummary() {
   }
   if (currentSchemeName) currentSchemeName.textContent = state.currentScheme;
   const timeSeriesCount = isTimeSeriesLoaded() ? (state.payload.time_series || []).length : state.payload.time_series_count || 0;
-  box.innerHTML = `<div>当前方案：<strong>${escapeHtml(state.currentScheme)}</strong></div><div>8760行数：${timeSeriesCount}</div><div>设备条目：${deviceSpecs.reduce((sum, [key]) => sum + (state.payload[key] || []).length, 0)}</div>`;
+  box.innerHTML = `<div>当前方案：<strong>${escapeHtml(state.currentScheme)}</strong></div><div>时序行数：${timeSeriesCount}</div><div>设备条目：${deviceSpecs.reduce((sum, [key]) => sum + (state.payload[key] || []).length, 0)}</div>`;
   const localMessages = validateLocal();
   list.innerHTML = localMessages.map((item) => `<div class="validation-item ${item.level}">${escapeHtml(item.message)}</div>`).join("");
 }
@@ -1247,10 +1247,10 @@ function collectSaveWarnings() {
   const messages = [];
   if (!isTimeSeriesLoaded()) {
     if (Number(state.payload.time_series_count || 0) !== 8760) {
-      messages.push({ level: "error", message: `8760时序数据行数应为8760，当前为${state.payload.time_series_count || 0}` });
+      messages.push({ level: "error", message: `时序数据行数应为8760，当前为${state.payload.time_series_count || 0}` });
     }
   } else if ((state.payload.time_series || []).length !== 8760) {
-    messages.push({ level: "error", message: `8760时序数据行数应为8760，当前为${(state.payload.time_series || []).length}` });
+    messages.push({ level: "error", message: `时序数据行数应为8760，当前为${(state.payload.time_series || []).length}` });
   }
   deviceSpecs.forEach(([key, title]) => {
     (state.payload[key] || []).forEach((row, index) => {

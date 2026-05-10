@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>电网规划参数维护</title>
+  <title>微电网风光氢储联合规划系统</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="assets/planning.css?v=20260510-summary-row-height">
 </head>
 <body>
   <main class="planning-shell">
     <header class="topbar">
-      <a class="brand" href="index.html">电网规划系统</a>
+      <a class="brand" href="index.html">微电网风光氢储联合规划系统</a>
       <nav class="main-nav" aria-label="主功能导航">
         <a href="index.html">系统首页</a>
         <a class="active" href="planning.html">参数维护</a>
-        <button type="button" disabled>启动优化</button>
+        <a href="optimize.html">启动优化</a>
         <button type="button" disabled>方案评估</button>
         <button type="button" disabled>结果比对</button>
       </nav>
@@ -35,7 +35,7 @@
             </div>
           </div>
           <div class="tabs" role="tablist" aria-label="参数维护标签">
-            <button class="tab active" data-tab="time" type="button">8760时序数据</button>
+            <button class="tab active" data-tab="time" type="button">时序数据</button>
             <button class="tab" data-tab="devices" type="button">设备参数</button>
             <button class="tab" data-tab="planning" type="button">规划参数</button>
             <button class="tab" data-tab="limits" type="button">方案概览</button>
@@ -67,7 +67,7 @@
                 <button type="button" data-curve="load" class="curve-button" aria-pressed="false">负荷</button>
               </div>
             </div>
-            <svg id="timeChart" class="time-chart" role="img" aria-label="8760点风光温荷曲线"></svg>
+            <svg id="timeChart" class="time-chart" role="img" aria-label="风光温荷时序曲线"></svg>
             <div id="chartTip" class="chart-tip" hidden></div>
           </div>
 
@@ -154,6 +154,6 @@
       </aside>
     </section>
   </main>
-  <script src="assets/planning.js?v=20260510-summary-row-height"></script>
+  <script src="assets/planning.js?v=20260510-labels"></script>
 </body>
 </html>
