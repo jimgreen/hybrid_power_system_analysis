@@ -9,7 +9,13 @@ description = "Hybrid AC/DC power-flow, state-estimation, simulation, AGC, and c
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cplex",
+    "cvxpy",
+    "gurobipy",
+    "mosek",
     "numpy",
+    "pyklu",
+    "PyMySQL",
     "scipy",
 ]
 
@@ -20,6 +26,11 @@ dev = [
 ]
 benchmark = [
     "pypower",
+]
+solver = [
+    "pypower",
+    "scikit-sparse",
+    "scikit-umfpack",
 ]
 
 [tool.setuptools.packages.find]
@@ -65,4 +76,3 @@ ignore = [
 
 [tool.ruff.format]
 line-ending = "auto"
-
