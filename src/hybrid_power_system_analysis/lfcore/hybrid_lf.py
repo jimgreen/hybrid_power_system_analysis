@@ -14,7 +14,19 @@ for path in (ROOT_DIR, LFCORE_DIR, MODEL_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_lf import ACLFResult, ACPowerFlowCalc, _device_key as _lf_device_key, coo_matrix, csr_matrix, solve_sparse_system
+from ac_lf import (
+    ACLFResult,
+    ACPowerFlowCalc,
+    _device_key as _lf_device_key,
+    coo_matrix,
+    csr_matrix,
+    solve_sparse_system,
+    _resolve_linear_solver,
+    _factor_jacobian,
+    _OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
+    _OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
+)
+from scipy.sparse.linalg import spsolve as _scipy_spsolve
 from dc_lf import DCLFResult, DCPowerFlowCalc
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
@@ -539,8 +551,9 @@ class HybridPowerFlowCalc:
         verbose=True,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
-        linear_solver: str = "scipy",
+        linear_solver: str = "auto",
         result_mode: str = "full",
+        jacobian_refresh_period: int = 1,
     ):
         self.network = network
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
@@ -551,7 +564,13 @@ class HybridPowerFlowCalc:
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.verbose = verbose
+        # 与 ac_lf/dc_lf 同步：linear_solver 留用户输入，实际 callable 与解析后名
+        # 分别保存到 _linear_solver_fn / _linear_solver_resolved。
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
+        # jacobian_refresh_period>=2 触发 Honest-Newton（DCDC 损耗强非线性时容易发散，
+        # 默认 1 与标准 NR 等价）。
+        self.jacobian_refresh_period = max(1, int(jacobian_refresh_period or 1))
         self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
@@ -1240,17 +1259,18 @@ class HybridPowerFlowCalc:
         self.global_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
         self.global_jac_csr_data = np.empty(self.global_jac_csr_indices.size, dtype=np.float64)
 
-        positions = {}
-        for row in range(self.total_eq):
-            start = int(self.global_jac_csr_indptr[row])
-            end = int(self.global_jac_csr_indptr[row + 1])
-            for pos in range(start, end):
-                positions[(row, int(self.global_jac_csr_indices[pos]))] = pos
-        self.global_jac_raw_to_csr_pos = np.fromiter(
-            (positions[(int(row), int(col))] for row, col in zip(raw_rows, raw_cols)),
-            dtype=np.intp,
-            count=raw_count,
+        # 把 (row, col) 编码成 row*total_vars+col，并对全 CSR 键做 searchsorted。
+        # 替换掉原先用 Python dict + fromiter 的查找：hybrid_net_4w 上 1.2s -> 几十 ms。
+        indptr = self.global_jac_csr_indptr
+        indices = self.global_jac_csr_indices
+        csr_rows = np.repeat(
+            np.arange(self.total_eq, dtype=np.int64),
+            np.diff(indptr).astype(np.int64, copy=False),
         )
+        stride = np.int64(self.total_vars)
+        csr_key = csr_rows * stride + indices.astype(np.int64, copy=False)
+        raw_key = raw_rows.astype(np.int64, copy=False) * stride + raw_cols.astype(np.int64, copy=False)
+        self.global_jac_raw_to_csr_pos = np.searchsorted(csr_key, raw_key).astype(np.intp, copy=False)
 
     def _cache_acac_arrays(self):
         """Cache ACAC converter metadata as arrays for residual/Jacobian assembly."""
@@ -1331,10 +1351,14 @@ class HybridPowerFlowCalc:
         ac_p = dcac[:, 1]
         ac_q = dcac[:, 2]
         # Converter port powers are injected into the existing AC/DC nodal balance rows.
-        np.add.at(ac_f, self.dcac_ac_p_row, ac_p)
-        np.add.at(ac_f, self.dcac_ac_q_row, ac_q)
+        # bincount 比 np.add.at 显著更快；ac_f / dc_f 是预分配的全局 F 切片，
+        # 这里用 += 把贡献加进去。
+        ac_f += np.bincount(self.dcac_ac_p_row, weights=ac_p, minlength=ac_f.size)
+        ac_f += np.bincount(self.dcac_ac_q_row, weights=ac_q, minlength=ac_f.size)
         if self.dcac_dc_eq_mask.any():
-            np.add.at(dc_f, self.dcac_dc_eq[self.dcac_dc_eq_mask], dc_p[self.dcac_dc_eq_mask])
+            dc_eq_active = self.dcac_dc_eq[self.dcac_dc_eq_mask]
+            dc_p_active = dc_p[self.dcac_dc_eq_mask]
+            dc_f += np.bincount(dc_eq_active, weights=dc_p_active, minlength=dc_f.size)
 
         va = ac_V[self.dcac_ac_pos]
         vd = dc_V[self.dcac_dc_pos]
@@ -1369,10 +1393,10 @@ class HybridPowerFlowCalc:
         j_p = acac[:, 2]
         j_q = acac[:, 3]
         # ACAC port powers couple two AC PQ nodes inside the same global system.
-        np.add.at(ac_f, self.acac_i_p_row, i_p)
-        np.add.at(ac_f, self.acac_i_q_row, i_q)
-        np.add.at(ac_f, self.acac_j_p_row, j_p)
-        np.add.at(ac_f, self.acac_j_q_row, j_q)
+        ac_f += np.bincount(self.acac_i_p_row, weights=i_p, minlength=ac_f.size)
+        ac_f += np.bincount(self.acac_i_q_row, weights=i_q, minlength=ac_f.size)
+        ac_f += np.bincount(self.acac_j_p_row, weights=j_p, minlength=ac_f.size)
+        ac_f += np.bincount(self.acac_j_q_row, weights=j_q, minlength=ac_f.size)
 
         vi = ac_V[self.acac_i_pos]
         vj = ac_V[self.acac_j_pos]
@@ -1540,7 +1564,12 @@ class HybridPowerFlowCalc:
         self._fill_acac_global_jacobian_data(raw, acac_x, ac_V)
 
         self.global_jac_csr_data.fill(0.0)
-        np.add.at(self.global_jac_csr_data, self.global_jac_raw_to_csr_pos, raw)
+        # bincount 比 np.add.at 快得多；目标尺寸固定，雅可比 CSR 每次迭代散射。
+        self.global_jac_csr_data[:] = np.bincount(
+            self.global_jac_raw_to_csr_pos,
+            weights=raw,
+            minlength=self.global_jac_csr_data.size,
+        )
         jac = csr_matrix(
             (self.global_jac_csr_data, self.global_jac_csr_indices, self.global_jac_csr_indptr),
             shape=(self.total_eq, self.total_vars),
@@ -1791,6 +1820,14 @@ class HybridPowerFlowCalc:
 
         self.converged = False
         x = self.x.copy()
+        refresh_period = self.jacobian_refresh_period
+        # period=1 时走 module 层 solve_sparse_system（保留 monkey-patch hook，
+        # 便于上层注入计数/替换求解器）。period>=2 才启用 factor 对象以复用因子。
+        factor = None
+        steps_since_refresh = refresh_period
+        resolved_name = self._linear_solver_resolved
+        solver_fn = self._linear_solver_fn
+
         for it in range(self.max_iter):
             F, J = self._build_newton_system(x)
             self.iterations = it + 1
@@ -1821,7 +1858,26 @@ class HybridPowerFlowCalc:
                 self._finish_result(x)
                 return 0
 
-            delta = solve_sparse_system(J, -F, self.linear_solver)
+            if refresh_period <= 1:
+                # 走原有 dispatch 路径，保持 monkey-patch 兼容性。
+                delta = solve_sparse_system(J, -F, self.linear_solver)
+            else:
+                try:
+                    if factor is None or steps_since_refresh >= refresh_period:
+                        factor = _factor_jacobian(J, resolved_name, solver_fn)
+                        steps_since_refresh = 0
+                    delta = factor.solve(-F)
+                    steps_since_refresh += 1
+                except Exception:
+                    _AC_OPTIONAL_SPARSE_SOLVERS.pop(resolved_name, None)
+                    _AC_OPTIONAL_SPARSE_MISSING.add(resolved_name)
+                    resolved_name = "scipy"
+                    solver_fn = _scipy_spsolve
+                    self._linear_solver_resolved = "scipy"
+                    self._linear_solver_fn = _scipy_spsolve
+                    factor = None
+                    steps_since_refresh = refresh_period
+                    delta = _scipy_spsolve(J, -F)
             x += delta
 
         self.x = x
@@ -2320,7 +2376,7 @@ def run_hybrid_power_flow(
     verbose=True,
     parameter_file=DEFAULT_LF_PARAMETER_FILE,
     parameters: Optional[PowerFlowParameters] = None,
-    linear_solver: str = "scipy",
+    linear_solver: str = "auto",
     result_mode: str = "full",
 ) -> Any:
     # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
