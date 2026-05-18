@@ -145,12 +145,37 @@ def _int_cell(row, col, default: int = 0) -> int:
 
 def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.ndarray:
     col = columns.get(attr)
-    return np.asarray([_float_cell(row, col, default) for row in table_rows], dtype=np.float64)
+    n = len(table_rows)
+    if col is None or n == 0:
+        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    # Inline the cell extraction to skip the `_float_cell`/`_cell` call
+    # overhead — this loop runs hundreds of thousands of times during prepare
+    # for large grids.
+    values = [None] * n
+    for i in range(n):
+        row = table_rows[i]
+        if col >= len(row):
+            values[i] = default
+        else:
+            v = row[col]
+            values[i] = default if v in (None, "") else float(v)
+    return np.asarray(values, dtype=np.float64)
 
 
 def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
     col = columns.get(attr)
-    return np.asarray([_int_cell(row, col, default) for row in table_rows], dtype=np.float64)
+    n = len(table_rows)
+    if col is None or n == 0:
+        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    values = [None] * n
+    for i in range(n):
+        row = table_rows[i]
+        if col >= len(row):
+            values[i] = default
+        else:
+            v = row[col]
+            values[i] = default if v in (None, "") else int(float(v))
+    return np.asarray(values, dtype=np.float64)
 
 
 def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:

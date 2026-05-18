@@ -781,44 +781,61 @@ def _apply_common_node_bus_island_arrays(network, topology: GridTopologyArrays, 
     node_dict = {int(node.idx): node for node in nodes}
     network.node_dict = node_dict
 
+    # Pre-materialize numpy arrays into Python lists once; the loops below
+    # iterate by Python index and per-iteration numpy scalar access (with
+    # boxing) was a measurable cost for large grids.
     node_alive_mask = topology.node_alive_mask
+    node_alive_list = node_alive_mask.tolist() if node_alive_mask.size else []
+    n_node_alive = len(node_alive_list)
     for node_pos, node in enumerate(nodes):
         node.isl = 0
         node.isl_obj = None
         node.bus = None
         node.bus_obj = None
-        node.is_alive = bool(node_alive_mask[node_pos]) if node_pos < node_alive_mask.size else False
+        node.is_alive = node_alive_list[node_pos] if node_pos < n_node_alive else False
 
+    island_ids_list = topology.island_ids.tolist()
+    island_alive_list = topology.island_alive_mask.tolist()
     islands = []
-    for pos, island_id in enumerate(topology.island_ids):
-        island = island_factory(int(island_id), bool(topology.island_alive_mask[pos]))
-        island.is_alive = bool(topology.island_alive_mask[pos])
-        islands.append(island)
+    append_island = islands.append
+    for pos in range(len(island_ids_list)):
+        is_alive = bool(island_alive_list[pos])
+        island = island_factory(int(island_ids_list[pos]), is_alive)
+        island.is_alive = is_alive
+        append_island(island)
     network.islands = islands
 
+    bus_ids_list = topology.bus_ids.tolist()
+    bus_offsets_list = topology.bus_node_offsets.tolist()
+    bus_node_indices_list = topology.bus_node_indices.tolist()
+    bus_alive_list = topology.bus_alive_mask.tolist()
+    bus_to_island_list = topology.bus_to_island_pos.tolist()
     buses = []
     network.bus_dict = {}
     network.node_to_bus = {}
-    for bus_pos, bus_id in enumerate(topology.bus_ids):
-        start = int(topology.bus_node_offsets[bus_pos])
-        end = int(topology.bus_node_offsets[bus_pos + 1])
-        grouped_nodes = [nodes[int(node_pos)] for node_pos in topology.bus_node_indices[start:end]]
-        bus = _make_compact_bus(bus_cls, int(bus_id), grouped_nodes) if compact else bus_cls(int(bus_id), grouped_nodes)
-        bus.is_alive = bool(topology.bus_alive_mask[bus_pos])
+    node_to_bus = network.node_to_bus
+    bus_dict = network.bus_dict
+    for bus_pos in range(len(bus_ids_list)):
+        bus_id = int(bus_ids_list[bus_pos])
+        start = bus_offsets_list[bus_pos]
+        end = bus_offsets_list[bus_pos + 1]
+        grouped_nodes = [nodes[node_pos] for node_pos in bus_node_indices_list[start:end]]
+        bus = _make_compact_bus(bus_cls, bus_id, grouped_nodes) if compact else bus_cls(bus_id, grouped_nodes)
+        bus.is_alive = bool(bus_alive_list[bus_pos])
         buses.append(bus)
         if not compact:
-            network.bus_dict[int(bus.idx)] = bus
-        island_pos = int(topology.bus_to_island_pos[bus_pos])
+            bus_dict[bus_id] = bus
+        island_pos = bus_to_island_list[bus_pos]
         island = islands[island_pos] if island_pos >= 0 else None
         if island is not None:
             bus.isl = int(island.idx)
             bus.isl_obj = island
             island.buses.append(bus)
         for node in grouped_nodes:
-            node.bus = int(bus.idx)
+            node.bus = bus_id
             node.bus_obj = bus
             if not compact:
-                network.node_to_bus[int(node.idx)] = bus
+                node_to_bus[int(node.idx)] = bus
             if island is not None:
                 node.isl = int(island.idx)
                 node.isl_obj = island

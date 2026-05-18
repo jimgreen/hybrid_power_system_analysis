@@ -357,6 +357,26 @@ class HybridStateEstimator:
         summary_attrs: Optional[Dict[str, object]]
 
     @dataclass(frozen=True)
+    class _HybridCodeBucket:
+        """Pre-sliced state/jacobian info for a single (device-type, measurement-code) pair.
+
+        Built once at plan construction; consumed every iteration by
+        `_evaluate_hybrid_measurements` and `_append_hybrid_jacobian_plan` so they
+        avoid per-iteration `codes == k` masks, column-validity filtering and
+        default-template copies.
+        """
+        rows: np.ndarray         # int32, global measurement rows
+        hx_p: np.ndarray         # int32, primary hybrid_x index (e.g. 3*pos for DCAC P_DC)
+        hx_q: np.ndarray         # int32, secondary hybrid_x index (used by hypot codes)
+        jcol_p: np.ndarray       # int32, jacobian col for the primary power state
+        jcol_q: np.ndarray       # int32, jacobian col for the secondary power state
+        v_default: np.ndarray    # float64, len == rows.size, default voltage per row
+        v_use_x: np.ndarray      # bool,    len == rows.size, True where voltage comes from x
+        v_x_index: np.ndarray    # int32,   filtered (len == v_use_x.sum()), index into x
+        v_jcol: np.ndarray       # int32,   len == rows.size, voltage jacobian col (only valid where v_use_x)
+        v_any_x: bool            # True iff v_use_x has any True entries
+
+    @dataclass(frozen=True)
     class _HybridMeasurementPlan:
         dcac_rows: np.ndarray
         dcac_codes: np.ndarray
@@ -372,6 +392,24 @@ class HybridStateEstimator:
         acac_to_v_col: np.ndarray
         acac_from_v_default: np.ndarray
         acac_to_v_default: np.ndarray
+        # Per-code buckets (indexed by 1-based measurement code).
+        # DCAC: 1=P_DC 2=P_AC 3=Q_AC 4=V_DC 5=I_DC 6=V_AC 7=I_AC
+        dcac_p_dc: "HybridStateEstimator._HybridCodeBucket"
+        dcac_p_ac: "HybridStateEstimator._HybridCodeBucket"
+        dcac_q_ac: "HybridStateEstimator._HybridCodeBucket"
+        dcac_v_dc: "HybridStateEstimator._HybridCodeBucket"
+        dcac_i_dc: "HybridStateEstimator._HybridCodeBucket"
+        dcac_v_ac: "HybridStateEstimator._HybridCodeBucket"
+        dcac_i_ac: "HybridStateEstimator._HybridCodeBucket"
+        # ACAC: 1=P_FROM 2=Q_FROM 3=P_TO 4=Q_TO 5=V_FROM 6=I_FROM 7=V_TO 8=I_TO
+        acac_p_from: "HybridStateEstimator._HybridCodeBucket"
+        acac_q_from: "HybridStateEstimator._HybridCodeBucket"
+        acac_p_to: "HybridStateEstimator._HybridCodeBucket"
+        acac_q_to: "HybridStateEstimator._HybridCodeBucket"
+        acac_v_from: "HybridStateEstimator._HybridCodeBucket"
+        acac_i_from: "HybridStateEstimator._HybridCodeBucket"
+        acac_v_to: "HybridStateEstimator._HybridCodeBucket"
+        acac_i_to: "HybridStateEstimator._HybridCodeBucket"
 
     @dataclass(frozen=True)
     class _HybridSeedMeasurementPlan:
@@ -1037,10 +1075,11 @@ class HybridStateEstimator:
                     if not devices:
                         disabled_rows.append(rows)
                         continue
-                    available = np.fromiter(
-                        (str(device_name[int(row)]) in devices for row in rows),
+                    # `tolist()` + list comp avoids per-element numpy unboxing.
+                    name_list = device_name[rows].tolist()
+                    available = np.array(
+                        [name in devices for name in name_list],
                         dtype=bool,
-                        count=int(rows.size),
                     )
                     if not np.all(available):
                         disabled_rows.append(rows[~available])
@@ -1531,19 +1570,25 @@ class HybridStateEstimator:
                 )
                 for name, conv in self.dcac_by_name.items()
             }
-            for row in dcac_rows:
-                mtype = str(table.meas_type[row])
-                values = dcac_scales[str(table.device_name[row])]
-                if mtype in ("P_DC", "P_AC", "Q_AC"):
-                    scale[row] = values[0]
+            mt_list = table.meas_type[dcac_rows].tolist()
+            dn_list = table.device_name[dcac_rows].tolist()
+            scale_vals = np.empty(dcac_rows.size, dtype=np.float64)
+            for k in range(dcac_rows.size):
+                mtype = mt_list[k]
+                values = dcac_scales[dn_list[k]]
+                if mtype == "P_DC" or mtype == "P_AC" or mtype == "Q_AC":
+                    scale_vals[k] = values[0]
                 elif mtype == "V_DC":
-                    scale[row] = values[1]
+                    scale_vals[k] = values[1]
                 elif mtype == "I_DC":
-                    scale[row] = values[2]
+                    scale_vals[k] = values[2]
                 elif mtype == "V_AC":
-                    scale[row] = values[3]
+                    scale_vals[k] = values[3]
                 elif mtype == "I_AC":
-                    scale[row] = values[4]
+                    scale_vals[k] = values[4]
+                else:
+                    scale_vals[k] = 1.0
+            scale[dcac_rows] = scale_vals
 
         acac_rows = np.flatnonzero(active & (code == acac_code))
         if acac_rows.size:
@@ -1557,21 +1602,31 @@ class HybridStateEstimator:
                 )
                 for name, conv in self.acac_by_name.items()
             }
-            for row in acac_rows:
-                mtype = str(table.meas_type[row])
-                values = acac_scales[str(table.device_name[row])]
+            mt_list = table.meas_type[acac_rows].tolist()
+            dn_list = table.device_name[acac_rows].tolist()
+            scale_vals = np.empty(acac_rows.size, dtype=np.float64)
+            for k in range(acac_rows.size):
+                mtype = mt_list[k]
+                values = acac_scales[dn_list[k]]
                 if mtype.startswith(("P_", "Q_")):
-                    scale[row] = values[0]
+                    scale_vals[k] = values[0]
                 elif mtype.endswith("_FROM"):
                     if mtype.startswith("V_"):
-                        scale[row] = values[1]
+                        scale_vals[k] = values[1]
                     elif mtype.startswith("I_"):
-                        scale[row] = values[2]
+                        scale_vals[k] = values[2]
+                    else:
+                        scale_vals[k] = 1.0
                 elif mtype.endswith("_TO"):
                     if mtype.startswith("V_"):
-                        scale[row] = values[3]
+                        scale_vals[k] = values[3]
                     elif mtype.startswith("I_"):
-                        scale[row] = values[4]
+                        scale_vals[k] = values[4]
+                    else:
+                        scale_vals[k] = 1.0
+                else:
+                    scale_vals[k] = 1.0
+            scale[acac_rows] = scale_vals
 
         table.value[active] = np.divide(
             table.value[active],
@@ -1853,34 +1908,65 @@ class HybridStateEstimator:
                 measured_devices.add((meas.device_type, meas.device_name))
         return measured_devices
 
+    # Module-style constants reused across the 60K+ per-converter state-meta
+    # rebuilds during prepare; previously the dicts were re-created on every
+    # call which dominated state-layout construction for large grids.
+    _AC_STATE_META_PREFIX_BY_KIND = {
+        "angle": "AC_THETA",
+        "voltage": "AC_V",
+        "generator_p": "AC_GEN_P",
+        "generator_q": "AC_GEN_Q",
+        "load_p": "AC_LOAD_P",
+        "load_q": "AC_LOAD_Q",
+        "shunt_q": "AC_Q_SHUNT",
+    }
+    _DC_STATE_META_PREFIX_BY_KIND = {
+        "voltage": "DC_V",
+        "zero_current": "DC_I",
+        "break_current": "DC_I",
+        "dcdc_p_from": "DCDC_P_FROM",
+        "dcdc_p_to": "DCDC_P_TO",
+        "v_generator_p": "DC_VGEN_P",
+    }
+
     @staticmethod
     def _ac_sub_state_meta_to_hybrid(meta: StateMeta) -> StateMeta:
-        prefix_by_kind = {
-            "angle": "AC_THETA",
-            "voltage": "AC_V",
-            "zero_current": "AC_I_RE" if meta.component == "re" else "AC_I_IM",
-            "break_current": "AC_I_RE" if meta.component == "re" else "AC_I_IM",
-            "generator_p": "AC_GEN_P",
-            "generator_q": "AC_GEN_Q",
-            "load_p": "AC_LOAD_P",
-            "load_q": "AC_LOAD_Q",
-            "shunt_q": "AC_Q_SHUNT",
-        }
-        prefix = prefix_by_kind.get(meta.kind, f"AC_{meta.kind.upper()}")
-        return with_legacy_label(meta, f"{prefix}:{meta.device_name}", side="ac")
+        kind = meta.kind
+        prefix = HybridStateEstimator._AC_STATE_META_PREFIX_BY_KIND.get(kind)
+        if prefix is None:
+            if kind == "zero_current" or kind == "break_current":
+                prefix = "AC_I_RE" if meta.component == "re" else "AC_I_IM"
+            else:
+                prefix = f"AC_{kind.upper()}"
+        device_name = meta.device_name
+        # Construct StateMeta inline (rather than going through
+        # `with_legacy_label`) to skip one Python-level function call per state.
+        return StateMeta(
+            "ac",
+            kind,
+            meta.device_type,
+            device_name,
+            terminal=meta.terminal,
+            component=meta.component,
+            legacy_label=f"{prefix}:{device_name}",
+        )
 
     @staticmethod
     def _dc_sub_state_meta_to_hybrid(meta: StateMeta) -> StateMeta:
-        prefix_by_kind = {
-            "voltage": "DC_V",
-            "zero_current": "DC_I",
-            "break_current": "DC_I",
-            "dcdc_p_from": "DCDC_P_FROM",
-            "dcdc_p_to": "DCDC_P_TO",
-            "v_generator_p": "DC_VGEN_P",
-        }
-        prefix = prefix_by_kind.get(meta.kind, f"DC_{meta.kind.upper()}")
-        return with_legacy_label(meta, f"{prefix}:{meta.device_name}", side="dc")
+        kind = meta.kind
+        prefix = HybridStateEstimator._DC_STATE_META_PREFIX_BY_KIND.get(kind)
+        if prefix is None:
+            prefix = f"DC_{kind.upper()}"
+        device_name = meta.device_name
+        return StateMeta(
+            "dc",
+            kind,
+            meta.device_type,
+            device_name,
+            terminal=meta.terminal,
+            component=meta.component,
+            legacy_label=f"{prefix}:{device_name}",
+        )
 
     def _build_state_layout(self) -> None:
         ac_n = int(getattr(self._ac_sub_estimator, "n_state", 0) or 0)
@@ -2163,6 +2249,8 @@ class HybridStateEstimator:
         self._active_normal_pattern = None
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
         self._jacobian_builder._assume_fixed_pattern = True
+        self._active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask)) if self.active_angle_residual_mask is not None else False
+        self._sub_jacobian_stamp_cache = {}
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
         self._invalidate_real_voltage_seed_cache()
@@ -2248,6 +2336,8 @@ class HybridStateEstimator:
         self._active_normal_pattern = None
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
         self._jacobian_builder._assume_fixed_pattern = True
+        self._active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask))
+        self._sub_jacobian_stamp_cache = {}
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
         if self._has_real_voltage_seed_measurement(appended_measurements):
@@ -2332,6 +2422,8 @@ class HybridStateEstimator:
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
         self._jacobian_builder._assume_fixed_pattern = True
         self._active_normal_pattern = None
+        self._active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask))
+        self._sub_jacobian_stamp_cache = {}
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
         if self._has_real_voltage_seed_measurement([removed_measurement]):
@@ -2387,6 +2479,237 @@ class HybridStateEstimator:
             self._acac_to_v_default_by_pos[acac_pos] if acac_pos.size else np.array([], dtype=np.float64)
         )
 
+        # Per-code buckets pre-slice all per-iteration indexing arrays so that
+        # evaluate/jacobian can run without recomputing `codes == k` masks or
+        # filtering invalid voltage columns. v_col-related fields default to
+        # empty for codes that don't read a voltage state.
+        dc_state_start = int(self.dc_state_start)
+
+        def _empty_bucket() -> "HybridStateEstimator._HybridCodeBucket":
+            return self._HybridCodeBucket(
+                rows=np.array([], dtype=np.int32),
+                hx_p=np.array([], dtype=np.int32),
+                hx_q=np.array([], dtype=np.int32),
+                jcol_p=np.array([], dtype=np.int32),
+                jcol_q=np.array([], dtype=np.int32),
+                v_default=np.array([], dtype=np.float64),
+                v_use_x=np.array([], dtype=bool),
+                v_x_index=np.array([], dtype=np.int32),
+                v_jcol=np.array([], dtype=np.int32),
+                v_any_x=False,
+            )
+
+        def _voltage_fields(
+            cols_subset: np.ndarray,
+            defaults_subset: np.ndarray,
+            offset: int,
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+            """Pack voltage-gather info: (default, use_x, x_index, jcol, any_x)."""
+            if cols_subset.size == 0:
+                return (
+                    np.array([], dtype=np.float64),
+                    np.array([], dtype=bool),
+                    np.array([], dtype=np.int32),
+                    np.array([], dtype=np.int32),
+                    False,
+                )
+            cols_int = cols_subset.astype(np.int32, copy=False)
+            use_x = cols_int >= 0
+            any_x = bool(use_x.any())
+            x_index = (cols_int[use_x] - int(offset)).astype(np.int32, copy=False) if any_x else np.array([], dtype=np.int32)
+            return (
+                defaults_subset.astype(np.float64, copy=False),
+                use_x,
+                x_index,
+                cols_int,
+                any_x,
+            )
+
+        def _build_dcac_linear_power_bucket(code: int, hx_offset: int, state_col_arr: np.ndarray) -> "HybridStateEstimator._HybridCodeBucket":
+            """For DCAC codes 1/2/3: identity observation of a hybrid power state."""
+            if dcac_pos.size == 0:
+                return _empty_bucket()
+            mask = dcac_codes == code
+            if not mask.any():
+                return _empty_bucket()
+            pos_k = dcac_pos[mask]
+            rows_k = dcac_rows[mask]
+            hx_p = (3 * pos_k.astype(np.int32, copy=False) + hx_offset).astype(np.int32, copy=False)
+            jcol_p = state_col_arr[pos_k].astype(np.int32, copy=False)
+            return self._HybridCodeBucket(
+                rows=rows_k,
+                hx_p=hx_p,
+                hx_q=np.array([], dtype=np.int32),
+                jcol_p=jcol_p,
+                jcol_q=np.array([], dtype=np.int32),
+                v_default=np.array([], dtype=np.float64),
+                v_use_x=np.array([], dtype=bool),
+                v_x_index=np.array([], dtype=np.int32),
+                v_jcol=np.array([], dtype=np.int32),
+                v_any_x=False,
+            )
+
+        def _build_voltage_only_bucket(
+            codes_arr: np.ndarray,
+            rows_arr: np.ndarray,
+            v_col_full: np.ndarray,
+            v_default_full: np.ndarray,
+            code: int,
+            offset: int,
+        ) -> "HybridStateEstimator._HybridCodeBucket":
+            """For codes that observe a voltage directly (V_DC, V_AC, V_FROM, V_TO)."""
+            if codes_arr.size == 0:
+                return _empty_bucket()
+            mask = codes_arr == code
+            if not mask.any():
+                return _empty_bucket()
+            rows_k = rows_arr[mask]
+            v_default, v_use_x, v_x_index, v_jcol, v_any_x = _voltage_fields(
+                v_col_full[mask], v_default_full[mask], offset,
+            )
+            return self._HybridCodeBucket(
+                rows=rows_k,
+                hx_p=np.array([], dtype=np.int32),
+                hx_q=np.array([], dtype=np.int32),
+                jcol_p=np.array([], dtype=np.int32),
+                jcol_q=np.array([], dtype=np.int32),
+                v_default=v_default,
+                v_use_x=v_use_x,
+                v_x_index=v_x_index,
+                v_jcol=v_jcol,
+                v_any_x=v_any_x,
+            )
+
+        def _build_dcac_i_dc_bucket() -> "HybridStateEstimator._HybridCodeBucket":
+            """DCAC code 5: i_dc = p_dc / v_dc."""
+            if dcac_pos.size == 0:
+                return _empty_bucket()
+            mask = dcac_codes == 5
+            if not mask.any():
+                return _empty_bucket()
+            pos_k = dcac_pos[mask]
+            rows_k = dcac_rows[mask]
+            hx_p = (3 * pos_k.astype(np.int32, copy=False)).astype(np.int32, copy=False)
+            jcol_p = self.dcac_p_dc_state_col[pos_k].astype(np.int32, copy=False)
+            v_default, v_use_x, v_x_index, v_jcol, v_any_x = _voltage_fields(
+                dcac_dc_v_col[mask], dcac_dc_v_default[mask], dc_state_start,
+            )
+            return self._HybridCodeBucket(
+                rows=rows_k, hx_p=hx_p, hx_q=np.array([], dtype=np.int32),
+                jcol_p=jcol_p, jcol_q=np.array([], dtype=np.int32),
+                v_default=v_default, v_use_x=v_use_x, v_x_index=v_x_index,
+                v_jcol=v_jcol, v_any_x=v_any_x,
+            )
+
+        def _build_dcac_i_ac_bucket() -> "HybridStateEstimator._HybridCodeBucket":
+            """DCAC code 7: i_ac = hypot(p_ac, q_ac) / v_ac."""
+            if dcac_pos.size == 0:
+                return _empty_bucket()
+            mask = dcac_codes == 7
+            if not mask.any():
+                return _empty_bucket()
+            pos_k = dcac_pos[mask]
+            rows_k = dcac_rows[mask]
+            hx_p = (3 * pos_k.astype(np.int32, copy=False) + 1).astype(np.int32, copy=False)
+            hx_q = (3 * pos_k.astype(np.int32, copy=False) + 2).astype(np.int32, copy=False)
+            jcol_p = self.dcac_p_ac_state_col[pos_k].astype(np.int32, copy=False)
+            jcol_q = self.dcac_q_ac_state_col[pos_k].astype(np.int32, copy=False)
+            v_default, v_use_x, v_x_index, v_jcol, v_any_x = _voltage_fields(
+                dcac_ac_v_col[mask], dcac_ac_v_default[mask], 0,
+            )
+            return self._HybridCodeBucket(
+                rows=rows_k, hx_p=hx_p, hx_q=hx_q,
+                jcol_p=jcol_p, jcol_q=jcol_q,
+                v_default=v_default, v_use_x=v_use_x, v_x_index=v_x_index,
+                v_jcol=v_jcol, v_any_x=v_any_x,
+            )
+
+        dcac_p_dc_bucket = _build_dcac_linear_power_bucket(1, 0, self.dcac_p_dc_state_col)
+        dcac_p_ac_bucket = _build_dcac_linear_power_bucket(2, 1, self.dcac_p_ac_state_col)
+        dcac_q_ac_bucket = _build_dcac_linear_power_bucket(3, 2, self.dcac_q_ac_state_col)
+        dcac_v_dc_bucket = _build_voltage_only_bucket(
+            dcac_codes, dcac_rows, dcac_dc_v_col, dcac_dc_v_default, 4, dc_state_start,
+        )
+        dcac_i_dc_bucket = _build_dcac_i_dc_bucket()
+        dcac_v_ac_bucket = _build_voltage_only_bucket(
+            dcac_codes, dcac_rows, dcac_ac_v_col, dcac_ac_v_default, 6, 0,
+        )
+        dcac_i_ac_bucket = _build_dcac_i_ac_bucket()
+
+        acac_hybrid_base = 3 * len(self.dcac_converters)
+
+        def _build_acac_linear_power_bucket(code: int, hx_offset: int, state_col_arr: np.ndarray) -> "HybridStateEstimator._HybridCodeBucket":
+            if acac_pos.size == 0:
+                return _empty_bucket()
+            mask = acac_codes == code
+            if not mask.any():
+                return _empty_bucket()
+            pos_k = acac_pos[mask]
+            rows_k = acac_rows[mask]
+            hx_p = (acac_hybrid_base + 4 * pos_k.astype(np.int32, copy=False) + hx_offset).astype(np.int32, copy=False)
+            jcol_p = state_col_arr[pos_k].astype(np.int32, copy=False)
+            return self._HybridCodeBucket(
+                rows=rows_k, hx_p=hx_p, hx_q=np.array([], dtype=np.int32),
+                jcol_p=jcol_p, jcol_q=np.array([], dtype=np.int32),
+                v_default=np.array([], dtype=np.float64),
+                v_use_x=np.array([], dtype=bool),
+                v_x_index=np.array([], dtype=np.int32),
+                v_jcol=np.array([], dtype=np.int32),
+                v_any_x=False,
+            )
+
+        def _build_acac_current_bucket(
+            code: int,
+            p_hx_offset: int,
+            q_hx_offset: int,
+            p_state_col: np.ndarray,
+            q_state_col: np.ndarray,
+            v_col_full: np.ndarray,
+            v_default_full: np.ndarray,
+        ) -> "HybridStateEstimator._HybridCodeBucket":
+            """ACAC current codes (I_FROM=6, I_TO=8): hypot(p, q) / v."""
+            if acac_pos.size == 0:
+                return _empty_bucket()
+            mask = acac_codes == code
+            if not mask.any():
+                return _empty_bucket()
+            pos_k = acac_pos[mask]
+            rows_k = acac_rows[mask]
+            hx_p = (acac_hybrid_base + 4 * pos_k.astype(np.int32, copy=False) + p_hx_offset).astype(np.int32, copy=False)
+            hx_q = (acac_hybrid_base + 4 * pos_k.astype(np.int32, copy=False) + q_hx_offset).astype(np.int32, copy=False)
+            jcol_p = p_state_col[pos_k].astype(np.int32, copy=False)
+            jcol_q = q_state_col[pos_k].astype(np.int32, copy=False)
+            v_default, v_use_x, v_x_index, v_jcol, v_any_x = _voltage_fields(
+                v_col_full[mask], v_default_full[mask], 0,
+            )
+            return self._HybridCodeBucket(
+                rows=rows_k, hx_p=hx_p, hx_q=hx_q,
+                jcol_p=jcol_p, jcol_q=jcol_q,
+                v_default=v_default, v_use_x=v_use_x, v_x_index=v_x_index,
+                v_jcol=v_jcol, v_any_x=v_any_x,
+            )
+
+        acac_p_from_bucket = _build_acac_linear_power_bucket(1, 0, self.acac_p_from_state_col)
+        acac_q_from_bucket = _build_acac_linear_power_bucket(2, 1, self.acac_q_from_state_col)
+        acac_p_to_bucket = _build_acac_linear_power_bucket(3, 2, self.acac_p_to_state_col)
+        acac_q_to_bucket = _build_acac_linear_power_bucket(4, 3, self.acac_q_to_state_col)
+        acac_v_from_bucket = _build_voltage_only_bucket(
+            acac_codes, acac_rows, acac_from_v_col, acac_from_v_default, 5, 0,
+        )
+        acac_i_from_bucket = _build_acac_current_bucket(
+            6, 0, 1,
+            self.acac_p_from_state_col, self.acac_q_from_state_col,
+            acac_from_v_col, acac_from_v_default,
+        )
+        acac_v_to_bucket = _build_voltage_only_bucket(
+            acac_codes, acac_rows, acac_to_v_col, acac_to_v_default, 7, 0,
+        )
+        acac_i_to_bucket = _build_acac_current_bucket(
+            8, 2, 3,
+            self.acac_p_to_state_col, self.acac_q_to_state_col,
+            acac_to_v_col, acac_to_v_default,
+        )
+
         return self._HybridMeasurementPlan(
             dcac_rows=dcac_rows,
             dcac_codes=dcac_codes,
@@ -2402,6 +2725,21 @@ class HybridStateEstimator:
             acac_to_v_col=acac_to_v_col,
             acac_from_v_default=acac_from_v_default,
             acac_to_v_default=acac_to_v_default,
+            dcac_p_dc=dcac_p_dc_bucket,
+            dcac_p_ac=dcac_p_ac_bucket,
+            dcac_q_ac=dcac_q_ac_bucket,
+            dcac_v_dc=dcac_v_dc_bucket,
+            dcac_i_dc=dcac_i_dc_bucket,
+            dcac_v_ac=dcac_v_ac_bucket,
+            dcac_i_ac=dcac_i_ac_bucket,
+            acac_p_from=acac_p_from_bucket,
+            acac_q_from=acac_q_from_bucket,
+            acac_p_to=acac_p_to_bucket,
+            acac_q_to=acac_q_to_bucket,
+            acac_v_from=acac_v_from_bucket,
+            acac_i_from=acac_i_from_bucket,
+            acac_v_to=acac_v_to_bucket,
+            acac_i_to=acac_i_to_bucket,
         )
 
     def _hybrid_measurement_plan_for(
@@ -3538,9 +3876,28 @@ class HybridStateEstimator:
         table = self._measurement_table(measurements)
         return np.asarray(table.angle_mask, dtype=bool)
 
-    def _measurement_residual(self, z: np.ndarray, z_est: np.ndarray, measurements: Sequence[Measurement]) -> np.ndarray:
-        angle_mask = self._angle_residual_mask(measurements)
-        return build_measurement_residual(z, z_est, angle_mask)
+    def _measurement_residual(
+        self,
+        z: np.ndarray,
+        z_est: np.ndarray,
+        measurements: Sequence[Measurement],
+        *,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        if measurements is self.active_measurements:
+            angle_mask = self.active_angle_residual_mask
+            has_angle = self._active_has_angle_residuals
+        else:
+            angle_mask = self._angle_residual_mask(measurements)
+            has_angle = bool(angle_mask is not None and np.any(angle_mask))
+        if out is None:
+            residual = np.subtract(z, z_est, dtype=np.float64)
+        else:
+            np.subtract(z, z_est, out=out)
+            residual = out
+        if has_angle:
+            residual[angle_mask] = (residual[angle_mask] + np.pi) % (2.0 * np.pi) - np.pi
+        return residual
 
     def _safe_current(self, p: np.ndarray, q: Optional[np.ndarray], v: np.ndarray) -> np.ndarray:
         power = np.abs(p) if q is None else np.hypot(p, q)
@@ -3610,94 +3967,84 @@ class HybridStateEstimator:
         hybrid_x: np.ndarray,
         plan: "HybridStateEstimator._HybridMeasurementPlan",
     ) -> None:
-        rows = plan.dcac_rows
-        if rows.size:
-            codes = plan.dcac_codes
-            pos = plan.dcac_pos
-            base = 3 * pos
-            p_dc = hybrid_x[base]
-            p_ac = hybrid_x[base + 1]
-            q_ac = hybrid_x[base + 2]
-            v_dc = self._state_values_from_cols(
-                dc_x,
-                plan.dcac_dc_v_col,
-                plan.dcac_dc_v_default,
-                self.dc_state_start,
-            )
-            v_ac = self._state_values_from_cols(ac_x, plan.dcac_ac_v_col, plan.dcac_ac_v_default)
-            for code, source in (
-                (1, p_dc),
-                (2, p_ac),
-                (3, q_ac),
-                (4, v_dc),
-                (6, v_ac),
-            ):
-                mask = codes == code
-                if np.any(mask):
-                    values[rows[mask]] = source[mask]
-            mask = codes == 5
-            if np.any(mask):
-                values[rows[mask]] = np.divide(
-                    p_dc[mask],
-                    v_dc[mask],
-                    out=np.zeros(int(np.count_nonzero(mask)), dtype=np.float64),
-                    where=np.abs(v_dc[mask]) > self.min_current_voltage,
-                )
-            mask = codes == 7
-            if np.any(mask):
-                values[rows[mask]] = np.divide(
-                    np.hypot(p_ac[mask], q_ac[mask]),
-                    v_ac[mask],
-                    out=np.zeros(int(np.count_nonzero(mask)), dtype=np.float64),
-                    where=np.abs(v_ac[mask]) > self.min_current_voltage,
-                )
+        min_v = self.min_current_voltage
 
-        rows = plan.acac_rows
-        if rows.size:
-            codes = plan.acac_codes
-            pos = plan.acac_pos
-            base = 3 * len(self.dcac_converters) + 4 * pos
-            p_from = hybrid_x[base]
-            q_from = hybrid_x[base + 1]
-            p_to = hybrid_x[base + 2]
-            q_to = hybrid_x[base + 3]
-            v_from = self._state_values_from_cols(ac_x, plan.acac_from_v_col, plan.acac_from_v_default)
-            v_to = self._state_values_from_cols(ac_x, plan.acac_to_v_col, plan.acac_to_v_default)
-            for code, source in (
-                (1, p_from),
-                (2, q_from),
-                (3, p_to),
-                (4, q_to),
-                (5, v_from),
-                (7, v_to),
-            ):
-                mask = codes == code
-                if np.any(mask):
-                    values[rows[mask]] = source[mask]
-            mask = codes == 6
-            if np.any(mask):
-                values[rows[mask]] = np.divide(
-                    np.hypot(p_from[mask], q_from[mask]),
-                    v_from[mask],
-                    out=np.zeros(int(np.count_nonzero(mask)), dtype=np.float64),
-                    where=np.abs(v_from[mask]) > self.min_current_voltage,
-                )
-            mask = codes == 8
-            if np.any(mask):
-                values[rows[mask]] = np.divide(
-                    np.hypot(p_to[mask], q_to[mask]),
-                    v_to[mask],
-                    out=np.zeros(int(np.count_nonzero(mask)), dtype=np.float64),
-                    where=np.abs(v_to[mask]) > self.min_current_voltage,
-                )
+        def _gather_voltage(x: np.ndarray, bucket) -> np.ndarray:
+            out = bucket.v_default.copy()
+            if bucket.v_any_x:
+                out[bucket.v_use_x] = x[bucket.v_x_index]
+            return out
 
-    def evaluate(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
+        # DCAC identity codes (1 P_DC, 2 P_AC, 3 Q_AC).
+        for bucket in (plan.dcac_p_dc, plan.dcac_p_ac, plan.dcac_q_ac):
+            if bucket.rows.size:
+                values[bucket.rows] = hybrid_x[bucket.hx_p]
+
+        # DCAC voltage-only codes (4 V_DC, 6 V_AC) and ACAC (5 V_FROM, 7 V_TO).
+        for bucket, source_x in (
+            (plan.dcac_v_dc, dc_x),
+            (plan.dcac_v_ac, ac_x),
+        ):
+            if bucket.rows.size:
+                values[bucket.rows] = _gather_voltage(source_x, bucket)
+
+        # DCAC code 5 — I_DC = P_DC / V_DC.
+        bucket = plan.dcac_i_dc
+        if bucket.rows.size:
+            p_dc_k = hybrid_x[bucket.hx_p]
+            v_dc_k = _gather_voltage(dc_x, bucket)
+            out = np.zeros(bucket.rows.size, dtype=np.float64)
+            np.divide(p_dc_k, v_dc_k, out=out, where=np.abs(v_dc_k) > min_v)
+            values[bucket.rows] = out
+
+        # DCAC code 7 — I_AC = hypot(P_AC, Q_AC) / V_AC.
+        bucket = plan.dcac_i_ac
+        if bucket.rows.size:
+            p_ac_k = hybrid_x[bucket.hx_p]
+            q_ac_k = hybrid_x[bucket.hx_q]
+            v_ac_k = _gather_voltage(ac_x, bucket)
+            out = np.zeros(bucket.rows.size, dtype=np.float64)
+            np.divide(np.hypot(p_ac_k, q_ac_k), v_ac_k, out=out, where=np.abs(v_ac_k) > min_v)
+            values[bucket.rows] = out
+
+        # ACAC identity codes (1 P_FROM, 2 Q_FROM, 3 P_TO, 4 Q_TO).
+        for bucket in (plan.acac_p_from, plan.acac_q_from, plan.acac_p_to, plan.acac_q_to):
+            if bucket.rows.size:
+                values[bucket.rows] = hybrid_x[bucket.hx_p]
+
+        # ACAC voltage-only codes (5 V_FROM, 7 V_TO).
+        for bucket in (plan.acac_v_from, plan.acac_v_to):
+            if bucket.rows.size:
+                values[bucket.rows] = _gather_voltage(ac_x, bucket)
+
+        # ACAC nonlinear current codes (6 I_FROM, 8 I_TO).
+        for bucket in (plan.acac_i_from, plan.acac_i_to):
+            if bucket.rows.size:
+                p_k = hybrid_x[bucket.hx_p]
+                q_k = hybrid_x[bucket.hx_q]
+                v_k = _gather_voltage(ac_x, bucket)
+                out = np.zeros(bucket.rows.size, dtype=np.float64)
+                np.divide(np.hypot(p_k, q_k), v_k, out=out, where=np.abs(v_k) > min_v)
+                values[bucket.rows] = out
+
+    def evaluate(
+        self,
+        x: np.ndarray,
+        measurements: Optional[Sequence[Measurement]] = None,
+        *,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         delegate = self._delegate()
         if delegate is not None:
             return delegate.evaluate(x, measurements)
         measurements = self._normalize_measurements(measurements)
         ac_x, dc_x, hybrid_x = self._split_state(x)
-        values = np.zeros(len(measurements), dtype=np.float64)
+        n_meas = len(measurements)
+        if out is None:
+            values = np.zeros(n_meas, dtype=np.float64)
+        else:
+            values = out
+            values.fill(0.0)
         blocks = self._measurement_blocks_for(measurements)
         ac_block = blocks["ac"]
         dc_block = blocks["dc"]
@@ -3724,11 +4071,12 @@ class HybridStateEstimator:
         measurements = self._normalize_measurements(measurements)
         ac_x, dc_x, hybrid_x = self._split_state(x)
         shape = (len(measurements), self.n_state)
-        H = self._jacobian_builder if measurements is self.active_measurements else SparseJacobianBuilder(shape)
+        is_active = measurements is self.active_measurements
+        H = self._jacobian_builder if is_active else SparseJacobianBuilder(shape)
         H.reset()
         blocks = self._measurement_blocks_for(measurements)
-        self._append_sub_jacobian(H, self._ac_sub_estimator, ac_x, blocks["ac"], 0)
-        self._append_sub_jacobian(H, self._dc_sub_estimator, dc_x, blocks["dc"], self.dc_state_start)
+        self._append_sub_jacobian(H, self._ac_sub_estimator, ac_x, blocks["ac"], 0, "ac" if is_active else None)
+        self._append_sub_jacobian(H, self._dc_sub_estimator, dc_x, blocks["dc"], self.dc_state_start, "dc" if is_active else None)
         self._append_hybrid_jacobian_plan(
             H,
             ac_x,
@@ -3745,16 +4093,48 @@ class HybridStateEstimator:
         sub_x: np.ndarray,
         block: "HybridStateEstimator._MeasurementSideBlock",
         col_offset: int,
+        cache_key: Optional[str] = None,
     ) -> None:
+        """Stamp the sub-estimator's CSR jacobian into ``target``.
+
+        When ``cache_key`` is provided (i.e. the parent is operating on its
+        active measurements), the remapped row/column index arrays are cached
+        after the first call. Subsequent calls skip the CSR→COO conversion,
+        the row gather via ``block.rows[csr_rows]`` and the column offset
+        arithmetic — only the freshly-computed ``sub_csr.data`` is stamped.
+
+        Cache invalidation is driven by ``_refresh_active_measurement_state_layout``
+        and friends, which reset ``self._sub_jacobian_stamp_cache`` whenever the
+        active partition changes. We additionally guard against unexpected
+        pattern shifts by checking nnz on every reuse.
+        """
         if estimator is None or len(block.measurements) == 0:
             return
-        H = estimator.jacobian_sparse(sub_x, block.measurements).tocoo()
-        if H.nnz == 0:
+        sub_csr = estimator.jacobian_sparse(sub_x, block.measurements)
+        if sub_csr.nnz == 0:
             return
-        rows = block.rows[H.row].astype(np.int32, copy=False)
-        cols = H.col.astype(np.int32, copy=False) + int(col_offset)
-        data = H.data.astype(np.float64, copy=False)
-        target.add_many(rows, cols, data)
+        cache_store = self._sub_jacobian_stamp_cache if cache_key is not None else None
+        cached = cache_store.get(cache_key) if cache_store is not None else None
+        if cached is not None and cached["nnz"] == sub_csr.nnz:
+            target.add_many(cached["parent_rows"], cached["parent_cols"], sub_csr.data)
+            return
+
+        # Cold path: derive row indices from indptr without going through tocoo().
+        indptr = np.asarray(sub_csr.indptr)
+        indices = np.asarray(sub_csr.indices)
+        sub_rows = np.repeat(
+            np.arange(sub_csr.shape[0], dtype=np.int64),
+            np.diff(indptr).astype(np.int64, copy=False),
+        )
+        parent_rows = block.rows[sub_rows].astype(np.int32, copy=False)
+        parent_cols = (indices.astype(np.int32, copy=False) + np.int32(col_offset))
+        target.add_many(parent_rows, parent_cols, sub_csr.data)
+        if cache_store is not None:
+            cache_store[cache_key] = {
+                "parent_rows": parent_rows,
+                "parent_cols": parent_cols,
+                "nnz": int(sub_csr.nnz),
+            }
 
     @staticmethod
     def _append_vector_jacobian_entries(
@@ -3812,143 +4192,100 @@ class HybridStateEstimator:
         hybrid_x: np.ndarray,
         plan: "HybridStateEstimator._HybridMeasurementPlan",
     ) -> None:
-        row_array = plan.dcac_rows
-        if row_array.size:
-            codes = plan.dcac_codes
-            pos = plan.dcac_pos
-            base = 3 * pos
-            p_dc = hybrid_x[base]
-            p_ac = hybrid_x[base + 1]
-            q_ac = hybrid_x[base + 2]
-            p_dc_col = self.dcac_p_dc_state_col[pos]
-            p_ac_col = self.dcac_p_ac_state_col[pos]
-            q_ac_col = self.dcac_q_ac_state_col[pos]
-            v_dc_col = plan.dcac_dc_v_col
-            v_ac_col = plan.dcac_ac_v_col
-            v_dc = self._state_values_from_cols(dc_x, v_dc_col, plan.dcac_dc_v_default, self.dc_state_start)
-            v_ac = self._state_values_from_cols(ac_x, v_ac_col, plan.dcac_ac_v_default)
+        min_v = self.min_current_voltage
 
-            self._append_vector_jacobian_entries(target, row_array, p_dc_col, 1.0, codes == 1)
-            self._append_vector_jacobian_entries(target, row_array, p_ac_col, 1.0, codes == 2)
-            self._append_vector_jacobian_entries(target, row_array, q_ac_col, 1.0, codes == 3)
-            self._append_vector_jacobian_entries(target, row_array, v_dc_col, 1.0, codes == 4)
-            self._append_vector_jacobian_entries(target, row_array, v_ac_col, 1.0, codes == 6)
+        def _gather_voltage(x: np.ndarray, bucket) -> np.ndarray:
+            out = bucket.v_default.copy()
+            if bucket.v_any_x:
+                out[bucket.v_use_x] = x[bucket.v_x_index]
+            return out
 
-            valid = (codes == 5) & (np.abs(v_dc) > self.min_current_voltage)
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                p_dc_col,
-                self._masked_divide(1.0, v_dc, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                v_dc_col,
-                self._masked_divide(-p_dc, v_dc * v_dc, valid),
-                valid,
-            )
+        def _stamp_identity_power(bucket) -> None:
+            """Identity derivative: 1.0 at jcol_p for every row."""
+            if bucket.rows.size:
+                target.add_many(
+                    bucket.rows,
+                    bucket.jcol_p,
+                    np.ones(bucket.rows.size, dtype=np.float64),
+                )
 
-            s_ac = np.hypot(p_ac, q_ac)
-            valid = (codes == 7) & (np.abs(v_ac) > self.min_current_voltage) & (s_ac > 1e-12)
-            s_ac_v = s_ac * v_ac
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                p_ac_col,
-                self._masked_divide(p_ac, s_ac_v, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                q_ac_col,
-                self._masked_divide(q_ac, s_ac_v, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                v_ac_col,
-                self._masked_divide(-s_ac, v_ac * v_ac, valid),
-                valid,
-            )
+        def _stamp_identity_voltage(bucket) -> None:
+            """Identity derivative: 1.0 at v_jcol where v_use_x (cols<0 filtered out)."""
+            if bucket.rows.size and bucket.v_any_x:
+                mask = bucket.v_use_x
+                target.add_many(
+                    bucket.rows[mask],
+                    bucket.v_jcol[mask],
+                    np.ones(int(mask.sum()), dtype=np.float64),
+                )
 
-        row_array = plan.acac_rows
-        if row_array.size:
-            codes = plan.acac_codes
-            pos = plan.acac_pos
-            base = 3 * len(self.dcac_converters) + 4 * pos
-            p_from = hybrid_x[base]
-            q_from = hybrid_x[base + 1]
-            p_to = hybrid_x[base + 2]
-            q_to = hybrid_x[base + 3]
-            p_from_col = self.acac_p_from_state_col[pos]
-            q_from_col = self.acac_q_from_state_col[pos]
-            p_to_col = self.acac_p_to_state_col[pos]
-            q_to_col = self.acac_q_to_state_col[pos]
-            v_from_col = plan.acac_from_v_col
-            v_to_col = plan.acac_to_v_col
-            v_from = self._state_values_from_cols(ac_x, v_from_col, plan.acac_from_v_default)
-            v_to = self._state_values_from_cols(ac_x, v_to_col, plan.acac_to_v_default)
+        def _stamp_current_dc(bucket, x_for_v) -> None:
+            """I_DC = p_dc / v_dc. Two jacobian terms."""
+            if not bucket.rows.size:
+                return
+            p_dc_k = hybrid_x[bucket.hx_p]
+            v_dc_k = _gather_voltage(x_for_v, bucket)
+            valid = np.abs(v_dc_k) > min_v
+            if not valid.any():
+                return
+            target.add_many(
+                bucket.rows[valid],
+                bucket.jcol_p[valid],
+                1.0 / v_dc_k[valid],
+            )
+            v_mask = bucket.v_use_x & valid
+            if v_mask.any():
+                v_dc_sel = v_dc_k[v_mask]
+                target.add_many(
+                    bucket.rows[v_mask],
+                    bucket.v_jcol[v_mask],
+                    -p_dc_k[v_mask] / (v_dc_sel * v_dc_sel),
+                )
 
-            self._append_vector_jacobian_entries(target, row_array, p_from_col, 1.0, codes == 1)
-            self._append_vector_jacobian_entries(target, row_array, q_from_col, 1.0, codes == 2)
-            self._append_vector_jacobian_entries(target, row_array, p_to_col, 1.0, codes == 3)
-            self._append_vector_jacobian_entries(target, row_array, q_to_col, 1.0, codes == 4)
-            self._append_vector_jacobian_entries(target, row_array, v_from_col, 1.0, codes == 5)
-            self._append_vector_jacobian_entries(target, row_array, v_to_col, 1.0, codes == 7)
+        def _stamp_current_ac(bucket, x_for_v) -> None:
+            """I = hypot(p, q) / v. Three jacobian terms."""
+            if not bucket.rows.size:
+                return
+            p_k = hybrid_x[bucket.hx_p]
+            q_k = hybrid_x[bucket.hx_q]
+            v_k = _gather_voltage(x_for_v, bucket)
+            s_k = np.hypot(p_k, q_k)
+            valid = (np.abs(v_k) > min_v) & (s_k > 1e-12)
+            if not valid.any():
+                return
+            s_v = s_k[valid] * v_k[valid]
+            rows_v = bucket.rows[valid]
+            target.add_many(rows_v, bucket.jcol_p[valid], p_k[valid] / s_v)
+            target.add_many(rows_v, bucket.jcol_q[valid], q_k[valid] / s_v)
+            v_mask = bucket.v_use_x & valid
+            if v_mask.any():
+                v_sel = v_k[v_mask]
+                target.add_many(
+                    bucket.rows[v_mask],
+                    bucket.v_jcol[v_mask],
+                    -s_k[v_mask] / (v_sel * v_sel),
+                )
 
-            s_from = np.hypot(p_from, q_from)
-            valid = (codes == 6) & (np.abs(v_from) > self.min_current_voltage) & (s_from > 1e-12)
-            s_from_v = s_from * v_from
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                p_from_col,
-                self._masked_divide(p_from, s_from_v, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                q_from_col,
-                self._masked_divide(q_from, s_from_v, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                v_from_col,
-                self._masked_divide(-s_from, v_from * v_from, valid),
-                valid,
-            )
+        # DCAC linear codes (1/2/3 — identity on power state; 4/6 — identity on voltage state).
+        _stamp_identity_power(plan.dcac_p_dc)
+        _stamp_identity_power(plan.dcac_p_ac)
+        _stamp_identity_power(plan.dcac_q_ac)
+        _stamp_identity_voltage(plan.dcac_v_dc)
+        _stamp_identity_voltage(plan.dcac_v_ac)
+        # DCAC nonlinear codes.
+        _stamp_current_dc(plan.dcac_i_dc, dc_x)
+        _stamp_current_ac(plan.dcac_i_ac, ac_x)
 
-            s_to = np.hypot(p_to, q_to)
-            valid = (codes == 8) & (np.abs(v_to) > self.min_current_voltage) & (s_to > 1e-12)
-            s_to_v = s_to * v_to
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                p_to_col,
-                self._masked_divide(p_to, s_to_v, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                q_to_col,
-                self._masked_divide(q_to, s_to_v, valid),
-                valid,
-            )
-            self._append_vector_jacobian_entries(
-                target,
-                row_array,
-                v_to_col,
-                self._masked_divide(-s_to, v_to * v_to, valid),
-                valid,
-            )
+        # ACAC linear codes.
+        _stamp_identity_power(plan.acac_p_from)
+        _stamp_identity_power(plan.acac_q_from)
+        _stamp_identity_power(plan.acac_p_to)
+        _stamp_identity_power(plan.acac_q_to)
+        _stamp_identity_voltage(plan.acac_v_from)
+        _stamp_identity_voltage(plan.acac_v_to)
+        # ACAC nonlinear current codes.
+        _stamp_current_ac(plan.acac_i_from, ac_x)
+        _stamp_current_ac(plan.acac_i_to, ac_x)
 
     def observability_analysis(
         self,
@@ -4069,12 +4406,18 @@ class HybridStateEstimator:
         gain = None
         normal_factor_diag = None
         iteration = 0
-        z_est = np.array([], dtype=np.float64)
-        residual = np.array([], dtype=np.float64)
+        # Pre-allocate evaluation/residual buffers and reuse them across iterations
+        # and line-search candidates. On acceptance we swap pointers so the accepted
+        # vectors become the "main" buffers without copying.
+        n_meas = len(measurements)
+        z_est = np.empty(n_meas, dtype=np.float64)
+        residual = np.empty(n_meas, dtype=np.float64)
+        cand_z_est = np.empty(n_meas, dtype=np.float64)
+        cand_residual = np.empty(n_meas, dtype=np.float64)
 
         for iteration in range(1, self.max_iter + 1):
-            z_est = self.evaluate(x, measurements)
-            residual = self._measurement_residual(z, z_est, measurements)
+            self.evaluate(x, measurements, out=z_est)
+            self._measurement_residual(z, z_est, measurements, out=residual)
             objective = self._weighted_objective(weight, residual)
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if iteration == 1 and cached_initial_H is not None:
@@ -4114,14 +4457,15 @@ class HybridStateEstimator:
                 candidate = x + step_scale * dx
                 if self.voltage_cols.size:
                     candidate[self.voltage_cols] = np.maximum(candidate[self.voltage_cols], self.voltage_floor)
-                candidate_z_est = self.evaluate(candidate, measurements)
-                candidate_residual = self._measurement_residual(z, candidate_z_est, measurements)
-                candidate_objective = self._weighted_objective(weight, candidate_residual)
+                self.evaluate(candidate, measurements, out=cand_z_est)
+                self._measurement_residual(z, cand_z_est, measurements, out=cand_residual)
+                candidate_objective = self._weighted_objective(weight, cand_residual)
                 if np.isfinite(candidate_objective) and candidate_objective <= objective + 1e-12:
                     x = candidate
                     objective = candidate_objective
-                    residual = candidate_residual
-                    z_est = candidate_z_est
+                    # Swap the accepted candidate buffers into the main role.
+                    z_est, cand_z_est = cand_z_est, z_est
+                    residual, cand_residual = cand_residual, residual
                     residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
                     accepted = True
                     break
@@ -4142,8 +4486,8 @@ class HybridStateEstimator:
                 _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, False)
 
         if H is None or gain is None:
-            z_est = self.evaluate(x, measurements)
-            residual = self._measurement_residual(z, z_est, measurements)
+            self.evaluate(x, measurements, out=z_est)
+            self._measurement_residual(z, z_est, measurements, out=residual)
             objective = self._weighted_objective(weight, residual)
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if final_diagnostics:
@@ -4170,6 +4514,8 @@ class HybridStateEstimator:
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         array_only_result = bool(getattr(self, "_array_only_estimate_result", False))
+        # Copy the buffer-backed vectors so callers (and the next estimate() invocation)
+        # can't accidentally see them mutate as line-search scratch space later on.
         return EstimateResult(
             converged=converged,
             iterations=iteration,
@@ -4177,8 +4523,8 @@ class HybridStateEstimator:
             max_correction=max_correction,
             residual_inf=residual_inf,
             x=x,
-            z_est=z_est,
-            residual=residual,
+            z_est=z_est.copy(),
+            residual=residual.copy(),
             H=H,
             gain=gain,
             measurements=[] if array_only_result else (

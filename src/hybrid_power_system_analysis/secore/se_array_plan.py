@@ -226,10 +226,15 @@ def _cached_measurement_device_pos(
             continue
         pos_map = device_pos_by_type_code.get(code_int)
         if pos_map:
-            device_pos[rows] = np.fromiter(
-                (pos_map.get(device_name, -1) for device_name in table.device_name[rows]),
+            # `np.fromiter` with a generator was the dominant cost here for
+            # large measurement files. `tolist()` + list comprehension +
+            # `np.array(..., dtype=...)` is markedly faster because it avoids
+            # per-element Python <-> numpy boxing.
+            names = table.device_name[rows].tolist()
+            pos_get = pos_map.get
+            device_pos[rows] = np.array(
+                [pos_get(name, -1) for name in names],
                 dtype=np.int64,
-                count=rows.size,
             )
     if cache is None:
         cache = {}
@@ -258,10 +263,11 @@ def _cached_measurement_kind(
             continue
         kind_map = meas_kind_by_type_code.get(code_int)
         if kind_map:
-            meas_kind[rows] = np.fromiter(
-                (kind_map.get(meas_type, -1) for meas_type in table.meas_type[rows]),
+            names = table.meas_type[rows].tolist()
+            kind_get = kind_map.get
+            meas_kind[rows] = np.array(
+                [kind_get(name, -1) for name in names],
                 dtype=np.int16,
-                count=rows.size,
             )
     if cache is None:
         cache = {}

@@ -2817,13 +2817,21 @@ class HybridStateEstimationTest(unittest.TestCase):
         original_evaluate = estimator.evaluate
         evaluate_count = 0
 
-        def nonfinite_candidate_evaluate(x, measurements=None):
+        def nonfinite_candidate_evaluate(x, measurements=None, *, out=None):
             nonlocal evaluate_count
             evaluate_count += 1
             if evaluate_count == 1:
-                return original_evaluate(x, measurements)
+                result = original_evaluate(x, measurements)
+                if out is not None:
+                    out[...] = result
+                    return out
+                return result
             measurements = estimator.active_measurements if measurements is None else list(measurements)
-            return np.full(len(measurements), np.nan)
+            result = np.full(len(measurements), np.nan)
+            if out is not None:
+                out[...] = result
+                return out
+            return result
 
         class FiniteStepSolver:
             def __init__(self, assume_fixed_pattern=False):

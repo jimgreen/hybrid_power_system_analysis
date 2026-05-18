@@ -369,49 +369,71 @@ def _build_dc_se_network_from_ppc_dict(ppc: Dict) -> DCPowerNetwork:
     )
 
     bus_names = ppc.get("bus_name")
-    network.nodes = []
-    append_node = network.nodes.append
-    for pos, row in enumerate(ppc["bus"]):
-        idx = int(row[DC_BUS_COLS["idx"]])
-        append_node(
-            _dc_array_object(
-                idx,
-                _ppc_name(bus_names, pos, "bus", idx),
-                vbase=float(row[DC_BUS_COLS["vbase"]]),
-                voltage=float(row[DC_BUS_COLS["voltage"]]),
-                run_stat=int(row[DC_BUS_COLS["run_stat"]]),
-                isl=None,
-                isl_obj=None,
-                bus=None,
-                bus_obj=None,
-                v_set=1.0,
-                v_gens=[],
-                v_dcdcs=[],
-                is_slack=False,
-            )
-        )
+    bus_rows = ppc["bus"]
+    nodes = []
+    append_node = nodes.append
+    bus_idx_col = DC_BUS_COLS["idx"]
+    bus_vbase_col = DC_BUS_COLS["vbase"]
+    bus_voltage_col = DC_BUS_COLS["voltage"]
+    bus_run_stat_col = DC_BUS_COLS["run_stat"]
+    for pos, row in enumerate(bus_rows):
+        idx = int(row[bus_idx_col])
+        obj = _DCArrayObject()
+        obj.idx = idx
+        obj.name = _ppc_name(bus_names, pos, "bus", idx)
+        obj.vbase = float(row[bus_vbase_col])
+        obj.voltage = float(row[bus_voltage_col])
+        obj.run_stat = int(row[bus_run_stat_col])
+        obj.is_alive = False
+        obj.isl = None
+        obj.isl_obj = None
+        obj.bus = None
+        obj.bus_obj = None
+        obj.v_set = 1.0
+        obj.v_gens = []
+        obj.v_dcdcs = []
+        obj.is_slack = False
+        append_node(obj)
+    network.nodes = nodes
 
     def terminal_devices(table_key, name_key, cols, prefix, extra=None):
+        """Build a list of _DCArrayObject terminal devices.
+
+        Inlines slot assignment instead of going through `_dc_array_object`'s
+        **kwargs path, since the kwargs dict construction was a dominant cost
+        when this loop runs over tens of thousands of devices.
+        """
         rows = ppc.get(table_key)
         if rows is None:
             return []
         names = ppc.get(name_key)
         out = []
         append = out.append
+        idx_col = cols["idx"]
+        i_node_col = cols["i_node"]
+        j_node_col = cols["j_node"]
+        run_stat_col = cols["run_stat"]
         extra = extra or {}
+        # Pre-resolve (attr_name, col_index, is_int) tuples to avoid dict ops in loop.
+        extra_specs = tuple(
+            (attr, cols[col_name], attr == "status")
+            for attr, col_name in extra.items()
+        )
         for pos, row in enumerate(rows):
-            idx = int(row[cols["idx"]])
-            values = {
-                "i_node": int(row[cols["i_node"]]),
-                "j_node": int(row[cols["j_node"]]),
-                "run_stat": int(row[cols["run_stat"]]),
-                "i_node_obj": None,
-                "j_node_obj": None,
-            }
-            for attr, col_name in extra.items():
-                raw = row[cols[col_name]]
-                values[attr] = int(raw) if attr == "status" else float(raw)
-            append(_dc_array_object(idx, _ppc_name(names, pos, prefix, idx), **values))
+            idx = int(row[idx_col])
+            obj = _DCArrayObject()
+            obj.idx = idx
+            obj.name = _ppc_name(names, pos, prefix, idx)
+            obj.is_alive = False
+            obj.i_node = int(row[i_node_col])
+            obj.j_node = int(row[j_node_col])
+            obj.run_stat = int(row[run_stat_col])
+            obj.i_node_obj = None
+            obj.j_node_obj = None
+            for attr, col_index, is_int in extra_specs:
+                raw = row[col_index]
+                setattr(obj, attr, int(raw) if is_int else float(raw))
+            append(obj)
         return out
 
     network.branches = terminal_devices(
@@ -432,74 +454,109 @@ def _build_dc_se_network_from_ppc_dict(ppc: Dict) -> DCPowerNetwork:
     network.switches = terminal_devices("switch", "switch_name", DC_SWITCH_COLS, "switch", switch_extra)
     network.breakers = terminal_devices("break", "break_name", DC_BREAK_COLS, "break", switch_extra)
 
-    network.loads = []
-    append_load = network.loads.append
+    load_rows = ppc["load"]
+    loads = []
+    append_load = loads.append
     load_names = ppc.get("load_name")
-    for pos, row in enumerate(ppc["load"]):
-        idx = int(row[DC_LOAD_COLS["idx"]])
-        append_load(
-            _dc_array_object(
-                idx,
-                _ppc_name(load_names, pos, "load", idx),
-                node=int(row[DC_LOAD_COLS["node"]]),
-                pbase=float(row[DC_LOAD_COLS["pbase"]]),
-                pv0=float(row[DC_LOAD_COLS["pv0"]]),
-                pv1=float(row[DC_LOAD_COLS["pv1"]]),
-                pv2=float(row[DC_LOAD_COLS["pv2"]]),
-                run_stat=int(row[DC_LOAD_COLS["run_stat"]]),
-                p=float(row[DC_LOAD_COLS["p"]]),
-                current=float(row[DC_LOAD_COLS["current"]]),
-                node_obj=None,
-            )
-        )
+    load_idx_col = DC_LOAD_COLS["idx"]
+    load_node_col = DC_LOAD_COLS["node"]
+    load_pbase_col = DC_LOAD_COLS["pbase"]
+    load_pv0_col = DC_LOAD_COLS["pv0"]
+    load_pv1_col = DC_LOAD_COLS["pv1"]
+    load_pv2_col = DC_LOAD_COLS["pv2"]
+    load_run_stat_col = DC_LOAD_COLS["run_stat"]
+    load_p_col = DC_LOAD_COLS["p"]
+    load_current_col = DC_LOAD_COLS["current"]
+    for pos, row in enumerate(load_rows):
+        idx = int(row[load_idx_col])
+        obj = _DCArrayObject()
+        obj.idx = idx
+        obj.name = _ppc_name(load_names, pos, "load", idx)
+        obj.is_alive = False
+        obj.node = int(row[load_node_col])
+        obj.pbase = float(row[load_pbase_col])
+        obj.pv0 = float(row[load_pv0_col])
+        obj.pv1 = float(row[load_pv1_col])
+        obj.pv2 = float(row[load_pv2_col])
+        obj.run_stat = int(row[load_run_stat_col])
+        obj.p = float(row[load_p_col])
+        obj.current = float(row[load_current_col])
+        obj.node_obj = None
+        append_load(obj)
+    network.loads = loads
 
-    network.generators = []
-    append_gen = network.generators.append
+    gen_rows = ppc["gen"]
+    generators = []
+    append_gen = generators.append
     gen_names = ppc.get("gen_name")
-    for pos, row in enumerate(ppc["gen"]):
-        idx = int(row[DC_GEN_COLS["idx"]])
-        append_gen(
-            _dc_array_object(
-                idx,
-                _ppc_name(gen_names, pos, "gen", idx),
-                node=int(row[DC_GEN_COLS["node"]]),
-                control_type=_DC_CTRL_NAME_BY_CODE.get(int(row[DC_GEN_COLS["control_type"]]), "P"),
-                p_set=float(row[DC_GEN_COLS["p_set"]]),
-                v_set=float(row[DC_GEN_COLS["v_set"]]),
-                i_set=float(row[DC_GEN_COLS["i_set"]]),
-                run_stat=int(row[DC_GEN_COLS["run_stat"]]),
-                p=float(row[DC_GEN_COLS["p"]]),
-                current=float(row[DC_GEN_COLS["current"]]),
-                node_obj=None,
-            )
-        )
+    gen_idx_col = DC_GEN_COLS["idx"]
+    gen_node_col = DC_GEN_COLS["node"]
+    gen_ctrl_col = DC_GEN_COLS["control_type"]
+    gen_p_set_col = DC_GEN_COLS["p_set"]
+    gen_v_set_col = DC_GEN_COLS["v_set"]
+    gen_i_set_col = DC_GEN_COLS["i_set"]
+    gen_run_stat_col = DC_GEN_COLS["run_stat"]
+    gen_p_col = DC_GEN_COLS["p"]
+    gen_current_col = DC_GEN_COLS["current"]
+    for pos, row in enumerate(gen_rows):
+        idx = int(row[gen_idx_col])
+        obj = _DCArrayObject()
+        obj.idx = idx
+        obj.name = _ppc_name(gen_names, pos, "gen", idx)
+        obj.is_alive = False
+        obj.node = int(row[gen_node_col])
+        obj.control_type = _DC_CTRL_NAME_BY_CODE.get(int(row[gen_ctrl_col]), "P")
+        obj.p_set = float(row[gen_p_set_col])
+        obj.v_set = float(row[gen_v_set_col])
+        obj.i_set = float(row[gen_i_set_col])
+        obj.run_stat = int(row[gen_run_stat_col])
+        obj.p = float(row[gen_p_col])
+        obj.current = float(row[gen_current_col])
+        obj.node_obj = None
+        append_gen(obj)
+    network.generators = generators
 
-    network.dcdc_converters = []
-    append_dcdc = network.dcdc_converters.append
+    dcdc_rows = ppc["dcdc"]
+    dcdc_converters = []
+    append_dcdc = dcdc_converters.append
     dcdc_names = ppc.get("dcdc_name")
-    for pos, row in enumerate(ppc["dcdc"]):
-        idx = int(row[DC_DCDC_COLS["idx"]])
-        append_dcdc(
-            _dc_array_object(
-                idx,
-                _ppc_name(dcdc_names, pos, "dcdc", idx),
-                i_node=int(row[DC_DCDC_COLS["i_node"]]),
-                j_node=int(row[DC_DCDC_COLS["j_node"]]),
-                r1=float(row[DC_DCDC_COLS["r1"]]),
-                r2=float(row[DC_DCDC_COLS["r2"]]),
-                control_type=_DC_CTRL_NAME_BY_CODE.get(int(row[DC_DCDC_COLS["control_type"]]), "P"),
-                p_set=float(row[DC_DCDC_COLS["p_set"]]),
-                i_set=float(row[DC_DCDC_COLS["i_set"]]),
-                v_set=float(row[DC_DCDC_COLS["v_set"]]),
-                run_stat=int(row[DC_DCDC_COLS["run_stat"]]),
-                i_p=float(row[DC_DCDC_COLS["i_p"]]),
-                j_p=float(row[DC_DCDC_COLS["j_p"]]),
-                i_c=float(row[DC_DCDC_COLS["i_c"]]),
-                j_c=float(row[DC_DCDC_COLS["j_c"]]),
-                i_node_obj=None,
-                j_node_obj=None,
-            )
-        )
+    dcdc_idx_col = DC_DCDC_COLS["idx"]
+    dcdc_i_node_col = DC_DCDC_COLS["i_node"]
+    dcdc_j_node_col = DC_DCDC_COLS["j_node"]
+    dcdc_r1_col = DC_DCDC_COLS["r1"]
+    dcdc_r2_col = DC_DCDC_COLS["r2"]
+    dcdc_ctrl_col = DC_DCDC_COLS["control_type"]
+    dcdc_p_set_col = DC_DCDC_COLS["p_set"]
+    dcdc_i_set_col = DC_DCDC_COLS["i_set"]
+    dcdc_v_set_col = DC_DCDC_COLS["v_set"]
+    dcdc_run_stat_col = DC_DCDC_COLS["run_stat"]
+    dcdc_i_p_col = DC_DCDC_COLS["i_p"]
+    dcdc_j_p_col = DC_DCDC_COLS["j_p"]
+    dcdc_i_c_col = DC_DCDC_COLS["i_c"]
+    dcdc_j_c_col = DC_DCDC_COLS["j_c"]
+    for pos, row in enumerate(dcdc_rows):
+        idx = int(row[dcdc_idx_col])
+        obj = _DCArrayObject()
+        obj.idx = idx
+        obj.name = _ppc_name(dcdc_names, pos, "dcdc", idx)
+        obj.is_alive = False
+        obj.i_node = int(row[dcdc_i_node_col])
+        obj.j_node = int(row[dcdc_j_node_col])
+        obj.r1 = float(row[dcdc_r1_col])
+        obj.r2 = float(row[dcdc_r2_col])
+        obj.control_type = _DC_CTRL_NAME_BY_CODE.get(int(row[dcdc_ctrl_col]), "P")
+        obj.p_set = float(row[dcdc_p_set_col])
+        obj.i_set = float(row[dcdc_i_set_col])
+        obj.v_set = float(row[dcdc_v_set_col])
+        obj.run_stat = int(row[dcdc_run_stat_col])
+        obj.i_p = float(row[dcdc_i_p_col])
+        obj.j_p = float(row[dcdc_j_p_col])
+        obj.i_c = float(row[dcdc_i_c_col])
+        obj.j_c = float(row[dcdc_j_c_col])
+        obj.i_node_obj = None
+        obj.j_node_obj = None
+        append_dcdc(obj)
+    network.dcdc_converters = dcdc_converters
 
     network._topology_arrays = topology_arrays
     network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, build_alive_maps=False)
@@ -892,6 +949,26 @@ class DCStateEstimator:
         self._active_measurement_plan = self._measurement_plan(self.active_measurements)
 
     @staticmethod
+    def _populate_kind_masks(plan: Dict[str, np.ndarray]) -> None:
+        """Fill in per-kind bool masks that the fill_* hot loops would otherwise
+        recompute every iteration. Tuples of length max_kind+1; entry k is the
+        ``section_kind == k`` mask. Called after every plan build / merge /
+        shrink so the masks always reflect the current kind arrays."""
+        for key, max_kind in (
+            ("branch_kind", 5),
+            ("load_kind", 2),
+            ("gen_kind", 2),
+            ("gen_ctrl", 2),
+            ("switch_kind", 5),
+            ("dcdc_kind", 5),
+        ):
+            kind = plan.get(key)
+            if kind is None:
+                continue
+            mask_key = key.rsplit("_", 1)[0] + ("_ctrl_masks" if key.endswith("_ctrl") else "_kind_masks")
+            plan[mask_key] = tuple((kind == k) for k in range(max_kind + 1))
+
+    @staticmethod
     def _merge_measurement_plan(
         head: Dict[str, np.ndarray],
         tail: Dict[str, np.ndarray],
@@ -906,8 +983,20 @@ class DCStateEstimator:
             "constraint_rows",
             "dcdc_rows",
         }
+        # Per-kind bool mask tuples are recomputed from merged kind arrays after
+        # the rest is concatenated; skip them in the per-key concat loop below.
+        skip_keys = {
+            "branch_kind_masks",
+            "load_kind_masks",
+            "gen_kind_masks",
+            "gen_ctrl_masks",
+            "switch_kind_masks",
+            "dcdc_kind_masks",
+        }
         merged: Dict[str, np.ndarray] = {}
         for key, head_value in head.items():
+            if key in skip_keys:
+                continue
             tail_value = tail[key]
             if key in row_keys:
                 merged[key] = np.concatenate(
@@ -918,6 +1007,7 @@ class DCStateEstimator:
                 ).astype(np.int64, copy=False)
             else:
                 merged[key] = np.concatenate((np.asarray(head_value), np.asarray(tail_value)))
+        DCStateEstimator._populate_kind_masks(merged)
         return merged
 
     def _incremental_update_active_measurement_indexes(self, appended_measurements: Sequence[Measurement]) -> bool:
@@ -997,6 +1087,7 @@ class DCStateEstimator:
             merged[row_key] = shrunk_rows
             for value_key in value_keys:
                 merged[value_key] = np.asarray(plan[value_key])[keep]
+        DCStateEstimator._populate_kind_masks(merged)
         return merged
 
     def _shrink_active_measurement_indexes(self, removed_pos: int) -> MeasurementList:
@@ -2341,52 +2432,62 @@ class DCStateEstimator:
                 meas.value = float(value[pos])
 
         active_rows = np.flatnonzero(active)
-        active_device_keys = set(zip(table.device_type[active_rows], table.device_name[active_rows]))
-        active_measurement_keys = set(zip(table.device_type[active_rows], table.device_name[active_rows], table.meas_type[active_rows]))
+        device_type_arr = np.asarray(table.device_type, dtype=object)
+        device_name_arr = np.asarray(table.device_name, dtype=object)
+        meas_type_arr = np.asarray(table.meas_type, dtype=object)
+        active_device_keys = set(zip(device_type_arr[active_rows].tolist(), device_name_arr[active_rows].tolist()))
+        active_measurement_keys = set(zip(
+            device_type_arr[active_rows].tolist(),
+            device_name_arr[active_rows].tolist(),
+            meas_type_arr[active_rows].tolist(),
+        ))
         node_voltage_best: Dict[int, Tuple[float, float]] = {}
         real_voltage_best: Dict[int, Tuple[float, float]] = {}
         seed_rows = []
-        for pos in active_rows:
-            device_type = str(table.device_type[pos])
-            device_name = str(table.device_name[pos])
-            row_type = str(table.meas_type[pos])
-            row_value = float(value[pos])
-            row_weight = float(weight[pos])
-            is_real_measurement = int(status_code[pos]) != MEAS_STATUS_PSEUDO
-            if is_real_measurement and row_type in _VOLTAGE_MEASUREMENT_TYPES:
-                node_idx = self._voltage_measurement_node_idx(device_type, device_name, row_type)
-                if node_idx is not None and node_idx in self.node_pos:
-                    current = real_voltage_best.get(node_idx)
-                    if current is None or row_weight > current[0]:
-                        real_voltage_best[node_idx] = (row_weight, row_value)
-                if device_type == "DCNode" and row_type == "V" and device_name in self.node_by_name:
-                    node_idx = int(self.node_by_name[device_name].idx)
-                    current = node_voltage_best.get(node_idx)
-                    if current is None or row_weight > current[0]:
-                        node_voltage_best[node_idx] = (row_weight, row_value)
-            if (
-                (device_type == "DCNode" and row_type == "V")
-                or (device_type == "DCGenerator" and row_type in ("P_GEN", "V_GEN", "I_GEN"))
-                or (device_type == "DCLoad" and row_type in ("P_LOAD", "V_LOAD", "I_LOAD"))
-                or (
-                    device_type == "DCDCConverter"
-                    and row_type
-                    in (
-                        "P_FROM",
-                        "P_DC",
-                        "P_IN",
-                        "P_TO",
-                        "P_OUT",
-                        "V_FROM",
-                        "V_TO",
-                        "I_FROM",
-                        "I_DC",
-                        "I_TO",
-                        "I_OUT",
-                    )
-                )
-            ):
-                seed_rows.append((device_type, device_name, row_type, row_value))
+        # Pre-materialize numpy fields as Python lists to skip per-iteration
+        # numpy scalar boxing. The dict-build loop below operates entirely on
+        # plain Python objects.
+        if active_rows.size:
+            dt_list = device_type_arr[active_rows].tolist()
+            dn_list = device_name_arr[active_rows].tolist()
+            mt_list = meas_type_arr[active_rows].tolist()
+            val_list = value[active_rows].tolist()
+            w_list = weight[active_rows].tolist()
+            is_pseudo_list = (status_code[active_rows] == MEAS_STATUS_PSEUDO).tolist()
+            node_by_name = self.node_by_name
+            node_pos_local = self.node_pos
+            voltage_node_lookup = self._voltage_measurement_node_idx
+            seed_dcdc_types = frozenset((
+                "P_FROM", "P_DC", "P_IN", "P_TO", "P_OUT",
+                "V_FROM", "V_TO", "I_FROM", "I_DC", "I_TO", "I_OUT",
+            ))
+            seed_gen_types = frozenset(("P_GEN", "V_GEN", "I_GEN"))
+            seed_load_types = frozenset(("P_LOAD", "V_LOAD", "I_LOAD"))
+            for k in range(active_rows.size):
+                device_type = dt_list[k]
+                device_name = dn_list[k]
+                row_type = mt_list[k]
+                row_value = val_list[k]
+                row_weight = w_list[k]
+                is_real_measurement = not is_pseudo_list[k]
+                if is_real_measurement and row_type in _VOLTAGE_MEASUREMENT_TYPES:
+                    node_idx = voltage_node_lookup(device_type, device_name, row_type)
+                    if node_idx is not None and node_idx in node_pos_local:
+                        current = real_voltage_best.get(node_idx)
+                        if current is None or row_weight > current[0]:
+                            real_voltage_best[node_idx] = (row_weight, row_value)
+                    if device_type == "DCNode" and row_type == "V" and device_name in node_by_name:
+                        node_idx = int(node_by_name[device_name].idx)
+                        current = node_voltage_best.get(node_idx)
+                        if current is None or row_weight > current[0]:
+                            node_voltage_best[node_idx] = (row_weight, row_value)
+                if (
+                    (device_type == "DCNode" and row_type == "V")
+                    or (device_type == "DCGenerator" and row_type in seed_gen_types)
+                    or (device_type == "DCLoad" and row_type in seed_load_types)
+                    or (device_type == "DCDCConverter" and row_type in seed_dcdc_types)
+                ):
+                    seed_rows.append((device_type, device_name, row_type, row_value))
         self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
@@ -3336,6 +3437,11 @@ class DCStateEstimator:
             "dcdc_q_col": self._int_array(dcdc_q_col),
             "dcdc_pos": self._int_array(dcdc_pos),
         }
+        # Precompute per-kind bool masks once. The fill_* helpers branch on
+        # `kind == k` for each k in the relevant range; without these caches
+        # every iteration re-evaluates the comparison even though `kind` is
+        # immutable. Each mask is len(section_rows) so storage is trivial.
+        self._populate_kind_masks(plan)
         if len(self._measurement_plan_cache) > 16:
             self._measurement_plan_cache.clear()
         self._measurement_plan_cache[key] = (measurements, plan)
@@ -3361,79 +3467,123 @@ class DCStateEstimator:
 
         rows = plan["branch_rows"]
         if rows.size:
+            kind_masks = plan["branch_kind_masks"]
             i = plan["branch_i"]
             j = plan["branch_j"]
-            kind = plan["branch_kind"]
             vi = voltage[i]
             vj = voltage[j]
-            current = (vi - vj) * plan["branch_inv_r"]
+            inv_r = plan["branch_inv_r"]
+            current = (vi - vj) * inv_r
             out = np.empty(rows.size, dtype=np.float64)
-            out[kind == 0] = (vi * current)[kind == 0]
-            out[kind == 1] = vi[kind == 1]
-            out[kind == 2] = current[kind == 2]
-            out[kind == 3] = (-vj * current)[kind == 3]
-            out[kind == 4] = vj[kind == 4]
-            out[kind == 5] = (-current)[kind == 5]
+            m = kind_masks[0]
+            if m.any():
+                out[m] = vi[m] * current[m]
+            m = kind_masks[1]
+            if m.any():
+                out[m] = vi[m]
+            m = kind_masks[2]
+            if m.any():
+                out[m] = current[m]
+            m = kind_masks[3]
+            if m.any():
+                out[m] = -vj[m] * current[m]
+            m = kind_masks[4]
+            if m.any():
+                out[m] = vj[m]
+            m = kind_masks[5]
+            if m.any():
+                out[m] = -current[m]
             values[rows] = out
 
         rows = plan["load_rows"]
         if rows.size:
-            kind = plan["load_kind"]
+            kind_masks = plan["load_kind_masks"]
             v = voltage[plan["load_pos"]]
             p = plan["load_pv0"] + plan["load_pv1"] * v + plan["load_pv2"] * v * v
             out = np.empty(rows.size, dtype=np.float64)
-            out[kind == 0] = p[kind == 0]
-            out[kind == 1] = v[kind == 1]
-            i_mask = kind == 2
-            out[i_mask] = 0.0
-            if np.any(i_mask):
-                valid = np.abs(v[i_mask]) > self.min_current_voltage
-                idx = np.flatnonzero(i_mask)
-                out[idx[valid]] = p[i_mask][valid] / v[i_mask][valid]
+            m = kind_masks[0]
+            if m.any():
+                out[m] = p[m]
+            m = kind_masks[1]
+            if m.any():
+                out[m] = v[m]
+            i_mask = kind_masks[2]
+            if i_mask.any():
+                out[i_mask] = 0.0
+                v_i = v[i_mask]
+                p_i = p[i_mask]
+                valid = np.abs(v_i) > self.min_current_voltage
+                if valid.any():
+                    idx = np.flatnonzero(i_mask)
+                    out[idx[valid]] = p_i[valid] / v_i[valid]
             values[rows] = out
 
         rows = plan["gen_rows"]
         if rows.size:
-            kind = plan["gen_kind"]
-            ctrl = plan["gen_ctrl"]
+            kind_masks = plan["gen_kind_masks"]
+            ctrl_masks = plan["gen_ctrl_masks"]
             v = voltage[plan["gen_pos"]]
+            v_ctrl = ctrl_masks[0]
+            p_ctrl = ctrl_masks[1]
+            i_ctrl = ctrl_masks[2]
             p = np.zeros(rows.size, dtype=np.float64)
-            v_mask = ctrl == 0
-            p_mask = ctrl == 1
-            i_mask = ctrl == 2
-            if np.any(v_mask):
-                p[v_mask] = v_generator_power[plan["gen_vgen_pos"][v_mask]]
-            p[p_mask] = plan["gen_p_set"][p_mask]
-            p[i_mask] = plan["gen_i_set"][i_mask] * v[i_mask]
+            if v_ctrl.any():
+                p[v_ctrl] = v_generator_power[plan["gen_vgen_pos"][v_ctrl]]
+            if p_ctrl.any():
+                p[p_ctrl] = plan["gen_p_set"][p_ctrl]
+            if i_ctrl.any():
+                p[i_ctrl] = plan["gen_i_set"][i_ctrl] * v[i_ctrl]
             current = np.zeros(rows.size, dtype=np.float64)
-            fixed_current = i_mask
-            current[fixed_current] = plan["gen_i_set"][fixed_current]
-            derived_current = ~fixed_current
-            valid = np.abs(v[derived_current]) > self.min_current_voltage
-            idx = np.flatnonzero(derived_current)
-            current[idx[valid]] = p[derived_current][valid] / v[derived_current][valid]
+            if i_ctrl.any():
+                current[i_ctrl] = plan["gen_i_set"][i_ctrl]
+            derived_current = ~i_ctrl
+            if derived_current.any():
+                v_d = v[derived_current]
+                p_d = p[derived_current]
+                valid = np.abs(v_d) > self.min_current_voltage
+                if valid.any():
+                    idx = np.flatnonzero(derived_current)
+                    current[idx[valid]] = p_d[valid] / v_d[valid]
             out = np.empty(rows.size, dtype=np.float64)
-            out[kind == 0] = p[kind == 0]
-            out[kind == 1] = v[kind == 1]
-            out[kind == 2] = current[kind == 2]
+            m = kind_masks[0]
+            if m.any():
+                out[m] = p[m]
+            m = kind_masks[1]
+            if m.any():
+                out[m] = v[m]
+            m = kind_masks[2]
+            if m.any():
+                out[m] = current[m]
             values[rows] = out
 
         rows = plan["switch_rows"]
         if rows.size:
-            kind = plan["switch_kind"]
+            kind_masks = plan["switch_kind_masks"]
             vi = voltage[plan["switch_i"]]
             vj = voltage[plan["switch_j"]]
             current = np.zeros(rows.size, dtype=np.float64)
             current_mask = plan["switch_pos"] >= 0
-            if np.any(current_mask):
+            if current_mask.any():
                 current[current_mask] = switch_current[plan["switch_pos"][current_mask]]
             out = np.empty(rows.size, dtype=np.float64)
-            out[kind == 0] = (vi * current)[kind == 0]
-            out[kind == 1] = vi[kind == 1]
-            out[kind == 2] = current[kind == 2]
-            out[kind == 3] = (-vj * current)[kind == 3]
-            out[kind == 4] = vj[kind == 4]
-            out[kind == 5] = (-current)[kind == 5]
+            m = kind_masks[0]
+            if m.any():
+                out[m] = vi[m] * current[m]
+            m = kind_masks[1]
+            if m.any():
+                out[m] = vi[m]
+            m = kind_masks[2]
+            if m.any():
+                out[m] = current[m]
+            m = kind_masks[3]
+            if m.any():
+                out[m] = -vj[m] * current[m]
+            m = kind_masks[4]
+            if m.any():
+                out[m] = vj[m]
+            m = kind_masks[5]
+            if m.any():
+                out[m] = -current[m]
             values[rows] = out
 
         rows = plan["constraint_rows"]
@@ -3442,34 +3592,63 @@ class DCStateEstimator:
 
         rows = plan["dcdc_rows"]
         if rows.size:
-            kind = plan["dcdc_kind"]
+            kind_masks = plan["dcdc_kind_masks"]
             conv_pos = plan["dcdc_pos"]
             p_from = dcdc_power[2 * conv_pos]
             p_to = dcdc_power[2 * conv_pos + 1]
             v_from = voltage[plan["dcdc_i"]]
             v_to = voltage[plan["dcdc_j"]]
-            i_from = np.zeros(rows.size, dtype=np.float64)
-            i_to = np.zeros(rows.size, dtype=np.float64)
-            valid_from = np.abs(v_from) > self.min_current_voltage
-            valid_to = np.abs(v_to) > self.min_current_voltage
-            i_from[valid_from] = p_from[valid_from] / v_from[valid_from]
-            i_to[valid_to] = p_to[valid_to] / v_to[valid_to]
             out = np.empty(rows.size, dtype=np.float64)
-            out[kind == 0] = p_from[kind == 0]
-            out[kind == 1] = v_from[kind == 1]
-            out[kind == 2] = i_from[kind == 2]
-            out[kind == 3] = p_to[kind == 3]
-            out[kind == 4] = v_to[kind == 4]
-            out[kind == 5] = i_to[kind == 5]
+            m = kind_masks[0]
+            if m.any():
+                out[m] = p_from[m]
+            m = kind_masks[1]
+            if m.any():
+                out[m] = v_from[m]
+            m = kind_masks[2]
+            if m.any():
+                v_f = v_from[m]
+                valid = np.abs(v_f) > self.min_current_voltage
+                idx = np.flatnonzero(m)
+                tmp = np.zeros(idx.size, dtype=np.float64)
+                if valid.any():
+                    tmp[valid] = p_from[m][valid] / v_f[valid]
+                out[idx] = tmp
+            m = kind_masks[3]
+            if m.any():
+                out[m] = p_to[m]
+            m = kind_masks[4]
+            if m.any():
+                out[m] = v_to[m]
+            m = kind_masks[5]
+            if m.any():
+                v_t = v_to[m]
+                valid = np.abs(v_t) > self.min_current_voltage
+                idx = np.flatnonzero(m)
+                tmp = np.zeros(idx.size, dtype=np.float64)
+                if valid.any():
+                    tmp[valid] = p_to[m][valid] / v_t[valid]
+                out[idx] = tmp
             values[rows] = out
 
         return plan["handled_mask"]
 
-    def evaluate(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
+    def evaluate(
+        self,
+        x: np.ndarray,
+        measurements: Optional[Sequence[Measurement]] = None,
+        *,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Evaluate h(x): estimated values for each active DC measurement."""
         measurements = self._normalize_measurements(measurements)
         voltage, switch_current, dcdc_power, v_generator_power = self._unpack_state(x)
-        values = np.zeros(len(measurements), dtype=np.float64)
+        n_meas = len(measurements)
+        if out is None:
+            values = np.zeros(n_meas, dtype=np.float64)
+        else:
+            values = out
+            values.fill(0.0)
         vectorized_rows = self._fill_measurement_values_vectorized(
             values,
             measurements,
@@ -3550,6 +3729,15 @@ class DCStateEstimator:
         values: np.ndarray,
         mask: Optional[np.ndarray] = None,
     ) -> None:
+        # SparseJacobianBuilder.add_many already handles dtype coercion and
+        # cols >= 0 filtering; passing rows/cols straight through avoids the
+        # int64/int32 round-trip that used to dominate this function's cost.
+        if hasattr(H, "add_many"):
+            if mask is None:
+                H.add_many(rows, cols, values)
+            else:
+                H.add_many(rows, cols, values, mask)
+            return
         rows = np.asarray(rows, dtype=np.int64)
         cols = np.asarray(cols, dtype=np.int64)
         values = np.asarray(values, dtype=np.float64)
@@ -3557,9 +3745,6 @@ class DCStateEstimator:
             mask = cols >= 0
         else:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
-        if hasattr(H, "add_many"):
-            H.add_many(rows, cols, values, mask)
-            return
         if np.any(mask):
             np.add.at(H, (rows[mask], cols[mask]), values[mask])
 
@@ -3590,7 +3775,7 @@ class DCStateEstimator:
 
         rows = plan["branch_rows"]
         if rows.size:
-            kind = plan["branch_kind"]
+            kind_masks = plan["branch_kind_masks"]
             i = plan["branch_i"]
             j = plan["branch_j"]
             i_col = plan["branch_i_col"]
@@ -3599,63 +3784,62 @@ class DCStateEstimator:
             vj = voltage[j]
             inv_r = plan["branch_inv_r"]
 
-            mask = kind == 0
+            mask = kind_masks[0]
             self._add_indexed_values(H, rows, i_col, (2.0 * vi - vj) * inv_r, mask)
             self._add_indexed_values(H, rows, j_col, -vi * inv_r, mask)
-            mask = kind == 1
+            mask = kind_masks[1]
             self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 2
+            mask = kind_masks[2]
             self._add_indexed_values(H, rows, i_col, inv_r, mask)
             self._add_indexed_values(H, rows, j_col, -inv_r, mask)
-            mask = kind == 3
+            mask = kind_masks[3]
             self._add_indexed_values(H, rows, i_col, -vj * inv_r, mask)
             self._add_indexed_values(H, rows, j_col, (-vi + 2.0 * vj) * inv_r, mask)
-            mask = kind == 4
+            mask = kind_masks[4]
             self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 5
+            mask = kind_masks[5]
             self._add_indexed_values(H, rows, i_col, -inv_r, mask)
             self._add_indexed_values(H, rows, j_col, inv_r, mask)
 
         rows = plan["load_rows"]
         if rows.size:
-            kind = plan["load_kind"]
+            kind_masks = plan["load_kind_masks"]
             pos = plan["load_pos"]
             col = plan["load_col"]
             v = voltage[pos]
-            mask = kind == 0
-            self._add_indexed_values(H, rows, col, plan["load_pv1"] + 2.0 * plan["load_pv2"] * v, mask)
-            mask = kind == 1
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 2
-            self._add_indexed_values(H, rows, col, plan["load_pv2"] - plan["load_pv0"] / (v * v), mask)
+            self._add_indexed_values(H, rows, col, plan["load_pv1"] + 2.0 * plan["load_pv2"] * v, kind_masks[0])
+            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[1])
+            self._add_indexed_values(H, rows, col, plan["load_pv2"] - plan["load_pv0"] / (v * v), kind_masks[2])
 
         rows = plan["gen_rows"]
         if rows.size:
-            kind = plan["gen_kind"]
-            ctrl = plan["gen_ctrl"]
+            kind_masks = plan["gen_kind_masks"]
+            ctrl_masks = plan["gen_ctrl_masks"]
             pos = plan["gen_pos"]
             col = plan["gen_col"]
             v = voltage[pos]
             p_col = plan["gen_p_col"]
+            v_ctrl = ctrl_masks[0]
+            p_ctrl = ctrl_masks[1]
+            i_ctrl = ctrl_masks[2]
             p = np.zeros(rows.size, dtype=np.float64)
-            v_ctrl = ctrl == 0
-            p_ctrl = ctrl == 1
-            i_ctrl = ctrl == 2
-            if np.any(v_ctrl):
+            if v_ctrl.any():
                 p[v_ctrl] = v_generator_power[plan["gen_vgen_pos"][v_ctrl]]
-            p[p_ctrl] = plan["gen_p_set"][p_ctrl]
-            p[i_ctrl] = plan["gen_i_set"][i_ctrl] * v[i_ctrl]
+            if p_ctrl.any():
+                p[p_ctrl] = plan["gen_p_set"][p_ctrl]
+            if i_ctrl.any():
+                p[i_ctrl] = plan["gen_i_set"][i_ctrl] * v[i_ctrl]
 
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind == 1)
-            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), (kind == 0) & v_ctrl)
-            self._add_indexed_values(H, rows, col, plan["gen_i_set"], (kind == 0) & i_ctrl)
-            self._add_indexed_values(H, rows, p_col, 1.0 / v, (kind == 2) & v_ctrl)
-            self._add_indexed_values(H, rows, col, -p / (v * v), (kind == 2) & v_ctrl)
-            self._add_indexed_values(H, rows, col, -plan["gen_p_set"] / (v * v), (kind == 2) & p_ctrl)
+            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[1])
+            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[0] & v_ctrl)
+            self._add_indexed_values(H, rows, col, plan["gen_i_set"], kind_masks[0] & i_ctrl)
+            self._add_indexed_values(H, rows, p_col, 1.0 / v, kind_masks[2] & v_ctrl)
+            self._add_indexed_values(H, rows, col, -p / (v * v), kind_masks[2] & v_ctrl)
+            self._add_indexed_values(H, rows, col, -plan["gen_p_set"] / (v * v), kind_masks[2] & p_ctrl)
 
         rows = plan["switch_rows"]
         if rows.size:
-            kind = plan["switch_kind"]
+            kind_masks = plan["switch_kind_masks"]
             i = plan["switch_i"]
             j = plan["switch_j"]
             i_col = plan["switch_i_col"]
@@ -3665,22 +3849,22 @@ class DCStateEstimator:
             vj = voltage[j]
             current = np.zeros(rows.size, dtype=np.float64)
             current_mask = plan["switch_pos"] >= 0
-            if np.any(current_mask):
+            if current_mask.any():
                 current[current_mask] = switch_current[plan["switch_pos"][current_mask]]
 
-            mask = kind == 0
+            mask = kind_masks[0]
             self._add_indexed_values(H, rows, i_col, current, mask)
             self._add_indexed_values(H, rows, col, vi, mask)
-            mask = kind == 1
+            mask = kind_masks[1]
             self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 2
+            mask = kind_masks[2]
             self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 3
+            mask = kind_masks[3]
             self._add_indexed_values(H, rows, j_col, -current, mask)
             self._add_indexed_values(H, rows, col, -vj, mask)
-            mask = kind == 4
+            mask = kind_masks[4]
             self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 5
+            mask = kind_masks[5]
             self._add_indexed_values(H, rows, col, -np.ones(rows.size, dtype=np.float64), mask)
 
         rows = plan["constraint_rows"]
@@ -3690,7 +3874,7 @@ class DCStateEstimator:
 
         rows = plan["dcdc_rows"]
         if rows.size:
-            kind = plan["dcdc_kind"]
+            kind_masks = plan["dcdc_kind_masks"]
             i = plan["dcdc_i"]
             j = plan["dcdc_j"]
             i_col = plan["dcdc_i_col"]
@@ -3703,18 +3887,14 @@ class DCStateEstimator:
             v_from = voltage[i]
             v_to = voltage[j]
 
-            mask = kind == 0
-            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 1
-            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 2
+            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[0])
+            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), kind_masks[1])
+            mask = kind_masks[2]
             self._add_indexed_values(H, rows, p_col, 1.0 / v_from, mask)
             self._add_indexed_values(H, rows, i_col, -p_from / (v_from * v_from), mask)
-            mask = kind == 3
-            self._add_indexed_values(H, rows, q_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 4
-            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind == 5
+            self._add_indexed_values(H, rows, q_col, np.ones(rows.size, dtype=np.float64), kind_masks[3])
+            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), kind_masks[4])
+            mask = kind_masks[5]
             self._add_indexed_values(H, rows, q_col, 1.0 / v_to, mask)
             self._add_indexed_values(H, rows, j_col, -p_to / (v_to * v_to), mask)
 
@@ -3730,8 +3910,28 @@ class DCStateEstimator:
         measurements = self._normalize_measurements(measurements)
         voltage, switch_current, dcdc_power, v_generator_power = self._unpack_state(x)
         if sparse:
-            H = self._jacobian_builder if measurements is self.active_measurements else SparseJacobianBuilder((len(measurements), self.n_state))
-            H.reset()
+            if measurements is self.active_measurements:
+                H = self._jacobian_builder
+                H.reset()
+            else:
+                # Cache a fixed-pattern builder per `id(measurements)` so repeated
+                # calls (e.g. from a hybrid parent) reuse the CSR pattern instead
+                # of rebuilding it each call.
+                cache = getattr(self, "_external_jacobian_builder_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._external_jacobian_builder_cache = cache
+                key = id(measurements)
+                cached = cache.get(key)
+                if cached is not None and cached[0] is measurements:
+                    H = cached[1]
+                    H.reset()
+                else:
+                    H = SparseJacobianBuilder((len(measurements), self.n_state))
+                    H._assume_fixed_pattern = True
+                    if len(cache) > 4:
+                        cache.clear()
+                    cache[key] = (measurements, H)
         else:
             H = np.zeros((len(measurements), self.n_state), dtype=np.float64)
         vectorized_rows = self._fill_jacobian_vectorized(
@@ -4019,9 +4219,18 @@ class DCStateEstimator:
         if verbose:
             _print_iteration_header()
 
+        # Pre-allocate evaluation buffers reused across iterations and line-search
+        # candidates. On acceptance we swap pointers so the accepted vectors
+        # become the "main" buffers without copying.
+        n_meas = len(measurements)
+        z_est = np.empty(n_meas, dtype=np.float64)
+        residual = np.empty(n_meas, dtype=np.float64)
+        cand_z_est = np.empty(n_meas, dtype=np.float64)
+        cand_residual = np.empty(n_meas, dtype=np.float64)
+
         for iteration in range(1, self.max_iter + 1):
-            z_est = self.evaluate(x, measurements)
-            residual = z - z_est
+            self.evaluate(x, measurements, out=z_est)
+            np.subtract(z, z_est, out=residual)
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             objective = 0.5 * float(np.dot(weight * residual, residual))
             if iteration == 1 and cached_initial_H is not None:
@@ -4064,13 +4273,17 @@ class DCStateEstimator:
             for _ in range(8):
                 candidate = x + step_scale * dx
                 candidate[: self.n_voltage] = np.maximum(candidate[: self.n_voltage], self.voltage_floor)
-                candidate_residual = z - self.evaluate(candidate, measurements)
-                candidate_objective = 0.5 * float(np.dot(weight * candidate_residual, candidate_residual))
+                self.evaluate(candidate, measurements, out=cand_z_est)
+                np.subtract(z, cand_z_est, out=cand_residual)
+                candidate_objective = 0.5 * float(np.dot(weight * cand_residual, cand_residual))
                 if candidate_objective <= objective or step_scale < 1e-3:
                     x = candidate
                     objective = candidate_objective
                     accepted_step = step_scale
                     accepted = True
+                    # Swap so the accepted candidate becomes the "main" buffer.
+                    z_est, cand_z_est = cand_z_est, z_est
+                    residual, cand_residual = cand_residual, residual
                     break
                 step_scale *= 0.5
             if not accepted:
@@ -4079,9 +4292,10 @@ class DCStateEstimator:
                 accepted_step = 1.0
 
             if verbose:
-                updated_residual = z - self.evaluate(x, measurements)
-                updated_residual_inf = float(np.linalg.norm(updated_residual, np.inf)) if updated_residual.size else 0.0
-                updated_objective = 0.5 * float(np.dot(weight * updated_residual, updated_residual))
+                self.evaluate(x, measurements, out=cand_z_est)
+                np.subtract(z, cand_z_est, out=cand_residual)
+                updated_residual_inf = float(np.linalg.norm(cand_residual, np.inf)) if cand_residual.size else 0.0
+                updated_objective = 0.5 * float(np.dot(weight * cand_residual, cand_residual))
                 _print_iteration(
                     iteration,
                     updated_objective,
@@ -4092,8 +4306,8 @@ class DCStateEstimator:
                 )
 
         if not final_quantities_current:
-            z_est = self.evaluate(x, measurements)
-            residual = z - z_est
+            self.evaluate(x, measurements, out=z_est)
+            np.subtract(z, z_est, out=residual)
             objective = 0.5 * float(np.dot(weight * residual, residual))
             if final_diagnostics:
                 H = self.jacobian_sparse(x, measurements)
@@ -4128,8 +4342,8 @@ class DCStateEstimator:
             max_correction=max_correction,
             residual_inf=float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0,
             x=x,
-            z_est=z_est,
-            residual=residual,
+            z_est=z_est.copy(),
+            residual=residual.copy(),
             H=H,
             gain=gain,
             measurements=[] if array_only_result else measurements,

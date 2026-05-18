@@ -229,17 +229,21 @@ def _file_cache_key(file_name: Path) -> Tuple[Path, int, int]:
 def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str], measurement_cls, table_only: bool = False):
     count = len(data_lines)
     measurements = None if table_only else [None] * count
-    idx_values = np.empty(count, dtype=np.int64)
-    name_values = np.empty(count, dtype=object)
-    device_type_values = np.empty(count, dtype=object)
-    device_name_values = np.empty(count, dtype=object)
-    meas_type_values = np.empty(count, dtype=object)
-    weight_values = np.empty(count, dtype=np.float64)
-    valid_values = np.empty(count, dtype=bool)
-    value_values = np.empty(count, dtype=np.float64)
-    device_type_code_values = np.empty(count, dtype=np.int16)
-    angle_mask_values = np.empty(count, dtype=bool)
-    status_values = np.empty(count, dtype=np.int16)
+    # Accumulate into Python lists during parsing — `np.asarray(list, dtype=...)`
+    # at the end is markedly faster than per-row scalar assignment into
+    # pre-allocated numpy arrays (each ndarray scalar set crosses the C/Python
+    # boundary).
+    idx_list: List[int] = [0] * count
+    name_list: List[object] = [None] * count
+    device_type_list: List[object] = [None] * count
+    device_name_list: List[object] = [None] * count
+    meas_type_list: List[object] = [None] * count
+    weight_list: List[float] = [0.0] * count
+    valid_list: List[bool] = [False] * count
+    value_list: List[float] = [0.0] * count
+    device_type_code_list: List[int] = [0] * count
+    angle_mask_list: List[bool] = [False] * count
+    status_list: List[int] = [0] * count
 
     new_measurement = None if table_only else measurement_cls.__new__
     device_type_code_get = _DEVICE_TYPE_CODES.get
@@ -296,18 +300,30 @@ def _read_standard_measurement_lines(file_name: Path, data_lines: Sequence[str],
             meas.value = value
             meas.status = status
             measurements[row_pos] = meas
-        idx_values[row_pos] = idx
-        name_values[row_pos] = name
-        device_type_values[row_pos] = device_type
-        device_name_values[row_pos] = device_name
-        meas_type_values[row_pos] = meas_type
-        weight_values[row_pos] = weight
-        valid_values[row_pos] = valid
-        value_values[row_pos] = value
-        device_type_code_values[row_pos] = device_type_code
-        angle_mask_values[row_pos] = is_angle_measurement
-        status_values[row_pos] = status
+        idx_list[row_pos] = idx
+        name_list[row_pos] = name
+        device_type_list[row_pos] = device_type
+        device_name_list[row_pos] = device_name
+        meas_type_list[row_pos] = meas_type
+        weight_list[row_pos] = weight
+        valid_list[row_pos] = valid
+        value_list[row_pos] = value
+        device_type_code_list[row_pos] = device_type_code
+        angle_mask_list[row_pos] = is_angle_measurement
+        status_list[row_pos] = status
         code_rows.append(row_pos)
+
+    idx_values = np.asarray(idx_list, dtype=np.int64)
+    name_values = np.asarray(name_list, dtype=object)
+    device_type_values = np.asarray(device_type_list, dtype=object)
+    device_name_values = np.asarray(device_name_list, dtype=object)
+    meas_type_values = np.asarray(meas_type_list, dtype=object)
+    weight_values = np.asarray(weight_list, dtype=np.float64)
+    valid_values = np.asarray(valid_list, dtype=bool)
+    value_values = np.asarray(value_list, dtype=np.float64)
+    device_type_code_values = np.asarray(device_type_code_list, dtype=np.int16)
+    angle_mask_values = np.asarray(angle_mask_list, dtype=bool)
+    status_values = np.asarray(status_list, dtype=np.int16)
 
     rows_by_code = {
         int(code): np.asarray(rows, dtype=np.int64)
@@ -1963,14 +1979,19 @@ class ACStateEstimator:
         z: np.ndarray,
         z_est: np.ndarray,
         measurements: Sequence[Measurement],
+        *,
+        out: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         angle_mask = self._angle_residual_mask(measurements)
-        return build_measurement_residual(
-            z,
-            z_est,
-            angle_mask,
-            has_angle_residuals=self._has_angle_residuals(measurements, angle_mask),
-        )
+        has_angle = self._has_angle_residuals(measurements, angle_mask)
+        if out is None:
+            residual = np.subtract(z, z_est, dtype=np.float64)
+        else:
+            np.subtract(z, z_est, out=out)
+            residual = out
+        if has_angle:
+            residual[angle_mask] = (residual[angle_mask] + np.pi) % (2.0 * np.pi) - np.pi
+        return residual
 
     @staticmethod
     def _weighted_objective(weight: np.ndarray, residual: np.ndarray) -> float:
@@ -2878,63 +2899,97 @@ class ACStateEstimator:
             elif mtype == "I_LOAD":
                 scale_array[int(row)] = node_scales[1]
 
-        def invalidate_measurement(pos: int) -> None:
-            valid_array[pos] = False
-            status_array[pos] = MEAS_STATUS_INVALID
-
-        for pos in range(value_array.size):
-            meas_idx = int(idx_array[pos])
-            mtype = meas_type_array[pos]
-            device_type = device_type_array[pos]
-            device_name = device_name_array[pos]
-            weight = float(weight_array[pos])
-            if meas_idx > max_idx:
-                max_idx = meas_idx
-            if mtype in ANGLE_MEASUREMENT_TYPES:
-                if self.flat_start:
-                    value_array[pos] = 0.0
-                invalidate_measurement(pos)
-                continue
-            if not bool(valid_array[pos]) or weight <= 0.0:
-                continue
-            if bool(unavailable_mask[pos]):
-                invalidate_measurement(pos)
-                continue
-            scale = float(scale_array[pos])
-            converted_value = float(value_array[pos]) / scale
-            value_array[pos] = converted_value
-            is_real_measurement = int(status_array[pos]) != MEAS_STATUS_PSEUDO
-            if is_real_measurement and mtype in _VOLTAGE_MEASUREMENT_TYPES:
-                node_idx = self._voltage_measurement_node_idx(device_type, device_name, mtype)
-                if node_idx is not None and node_idx in node_pos:
-                    current = real_voltage_best.get(node_idx)
+        # Vectorize the bulk: classify rows by mask, apply value/=scale and
+        # status flag updates en-masse, then loop only over the surviving
+        # subset to fill the per-key "max weight wins" dictionaries.
+        n_rows = value_array.size
+        max_idx = int(idx_array.max()) if n_rows else 0
+        # Angle measurements are always treated as invalid (status INVALID).
+        # When flat_start is enabled their value is zeroed out as well.
+        angle_mask = np.isin(meas_type_array, tuple(ANGLE_MEASUREMENT_TYPES))
+        if angle_mask.any():
+            if self.flat_start:
+                value_array[angle_mask] = 0.0
+            valid_array[angle_mask] = False
+            status_array[angle_mask] = MEAS_STATUS_INVALID
+        # Rows that were already invalid (or zero-weight) skip everything below;
+        # rows whose device wasn't in any scale lookup are invalidated.
+        candidate_mask = valid_array & (weight_array > 0.0) & (~angle_mask)
+        flagged_unavailable = candidate_mask & unavailable_mask
+        if flagged_unavailable.any():
+            valid_array[flagged_unavailable] = False
+            status_array[flagged_unavailable] = MEAS_STATUS_INVALID
+        processable_mask = candidate_mask & (~unavailable_mask)
+        if processable_mask.any():
+            # value /= scale, in place.
+            value_array[processable_mask] = value_array[processable_mask] / scale_array[processable_mask]
+        # Update active device/measurement key caches via vectorized filtering
+        # then convert to Python tuples once.
+        if processable_mask.any():
+            pseudo_dev_tuple = tuple(_PSEUDO_DEVICE_SUMMARY_TYPES)
+            pseudo_dev_mask = processable_mask & np.isin(device_type_array, pseudo_dev_tuple)
+            if pseudo_dev_mask.any():
+                dt_list = device_type_array[pseudo_dev_mask].tolist()
+                dn_list = device_name_array[pseudo_dev_mask].tolist()
+                active_device_keys.update(zip(dt_list, dn_list))
+            # Build (device_type, meas_type) pair set, then filter rows.
+            pseudo_pairs = {
+                (dtype, mt)
+                for dtype, mts in _PSEUDO_MEASUREMENT_SUMMARY_TYPES.items()
+                for mt in mts
+            }
+            if pseudo_pairs:
+                dt_arr = device_type_array[processable_mask]
+                mt_arr = meas_type_array[processable_mask]
+                dn_arr = device_name_array[processable_mask]
+                pair_iter = zip(dt_arr.tolist(), dn_arr.tolist(), mt_arr.tolist())
+                for dt, dn, mt in pair_iter:
+                    if (dt, mt) in pseudo_pairs:
+                        active_measurement_keys.add((dt, dn, mt))
+        # Iterate only the surviving rows for the dict-build side effects.
+        is_pseudo_array = status_array == MEAS_STATUS_PSEUDO
+        processable_rows = np.flatnonzero(processable_mask)
+        if processable_rows.size:
+            converted_values = value_array[processable_rows].tolist()
+            weights_list = weight_array[processable_rows].tolist()
+            dt_list = device_type_array[processable_rows].tolist()
+            dn_list = device_name_array[processable_rows].tolist()
+            mt_list = meas_type_array[processable_rows].tolist()
+            is_pseudo_list = is_pseudo_array[processable_rows].tolist()
+            for k in range(processable_rows.size):
+                device_type = dt_list[k]
+                device_name = dn_list[k]
+                mtype = mt_list[k]
+                converted_value = converted_values[k]
+                weight = weights_list[k]
+                is_real_measurement = not is_pseudo_list[k]
+                if is_real_measurement and mtype in _VOLTAGE_MEASUREMENT_TYPES:
+                    node_idx = self._voltage_measurement_node_idx(device_type, device_name, mtype)
+                    if node_idx is not None and node_idx in node_pos:
+                        current = real_voltage_best.get(node_idx)
+                        if current is None or weight > current[0]:
+                            real_voltage_best[node_idx] = (weight, converted_value)
+                if device_type == "ACNode" and mtype == "V":
+                    if is_real_measurement:
+                        node_idx = self.node_by_name[device_name].idx
+                        current = node_voltage_best.get(node_idx)
+                        if current is None or weight > current[0]:
+                            node_voltage_best[node_idx] = (weight, converted_value)
+                    power_flow_seed_rows.append((device_type, device_name, mtype, converted_value))
+                elif (
+                    (device_type == "ACGenerator" and mtype in ("P_GEN", "Q_GEN"))
+                    or (device_type == "ACLoad" and mtype in ("P_LOAD", "Q_LOAD"))
+                ):
+                    key = (device_type, device_name, mtype)
+                    current = power_seed_best.get(key)
                     if current is None or weight > current[0]:
-                        real_voltage_best[node_idx] = (weight, converted_value)
-            if device_type == "ACNode" and mtype == "V":
-                if is_real_measurement:
-                    node_idx = self.node_by_name[device_name].idx
-                    current = node_voltage_best.get(node_idx)
-                    if current is None or weight > current[0]:
-                        node_voltage_best[node_idx] = (weight, converted_value)
-                power_flow_seed_rows.append((device_type, device_name, mtype, converted_value))
-            elif (
-                (device_type == "ACGenerator" and mtype in ("P_GEN", "Q_GEN"))
-                or (device_type == "ACLoad" and mtype in ("P_LOAD", "Q_LOAD"))
-            ):
-                key = (device_type, device_name, mtype)
-                current = power_seed_best.get(key)
-                if current is None or weight > current[0]:
-                    power_seed_best[key] = (weight, converted_value)
-                power_flow_seed_rows.append((device_type, device_name, mtype, converted_value))
-            elif (
-                (device_type == "ACGenerator" and mtype in ("V_GEN", "I_GEN"))
-                or (device_type == "ACLoad" and mtype in ("V_LOAD", "I_LOAD"))
-            ):
-                power_flow_seed_rows.append((device_type, device_name, mtype, converted_value))
-            if device_type in _PSEUDO_DEVICE_SUMMARY_TYPES:
-                add_active_device_key((device_type, device_name))
-            if mtype in _PSEUDO_MEASUREMENT_SUMMARY_TYPES.get(device_type, ()):
-                add_active_measurement_key((device_type, device_name, mtype))
+                        power_seed_best[key] = (weight, converted_value)
+                    power_flow_seed_rows.append((device_type, device_name, mtype, converted_value))
+                elif (
+                    (device_type == "ACGenerator" and mtype in ("V_GEN", "I_GEN"))
+                    or (device_type == "ACLoad" and mtype in ("V_LOAD", "I_LOAD"))
+                ):
+                    power_flow_seed_rows.append((device_type, device_name, mtype, converted_value))
         self.measurement_table = table
         self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
@@ -4971,14 +5026,25 @@ class ACStateEstimator:
 
         return plan["handled_mask"]
 
-    def evaluate(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
+    def evaluate(
+        self,
+        x: np.ndarray,
+        measurements: Optional[Sequence[Measurement]] = None,
+        *,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         measurements = self._normalize_measurements(measurements)
         theta, voltage = self._unpack_state(x)
         switch_current = self._switch_current_from_state(x)
         voltage_complex = self._complex_voltage(theta, voltage)
         load_power = gen_power = None
         branch_flow_cache = {}
-        values = np.zeros(len(measurements), dtype=np.float64)
+        n_meas = len(measurements)
+        if out is None:
+            values = np.zeros(n_meas, dtype=np.float64)
+        else:
+            values = out
+            values.fill(0.0)
         vectorized_branch_rows = self._fill_branch_transformer_values_vectorized(
             values,
             measurements,
@@ -5544,10 +5610,19 @@ class ACStateEstimator:
         values: np.ndarray,
         mask: Optional[np.ndarray] = None,
     ) -> None:
+        # SparseJacobianBuilder.add_many handles dtype coercion and cols >= 0
+        # filtering. The rows>=0 case happens only for a handful of pseudo
+        # rows, so we still gate on that explicitly to keep behaviour identical.
         if hasattr(H, "add_many"):
-            row_col_mask = (rows >= 0) & (cols >= 0)
-            mask = row_col_mask if mask is None else (np.asarray(mask, dtype=bool) & row_col_mask)
-            H.add_many(rows, cols, values, mask)
+            if mask is None:
+                row_mask = rows >= 0
+                if row_mask.all():
+                    H.add_many(rows, cols, values)
+                else:
+                    H.add_many(rows, cols, values, row_mask)
+            else:
+                row_mask = (rows >= 0) & np.asarray(mask, dtype=bool)
+                H.add_many(rows, cols, values, row_mask)
             return
         rows = np.asarray(rows, dtype=np.int64)
         cols = np.asarray(cols, dtype=np.int64)
@@ -6763,8 +6838,29 @@ class ACStateEstimator:
             H.shape = (len(measurements), self.n_state)
             H.size = H.shape[0] * H.shape[1]
             H.reset()
+        elif sparse:
+            # Cache a fixed-pattern builder per `id(measurements)` so repeated
+            # calls with the same measurements list (e.g. from a hybrid parent)
+            # reuse the cached CSR pattern instead of rebuilding it each call.
+            cache = getattr(self, "_external_jacobian_builder_cache", None)
+            if cache is None:
+                cache = {}
+                self._external_jacobian_builder_cache = cache
+            key = id(measurements)
+            cached = cache.get(key)
+            if cached is not None and cached[0] is measurements:
+                H = cached[1]
+                H.shape = (len(measurements), self.n_state)
+                H.size = H.shape[0] * H.shape[1]
+                H.reset()
+            else:
+                H = SparseJacobianBuilder((len(measurements), self.n_state))
+                H._assume_fixed_pattern = True
+                if len(cache) > 4:
+                    cache.clear()
+                cache[key] = (measurements, H)
         else:
-            H = SparseJacobianBuilder((len(measurements), self.n_state)) if sparse else np.zeros((len(measurements), self.n_state), dtype=np.float64)
+            H = np.zeros((len(measurements), self.n_state), dtype=np.float64)
         branch_power_derivative_cache = {}
         branch_current_derivative_cache = {}
         vectorized_branch_rows = self._fill_branch_transformer_jacobian_vectorized(
@@ -7155,9 +7251,6 @@ class ACStateEstimator:
         H = None
         gain = np.zeros((self.n_state, self.n_state), dtype=np.float64)
         final_quantities_current = False
-        cached_z_est = None
-        cached_residual = None
-        cached_objective = None
         normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
         normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
         if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
@@ -7169,19 +7262,25 @@ class ACStateEstimator:
         flat_restart_enabled = False
         iteration_limit = self.max_iter
 
+        # Pre-allocated buffers reused across iterations and line-search trials.
+        # ``z_est_dirty`` tracks whether the main buffer already reflects the
+        # current ``x`` (set True after an accepted line-search step swap).
+        n_meas = len(measurements)
+        z_est = np.empty(n_meas, dtype=np.float64)
+        residual = np.empty(n_meas, dtype=np.float64)
+        cand_z_est = np.empty(n_meas, dtype=np.float64)
+        cand_residual = np.empty(n_meas, dtype=np.float64)
+        z_est_dirty = True  # True => z_est does not yet reflect current x
+
         for iteration in range(1, iteration_limit + 1):
-            if cached_z_est is None:
-                z_est = self.evaluate(x, measurements)
+            if z_est_dirty:
+                self.evaluate(x, measurements, out=z_est)
                 start = time.perf_counter() if self.profile_enabled else None
-                residual = self._measurement_residual(z, z_est, measurements)
+                self._measurement_residual(z, z_est, measurements, out=residual)
                 objective = self._weighted_objective(weight, residual)
                 if start is not None:
                     self._record_profile_time("solve.residual_objective", time.perf_counter() - start)
-            else:
-                z_est = cached_z_est
-                residual = cached_residual
-                objective = cached_objective
-                cached_z_est = cached_residual = cached_objective = None
+                z_est_dirty = False
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if iteration == 1 and cached_initial_H is not None:
                 H = cached_initial_H
@@ -7232,10 +7331,10 @@ class ACStateEstimator:
                     candidate[self.n_angle : self.base_switch_re],
                     self.voltage_floor,
                 )
-                candidate_z_est = self.evaluate(candidate, measurements)
+                self.evaluate(candidate, measurements, out=cand_z_est)
                 start = time.perf_counter() if self.profile_enabled else None
-                candidate_residual = self._measurement_residual(z, candidate_z_est, measurements)
-                candidate_objective = self._weighted_objective(weight, candidate_residual)
+                self._measurement_residual(z, cand_z_est, measurements, out=cand_residual)
+                candidate_objective = self._weighted_objective(weight, cand_residual)
                 if start is not None:
                     self._record_profile_time("solve.line_search_residual_objective", time.perf_counter() - start)
                 finite_candidate = np.isfinite(candidate_objective)
@@ -7249,9 +7348,9 @@ class ACStateEstimator:
                 objective_tol = max(1e-12, 1e-10 * (abs(objective) + 1.0))
                 if finite_candidate and candidate_objective <= objective + objective_tol:
                     x = candidate
-                    cached_z_est = candidate_z_est
-                    cached_residual = candidate_residual
-                    cached_objective = candidate_objective
+                    # Swap so the accepted candidate becomes the main buffer.
+                    z_est, cand_z_est = cand_z_est, z_est
+                    residual, cand_residual = cand_residual, residual
                     objective = candidate_objective
                     accepted_step = step_scale
                     accepted = True
@@ -7269,15 +7368,11 @@ class ACStateEstimator:
             )
 
             if verbose:
-                if cached_residual is None:
-                    cached_z_est = self.evaluate(x, measurements)
-                    cached_residual = self._measurement_residual(z, cached_z_est, measurements)
-                    cached_objective = self._weighted_objective(weight, cached_residual)
-                updated_residual = cached_residual
-                updated_residual_inf = float(np.linalg.norm(updated_residual, np.inf)) if updated_residual.size else 0.0
+                # `z_est`/`residual` already reflect the accepted candidate via swap.
+                updated_residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
                 _print_iteration(
                     iteration,
-                    cached_objective,
+                    objective,
                     updated_residual_inf,
                     max_correction,
                     accepted_step,
@@ -7299,18 +7394,13 @@ class ACStateEstimator:
             restart_result.iterations += iteration
             return restart_result
 
-        if not final_quantities_current:
-            if cached_z_est is None:
-                z_est = self.evaluate(x, measurements)
-                start = time.perf_counter() if self.profile_enabled else None
-                residual = self._measurement_residual(z, z_est, measurements)
-                objective = self._weighted_objective(weight, residual)
-                if start is not None:
-                    self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
-            else:
-                z_est = cached_z_est
-                residual = cached_residual
-                objective = cached_objective
+        if not final_quantities_current and z_est_dirty:
+            self.evaluate(x, measurements, out=z_est)
+            start = time.perf_counter() if self.profile_enabled else None
+            self._measurement_residual(z, z_est, measurements, out=residual)
+            objective = self._weighted_objective(weight, residual)
+            if start is not None:
+                self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
         if final_diagnostics and not final_quantities_current:
             H = self.jacobian_sparse(x, measurements)
             if weighted_residual is not None:
@@ -7339,8 +7429,8 @@ class ACStateEstimator:
             max_correction=max_correction,
             residual_inf=float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0,
             x=x,
-            z_est=z_est,
-            residual=residual,
+            z_est=z_est.copy(),
+            residual=residual.copy(),
             H=H,
             gain=gain,
             measurements=[] if array_only_result else measurements,

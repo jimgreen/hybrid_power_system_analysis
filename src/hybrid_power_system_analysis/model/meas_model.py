@@ -340,41 +340,45 @@ def measurement_table_from_measurements(
             return table
 
     count = len(measurements)
-    idx = np.empty(count, dtype=np.int64)
-    name = np.empty(count, dtype=object)
-    device_type = np.empty(count, dtype=object)
-    device_name = np.empty(count, dtype=object)
-    meas_type = np.empty(count, dtype=object)
-    weight = np.empty(count, dtype=np.float64)
-    valid = np.empty(count, dtype=bool)
-    value = np.empty(count, dtype=np.float64)
-    device_type_code = np.empty(count, dtype=np.int16)
-    angle_mask = np.empty(count, dtype=bool)
-    status_code = np.empty(count, dtype=np.int16)
+    # Accumulate to Python lists first, then convert once via `np.asarray(list, dtype=...)`.
+    # Per-row writes into pre-allocated ndarrays were a measurable cost
+    # because each scalar assignment crosses the C/Python boundary.
+    idx_list = [0] * count
+    name_list: List[object] = [None] * count
+    device_type_list: List[object] = [None] * count
+    device_name_list: List[object] = [None] * count
+    meas_type_list: List[object] = [None] * count
+    weight_list = [0.0] * count
+    valid_list = [False] * count
+    value_list = [0.0] * count
+    device_type_code_list = [0] * count
+    angle_mask_list = [False] * count
+    status_list = [0] * count
+    device_type_codes_get = device_type_codes.get
     for pos, meas in enumerate(measurements):
-        idx[pos] = int(meas.idx)
-        name[pos] = meas.name
-        device_type[pos] = meas.device_type
-        device_name[pos] = meas.device_name
-        meas_type[pos] = meas.meas_type
-        weight[pos] = float(meas.weight)
-        valid[pos] = bool(meas.valid)
-        value[pos] = float(meas.value)
-        device_type_code[pos] = device_type_codes.get(meas.device_type, 0)
-        angle_mask[pos] = meas.meas_type in angle_measurement_types
-        status_code[pos] = measurement_status_from_measurement(meas)
+        idx_list[pos] = int(meas.idx)
+        name_list[pos] = meas.name
+        device_type_list[pos] = meas.device_type
+        device_name_list[pos] = meas.device_name
+        meas_type_list[pos] = meas.meas_type
+        weight_list[pos] = float(meas.weight)
+        valid_list[pos] = bool(meas.valid)
+        value_list[pos] = float(meas.value)
+        device_type_code_list[pos] = device_type_codes_get(meas.device_type, 0)
+        angle_mask_list[pos] = meas.meas_type in angle_measurement_types
+        status_list[pos] = measurement_status_from_measurement(meas)
     return MeasurementTable(
-        idx=idx,
-        name=name,
-        device_type=device_type,
-        device_name=device_name,
-        meas_type=meas_type,
-        weight=weight,
-        valid=valid,
-        value=value,
-        device_type_code=device_type_code,
-        angle_mask=angle_mask,
-        status_code=status_code,
+        idx=np.asarray(idx_list, dtype=np.int64),
+        name=np.asarray(name_list, dtype=object),
+        device_type=np.asarray(device_type_list, dtype=object),
+        device_name=np.asarray(device_name_list, dtype=object),
+        meas_type=np.asarray(meas_type_list, dtype=object),
+        weight=np.asarray(weight_list, dtype=np.float64),
+        valid=np.asarray(valid_list, dtype=bool),
+        value=np.asarray(value_list, dtype=np.float64),
+        device_type_code=np.asarray(device_type_code_list, dtype=np.int16),
+        angle_mask=np.asarray(angle_mask_list, dtype=bool),
+        status_code=np.asarray(status_list, dtype=np.int16),
     )
 
 
