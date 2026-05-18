@@ -47,7 +47,13 @@ from typing import Dict, Optional
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import splu, spsolve
+
+try:
+    from scipy.sparse.linalg import use_solver as _scipy_use_solver
+    _scipy_use_solver(useUmfpack=False)
+except Exception:
+    pass
 from collections import deque
 from pathlib import Path
 import sys
@@ -125,7 +131,7 @@ def _load_named_sparse_solver(solver_name):
     if solver_name in _OPTIONAL_SPARSE_MISSING:
         return None
 
-    candidate_names = ("umfpack", "sksparse.klu.klu_solve", "pyklu", "klu", "klu_alt") if solver_name == "auto" else (solver_name,)
+    candidate_names = ("pyklu", "sksparse.klu.klu_solve", "klu", "klu_alt", "pypardiso") if solver_name == "auto" else (solver_name,)
     for candidate_name in candidate_names:
         module_name, func_name = _OPTIONAL_SOLVER_CANDIDATES.get(candidate_name, (None, None))
         if module_name is None:
@@ -168,6 +174,59 @@ def solve_sparse_system(matrix, rhs, solver_name="scipy"):
             _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
             _OPTIONAL_SPARSE_MISSING.add(solver_name)
     return spsolve(matrix, rhs)
+
+
+def _resolve_linear_solver(solver_name):
+    """Return (resolved_name, callable) for a requested linear solver.
+
+    "auto" picks the best available optional solver (pyklu, then KLU bindings,
+    then pypardiso). Unknown / unavailable names silently fall back to scipy
+    SuperLU.
+    """
+    name = str(solver_name or "scipy").strip().lower()
+    if name in {"scipy", "superlu", "default"}:
+        return "scipy", spsolve
+    solver = _load_named_sparse_solver(name)
+    if solver is None:
+        return "scipy", spsolve
+    return name, solver
+
+
+class _CallableFactor:
+    """Wraps a (matrix, rhs)->solution callable into a .solve(rhs) factor object."""
+
+    __slots__ = ("_matrix", "_fn")
+
+    def __init__(self, matrix, fn):
+        self._matrix = matrix
+        self._fn = fn
+
+    def solve(self, rhs):
+        return self._fn(self._matrix, rhs)
+
+
+def _get_pyklu_cls():
+    """Lazily import PyKLU.Klu and cache the class (or None when unavailable)."""
+    cache = _OPTIONAL_SPARSE_SOLVERS
+    if "__pyklu_cls__" in cache:
+        return cache["__pyklu_cls__"]
+    try:
+        from PyKLU import Klu as klu_cls  # type: ignore
+    except Exception:
+        klu_cls = None
+    cache["__pyklu_cls__"] = klu_cls
+    return klu_cls
+
+
+def _factor_jacobian(matrix, resolved_name, solver_fn):
+    """Build a factored solver object that supports repeated .solve(b) calls."""
+    if resolved_name in {"scipy", "superlu", "default"}:
+        return splu(matrix.tocsc())
+    if resolved_name in {"pyklu", "auto"}:
+        klu_cls = _get_pyklu_cls()
+        if klu_cls is not None:
+            return klu_cls(matrix.tocsc())
+    return _CallableFactor(matrix, solver_fn)
 
 
 def find_spanning_tree_edges(edges, n_nodes):
@@ -344,9 +403,10 @@ class DCPowerFlowCalc:
         parameters: Optional[PowerFlowParameters] = None,
         algorithm: str = "nr",
         keep_node_objects: bool = True,
-        linear_solver: str = "scipy",
+        linear_solver: str = "auto",
         writeback_network=None,
         result_mode: str = "full",
+        jacobian_refresh_period: int = 1,
     ):
         algorithm = str(algorithm).strip().lower()
         if algorithm not in {"nr"}:
@@ -368,7 +428,12 @@ class DCPowerFlowCalc:
         self.algorithm = algorithm
         self.used_algorithm = algorithm
         self.target_island = island
+        # 用户传入的求解器名原样保留，便于上层日志/测试断言；实际 callable
+        # 由 _resolve_linear_solver 决定，未安装时回退 SuperLU。
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
+        # jacobian_refresh_period>=2 触发 Honest-Newton：复用同一因子若干次。
+        self.jacobian_refresh_period = max(1, int(jacobian_refresh_period or 1))
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = bool(keep_node_objects) and (
             not self.array_mode or self.result_mode == "full"
@@ -701,8 +766,8 @@ class DCPowerFlowCalc:
                 load_pv0 = load_pbase * load[load_mask, DC_LOAD_COLS["pv0"]]
                 load_pv1 = load_pbase * load[load_mask, DC_LOAD_COLS["pv1"]]
                 load_pv2 = load_pbase * load[load_mask, DC_LOAD_COLS["pv2"]]
-                np.add.at(self.P_const, load_pos, -load_pv0)
-                np.add.at(self.I_shunt, load_pos, load_pv1)
+                self.P_const += np.bincount(load_pos, weights=-load_pv0, minlength=self.P_const.size)
+                self.I_shunt += np.bincount(load_pos, weights=load_pv1, minlength=self.I_shunt.size)
                 nz_load = load_pv2 != 0.0
                 load_nodes_arr = load_pos[nz_load].astype(np.int32, copy=False)
                 load_g_arr = load_pv2[nz_load]
@@ -722,9 +787,17 @@ class DCPowerFlowCalc:
                 i_mask = gen_ctrl == DC_CTRL_I
                 v_mask = gen_ctrl == DC_CTRL_V
                 if np.any(p_mask):
-                    np.add.at(self.P_const, gen_pos[p_mask], gen_active[p_mask, DC_GEN_COLS["p_set"]])
+                    self.P_const += np.bincount(
+                        gen_pos[p_mask],
+                        weights=gen_active[p_mask, DC_GEN_COLS["p_set"]],
+                        minlength=self.P_const.size,
+                    )
                 if np.any(i_mask):
-                    np.add.at(self.I_shunt, gen_pos[i_mask], -gen_active[i_mask, DC_GEN_COLS["i_set"]])
+                    self.I_shunt += np.bincount(
+                        gen_pos[i_mask],
+                        weights=-gen_active[i_mask, DC_GEN_COLS["i_set"]],
+                        minlength=self.I_shunt.size,
+                    )
                 if np.any(v_mask):
                     for row_idx, node in zip(gen_rows[v_mask], gen_pos[v_mask]):
                         slack_ref = int(row_idx) if self._direct_ppc_mode else self.model.generators[int(row_idx)]
@@ -1429,8 +1502,12 @@ class DCPowerFlowCalc:
         if self._dc_jac_raw_data.size == 0:
             return csr_matrix((self.total_eq, self.total_vars), dtype=np.float64)
         self._fill_jacobian_raw_data(terms)
-        self._dc_jac_csr_data.fill(0.0)
-        np.add.at(self._dc_jac_csr_data, self._dc_jac_raw_to_csr_pos, self._dc_jac_raw_data)
+        # bincount 比 np.add.at 快很多，且每次迭代都要执行。
+        self._dc_jac_csr_data[:] = np.bincount(
+            self._dc_jac_raw_to_csr_pos,
+            weights=self._dc_jac_raw_data,
+            minlength=self._dc_jac_csr_data.size,
+        )
         return csr_matrix(
             (self._dc_jac_csr_data, self._dc_jac_csr_indices, self._dc_jac_csr_indptr),
             shape=(self.total_eq, self.total_vars),
@@ -1599,12 +1676,12 @@ class DCPowerFlowCalc:
 
         if self.zero_i.size:
             current = terms["zero_current"]
-            np.add.at(P_inj, self.zero_i, V[self.zero_i] * current)
-            np.add.at(P_inj, self.zero_j, -V[self.zero_j] * current)
+            P_inj += np.bincount(self.zero_i, weights=V[self.zero_i] * current, minlength=P_inj.size)
+            P_inj += np.bincount(self.zero_j, weights=-V[self.zero_j] * current, minlength=P_inj.size)
 
         if self.N_dcdc:
-            np.add.at(P_inj, self.dcdc_i, Pdc[0::2])
-            np.add.at(P_inj, self.dcdc_j, Pdc[1::2])
+            P_inj += np.bincount(self.dcdc_i, weights=Pdc[0::2], minlength=P_inj.size)
+            P_inj += np.bincount(self.dcdc_j, weights=Pdc[1::2], minlength=P_inj.size)
 
         F = np.zeros(self.total_eq, dtype=np.float64)
 
@@ -1685,8 +1762,8 @@ class DCPowerFlowCalc:
             branch[self.branch_idx, DC_BRANCH_COLS["current"]] = current
             branch[self.branch_idx, DC_BRANCH_COLS["i_p"]] = i_p
             branch[self.branch_idx, DC_BRANCH_COLS["j_p"]] = j_p
-            np.add.at(P_inj, self.branch_i, i_p)
-            np.add.at(P_inj, self.branch_j, j_p)
+            P_inj += np.bincount(self.branch_i, weights=i_p, minlength=P_inj.size)
+            P_inj += np.bincount(self.branch_j, weights=j_p, minlength=P_inj.size)
 
         if zero_branch.size:
             zero_branch[:, [DC_ZERO_BRANCH_COLS["p"], DC_ZERO_BRANCH_COLS["current"]]] = 0.0
@@ -1729,7 +1806,7 @@ class DCPowerFlowCalc:
                 )
                 load[load_mask, DC_LOAD_COLS["p"]] = p
                 load[load_mask, DC_LOAD_COLS["current"]] = current
-                np.add.at(P_inj, load_pos, p)
+                P_inj += np.bincount(load_pos, weights=p, minlength=P_inj.size)
 
         if gen.size:
             gen[:, [DC_GEN_COLS["p"], DC_GEN_COLS["current"]]] = 0.0
@@ -1754,7 +1831,9 @@ class DCPowerFlowCalc:
                 non_slack = p_mask | i_mask
                 gen[active_rows[non_slack], DC_GEN_COLS["p"]] = p_values[non_slack]
                 gen[active_rows[non_slack], DC_GEN_COLS["current"]] = current[non_slack]
-                np.add.at(P_inj, gen_pos[non_slack], -p_values[non_slack])
+                P_inj += np.bincount(
+                    gen_pos[non_slack], weights=-p_values[non_slack], minlength=P_inj.size
+                )
 
         if dcdc.size:
             dcdc[:, [DC_DCDC_COLS["i_p"], DC_DCDC_COLS["j_p"], DC_DCDC_COLS["i_c"], DC_DCDC_COLS["j_c"]]] = 0.0
@@ -1779,8 +1858,8 @@ class DCPowerFlowCalc:
             dcdc[self.dcdc_idx, DC_DCDC_COLS["j_p"]] = dcdc_j_p
             dcdc[self.dcdc_idx, DC_DCDC_COLS["i_c"]] = dcdc_i_c
             dcdc[self.dcdc_idx, DC_DCDC_COLS["j_c"]] = dcdc_j_c
-            np.add.at(P_inj, self.dcdc_i, dcdc_i_p)
-            np.add.at(P_inj, self.dcdc_j, dcdc_j_p)
+            P_inj += np.bincount(self.dcdc_i, weights=dcdc_i_p, minlength=P_inj.size)
+            P_inj += np.bincount(self.dcdc_j, weights=dcdc_j_p, minlength=P_inj.size)
 
         for node, gens in self.slack_gen_info.items():
             if not gens:
@@ -1910,61 +1989,121 @@ class DCPowerFlowCalc:
         return 0.0
 
     def _build_lf_result_from_ppc(self) -> DCLFResult:
+        # 与 ac_lf 同构：按列向量化抽取 + 单次 searchsorted 做节点电压查表，
+        # 避免每行 Python float/int 转换与 dict 查询。
         result = DCLFResult()
-        names = lambda key, n: self.ppc.get(key, np.asarray([str(i) for i in range(n)], dtype=object))
-        bus_rows = self.result.get("bus", [])
-        voltage_by_node = {
-            int(row[DC_BUS_COLS["idx"]]): float(row[DC_BUS_COLS["voltage"]])
-            for row in bus_rows
+        bus_rows = self.result.get("bus")
+        if bus_rows is None or len(bus_rows) == 0:
+            return result
+
+        bus_volt = bus_rows[:, DC_BUS_COLS["voltage"]]
+        bus_idx_col = bus_rows[:, DC_BUS_COLS["idx"]].astype(np.int64)
+        sort_order = np.argsort(bus_idx_col, kind="stable")
+        sorted_idx = bus_idx_col[sort_order]
+
+        def _lookup_voltage(col_array):
+            if col_array.size == 0:
+                return np.zeros(0, dtype=np.float64)
+            nids = col_array.astype(np.int64)
+            if sorted_idx.size == 0:
+                return np.zeros(nids.shape, dtype=np.float64)
+            pos = np.searchsorted(sorted_idx, nids)
+            pos_clip = np.clip(pos, 0, sorted_idx.size - 1)
+            hit = sorted_idx[pos_clip] == nids
+            bus_row = np.where(hit, sort_order[pos_clip], 0)
+            return np.where(hit, bus_volt[bus_row], 0.0)
+
+        def _name_list(key, n):
+            names = self.ppc.get(key)
+            if names is None or len(names) != n:
+                return np.arange(n).astype(str).tolist()
+            if isinstance(names, np.ndarray):
+                return names.astype(str).tolist()
+            return [str(x) for x in names]
+
+        n_bus = len(bus_rows)
+        bus_names = _name_list("bus_name", n_bus)
+        result.nodes = {
+            name: SimpleNamespace(volt=v)
+            for name, v in zip(bus_names, bus_volt.tolist())
         }
 
-        def node_voltage(node_idx):
-            return voltage_by_node.get(int(node_idx), 0.0)
+        def _build_two_port(rows, name_key, p_i, p_j, c_col, n_i, n_j, target, *, neg_j_current=False):
+            if rows is None or len(rows) == 0:
+                return
+            names = _name_list(name_key, len(rows))
+            i_p = rows[:, p_i].tolist()
+            j_p = rows[:, p_j].tolist()
+            currents = rows[:, c_col]
+            i_c = currents.tolist()
+            j_c = (-currents).tolist() if neg_j_current else currents.tolist()
+            i_v = _lookup_voltage(rows[:, n_i]).tolist()
+            j_v = _lookup_voltage(rows[:, n_j]).tolist()
+            for name, ip, ic, iv, jp, jc, jv in zip(names, i_p, i_c, i_v, j_p, j_c, j_v):
+                target[name] = SimpleNamespace(
+                    i_p=ip, i_c=ic, i_v=iv,
+                    j_p=jp, j_c=jc, j_v=jv,
+                )
 
-        for row, name in zip(bus_rows, names("bus_name", len(bus_rows))):
-            result.nodes[str(name)] = SimpleNamespace(volt=float(row[DC_BUS_COLS["voltage"]]))
-        for row, name in zip(self.result.get("branch", []), names("branch_name", len(self.result.get("branch", [])))):
-            result.branches[str(name)] = SimpleNamespace(
-                i_p=float(row[DC_BRANCH_COLS["i_p"]]),
-                i_c=float(row[DC_BRANCH_COLS["current"]]),
-                i_v=node_voltage(row[DC_BRANCH_COLS["i_node"]]),
-                j_p=float(row[DC_BRANCH_COLS["j_p"]]),
-                j_c=-float(row[DC_BRANCH_COLS["current"]]),
-                j_v=node_voltage(row[DC_BRANCH_COLS["j_node"]]),
-            )
-        for row, name in zip(self.result.get("zero_branch", []), names("zero_branch_name", len(self.result.get("zero_branch", [])))):
-            result.zero_branches[str(name)] = SimpleNamespace(
-                i_p=float(row[DC_ZERO_BRANCH_COLS["p"]]),
-                i_c=float(row[DC_ZERO_BRANCH_COLS["current"]]),
-                i_v=node_voltage(row[DC_ZERO_BRANCH_COLS["i_node"]]),
-            )
-        for row, name in zip(self.result.get("break", []), names("break_name", len(self.result.get("break", [])))):
-            result.breakers[str(name)] = SimpleNamespace(
-                i_p=float(row[DC_BREAK_COLS["p"]]),
-                i_c=float(row[DC_BREAK_COLS["current"]]),
-                i_v=node_voltage(row[DC_BREAK_COLS["i_node"]]),
-            )
-        for row, name in zip(self.result.get("dcdc", []), names("dcdc_name", len(self.result.get("dcdc", [])))):
-            result.dcdc_converters[str(name)] = SimpleNamespace(
-                i_p=float(row[DC_DCDC_COLS["i_p"]]),
-                i_c=float(row[DC_DCDC_COLS["i_c"]]),
-                i_v=node_voltage(row[DC_DCDC_COLS["i_node"]]),
-                j_p=float(row[DC_DCDC_COLS["j_p"]]),
-                j_c=float(row[DC_DCDC_COLS["j_c"]]),
-                j_v=node_voltage(row[DC_DCDC_COLS["j_node"]]),
-            )
-        for row, name in zip(self.result.get("gen", []), names("gen_name", len(self.result.get("gen", [])))):
-            result.generators[str(name)] = SimpleNamespace(
-                i_p=float(row[DC_GEN_COLS["p"]]),
-                i_c=float(row[DC_GEN_COLS["current"]]),
-                i_v=node_voltage(row[DC_GEN_COLS["node"]]),
-            )
-        for row, name in zip(self.result.get("load", []), names("load_name", len(self.result.get("load", [])))):
-            result.loads[str(name)] = SimpleNamespace(
-                i_p=float(row[DC_LOAD_COLS["p"]]),
-                i_c=float(row[DC_LOAD_COLS["current"]]),
-                i_v=node_voltage(row[DC_LOAD_COLS["node"]]),
-            )
+        def _build_two_port_separate_currents(rows, name_key, p_i, p_j, c_i, c_j, n_i, n_j, target):
+            if rows is None or len(rows) == 0:
+                return
+            names = _name_list(name_key, len(rows))
+            i_p = rows[:, p_i].tolist()
+            j_p = rows[:, p_j].tolist()
+            i_c = rows[:, c_i].tolist()
+            j_c = rows[:, c_j].tolist()
+            i_v = _lookup_voltage(rows[:, n_i]).tolist()
+            j_v = _lookup_voltage(rows[:, n_j]).tolist()
+            for name, ip, ic, iv, jp, jc, jv in zip(names, i_p, i_c, i_v, j_p, j_c, j_v):
+                target[name] = SimpleNamespace(
+                    i_p=ip, i_c=ic, i_v=iv,
+                    j_p=jp, j_c=jc, j_v=jv,
+                )
+
+        def _build_single_port(rows, name_key, p_col, c_col, n_col, target):
+            if rows is None or len(rows) == 0:
+                return
+            names = _name_list(name_key, len(rows))
+            i_p = rows[:, p_col].tolist()
+            i_c = rows[:, c_col].tolist()
+            i_v = _lookup_voltage(rows[:, n_col]).tolist()
+            for name, p, c, v in zip(names, i_p, i_c, i_v):
+                target[name] = SimpleNamespace(i_p=p, i_c=c, i_v=v)
+
+        _build_two_port(
+            self.result.get("branch"), "branch_name",
+            DC_BRANCH_COLS["i_p"], DC_BRANCH_COLS["j_p"], DC_BRANCH_COLS["current"],
+            DC_BRANCH_COLS["i_node"], DC_BRANCH_COLS["j_node"], result.branches,
+            neg_j_current=True,
+        )
+        # DC/DC has separate i_c / j_c columns and i_p / j_p.
+        _build_two_port_separate_currents(
+            self.result.get("dcdc"), "dcdc_name",
+            DC_DCDC_COLS["i_p"], DC_DCDC_COLS["j_p"],
+            DC_DCDC_COLS["i_c"], DC_DCDC_COLS["j_c"],
+            DC_DCDC_COLS["i_node"], DC_DCDC_COLS["j_node"], result.dcdc_converters,
+        )
+        _build_single_port(
+            self.result.get("zero_branch"), "zero_branch_name",
+            DC_ZERO_BRANCH_COLS["p"], DC_ZERO_BRANCH_COLS["current"],
+            DC_ZERO_BRANCH_COLS["i_node"], result.zero_branches,
+        )
+        _build_single_port(
+            self.result.get("break"), "break_name",
+            DC_BREAK_COLS["p"], DC_BREAK_COLS["current"],
+            DC_BREAK_COLS["i_node"], result.breakers,
+        )
+        _build_single_port(
+            self.result.get("gen"), "gen_name",
+            DC_GEN_COLS["p"], DC_GEN_COLS["current"],
+            DC_GEN_COLS["node"], result.generators,
+        )
+        _build_single_port(
+            self.result.get("load"), "load_name",
+            DC_LOAD_COLS["p"], DC_LOAD_COLS["current"],
+            DC_LOAD_COLS["node"], result.loads,
+        )
         return result
 
     def _summary_node_ids(self):
@@ -2041,8 +2180,8 @@ class DCPowerFlowCalc:
                 br.current = float(cur)
                 br.i_p = float(p_from)
                 br.j_p = float(p_to)
-            np.add.at(P_inj, self.branch_i, i_p)
-            np.add.at(P_inj, self.branch_j, j_p)
+            P_inj += np.bincount(self.branch_i, weights=i_p, minlength=P_inj.size)
+            P_inj += np.bincount(self.branch_j, weights=j_p, minlength=P_inj.size)
 
         # 零阻抗支路
         for tp, zb_idx, i_node, j_node, phi_a, phi_b in self.zero_branch_info:
@@ -2115,8 +2254,8 @@ class DCPowerFlowCalc:
                 out=np.zeros_like(dcdc_j_p),
                 where=np.abs(dcdc_vj) > self.runtime_params.min_voltage,
             )
-            np.add.at(P_inj, self.dcdc_i, dcdc_i_p)
-            np.add.at(P_inj, self.dcdc_j, dcdc_j_p)
+            P_inj += np.bincount(self.dcdc_i, weights=dcdc_i_p, minlength=P_inj.size)
+            P_inj += np.bincount(self.dcdc_j, weights=dcdc_j_p, minlength=P_inj.size)
             for dc_idx, i_p, j_p, i_c, j_c in zip(self.dcdc_idx, dcdc_i_p, dcdc_j_p, dcdc_i_c, dcdc_j_c):
                 dc = self.model.dcdc_converters[int(dc_idx)]
                 dc.i_p = float(i_p)
@@ -2244,17 +2383,21 @@ class DCPowerFlowCalc:
         G, x = self.prepare()
         self.converged = False
 
+        refresh_period = self.jacobian_refresh_period
+        factor = None
+        steps_since_refresh = refresh_period
+        solver_name = self._linear_solver_resolved
+        solver_fn = self._linear_solver_fn
 
         # ---------- 7. 牛顿-拉夫逊迭代 ----------
         for it in range(params.max_iter):
             F, J = self._build_newton_system(G, x)
 
-            # print("F", F)
             # 收敛检查
             self.normF = np.linalg.norm(F, np.inf)
 
             if self.verbose:
-                print("it:",it, f"eps:{self.normF:.3e}")
+                print("it:", it, f"eps:{self.normF:.3e}")
 
             self.iterations = it + 1
             if self.normF < params.tol:
@@ -2270,19 +2413,35 @@ class DCPowerFlowCalc:
                 self.converged = False
                 break
 
+            # 因子复用：refresh_period=1 时等价于标准 NR。
             try:
-                delta = solve_sparse_system(J, -F, self.linear_solver)
+                if factor is None or steps_since_refresh >= refresh_period:
+                    factor = _factor_jacobian(J, solver_name, solver_fn)
+                    steps_since_refresh = 0
+                delta = factor.solve(-F)
+                steps_since_refresh += 1
             except Exception as e:
                 if self.verbose:
                     print(f"\n线性方程组求解失败: {e}")
-                # 改用最小二乘作为备选
-                J_dense = J.toarray()
+                # 可选求解器失败时退回到 SuperLU；再不行就走最小二乘。
+                _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
+                _OPTIONAL_SPARSE_MISSING.add(solver_name)
+                solver_name = "scipy"
+                solver_fn = spsolve
+                self._linear_solver_resolved = "scipy"
+                self._linear_solver_fn = spsolve
+                factor = None
+                steps_since_refresh = refresh_period
                 try:
-                    delta = np.linalg.lstsq(J_dense, -F, rcond=None)[0]
-                except:
-                    if self.verbose:
-                        print("最小二乘也失败，迭代终止")
-                    break
+                    delta = spsolve(J, -F)
+                except Exception:
+                    J_dense = J.toarray()
+                    try:
+                        delta = np.linalg.lstsq(J_dense, -F, rcond=None)[0]
+                    except Exception:
+                        if self.verbose:
+                            print("最小二乘也失败，迭代终止")
+                        break
 
             # 更新变量
             x += delta

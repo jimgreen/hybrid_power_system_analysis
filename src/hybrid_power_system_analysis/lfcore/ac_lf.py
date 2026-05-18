@@ -393,7 +393,10 @@ class ACPowerFlowCalc:
         self.min_voltage = self.params.min_voltage
         self.algorithm = algorithm
         self.used_algorithm = algorithm
-        self.linear_solver, self._linear_solver_fn = _resolve_linear_solver(linear_solver)
+        # 用户请求的求解器名原样保留，便于上层日志/测试断言；实际 callable
+        # 由 _resolve_linear_solver 决定，未安装时回退 SuperLU。
+        self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         # jacobian_refresh_period>=2 触发 Honest-Newton：复用同一因子若干次，
         # 节省每轮因子分解；可能略增迭代次数，由用户按系统稳态衡量。
         self.jacobian_refresh_period = max(1, int(jacobian_refresh_period or 1))
@@ -3161,15 +3164,15 @@ class ACPowerFlowCalc:
             # 因子复用策略：refresh_period=1 时与标准 NR 完全等价。
             try:
                 if factor is None or steps_since_refresh >= refresh_period:
-                    factor = _factor_jacobian(J, self.linear_solver, self._linear_solver_fn)
+                    factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
                     steps_since_refresh = 0
                 delta = factor.solve(F)
                 steps_since_refresh += 1
             except Exception:
                 # 因子分解或解算失败时，回退到 SuperLU spsolve 单步路径。
-                _OPTIONAL_SPARSE_SOLVERS.pop(self.linear_solver, None)
-                _OPTIONAL_SPARSE_MISSING.add(self.linear_solver)
-                self.linear_solver, self._linear_solver_fn = "scipy", spsolve
+                _OPTIONAL_SPARSE_SOLVERS.pop(self._linear_solver_resolved, None)
+                _OPTIONAL_SPARSE_MISSING.add(self._linear_solver_resolved)
+                self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
                 factor = None
                 steps_since_refresh = refresh_period
                 delta = spsolve(J, F)
