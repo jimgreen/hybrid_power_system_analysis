@@ -9,7 +9,7 @@
 - `HybridIsland`
 - `HybridPowerNetwork`
 - `HybridPowerFlowCalc`
-- `HybridPowerFlowResult`
+- `HybridLFResult`
 
 该模块不是简单顺序调用 AC 和 DC 潮流，而是将 AC、DC、DC/AC、AC/AC 等方程合并到一个全局 Newton 系统中统一求解。
 
@@ -26,15 +26,20 @@
 ## 入口与使用方式
 
 ```python
-from lfcore.hybrid_lf import run_hybrid_power_flow
+from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 
-result = run_hybrid_power_flow(
-    "data/model/hybrid/qinling.e",
+network = _read_lf_network_from_file("data/model/hybrid/qinling.e")
+calc = HybridPowerFlowCalc(
+    network,
     tol=1e-8,
     max_iter=50,
     min_voltage=0.01,
     verbose=False,
 )
+rc = calc.run()
+if rc != 0 or not calc.converged:
+    raise RuntimeError(f"hybrid LF failed: iter={calc.iterations}, normF={calc.normF:.3e}")
+result = calc.lf_result
 ```
 
 命令行：
@@ -178,7 +183,7 @@ Vi^2 * Vj^2 * (P_i + P_j)
 
 ## 结果对象
 
-`HybridPowerFlowResult` 包含：
+`HybridLFResult` 包含：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -194,7 +199,7 @@ Vi^2 * Vj^2 * (P_i + P_j)
 
 ### 结果回填模式
 
-`HybridPowerFlowCalc` 和 `run_hybrid_power_flow()` 支持以下 `result_mode`：
+`HybridPowerFlowCalc` 支持以下 `result_mode`：
 
 | 模式 | 行为 | 适用场景 |
 | --- | --- | --- |
@@ -203,7 +208,7 @@ Vi^2 * Vj^2 * (P_i + P_j)
 | `summary` | 只保留节点电压、相角和收敛摘要 | 快速检查收敛和电压水平 |
 | `none` | 只保留 `calc.x`、迭代次数和残差，不做结果回填 | 批量性能测试或上层自行读取状态向量 |
 
-`array` 模式下，`run_hybrid_power_flow()` 直接返回数组结果字典，不构造 `HybridLFResult` 包装对象。返回键为
+`array` 模式下，`calc.run()` 后直接从 `calc.result` 读取数组结果字典，不构造 `HybridLFResult` 包装对象。返回键为
 `ac`、`dc`、`dcac`、`acac` 和 `summary`；其中 `ac`/`dc` 为子求解器数组结果字典，`dcac`/`acac`
 为换流器结果数组，`summary` 只包含收敛和规模摘要。
 

@@ -7,7 +7,7 @@
 | 对象 | 实现 | 说明 |
 | --- | --- | --- |
 | `ac_lf` | `src/hybrid_power_system_analysis/lfcore/ac_lf.py` 中的 `ACPowerFlowCalc` | 纯交流 Newton-Raphson 潮流 |
-| `hybrid_lf` | `src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` 中的 `run_hybrid_power_flow` | 统一交直流 Newton 潮流；纯 AC 算例中只包含 AC 子系统 |
+| `hybrid_lf` | `src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` 中的 `HybridPowerFlowCalc.run()` | 统一交直流 Newton 潮流；纯 AC 算例中只包含 AC 子系统 |
 | MATPOWER 参照 | `PYPOWER runpf` | 使用 MATPOWER 兼容的 branch/tap 模型 |
 
 本文记录的是当前 T 型变压器建模调整后的基准结果。若后续需要把该对比固化为持续基准，应将 E 文件到 MATPOWER/PYPOWER ppc 的投影逻辑放入 `benchmarks/`，并在脚本输出中显式标注变压器 `gt/bt` 到 `BR_B` 的近似关系。

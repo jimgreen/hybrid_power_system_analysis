@@ -87,7 +87,6 @@ from model.dc_array_model import (
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
     build_dc_network_from_ppc,
-    build_dc_ppc_from_e_file as _build_dc_ppc_from_e_file,
     build_dc_ppc_from_network,
 )
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology

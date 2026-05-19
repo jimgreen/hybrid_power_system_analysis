@@ -267,7 +267,6 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from lfcore.dc_lf import DCPowerFlowCalc
 
         case_path = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
-        original_loader = dc_lf._build_dc_ppc_from_e_file
         original_common_loader = dc_lf.build_dc_ppc_with_topology_from_e_file
         calls = []
 
@@ -275,17 +274,13 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             calls.append(Path(file_name).name)
             return original_common_loader(file_name)
 
-        def reject_direct_loader(*_args, **_kwargs):
-            raise AssertionError("DC LF should use the shared E-to-PPC topology loader")
-
-        dc_lf._build_dc_ppc_from_e_file = reject_direct_loader
+        self.assertFalse(hasattr(dc_lf, "_build_dc_ppc_from_e_file"))
         dc_lf.build_dc_ppc_with_topology_from_e_file = counted_common_loader
         try:
             ppc = dc_lf.load_dc_ppc_from_e_file(case_path)
             network = dc_lf._dc_network_from_ppc(ppc)
             calc = DCPowerFlowCalc(network)
         finally:
-            dc_lf._build_dc_ppc_from_e_file = original_loader
             dc_lf.build_dc_ppc_with_topology_from_e_file = original_common_loader
 
         self.assertEqual(["dc_net_30.e"], calls)

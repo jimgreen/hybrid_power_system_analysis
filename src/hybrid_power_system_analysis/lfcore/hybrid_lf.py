@@ -94,25 +94,6 @@ from model.ppc_topology import (
 
 
 DEFAULT_HYBRID_EFILE = model_file("hybrid", "hybrid_net_40.e")
-LINEAR_SOLVER_CHOICES = (
-    "scipy",
-    "superlu",
-    "default",
-    "auto",
-    "pypardiso",
-    "umfpack",
-    "sksparse.klu.klu_solve",
-    "klu_solve",
-    "pyklu",
-    "klu",
-    "klu_alt",
-)
-LINEAR_SOLVER_HELP = (
-    "Sparse linear solver for the unified Newton system and AC/DC sub-solvers. "
-    "scipy/superlu/default use SciPy SuperLU; auto tries optional UMFPACK/KLU bindings first."
-)
-
-
 def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
 
@@ -601,44 +582,8 @@ class HybridPowerFlowCalc:
         self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
-        sub_result_mode = self.result_mode
-        self.ac_calc = (
-            ACPowerFlowCalc(
-                network._ac_ppc,
-                parameters=self.params,
-                linear_solver=self.linear_solver,
-                result_mode=sub_result_mode,
-                verbose=self.verbose,
-            )
-            if self.has_ac and hasattr(network, "_ac_ppc")
-            else ACPowerFlowCalc(
-                network.ac,
-                parameters=self.params,
-                linear_solver=self.linear_solver,
-                result_mode=sub_result_mode,
-                verbose=self.verbose,
-            ) if self.has_ac else None
-        )
-        if self.has_dc and hasattr(network, "_dc_ppc"):
-            dc_writeback_network = None if getattr(network.dc, "_lf_lightweight", False) else network.dc
-            self.dc_calc = DCPowerFlowCalc(
-                network._dc_ppc,
-                parameters=self.params,
-                linear_solver=self.linear_solver,
-                result_mode=sub_result_mode,
-                verbose=self.verbose,
-            )
-            self.dc_calc._network_writeback = dc_writeback_network
-            self.dc_calc.model = dc_writeback_network
-            self.dc_calc.net = dc_writeback_network
-        else:
-            self.dc_calc = DCPowerFlowCalc(
-                network.dc,
-                parameters=self.params,
-                linear_solver=self.linear_solver,
-                result_mode=sub_result_mode,
-                verbose=self.verbose,
-            ) if self.has_dc else None
+        self.ac_calc = self._build_ac_subcalc()
+        self.dc_calc = self._build_dc_subcalc()
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -695,12 +640,46 @@ class HybridPowerFlowCalc:
     def _normalize_result_mode(result_mode: str) -> str:
         return _normalize_lf_result_mode(result_mode, "Hybrid")
 
+    def _build_ac_subcalc(self):
+        if not self.has_ac:
+            return None
+        source = self.network._ac_ppc if hasattr(self.network, "_ac_ppc") else self.network.ac
+        return ACPowerFlowCalc(
+            source,
+            parameters=self.params,
+            linear_solver=self.linear_solver,
+            result_mode=self.result_mode,
+            verbose=self.verbose,
+        )
+
+    def _build_dc_subcalc(self):
+        if not self.has_dc:
+            return None
+        source = self.network._dc_ppc if hasattr(self.network, "_dc_ppc") else self.network.dc
+        calc = DCPowerFlowCalc(
+            source,
+            parameters=self.params,
+            linear_solver=self.linear_solver,
+            result_mode=self.result_mode,
+            verbose=self.verbose,
+        )
+        if hasattr(self.network, "_dc_ppc"):
+            dc_writeback_network = None if getattr(self.network.dc, "_lf_lightweight", False) else self.network.dc
+            calc._network_writeback = dc_writeback_network
+            calc.model = dc_writeback_network
+            calc.net = dc_writeback_network
+        return calc
+
     def _sync_sub_result_modes(self) -> None:
         sub_result_mode = self.result_mode
         if self.ac_calc is not None:
             self.ac_calc.result_mode = sub_result_mode
+            if sub_result_mode != "full":
+                self.ac_calc.keep_node_objects = False
         if self.dc_calc is not None:
             self.dc_calc.result_mode = sub_result_mode
+            if sub_result_mode != "full":
+                self.dc_calc.keep_node_objects = False
 
     def prepare(self):
         """Build the global hybrid state vector and block equation layout."""
@@ -1358,13 +1337,6 @@ class HybridPowerFlowCalc:
             dc_V = dc_x[:self.dc_calc.N]
         return ac_theta, ac_V, dc_V
 
-    def _append_converter_residuals(self, parts, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V):
-        """Inject converter port powers and append converter equation residuals."""
-        if self.N_dcac:
-            parts.append(self._append_dcac_residuals(ac_f, dc_f, dcac_x, ac_V, dc_V))
-        if self.N_acac:
-            parts.append(self._append_acac_residuals(ac_f, acac_x, ac_V))
-
     def _append_dcac_residuals(self, ac_f, dc_f, dcac_x, ac_V, dc_V, out=None):
         """Mutate AC/DC nodal residuals and return DC/AC converter residual rows."""
         dcac = dcac_x.reshape(self.N_dcac, 3)
@@ -1825,54 +1797,69 @@ class HybridPowerFlowCalc:
                 col_parts.append(cols_src[mask])
                 data_parts.append(self.acac_ones[mask])
 
-    def _write_single_ac_result_from_subsolver(self):
+    def _single_block(self):
+        if self._single_ac_newton_block:
+            return "ac", self.ac_calc, self.ac_eq, self.ac_size
+        if self._single_dc_newton_block:
+            return "dc", self.dc_calc, self.dc_eq, self.dc_size
+        return None, None, 0, 0
+
+    def _hybrid_summary(self):
+        return {
+            "converged": bool(self.converged),
+            "iterations": int(self.iterations),
+            "normF": float(self.normF),
+            "total_vars": int(self.total_vars),
+            "total_eq": int(self.total_eq),
+        }
+
+    def _set_array_result(self, ac_result, dc_result, dcac_result=None, acac_result=None):
+        self.result = {
+            "ac": ac_result,
+            "dc": dc_result,
+            "dcac": (
+                np.zeros((0, 5), dtype=np.float64)
+                if dcac_result is None
+                else dcac_result
+            ),
+            "acac": (
+                np.zeros((0, 6), dtype=np.float64)
+                if acac_result is None
+                else acac_result
+            ),
+            "summary": self._hybrid_summary(),
+        }
+
+    def _sync_single_subsolver_result(self, kind):
+        ac_result = self.ac_calc.result if kind == "ac" else None
+        dc_result = self.dc_calc.result if kind == "dc" else None
+        if kind == "ac":
+            self._write_ac_ppc_result_to_network()
+        elif kind == "dc":
+            self._write_dc_ppc_result_to_network()
+
         if self.result_mode == "full":
-            if getattr(self, "skip_lf_result", False):
-                self.lf_result = None
-            else:
-                self._write_ac_ppc_result_to_network()
-                self.lf_result = self._build_lf_result()
+            self.result = {}
+            self.lf_result = None if getattr(self, "skip_lf_result", False) else self._build_lf_result()
         elif self.result_mode == "array":
-            self.result = {
-                "ac": self.ac_calc.result,
-                "dc": None,
-                "dcac": np.zeros((0, 5), dtype=np.float64),
-                "acac": np.zeros((0, 6), dtype=np.float64),
-                "summary": {
-                    "converged": bool(self.converged),
-                    "iterations": int(self.iterations),
-                    "normF": float(self.normF),
-                    "total_vars": int(self.total_vars),
-                    "total_eq": int(self.total_eq),
-                },
-            }
+            self._set_array_result(ac_result, dc_result)
             self.lf_result = None
         elif self.result_mode == "summary":
-            self.lf_result = {
-                "ac": self.ac_calc.result,
-                "dc": None,
-                "hybrid": {
-                    "converged": bool(self.converged),
-                    "iterations": int(self.iterations),
-                    "normF": float(self.normF),
-                    "total_vars": int(self.total_vars),
-                    "total_eq": int(self.total_eq),
-                },
-            }
+            self.lf_result = {"ac": ac_result, "dc": dc_result, "hybrid": self._hybrid_summary()}
         else:
             self.result = {}
             self.lf_result = None
 
-    def _run_single_ac_subsolver(self):
-        self.ac_calc.verbose = self.verbose
-        self.ac_calc.skip_lf_result = bool(getattr(self, "skip_lf_result", False) or self.result_mode == "array")
-        rc = self.ac_calc.run()
-        self.x = self.ac_calc.x
-        self.converged = bool(self.ac_calc.converged)
-        self.iterations = int(self.ac_calc.iterations)
-        self.normF = float(self.ac_calc.normF)
-        self.last_jacobian_shape = (self.ac_eq, self.ac_size)
-        self._write_single_ac_result_from_subsolver()
+    def _run_single_subsolver(self, kind, subcalc, eq_count, var_count):
+        subcalc.verbose = self.verbose
+        subcalc.skip_lf_result = bool(getattr(self, "skip_lf_result", False) or self.result_mode == "array")
+        rc = subcalc._run_newton_raphson()
+        self.x = subcalc.x
+        self.converged = bool(subcalc.converged)
+        self.iterations = int(subcalc.iterations)
+        self.normF = float(subcalc.normF)
+        self.last_jacobian_shape = (eq_count, var_count)
+        self._sync_single_subsolver_result(kind)
         return rc
 
     def run(self, result_mode=None):
@@ -1882,9 +1869,13 @@ class HybridPowerFlowCalc:
             self._sync_sub_result_modes()
         if self.x.size == 0:
             self.prepare()
+        return self._run_newton_raphson()
 
-        if self._single_ac_newton_block:
-            return self._run_single_ac_subsolver()
+    def _run_newton_raphson(self):
+        """Execute Newton iterations or delegate single-block AC/DC cases."""
+        kind, subcalc, eq_count, var_count = self._single_block()
+        if subcalc is not None:
+            return self._run_single_subsolver(kind, subcalc, eq_count, var_count)
 
         self.converged = False
         x = self.x.copy()
@@ -1981,13 +1972,7 @@ class HybridPowerFlowCalc:
         self.lf_result = {
             "ac": ac_result,
             "dc": dc_result,
-            "hybrid": {
-                "converged": bool(self.converged),
-                "iterations": int(self.iterations),
-                "normF": float(self.normF),
-                "total_vars": int(self.total_vars),
-                "total_eq": int(self.total_eq),
-            },
+            "hybrid": self._hybrid_summary(),
         }
 
     def _write_array_result(self, x):
@@ -2051,20 +2036,13 @@ class HybridPowerFlowCalc:
                 out=np.zeros(self.N_acac, dtype=np.float64),
                 where=np.abs(vj) > self.params.min_voltage,
             )
-        self.result = {
-            "ac": ac_result,
-            "dc": dc_result,
-            "dcac": dcac_result,
-            "acac": acac_result,
-            "summary": {
-                "converged": bool(self.converged),
-                "iterations": int(self.iterations),
-                "normF": float(self.normF),
-                "total_vars": int(self.total_vars),
-                "total_eq": int(self.total_eq),
-            },
-        }
+        self._set_array_result(ac_result, dc_result, dcac_result, acac_result)
         self.lf_result = None
+
+    def _write_dc_ppc_result_to_network(self) -> None:
+        result = self.dc_calc.result if self.dc_calc is not None else None
+        if result and getattr(self.network.dc, "_lf_lightweight", False):
+            self.network.dc.result = result
 
     def _write_ac_ppc_result_to_network(self) -> None:
         """Copy array-mode AC results back to the hybrid AC object facade."""
@@ -2182,6 +2160,7 @@ class HybridPowerFlowCalc:
             if skip_lf_result:
                 self.dc_calc.skip_lf_result = True
             self.dc_calc.update_lf_info(dc_x)
+            self._write_dc_ppc_result_to_network()
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
@@ -2372,93 +2351,6 @@ class HybridPowerFlowCalc:
         return result
 
 
-def _hybrid_result_from_calc(
-    calc,
-    rc: int,
-    ac_warnings=None,
-    ac_errors=None,
-    dc_warnings=None,
-    dc_errors=None,
-) -> Any:
-    mode = getattr(calc, "result_mode", "full")
-    if mode == "array":
-        result = getattr(calc, "result", None)
-        if isinstance(result, dict) and result:
-            return result
-        return {
-            "ac": None,
-            "dc": None,
-            "dcac": np.zeros((0, 5), dtype=np.float64),
-            "acac": np.zeros((0, 6), dtype=np.float64),
-            "summary": {
-                "converged": False,
-                "iterations": int(getattr(calc, "iterations", 0)),
-                "normF": float(getattr(calc, "normF", np.inf)),
-                "total_vars": int(getattr(calc, "total_vars", 0)),
-                "total_eq": int(getattr(calc, "total_eq", 0)),
-            },
-        }
-    if mode == "none":
-        return getattr(calc, "result", {})
-
-    result = getattr(calc, "lf_result", None)
-    if isinstance(result, dict):
-        return result
-    if result is None:
-        result = calc._build_lf_result()
-    network = getattr(calc, "network", None)
-    if network is not None:
-        result.network = network
-        result.ac_network = network.ac
-        result.dc_network = network.dc
-    result.calc = calc
-    result.ac_calc = getattr(calc, "ac_calc", None)
-    result.dc_calc = getattr(calc, "dc_calc", None)
-    result.rc = rc
-    result.ac_warnings = list(ac_warnings or [])
-    result.ac_errors = list(ac_errors or [])
-    result.dc_warnings = list(dc_warnings or [])
-    result.dc_errors = list(dc_errors or [])
-    return result
-
-
-def run_hybrid_power_flow(
-    file_name=DEFAULT_HYBRID_EFILE,
-    tol=None,
-    max_iter=None,
-    min_voltage=None,
-    verbose=True,
-    parameter_file=DEFAULT_LF_PARAMETER_FILE,
-    parameters: Optional[PowerFlowParameters] = None,
-    linear_solver: str = "auto",
-    result_mode: str = "full",
-) -> Any:
-    # Main load-flow preparation is delegated to AC/DC sub-solvers.  Full hybrid
-    # topology diagnostics remain available through HybridPowerNetwork.prepare()
-    # and check_topology(), but the Newton path avoids that duplicate object scan.
-    ac_warnings, ac_errors, dc_warnings, dc_errors = [], [], [], []
-
-    network = _read_lf_network_from_file(file_name)
-    calc = HybridPowerFlowCalc(
-        network,
-        tol=tol,
-        max_iter=max_iter,
-        min_voltage=min_voltage,
-        verbose=verbose,
-        parameter_file=parameter_file,
-        parameters=parameters,
-        linear_solver=linear_solver,
-        result_mode=result_mode,
-    )
-
-    if ac_errors or dc_errors:
-        return _hybrid_result_from_calc(calc, -1, ac_warnings, ac_errors, dc_warnings, dc_errors)
-
-    calc.prepare()
-    rc = calc.run()
-    return _hybrid_result_from_calc(calc, rc, ac_warnings, ac_errors, dc_warnings, dc_errors)
-
-
 def print_hybrid_result(result: HybridLFResult):
     print("\n=== 交直流联合潮流计算结果 ===")
     print(f"节点总数: {result.total_nodes} (AC={len(result.ac_network.nodes)}, DC={len(result.dc_network.nodes)})")
@@ -2525,17 +2417,12 @@ def print_hybrid_result(result: HybridLFResult):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Hybrid AC/DC power flow")
-    parser.add_argument("file", nargs="?", default=str(DEFAULT_HYBRID_EFILE), help="hybrid E file path")
+    parser.add_argument("file", nargs="?", default=str(DEFAULT_HYBRID_EFILE), help="Hybrid E file path")
     parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
-    parser.add_argument(
-        "--linear-solver",
-        choices=LINEAR_SOLVER_CHOICES,
-        default="scipy",
-        help=LINEAR_SOLVER_HELP,
-    )
+    parser.add_argument("--linear-solver", default="scipy")
     parser.add_argument("--result-mode", choices=("full", "array", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
@@ -2543,23 +2430,20 @@ def main(argv=None) -> int:
     network = _read_lf_network_from_file(args.file)
     calc = HybridPowerFlowCalc(
         network,
+        parameter_file=args.para,
         tol=args.tol,
         max_iter=args.max_iter,
         min_voltage=args.min_voltage,
-        verbose=not args.quiet,
-        parameter_file=args.para,
         linear_solver=args.linear_solver,
         result_mode=args.result_mode,
+        verbose=not args.quiet,
     )
-    calc.prepare()
     rc = calc.run()
-    result = _hybrid_result_from_calc(calc, rc)
-    if not args.quiet and isinstance(result, HybridLFResult):
-        print_hybrid_result(result)
+    if not args.quiet and calc.result_mode == "full":
+        print_hybrid_result(calc.lf_result)
     elif not args.quiet:
         print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
-    converged = result.converged if isinstance(result, HybridLFResult) else calc.converged
-    return 0 if converged else 1
+    return 0 if rc == 0 else 1
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from ac_lf import ACPowerFlowCalc
 from ac_model import ACPowerNetwork
 from dc_lf import DCPowerFlowCalc
 from dc_model import DCPowerNetwork
-from hybrid_lf import run_hybrid_power_flow
+from hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
@@ -430,15 +430,15 @@ def solve_dc(e_file: Path) -> Tuple[Snapshot, str]:
 
 
 def solve_hybrid(e_file: Path) -> Tuple[Snapshot, str]:
+    network = _read_lf_network_from_file(e_file)
+    calc = HybridPowerFlowCalc(network, verbose=False)
     with contextlib.redirect_stdout(io.StringIO()):
-        result = run_hybrid_power_flow(e_file, verbose=False)
-    if not result.converged:
+        rc = calc.run()
+    if rc != 0 or not calc.converged:
         raise RuntimeError(
-            f"Hybrid load flow failed for {e_file}: rc={result.rc}, "
-            f"iter={result.calc.iterations}, normF={result.calc.normF:.3e}, "
-            f"ac_errors={result.ac_errors}, dc_errors={result.dc_errors}"
+            f"Hybrid load flow failed for {e_file}: rc={rc}, "
+            f"iter={calc.iterations}, normF={calc.normF:.3e}"
         )
-    network = result.network
     return (
         Snapshot(
             network,
@@ -447,7 +447,7 @@ def solve_hybrid(e_file: Path) -> Tuple[Snapshot, str]:
             dcac_converters=network.dcac_converters,
             acac_converters=network.acac_converters,
         ),
-        f"iter={result.calc.iterations}, normF={result.calc.normF:.3e}",
+        f"iter={calc.iterations}, normF={calc.normF:.3e}",
     )
 
 

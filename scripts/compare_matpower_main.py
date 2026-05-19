@@ -16,15 +16,18 @@ from pypower.idx_gen import GEN_BUS, GEN_STATUS
 
 
 ROOT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = ROOT_DIR.parent
 CODE_DIR = ROOT_DIR / "code"
-if str(CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(CODE_DIR))
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+SRC_DIR = PROJECT_DIR / "src" / "hybrid_power_system_analysis"
+LFCORE_DIR = SRC_DIR / "lfcore"
+MODEL_DIR = SRC_DIR / "model"
+for path in (CODE_DIR, ROOT_DIR, SRC_DIR, LFCORE_DIR, MODEL_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from ac_net_flow import ACPowerFlowCalc
 from ac_net_model import ACPowerNetwork
-from hybrid_net_flow import run_hybrid_power_flow
+from hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 
 
 CASES = (
@@ -84,11 +87,14 @@ def _run_ac_flow(e_file):
 
 
 def _run_hybrid_flow(e_file):
-    result = run_hybrid_power_flow(e_file, tol=1e-8, max_iter=50, verbose=False)
-    if not result.converged:
+    network = _read_lf_network_from_file(e_file)
+    calc = HybridPowerFlowCalc(network, tol=1e-8, max_iter=50, verbose=False, result_mode="full")
+    rc = _quiet_call(calc.run)
+    result = calc.lf_result
+    if rc != 0 or not calc.converged or result is None:
         raise RuntimeError(
             f"hybrid_flow.py did not converge for {e_file}: "
-            f"ac_errors={result.ac_errors}, dc_errors={result.dc_errors}"
+            f"iter={calc.iterations}, normF={calc.normF:.3e}"
         )
     return result.ac_network, result.ac, result
 

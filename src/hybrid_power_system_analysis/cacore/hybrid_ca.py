@@ -15,7 +15,7 @@ for path in (ROOT_DIR, LFCORE_DIR):
         sys.path.insert(0, str(path))
 
 from efile_read import EBook
-from lfcore.hybrid_lf import run_hybrid_power_flow
+from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 from paths import DATA_DIR, model_file
 
 
@@ -269,7 +269,10 @@ def collect_limit_risks(result, constraints, source: str) -> list[CARisk]:
 
 def _run_case(model_file: str | Path):
     try:
-        result = run_hybrid_power_flow(model_file, verbose=False, result_mode="full")
+        network = _read_lf_network_from_file(model_file)
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="full")
+        calc.run()
+        result = calc.lf_result
         return result, None
     except Exception as exc:  # pragma: no cover - exercised by real divergent cases.
         return None, exc

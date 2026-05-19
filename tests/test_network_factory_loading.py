@@ -295,11 +295,12 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
             self.assertNotIn("mode = str(result_mode", source, rel_path)
 
     def test_lf_old_compatibility_hooks_are_removed(self):
-        for rel_path in (
-            "src/hybrid_power_system_analysis/lfcore/ac_lf.py",
-            "src/hybrid_power_system_analysis/lfcore/dc_lf.py",
-            "src/hybrid_power_system_analysis/lfcore/hybrid_lf.py",
-        ):
+        checked_files = {
+            "src/hybrid_power_system_analysis/lfcore/ac_lf.py": ("def _cache_static_arrays",),
+            "src/hybrid_power_system_analysis/lfcore/dc_lf.py": ("_build_dc_ppc_from_e_file",),
+            "src/hybrid_power_system_analysis/lfcore/hybrid_lf.py": (),
+        }
+        for rel_path, extra_tokens in checked_files.items():
             source = (ROOT_DIR / rel_path).read_text(encoding="utf-8")
             self.assertNotIn("_run_with_optional_output", source, rel_path)
             self.assertNotIn("solve_sparse_system", source, rel_path)
@@ -307,6 +308,35 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
             self.assertNotIn("兼容", source, rel_path)
             self.assertNotIn("compatibility", source, rel_path)
             self.assertNotIn("standard_jac_csr_order", source, rel_path)
+            for token in extra_tokens:
+                self.assertNotIn(token, source, rel_path)
+
+    def test_hybrid_lf_run_matches_ac_dc_control_flow(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        self.assertFalse(hasattr(hybrid_lf, "run_hybrid_power_flow"))
+        self.assertFalse(hasattr(hybrid_lf, "_hybrid_result_from_calc"))
+        self.assertIn("return self._run_newton_raphson()", inspect.getsource(hybrid_lf.HybridPowerFlowCalc.run))
+        self.assertTrue(hasattr(hybrid_lf.HybridPowerFlowCalc, "_run_newton_raphson"))
+
+        source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "hybrid_lf.py").read_text(
+            encoding="utf-8"
+        )
+        for token in (
+            "def run_hybrid_power_flow",
+            "def _hybrid_result_from_calc",
+            "def _append_converter_residuals",
+            "ac_warnings=None",
+            "ac_errors=None",
+            "dc_warnings=None",
+            "dc_errors=None",
+            "result.ac_warnings =",
+            "result.ac_errors =",
+            "result.dc_warnings =",
+            "result.dc_errors =",
+            '"converged": False',
+        ):
+            self.assertNotIn(token, source)
 
     def test_ac_dc_lf_array_mode_switch_is_removed(self):
         import lfcore.ac_lf as ac_lf

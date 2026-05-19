@@ -154,9 +154,6 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             def __init__(self, network, **kwargs):
                 calls.append(("calc", network, kwargs.get("parameter_file")))
 
-            def prepare(self):
-                calls.append("prepare")
-
             def run(self):
                 calls.append("run")
                 return 0
@@ -180,7 +177,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             hybrid_lf.HybridPowerFlowCalc = original_calc
 
         self.assertEqual(0, rc)
-        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "custom_lf.para"), "prepare", "run"], calls)
+        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "custom_lf.para"), "run"], calls)
 
     def test_hybrid_lf_cli_accepts_linear_solver_argument(self):
         import lfcore.hybrid_lf as hybrid_lf
@@ -192,9 +189,6 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
             def __init__(self, network, **kwargs):
                 calls.append(("calc", network, kwargs.get("linear_solver")))
-
-            def prepare(self):
-                calls.append("prepare")
 
             def run(self):
                 calls.append("run")
@@ -217,7 +211,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 [
                     "data/model/hybrid/hybrid_net_40.e",
                     "--linear-solver",
-                    "sksparse.klu.klu_solve",
+                    "custom.experimental_solver",
                     "--quiet",
                 ]
             )
@@ -229,8 +223,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("load", "hybrid_net_40.e"),
-                ("calc", "hybrid-network", "sksparse.klu.klu_solve"),
-                "prepare",
+                ("calc", "hybrid-network", "custom.experimental_solver"),
                 "run",
             ],
             calls,
@@ -312,13 +305,38 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
         self.assertEqual([("init", "csc"), ("solve", (2.0,)), ("init", "csc"), ("solve", (2.0,))], calls)
 
-    def test_hybrid_lf_cli_rejects_unknown_linear_solver(self):
+    def test_hybrid_lf_cli_defers_unknown_linear_solver_to_calc(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        with self.assertRaises(SystemExit) as ctx:
-            hybrid_lf.main(["data/model/hybrid/hybrid_net_40.e", "--linear-solver", "unknown-solver", "--quiet"])
+        calls = []
 
-        self.assertEqual(2, ctx.exception.code)
+        class FakeCalc:
+            converged = True
+
+            def __init__(self, network, **kwargs):
+                calls.append(("calc", network, kwargs.get("linear_solver")))
+
+            def run(self):
+                calls.append("run")
+                return 0
+
+        original_loader = hybrid_lf._read_lf_network_from_file
+        original_calc = hybrid_lf.HybridPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return "hybrid-network"
+
+        hybrid_lf._read_lf_network_from_file = fake_loader
+        hybrid_lf.HybridPowerFlowCalc = FakeCalc
+        try:
+            rc = hybrid_lf.main(["data/model/hybrid/hybrid_net_40.e", "--linear-solver", "unknown-solver", "--quiet"])
+        finally:
+            hybrid_lf._read_lf_network_from_file = original_loader
+            hybrid_lf.HybridPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "unknown-solver"), "run"], calls)
 
     def test_power_flow_classes_read_algorithm_parameters_from_lf_para(self):
         from algorithm_parameters import load_lf_parameters

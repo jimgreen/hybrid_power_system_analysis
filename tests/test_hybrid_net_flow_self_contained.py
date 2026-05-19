@@ -46,6 +46,17 @@ def _set_block_value(text, block_name, row_idx, column_name, value):
     return text[:start] + "\n".join(lines) + "\n" + text[end:]
 
 
+def _run_hybrid_lf(file_name, **kwargs):
+    import lfcore.hybrid_lf as hybrid_lf
+
+    network = hybrid_lf._read_lf_network_from_file(file_name)
+    calc = hybrid_lf.HybridPowerFlowCalc(network, **kwargs)
+    calc.run()
+    if calc.result_mode in {"array", "none"}:
+        return calc.result
+    return calc.lf_result
+
+
 class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_net_flow_does_not_import_network_classes(self):
         import hybrid_net_flow
@@ -57,13 +68,14 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertFalse(hasattr(hybrid_net_flow, "DCPowerNetwork"))
         self.assertFalse(hasattr(hybrid_net_flow, "HybridACGrid"))
         self.assertFalse(hasattr(hybrid_net_flow, "HybridDCGrid"))
+        self.assertFalse(hasattr(hybrid_net_flow, "run_hybrid_power_flow"))
         self.assertTrue(hasattr(hybrid_net_flow, "HybridPowerNetwork"))
 
     def test_hybrid_net_40_runs_from_self_contained_network(self):
         from scipy.sparse import issparse
         import hybrid_net_flow
 
-        result = hybrid_net_flow.run_hybrid_power_flow(
+        result = _run_hybrid_lf(
             ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
             verbose=False,
         )
@@ -425,7 +437,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         hybrid_lf._array_device = reject_converter_materialization
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                result = hybrid_lf.run_hybrid_power_flow(
+                result = _run_hybrid_lf(
                     ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
                     verbose=False,
                     result_mode="full",
@@ -469,15 +481,16 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(10, len(model.ac.nodes))
         self.assertEqual(30, len(model.dc.nodes))
 
-    def test_run_hybrid_power_flow_returns_hybrid_lf_result(self):
+    def test_hybrid_calc_run_returns_hybrid_lf_result(self):
         import lfcore.hybrid_lf as hybrid_lf
 
-        result = hybrid_lf.run_hybrid_power_flow(
+        result = _run_hybrid_lf(
             ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
             verbose=False,
         )
 
         self.assertFalse(hasattr(hybrid_lf, "HybridPowerFlowResult"))
+        self.assertFalse(hasattr(hybrid_lf, "run_hybrid_power_flow"))
         self.assertIsInstance(result, hybrid_lf.HybridLFResult)
         self.assertIs(result.lf_result, result)
         self.assertTrue(result.converged)
@@ -563,7 +576,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
     def test_array_result_mode_keeps_arrays_without_hybrid_object_backfill(self):
         import numpy as np
-        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file, run_hybrid_power_flow
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 
         network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
@@ -586,7 +599,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
         self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
 
-        result = run_hybrid_power_flow(
+        result = _run_hybrid_lf(
             ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e",
             verbose=False,
             result_mode="array",
@@ -601,7 +614,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsInstance(result["dcac"], np.ndarray)
         self.assertIsInstance(result["acac"], np.ndarray)
 
-        ac_only_result = run_hybrid_power_flow(
+        ac_only_result = _run_hybrid_lf(
             ROOT / "data" / "model" / "ac" / "ieee14.e",
             verbose=False,
             result_mode="array",
@@ -638,6 +651,38 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(0, calc.global_jac_raw_data.size)
         self.assertEqual(calc.ac_calc.iterations, calc.iterations)
 
+    def test_single_ac_hybrid_newton_calls_ac_core_without_run_prepare_gate(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "ac" / "ieee14.e")
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+        self.assertTrue(calc._single_ac_newton_block)
+
+        calls = []
+        original_ac_core = calc.ac_calc._run_newton_raphson
+
+        def counted_ac_core():
+            calls.append("core")
+            return original_ac_core()
+
+        def reject_ac_run(*_args, **_kwargs):
+            raise AssertionError("single AC hybrid run should call ACPowerFlowCalc._run_newton_raphson directly")
+
+        def reject_ac_prepare(*_args, **_kwargs):
+            raise AssertionError("prepared single AC hybrid run should not call ACPowerFlowCalc.prepare again")
+
+        calc.ac_calc._run_newton_raphson = counted_ac_core
+        calc.ac_calc.run = reject_ac_run
+        calc.ac_calc.prepare = reject_ac_prepare
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertEqual(["core"], calls)
+        self.assertTrue(calc.converged)
+
     def test_single_dc_hybrid_newton_uses_dc_solver_without_global_packaging(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 
@@ -662,6 +707,67 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(calc._single_dc_newton_block)
         self.assertEqual(0, calc.global_jac_raw_data.size)
         self.assertEqual(calc.dc_calc.iterations, calc.iterations)
+
+    def test_single_dc_hybrid_run_delegates_to_dc_newton_core(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "dc" / "dc_net_30.e")
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        calls = []
+        original_dc_core = calc.dc_calc._run_newton_raphson
+        original_factor = hybrid_lf._factor_jacobian
+
+        def counted_dc_core():
+            calls.append("core")
+            return original_dc_core()
+
+        def reject_dc_run(*_args, **_kwargs):
+            raise AssertionError("single DC hybrid run should call DCPowerFlowCalc._run_newton_raphson directly")
+
+        def reject_hybrid_factor(*_args, **_kwargs):
+            raise AssertionError("single DC hybrid run should delegate to the DC Newton core")
+
+        calc.dc_calc._run_newton_raphson = counted_dc_core
+        calc.dc_calc.run = reject_dc_run
+        hybrid_lf._factor_jacobian = reject_hybrid_factor
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = calc.run()
+        finally:
+            calc.dc_calc._run_newton_raphson = original_dc_core
+            hybrid_lf._factor_jacobian = original_factor
+
+        self.assertEqual(0, rc)
+        self.assertEqual(["core"], calls)
+        self.assertTrue(calc.converged)
+        self.assertIs(calc.result["dc"], calc.dc_calc.result)
+        self.assertIsNone(calc.result["ac"])
+
+    def test_hybrid_run_lets_run_prepare_once(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        original_run = hybrid_lf.HybridPowerFlowCalc.run
+        x_sizes_before_run = []
+
+        def counted_run(self, *args, **kwargs):
+            x_sizes_before_run.append(int(self.x.size))
+            return original_run(self, *args, **kwargs)
+
+        network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "ac" / "ieee14.e")
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="array")
+        hybrid_lf.HybridPowerFlowCalc.run = counted_run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = calc.run()
+        finally:
+            hybrid_lf.HybridPowerFlowCalc.run = original_run
+
+        self.assertEqual(0, rc)
+        self.assertEqual([0], x_sizes_before_run)
+        self.assertTrue(calc.result["summary"]["converged"])
 
     def test_hybrid_power_flow_uses_dc_ppc_without_dc_object_topo(self):
         import lfcore.hybrid_lf as hybrid_lf
@@ -797,7 +903,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 """
             case_path.write_text(source_text + acac_block, encoding="utf-8")
 
-            result = hybrid_net_flow.run_hybrid_power_flow(case_path, verbose=False)
+            result = _run_hybrid_lf(case_path, verbose=False)
 
         self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
         self.assertTrue(result.has_acac)
@@ -845,7 +951,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         ACPowerNetwork.check_topo = reject_check_topo
         DCPowerNetwork.check_topo = reject_check_topo
         try:
-            result = hybrid_net_flow.run_hybrid_power_flow(
+            result = _run_hybrid_lf(
                 ROOT / "data" / "model" / "hybrid" / "qinling.e",
                 verbose=False,
             )
@@ -876,7 +982,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             case_path = Path(tmpdir) / "qinling_node_out.e"
             case_path.write_text(text, encoding="utf-8")
-            result = hybrid_net_flow.run_hybrid_power_flow(case_path, verbose=False)
+            result = _run_hybrid_lf(case_path, verbose=False)
 
         self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
         self.assertEqual(len(result.network.dcac_converters), 11)
