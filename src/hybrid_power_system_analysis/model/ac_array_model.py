@@ -166,11 +166,75 @@ def _empty(width: int) -> np.ndarray:
     return np.zeros((0, width), dtype=np.float64)
 
 
+class _EFileTableRows:
+    """List-compatible E table rows with cached column access."""
+
+    __slots__ = ("rows", "columns", "_matrix", "_raw_cache")
+
+    def __init__(self, rows, columns):
+        self.rows = rows
+        self.columns = columns
+        self._matrix = None
+        self._raw_cache = {}
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __bool__(self):
+        return bool(self.rows)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __getitem__(self, item):
+        return self.rows[item]
+
+    def _as_matrix(self):
+        if self._matrix is not None:
+            return self._matrix
+        if not self.rows:
+            self._matrix = np.empty((0, 0), dtype=object)
+            return self._matrix
+        matrix = np.asarray(self.rows, dtype=object)
+        self._matrix = matrix if matrix.ndim == 2 else False
+        return self._matrix
+
+    def raw_column(self, col, default="") -> np.ndarray:
+        n = len(self.rows)
+        if col is None or n == 0:
+            return np.full(n, default, dtype=object) if n else np.empty(0, dtype=object)
+        key = (int(col), default)
+        cached = self._raw_cache.get(key)
+        if cached is not None:
+            return cached
+
+        matrix = self._as_matrix()
+        if isinstance(matrix, np.ndarray) and col < matrix.shape[1]:
+            raw = matrix[:, int(col)]
+            missing = (raw == "") | (raw == None)
+            if np.any(missing):
+                values = raw.copy()
+                values[missing] = default
+            else:
+                values = raw
+        else:
+            values = np.empty(n, dtype=object)
+            for i, row in enumerate(self.rows):
+                if col >= len(row):
+                    values[i] = default
+                else:
+                    value = row[col]
+                    values[i] = default if value in (None, "") else value
+        self._raw_cache[key] = values
+        return values
+
+
 def _rows_for(data: Dict, table_name: str):
     table = data.get(table_name)
     if not table:
         return {}, []
-    return {str(name): pos for pos, name in enumerate(table.get("header_list", []))}, table.get("rows", [])
+    columns = {str(name): pos for pos, name in enumerate(table.get("header_list", []))}
+    return columns, _EFileTableRows(table.get("rows", []), columns)
 
 
 def _cell(row, col, default=""):
@@ -193,6 +257,8 @@ def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.nd
     n = len(table_rows)
     if col is None or n == 0:
         return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    if hasattr(table_rows, "raw_column"):
+        return table_rows.raw_column(col, default).astype(np.float64, copy=False)
     # Inline cell extraction; the per-call `_float_cell`/`_cell` overhead
     # dominated this helper for tables with hundreds of thousands of rows.
     values = [None] * n
@@ -211,6 +277,13 @@ def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
     n = len(table_rows)
     if col is None or n == 0:
         return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    if hasattr(table_rows, "raw_column"):
+        return (
+            table_rows.raw_column(col, default)
+            .astype(np.float64, copy=False)
+            .astype(np.int64, copy=False)
+            .astype(np.float64)
+        )
     values = [None] * n
     for i in range(n):
         row = table_rows[i]
@@ -227,6 +300,9 @@ def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], defaul
     default = mapping[default_label]
     if col is None:
         return np.full(len(table_rows), float(default), dtype=np.float64)
+    if hasattr(table_rows, "raw_column"):
+        raw = table_rows.raw_column(col, default_label)
+        return np.asarray([_code_value(value, mapping, default_label) for value in raw], dtype=np.float64)
     return np.asarray(
         [_code_value(_cell(row, col, default_label), mapping, default_label) for row in table_rows],
         dtype=np.float64,
@@ -237,6 +313,15 @@ def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -
     name_col = columns.get("name")
     if name_col is None:
         return np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
+    if hasattr(table_rows, "raw_column"):
+        raw = table_rows.raw_column(name_col, "")
+        names = raw.astype(str).astype(object, copy=False)
+        missing = (raw == "") | (raw == None)
+        if np.any(missing):
+            fallback = np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
+            names = names.copy()
+            names[missing] = fallback[missing]
+        return names
     return np.asarray(
         [
             str(_cell(row, name_col, "") or f"{prefix}_{int(idx_values[pos])}")
@@ -288,6 +373,8 @@ def _assign_current_if_present(
 ) -> None:
     if attr not in columns:
         return
+    if callable(current_scale_by_node):
+        current_scale_by_node = current_scale_by_node()
     scales = _scale_by_node(node_values.astype(np.int64, copy=False), current_scale_by_node)
     raw = _float_column(table_rows, columns, attr)
     out[:, col] = np.divide(raw, scales, out=np.zeros_like(raw), where=np.abs(scales) > 1e-12)
@@ -364,10 +451,16 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         int(idx): float(vbase)
         for idx, vbase in zip(bus[:, BUS_COLS["idx"]], raw_vbase if table_rows else [])
     }
-    current_scale_by_node = {
-        int(row[BUS_COLS["idx"]]): i_scale * ac_current_base_ka(p_base_kW, float(row[BUS_COLS["vbase"]]))
-        for row in bus
-    }
+    current_scale_by_node = None
+
+    def get_current_scale_by_node():
+        nonlocal current_scale_by_node
+        if current_scale_by_node is None:
+            current_scale_by_node = {
+                int(row[BUS_COLS["idx"]]): i_scale * ac_current_base_ka(p_base_kW, float(row[BUS_COLS["vbase"]]))
+                for row in bus
+            }
+        return current_scale_by_node
 
     columns, table_rows = _rows_for(rows, "ACBranch")
     branch = np.zeros((len(table_rows), len(BRANCH_COLS)), dtype=np.float64)
@@ -381,8 +474,24 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         branch[:, BRANCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         for attr in ("i_p", "i_q", "j_p", "j_q"):
             _assign_power_if_present(branch, BRANCH_COLS[attr], table_rows, columns, attr, p_base)
-        _assign_current_if_present(branch, BRANCH_COLS["i_c"], table_rows, columns, "i_c", branch[:, BRANCH_COLS["i_node"]], current_scale_by_node)
-        _assign_current_if_present(branch, BRANCH_COLS["j_c"], table_rows, columns, "j_c", branch[:, BRANCH_COLS["j_node"]], current_scale_by_node)
+        _assign_current_if_present(
+            branch,
+            BRANCH_COLS["i_c"],
+            table_rows,
+            columns,
+            "i_c",
+            branch[:, BRANCH_COLS["i_node"]],
+            get_current_scale_by_node,
+        )
+        _assign_current_if_present(
+            branch,
+            BRANCH_COLS["j_c"],
+            table_rows,
+            columns,
+            "j_c",
+            branch[:, BRANCH_COLS["j_node"]],
+            get_current_scale_by_node,
+        )
     branch_names = _names_from_rows(table_rows, columns, "branch", branch[:, BRANCH_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACTransformer")
@@ -403,8 +512,24 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         transformer[:, TRANSFORMER_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         for attr in ("i_p", "i_q", "j_p", "j_q"):
             _assign_power_if_present(transformer, TRANSFORMER_COLS[attr], table_rows, columns, attr, p_base)
-        _assign_current_if_present(transformer, TRANSFORMER_COLS["i_c"], table_rows, columns, "i_c", transformer[:, TRANSFORMER_COLS["i_node"]], current_scale_by_node)
-        _assign_current_if_present(transformer, TRANSFORMER_COLS["j_c"], table_rows, columns, "j_c", transformer[:, TRANSFORMER_COLS["j_node"]], current_scale_by_node)
+        _assign_current_if_present(
+            transformer,
+            TRANSFORMER_COLS["i_c"],
+            table_rows,
+            columns,
+            "i_c",
+            transformer[:, TRANSFORMER_COLS["i_node"]],
+            get_current_scale_by_node,
+        )
+        _assign_current_if_present(
+            transformer,
+            TRANSFORMER_COLS["j_c"],
+            table_rows,
+            columns,
+            "j_c",
+            transformer[:, TRANSFORMER_COLS["j_node"]],
+            get_current_scale_by_node,
+        )
     transformer_names = _names_from_rows(table_rows, columns, "transformer", transformer[:, TRANSFORMER_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACGenerator")
@@ -420,7 +545,15 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         gen[:, GEN_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         _assign_power_if_present(gen, GEN_COLS["p"], table_rows, columns, "p", p_base)
         _assign_power_if_present(gen, GEN_COLS["q"], table_rows, columns, "q", p_base)
-        _assign_current_if_present(gen, GEN_COLS["current"], table_rows, columns, "current", gen[:, GEN_COLS["node"]], current_scale_by_node)
+        _assign_current_if_present(
+            gen,
+            GEN_COLS["current"],
+            table_rows,
+            columns,
+            "current",
+            gen[:, GEN_COLS["node"]],
+            get_current_scale_by_node,
+        )
     gen_names = _names_from_rows(table_rows, columns, "gen", gen[:, GEN_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACLoad")
@@ -439,7 +572,15 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         load[:, LOAD_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         _assign_power_if_present(load, LOAD_COLS["p"], table_rows, columns, "p", p_base)
         _assign_power_if_present(load, LOAD_COLS["q"], table_rows, columns, "q", p_base)
-        _assign_current_if_present(load, LOAD_COLS["current"], table_rows, columns, "current", load[:, LOAD_COLS["node"]], current_scale_by_node)
+        _assign_current_if_present(
+            load,
+            LOAD_COLS["current"],
+            table_rows,
+            columns,
+            "current",
+            load[:, LOAD_COLS["node"]],
+            get_current_scale_by_node,
+        )
     load_names = _names_from_rows(table_rows, columns, "load", load[:, LOAD_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACShuntCompensator")
@@ -455,7 +596,15 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         shunt[:, SHUNT_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         _assign_power_if_present(shunt, SHUNT_COLS["p"], table_rows, columns, "p", p_base)
         _assign_power_if_present(shunt, SHUNT_COLS["q"], table_rows, columns, "q", p_base)
-        _assign_current_if_present(shunt, SHUNT_COLS["current"], table_rows, columns, "current", shunt[:, SHUNT_COLS["node"]], current_scale_by_node)
+        _assign_current_if_present(
+            shunt,
+            SHUNT_COLS["current"],
+            table_rows,
+            columns,
+            "current",
+            shunt[:, SHUNT_COLS["node"]],
+            get_current_scale_by_node,
+        )
     shunt_names = _names_from_rows(table_rows, columns, "shunt", shunt[:, SHUNT_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACZeroBranch")
@@ -467,14 +616,22 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         _assign_power_if_present(zero_branch, ZERO_BRANCH_COLS["p"], table_rows, columns, "p", p_base)
         _assign_power_if_present(zero_branch, ZERO_BRANCH_COLS["q"], table_rows, columns, "q", p_base)
-        _assign_current_if_present(zero_branch, ZERO_BRANCH_COLS["current"], table_rows, columns, "current", zero_branch[:, ZERO_BRANCH_COLS["i_node"]], current_scale_by_node)
+        _assign_current_if_present(
+            zero_branch,
+            ZERO_BRANCH_COLS["current"],
+            table_rows,
+            columns,
+            "current",
+            zero_branch[:, ZERO_BRANCH_COLS["i_node"]],
+            get_current_scale_by_node,
+        )
     zero_branch_names = _names_from_rows(table_rows, columns, "zero_branch", zero_branch[:, ZERO_BRANCH_COLS["idx"]])
 
     sw_columns, sw_rows = _rows_for(rows, "ACSwitch")
     switch, switch_names = _build_switch_like_from_rows(
         sw_rows,
         sw_columns,
-        current_scale_by_node,
+        get_current_scale_by_node,
         prefix="switch",
         p_base=p_base,
     )
@@ -482,7 +639,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     breaker, breaker_names = _build_switch_like_from_rows(
         br_rows,
         br_columns,
-        current_scale_by_node,
+        get_current_scale_by_node,
         prefix="break",
         scale_optional_power=False,
         p_base=p_base,

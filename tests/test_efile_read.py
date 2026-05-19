@@ -7,6 +7,37 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class EFileReadPerformanceTest(unittest.TestCase):
+    def test_rows_reader_unquoted_rows_use_inline_fast_split(self):
+        import efile_read
+
+        content = "\n".join(
+            [
+                "<ACNode>",
+                "@ idx name vbase voltage",
+                "# 1 n1 110 110",
+                "# 2 n2 220 220",
+                "</ACNode>",
+                "",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "fast_rows.e"
+            path.write_text(content, encoding="utf-8")
+            original_split_row = efile_read._split_data_row
+
+            def forbidden_split_row(*args, **kwargs):
+                raise AssertionError("_read_efile_rows should inline unquoted row splitting")
+
+            efile_read._split_data_row = forbidden_split_row
+            try:
+                data = efile_read._read_efile_rows(path)
+            finally:
+                efile_read._split_data_row = original_split_row
+
+        self.assertEqual(["1", "n1", "110", "110"], data["ACNode"]["rows"][0])
+        self.assertEqual(["2", "n2", "220", "220"], data["ACNode"]["rows"][1])
+
     def test_unquoted_rows_use_fast_split_without_regex(self):
         import efile_read
         from efile_read import EBook

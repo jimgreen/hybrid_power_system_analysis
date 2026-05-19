@@ -5,6 +5,65 @@ import numpy as np
 
 
 class ArrayModelColumnHelperTest(unittest.TestCase):
+    def test_ac_rows_for_returns_reusable_column_view(self):
+        import model.ac_array_model as ac_array_model
+
+        data = {
+            "ACNode": {
+                "header_list": ["idx", "name", "vbase", "voltage", "run_stat"],
+                "rows": [
+                    ["1", "n1", "110", "110", "1"],
+                    ["2", "", "220", "", ""],
+                ],
+            }
+        }
+
+        columns, rows = ac_array_model._rows_for(data, "ACNode")
+
+        self.assertTrue(hasattr(rows, "raw_column"))
+        np.testing.assert_allclose(ac_array_model._int_column(rows, columns, "idx"), np.array([1.0, 2.0]))
+        np.testing.assert_allclose(ac_array_model._float_column(rows, columns, "voltage", 1.0), np.array([110.0, 1.0]))
+        np.testing.assert_array_equal(
+            ac_array_model._names_from_rows(rows, columns, "bus", np.array([1.0, 2.0])),
+            np.array(["n1", "bus_2"], dtype=object),
+        )
+
+    def test_ac_current_scale_provider_is_lazy(self):
+        import model.ac_array_model as ac_array_model
+
+        rows = [["10.0"], ["20.0"]]
+        node_values = np.array([1.0, 2.0])
+        out = np.zeros((2, 1), dtype=np.float64)
+        calls = []
+
+        def scale_provider():
+            calls.append("called")
+            return {1: 10.0, 2: 20.0}
+
+        ac_array_model._assign_current_if_present(
+            out,
+            0,
+            rows,
+            {},
+            "current",
+            node_values,
+            scale_provider,
+        )
+        self.assertEqual([], calls)
+        np.testing.assert_allclose(out[:, 0], np.array([0.0, 0.0]))
+
+        ac_array_model._assign_current_if_present(
+            out,
+            0,
+            rows,
+            {"current": 0},
+            "current",
+            node_values,
+            scale_provider,
+        )
+        self.assertEqual(["called"], calls)
+        np.testing.assert_allclose(out[:, 0], np.array([1.0, 1.0]))
+
     def test_ppc_column_helpers_do_not_use_numpy_fromiter(self):
         import model.ac_array_model as ac_array_model
         import model.dc_array_model as dc_array_model

@@ -208,6 +208,12 @@ def _read_efile_rows(file_path):
     rows = None
     split_data_row = _split_data_row
 
+    def append_data_row(text):
+        if "'" not in text:
+            rows.append(text.split())
+        else:
+            rows.append(split_data_row(text))
+
     def finish_block():
         if block_name is None:
             return
@@ -230,7 +236,7 @@ def _read_efile_rows(file_path):
             if first == "#":
                 if block_name is None:
                     raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
-                rows.append(split_data_row(raw_line[1:]))
+                append_data_row(raw_line[1:])
                 continue
             line = raw_line.strip()
             if not line:
@@ -251,7 +257,7 @@ def _read_efile_rows(file_path):
             elif first == "#":
                 if block_name is None:
                     raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
-                rows.append(split_data_row(line[1:]))
+                append_data_row(line[1:])
             else:
                 raise SyntaxError(f"Invalid row at line {idx + 1} {line} in {file_path}")
     return data
