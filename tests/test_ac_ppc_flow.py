@@ -531,6 +531,28 @@ class ACPPCFlowTest(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
 
+    def test_full_jacobian_csr_pattern_maps_duplicate_raw_coordinates(self):
+        from scipy.sparse import coo_matrix, csr_matrix
+
+        from ac_lf import _build_csr_pattern_from_raw_coords
+
+        raw_rows = np.asarray([1, 0, 1, 0, 1, 2], dtype=np.int32)
+        raw_cols = np.asarray([2, 1, 2, 1, 3, 0], dtype=np.int32)
+        raw_data = np.asarray([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float64)
+
+        indices, indptr, raw_to_csr = _build_csr_pattern_from_raw_coords(
+            raw_rows,
+            raw_cols,
+            n_rows=3,
+        )
+        actual_data = np.bincount(raw_to_csr, weights=raw_data, minlength=indices.size)
+        actual = csr_matrix((actual_data, indices, indptr), shape=(3, 4))
+        expected = coo_matrix((raw_data, (raw_rows, raw_cols)), shape=(3, 4)).tocsr()
+
+        np.testing.assert_array_equal(actual.indptr, expected.indptr)
+        np.testing.assert_array_equal(actual.indices, expected.indices)
+        np.testing.assert_allclose(actual.data, expected.data, atol=1e-12)
+
     def test_ppc_zero_branch_jacobian_uses_precomputed_kind_groups(self):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc

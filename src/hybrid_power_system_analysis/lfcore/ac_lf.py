@@ -70,6 +70,45 @@ def load_ac_ppc_from_e_file(file_name) -> Dict:
     return build_ac_ppc_with_topology_from_e_file(file_name)
 
 
+def _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, n_rows: int):
+    """Build a CSR sparsity pattern and raw-entry-to-CSR-position map.
+
+    ``raw_rows``/``raw_cols`` may contain duplicate coordinates.  The returned
+    ``raw_to_csr`` array maps each raw coordinate to the corresponding entry in
+    the unique CSR pattern so runtime values can be accumulated with
+    ``np.bincount``.
+    """
+    raw_rows = np.asarray(raw_rows, dtype=np.int32)
+    raw_cols = np.asarray(raw_cols, dtype=np.int32)
+    if raw_rows.size != raw_cols.size:
+        raise ValueError("raw_rows and raw_cols must have the same length")
+    raw_count = int(raw_rows.size)
+    if raw_count == 0:
+        return (
+            np.array([], dtype=np.int32),
+            np.zeros(int(n_rows) + 1, dtype=np.int32),
+            np.array([], dtype=np.intp),
+        )
+
+    order = np.lexsort((raw_cols, raw_rows))
+    sorted_rows = raw_rows[order]
+    sorted_cols = raw_cols[order]
+
+    is_new = np.empty(raw_count, dtype=bool)
+    is_new[0] = True
+    is_new[1:] = (sorted_rows[1:] != sorted_rows[:-1]) | (sorted_cols[1:] != sorted_cols[:-1])
+    sorted_group = np.cumsum(is_new, dtype=np.intp) - 1
+    raw_to_csr = np.empty(raw_count, dtype=np.intp)
+    raw_to_csr[order] = sorted_group
+
+    indices = sorted_cols[is_new].astype(np.int32, copy=True)
+    row_counts = np.bincount(sorted_rows[is_new], minlength=int(n_rows))
+    indptr = np.empty(int(n_rows) + 1, dtype=np.int32)
+    indptr[0] = 0
+    indptr[1:] = np.cumsum(row_counts, dtype=np.int64)
+    return indices, indptr, raw_to_csr
+
+
 _SPARSE_SOLVER = None
 _SPARSE_SOLVER_NAME = None
 _OPTIONAL_SPARSE_SOLVERS = {}
@@ -1938,26 +1977,12 @@ class ACPowerFlowCalc:
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        pattern = coo_matrix(
-            (np.ones(raw_count, dtype=np.float64), (raw_rows, raw_cols)),
-            shape=(self.total_eq, self.total_vars),
-        ).tocsr()
-        pattern.sum_duplicates()
-        self.full_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
-        self.full_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
+        (
+            self.full_jac_csr_indices,
+            self.full_jac_csr_indptr,
+            self.full_jac_raw_to_csr_pos,
+        ) = _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
         self.full_jac_csr_data = np.empty(self.full_jac_csr_indices.size, dtype=np.float64)
-
-        positions = {}
-        for row in range(self.total_eq):
-            start = int(self.full_jac_csr_indptr[row])
-            end = int(self.full_jac_csr_indptr[row + 1])
-            for pos in range(start, end):
-                positions[(row, int(self.full_jac_csr_indices[pos]))] = pos
-        self.full_jac_raw_to_csr_pos = np.fromiter(
-            (positions[(int(row), int(col))] for row, col in zip(raw_rows, raw_cols)),
-            dtype=np.intp,
-            count=raw_count,
-        )
 
     def _cache_pq_decoupled_matrices(self):
         """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
