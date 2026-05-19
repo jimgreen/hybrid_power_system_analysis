@@ -14,7 +14,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from dc_array_model import DCPowerNetwork  # noqa: E402
+from dc_model import DCPowerNetwork  # noqa: E402
 from dc_lf import DCPowerFlowCalc  # noqa: E402
 from hybrid_lf import HybridPowerFlowCalc, HybridPowerFlowResult, _read_lf_network_from_file  # noqa: E402
 

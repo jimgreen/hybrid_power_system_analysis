@@ -717,11 +717,11 @@ def _build_ac_se_network_from_ppc_dict(ppc: Dict, source: Optional[Path] = None)
     network._se_lightweight = True
     network.ppc = ppc
     base = ppc["base"]
-    network.p_base = float(base[0])
-    network.u_scale = float(base[1])
-    network.p_scale = float(base[2])
-    network.i_scale = float(base[3])
-    network.p_base_kW = float(base[4])
+    network.p_base = float(base["p_base"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network.p_base_kW = float(base["p_base_kW"])
     network.model = SimpleNamespace(_named_units_normalized=True)
 
     bus = ppc["bus"]
@@ -2089,7 +2089,6 @@ class ACStateEstimator:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     with contextlib.redirect_stdout(io.StringIO()):
-                        calc.prepare()
                         try:
                             rc = calc.run(result_mode="none")
                         except TypeError as exc:
@@ -2116,7 +2115,6 @@ class ACStateEstimator:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 with contextlib.redirect_stdout(io.StringIO()):
-                    calc.prepare()
                     rc = calc.run()
         except Exception:
             ACStateEstimator._restore_power_flow_seed_snapshot(snapshot)

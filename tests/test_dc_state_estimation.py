@@ -1536,15 +1536,17 @@ class DCStateEstimationTest(unittest.TestCase):
             raise AssertionError("cached seed rows should update seed ppc without full network sync")
 
         class FakePowerFlowCalc:
-            def __init__(self, model):
+            def __init__(self, model, **kwargs):
                 self.model = model
-                self.ppc = getattr(model, "ppc", None)
+                self.ppc = model if isinstance(model, dict) else getattr(model, "ppc", None)
+                self.kwargs = kwargs
                 self.converged = False
                 self.iterations = 0
                 self.normF = 0.0
                 calls.append(isinstance(self.ppc, dict))
 
             def run(self, **_kwargs):
+                self.testcase.assertEqual("none", self.kwargs.get("result_mode"))
                 self.testcase.assertTrue(
                     getattr(self, "skip_lf_result", False),
                     "SE LF seed should skip detailed LFResult construction",

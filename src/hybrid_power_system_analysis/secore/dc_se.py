@@ -31,9 +31,9 @@ from model.dc_array_model import (
     LOAD_COLS as DC_LOAD_COLS,
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
-    DCPowerNetwork,
     build_dc_network_from_ppc,
 )
+from model.dc_model import DCPowerNetwork
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 from model.meas_model import (
     BadDataItem,
@@ -1741,18 +1741,22 @@ class DCStateEstimator:
         ppc = DCStateEstimator._power_flow_seed_ppc_from_network(network)
         if ppc is not None:
             network.ppc = ppc
-            calc = DCPowerFlowCalc(network)
+            calc = DCPowerFlowCalc(
+                ppc,
+                tol=seed_tol,
+                max_iter=params.power_flow_max_iter,
+                min_voltage=params.power_flow_min_voltage,
+                result_mode="none",
+            )
+            calc._network_writeback = network
+            calc.model = network
+            calc.net = network
             calc.skip_lf_result = True
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     with contextlib.redirect_stdout(io.StringIO()):
-                        rc = calc.run(
-                            tol=seed_tol,
-                            max_iter=params.power_flow_max_iter,
-                            min_voltage=params.power_flow_min_voltage,
-                            result_mode="none",
-                        )
+                        rc = calc.run()
             except Exception:
                 if original_ppc is not None:
                     network.ppc = original_ppc
@@ -1765,17 +1769,18 @@ class DCStateEstimator:
             return True
 
         snapshot = DCStateEstimator._capture_power_flow_seed_snapshot(network)
-        calc = DCPowerFlowCalc(network)
+        calc = DCPowerFlowCalc(
+            network,
+            tol=seed_tol,
+            max_iter=params.power_flow_max_iter,
+            min_voltage=params.power_flow_min_voltage,
+        )
         calc.skip_lf_result = True
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 with contextlib.redirect_stdout(io.StringIO()):
-                    rc = calc.run(
-                        tol=seed_tol,
-                        max_iter=params.power_flow_max_iter,
-                        min_voltage=params.power_flow_min_voltage,
-                    )
+                    rc = calc.run()
         except Exception:
             DCStateEstimator._restore_power_flow_seed_snapshot(snapshot)
             return False
@@ -2019,13 +2024,13 @@ class DCStateEstimator:
             voltage = np.asarray(calc.x[: calc.N], dtype=np.float64)
             if isinstance(bus, np.ndarray) and bus.size:
                 node_pos = getattr(calc, "alive_node_dict", None)
-                if isinstance(node_pos, dict):
+                if node_pos is not None and hasattr(node_pos, "get"):
                     bus[:, DC_BUS_COLS["voltage"]] = 0.0
                     for row, node_idx in enumerate(bus[:, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)):
                         pos = node_pos.get(int(node_idx), -1)
                         if 0 <= int(pos) < voltage.size:
                             bus[row, DC_BUS_COLS["voltage"]] = voltage[int(pos)]
-                else:
+                elif voltage.size == bus.shape[0]:
                     bus[:, DC_BUS_COLS["voltage"]] = voltage
             network.ppc = ppc
             if hasattr(network, "_array_model"):

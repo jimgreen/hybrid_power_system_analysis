@@ -7,12 +7,14 @@ from pathlib import Path
 
 class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_array_network_replaces_object_model_loader(self):
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_array_model import build_dc_network_from_ppc, build_dc_ppc_from_e_file
+        from dc_model import DCPowerNetwork
 
-        network = DCPowerNetwork()
-        network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        network = build_dc_network_from_ppc(ppc)
         network.topo()
 
+        self.assertIsInstance(network, DCPowerNetwork)
         self.assertEqual("dc_ppc_v1", network.ppc["format"])
         self.assertEqual(30, len(network.nodes))
         self.assertEqual(37, len(network.branches))
@@ -22,24 +24,24 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertIs(network.branches[0].i_node_obj, network.nodes[0])
         self.assertTrue(any(isl.is_alive for isl in network.islands))
 
-    def test_dc_programs_import_array_model_network(self):
+    def test_dc_programs_do_not_import_dc_array_model_network_facade(self):
         root = Path(__file__).resolve().parents[1]
         checked_files = [
             root / "benchmarks" / "benchmark_flat_lf_se.py",
             root / "scripts" / "generate_dc_large_cases.py",
             root / "scripts" / "update_meas_from_lf.py",
+            root / "src" / "hybrid_power_system_analysis" / "model" / "hybrid_model.py",
             root / "src" / "hybrid_power_system_analysis" / "secore" / "dc_se.py",
             root / "src" / "hybrid_power_system_analysis" / "lfcore" / "dc_lf.py",
         ]
 
         for file_path in checked_files:
             source = file_path.read_text(encoding="utf-8")
-            self.assertNotIn("dc_model import DCPowerNetwork", source, str(file_path))
-            self.assertNotIn("import dc_model", source, str(file_path))
+            self.assertNotIn("dc_array_model import DCPowerNetwork", source, str(file_path))
 
     def test_dc_solver_accepts_optional_solver_name_and_falls_back(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
 
         network = DCPowerNetwork()
         network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
@@ -56,7 +58,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_solver_prepare_uses_array_model_fast_path(self):
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
 
         network = DCPowerNetwork()
         network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
@@ -64,14 +66,34 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         calc = DCPowerFlowCalc(network)
 
         with contextlib.redirect_stdout(io.StringIO()):
-            G, x = calc.prepare()
+            prepared = calc.prepare()
 
-        self.assertTrue(calc.array_mode)
-        self.assertEqual((30, 30), G.shape)
-        self.assertEqual(70, x.size)
+        self.assertIsNone(prepared)
+        self.assertFalse(hasattr(calc, "array_mode"))
+        self.assertEqual((30, 30), calc.G.shape)
+        self.assertEqual(70, calc.x.size)
         np.testing.assert_array_equal(calc.branch_i[:3], np.asarray([0, 1, 2], dtype=np.int32))
         np.testing.assert_array_equal(calc.branch_j[:3], np.asarray([1, 2, 3], dtype=np.int32))
         self.assertEqual(9, calc.N_dcdc)
+
+    def test_dc_solver_run_prepares_and_exposes_ac_style_state_access(self):
+        import numpy as np
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        calc = DCPowerFlowCalc(ppc, result_mode="array")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+            residual, jacobian = calc._build_newton_system(calc.x)
+            public_jacobian = calc.get_jacobi(calc.x)
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual(calc.total_eq, residual.size)
+        self.assertEqual("csc", jacobian.format)
+        np.testing.assert_allclose(jacobian.toarray(), public_jacobian.toarray(), atol=1e-12)
 
     def test_dc_solver_accepts_ppc_without_network_topology(self):
         from lfcore.dc_lf import DCPowerFlowCalc
@@ -84,7 +106,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             rc = calc.run()
 
         self.assertEqual(0, rc)
-        self.assertTrue(calc.array_mode)
+        self.assertFalse(hasattr(calc, "array_mode"))
         self.assertTrue(calc.converged)
         self.assertEqual("dc_ppc_v1", calc.ppc["format"])
         self.assertIn("bus", calc.result)
@@ -98,7 +120,10 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         ppc.pop("_dc_pf_static", None)
 
         with contextlib.redirect_stdout(io.StringIO()):
-            cold_G, cold_x = DCPowerFlowCalc(ppc).prepare()
+            cold_calc = DCPowerFlowCalc(ppc)
+            cold_calc.prepare()
+            cold_G = cold_calc.G
+            cold_x = cold_calc.x
         self.assertIn("_dc_pf_static", ppc)
 
         original_topology = DCPowerFlowCalc._prepare_direct_ppc_topology
@@ -110,18 +135,22 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 warm_calc = DCPowerFlowCalc(ppc)
-                warm_G, warm_x = warm_calc.prepare()
+                warm_calc.prepare()
+                warm_G = warm_calc.G
+                warm_x = warm_calc.x
         finally:
             DCPowerFlowCalc._prepare_direct_ppc_topology = original_topology
 
         self.assertEqual(cold_G.shape, warm_G.shape)
         self.assertEqual(cold_x.shape, warm_x.shape)
-        self.assertTrue(warm_calc.array_mode)
+        self.assertFalse(hasattr(warm_calc, "array_mode"))
         self.assertEqual(cold_x.tolist(), warm_x.tolist())
 
         cold_x[0] = 123.0
         with contextlib.redirect_stdout(io.StringIO()):
-            _again_G, again_x = DCPowerFlowCalc(ppc).prepare()
+            again_calc = DCPowerFlowCalc(ppc)
+            again_calc.prepare()
+            again_x = again_calc.x
         self.assertNotEqual(123.0, again_x[0])
 
     def test_dc_array_mode_skips_full_static_cache_and_uses_dense_lookup(self):
@@ -150,9 +179,10 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         ppc.pop("_dc_pf_static", None)
         calc = DCPowerFlowCalc(ppc)
         with contextlib.redirect_stdout(io.StringIO()):
-            G, x = calc.prepare()
+            calc.prepare()
+            x = calc.x
 
-        expected = calc.get_jacobi(G, x).toarray()
+        expected = calc.get_jacobi(x).toarray()
         self.assertGreater(calc._dc_jac_csr_indices.size, 0)
 
         original_coo_matrix = dc_lf.coo_matrix
@@ -162,7 +192,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         dc_lf.coo_matrix = reject_coo_matrix
         try:
-            actual = calc.get_jacobi(G, x).toarray()
+            actual = calc.get_jacobi(x).toarray()
         finally:
             dc_lf.coo_matrix = original_coo_matrix
 
@@ -177,10 +207,10 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         ppc.pop("_dc_pf_static", None)
         calc = DCPowerFlowCalc(ppc)
         with contextlib.redirect_stdout(io.StringIO()):
-            G, x = calc.prepare()
+            calc.prepare()
 
-        _f, solver_jac = calc._build_newton_system(G, x)
-        public_jac = calc.get_jacobi(G, x)
+        _f, solver_jac = calc._build_newton_system(calc.x)
+        public_jac = calc.get_jacobi(calc.x)
 
         self.assertEqual("csc", solver_jac.format)
         np.testing.assert_allclose(solver_jac.toarray(), public_jac.toarray(), atol=1e-12)
@@ -197,6 +227,8 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         def reject_full_backfill(_x):
             raise AssertionError("result_mode='none' should skip full DC result backfill")
 
+        stale_result = object()
+        calc.lf_result = stale_result
         calc._write_back_ppc = reject_full_backfill
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run()
@@ -204,9 +236,11 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertTrue(calc.converged)
         self.assertEqual({}, calc.result)
+        self.assertIsNone(calc.lf_result)
         self.assertTrue(hasattr(calc, "x"))
 
         summary_calc = DCPowerFlowCalc(ppc, result_mode="summary")
+        summary_calc.lf_result = stale_result
         summary_calc._write_back_ppc = reject_full_backfill
         with contextlib.redirect_stdout(io.StringIO()):
             rc = summary_calc.run()
@@ -216,6 +250,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual({"node_id", "voltage", "summary"}, set(summary_calc.result))
         self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)
+        self.assertIsNone(summary_calc.lf_result)
 
         array_calc = DCPowerFlowCalc(ppc, result_mode="array")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -254,9 +289,45 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             dc_lf.build_dc_ppc_with_topology_from_e_file = original_common_loader
 
         self.assertEqual(["dc_net_30.e"], calls)
-        self.assertTrue(calc.array_mode)
+        self.assertFalse(hasattr(calc, "array_mode"))
         self.assertEqual("dc_ppc_v1", calc.ppc["format"])
         self.assertIn("_topology_arrays", calc.ppc)
+
+    def test_dc_prepare_ensures_ppc_topology_before_direct_topology_step(self):
+        import lfcore.dc_lf as dc_lf
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        case_path = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
+        ppc = build_dc_ppc_from_e_file(case_path)
+        ppc.pop("_dc_pf_static", None)
+        ppc.pop("_topology_arrays", None)
+        calc = DCPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        original_prepare_topology = DCPowerFlowCalc._prepare_direct_ppc_topology
+        original_ensure_topology = dc_lf.ensure_dc_ppc_topology
+        calls = []
+        ensure_calls = []
+
+        def counted_ensure_topology(ppc_arg):
+            ensure_calls.append(ppc_arg)
+            return original_ensure_topology(ppc_arg)
+
+        def wrapped_prepare_topology(self):
+            calls.append(self.ppc.get("_topology_arrays") is not None)
+            return original_prepare_topology(self)
+
+        dc_lf.ensure_dc_ppc_topology = counted_ensure_topology
+        DCPowerFlowCalc._prepare_direct_ppc_topology = wrapped_prepare_topology
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                calc.prepare()
+        finally:
+            dc_lf.ensure_dc_ppc_topology = original_ensure_topology
+            DCPowerFlowCalc._prepare_direct_ppc_topology = original_prepare_topology
+
+        self.assertEqual([ppc], ensure_calls)
+        self.assertEqual([True], calls)
+        self.assertIn("_topology_arrays", ppc)
 
     def test_update_meas_snapshot_supports_dc_breaker_measurements(self):
         import sys
@@ -276,7 +347,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_run_reuses_combined_dc_newton_system_builder(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
 
         class CountingDCPowerFlowCalc(DCPowerFlowCalc):
             def __init__(self, *args, **kwargs):
@@ -285,17 +356,17 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
                 self.public_f_calls = 0
                 self.public_j_calls = 0
 
-            def _build_newton_system(self, G, x):
+            def _build_newton_system(self, x, **kwargs):
                 self.combined_calls += 1
-                return super()._build_newton_system(G, x)
+                return super()._build_newton_system(x, **kwargs)
 
-            def get_f(self, x, terms=None):
+            def get_f(self, x):
                 self.public_f_calls += 1
-                return super().get_f(x, terms=terms)
+                return super().get_f(x)
 
-            def get_jacobi(self, G, x, terms=None):
+            def get_jacobi(self, x):
                 self.public_j_calls += 1
-                return super().get_jacobi(G, x, terms=terms)
+                return super().get_jacobi(x)
 
         network = DCPowerNetwork()
         network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
@@ -335,11 +406,25 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(1.0, ppc["bus"][0, BUS_COLS["voltage"]])
         self.assertEqual(100.0, ppc["bus"][0, BUS_COLS["vbase"]])
         self.assertEqual(100.0, ppc["base"]["p_base"])
+        for key in (
+            "bus_cols",
+            "branch_cols",
+            "load_cols",
+            "gen_cols",
+            "zero_branch_cols",
+            "switch_cols",
+            "break_cols",
+            "dcdc_cols",
+            "ctrl",
+        ):
+            self.assertIn(key, ppc)
+        self.assertIs(ppc["bus_cols"], BUS_COLS)
         np.testing.assert_array_equal(ppc["bus_name"][:3], np.asarray(["nd_1", "nd_2", "nd_3"], dtype=object))
 
     def test_build_dc_ppc_from_network_reflects_network_objects(self):
         import numpy as np
-        from model.dc_array_model import BUS_COLS, DCPowerNetwork, build_dc_ppc_from_e_file, build_dc_ppc_from_network
+        from model.dc_array_model import BUS_COLS, build_dc_ppc_from_e_file, build_dc_ppc_from_network
+        from model.dc_model import DCPowerNetwork
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         expected = build_dc_ppc_from_e_file(e_file)
@@ -463,7 +548,8 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         with contextlib.redirect_stdout(io.StringIO()):
-            expected_G, expected_x = DCPowerFlowCalc(ppc, result_mode="array").prepare()
+            expected_calc = DCPowerFlowCalc(ppc, result_mode="array")
+            expected_calc.prepare()
 
         original_mapper = DCPowerFlowCalc.__dict__["_map_nodes_with_lookup"]
 
@@ -474,12 +560,12 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         try:
             calc = DCPowerFlowCalc(ppc, result_mode="array")
             with contextlib.redirect_stdout(io.StringIO()):
-                G, x = calc.prepare()
+                calc.prepare()
         finally:
             DCPowerFlowCalc._map_nodes_with_lookup = original_mapper
 
-        self.assertEqual(expected_G.shape, G.shape)
-        self.assertEqual(expected_x.size, x.size)
+        self.assertEqual(expected_calc.G.shape, calc.G.shape)
+        self.assertEqual(expected_calc.x.size, calc.x.size)
 
     def test_dc_array_mode_eliminates_dcdc_j_power_variables_and_matches_full(self):
         import contextlib
@@ -496,10 +582,10 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         array_calc = DCPowerFlowCalc(ppc, result_mode="array")
         with contextlib.redirect_stdout(io.StringIO()):
-            G, x = array_calc.prepare()
+            array_calc.prepare()
 
         self.assertEqual(array_calc.N + array_calc.N_phi + array_calc.N_dcdc, array_calc.total_vars)
-        self.assertEqual(array_calc.total_vars, x.size)
+        self.assertEqual(array_calc.total_vars, array_calc.x.size)
 
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, array_calc.run())
@@ -518,7 +604,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
 
         class NonIterableControls:
             def __iter__(self):
@@ -529,18 +615,19 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         network.topo()
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
-            G, x = calc.prepare()
+            calc.prepare()
+            x = calc.x
 
         expected_f = calc.get_f(x)
-        expected_j = calc.get_jacobi(G, x).toarray()
+        expected_j = calc.get_jacobi(x).toarray()
         calc.dcdc_ctrl = NonIterableControls()
 
         np.testing.assert_allclose(calc.get_f(x), expected_f, atol=1e-12)
-        np.testing.assert_allclose(calc.get_jacobi(G, x).toarray(), expected_j, atol=1e-12)
+        np.testing.assert_allclose(calc.get_jacobi(x).toarray(), expected_j, atol=1e-12)
 
     def test_update_lf_info_uses_cached_branch_arrays(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
 
         class NonIterableBranches:
             def __iter__(self):
@@ -551,7 +638,8 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         network.topo()
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
-            _, x = calc.prepare()
+            calc.prepare()
+            x = calc.x
         calc.runtime_params = calc.params
         network.branches = NonIterableBranches()
 
@@ -561,14 +649,15 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_lf_result_uses_cached_voltage_lookup(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
 
         network = DCPowerNetwork()
         network.read_from_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         network.topo()
         calc = DCPowerFlowCalc(network)
         with contextlib.redirect_stdout(io.StringIO()):
-            _, x = calc.prepare()
+            calc.prepare()
+            x = calc.x
         calc.runtime_params = calc.params
         calc.skip_lf_result = True
         calc.update_lf_info(x)
@@ -585,7 +674,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_generates_solvable_dc_case_and_measurements(self):
         from generate_dc_large_cases import generate_dc_case_files
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import DCPowerNetwork
+        from model.dc_model import DCPowerNetwork
         from secore.dc_se import DCStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:

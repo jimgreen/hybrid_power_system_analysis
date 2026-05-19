@@ -73,10 +73,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             normF = 0.0
 
             def __init__(self, ppc, **kwargs):
-                calls.append(("calc", ppc["format"], kwargs.get("parameter_file")))
-
-            def prepare(self):
-                calls.append("prepare")
+                calls.append(("calc", ppc["format"], kwargs.get("parameter_file"), kwargs.get("result_mode")))
+                self.result_mode = kwargs.get("result_mode")
 
             def run(self):
                 calls.append("run")
@@ -92,13 +90,13 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         ac_lf.load_ac_ppc_from_e_file = fake_loader
         ac_lf.ACPowerFlowCalc = FakeCalc
         try:
-            rc = ac_lf.main(["data/model/ac/ieee39.e", "--para", "custom_lf.para", "--quiet"])
+            rc = ac_lf.main(["data/model/ac/ieee39.e", "--para", "custom_lf.para", "--result-mode", "array", "--quiet"])
         finally:
             ac_lf.load_ac_ppc_from_e_file = original_loader
             ac_lf.ACPowerFlowCalc = original_calc
 
         self.assertEqual(0, rc)
-        self.assertEqual([("load", "ieee39.e"), ("calc", "ac_ppc_v1", "custom_lf.para"), "prepare", "run"], calls)
+        self.assertEqual([("load", "ieee39.e"), ("calc", "ac_ppc_v1", "custom_lf.para", "array"), "run"], calls)
 
     def test_dc_lf_cli_accepts_parameter_file_argument(self):
         import lfcore.dc_lf as dc_lf
@@ -114,7 +112,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 calls.append(("calc", network, kwargs.get("parameter_file")))
                 self.model = network
 
-            def run(self, **_kwargs):
+            def run(self):
                 calls.append("run")
                 return 0
 
@@ -243,10 +241,11 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
         import lfcore.ac_lf as ac_lf
         import lfcore.dc_lf as dc_lf
+        import lfcore.solver_common as solver_common
 
         fake_solver = object()
-        original_find_spec = ac_lf.importlib.util.find_spec
-        original_import_module = ac_lf.importlib.import_module
+        original_find_spec = solver_common.importlib.util.find_spec
+        original_import_module = solver_common.importlib.import_module
 
         def fake_find_spec(module_name):
             return object() if module_name == "sksparse.klu" else None
@@ -256,8 +255,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 return types.SimpleNamespace(klu_solve=fake_solver)
             raise ImportError(module_name)
 
-        ac_lf.importlib.util.find_spec = fake_find_spec
-        ac_lf.importlib.import_module = fake_import_module
+        solver_common.importlib.util.find_spec = fake_find_spec
+        solver_common.importlib.import_module = fake_import_module
         try:
             for module in (ac_lf, dc_lf):
                 for solver_name in ("sksparse.klu.klu_solve", "klu_solve", "auto"):
@@ -265,8 +264,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                     module._OPTIONAL_SPARSE_MISSING.clear()
                     self.assertIs(fake_solver, module._load_named_sparse_solver(solver_name))
         finally:
-            ac_lf.importlib.util.find_spec = original_find_spec
-            ac_lf.importlib.import_module = original_import_module
+            solver_common.importlib.util.find_spec = original_find_spec
+            solver_common.importlib.import_module = original_import_module
 
     def test_ac_dc_sparse_solver_registry_supports_pyklu_wrapper(self):
         import types
@@ -276,10 +275,11 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
         import lfcore.ac_lf as ac_lf
         import lfcore.dc_lf as dc_lf
+        import lfcore.solver_common as solver_common
 
         calls = []
-        original_find_spec = ac_lf.importlib.util.find_spec
-        original_import_module = ac_lf.importlib.import_module
+        original_find_spec = solver_common.importlib.util.find_spec
+        original_import_module = solver_common.importlib.import_module
 
         class FakeKlu:
             def __init__(self, matrix):
@@ -297,8 +297,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 return types.SimpleNamespace(Klu=FakeKlu)
             raise ImportError(module_name)
 
-        ac_lf.importlib.util.find_spec = fake_find_spec
-        ac_lf.importlib.import_module = fake_import_module
+        solver_common.importlib.util.find_spec = fake_find_spec
+        solver_common.importlib.import_module = fake_import_module
         try:
             for module in (ac_lf, dc_lf):
                 module._OPTIONAL_SPARSE_SOLVERS.clear()
@@ -307,8 +307,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 result = solver(csr_matrix([[1.0]]), np.array([2.0]))
                 np.testing.assert_allclose([3.0], result)
         finally:
-            ac_lf.importlib.util.find_spec = original_find_spec
-            ac_lf.importlib.import_module = original_import_module
+            solver_common.importlib.util.find_spec = original_find_spec
+            solver_common.importlib.import_module = original_import_module
 
         self.assertEqual([("init", "csc"), ("solve", (2.0,)), ("init", "csc"), ("solve", (2.0,))], calls)
 
@@ -336,12 +336,12 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             self.assertEqual(0.123, params.min_voltage)
             self.assertEqual(98765.0, params.divergence_threshold)
 
-            ac_calc = ACPowerFlowCalc(object(), parameter_file=para_file)
+            ac_calc = ACPowerFlowCalc({"format": "ac_ppc_v1"}, parameter_file=para_file)
             self.assertEqual(params.tol, ac_calc.tol)
             self.assertEqual(params.max_iter, ac_calc.max_iter)
             self.assertEqual(params.min_voltage, ac_calc.min_voltage)
 
-            dc_calc = DCPowerFlowCalc(object(), parameter_file=para_file)
+            dc_calc = DCPowerFlowCalc({"format": "dc_ppc_v1"}, parameter_file=para_file)
             self.assertEqual(params.tol, dc_calc.params.tol)
             self.assertEqual(params.max_iter, dc_calc.params.max_iter)
             self.assertEqual(params.min_voltage, dc_calc.params.min_voltage)

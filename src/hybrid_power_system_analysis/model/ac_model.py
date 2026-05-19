@@ -394,6 +394,8 @@ class ACPowerNetwork:
         self.generator_dict = {}
         self.zero_branch_dict = {}
         self.branch_dict = {}
+        self.zero_branche_dict = self.zero_branch_dict
+        self.branche_dict = self.branch_dict
         self.transformer_dict = {}
         self.shunt_compensator_dict = {}
 
@@ -468,6 +470,8 @@ class ACPowerNetwork:
         self.generator_dict = {}
         self.zero_branch_dict = {}
         self.branch_dict = {}
+        self.zero_branche_dict = self.zero_branch_dict
+        self.branche_dict = self.branch_dict
         self.transformer_dict = {}
         self.shunt_compensator_dict = {}
         self.islands = []
@@ -494,6 +498,8 @@ class ACPowerNetwork:
         self.generator_dict = {gen.idx: gen for gen in self.generators}
         self.zero_branch_dict = {zbr.idx: zbr for zbr in self.zero_branches}
         self.branch_dict = {br.idx: br for br in self.branches}
+        self.zero_branche_dict = self.zero_branch_dict
+        self.branche_dict = self.branch_dict
         self.transformer_dict = {trfm.idx: trfm for trfm in self.transformers}
         self.shunt_compensator_dict = {scp.idx: scp for scp in self.shunt_compensators}
 

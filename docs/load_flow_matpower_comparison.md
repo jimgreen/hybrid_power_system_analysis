@@ -45,15 +45,31 @@ Ytt = y
 
 其中 `gt/bt` 是 i 侧单端对地导纳，不按两端平分。它不是 MATPOWER `BR_B` 的语义。
 
-### 2.3 MATPOWER 投影误差
+### 2.3 MATPOWER 投影与回摊口径
 
-MATPOWER 标准 branch/tap 模型不能直接表达“变压器 i 侧单端对地 `gt/bt`”。为了做工程对比，脚本把变压器 `bt` 投影为 MATPOWER 的对称充电：
+MATPOWER 标准 branch/tap 模型不能直接表达“变压器 i 侧单端对地 `gt/bt`”。当前转换脚本会先把它投影到 i 侧母线 shunt：
 
 ```text
-BR_B = 2 * bt
+GS += gt / tap^2
+BS += bt / tap^2
 ```
 
-这个投影只保持总充电量相近，不保持端口分布一致。因此 `ac_lf/hybrid_lf` 相对 MATPOWER 的端口无功、发电机无功和电压会出现系统性差异。该差异不代表 Newton 求解未收敛。
+这样做可以保持节点注入与主潮流状态更贴近工程模型。  
+但 MATPOWER 输出的 `branch[:, QF/QT]` 不包含这部分已投影到 bus shunt 的无功，因此若直接拿 `QF + QT` 与本地变压器 `i_q + j_q` 对比，会出现系统性偏差。
+
+为保证设备级统计口径一致，对比脚本应再把这部分 bus shunt 按原始变压器映射回摊到对应 transformer：
+
+```text
+P_sh =  gs_proj * Vm_i^2
+Q_sh = -bs_proj * Vm_i^2
+transformer_total = branch_terminal + projected_shunt
+```
+
+因此：
+
+- `Vm / Va / Pg / P_loss` 可直接比较；
+- 变压器 `Q loss`、总 `Q loss` 需要使用“回摊后”的 MATPOWER 统计量；
+- 直接使用 MATPOWER 原始 `QF + QT` 只适合看 branch/tap 主体，不适合看包含单端 `gt/bt` 的工程设备总无功。
 
 ## 3. 模型规模
 
@@ -102,7 +118,7 @@ BR_B = 2 * bt
 | `ieee3w` | `ac_lf` | 6.049e-03 | 1.206e-01 | 1.214e-02 | 6.382e-01 | 5.311e-01 | 6.023e-01 |
 | `ieee3w` | `hybrid_lf` | 6.049e-03 | 1.206e-01 | 1.214e-02 | 6.382e-01 | 5.311e-01 | 6.023e-01 |
 
-最大无功误差主要来自变压器单端对地 `bt` 与 MATPOWER 对称 `BR_B` 的差异。对比 MATPOWER 时不能只看端口 Q 最大误差来判断本地求解器精度。
+最大无功误差主要来自“变压器单端对地 `gt/bt` 被投影到 MATPOWER bus shunt”这一模型差异。若未做 compare-side 回摊，端口 Q 最大误差会被系统性放大，不能据此判断本地求解器精度。
 
 ## 6. `ac_lf` 与 `hybrid_lf` 同模型对比
 
@@ -133,10 +149,10 @@ BR_B = 2 * bt
 如果目标是验证本地 Newton 数值实现，应使用同一物理导纳模型：
 
 - 用当前 T 型单端 `gt/bt` 模型对比 `ac_lf` 与 `hybrid_lf`。
-- 或在 MATPOWER 侧额外增加等效 bus shunt，精确模拟变压器 i 侧单端 `gt/bt`。
+- 或在 MATPOWER 侧额外增加等效 bus shunt，并在结果统计阶段把该 shunt 回摊到对应 transformer。
 
 如果目标是对标 MATPOWER 原始算例结果，应使用 MATPOWER 的原生模型：
 
 - 把本地变压器临时退化为 MATPOWER branch/tap 模型。
-- 将变压器充电作为对称 `BR_B` 处理。
+- 将变压器充电按 MATPOWER 原生 branch/tap 口径处理。
 - 明确该口径不再是当前工程的 T 型单端变压器模型。

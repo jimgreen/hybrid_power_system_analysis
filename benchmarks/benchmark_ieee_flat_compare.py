@@ -281,10 +281,9 @@ def _run_matpower(ppc):
 
 
 def _run_ours(acppc):
-    calc = ACPowerFlowCalc.from_ppc(acppc, tol=1e-8, max_iter=50)
+    calc = ACPowerFlowCalc(acppc, tol=1e-8, max_iter=50)
     start = time.perf_counter()
     with contextlib.redirect_stdout(io.StringIO()):
-        calc.prepare()
         rc = calc.run()
     return calc, rc, time.perf_counter() - start
 

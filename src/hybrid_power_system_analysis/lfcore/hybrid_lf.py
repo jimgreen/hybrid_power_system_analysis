@@ -17,16 +17,28 @@ for path in (ROOT_DIR, LFCORE_DIR, MODEL_DIR):
 from ac_lf import (
     ACLFResult,
     ACPowerFlowCalc,
-    _device_key as _lf_device_key,
     coo_matrix,
     csc_matrix,
     csr_matrix,
-    solve_sparse_system,
-    _resolve_linear_solver,
-    _factor_jacobian,
-    _OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
-    _OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
 )
+try:
+    from lfcore.common import device_key as _lf_device_key, normalize_result_mode as _normalize_lf_result_mode
+except ImportError:  # pragma: no cover - direct script import path
+    from common import device_key as _lf_device_key, normalize_result_mode as _normalize_lf_result_mode
+try:
+    from lfcore.solver_common import (
+        OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
+        OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
+        factor_jacobian as _factor_jacobian,
+        resolve_linear_solver as _resolve_linear_solver,
+    )
+except ImportError:  # pragma: no cover - direct script import path
+    from solver_common import (
+        OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
+        OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
+        factor_jacobian as _factor_jacobian,
+        resolve_linear_solver as _resolve_linear_solver,
+    )
 from scipy.sparse.linalg import spsolve as _scipy_spsolve
 from dc_lf import DCLFResult, DCPowerFlowCalc
 try:
@@ -354,11 +366,11 @@ def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightH
     )
     network.ppc = {"format": "hybrid_ppc_v1", "source": str(file_name), "base": base, "ac": ac_ppc, "dc": None}
     network._ac_ppc = ac_ppc
-    network.p_base = float(base[0])
-    network.u_scale = float(base[1])
-    network.p_scale = float(base[2])
-    network.i_scale = float(base[3])
-    network.p_base_kW = float(base[4])
+    network.p_base = float(base["p_base"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network.p_base_kW = float(base["p_base_kW"])
     return network
 
 
@@ -371,7 +383,13 @@ def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightH
     base = dc_ppc["base"]
     ac_network = _lightweight_ac_network(
         {
-            "base": np.array([base["p_base"], base["u_scale"], base["p_scale"], base["i_scale"], base["p_base_kW"]]),
+            "base": {
+                "p_base": float(base["p_base"]),
+                "u_scale": float(base["u_scale"]),
+                "p_scale": float(base["p_scale"]),
+                "i_scale": float(base["i_scale"]),
+                "p_base_kW": float(base["p_base_kW"]),
+            },
             "bus": np.zeros((0, len(AC_BUS_COLS)), dtype=np.float64),
         }
     )
@@ -462,11 +480,11 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
     network._ac_ppc = ppc["ac"]
     network._dc_ppc = ppc["dc"]
     base = ppc["base"]
-    network.p_base = float(base[0])
-    network.u_scale = float(base[1])
-    network.p_scale = float(base[2])
-    network.i_scale = float(base[3])
-    network.p_base_kW = float(base[4])
+    network.p_base = float(base["p_base"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network.p_base_kW = float(base["p_base_kW"])
     return network
 
 
@@ -566,7 +584,6 @@ class HybridPowerFlowCalc:
         parameters: Optional[PowerFlowParameters] = None,
         linear_solver: str = "auto",
         result_mode: str = "full",
-        jacobian_refresh_period: int = 1,
     ):
         self.network = network
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
@@ -581,9 +598,6 @@ class HybridPowerFlowCalc:
         # 分别保存到 _linear_solver_fn / _linear_solver_resolved。
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
-        # jacobian_refresh_period>=2 触发 Honest-Newton（DCDC 损耗强非线性时容易发散，
-        # 默认 1 与标准 NR 等价）。
-        self.jacobian_refresh_period = max(1, int(jacobian_refresh_period or 1))
         self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
@@ -611,11 +625,20 @@ class HybridPowerFlowCalc:
                 network._dc_ppc,
                 parameters=self.params,
                 linear_solver=self.linear_solver,
-                writeback_network=dc_writeback_network,
                 result_mode=sub_result_mode,
+                verbose=self.verbose,
             )
+            self.dc_calc._network_writeback = dc_writeback_network
+            self.dc_calc.model = dc_writeback_network
+            self.dc_calc.net = dc_writeback_network
         else:
-            self.dc_calc = DCPowerFlowCalc(network.dc, parameters=self.params, linear_solver=self.linear_solver, result_mode=sub_result_mode) if self.has_dc else None
+            self.dc_calc = DCPowerFlowCalc(
+                network.dc,
+                parameters=self.params,
+                linear_solver=self.linear_solver,
+                result_mode=sub_result_mode,
+                verbose=self.verbose,
+            ) if self.has_dc else None
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -670,24 +693,7 @@ class HybridPowerFlowCalc:
 
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
-        mode = str(result_mode or "full").strip().lower()
-        aliases = {
-            "all": "full",
-            "full": "full",
-            "complete": "full",
-            "summary": "summary",
-            "brief": "summary",
-            "minimal": "summary",
-            "array": "array",
-            "arrays": "array",
-            "ppc": "array",
-            "none": "none",
-            "skip": "none",
-            "raw": "none",
-        }
-        if mode not in aliases:
-            raise ValueError(f"Unsupported Hybrid result_mode: {result_mode!r}")
-        return aliases[mode]
+        return _normalize_lf_result_mode(result_mode, "Hybrid")
 
     def _sync_sub_result_modes(self) -> None:
         sub_result_mode = self.result_mode
@@ -707,7 +713,9 @@ class HybridPowerFlowCalc:
             self.ac_eq = self.ac_calc.total_eq
             parts.append(self.ac_calc.x.copy())
         if self.dc_calc is not None:
-            self.dc_G, dc_x = self.dc_calc.prepare()
+            self.dc_calc.prepare()
+            self.dc_G = self.dc_calc.G
+            dc_x = self.dc_calc.x
             self.dc_size = self.dc_calc.total_vars
             self.dc_eq = self.dc_calc.total_eq
             parts.append(dc_x.copy())
@@ -1206,7 +1214,7 @@ class HybridPowerFlowCalc:
                 self._rows_from_csr_indptr(calc.standard_jac_csr_indptr),
                 calc.standard_jac_csr_indices.astype(np.int32, copy=True),
             )
-        jac = calc.get_jacobi(calc.x) if not is_dc else calc.get_jacobi(self.dc_G, calc.x)
+        jac = calc.get_jacobi(calc.x)
         jac = jac.tocsr()
         return self._rows_from_csr_indptr(jac.indptr), jac.indices.astype(np.int32, copy=True)
 
@@ -1480,12 +1488,12 @@ class HybridPowerFlowCalc:
             self.last_jacobian_shape = jac.shape
             return jac
         if self._single_dc_newton_block:
-            jac = self.dc_calc.get_jacobi(self.dc_G, x)
+            jac = self.dc_calc.get_jacobi(x)
             self.last_jacobian_shape = jac.shape
             return jac
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         ac_j = self.ac_calc.get_jacobi(ac_x) if self.ac_calc is not None else None
-        dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x) if self.dc_calc is not None else None
+        dc_j = self.dc_calc.get_jacobi(dc_x) if self.dc_calc is not None else None
         return self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
 
     @staticmethod
@@ -1675,7 +1683,7 @@ class HybridPowerFlowCalc:
             self.last_jacobian_shape = J.shape
             return F, J
         if self._single_dc_newton_block:
-            F, J = self.dc_calc._build_newton_system(self.dc_G, x)
+            F, J = self.dc_calc._build_newton_system(x)
             self.last_jacobian_shape = J.shape
             return F, J
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
@@ -1691,13 +1699,12 @@ class HybridPowerFlowCalc:
                 ac_j = self.ac_calc.get_jacobi(ac_x)
         if self.dc_calc is not None:
             dc_f, dc_j = self.dc_calc._build_newton_system(
-                self.dc_G,
                 dc_x,
                 return_jacobian=False,
                 jacobian_format="csr",
             )
             if dc_j is None and self._slice_len(self.global_jac_dc_slice):
-                dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x)
+                dc_j = self.dc_calc.get_jacobi(dc_x)
 
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
@@ -1881,11 +1888,6 @@ class HybridPowerFlowCalc:
 
         self.converged = False
         x = self.x.copy()
-        refresh_period = self.jacobian_refresh_period
-        # period=1 时走 module 层 solve_sparse_system（保留 monkey-patch hook，
-        # 便于上层注入计数/替换求解器）。period>=2 才启用 factor 对象以复用因子。
-        factor = None
-        steps_since_refresh = refresh_period
         resolved_name = self._linear_solver_resolved
         solver_fn = self._linear_solver_fn
 
@@ -1919,26 +1921,17 @@ class HybridPowerFlowCalc:
                 self._finish_result(x)
                 return 0
 
-            if refresh_period <= 1:
-                # 走原有 dispatch 路径，保持 monkey-patch 兼容性。
-                delta = solve_sparse_system(J, -F, self.linear_solver)
-            else:
-                try:
-                    if factor is None or steps_since_refresh >= refresh_period:
-                        factor = _factor_jacobian(J, resolved_name, solver_fn)
-                        steps_since_refresh = 0
-                    delta = factor.solve(-F)
-                    steps_since_refresh += 1
-                except Exception:
-                    _AC_OPTIONAL_SPARSE_SOLVERS.pop(resolved_name, None)
-                    _AC_OPTIONAL_SPARSE_MISSING.add(resolved_name)
-                    resolved_name = "scipy"
-                    solver_fn = _scipy_spsolve
-                    self._linear_solver_resolved = "scipy"
-                    self._linear_solver_fn = _scipy_spsolve
-                    factor = None
-                    steps_since_refresh = refresh_period
-                    delta = _scipy_spsolve(J, -F)
+            try:
+                factor = _factor_jacobian(J, resolved_name, solver_fn)
+                delta = factor.solve(-F)
+            except Exception:
+                _AC_OPTIONAL_SPARSE_SOLVERS.pop(resolved_name, None)
+                _AC_OPTIONAL_SPARSE_MISSING.add(resolved_name)
+                resolved_name = "scipy"
+                solver_fn = _scipy_spsolve
+                self._linear_solver_resolved = "scipy"
+                self._linear_solver_fn = _scipy_spsolve
+                delta = _scipy_spsolve(J, -F)
             x += delta
 
         self.x = x

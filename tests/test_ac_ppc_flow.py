@@ -173,48 +173,23 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["voltage"]], object_voltage, atol=1e-10)
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["angle"]], object_angle, atol=1e-10)
 
-    def test_ppc_flow_supports_pq_decoupled_algorithm(self):
+    def test_ac_lf_rejects_pq_decoupled_algorithm(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
 
-        nr_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
-        pq_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
-        with contextlib.redirect_stdout(io.StringIO()):
-            nr_calc.prepare()
-            nr_rc = nr_calc.run()
-            pq_calc.prepare()
-            pq_rc = pq_calc.run()
+        with self.assertRaises(TypeError):
+            ACPowerFlowCalc(ppc, algorithm="pq")
 
-        self.assertEqual("nr", nr_calc.algorithm)
-        self.assertEqual("pq", pq_calc.algorithm)
-        self.assertEqual(0, nr_rc)
-        self.assertEqual(0, pq_rc)
-        self.assertTrue(pq_calc.converged)
-        self.assertEqual("pq", pq_calc.used_algorithm)
-        self.assertLess(pq_calc.iterations, 50)
-
-        cols = ppc["bus_cols"]
-        np.testing.assert_allclose(
-            pq_calc.result["bus"][:, cols["voltage"]],
-            nr_calc.result["bus"][:, cols["voltage"]],
-            atol=1e-5,
-        )
-        np.testing.assert_allclose(
-            pq_calc.result["bus"][:, cols["angle"]],
-            nr_calc.result["bus"][:, cols["angle"]],
-            atol=1e-5,
-        )
-
-    def test_invalid_power_flow_algorithm_is_rejected(self):
+    def test_invalid_power_flow_algorithm_parameter_is_removed(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
         case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             ACPowerFlowCalc(ppc, algorithm="bad")
 
     def test_ac_power_flow_can_load_e_file_through_efile_reader_path(self):
@@ -246,7 +221,7 @@ class ACPPCFlowTest(unittest.TestCase):
             ac_lf.build_ac_ppc_with_topology_from_e_file = previous_common_loader
 
         self.assertEqual(["ieee300.e"], calls)
-        self.assertTrue(calc.array_mode)
+        self.assertFalse(hasattr(calc, "array_mode"))
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
         self.assertIn("_topology_arrays", calc.ppc)
 
@@ -261,7 +236,7 @@ class ACPPCFlowTest(unittest.TestCase):
             network.read_from_file(case_path)
 
         calc = ACPowerFlowCalc(network, tol=1e-8, max_iter=50)
-        self.assertTrue(calc.array_mode)
+        self.assertFalse(hasattr(calc, "array_mode"))
 
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -340,60 +315,53 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertIn("load_ac_ppc_from_e_file(args.file)", main_block)
         self.assertIn("ACPowerFlowCalc(", main_block)
         self.assertIn("verbose=not args.quiet", main_block)
-        self.assertIn("calc.prepare()", main_block)
         self.assertIn("calc.run()", main_block)
+        self.assertNotIn("calc.prepare()", main_block)
         self.assertNotIn("_run_with_optional_output", main_block)
+        self.assertNotIn("--algorithm", main_block)
         self.assertNotIn("ACPowerFlowCalc.from_e_file", main_block)
         self.assertNotIn("read_from_file", main_block)
         self.assertNotIn("ACPowerNetwork", main_block)
 
-    def test_ac_lf_benchmark_accepts_algorithm_option(self):
-        from lfcore import ac_lf_benchmark
+    def test_ac_lf_pq_decoupled_code_is_removed(self):
+        source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
+            encoding="utf-8"
+        )
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = ac_lf_benchmark.run_case("ieee300", repeats=1, profile=False, algorithm="pq")
+        self.assertNotIn("_run_pq_decoupled", source)
+        self.assertNotIn("_cache_pq_decoupled_matrices", source)
+        self.assertNotIn("_build_fast_decoupled_b_matrix", source)
+        self.assertNotIn("pq_Bp", source)
+        self.assertNotIn("pq_Bpp", source)
+        self.assertNotIn("used_algorithm", source)
+        self.assertNotIn("self.algorithm", source)
+        self.assertNotIn('algorithm == "pq"', source)
+        self.assertNotIn('"pq"', source.split("def main", 1)[1].split('if __name__ == "__main__":', 1)[0])
 
-        self.assertEqual("pq", result["algorithm"])
-        self.assertEqual(0, result["rc"])
-        self.assertTrue(result["converged"])
-        self.assertLess(result["iterations"], 50)
-
-    def test_pq_algorithm_reuses_fixed_b_matrix_factorization(self):
-        import ac_lf
+    def test_ac_run_prepares_when_called_directly(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
-        ppc = build_ac_ppc_from_e_file(case_path)
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
 
-        original_splu = ac_lf.splu
-        original_spsolve = ac_lf.spsolve
-        factor_shapes = []
-
-        def wrapped_splu(matrix, *args, **kwargs):
-            factor_shapes.append(matrix.shape)
-            return original_splu(matrix, *args, **kwargs)
-
-        def reject_spsolve(*_args, **_kwargs):
-            raise AssertionError("PQ iterations should reuse fixed B' and B'' factorizations")
-
-        ac_lf.splu = wrapped_splu
-        try:
-            calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
-            with contextlib.redirect_stdout(io.StringIO()):
-                calc.prepare()
-            ac_lf.spsolve = reject_spsolve
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    rc = calc.run()
-            finally:
-                ac_lf.spsolve = original_spsolve
-        finally:
-            ac_lf.splu = original_splu
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
 
         self.assertEqual(0, rc)
-        self.assertEqual("pq", calc.used_algorithm)
-        self.assertEqual([calc.pq_Bp.shape, calc.pq_Bpp.shape], factor_shapes)
+        self.assertTrue(calc.converged)
+        self.assertGreater(calc.x.size, 0)
+        self.assertIn("bus", calc.result)
+
+    def test_ac_lf_benchmark_uses_nr_only(self):
+        from lfcore import ac_lf_benchmark
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = ac_lf_benchmark.run_case("ieee300", repeats=1, profile=False)
+
+        self.assertNotIn("algorithm", result)
+        self.assertEqual(0, result["rc"])
+        self.assertTrue(result["converged"])
 
     def test_state_extraction_reuses_iteration_work_arrays(self):
         from ac_array_model import build_ac_ppc_from_e_file
@@ -658,7 +626,7 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertIsNone(getattr(array_calc, "lf_result", None))
 
     def test_ppc_prepare_uses_shared_ppc_topology(self):
-        import ac_lf
+        from model import ppc_topology
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
@@ -668,19 +636,19 @@ class ACPPCFlowTest(unittest.TestCase):
         ppc.pop("_topology_arrays", None)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
 
-        original_prepare_topology = ac_lf.network_topology.prepare_ac_topology_ppc
+        original_prepare_topology = ppc_topology.network_topology.prepare_ac_topology_ppc
         calls = []
 
         def wrapped_prepare_topology(arg):
             calls.append(arg)
             return original_prepare_topology(arg)
 
-        ac_lf.network_topology.prepare_ac_topology_ppc = wrapped_prepare_topology
+        ppc_topology.network_topology.prepare_ac_topology_ppc = wrapped_prepare_topology
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 calc.prepare()
         finally:
-            ac_lf.network_topology.prepare_ac_topology_ppc = original_prepare_topology
+            ppc_topology.network_topology.prepare_ac_topology_ppc = original_prepare_topology
 
         self.assertEqual([ppc], calls)
         self.assertIn("_topology_arrays", ppc)
@@ -699,18 +667,18 @@ class ACPPCFlowTest(unittest.TestCase):
 
         self.assertIn("_pf_static", ppc)
 
-        original_connected_components = ac_lf.connected_components
+        original_ensure_topology = ac_lf.ensure_ac_ppc_topology
 
-        def reject_connected_components(*_args, **_kwargs):
+        def reject_ensure_topology(*_args, **_kwargs):
             raise AssertionError("second PPC prepare should reuse cached static data")
 
-        ac_lf.connected_components = reject_connected_components
+        ac_lf.ensure_ac_ppc_topology = reject_ensure_topology
         try:
             second = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
             with contextlib.redirect_stdout(io.StringIO()):
                 second.prepare()
         finally:
-            ac_lf.connected_components = original_connected_components
+            ac_lf.ensure_ac_ppc_topology = original_ensure_topology
 
         self.assertEqual(first.total_vars, second.total_vars)
         self.assertEqual(first.total_eq, second.total_eq)

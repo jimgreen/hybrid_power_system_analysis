@@ -26,7 +26,7 @@ for path in (SRC_DIR, MODEL_DIR, LFCORE_DIR):
 from ac_lf import ACPowerFlowCalc
 from ac_model import ACPowerNetwork
 from dc_lf import DCPowerFlowCalc
-from dc_array_model import DCPowerNetwork
+from dc_model import DCPowerNetwork
 from hybrid_lf import run_hybrid_power_flow
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
@@ -411,7 +411,6 @@ def solve_ac(e_file: Path) -> Tuple[Snapshot, str]:
     network.topo()
     calc = ACPowerFlowCalc(network)
     with contextlib.redirect_stdout(io.StringIO()):
-        calc.prepare()
         rc = calc.run()
     if rc != 0 or not calc.converged:
         raise RuntimeError(f"AC load flow failed for {e_file}: rc={rc}, iter={calc.iterations}, normF={calc.normF:.3e}")

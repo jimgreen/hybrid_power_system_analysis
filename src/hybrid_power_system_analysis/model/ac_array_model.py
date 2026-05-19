@@ -10,9 +10,37 @@ from paths import resolve_project_file
 from unit_system import ac_current_base_ka
 
 MODEL_DIR = Path(__file__).resolve().parent
-for path in (MODEL_DIR,):
+ROOT_DIR = MODEL_DIR.parent
+for path in (MODEL_DIR, ROOT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+from topology import build_ac_topology_input_ppc
+from model.array_common import (
+    _assign_current_if_present,
+    _assign_power_if_present,
+    _base_from_rows,
+    _cell,
+    _code_column,
+    _code_value,
+    _empty,
+    _fill_float_column_if_present,
+    _float_cell,
+    _float_column,
+    _float_value,
+    _has_value,
+    _int_cell,
+    _int_column,
+    _int_value,
+    _name_array,
+    _names_from_rows,
+    _raw_vbase_by_node,
+    _rows_for,
+    _scale_by_node,
+    _value,
+    _voltage_set_column,
+    file_cache_key as _file_cache_key,
+)
 
 
 CTRL_PQ = 0
@@ -147,12 +175,6 @@ _AC_PPC_CACHE = {}
 _AC_PPC_CACHE_LOCK = threading.Lock()
 
 
-def _file_cache_key(file_path) -> Tuple[Path, int, int]:
-    path = resolve_project_file(file_path).resolve()
-    stat = path.stat()
-    return path, stat.st_mtime_ns, stat.st_size
-
-
 def clear_ac_ppc_cache(file_path=None) -> None:
     with _AC_PPC_CACHE_LOCK:
         if file_path is None:
@@ -160,232 +182,6 @@ def clear_ac_ppc_cache(file_path=None) -> None:
         else:
             path = Path(file_path).resolve()
             _AC_PPC_CACHE.pop(path, None)
-
-
-def _empty(width: int) -> np.ndarray:
-    return np.zeros((0, width), dtype=np.float64)
-
-
-class _EFileTableRows:
-    """List-compatible E table rows with cached column access."""
-
-    __slots__ = ("rows", "columns", "_matrix", "_raw_cache")
-
-    def __init__(self, rows, columns):
-        self.rows = rows
-        self.columns = columns
-        self._matrix = None
-        self._raw_cache = {}
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __bool__(self):
-        return bool(self.rows)
-
-    def __iter__(self):
-        return iter(self.rows)
-
-    def __getitem__(self, item):
-        return self.rows[item]
-
-    def _as_matrix(self):
-        if self._matrix is not None:
-            return self._matrix
-        if not self.rows:
-            self._matrix = np.empty((0, 0), dtype=object)
-            return self._matrix
-        matrix = np.asarray(self.rows, dtype=object)
-        self._matrix = matrix if matrix.ndim == 2 else False
-        return self._matrix
-
-    def raw_column(self, col, default="") -> np.ndarray:
-        n = len(self.rows)
-        if col is None or n == 0:
-            return np.full(n, default, dtype=object) if n else np.empty(0, dtype=object)
-        key = (int(col), default)
-        cached = self._raw_cache.get(key)
-        if cached is not None:
-            return cached
-
-        matrix = self._as_matrix()
-        if isinstance(matrix, np.ndarray) and col < matrix.shape[1]:
-            raw = matrix[:, int(col)]
-            missing = (raw == "") | (raw == None)
-            if np.any(missing):
-                values = raw.copy()
-                values[missing] = default
-            else:
-                values = raw
-        else:
-            values = np.empty(n, dtype=object)
-            for i, row in enumerate(self.rows):
-                if col >= len(row):
-                    values[i] = default
-                else:
-                    value = row[col]
-                    values[i] = default if value in (None, "") else value
-        self._raw_cache[key] = values
-        return values
-
-
-def _rows_for(data: Dict, table_name: str):
-    table = data.get(table_name)
-    if not table:
-        return {}, []
-    columns = {str(name): pos for pos, name in enumerate(table.get("header_list", []))}
-    return columns, _EFileTableRows(table.get("rows", []), columns)
-
-
-def _cell(row, col, default=""):
-    if col is None or col >= len(row):
-        return default
-    value = row[col]
-    return default if value in (None, "") else value
-
-
-def _float_cell(row, col, default: float = 0.0) -> float:
-    return float(_cell(row, col, default))
-
-
-def _int_cell(row, col, default: int = 0) -> int:
-    return int(float(_cell(row, col, default)))
-
-
-def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.ndarray:
-    col = columns.get(attr)
-    n = len(table_rows)
-    if col is None or n == 0:
-        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
-    if hasattr(table_rows, "raw_column"):
-        return table_rows.raw_column(col, default).astype(np.float64, copy=False)
-    # Inline cell extraction; the per-call `_float_cell`/`_cell` overhead
-    # dominated this helper for tables with hundreds of thousands of rows.
-    values = [None] * n
-    for i in range(n):
-        row = table_rows[i]
-        if col >= len(row):
-            values[i] = default
-        else:
-            v = row[col]
-            values[i] = default if v in (None, "") else float(v)
-    return np.asarray(values, dtype=np.float64)
-
-
-def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
-    col = columns.get(attr)
-    n = len(table_rows)
-    if col is None or n == 0:
-        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
-    if hasattr(table_rows, "raw_column"):
-        return (
-            table_rows.raw_column(col, default)
-            .astype(np.float64, copy=False)
-            .astype(np.int64, copy=False)
-            .astype(np.float64)
-        )
-    values = [None] * n
-    for i in range(n):
-        row = table_rows[i]
-        if col >= len(row):
-            values[i] = default
-        else:
-            v = row[col]
-            values[i] = default if v in (None, "") else int(float(v))
-    return np.asarray(values, dtype=np.float64)
-
-
-def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:
-    col = columns.get(attr)
-    default = mapping[default_label]
-    if col is None:
-        return np.full(len(table_rows), float(default), dtype=np.float64)
-    if hasattr(table_rows, "raw_column"):
-        raw = table_rows.raw_column(col, default_label)
-        return np.asarray([_code_value(value, mapping, default_label) for value in raw], dtype=np.float64)
-    return np.asarray(
-        [_code_value(_cell(row, col, default_label), mapping, default_label) for row in table_rows],
-        dtype=np.float64,
-    )
-
-
-def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -> np.ndarray:
-    name_col = columns.get("name")
-    if name_col is None:
-        return np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
-    if hasattr(table_rows, "raw_column"):
-        raw = table_rows.raw_column(name_col, "")
-        names = raw.astype(str).astype(object, copy=False)
-        missing = (raw == "") | (raw == None)
-        if np.any(missing):
-            fallback = np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
-            names = names.copy()
-            names[missing] = fallback[missing]
-        return names
-    return np.asarray(
-        [
-            str(_cell(row, name_col, "") or f"{prefix}_{int(idx_values[pos])}")
-            for pos, row in enumerate(table_rows)
-        ],
-        dtype=object,
-    )
-
-
-def _base_from_rows(data: Dict) -> Tuple[float, float, float, float, float]:
-    columns, table_rows = _rows_for(data, "PowerBase")
-    if not table_rows:
-        raise RuntimeError("E file must define <PowerBase> with p_base, u_scale, p_scale, and i_scale")
-    row = table_rows[0]
-    required = {}
-    for attr in ("p_base", "u_scale", "p_scale", "i_scale"):
-        if attr not in columns:
-            raise RuntimeError("E file <PowerBase> must define p_base, u_scale, p_scale, and i_scale")
-        value = float(_cell(row, columns[attr], 0.0))
-        if value <= 0.0:
-            raise RuntimeError(f"Invalid {attr} in <PowerBase>: {value}")
-        required[attr] = value
-    p_base = required["p_base"]
-    p_scale = required["p_scale"]
-    return p_base, required["u_scale"], p_scale, required["i_scale"], p_base / p_scale
-
-
-def _scale_by_node(node_values: np.ndarray, scales_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.asarray([scales_by_idx.get(int(node), 1.0) for node in node_values], dtype=np.float64)
-
-
-def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.asarray([raw_vbase_by_idx.get(int(node), 0.0) for node in node_values], dtype=np.float64)
-
-
-def _assign_power_if_present(out: np.ndarray, col: int, table_rows, columns, attr: str, p_base: float) -> None:
-    if attr in columns:
-        out[:, col] = _float_column(table_rows, columns, attr) / p_base
-
-
-def _assign_current_if_present(
-    out: np.ndarray,
-    col: int,
-    table_rows,
-    columns,
-    attr: str,
-    node_values: np.ndarray,
-    current_scale_by_node: Dict[int, float],
-) -> None:
-    if attr not in columns:
-        return
-    if callable(current_scale_by_node):
-        current_scale_by_node = current_scale_by_node()
-    scales = _scale_by_node(node_values.astype(np.int64, copy=False), current_scale_by_node)
-    raw = _float_column(table_rows, columns, attr)
-    out[:, col] = np.divide(raw, scales, out=np.zeros_like(raw), where=np.abs(scales) > 1e-12)
-
-
-def _voltage_set_column(table_rows, columns, attr: str, node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
-    if attr not in columns:
-        return np.ones(len(table_rows), dtype=np.float64)
-    raw = _float_column(table_rows, columns, attr, 1.0)
-    raw_vbase = _raw_vbase_by_node(node_values.astype(np.int64, copy=False), raw_vbase_by_idx)
-    return np.divide(raw, raw_vbase, out=np.ones_like(raw), where=np.abs(raw_vbase) > 1e-12)
 
 
 def _build_switch_like_from_rows(
@@ -648,7 +444,13 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     ppc = {
         "format": "ac_ppc_v1",
         "source": str(source),
-        "base": np.asarray([p_base, u_scale, p_scale, i_scale, p_base_kW], dtype=np.float64),
+        "base": {
+            "p_base": float(p_base),
+            "u_scale": float(u_scale),
+            "p_scale": float(p_scale),
+            "i_scale": float(i_scale),
+            "p_base_kW": float(p_base_kW),
+        },
         "bus": bus,
         "branch": branch,
         "transformer": transformer,
@@ -679,11 +481,6 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "switch_name": switch_names,
         "break_name": breaker_names,
     }
-    try:
-        from .topology import build_ac_topology_input_ppc
-    except ImportError:  # pragma: no cover - top-level module import path
-        from topology import build_ac_topology_input_ppc
-
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
@@ -714,47 +511,6 @@ def build_ac_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build AC ppc from E rows that are already loaded in memory."""
     path = resolve_project_file(file_path).resolve()
     return _build_ac_ppc_from_rows_dict(rows, path)
-
-
-def _value(obj, attr: str, default=0.0):
-    value = getattr(obj, attr, default)
-    return default if value in (None, "") else value
-
-
-def _float_value(obj, attr: str, default: float = 0.0) -> float:
-    return float(_value(obj, attr, default))
-
-
-def _int_value(obj, attr: str, default: int = 0) -> int:
-    return int(float(_value(obj, attr, default)))
-
-
-def _has_value(devices, attr: str) -> bool:
-    return any(getattr(dev, attr, None) not in (None, "") for dev in devices)
-
-
-def _fill_float_column_if_present(out: np.ndarray, devices, col: int, attr: str) -> None:
-    if not _has_value(devices, attr):
-        return
-    for row, dev in enumerate(devices):
-        out[row, col] = _float_value(dev, attr)
-
-
-def _name_array(devices, prefix: str) -> np.ndarray:
-    return np.asarray(
-        [str(getattr(dev, "name", "") or f"{prefix}_{_int_value(dev, 'idx', pos)}") for pos, dev in enumerate(devices)],
-        dtype=object,
-    )
-
-
-def _code_value(value, mapping: Dict[str, int], default_label: str) -> int:
-    if value in (None, ""):
-        return mapping[default_label]
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)) and float(value).is_integer():
-        return int(value)
-    return mapping.get(str(value).upper(), mapping[default_label])
 
 
 def build_ac_ppc_from_network(network) -> Dict:
@@ -877,7 +633,13 @@ def build_ac_ppc_from_network(network) -> Dict:
     ppc = {
         "format": "ac_ppc_v1",
         "source": str(getattr(network, "source", getattr(network, "file_name", "<network>"))),
-        "base": np.asarray([p_base, u_scale, p_scale, i_scale, getattr(network, "p_base_kW", p_base / p_scale)], dtype=np.float64),
+        "base": {
+            "p_base": float(p_base),
+            "u_scale": float(u_scale),
+            "p_scale": float(p_scale),
+            "i_scale": float(i_scale),
+            "p_base_kW": float(getattr(network, "p_base_kW", p_base / p_scale)),
+        },
         "bus": bus,
         "branch": branch,
         "transformer": transformer,
@@ -910,11 +672,6 @@ def build_ac_ppc_from_network(network) -> Dict:
         switch_name=_name_array(switches, "switch"),
         break_name=_name_array(breakers, "break"),
     )
-    try:
-        from .topology import build_ac_topology_input_ppc
-    except ImportError:  # pragma: no cover - top-level module import path
-        from topology import build_ac_topology_input_ppc
-
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
@@ -970,11 +727,11 @@ def build_ac_network_from_ppc(ppc: Dict):
     network = ACPowerNetwork()
     base = ppc["base"]
     network.ppc = ppc
-    network.p_base = float(base[0])
-    network.u_scale = float(base[1])
-    network.p_scale = float(base[2])
-    network.i_scale = float(base[3])
-    network.p_base_kW = float(base[4])
+    network.p_base = float(base["p_base"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network.p_base_kW = float(base["p_base_kW"])
 
     network.nodes = [
         ACNode(

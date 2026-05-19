@@ -21,8 +21,10 @@ def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
 
 def ensure_dc_ppc_topology(ppc: Dict) -> Dict:
     """Attach DC PPC topology arrays when they are not already present."""
-    if ppc.get("_topology_arrays") is None:
-        ppc["_topology_arrays"] = network_topology.prepare_dc_topology_ppc(ppc)
+    topology = ppc.get("_topology_arrays")
+    if topology is None:
+        topology = network_topology.prepare_dc_topology_ppc(ppc)
+        ppc["_topology_arrays"] = topology
     return ppc
 
 

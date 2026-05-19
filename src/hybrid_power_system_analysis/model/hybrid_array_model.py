@@ -172,11 +172,12 @@ def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -
 
 def _raw_vbase_maps(ac_ppc: Dict, dc_ppc: Dict) -> Tuple[Dict[int, float], Dict[int, float], Dict[int, float], Dict[int, float]]:
     ac_base = ac_ppc["base"]
-    p_base = float(ac_base[0])
-    p_base_kW = float(ac_base[4])
-    ac_u_scale = float(ac_base[1])
+    p_base_kW = float(ac_base["p_base_kW"])
+    ac_u_scale = float(ac_base["u_scale"])
+    ac_i_scale = float(ac_base["i_scale"])
     dc_base = dc_ppc["base"]
     dc_u_scale = float(dc_base["u_scale"])
+    dc_i_scale = float(dc_base["i_scale"])
     ac_raw_vbase = {
         int(row[AC_BUS_COLS["idx"]]): float(row[AC_BUS_COLS["vbase"]]) * ac_u_scale
         for row in ac_ppc["bus"]
@@ -186,11 +187,11 @@ def _raw_vbase_maps(ac_ppc: Dict, dc_ppc: Dict) -> Tuple[Dict[int, float], Dict[
         for row in dc_ppc["bus"]
     }
     ac_current = {
-        int(row[AC_BUS_COLS["idx"]]): float(ac_base[3]) * ac_current_base_ka(p_base_kW, float(row[AC_BUS_COLS["vbase"]]))
+        int(row[AC_BUS_COLS["idx"]]): ac_i_scale * ac_current_base_ka(p_base_kW, float(row[AC_BUS_COLS["vbase"]]))
         for row in ac_ppc["bus"]
     }
     dc_current = {
-        int(row[DC_BUS_COLS["idx"]]): float(dc_base["i_scale"]) * dc_current_base_ka(p_base_kW, float(row[DC_BUS_COLS["vbase"]]))
+        int(row[DC_BUS_COLS["idx"]]): dc_i_scale * dc_current_base_ka(p_base_kW, float(row[DC_BUS_COLS["vbase"]]))
         for row in dc_ppc["bus"]
     }
     return ac_raw_vbase, dc_raw_vbase, ac_current, dc_current
@@ -463,7 +464,7 @@ def _build_dcac_from_rows(
     columns, table_rows = _rows_for(rows, "DCACConverter")
     if not table_rows:
         return _empty(len(DCAC_COLS)), np.asarray([], dtype=object), []
-    p_base = float(ac_ppc["base"][0])
+    p_base = float(ac_ppc["base"]["p_base"])
     ac_raw_vbase, dc_raw_vbase, ac_current, dc_current = _raw_vbase_maps(ac_ppc, dc_ppc)
     out = np.zeros((len(table_rows), len(DCAC_COLS)), dtype=np.float64)
     out[:, DCAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
@@ -543,7 +544,7 @@ def _build_acac_from_rows(
     columns, table_rows = _rows_for(rows, "ACACConverter")
     if not table_rows:
         return _empty(len(ACAC_COLS)), np.asarray([], dtype=object), []
-    p_base = float(ac_ppc["base"][0])
+    p_base = float(ac_ppc["base"]["p_base"])
     ac_raw_vbase, _dc_raw_vbase, ac_current, _dc_current = _raw_vbase_maps(ac_ppc, dc_ppc)
     out = np.zeros((len(table_rows), len(ACAC_COLS)), dtype=np.float64)
     out[:, ACAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
@@ -775,11 +776,11 @@ def build_hybrid_model_from_ppc(ppc: Dict):
 
     model = HybridPowerNetwork(ac=ac_network, dc=dc_network, dcac_converters=dcac, acac_converters=acac)
     base = ppc["base"]
-    model.p_base = float(base[0])
-    model.u_scale = float(base[1])
-    model.p_scale = float(base[2])
-    model.i_scale = float(base[3])
-    model.p_base_kW = float(base[4])
+    model.p_base = float(base["p_base"])
+    model.u_scale = float(base["u_scale"])
+    model.p_scale = float(base["p_scale"])
+    model.i_scale = float(base["i_scale"])
+    model.p_base_kW = float(base["p_base_kW"])
     model.ac.ppc = ppc["ac"]
     model.dc.ppc = ppc["dc"]
     model.ppc = ppc

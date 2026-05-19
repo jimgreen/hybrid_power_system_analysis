@@ -244,11 +244,11 @@ def _build_hybrid_se_network_from_ppc(ppc: Dict) -> _SELightweightHybridNetwork:
         _dc_ppc=ppc["dc"],
     )
     base = ppc["base"]
-    network.p_base = float(base[0])
-    network.u_scale = float(base[1])
-    network.p_scale = float(base[2])
-    network.i_scale = float(base[3])
-    network.p_base_kW = float(base[4])
+    network.p_base = float(base["p_base"])
+    network.u_scale = float(base["u_scale"])
+    network.p_scale = float(base["p_scale"])
+    network.i_scale = float(base["i_scale"])
+    network.p_base_kW = float(base["p_base_kW"])
     _assign_se_converter_topology(network)
     return network
 

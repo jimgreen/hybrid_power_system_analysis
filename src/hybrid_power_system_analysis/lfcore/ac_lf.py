@@ -3,8 +3,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags, hstack, vstack
-from scipy.sparse.csgraph import connected_components
-from scipy.sparse.linalg import splu, spsolve
+from scipy.sparse.linalg import spsolve
 
 try:
     from scipy.sparse.linalg import use_solver as _scipy_use_solver
@@ -16,7 +15,6 @@ from collections import deque
 from typing import List, Tuple, Dict, Optional
 import warnings
 import sys
-import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,7 +38,6 @@ except ImportError:  # pragma: no cover - package import path
     )
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
-from model import topology as network_topology
 from ac_array_model import (
     BRANCH_COLS,
     BUS_COLS,
@@ -61,6 +58,34 @@ from ac_array_model import (
     build_ac_ppc_from_network,
 )
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
+try:
+    from lfcore.common import (
+        device_key as _device_key,
+        find_spanning_tree_edges,
+        normalize_result_mode as _normalize_lf_result_mode,
+    )
+except ImportError:  # pragma: no cover - direct script import path
+    from common import (
+        device_key as _device_key,
+        find_spanning_tree_edges,
+        normalize_result_mode as _normalize_lf_result_mode,
+    )
+try:
+    from lfcore.solver_common import (
+        OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
+        OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
+        factor_jacobian as _factor_jacobian,
+        load_named_sparse_solver as _load_named_sparse_solver,
+        resolve_linear_solver as _resolve_linear_solver,
+    )
+except ImportError:  # pragma: no cover - direct script import path
+    from solver_common import (
+        OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
+        OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
+        factor_jacobian as _factor_jacobian,
+        load_named_sparse_solver as _load_named_sparse_solver,
+        resolve_linear_solver as _resolve_linear_solver,
+    )
 
 
 @dataclass
@@ -72,9 +97,6 @@ class ACLFResult:
     breakers: Dict[str, SimpleNamespace] = field(default_factory=dict)
     generators: Dict[str, SimpleNamespace] = field(default_factory=dict)
     loads: Dict[str, SimpleNamespace] = field(default_factory=dict)
-
-def _device_key(device) -> str:
-    return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
 
 
 def load_ac_ppc_from_e_file(file_name) -> Dict:
@@ -93,139 +115,6 @@ def _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, n_rows: int):
     return build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, n_rows)
 
 
-def _as_solver_csc(matrix):
-    return matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
-
-
-_SPARSE_SOLVER = None
-_SPARSE_SOLVER_NAME = None
-_OPTIONAL_SPARSE_SOLVERS = {}
-_OPTIONAL_SPARSE_MISSING = set()
-
-
-_OPTIONAL_SOLVER_CANDIDATES = {
-    "pypardiso": ("pypardiso", "spsolve"),
-    "umfpack": ("scikits.umfpack", "spsolve"),
-    "sksparse.klu.klu_solve": ("sksparse.klu", "klu_solve"),
-    "klu_solve": ("sksparse.klu", "klu_solve"),
-    "pyklu": ("PyKLU", "Klu"),
-    "klu": ("sksparse.klu", "spsolve"),
-    "klu_alt": ("klu", "solve"),
-}
-
-
-def _load_named_sparse_solver(solver_name):
-    """Return a named optional sparse solver when installed."""
-    solver_name = str(solver_name).strip().lower()
-    if solver_name in _OPTIONAL_SPARSE_SOLVERS:
-        return _OPTIONAL_SPARSE_SOLVERS[solver_name]
-    if solver_name in _OPTIONAL_SPARSE_MISSING:
-        return None
-
-    candidate_names = ("pyklu", "sksparse.klu.klu_solve", "klu", "klu_alt", "pypardiso") if solver_name == "auto" else (solver_name,)
-    for candidate_name in candidate_names:
-        module_name, func_name = _OPTIONAL_SOLVER_CANDIDATES.get(candidate_name, (None, None))
-        if module_name is None:
-            continue
-        try:
-            if importlib.util.find_spec(module_name) is None:
-                continue
-        except (ImportError, ValueError):
-            continue
-        try:
-            module = importlib.import_module(module_name)
-            solver = getattr(module, func_name, None)
-        except Exception:
-            continue
-        if solver is not None:
-            if candidate_name == "pyklu":
-                klu_cls = solver
-
-                def solver(matrix, rhs, _klu_cls=klu_cls):
-                    return _klu_cls(_as_solver_csc(matrix)).solve(rhs)
-
-            _OPTIONAL_SPARSE_SOLVERS[solver_name] = solver
-            return solver
-
-    _OPTIONAL_SPARSE_MISSING.add(solver_name)
-    return None
-
-
-def solve_sparse_system(matrix, rhs, solver_name="scipy"):
-    """Solve a sparse linear system, preferring optional high-performance bindings."""
-    solver_name = str(solver_name or "scipy").strip().lower()
-    if solver_name in {"scipy", "superlu", "default"}:
-        return spsolve(matrix, rhs)
-
-    solver = _load_named_sparse_solver(solver_name)
-    if solver is not None:
-        try:
-            return solver(matrix, rhs)
-        except Exception:
-            _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
-            _OPTIONAL_SPARSE_MISSING.add(solver_name)
-    return spsolve(matrix, rhs)
-
-
-def _resolve_linear_solver(solver_name):
-    """Return (resolved_name, callable) for a requested linear solver.
-
-    "auto" picks the best available optional solver (pyklu, then KLU bindings,
-    then pypardiso). Unknown / unavailable names silently fall back to scipy
-    SuperLU.
-    """
-    name = str(solver_name or "scipy").strip().lower()
-    if name in {"scipy", "superlu", "default"}:
-        return "scipy", spsolve
-    solver = _load_named_sparse_solver(name)
-    if solver is None:
-        return "scipy", spsolve
-    return name, solver
-
-
-class _CallableFactor:
-    """Wraps a (matrix, rhs)->solution callable into a .solve(rhs) factor object."""
-
-    __slots__ = ("_matrix", "_fn")
-
-    def __init__(self, matrix, fn):
-        self._matrix = matrix
-        self._fn = fn
-
-    def solve(self, rhs):
-        return self._fn(self._matrix, rhs)
-
-
-def _get_pyklu_cls():
-    """Lazily import PyKLU.Klu and cache the class (or None when unavailable)."""
-    cache = _OPTIONAL_SPARSE_SOLVERS
-    if "__pyklu_cls__" in cache:
-        return cache["__pyklu_cls__"]
-    try:
-        from PyKLU import Klu as klu_cls  # type: ignore
-    except Exception:
-        klu_cls = None
-    cache["__pyklu_cls__"] = klu_cls
-    return klu_cls
-
-
-def _factor_jacobian(matrix, resolved_name, solver_fn):
-    """Build a factored solver object that supports repeated .solve(b) calls.
-
-    Used by both standard Newton (re-factor every iteration) and Honest-Newton
-    (re-use one factorization across several iterations).
-    """
-    if resolved_name in {"scipy", "superlu", "default"}:
-        return splu(_as_solver_csc(matrix))
-    # pyklu 在 auto 模式下会被选中；其 .solve(b) 直接复用因子。
-    if resolved_name in {"pyklu", "auto"}:
-        klu_cls = _get_pyklu_cls()
-        if klu_cls is not None:
-            return klu_cls(_as_solver_csc(matrix))
-    # 通用回退：包装成单次解算的 Factor，不复用因子但语义一致。
-    return _CallableFactor(matrix, solver_fn)
-
-
 class _PPCNode:
     __slots__ = ("idx", "name", "vbase", "voltage", "angle")
 
@@ -237,47 +126,16 @@ class _PPCNode:
         self.angle = angle
 
 
-# ==============================================================================
-# 核心工具函数
-# ==============================================================================
-def find_spanning_tree_edges(edges: List[Tuple[int, int]], n_nodes: int) -> List[int]:
-    """Kruskal算法：寻找生成树的边索引（向量化优化）"""
-    parent = np.arange(n_nodes, dtype=np.int32)
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]  # 路径压缩
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> bool:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[ry] = rx
-            return True
-        return False
-
-    tree_indices = []
-    for idx, (u, v) in enumerate(edges):
-        if union(u, v):
-            tree_indices.append(idx)
-    return tree_indices
-
-
 def safe_division(a, b, default=0.0):
     """安全除法，避免除零错误"""
     try:
         return a / b if abs(b) > 1e-12 else default
-    except:
+    except Exception:
         return default
 
 
 def matpower_branch_stamp(r: float, x: float, b: float = 0.0, tap: float = 1.0, shift: float = 0.0):
-    """Return MATPOWER-compatible branch admittance entries Yff, Yft, Ytf, Ytt.
-
-    ``b`` is the total line charging susceptance and is split equally between
-    both terminal self-admittances, matching MATPOWER's branch model.
-    """
+    """Return MATPOWER-compatible branch admittance entries Yff, Yft, Ytf, Ytt."""
     y = safe_division(1.0, complex(r, x))
     tap_mag = tap if abs(tap) > 1e-12 else 1.0
     tap_complex = tap_mag * np.exp(1j * np.deg2rad(shift))
@@ -356,13 +214,6 @@ def matpower_transformer_stamp_vectorized(r, x, gt=0.0, bt=0.0, tap=1.0, shift=0
     )
 
 
-def build_jacobian_matrix(rows, cols, data, shape):
-    """Build a sparse Jacobian from COO triplets."""
-    J = coo_matrix((np.array(data), (np.array(rows), np.array(cols))), shape=shape).tocsr()
-    J.sum_duplicates()
-    return J
-
-
 # ==============================================================================
 # 核心潮流计算类（精简极速版）
 # ==============================================================================
@@ -383,17 +234,11 @@ class ACPowerFlowCalc:
         island=None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
-        algorithm: str = "nr",
         keep_node_objects: bool = True,
         linear_solver: str = "auto",
         result_mode: str = "full",
         verbose: bool = False,
-        jacobian_refresh_period: int = 1,
     ):
-        # 基础配置
-        algorithm = str(algorithm).strip().lower()
-        if algorithm not in {"nr", "pq"}:
-            raise ValueError(f"Unsupported AC power-flow algorithm: {algorithm!r}")
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -404,29 +249,24 @@ class ACPowerFlowCalc:
             self.ppc = network
         elif island is None and hasattr(network, "nodes"):
             self._network_writeback = network
-            self.ppc = build_ac_ppc_from_network(network)
+            existing_ppc = getattr(network, "ppc", None)
+            if isinstance(existing_ppc, dict) and existing_ppc.get("format") == "ac_ppc_v1":
+                self.ppc = existing_ppc
+            else:
+                self.ppc = build_ac_ppc_from_network(network)
             if hasattr(network, "source") and "source" not in self.ppc:
                 self.ppc["source"] = str(getattr(network, "source"))
         else:
-            self.ppc = None
-        self.array_mode = self.ppc is not None
+            raise ValueError("ACPowerFlowCalc requires ac_ppc_v1 or ACPowerNetwork input")
         self.result_mode = self._normalize_result_mode(result_mode)
-        self.keep_node_objects = bool(keep_node_objects) and (
-            not self.array_mode or self.result_mode == "full"
-        )
-        self.net = self._network_writeback if self._network_writeback is not None else (None if self.array_mode else network)
+        self.keep_node_objects = bool(keep_node_objects) and self.result_mode == "full"
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
-        self.algorithm = algorithm
-        self.used_algorithm = algorithm
         # 用户请求的求解器名原样保留，便于上层日志/测试断言；实际 callable
         # 由 _resolve_linear_solver 决定，未安装时回退 SuperLU。
         self.linear_solver = str(linear_solver or "scipy").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
-        # jacobian_refresh_period>=2 触发 Honest-Newton：复用同一因子若干次，
-        # 节省每轮因子分解；可能略增迭代次数，由用户按系统稳态衡量。
-        self.jacobian_refresh_period = max(1, int(jacobian_refresh_period or 1))
         self.verbose = bool(verbose)
         self.target_island = island
         self.skipped_islands: List = []
@@ -562,7 +402,6 @@ class ACPowerFlowCalc:
         self.q_row_by_node = np.array([], dtype=np.int32)
         self.standard_jac_csr_indices = np.array([], dtype=np.int32)
         self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
-        self.standard_jac_csr_order = np.array([], dtype=np.intp)
         self.standard_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.standard_jac_csr_data = np.array([], dtype=np.float64)
         self.standard_jac_csr_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csr_pos, 0)
@@ -632,10 +471,6 @@ class ACPowerFlowCalc:
         self.ppc_shunt_pos = np.array([], dtype=np.int32)
         self.ppc_branch_rows = np.array([], dtype=np.int32)
         self.ppc_transformer_rows = np.array([], dtype=np.int32)
-        self.pq_Bp = None
-        self.pq_Bpp = None
-        self.pq_Bp_factor = None
-        self.pq_Bpp_factor = None
         self._state_theta = np.array([], dtype=np.float64)
         self._state_voltage = np.array([], dtype=np.float64)
         self._state_vc = np.array([], dtype=np.complex128)
@@ -656,24 +491,7 @@ class ACPowerFlowCalc:
 
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
-        mode = str(result_mode or "full").strip().lower()
-        aliases = {
-            "all": "full",
-            "full": "full",
-            "complete": "full",
-            "summary": "summary",
-            "brief": "summary",
-            "minimal": "summary",
-            "array": "array",
-            "arrays": "array",
-            "ppc": "array",
-            "none": "none",
-            "skip": "none",
-            "raw": "none",
-        }
-        if mode not in aliases:
-            raise ValueError(f"Unsupported AC result_mode: {result_mode!r}")
-        return aliases[mode]
+        return _normalize_lf_result_mode(result_mode, "AC")
 
     def _cache_node_type_masks(self):
         self._slack_mask = self.node_type == 'SLACK'
@@ -919,8 +737,6 @@ class ACPowerFlowCalc:
         static = ppc.get("_pf_static")
         if static is not None:
             self._load_ppc_static(static)
-            if self.algorithm == "pq" and self.pq_Bp is None:
-                self._cache_pq_decoupled_matrices()
             self._bind_ppc_nodes_to_network()
             if self.verbose:
                 print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
@@ -1100,7 +916,6 @@ class ACPowerFlowCalc:
             "std_jac_load_q_slice": self.std_jac_load_q_slice,
             "standard_jac_csr_indices": self.standard_jac_csr_indices,
             "standard_jac_csr_indptr": self.standard_jac_csr_indptr,
-            "standard_jac_csr_order": self.standard_jac_csr_order,
             "standard_jac_raw_to_csr_pos": self.standard_jac_raw_to_csr_pos,
             "standard_jac_csr_data": self.standard_jac_csr_data,
             "standard_jac_csr_sum_plan": self.standard_jac_csr_sum_plan,
@@ -1144,10 +959,6 @@ class ACPowerFlowCalc:
             "_load_value_work": self._load_value_work,
             "_load_aux_work": self._load_aux_work,
             "_residual_work": self._residual_work,
-            "pq_Bp": self.pq_Bp,
-            "pq_Bpp": self.pq_Bpp,
-            "pq_Bp_factor": self.pq_Bp_factor,
-            "pq_Bpp_factor": self.pq_Bpp_factor,
             "_state_theta": self._state_theta,
             "_state_voltage": self._state_voltage,
             "_state_vc": self._state_vc,
@@ -1228,7 +1039,7 @@ class ACPowerFlowCalc:
             "std_jac_q_vm_idx", "std_jac_p_theta_slice", "std_jac_p_vm_slice",
             "std_jac_q_theta_slice", "std_jac_q_vm_slice", "std_jac_load_p_slice",
             "std_jac_load_q_slice", "standard_jac_csr_indices", "standard_jac_csr_indptr",
-            "standard_jac_csr_order", "standard_jac_raw_to_csr_pos", "standard_jac_csr_data",
+            "standard_jac_raw_to_csr_pos", "standard_jac_csr_data",
             "standard_jac_csr_sum_plan", "standard_jac_raw_to_csc_pos", "standard_jac_csc_indices",
             "standard_jac_csc_indptr", "standard_jac_csc_data", "standard_jac_csc_sum_plan",
             "full_jac_raw_data", "full_jac_raw_to_csr_pos", "full_jac_csr_indices", "full_jac_csr_indptr",
@@ -1237,7 +1048,7 @@ class ACPowerFlowCalc:
             "full_jac_standard_slice", "full_jac_zero_top_left_slice",
             "full_jac_zero_top_right_slice", "full_jac_zero_bottom_left_slice",
             "full_jac_zero_bottom_right_slice", "std_jac_load_nodes",
-            "std_jac_load_extra_nodes", "std_jac_load_p_pos", "std_jac_load_q_pos", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
+            "std_jac_load_extra_nodes", "std_jac_load_p_pos", "std_jac_load_q_pos",
             "_jac_delta", "_jac_cos_delta", "_jac_sin_delta", "_jac_vivj", "_jac_common_p", "_jac_common_q", "_jac_tmp",
             "_load_p_work", "_load_q_work", "_load_dp_work", "_load_dq_work",
             "_load_vm_work", "_load_value_work", "_load_aux_work", "_residual_work",
@@ -1541,7 +1352,6 @@ class ACPowerFlowCalc:
             else np.empty(0, dtype=np.int32)
         )
         self._cache_static_numeric_arrays()
-        self._cache_pq_decoupled_matrices()
         if self.total_vars != self.total_eq:
             warnings.warn(f"变量数({self.total_vars})与方程数({self.total_eq})不匹配！")
 
@@ -1618,7 +1428,6 @@ class ACPowerFlowCalc:
         self.std_jac_load_p_slice = self.std_jac_load_q_slice = slice(0, 0)
         self.standard_jac_csr_indices = np.array([], dtype=np.int32)
         self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
-        self.standard_jac_csr_order = np.array([], dtype=np.intp)
         self.standard_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.standard_jac_csr_data = np.array([], dtype=np.float64)
         self.standard_jac_csr_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csr_pos, 0)
@@ -1707,9 +1516,6 @@ class ACPowerFlowCalc:
                 self.standard_jac_csc_indptr,
                 self.standard_jac_raw_to_csc_pos,
             ) = build_compressed_pattern_from_raw_coords(self.standard_jac_cols, self.standard_jac_rows, n_dim)
-            # Kept for compatibility with existing cached-static fields; runtime
-            # now uses the structured raw-to-slot plans below.
-            self.standard_jac_csr_order = self.standard_jac_raw_to_csr_pos
             self.standard_jac_csr_data = np.empty(self.standard_jac_csr_indices.size, dtype=np.float64)
             self.standard_jac_csc_data = np.empty(self.standard_jac_csc_indices.size, dtype=np.float64)
             self.standard_jac_csr_sum_plan = build_raw_sum_plan(
@@ -2043,221 +1849,12 @@ class ACPowerFlowCalc:
         self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, self.full_jac_csr_data.size)
         self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, self.full_jac_csc_data.size)
 
-    def _cache_pq_decoupled_matrices(self):
-        """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
-        self.pq_Bp = None
-        self.pq_Bpp = None
-        self.pq_Bp_factor = None
-        self.pq_Bpp_factor = None
-        if self.algorithm != "pq" or self.Y is None or self.N_phi > 0:
-            return
-        b_matrix = self._build_fast_decoupled_b_matrix()
-        self.pq_Bp = b_matrix[self.theta_unknown, :][:, self.theta_unknown].tocsr()
-        self.pq_Bpp = b_matrix[self.V_unknown, :][:, self.V_unknown].tocsr()
-        if self.n_theta:
-            self.pq_Bp_factor = splu(self.pq_Bp.tocsc())
-        if self.n_V:
-            self.pq_Bpp_factor = splu(self.pq_Bpp.tocsc())
-
-    def _build_fast_decoupled_b_matrix(self):
-        """Build the fixed B matrix used by fast-decoupled load flow.
-
-        The fast-decoupled method relies on a lossless network approximation.
-        Using ``-Y.imag`` from the full AC admittance matrix includes the impact
-        of branch resistance and shunts, which seriously degrades convergence.
-        """
-        row_parts = []
-        col_parts = []
-        data_parts = []
-
-        def append_series(i, j, x, tap=None):
-            if i.size == 0:
-                return
-            b = np.divide(1.0, x, out=np.zeros_like(x, dtype=np.float64), where=np.abs(x) > 1e-12)
-            if tap is None:
-                yff = b
-                yft = -b
-                ytf = -b
-                ytt = b
-            else:
-                tap_mag = tap.copy()
-                tap_mag[np.abs(tap_mag) < 1e-12] = 1.0
-                yff = b / (tap_mag * tap_mag)
-                yft = -b / tap_mag
-                ytf = -b / tap_mag
-                ytt = b
-            row_parts.append(np.column_stack((i, i, j, j)).ravel())
-            col_parts.append(np.column_stack((i, j, i, j)).ravel())
-            data_parts.append(np.column_stack((yff, yft, ytf, ytt)).ravel())
-
-        if self.array_mode:
-            branch = self.ppc["branch"]
-            transformer = self.ppc["transformer"]
-            append_series(
-                self.branch_i,
-                self.branch_j,
-                branch[self.ppc_branch_rows, BRANCH_COLS["x"]] if self.ppc_branch_rows.size else np.array([], dtype=np.float64),
-            )
-            append_series(
-                self.transformer_i,
-                self.transformer_j,
-                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["x"]]
-                if self.ppc_transformer_rows.size
-                else np.array([], dtype=np.float64),
-                transformer[self.ppc_transformer_rows, TRANSFORMER_COLS["tap"]]
-                if self.ppc_transformer_rows.size
-                else np.array([], dtype=np.float64),
-            )
-        else:
-            append_series(
-                self.branch_i,
-                self.branch_j,
-                np.asarray([br.x for br in self.live_branches], dtype=np.float64),
-            )
-            append_series(
-                self.transformer_i,
-                self.transformer_j,
-                np.asarray([tr.x for tr in self.live_transformers], dtype=np.float64),
-                np.asarray([getattr(tr, "tap", 1.0) for tr in self.live_transformers], dtype=np.float64),
-            )
-
-        if not row_parts:
-            return csr_matrix((self.N, self.N), dtype=np.float64)
-        rows = np.concatenate(row_parts).astype(np.int32, copy=False)
-        cols = np.concatenate(col_parts).astype(np.int32, copy=False)
-        data = np.concatenate(data_parts).astype(np.float64, copy=False)
-        matrix = coo_matrix((data, (rows, cols)), shape=(self.N, self.N)).tocsr()
-        matrix.sum_duplicates()
-        return matrix
-
     # --------------------------------------------------------------------------
     # 预处理阶段（精简版）
     # --------------------------------------------------------------------------
     def prepare(self):
         """预处理：合并带电拓扑岛，初始化参数并定义变量/方程索引。"""
-        if self.array_mode:
-            self._prepare_from_ppc()
-            return
-
-        if self.target_island is None:
-            if not getattr(self.net, 'islands', None):
-                network_topology.prepare_ac_topology(self.net)
-
-            self.calc_islands = [isl for isl in self.net.islands if isl.is_alive]
-            self.skipped_islands = [isl for isl in self.net.islands if not isl.is_alive]
-            if not self.calc_islands:
-                raise RuntimeError("无存活的拓扑岛，无法进行潮流计算")
-
-            # 多岛场景下在一个 Newton 系统里统一求解，避免主程序逐岛循环调用。
-            self.isl = SimpleNamespace(
-                idx=0,
-                is_alive=True,
-                buses=[bus for isl in self.calc_islands for bus in isl.buses],
-                gens=[gen for isl in self.calc_islands for gen in isl.gens],
-                loads=[load for isl in self.calc_islands for load in isl.loads],
-                branches=[br for isl in self.calc_islands for br in isl.branches],
-                transformers=[tr for isl in self.calc_islands for tr in isl.transformers],
-                zero_branches=[zbr for isl in self.calc_islands for zbr in isl.zero_branches],
-                switches=[sw for isl in self.calc_islands for sw in isl.switches],
-                breakers=[brk for isl in self.calc_islands for brk in getattr(isl, "breakers", [])],
-                shunt_compensators=[sc for isl in self.calc_islands for sc in isl.shunt_compensators],
-                slack_nodes=[node for isl in self.calc_islands for node in isl.slack_nodes],
-                v_gens=[gen for isl in self.calc_islands for gen in isl.v_gens],
-            )
-
-        # 1. 拓扑校验
-        if self.target_island is not None:
-            self.isl = self.target_island
-        if self.isl is None:
-            raise RuntimeError("无存活的拓扑岛，无法进行潮流计算")
-
-        # 2. 提取节点基础信息
-        self.node_list = sorted(self.isl.buses, key=lambda n: n.idx)
-        self.N = len(self.node_list)
-        self.node_pos = {}
-        for i, node in enumerate(self.node_list):
-            for member in getattr(node, "nodes", ()):
-                self.node_pos[int(member.idx)] = i
-            self.node_pos.setdefault(int(node.idx), i)
-
-        # 3. 核心预处理流程
-        self._build_y_matrix()
-        self._prepare_node_parameters()
-        self._prepare_zero_branches()
-
-        # 变量索引
-        self.theta_unknown = np.where(self.node_type != 'SLACK')[0]
-        self.V_unknown = np.where(self.node_type == 'PQ')[0]
-
-        self.theta_idx = {pos: i for i, pos in enumerate(self.theta_unknown)}
-        self.V_idx = {pos: i for i, pos in enumerate(self.V_unknown)}
-
-        self.n_theta = len(self.theta_unknown)
-        self.n_V = len(self.V_unknown)
-        self.base_phi_re = self.n_theta + self.n_V
-        self.base_phi_im = self.base_phi_re + self.N_phi
-        self.total_vars = self.base_phi_im + self.N_phi
-
-        # 方程索引（精简计算）
-        n_tree = sum(len(edges) for edges in self.comp_tree_edges)
-        n_phi_fix = 2 * len(self.comp_nodes)
-
-        self.total_eq = self.n_theta + self.n_V + 2 * n_tree + n_phi_fix
-
-        # 4. 初始化状态向量
-        self.x = np.zeros(self.total_vars, dtype=np.float64)
-        self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
-        self._state_theta = np.empty(self.N, dtype=np.float64)
-        self._state_voltage = np.empty(self.N, dtype=np.float64)
-        self._state_vc = np.empty(self.N, dtype=np.complex128)
-        self._empty_phi = np.array([], dtype=np.float64)
-        self._load_p_work = np.zeros(self.N, dtype=np.float64)
-        self._load_q_work = np.zeros(self.N, dtype=np.float64)
-        self._load_dp_work = np.zeros(self.N, dtype=np.float64)
-        self._load_dq_work = np.zeros(self.N, dtype=np.float64)
-        self._load_vm_work = np.empty(self.load_pos.size, dtype=np.float64)
-        self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
-        self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
-        self._residual_work = np.zeros(self.total_eq, dtype=np.float64)
-        self._cache_static_arrays()
-        self._cache_pq_decoupled_matrices()
-
-        # 维度校验
-        if self.verbose:
-            print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
-        if self.total_vars != self.total_eq:
-            warnings.warn(f"变量数({self.total_vars})与方程数({self.total_eq})不匹配！")
-
-    def _prepare_zero_branches(self):
-        """为零阻抗支路和闭合开关建立电流 phi 变量及电压相等约束。"""
-        # 收集零阻抗边（合并循环）
-        self.zero_edges = []
-        for idx, zb in [(idx, zb) for idx, zb in enumerate(self.isl.zero_branches) if zb.is_alive]:
-            a = self.node_pos[zb.i_node]
-            b = self.node_pos[zb.j_node]
-            if a == b:
-                continue
-            if self._is_redundant_slack_zero_edge(a, b):
-                continue
-            self.zero_edges.append((idx, 0, a, b))
-        for idx, brk in [(idx, brk) for idx, brk in enumerate(getattr(self.isl, "breakers", [])) if brk.is_alive]:
-            a = self.node_pos[brk.i_node]
-            b = self.node_pos[brk.j_node]
-            if a == b:
-                continue
-            if self._is_redundant_slack_zero_edge(a, b):
-                continue
-            self.zero_edges.append((idx, 2, a, b))
-        for idx, sw in [(idx,sw) for idx, sw in enumerate(self.isl.switches) if sw.is_alive and sw.status == 1]:
-            a = self.node_pos[sw.i_node]
-            b = self.node_pos[sw.j_node]
-            if a == b:
-                continue
-            if self._is_redundant_slack_zero_edge(a, b):
-                continue
-            self.zero_edges.append((idx, 1, a, b))
-
-        self._prepare_zero_branch_components()
+        self._prepare_from_ppc()
 
     def _prepare_zero_branch_components(self):
         """根据 self.zero_edges 建立零阻抗连通块、生成树约束和 phi 变量映射。"""
@@ -2360,155 +1957,6 @@ class ACPowerFlowCalc:
             return False
         return True
 
-    def _build_y_matrix(self):
-        """构建稀疏导纳矩阵。
-
-        普通支路采用 MATPOWER 对称线路充电模型；变压器采用本工程的
-        T 型模型，`gt/bt` 是 i 侧单端对地导纳，不等同于 MATPOWER
-        `BR_B` 的两端平分充电电纳。
-        """
-        N = self.N
-        rows, cols, data = [], [], []
-        self.live_branches = [br for br in self.isl.branches if br.is_alive]
-        self.live_transformers = [tr for tr in self.isl.transformers if tr.is_alive]
-        self.branch_i = np.empty(len(self.live_branches), dtype=np.int32)
-        self.branch_j = np.empty(len(self.live_branches), dtype=np.int32)
-        self.branch_yff = np.empty(len(self.live_branches), dtype=np.complex128)
-        self.branch_yft = np.empty(len(self.live_branches), dtype=np.complex128)
-        self.branch_ytf = np.empty(len(self.live_branches), dtype=np.complex128)
-        self.branch_ytt = np.empty(len(self.live_branches), dtype=np.complex128)
-        self.transformer_i = np.empty(len(self.live_transformers), dtype=np.int32)
-        self.transformer_j = np.empty(len(self.live_transformers), dtype=np.int32)
-        self.transformer_yff = np.empty(len(self.live_transformers), dtype=np.complex128)
-        self.transformer_yft = np.empty(len(self.live_transformers), dtype=np.complex128)
-        self.transformer_ytf = np.empty(len(self.live_transformers), dtype=np.complex128)
-        self.transformer_ytt = np.empty(len(self.live_transformers), dtype=np.complex128)
-
-        # 普通支路
-        if self.live_branches:
-            self.branch_i = np.asarray([self.node_pos[br.i_node] for br in self.live_branches], dtype=np.int32)
-            self.branch_j = np.asarray([self.node_pos[br.j_node] for br in self.live_branches], dtype=np.int32)
-            self.branch_yff, self.branch_yft, self.branch_ytf, self.branch_ytt = matpower_branch_stamp_vectorized(
-                [br.r for br in self.live_branches],
-                [br.x for br in self.live_branches],
-                [br.b for br in self.live_branches],
-            )
-            rows.extend(np.column_stack((self.branch_i, self.branch_i, self.branch_j, self.branch_j)).ravel())
-            cols.extend(np.column_stack((self.branch_i, self.branch_j, self.branch_i, self.branch_j)).ravel())
-            data.extend(
-                np.column_stack((self.branch_yff, self.branch_yft, self.branch_ytf, self.branch_ytt)).ravel()
-            )
-
-        # 变压器：gt/bt 为 i 侧单端对地导纳，不能按线路 b/2 平分。
-        if self.live_transformers:
-            self.transformer_i = np.asarray([self.node_pos[tr.i_node] for tr in self.live_transformers], dtype=np.int32)
-            self.transformer_j = np.asarray([self.node_pos[tr.j_node] for tr in self.live_transformers], dtype=np.int32)
-            (
-                self.transformer_yff,
-                self.transformer_yft,
-                self.transformer_ytf,
-                self.transformer_ytt,
-            ) = matpower_transformer_stamp_vectorized(
-                [tr.r for tr in self.live_transformers],
-                [tr.x for tr in self.live_transformers],
-                [getattr(tr, "gt", 0.0) for tr in self.live_transformers],
-                [getattr(tr, "bt", getattr(tr, "b", 0.0) / 2.0) for tr in self.live_transformers],
-                [tr.tap for tr in self.live_transformers],
-                [tr.shift for tr in self.live_transformers],
-            )
-            rows.extend(
-                np.column_stack((self.transformer_i, self.transformer_i, self.transformer_j, self.transformer_j)).ravel()
-            )
-            cols.extend(
-                np.column_stack((self.transformer_i, self.transformer_j, self.transformer_i, self.transformer_j)).ravel()
-            )
-            data.extend(
-                np.column_stack(
-                    (self.transformer_yff, self.transformer_yft, self.transformer_ytf, self.transformer_ytt)
-                ).ravel()
-            )
-
-        # 并联补偿器（精简）
-        for sc in [sc for sc in self.isl.shunt_compensators if sc.is_alive]:
-            i = self.node_pos[sc.node]
-            if sc.control_type in ['B', 'Z'] or sc.g_set != 0.0:
-                y_sh = sc.g_set + 1j * sc.b_set
-                if y_sh != 0:
-                    rows.append(i)
-                    cols.append(i)
-                    data.append(y_sh)
-
-        # 构建稀疏矩阵
-        self.Y = csr_matrix((np.array(data), (np.array(rows), np.array(cols))), shape=(N, N))
-        self.Y.sum_duplicates()
-
-    def _prepare_node_parameters(self):
-        """汇总节点类型、发电机设定值、并联补偿和电压相关负荷参数。"""
-        N = self.N
-        # 初始化节点参数（精简）
-        self.node_type = np.full(N, 'PQ', dtype='U5')
-        self.V_spec = np.full(N, np.nan, dtype=np.float64)
-        self.theta_spec = np.zeros(N, dtype=np.float64)
-        self.P_spec = np.zeros(N, dtype=np.float64)
-        self.Q_spec = np.zeros(N, dtype=np.float64)
-        self.load_info = []
-        self.slack_node = -1
-
-        # 处理发电机（精简逻辑）
-        for gen in [gen for gen in self.isl.gens if gen.is_alive]:
-            pos = self.node_pos[gen.node]
-
-            if gen.control_type in ['V', 'SLACK', 'PH']:
-                self.node_type[pos] = 'SLACK'
-                self.slack_node = pos
-                self.V_spec[pos] = gen.v_set if gen.v_set is not None else 1.0
-                self.theta_spec[pos] = getattr(self.node_list[pos], 'angle', 0.0)
-            elif gen.control_type == 'PV' and self.node_type[pos] != 'SLACK':
-                self.node_type[pos] = 'PV'
-                if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - gen.v_set) > 1e-6:
-                    raise ValueError(f"节点{gen.node}多个PV发电机电压设定冲突")
-                self.V_spec[pos] = gen.v_set
-                self.P_spec[pos] += gen.p_set
-            elif gen.control_type in ['PQ', 'P']:
-                self.P_spec[pos] += gen.p_set
-                self.Q_spec[pos] += gen.q_set
-
-        # 处理并联补偿器（精简）
-        for sc in [sc for sc in self.isl.shunt_compensators if sc.is_alive]:
-            pos = self.node_pos[sc.node]
-            if sc.control_type == 'Q':
-                self.Q_spec[pos] += sc.q_set
-            elif sc.control_type == 'V' and self.node_type[pos] != 'SLACK':
-                self.node_type[pos] = 'PV'
-                if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - sc.v_set) > 1e-6:
-                    raise ValueError(f"节点{sc.node}电压设定冲突")
-                self.V_spec[pos] = sc.v_set
-
-        # 处理负荷（精简）
-        for ld in self.isl.loads:
-            if ld.is_alive:
-                pbase = float(getattr(ld, "pbase", 1.0))
-                qbase = float(getattr(ld, "qbase", 1.0))
-                self.load_info.append((
-                    self.node_pos[ld.node],
-                    pbase * ld.pv0,
-                    pbase * ld.pv1,
-                    pbase * ld.pv2,
-                    qbase * ld.qv0,
-                    qbase * ld.qv1,
-                    qbase * ld.qv2,
-                ))
-
-        # 确保存在平衡节点（精简）
-        if self.slack_node == -1:
-            pv_indices = np.where(self.node_type == 'PV')[0]
-            if pv_indices.size > 0:
-                self.slack_node = pv_indices[0]
-                self.node_type[self.slack_node] = 'SLACK'
-
-        if self.slack_node == -1:
-            raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
-
     def get_f(self, x: np.ndarray) -> np.ndarray:
         """计算残差向量 F"""
         theta, V, phi_re, phi_im = self._extract_state_vars(x)
@@ -2547,259 +1995,6 @@ class ACPowerFlowCalc:
             F[eq_idx + 1:eq_idx + span:2] = phi_im[ref_phi_arr]
 
         return F
-
-    def _get_jacobi_loop(self, x: np.ndarray) -> csr_matrix:
-        """计算雅可比矩阵的逐行备用实现，供无 scipy 稀疏优化时使用。"""
-        # 提取状态变量
-        theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
-        cos_theta, sin_theta = self._cache['cos_theta'], self._cache['sin_theta']
-
-        # 初始化雅可比矩阵数据
-        rows, cols, data = [], [], []
-        N = self.N
-
-        # 标准雅可比计算（精简核心逻辑）
-        for i in range(N):
-            Vi_val, thetai_val = V[i], theta[i]
-
-            # 计算Pi, Qi
-            Yii = self.Y_diag[i]
-            Pi = Vi_val ** 2 * Yii.real
-            Qi = -Vi_val ** 2 * Yii.imag
-
-            # 向量化计算功率项
-            j_valid = self.Y_offdiag_indices[i]
-            y_valid = self.Y_offdiag_data[i]
-            if len(j_valid) > 0:
-
-                Gij = y_valid.real
-                Bij = y_valid.imag
-                Vj = V[j_valid]
-                delta = thetai_val - theta[j_valid]
-
-                cos_delta = np.cos(delta)
-                sin_delta = np.sin(delta)
-
-                Pi += np.sum(Vi_val * Vj * (Gij * cos_delta + Bij * sin_delta))
-                Qi += np.sum(Vi_val * Vj * (Gij * sin_delta - Bij * cos_delta))
-
-            # 对角线元素
-            Gii = Yii.real
-            Bii = Yii.imag
-
-            Hii = -Qi - Vi_val ** 2 * Bii
-            Nii = Pi + Vi_val ** 2 * Gii
-            Mii = Pi - Vi_val ** 2 * Gii
-            Lii = Qi - Vi_val ** 2 * Bii
-
-            # 有功方程偏导（精简判断）
-            if self.node_type[i] != 'SLACK':
-                eq_i = self.theta_idx[i]
-                rows.append(eq_i)
-                cols.append(self.theta_idx[i])
-                data.append(Hii)
-
-                if self.node_type[i] == 'PQ':
-                    rows.append(eq_i)
-                    cols.append(self.n_theta + self.V_idx[i])
-                    data.append(Nii)
-
-            # 无功方程偏导（精简）
-            if self.node_type[i] == 'PQ':
-                eq_i = self.n_theta + self.V_idx[i]
-                rows.append(eq_i)
-                cols.append(self.theta_idx[i])
-                data.append(Mii)
-                rows.append(eq_i)
-                cols.append(self.n_theta + self.V_idx[i])
-                data.append(Lii)
-
-            # 非对角线元素（精简）
-            if len(j_valid) > 0:
-                Gij = y_valid.real
-                Bij = y_valid.imag
-                Vj = V[j_valid]
-                delta = thetai_val - theta[j_valid]
-
-                cos_delta = np.cos(delta)
-                sin_delta = np.sin(delta)
-
-                # 计算偏导数
-                Hij = Vi_val * Vj * (Gij * sin_delta - Bij * cos_delta)
-                Nij = Vi_val * Vj * (Gij * cos_delta + Bij * sin_delta)
-                Mij = -Nij
-                Lij = Hij
-
-                # 批量处理
-                for idx, j in enumerate(j_valid):
-                    # 有功方程
-                    if self.node_type[i] != 'SLACK':
-                        eq_i = self.theta_idx[i]
-                        if self.node_type[j] != 'SLACK':
-                            rows.append(eq_i)
-                            cols.append(self.theta_idx[j])
-                            data.append(Hij[idx])
-                        if self.node_type[j] == 'PQ':
-                            rows.append(eq_i)
-                            cols.append(self.n_theta + self.V_idx[j])
-                            data.append(Nij[idx])
-
-                    # 无功方程
-                    if self.node_type[i] == 'PQ':
-                        eq_i = self.n_theta + self.V_idx[i]
-                        if self.node_type[j] != 'SLACK':
-                            rows.append(eq_i)
-                            cols.append(self.theta_idx[j])
-                            data.append(Mij[idx])
-                        if self.node_type[j] == 'PQ':
-                            rows.append(eq_i)
-                            cols.append(self.n_theta + self.V_idx[j])
-                            data.append(Lij[idx])
-
-
-        # 3. 计算负荷功率
-        for idx, pos in enumerate(self.load_pos):
-            vm = V[pos]
-            if self.node_type[pos] == 'PQ':
-                rows.append(self.theta_idx[pos])
-                cols.append(self.n_theta + self.V_idx[pos])
-                data.append(self.load_pv1[idx] + 2.0 * vm * self.load_pv2[idx])
-
-                rows.append(self.n_theta + self.V_idx[pos])
-                cols.append(self.n_theta + self.V_idx[pos])
-                data.append(self.load_qv1[idx] + 2.0 * vm * self.load_qv2[idx])
-
-
-        # 零阻抗支路雅可比（精简）
-        if self.N_phi > 0 and self.zero_a.size:
-            I_re = phi_re[self.zero_phi_a] - phi_re[self.zero_phi_b]
-            I_im = phi_im[self.zero_phi_a] - phi_im[self.zero_phi_b]
-            Va = V[self.zero_a]
-            Vb = V[self.zero_b]
-            cos_a = cos_theta[self.zero_a]
-            sin_a = sin_theta[self.zero_a]
-            cos_b = cos_theta[self.zero_b]
-            sin_b = sin_theta[self.zero_b]
-
-            # 批量处理
-            for idx in range(len(self.zero_a)):
-                a, b, phi_a, phi_b = self.zero_a[idx], self.zero_b[idx], self.zero_phi_a[idx], self.zero_phi_b[idx]
-
-                # 节点a的偏导
-                if self.node_type[a] != 'SLACK':
-                    eq_a = self.theta_idx[a]
-                    rows.append(eq_a)
-                    cols.append(self.theta_idx[a])
-                    data.append(Va[idx] * (-sin_a[idx] * I_re[idx] + cos_a[idx] * I_im[idx]))
-                    if self.node_type[a] == 'PQ':
-                        rows.append(eq_a)
-                        cols.append(self.n_theta + self.V_idx[a])
-                        data.append(cos_a[idx] * I_re[idx] + sin_a[idx] * I_im[idx])
-                    rows.extend([eq_a] * 4)
-                    cols.extend([self.base_phi_re + phi_a, self.base_phi_im + phi_a, self.base_phi_re + phi_b,
-                                 self.base_phi_im + phi_b])
-                    data.extend(
-                        [Va[idx] * cos_a[idx], Va[idx] * sin_a[idx], -Va[idx] * cos_a[idx], -Va[idx] * sin_a[idx]])
-
-                if self.node_type[a] == 'PQ':
-                    eq_a = self.n_theta + self.V_idx[a]
-                    rows.extend([eq_a, eq_a])
-                    cols.extend([self.theta_idx[a], self.n_theta + self.V_idx[a]])
-                    data.extend([
-                        Va[idx] * (cos_a[idx] * I_re[idx] + sin_a[idx] * I_im[idx]),
-                        sin_a[idx] * I_re[idx] - cos_a[idx] * I_im[idx],
-                    ])
-                    rows.extend([eq_a] * 4)
-                    cols.extend([self.base_phi_re + phi_a, self.base_phi_im + phi_a, self.base_phi_re + phi_b,
-                                 self.base_phi_im + phi_b])
-                    data.extend(
-                        [Va[idx] * sin_a[idx], -Va[idx] * cos_a[idx], -Va[idx] * sin_a[idx], Va[idx] * cos_a[idx]])
-
-                # 节点b的偏导
-                if self.node_type[b] != 'SLACK':
-                    eq_b = self.theta_idx[b]
-                    rows.append(eq_b)
-                    cols.append(self.theta_idx[b])
-                    data.append(Vb[idx] * (sin_b[idx] * I_re[idx] - cos_b[idx] * I_im[idx]))
-                    if self.node_type[b] == 'PQ':
-                        rows.append(eq_b)
-                        cols.append(self.n_theta + self.V_idx[b])
-                        data.append(-cos_b[idx] * I_re[idx] - sin_b[idx] * I_im[idx])
-                    rows.extend([eq_b] * 4)
-                    cols.extend([self.base_phi_re + phi_a, self.base_phi_im + phi_a, self.base_phi_re + phi_b,
-                                 self.base_phi_im + phi_b])
-                    data.extend(
-                        [-Vb[idx] * cos_b[idx], -Vb[idx] * sin_b[idx], Vb[idx] * cos_b[idx], Vb[idx] * sin_b[idx]])
-
-                if self.node_type[b] == 'PQ':
-                    eq_b = self.n_theta + self.V_idx[b]
-                    rows.extend([eq_b, eq_b])
-                    cols.extend([self.theta_idx[b], self.n_theta + self.V_idx[b]])
-                    data.extend([
-                        -Vb[idx] * (cos_b[idx] * I_re[idx] + sin_b[idx] * I_im[idx]),
-                        -sin_b[idx] * I_re[idx] + cos_b[idx] * I_im[idx],
-                    ])
-                    rows.extend([eq_b] * 4)
-                    cols.extend([self.base_phi_re + phi_a, self.base_phi_im + phi_a, self.base_phi_re + phi_b,
-                                 self.base_phi_im + phi_b])
-                    data.extend(
-                        [-Vb[idx] * sin_b[idx], Vb[idx] * cos_b[idx], Vb[idx] * sin_b[idx], -Vb[idx] * cos_b[idx]])
-
-        # 零阻抗约束雅可比（精简）
-        eq_idx = self.n_theta + self.n_V
-        for c in range(len(self.comp_nodes)):
-            for edge_idx in self.comp_tree_edges[c]:
-                _index, _type, a, b = self.zero_edges[edge_idx]
-
-                # 实部约束
-                if self.node_type[a] != 'SLACK':
-                    rows.append(eq_idx)
-                    cols.append(self.theta_idx[a])
-                    data.append(-V[a] * sin_theta[a])
-                if self.node_type[a] == 'PQ':
-                    rows.append(eq_idx)
-                    cols.append(self.n_theta + self.V_idx[a])
-                    data.append(cos_theta[a])
-                if self.node_type[b] != 'SLACK':
-                    rows.append(eq_idx)
-                    cols.append(self.theta_idx[b])
-                    data.append(V[b] * sin_theta[b])
-                if self.node_type[b] == 'PQ':
-                    rows.append(eq_idx)
-                    cols.append(self.n_theta + self.V_idx[b])
-                    data.append(-cos_theta[b])
-                eq_idx += 1
-
-                # 虚部约束
-                if self.node_type[a] != 'SLACK':
-                    rows.append(eq_idx)
-                    cols.append(self.theta_idx[a])
-                    data.append(V[a] * cos_theta[a])
-                if self.node_type[a] == 'PQ':
-                    rows.append(eq_idx)
-                    cols.append(self.n_theta + self.V_idx[a])
-                    data.append(sin_theta[a])
-                if self.node_type[b] != 'SLACK':
-                    rows.append(eq_idx)
-                    cols.append(self.theta_idx[b])
-                    data.append(-V[b] * cos_theta[b])
-                if self.node_type[b] == 'PQ':
-                    rows.append(eq_idx)
-                    cols.append(self.n_theta + self.V_idx[b])
-                    data.append(-sin_theta[b])
-                eq_idx += 1
-
-        # phi参考约束雅可比（精简）
-        for c in range(len(self.comp_nodes)):
-            idx_phi = self.ref_phi_idx[c]
-            rows.append(eq_idx + 2 * c)
-            cols.append(self.base_phi_re + idx_phi)
-            data.append(1.0)
-            rows.append(eq_idx + 2 * c + 1)
-            cols.append(self.base_phi_im + idx_phi)
-            data.append(1.0)
-
-        return build_jacobian_matrix(rows, cols, data, (self.total_eq, self.total_vars))
 
     def _calc_load_power_derivatives(self, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         dP = self._load_dp_work
@@ -3283,28 +2478,19 @@ class ACPowerFlowCalc:
         """执行所选潮流算法。"""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
-            if self.array_mode and self.result_mode != "full":
+            if self.result_mode != "full":
                 self.keep_node_objects = False
                 self.node_list = []
                 self.node_pos = {}
-        if self.algorithm == "pq" and self.N_phi == 0 and self.pq_Bp is not None and self.pq_Bpp is not None:
-            return self._run_pq_decoupled()
-        if self.algorithm == "pq":
-            if self.verbose:
-                print("PQ分解法不支持当前零阻抗扩展模型，自动回退到N-R法")
-            return self._run_newton_raphson(used_label="pq->nr")
+        if self.x.size == 0:
+            self.prepare()
         return self._run_newton_raphson()
 
-    def _run_newton_raphson(self, used_label: str = "nr") -> int:
+    def _run_newton_raphson(self) -> int:
         """执行牛顿-拉夫逊迭代求解"""
-        self.used_algorithm = used_label
         self.converged = False
         self.iterations = 0
         x = self.x.copy()
-        refresh_period = self.jacobian_refresh_period
-        factor = None
-        # 自上次重分解后已用因子求解的次数；达到 refresh_period 时强制重分解。
-        steps_since_refresh = refresh_period
 
         for it in range(self.max_iter):
             self.iterations += 1
@@ -3324,20 +2510,14 @@ class ACPowerFlowCalc:
                 self._write_back()
                 return 0
 
-            # 因子复用策略：refresh_period=1 时与标准 NR 完全等价。
             try:
-                if factor is None or steps_since_refresh >= refresh_period:
-                    factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
-                    steps_since_refresh = 0
+                factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
                 delta = factor.solve(F)
-                steps_since_refresh += 1
             except Exception:
                 # 因子分解或解算失败时，回退到 SuperLU spsolve 单步路径。
                 _OPTIONAL_SPARSE_SOLVERS.pop(self._linear_solver_resolved, None)
                 _OPTIONAL_SPARSE_MISSING.add(self._linear_solver_resolved)
                 self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
-                factor = None
-                steps_since_refresh = refresh_period
                 delta = spsolve(J, F)
             # 方程定义为 F(x)=0，这里使用 x_new = x - J^{-1}F。
             x -= delta
@@ -3348,66 +2528,6 @@ class ACPowerFlowCalc:
         self.x = x
         self._write_back()
         return -1
-
-    def _run_pq_decoupled(self) -> int:
-        """执行快速PQ分解潮流。"""
-        self.used_algorithm = "pq"
-        self.converged = False
-        self.iterations = 0
-        x0 = self.x.copy()
-        x = x0.copy()
-        v_slice = slice(self.n_theta, self.n_theta + self.n_V)
-
-        for it in range(self.max_iter):
-            self.iterations += 1
-
-            theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
-            dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
-            p_mis = dP[self.theta_unknown]
-            q_mis = dQ[self.V_unknown]
-            self.normF = max(
-                float(np.linalg.norm(p_mis, np.inf)) if p_mis.size else 0.0,
-                float(np.linalg.norm(q_mis, np.inf)) if q_mis.size else 0.0,
-            )
-            if self.verbose:
-                print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
-
-            if self.normF < self.tol:
-                if self.verbose:
-                    print(f"PQ分解法收敛于第 {it + 1} 次迭代")
-                self.converged = True
-                self.x = x
-                self._write_back()
-                return 0
-
-            if self.n_theta:
-                rhs_p = np.divide(
-                    p_mis,
-                    V[self.theta_unknown],
-                    out=np.zeros_like(p_mis),
-                    where=V[self.theta_unknown] > self.min_voltage,
-                )
-                dtheta = self.pq_Bp_factor.solve(rhs_p)
-                x[:self.n_theta] -= dtheta
-
-            theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
-            _, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
-            q_mis = dQ[self.V_unknown]
-            if self.n_V:
-                rhs_q = np.divide(
-                    q_mis,
-                    V[self.V_unknown],
-                    out=np.zeros_like(q_mis),
-                    where=V[self.V_unknown] > self.min_voltage,
-                )
-                dV = self.pq_Bpp_factor.solve(rhs_q)
-                x[v_slice] -= dV
-                np.maximum(x[v_slice], self.min_voltage, out=x[v_slice])
-
-        if self.verbose:
-            print(f"PQ分解法达到最大迭代次数 {self.max_iter}，未收敛，改用N-R法")
-        self.x = x0
-        return self._run_newton_raphson(used_label="pq->nr")
 
     def _summary_node_ids(self):
         if self.ppc_node_idx.size == self.N:
@@ -3426,7 +2546,6 @@ class ACPowerFlowCalc:
                 "converged": bool(self.converged),
                 "iterations": int(self.iterations),
                 "normF": float(self.normF),
-                "used_algorithm": self.used_algorithm,
             },
         }
         self.lf_result = None
@@ -3441,212 +2560,11 @@ class ACPowerFlowCalc:
             self._write_summary_result()
             return
 
-        if self.array_mode:
-            self._write_back_ppc()
-            return
-
-        theta, V, phi_re, phi_im = self._extract_state_vars(self.x)
-        Vc = self._cache['Vc']
-
-        P_load, Q_load = self._cache['P_load'], self._cache['Q_load']
-        if P_load is None or Q_load is None:
-            P_load, Q_load = self._calc_load_power(V)
-
-        # 计算节点注入功率
-        I_y = self.Y.dot(Vc)
-        S_y = Vc * np.conj(I_y)
-
-        if self.N_phi > 0 and self.zero_a.size:
-            I_ab = (phi_re[self.zero_phi_a] - phi_re[self.zero_phi_b]) + 1j * (
-                phi_im[self.zero_phi_a] - phi_im[self.zero_phi_b]
-            )
-            Sa = Vc[self.zero_a] * np.conj(I_ab)
-            Sb = Vc[self.zero_b] * np.conj(-I_ab)
-            P_zero = np.bincount(self.zero_a, weights=Sa.real, minlength=self.N)
-            P_zero += np.bincount(self.zero_b, weights=Sb.real, minlength=self.N)
-            Q_zero = np.bincount(self.zero_a, weights=Sa.imag, minlength=self.N)
-            Q_zero += np.bincount(self.zero_b, weights=Sb.imag, minlength=self.N)
-        else:
-            I_ab = np.array([], dtype=np.complex128)
-            P_zero = np.zeros(self.N, dtype=np.float64)
-            Q_zero = np.zeros(self.N, dtype=np.float64)
-
-        P_gen = S_y.real + P_zero + P_load
-        Q_gen = S_y.imag + Q_zero + Q_load
-
-        for node in self.isl.buses:
-            pos = self.node_pos[node.idx]
-            node.voltage = V[pos]
-            node.angle = theta[pos]
-            for member in getattr(node, "nodes", ()):
-                member.voltage = node.voltage
-                member.angle = node.angle
-
-        if self.live_gens:
-            gen_p = self.gen_share * P_gen[self.gen_pos]
-            gen_q = self.gen_share * Q_gen[self.gen_pos]
-            gen_v = V[self.gen_pos]
-            gen_current = np.divide(
-                np.hypot(gen_p, gen_q),
-                gen_v,
-                out=np.zeros_like(gen_p),
-                where=gen_v > self.min_voltage,
-            )
-            for gen, p, q, current in zip(self.live_gens, gen_p, gen_q, gen_current):
-                gen.p = float(p)
-                gen.q = float(q)
-                gen.current = float(current)
-
-        if self.live_loads:
-            vm = V[self.load_obj_pos]
-            load_p = self.load_pv0 + self.load_pv1 * vm + self.load_pv2 * vm ** 2
-            load_q = self.load_qv0 + self.load_qv1 * vm + self.load_qv2 * vm ** 2
-            load_current = np.divide(
-                np.hypot(load_p, load_q),
-                vm,
-                out=np.zeros_like(load_p),
-                where=vm > self.min_voltage,
-            )
-            for ld, p, q, current in zip(self.live_loads, load_p, load_q, load_current):
-                ld.p = float(p)
-                ld.q = float(q)
-                ld.current = float(current)
-
-        for sc, pos in zip(self.live_shunts, self.shunt_pos):
-            if sc.control_type in ['B', 'Z'] or sc.g_set != 0.0:
-                sc.p = V[pos] ** 2 * sc.g_set
-                sc.q = -V[pos] ** 2 * sc.b_set
-            else:
-                sc.p = 0.0
-                sc.q = sc.q_set if sc.control_type == 'Q' else 0.0
-            sc.current = self.get_current(Vc[pos], sc.p, sc.q)
-
-        if self.live_branches:
-            Vi = Vc[self.branch_i]
-            Vj = Vc[self.branch_j]
-            I_ij = self.branch_yff * Vi + self.branch_yft * Vj
-            I_ji = self.branch_ytf * Vi + self.branch_ytt * Vj
-            S_ij = Vi * np.conj(I_ij)
-            S_ji = Vj * np.conj(I_ji)
-            for idx, br in enumerate(self.live_branches):
-                br.i_p = float(S_ij.real[idx])
-                br.i_q = float(S_ij.imag[idx])
-                br.i_c = float(abs(I_ij[idx]))
-                br.j_p = float(S_ji.real[idx])
-                br.j_q = float(S_ji.imag[idx])
-                br.j_c = float(abs(I_ji[idx]))
-
-        if self.live_transformers:
-            Vi = Vc[self.transformer_i]
-            Vj = Vc[self.transformer_j]
-            I_ij = self.transformer_yff * Vi + self.transformer_yft * Vj
-            I_ji = self.transformer_ytf * Vi + self.transformer_ytt * Vj
-            S_ij = Vi * np.conj(I_ij)
-            S_ji = Vj * np.conj(I_ji)
-            for idx, tr in enumerate(self.live_transformers):
-                tr.i_p = float(S_ij.real[idx])
-                tr.i_q = float(S_ij.imag[idx])
-                tr.i_c = float(abs(I_ij[idx]))
-                tr.j_p = float(S_ji.real[idx])
-                tr.j_q = float(S_ji.imag[idx])
-                tr.j_c = float(abs(I_ji[idx]))
-
-        for sw in self.isl.switches:
-            sw.current = sw.p = sw.q = 0.0
-
-        for zb in self.isl.zero_branches:
-            zb.current = zb.p = zb.q = 0.0
-        for brk in getattr(self.isl, "breakers", []):
-            brk.current = brk.p = brk.q = 0.0
-
-        for dev_idx, dev_type, a, current in zip(
-            self.zero_idx,
-            self.zero_type,
-            self.zero_a,
-            I_ab,
-        ):
-            if dev_type == 0:
-                dev = self.isl.zero_branches[int(dev_idx)]
-            elif dev_type == 2:
-                dev = self.isl.breakers[int(dev_idx)]
-            else:
-                dev = self.isl.switches[int(dev_idx)]
-            s_from = Vc[a] * np.conj(current)
-            dev.current = float(abs(current))
-            dev.p = float(s_from.real)
-            dev.q = float(s_from.imag)
-        if not getattr(self, "skip_lf_result", False):
-            self.lf_result = self._build_lf_result()
-
-    def _device_voltage(self, node_idx) -> float:
-        if int(node_idx) in getattr(self, "node_pos", {}):
-            pos = self.node_pos[int(node_idx)]
-            if hasattr(self, "x"):
-                _theta, voltage, _phi_re, _phi_im = self._extract_state_vars(self.x)
-                return float(voltage[pos])
-        return 0.0
+        self._write_back_ppc()
+        return
 
     def _build_lf_result(self) -> ACLFResult:
-        if self.array_mode and isinstance(getattr(self, "result", None), dict):
-            return self._build_lf_result_from_ppc()
-        result = ACLFResult()
-        model = self.net
-        for node in getattr(model, "nodes", []):
-            result.nodes[_device_key(node)] = SimpleNamespace(
-                volt=float(getattr(node, "voltage", 0.0) or 0.0),
-                angle=float(getattr(node, "angle", 0.0) or 0.0),
-            )
-        for br in getattr(model, "branches", []):
-            result.branches[_device_key(br)] = SimpleNamespace(
-                i_p=float(getattr(br, "i_p", 0.0) or 0.0),
-                i_q=float(getattr(br, "i_q", 0.0) or 0.0),
-                i_c=float(getattr(br, "i_c", 0.0) or 0.0),
-                i_v=self._device_voltage(getattr(br, "i_node", -1)),
-                j_p=float(getattr(br, "j_p", 0.0) or 0.0),
-                j_q=float(getattr(br, "j_q", 0.0) or 0.0),
-                j_c=float(getattr(br, "j_c", 0.0) or 0.0),
-                j_v=self._device_voltage(getattr(br, "j_node", -1)),
-            )
-        for tr in getattr(model, "transformers", []):
-            result.transformers[_device_key(tr)] = SimpleNamespace(
-                i_p=float(getattr(tr, "i_p", 0.0) or 0.0),
-                i_q=float(getattr(tr, "i_q", 0.0) or 0.0),
-                i_c=float(getattr(tr, "i_c", 0.0) or 0.0),
-                i_v=self._device_voltage(getattr(tr, "i_node", -1)),
-                j_p=float(getattr(tr, "j_p", 0.0) or 0.0),
-                j_q=float(getattr(tr, "j_q", 0.0) or 0.0),
-                j_c=float(getattr(tr, "j_c", 0.0) or 0.0),
-                j_v=self._device_voltage(getattr(tr, "j_node", -1)),
-            )
-        for zbr in getattr(model, "zero_branches", []):
-            result.zero_branches[_device_key(zbr)] = SimpleNamespace(
-                i_p=float(getattr(zbr, "p", 0.0) or 0.0),
-                i_q=float(getattr(zbr, "q", 0.0) or 0.0),
-                i_c=float(getattr(zbr, "current", 0.0) or 0.0),
-                i_v=self._device_voltage(getattr(zbr, "i_node", -1)),
-            )
-        for brk in getattr(model, "breakers", []):
-            result.breakers[_device_key(brk)] = SimpleNamespace(
-                i_p=float(getattr(brk, "p", 0.0) or 0.0),
-                i_q=float(getattr(brk, "q", 0.0) or 0.0),
-                i_c=float(getattr(brk, "current", 0.0) or 0.0),
-                i_v=self._device_voltage(getattr(brk, "i_node", -1)),
-            )
-        for gen in getattr(model, "generators", []):
-            result.generators[_device_key(gen)] = SimpleNamespace(
-                i_p=float(getattr(gen, "p", 0.0) or 0.0),
-                i_q=float(getattr(gen, "q", 0.0) or 0.0),
-                i_c=float(getattr(gen, "current", 0.0) or 0.0),
-                i_v=self._device_voltage(getattr(gen, "node", -1)),
-            )
-        for load in getattr(model, "loads", []):
-            result.loads[_device_key(load)] = SimpleNamespace(
-                i_p=float(getattr(load, "p", 0.0) or 0.0),
-                i_q=float(getattr(load, "q", 0.0) or 0.0),
-                i_c=float(getattr(load, "current", 0.0) or 0.0),
-                i_v=self._device_voltage(getattr(load, "node", -1)),
-            )
-        return result
+        return self._build_lf_result_from_ppc()
 
     def _build_lf_result_from_ppc(self) -> ACLFResult:
         # 后处理：把 ppc 风格的 numpy 结果数组转成 dict[name]->SimpleNamespace。
@@ -4136,9 +3054,8 @@ def main(argv=None) -> int:
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
-    parser.add_argument("--algorithm", choices=("nr", "pq"), default="nr")
     parser.add_argument("--linear-solver", default="scipy")
-    parser.add_argument("--result-mode", choices=("full", "summary", "none"), default="full")
+    parser.add_argument("--result-mode", choices=("full", "array", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -4149,12 +3066,10 @@ def main(argv=None) -> int:
         tol=args.tol,
         max_iter=args.max_iter,
         min_voltage=args.min_voltage,
-        algorithm=args.algorithm,
         linear_solver=args.linear_solver,
         result_mode=args.result_mode,
         verbose=not args.quiet,
     )
-    calc.prepare()
     rc = calc.run()
     if not args.quiet and calc.result_mode == "full":
         print_ac_result(calc, rc)

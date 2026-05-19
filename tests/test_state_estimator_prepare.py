@@ -176,7 +176,7 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         fake_ppc = {
             "ac": {"kind": "ac"},
             "dc": {"kind": "dc"},
-            "base": [100.0, 2.0, 3.0, 4.0, 100000.0],
+            "base": {"p_base": 100.0, "u_scale": 2.0, "p_scale": 3.0, "i_scale": 4.0, "p_base_kW": 100000.0},
         }
         fake_rows = [["Base"], ["ACNode"]]
         e_file = Path("case.e")
@@ -200,11 +200,11 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             fake_network.ac.ppc = ppc["ac"]
             fake_network.dc.ppc = ppc["dc"]
             base = ppc["base"]
-            fake_network.p_base = float(base[0])
-            fake_network.u_scale = float(base[1])
-            fake_network.p_scale = float(base[2])
-            fake_network.i_scale = float(base[3])
-            fake_network.p_base_kW = float(base[4])
+            fake_network.p_base = float(base["p_base"])
+            fake_network.u_scale = float(base["u_scale"])
+            fake_network.p_scale = float(base["p_scale"])
+            fake_network.i_scale = float(base["i_scale"])
+            fake_network.p_base_kW = float(base["p_base_kW"])
             return fake_network
 
         def read_from_file_forbidden(*args, **kwargs):
@@ -288,9 +288,9 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         dc_bus[0, DC_BUS_COLS["voltage"]] = 1.0
         dc_bus[0, DC_BUS_COLS["run_stat"]] = 1
         fake_ppc = {
-            "base": np.array([100.0, 2.0, 3.0, 4.0, 100000.0], dtype=np.float64),
+            "base": {"p_base": 100.0, "u_scale": 2.0, "p_scale": 3.0, "i_scale": 4.0, "p_base_kW": 100000.0},
             "ac": {
-                "base": np.array([100.0, 2.0, 3.0, 4.0, 100000.0], dtype=np.float64),
+                "base": {"p_base": 100.0, "u_scale": 2.0, "p_scale": 3.0, "i_scale": 4.0, "p_base_kW": 100000.0},
                 "bus": ac_bus,
                 "branch": empty(len(AC_BRANCH_COLS)),
                 "transformer": empty(len(AC_TRANSFORMER_COLS)),
@@ -409,12 +409,12 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         def build_ac(model, **kwargs):
             self.assertTrue(getattr(model, "_named_units_normalized", False))
             self.assertTrue(kwargs.get("units_already_normalized"))
-            return fake_ac_network, {"base": [100.0, 1.0, 0.001, 1.0, 100000.0]}
+            return fake_ac_network, {"base": {"p_base": 100.0, "u_scale": 1.0, "p_scale": 0.001, "i_scale": 1.0, "p_base_kW": 100000.0}}
 
         def build_dc(model, **kwargs):
             self.assertTrue(getattr(model, "_named_units_normalized", False))
             self.assertTrue(kwargs.get("units_already_normalized"))
-            return fake_dc_network, {"base": {"p_base": 100.0}}
+            return fake_dc_network, {"base": {"p_base": 100.0, "u_scale": 1.0, "p_scale": 0.001, "i_scale": 1.0, "p_base_kW": 100000.0}}
 
         def build_model(ppc):
             return fake_hybrid_network
@@ -463,7 +463,7 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         dcac = FakeConverter()
         acac = FakeConverter()
         ppc = {
-            "base": [100.0, 1.0, 0.001, 1.0, 100000.0],
+            "base": {"p_base": 100.0, "u_scale": 1.0, "p_scale": 0.001, "i_scale": 1.0, "p_base_kW": 100000.0},
             "ac": {},
             "dc": {},
             "ac_network": ac,

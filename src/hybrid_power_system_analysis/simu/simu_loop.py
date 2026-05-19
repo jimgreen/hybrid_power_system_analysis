@@ -445,7 +445,6 @@ def solve_ac_snapshot(e_file: Path) -> Tuple[Snapshot, str]:
     network.topo()
     calc = ACPowerFlowCalc(network)
     with contextlib.redirect_stdout(io.StringIO()):
-        calc.prepare()
         rc = calc.run()
     if rc != 0 or not calc.converged:
         raise RuntimeError(f"AC load flow failed for {e_file}: rc={rc}, iter={calc.iterations}, normF={calc.normF:.3e}")

@@ -77,7 +77,6 @@ def _run_ac_flow(e_file):
     net.read_from_file(e_file)
     net.topo()
     calc = ACPowerFlowCalc(net, tol=1e-8, max_iter=50)
-    _quiet_call(calc.prepare)
     rc = _quiet_call(calc.run)
     if rc != 0 or not calc.converged:
         raise RuntimeError(f"ac_flow.py did not converge for {e_file}")

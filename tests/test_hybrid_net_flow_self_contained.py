@@ -80,7 +80,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         ac_x, dc_x, _, _ = result.calc._split_x(result.calc.x)
         with contextlib.redirect_stdout(io.StringIO()):
             ac_j = result.calc.ac_calc.get_jacobi(ac_x)
-            dc_j = result.calc.dc_calc.get_jacobi(result.calc.dc_G, dc_x)
+            dc_j = result.calc.dc_calc.get_jacobi(dc_x)
             hybrid_j = result.calc.get_jacobi(result.calc.x)
         self.assertTrue(issparse(ac_j))
         self.assertTrue(issparse(dc_j))
@@ -227,35 +227,35 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertEqual("", captured.getvalue())
 
-    def test_hybrid_newton_uses_shared_sparse_solver(self):
+    def test_hybrid_newton_uses_current_factored_sparse_solver(self):
         import lfcore.hybrid_lf as hybrid_lf
 
         network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
-        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, linear_solver="umfpack")
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, linear_solver="scipy")
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
 
-        self.assertEqual("umfpack", calc.ac_calc.linear_solver)
-        self.assertEqual("umfpack", calc.dc_calc.linear_solver)
+        self.assertEqual("scipy", calc.ac_calc.linear_solver)
+        self.assertEqual("scipy", calc.dc_calc.linear_solver)
 
-        original_solver = hybrid_lf.solve_sparse_system
+        original_factor = hybrid_lf._factor_jacobian
         calls = []
 
-        def counted_solver(matrix, rhs, solver_name="scipy"):
-            calls.append((matrix.shape, rhs.shape, solver_name))
-            return original_solver(matrix, rhs, "scipy")
+        def counted_factor(matrix, resolved_name, solver_fn):
+            calls.append((matrix.shape, resolved_name, solver_fn))
+            return original_factor(matrix, resolved_name, solver_fn)
 
-        hybrid_lf.solve_sparse_system = counted_solver
+        hybrid_lf._factor_jacobian = counted_factor
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = calc.run()
         finally:
-            hybrid_lf.solve_sparse_system = original_solver
+            hybrid_lf._factor_jacobian = original_factor
 
         self.assertEqual(0, rc)
         self.assertTrue(calls)
-        self.assertTrue(all(shape == (calc.total_eq, calc.total_vars) for shape, _rhs_shape, _solver in calls))
-        self.assertTrue(all(solver == "umfpack" for _shape, _rhs_shape, solver in calls))
+        self.assertTrue(all(shape == (calc.total_eq, calc.total_vars) for shape, _solver, _fn in calls))
+        self.assertTrue(all(solver == "scipy" for _shape, solver, _fn in calls))
 
     def test_converter_terms_reuse_ac_state_cache(self):
         import hybrid_net_flow
@@ -675,7 +675,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             rc = calc.run()
 
         self.assertEqual(0, rc)
-        self.assertTrue(calc.dc_calc.array_mode)
+        self.assertFalse(hasattr(calc.dc_calc, "array_mode"))
         self.assertEqual("dc_ppc_v1", calc.dc_calc.ppc["format"])
 
     def test_pure_ac_hybrid_lf_load_uses_lightweight_ac_fast_path(self):
@@ -760,7 +760,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         network.topo()
 
         from ac_model import ACPowerNetwork
-        from dc_array_model import DCPowerNetwork
+        from dc_model import DCPowerNetwork
 
         self.assertIsInstance(network.ac, ACPowerNetwork)
         self.assertIsInstance(network.dc, DCPowerNetwork)
@@ -834,7 +834,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_main_hybrid_power_flow_skips_topology_diagnostics(self):
         import hybrid_net_flow
         from ac_model import ACPowerNetwork
-        from dc_array_model import DCPowerNetwork
+        from dc_model import DCPowerNetwork
 
         original_ac_check_topo = ACPowerNetwork.check_topo
         original_dc_check_topo = DCPowerNetwork.check_topo

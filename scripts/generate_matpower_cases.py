@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-from pypower.idx_brch import ANGMAX, ANGMIN, BR_B, BR_R, BR_STATUS, BR_X, F_BUS, RATE_A, RATE_B, RATE_C, SHIFT, T_BUS, TAP
+from pypower.idx_brch import ANGMAX, ANGMIN, BR_B, BR_R, BR_STATUS, BR_X, F_BUS, PF, PT, QF, QT, RATE_A, RATE_B, RATE_C, SHIFT, T_BUS, TAP
 from pypower.idx_bus import BASE_KV, BS, BUS_AREA, BUS_I, BUS_TYPE, GS, PD, QD, VA, VM, VMAX, VMIN, ZONE
 from pypower.idx_gen import GEN_BUS, GEN_STATUS, MBASE, PG, PMAX, PMIN, QG, QMAX, QMIN, VG
 
@@ -115,8 +115,8 @@ def _build_components(acppc: dict) -> Tuple[np.ndarray, List[List[int]], dict, n
     return row_to_comp, comp_rows, row_by_node, row_to_bus_id
 
 
-def build_matpower_ppc_from_acppc(acppc: dict) -> dict:
-    """Convert project AC array ppc into a MATPOWER v2 ppc.
+def build_matpower_projection_from_acppc(acppc: dict) -> Dict[str, object]:
+    """Build a MATPOWER ppc plus projection metadata from an AC array ppc.
 
     Zero branches, closed switches, and closed breakers are collapsed into one
     MATPOWER bus. ZIP loads are exported as static P/Q at V=1. Transformer
@@ -224,9 +224,13 @@ def build_matpower_ppc_from_acppc(acppc: dict) -> dict:
     gen = np.vstack(gen_rows) if gen_rows else np.zeros((0, 21), dtype=np.float64)
 
     branch_rows = []
+    branch_map: List[Tuple[str, int]] = []
+    transformer_shunt_meta = []
 
     def add_branch_devices(devices: np.ndarray, cols: dict, is_transformer: bool) -> None:
-        for row in _active_rows(devices, cols["run_stat"]):
+        for pos, row in enumerate(devices):
+            if int(row[cols["run_stat"]]) != 1:
+                continue
             i_row = row_by_node.get(int(row[cols["i_node"]]))
             j_row = row_by_node.get(int(row[cols["j_node"]]))
             if i_row is None or j_row is None or row_to_comp[i_row] < 0 or row_to_comp[j_row] < 0:
@@ -251,12 +255,93 @@ def build_matpower_ppc_from_acppc(acppc: dict) -> dict:
             branch_row[BR_STATUS] = 1
             branch_row[ANGMIN] = -360.0
             branch_row[ANGMAX] = 360.0
+            mp_branch_idx = len(branch_rows)
             branch_rows.append(branch_row)
+            kind = "transformer" if is_transformer else "branch"
+            branch_map.append((kind, pos))
+            if is_transformer:
+                tap = row[cols["tap"]]
+                tap_mag = tap if abs(tap) > 1e-12 else 1.0
+                scale = 1.0 / (tap_mag * tap_mag)
+                transformer_shunt_meta.append(
+                    {
+                        "mp_branch_idx": mp_branch_idx,
+                        "transformer_row": pos,
+                        "transformer_idx": int(row[cols["idx"]]),
+                        "i_bus": int(i_bus),
+                        "j_bus": int(j_bus),
+                        "g_pu": float(row[cols["gt"]] * scale),
+                        "b_pu": float(row[cols["bt"]] * scale),
+                    }
+                )
 
     add_branch_devices(branch0, BRANCH_COLS, False)
     add_branch_devices(transformer0, TRANSFORMER_COLS, True)
     branch = np.vstack(branch_rows) if branch_rows else np.zeros((0, 13), dtype=np.float64)
-    return {"version": "2", "baseMVA": base_mva, "bus": bus, "gen": gen, "branch": branch}
+    return {
+        "ppc": {"version": "2", "baseMVA": base_mva, "bus": bus, "gen": gen, "branch": branch},
+        "row_to_comp": row_to_comp,
+        "comp_rows": comp_rows,
+        "row_by_node": row_by_node,
+        "row_to_bus_id": row_to_bus_id,
+        "branch_map": branch_map,
+        "transformer_shunt_meta": transformer_shunt_meta,
+    }
+
+
+def build_matpower_ppc_from_acppc(acppc: dict) -> dict:
+    """Convert project AC array ppc into a MATPOWER v2 ppc."""
+    return build_matpower_projection_from_acppc(acppc)["ppc"]
+
+
+def extract_matpower_device_losses(mp_result: dict, acppc: dict) -> Dict[str, np.ndarray]:
+    """Return MATPOWER branch/transformer losses in project device indexing.
+
+    Transformer totals include the projected i-side ``gt/bt`` bus-shunt term,
+    so the returned values are directly comparable with project-side
+    ``i_p+j_p`` / ``i_q+j_q`` terminal totals.
+    """
+
+    projection = build_matpower_projection_from_acppc(acppc)
+    base_mva = float(mp_result["baseMVA"])
+    mp_branch = np.asarray(mp_result["branch"], dtype=np.float64)
+    mp_bus = {int(row[BUS_I]): row for row in np.asarray(mp_result["bus"], dtype=np.float64)}
+
+    branch_terminal = np.zeros((acppc["branch"].shape[0], 4), dtype=np.float64)
+    transformer_terminal = np.zeros((acppc["transformer"].shape[0], 4), dtype=np.float64)
+    transformer_projected_shunt = np.zeros((acppc["transformer"].shape[0], 2), dtype=np.float64)
+
+    for mp_idx, (kind, device_idx) in enumerate(projection["branch_map"]):
+        row = mp_branch[mp_idx]
+        if int(row[BR_STATUS]) != 1:
+            continue
+        p_i = float(row[PF] / base_mva)
+        q_i = float(row[QF] / base_mva)
+        p_j = float(row[PT] / base_mva)
+        q_j = float(row[QT] / base_mva)
+        if kind == "branch":
+            branch_terminal[device_idx, :] = (p_i, q_i, p_j, q_j)
+        else:
+            transformer_terminal[device_idx, :] = (p_i, q_i, p_j, q_j)
+
+    for meta in projection["transformer_shunt_meta"]:
+        device_idx = int(meta["transformer_row"])
+        i_bus = int(meta["i_bus"])
+        vm = float(mp_bus[i_bus][VM])
+        p_sh = float(meta["g_pu"] * vm * vm)
+        q_sh = float(-meta["b_pu"] * vm * vm)
+        transformer_projected_shunt[device_idx, :] = (p_sh, q_sh)
+
+    transformer_total = transformer_terminal.copy()
+    transformer_total[:, 0] += transformer_projected_shunt[:, 0]
+    transformer_total[:, 1] += transformer_projected_shunt[:, 1]
+
+    return {
+        "branch_terminal": branch_terminal,
+        "transformer_terminal": transformer_terminal,
+        "transformer_projected_shunt": transformer_projected_shunt,
+        "transformer_total": transformer_total,
+    }
 
 
 def _fmt(value: float) -> str:

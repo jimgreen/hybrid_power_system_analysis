@@ -9,7 +9,7 @@ for path in (MODEL_DIR,):
         sys.path.insert(0, str(path))
 
 from ac_model import ACPowerNetwork
-from dc_array_model import DCPowerNetwork
+from dc_model import DCPowerNetwork
 from hybrid_array_model import build_hybrid_ppc_from_e_file
 
 

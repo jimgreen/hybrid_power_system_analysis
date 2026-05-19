@@ -16,7 +16,7 @@ from ac_array_model import build_ac_ppc_from_e_file  # noqa: E402
 from ac_lf import ACPowerFlowCalc  # noqa: E402
 from ac_se import ACStateEstimator  # noqa: E402
 from dc_lf import DCPowerFlowCalc  # noqa: E402
-from dc_array_model import DCPowerNetwork  # noqa: E402
+from dc_model import DCPowerNetwork  # noqa: E402
 from dc_se import DCStateEstimator  # noqa: E402
 from hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork  # noqa: E402
 from hybrid_se import HybridStateEstimator  # noqa: E402
@@ -57,11 +57,10 @@ def _time_call(func):
 
 
 def _bench_ac_lf(e_file: Path):
-    ppc, init_s = _time_call(lambda: build_ac_ppc_from_e_file(e_file, use_cache=True, copy_arrays=False))
-    calc = ACPowerFlowCalc.from_ppc(ppc, tol=1e-8, max_iter=50)
+    ppc, init_s = _time_call(lambda: build_ac_ppc_from_e_file(e_file))
+    calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
 
     def solve():
-        _silent(calc.prepare)
         return _silent(calc.run)
 
     rc, solve_s = _time_call(solve)

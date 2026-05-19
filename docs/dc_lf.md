@@ -17,11 +17,11 @@
 ```python
 from lfcore.dc_lf import DCPowerFlowCalc
 
-calc = DCPowerFlowCalc(network)
-rc = calc.run(tol=1e-8, max_iter=50, min_voltage=0.01, verbose=False)
+calc = DCPowerFlowCalc(network, tol=1e-8, max_iter=50, min_voltage=0.01, verbose=False)
+rc = calc.run()
 ```
 
-`run()` 内部会调用 `prepare()`，因此一般不需要外部单独调用。
+`run()` 内部会在需要时自动调用 `prepare()`；外部只有在需要调试或复用中间矩阵时才需要单独调用 `prepare()`。
 
 ## 支持的模型对象
 

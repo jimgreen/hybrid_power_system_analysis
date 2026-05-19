@@ -21,9 +21,10 @@
 from lfcore.ac_lf import ACPowerFlowCalc
 
 calc = ACPowerFlowCalc(network, tol=1e-8, max_iter=50, min_voltage=0.01)
-calc.prepare()
 rc = calc.run()
 ```
+
+`run()` 内部会在需要时自动调用 `prepare()`；外部只有在需要调试或复用中间矩阵时才需要单独调用 `prepare()`。
 
 也支持数组化输入：
 

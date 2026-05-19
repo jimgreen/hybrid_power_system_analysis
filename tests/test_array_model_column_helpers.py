@@ -85,6 +85,46 @@ class ArrayModelColumnHelperTest(unittest.TestCase):
                         np.array([3.0, 5.0]),
                     )
 
+    def test_ac_dc_ppc_base_contract_is_named_and_dc_hides_node_pos(self):
+        import model.ac_array_model as ac_array_model
+        import model.dc_array_model as dc_array_model
+
+        base_table = {
+            "header_list": ["p_base", "u_scale", "p_scale", "i_scale"],
+            "rows": [["100000", "1000", "1000", "1"]],
+        }
+        ac_ppc = ac_array_model.build_ac_ppc_from_efile_rows(
+            "inline_ac.e",
+            {
+                "PowerBase": base_table,
+                "ACNode": {
+                    "header_list": ["idx", "name", "vbase", "voltage", "angle", "run_stat"],
+                    "rows": [["1", "ac1", "110", "110", "0", "1"]],
+                },
+            },
+        )
+        dc_ppc = dc_array_model.build_dc_ppc_from_efile_rows(
+            "inline_dc.e",
+            {
+                "PowerBase": base_table,
+                "DCNode": {
+                    "header_list": ["idx", "name", "vbase", "voltage", "run_stat"],
+                    "rows": [["1", "dc1", "500", "500", "1"]],
+                },
+            },
+        )
+
+        expected_base = {
+            "p_base": 100000.0,
+            "u_scale": 1000.0,
+            "p_scale": 1000.0,
+            "i_scale": 1.0,
+            "p_base_kW": 100.0,
+        }
+        self.assertEqual(expected_base, ac_ppc["base"])
+        self.assertEqual(expected_base, dc_ppc["base"])
+        self.assertNotIn("node_pos", dc_ppc)
+
 
 if __name__ == "__main__":
     unittest.main()

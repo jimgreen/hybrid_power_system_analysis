@@ -1434,15 +1434,19 @@ def apply_ac_topology_arrays(
         network.load_dict = {}
         network.shunt_compensator_dict = {}
         network.zero_branch_dict = {}
+        network.zero_branche_dict = network.zero_branch_dict
         network.switch_dict = {}
         network.break_dict = {}
+        network.branche_dict = network.branch_dict
     else:
         network.branch_dict = {int(dev.idx): dev for dev in branches}
+        network.branche_dict = network.branch_dict
         network.transformer_dict = {int(dev.idx): dev for dev in transformers}
         network.generator_dict = {int(dev.idx): dev for dev in generators}
         network.load_dict = {int(dev.idx): dev for dev in loads}
         network.shunt_compensator_dict = {int(dev.idx): dev for dev in shunts}
         network.zero_branch_dict = {int(dev.idx): dev for dev in zero_branches}
+        network.zero_branche_dict = network.zero_branch_dict
         network.switch_dict = {int(dev.idx): dev for dev in switches}
         network.break_dict = {int(dev.idx): dev for dev in breakers}
 
@@ -1840,8 +1844,10 @@ def prepare_ac_topology(network) -> None:
     network.load_dict = {dev.idx: dev for dev in loads}
     network.shunt_compensator_dict = {dev.idx: dev for dev in shunts}
     network.zero_branch_dict = {dev.idx: dev for dev in zero_branches}
+    network.zero_branche_dict = network.zero_branch_dict
     network.switch_dict = {dev.idx: dev for dev in switches}
     network.break_dict = {dev.idx: dev for dev in breakers}
+    network.branche_dict = network.branch_dict
 
     for node in nodes:
         node.isl = 0

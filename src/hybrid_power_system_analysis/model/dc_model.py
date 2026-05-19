@@ -150,6 +150,149 @@ from efile_read import efile_factory_from_file, efile_factory_from_rows
 from unit_system import normalize_model_named_units
 
 
+_DC_ROW_CLASS_BY_TABLE = {
+    "DCNode": DCNode,
+    "DCBranch": DCBranch,
+    "DCLoad": DCLoad,
+    "DCGenerator": DCGenerator,
+    "DCZeroBranch": DCZeroBranch,
+    "DCSwitch": DCSwitch,
+    "DCBreak": DCBreak,
+    "DCDCConverter": DCDCConverter,
+}
+
+
+_DC_ROW_DEFAULT_ATTRS = {
+    "DCNode": {
+        "idx": 0,
+        "name": "",
+        "vbase": 0.0,
+        "voltage": 1.0,
+        "run_stat": 1,
+        "isl": None,
+        "isl_obj": None,
+        "v_set": 1.0,
+        "v_gens": [],
+        "v_dcdcs": [],
+        "is_slack": False,
+        "bus": None,
+        "bus_obj": None,
+    },
+    "DCBranch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "r": 0.0,
+        "run_stat": 1,
+        "current": None,
+        "i_p": None,
+        "j_p": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "DCLoad": {
+        "idx": 0,
+        "name": "",
+        "node": 0,
+        "pbase": 1.0,
+        "pv0": 0.0,
+        "pv1": 0.0,
+        "pv2": 0.0,
+        "run_stat": 1,
+        "p": None,
+        "current": None,
+        "node_obj": None,
+    },
+    "DCGenerator": {
+        "idx": 0,
+        "name": "",
+        "node": 0,
+        "control_type": "",
+        "p_set": 0.0,
+        "v_set": 1.0,
+        "i_set": 0.0,
+        "run_stat": 1,
+        "p": None,
+        "current": None,
+        "node_obj": None,
+    },
+    "DCZeroBranch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "run_stat": 1,
+        "current": None,
+        "p": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "DCSwitch": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "status": 1,
+        "run_stat": 1,
+        "current": None,
+        "p": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "DCBreak": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "status": 1,
+        "run_stat": 1,
+        "current": None,
+        "p": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+    "DCDCConverter": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "r1": 0.0,
+        "r2": 0.0,
+        "control_type": "",
+        "p_set": 0.0,
+        "i_set": 0.0,
+        "v_set": 1.0,
+        "run_stat": 1,
+        "i_p": None,
+        "j_p": None,
+        "i_c": None,
+        "j_c": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
+}
+
+
+def _coerce_dc_rows(rows, table_name):
+    row_cls = _DC_ROW_CLASS_BY_TABLE[table_name]
+    defaults = _DC_ROW_DEFAULT_ATTRS.get(table_name, {})
+    output = []
+    for row in rows:
+        if isinstance(row, row_cls):
+            for attr, value in defaults.items():
+                if not hasattr(row, attr):
+                    setattr(row, attr, value.copy() if isinstance(value, list) else value)
+            output.append(row)
+            continue
+        row_values = getattr(row, "__dict__", {})
+        obj = row_cls.__new__(row_cls)
+        obj.__dict__.update({key: value.copy() if isinstance(value, list) else value for key, value in defaults.items()})
+        obj.__dict__.update(row_values)
+        output.append(obj)
+    return output
+
+
 class DCPowerNetwork:
     def __init__(self):
 
@@ -162,6 +305,7 @@ class DCPowerNetwork:
         self.breakers = []
         self.dcdc_converters = []
         self.buses = []
+        self.islands = []
 
         self.node_dict = {}
         self.bus_dict = {}
@@ -170,8 +314,10 @@ class DCPowerNetwork:
         self.break_dict = {}
         self.load_dict = {}
         self.generator_dict = {}
-        self.zero_branche_dict = {}
-        self.branche_dict = {}
+        self.zero_branch_dict = {}
+        self.branch_dict = {}
+        self.zero_branche_dict = self.zero_branch_dict
+        self.branche_dict = self.branch_dict
         self.dcdc_converter_dict = {}
 
     def add_node(self, idx, vbase, voltage=1.0, run_stat=1):
@@ -227,17 +373,14 @@ class DCPowerNetwork:
             self.u_scale = float(self.model.u_scale)
             self.p_scale = float(self.model.p_scale)
             self.i_scale = float(self.model.i_scale)
-        self.branches = getattr(self.model, 'DCBranch', [])
-        self.nodes = getattr(self.model, 'DCNode', [])
-        self.generators = getattr(self.model, 'DCGenerator', [])
-        self.loads = getattr(self.model, 'DCLoad', [])
-        self.dcdc_converters = getattr(self.model, 'DCDCConverter', [])
-        self.switches = getattr(self.model, 'DCSwitch', [])
-        self.zero_branches = getattr(self.model, 'DCZeroBranch', [])
-        self.breakers = [
-            self._coerce_break(row)
-            for row in getattr(self.model, 'DCBreak', [])
-        ]
+        self.branches = _coerce_dc_rows(getattr(self.model, 'DCBranch', []), "DCBranch")
+        self.nodes = _coerce_dc_rows(getattr(self.model, 'DCNode', []), "DCNode")
+        self.generators = _coerce_dc_rows(getattr(self.model, 'DCGenerator', []), "DCGenerator")
+        self.loads = _coerce_dc_rows(getattr(self.model, 'DCLoad', []), "DCLoad")
+        self.dcdc_converters = _coerce_dc_rows(getattr(self.model, 'DCDCConverter', []), "DCDCConverter")
+        self.switches = _coerce_dc_rows(getattr(self.model, 'DCSwitch', []), "DCSwitch")
+        self.zero_branches = _coerce_dc_rows(getattr(self.model, 'DCZeroBranch', []), "DCZeroBranch")
+        self.breakers = _coerce_dc_rows(getattr(self.model, 'DCBreak', []), "DCBreak")
         self.buses = []
         self.islands = []
         self.node_dict = {}
@@ -247,8 +390,10 @@ class DCPowerNetwork:
         self.break_dict = {}
         self.load_dict = {}
         self.generator_dict = {}
-        self.zero_branche_dict = {}
-        self.branche_dict = {}
+        self.zero_branch_dict = {}
+        self.branch_dict = {}
+        self.zero_branche_dict = self.zero_branch_dict
+        self.branche_dict = self.branch_dict
         self.dcdc_converter_dict = {}
 
     def read_from_model(self, model):
@@ -284,8 +429,10 @@ class DCPowerNetwork:
         self.break_dict = {brk.idx: brk for brk in self.breakers}
         self.load_dict = {ld.idx: ld for ld in self.loads}
         self.generator_dict = {gen.idx: gen for gen in self.generators}
-        self.zero_branche_dict = {zbr.idx: zbr for zbr in self.zero_branches}
-        self.branche_dict = {br.idx: br for br in self.branches}
+        self.zero_branch_dict = {zbr.idx: zbr for zbr in self.zero_branches}
+        self.zero_branche_dict = self.zero_branch_dict
+        self.branch_dict = {br.idx: br for br in self.branches}
+        self.branche_dict = self.branch_dict
         self.dcdc_converter_dict = {conv.idx: conv for conv in self.dcdc_converters}
 
         for node in self.nodes:
