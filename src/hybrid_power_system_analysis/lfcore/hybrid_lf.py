@@ -563,7 +563,7 @@ class HybridPowerFlowCalc:
         verbose=True,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
-        linear_solver: str = "auto",
+        linear_solver: str = "pyklu",
         result_mode: str = "full",
     ):
         self.network = network
@@ -577,7 +577,7 @@ class HybridPowerFlowCalc:
         self.verbose = verbose
         # 与 ac_lf/dc_lf 同步：linear_solver 留用户输入，实际 callable 与解析后名
         # 分别保存到 _linear_solver_fn / _linear_solver_resolved。
-        self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self.linear_solver = str(linear_solver or "pyklu").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.result_mode = self._normalize_result_mode(result_mode)
         self.has_ac = len(network.ac.nodes) > 0
@@ -2422,7 +2422,7 @@ def main(argv=None) -> int:
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
-    parser.add_argument("--linear-solver", default="scipy")
+    parser.add_argument("--linear-solver", default="pyklu")
     parser.add_argument("--result-mode", choices=("full", "array", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)

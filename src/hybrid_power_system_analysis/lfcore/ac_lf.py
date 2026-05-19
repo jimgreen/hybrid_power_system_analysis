@@ -235,7 +235,7 @@ class ACPowerFlowCalc:
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
         keep_node_objects: bool = True,
-        linear_solver: str = "auto",
+        linear_solver: str = "pyklu",
         result_mode: str = "full",
         verbose: bool = False,
     ):
@@ -265,7 +265,7 @@ class ACPowerFlowCalc:
         self.min_voltage = self.params.min_voltage
         # 用户请求的求解器名原样保留，便于上层日志/测试断言；实际 callable
         # 由 _resolve_linear_solver 决定，未安装时回退 SuperLU。
-        self.linear_solver = str(linear_solver or "scipy").strip().lower()
+        self.linear_solver = str(linear_solver or "pyklu").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.verbose = bool(verbose)
         self.target_island = island
@@ -2979,7 +2979,7 @@ def main(argv=None) -> int:
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
-    parser.add_argument("--linear-solver", default="scipy")
+    parser.add_argument("--linear-solver", default="pyklu")
     parser.add_argument("--result-mode", choices=("full", "array", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)

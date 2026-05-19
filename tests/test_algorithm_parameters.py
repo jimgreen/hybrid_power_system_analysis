@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -228,6 +229,82 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             ],
             calls,
         )
+
+    def test_lf_cli_defaults_to_pyklu_linear_solver(self):
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
+        import lfcore.hybrid_lf as hybrid_lf
+
+        cases = (
+            (
+                ac_lf,
+                "load_ac_ppc_from_e_file",
+                "ACPowerFlowCalc",
+                ["data/model/ac/ieee300.e", "--quiet"],
+                lambda _file_name: {"format": "ac_ppc_v1"},
+            ),
+            (
+                dc_lf,
+                "load_dc_ppc_from_e_file",
+                "DCPowerFlowCalc",
+                ["data/model/dc/dc_net_30.e", "--quiet"],
+                lambda _file_name: {"format": "dc_ppc_v1"},
+            ),
+            (
+                hybrid_lf,
+                "_read_lf_network_from_file",
+                "HybridPowerFlowCalc",
+                ["data/model/hybrid/hybrid_net_40.e", "--quiet"],
+                lambda _file_name: "hybrid-network",
+            ),
+        )
+
+        for module, loader_name, calc_name, argv, loader in cases:
+            calls = []
+
+            class FakeCalc:
+                skipped_islands = []
+                converged = True
+                iterations = 0
+                normF = 0.0
+                result_mode = "full"
+
+                def __init__(self, network, **kwargs):
+                    calls.append(kwargs.get("linear_solver"))
+
+                def run(self):
+                    return 0
+
+            original_loader = getattr(module, loader_name)
+            original_calc = getattr(module, calc_name)
+            setattr(module, loader_name, loader)
+            setattr(module, calc_name, FakeCalc)
+            try:
+                self.assertEqual(0, module.main(argv))
+            finally:
+                setattr(module, loader_name, original_loader)
+                setattr(module, calc_name, original_calc)
+
+            self.assertEqual(["pyklu"], calls, calc_name)
+
+    def test_lf_calc_classes_default_to_pyklu_linear_solver(self):
+        from lfcore.ac_lf import ACPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        ac_calc = ACPowerFlowCalc({"format": "ac_ppc_v1"})
+        dc_calc = DCPowerFlowCalc({"format": "dc_ppc_v1"})
+        hybrid_network = SimpleNamespace(
+            ac=SimpleNamespace(nodes=[]),
+            dc=SimpleNamespace(nodes=[]),
+            dcac_converters=[],
+            acac_converters=[],
+        )
+        hybrid_calc = HybridPowerFlowCalc(hybrid_network, verbose=False)
+
+        self.assertEqual("pyklu", ac_calc.linear_solver)
+        self.assertEqual("pyklu", dc_calc.linear_solver)
+        self.assertEqual("pyklu", hybrid_calc.linear_solver)
 
     def test_ac_dc_sparse_solver_registry_supports_sksparse_klu_solve(self):
         import types
