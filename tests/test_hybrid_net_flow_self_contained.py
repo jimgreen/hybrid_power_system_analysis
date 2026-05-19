@@ -136,6 +136,38 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
 
+    def test_hybrid_newton_system_direct_stamps_subsolver_data(self):
+        import numpy as np
+        import ac_lf
+        import lfcore.dc_lf as dc_lf
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+        )
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        _expected_f, expected_j = calc._build_newton_system(calc.x)
+
+        original_ac_csr = ac_lf.csr_matrix
+        original_dc_csr = dc_lf.csr_matrix
+
+        def reject_submatrix_materialization(*_args, **_kwargs):
+            raise AssertionError("Hybrid assembly should stamp AC/DC Jacobian data without submatrix materialization")
+
+        ac_lf.csr_matrix = reject_submatrix_materialization
+        dc_lf.csr_matrix = reject_submatrix_materialization
+        try:
+            _actual_f, actual_j = calc._build_newton_system(calc.x)
+        finally:
+            ac_lf.csr_matrix = original_ac_csr
+            dc_lf.csr_matrix = original_dc_csr
+
+        self.assertEqual("csc", actual_j.format)
+        np.testing.assert_allclose(actual_j.toarray(), expected_j.toarray(), atol=1e-12)
+
     def test_hybrid_residual_reuses_preallocated_work_array(self):
         import numpy as np
         import lfcore.hybrid_lf as hybrid_lf

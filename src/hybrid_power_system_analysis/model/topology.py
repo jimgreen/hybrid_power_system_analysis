@@ -50,6 +50,28 @@ class GridTopologyArrays:
     devices: Dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class TerminalDeviceTopologyInput:
+    i_node_pos: np.ndarray
+    j_node_pos: np.ndarray
+    run_mask: np.ndarray
+
+
+@dataclass
+class SingleDeviceTopologyInput:
+    node_pos: np.ndarray
+    run_mask: np.ndarray
+
+
+@dataclass
+class GridTopologyInput:
+    node_ids: np.ndarray
+    node_run_mask: np.ndarray
+    node_lookup: object
+    terminals: Dict[str, TerminalDeviceTopologyInput] = field(default_factory=dict)
+    singles: Dict[str, SingleDeviceTopologyInput] = field(default_factory=dict)
+
+
 def _empty_terminal_device(count: int = 0) -> TerminalDeviceTopologyArrays:
     values = np.full(int(count), -1, dtype=np.int32)
     return TerminalDeviceTopologyArrays(
@@ -118,6 +140,65 @@ def _map_node_positions(values, lookup) -> np.ndarray:
     return out
 
 
+def _terminal_topology_input(
+    table,
+    i_col: int,
+    j_col: int,
+    run_col: int,
+    node_lookup,
+    status_col: Optional[int] = None,
+) -> TerminalDeviceTopologyInput:
+    rows = np.asarray(table)
+    count = int(rows.shape[0]) if rows.size else 0
+    if count == 0:
+        return TerminalDeviceTopologyInput(_EMPTY_INT, _EMPTY_INT, _EMPTY_BOOL)
+    run_mask = rows[:, run_col].astype(np.int64, copy=False) == 1
+    if status_col is not None:
+        run_mask &= rows[:, status_col].astype(np.int64, copy=False) == 1
+    return TerminalDeviceTopologyInput(
+        _map_node_positions(rows[:, i_col], node_lookup),
+        _map_node_positions(rows[:, j_col], node_lookup),
+        run_mask,
+    )
+
+
+def _single_topology_input(table, node_col: int, run_col: int, node_lookup) -> SingleDeviceTopologyInput:
+    rows = np.asarray(table)
+    count = int(rows.shape[0]) if rows.size else 0
+    if count == 0:
+        return SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+    return SingleDeviceTopologyInput(
+        _map_node_positions(rows[:, node_col], node_lookup),
+        rows[:, run_col].astype(np.int64, copy=False) == 1,
+    )
+
+
+def _compatible_terminal_input(precomputed, count: int) -> bool:
+    return (
+        precomputed is not None
+        and getattr(precomputed, "i_node_pos", _EMPTY_INT).shape[0] == count
+        and getattr(precomputed, "j_node_pos", _EMPTY_INT).shape[0] == count
+        and getattr(precomputed, "run_mask", _EMPTY_BOOL).shape[0] == count
+    )
+
+
+def _compatible_single_input(precomputed, count: int) -> bool:
+    return (
+        precomputed is not None
+        and getattr(precomputed, "node_pos", _EMPTY_INT).shape[0] == count
+        and getattr(precomputed, "run_mask", _EMPTY_BOOL).shape[0] == count
+    )
+
+
+def _compatible_grid_topology_input(precomputed, node_count: int) -> bool:
+    return (
+        precomputed is not None
+        and getattr(precomputed, "node_ids", _EMPTY_INT).shape[0] == node_count
+        and getattr(precomputed, "node_run_mask", _EMPTY_BOOL).shape[0] == node_count
+        and getattr(precomputed, "node_lookup", None) is not None
+    )
+
+
 def _table_count(table) -> int:
     return 0 if table is None else int(np.asarray(table).shape[0])
 
@@ -130,21 +211,28 @@ def _active_terminal_positions(
     node_lookup,
     running_node_mask: np.ndarray,
     status_col: Optional[int] = None,
+    precomputed: Optional[TerminalDeviceTopologyInput] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     rows = np.asarray(table)
     count = int(rows.shape[0]) if rows.size else 0
     if count == 0:
         return _EMPTY_INT, _EMPTY_INT, _EMPTY_BOOL
-    i_pos = _map_node_positions(rows[:, i_col], node_lookup)
-    j_pos = _map_node_positions(rows[:, j_col], node_lookup)
+    if _compatible_terminal_input(precomputed, count):
+        i_pos = precomputed.i_node_pos
+        j_pos = precomputed.j_node_pos
+        run_mask = precomputed.run_mask
+    else:
+        i_pos = _map_node_positions(rows[:, i_col], node_lookup)
+        j_pos = _map_node_positions(rows[:, j_col], node_lookup)
+        run_mask = rows[:, run_col].astype(np.int64, copy=False) == 1
+        if status_col is not None:
+            run_mask &= rows[:, status_col].astype(np.int64, copy=False) == 1
     active = (
-        (rows[:, run_col].astype(np.int64, copy=False) == 1)
+        run_mask
         & (i_pos >= 0)
         & (j_pos >= 0)
         & (i_pos != j_pos)
     )
-    if status_col is not None:
-        active &= rows[:, status_col].astype(np.int64, copy=False) == 1
     if running_node_mask.size:
         valid_i = i_pos >= 0
         valid_j = j_pos >= 0
@@ -222,7 +310,7 @@ def _make_compact_bus(bus_cls, idx: int, grouped_nodes):
 def _component_position_groups(
     node_ids: np.ndarray,
     node_run_mask: np.ndarray,
-    edge_specs: Sequence[Tuple[np.ndarray, int, int, int, Optional[int]]],
+    edge_specs: Sequence[Tuple],
     node_lookup,
 ) -> Sequence[Sequence[int]]:
     n_nodes = int(node_ids.size)
@@ -232,7 +320,9 @@ def _component_position_groups(
 
     left_chunks = []
     right_chunks = []
-    for table, i_col, j_col, run_col, status_col in edge_specs:
+    for edge_spec in edge_specs:
+        table, i_col, j_col, run_col, status_col = edge_spec[:5]
+        precomputed = edge_spec[5] if len(edge_spec) > 5 else None
         i_pos, j_pos, active = _active_terminal_positions(
             table,
             i_col,
@@ -241,6 +331,7 @@ def _component_position_groups(
             node_lookup,
             node_run_mask,
             status_col=status_col,
+            precomputed=precomputed,
         )
         if active.size and np.any(active):
             left_chunks.append(i_pos[active])
@@ -273,45 +364,135 @@ def _component_position_groups(
     return groups
 
 
+def _component_position_group_arrays(
+    node_ids: np.ndarray,
+    node_run_mask: np.ndarray,
+    edge_specs: Sequence[Tuple],
+    node_lookup,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n_nodes = int(node_ids.size)
+    item_to_group_pos = np.full(n_nodes, -1, dtype=np.int32)
+    running_positions = np.flatnonzero(node_run_mask).astype(np.int32, copy=False)
+    if running_positions.size == 0:
+        return (
+            np.empty(0, dtype=np.int32),
+            np.asarray([0], dtype=np.int32),
+            _EMPTY_INT,
+            item_to_group_pos,
+        )
+
+    left_chunks = []
+    right_chunks = []
+    for edge_spec in edge_specs:
+        table, i_col, j_col, run_col, status_col = edge_spec[:5]
+        precomputed = edge_spec[5] if len(edge_spec) > 5 else None
+        i_pos, j_pos, active = _active_terminal_positions(
+            table,
+            i_col,
+            j_col,
+            run_col,
+            node_lookup,
+            node_run_mask,
+            status_col=status_col,
+            precomputed=precomputed,
+        )
+        if active.size and np.any(active):
+            left_chunks.append(i_pos[active])
+            right_chunks.append(j_pos[active])
+
+    if not left_chunks:
+        order = np.argsort(node_ids[running_positions], kind="stable")
+        indices = running_positions[order].astype(np.int32, copy=False)
+        group_ids = node_ids[indices].astype(np.int32, copy=False)
+        offsets = np.arange(indices.size + 1, dtype=np.int32)
+        item_to_group_pos[indices] = np.arange(indices.size, dtype=np.int32)
+        return group_ids, offsets, indices, item_to_group_pos
+
+    left = np.concatenate(left_chunks).astype(np.int32, copy=False)
+    right = np.concatenate(right_chunks).astype(np.int32, copy=False)
+    graph = coo_matrix((np.ones(left.size, dtype=np.int8), (left, right)), shape=(n_nodes, n_nodes))
+    _count, labels = connected_components(graph, directed=False, return_labels=True)
+
+    running_labels = labels[running_positions]
+    order = np.lexsort((node_ids[running_positions], running_labels))
+    sorted_positions = running_positions[order].astype(np.int32, copy=False)
+    sorted_labels = running_labels[order]
+    boundaries = np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(sorted_labels[1:] != sorted_labels[:-1]).astype(np.int64) + 1,
+            np.asarray([sorted_positions.size], dtype=np.int64),
+        )
+    )
+    counts = np.diff(boundaries).astype(np.int32, copy=False)
+    first_positions = sorted_positions[boundaries[:-1]]
+    group_ids_unsorted = node_ids[first_positions].astype(np.int32, copy=False)
+    group_order = np.argsort(group_ids_unsorted, kind="stable")
+
+    old_group_for_sorted = np.repeat(np.arange(counts.size, dtype=np.int32), counts)
+    old_to_new = np.empty(counts.size, dtype=np.int32)
+    old_to_new[group_order] = np.arange(counts.size, dtype=np.int32)
+    new_group_for_sorted = old_to_new[old_group_for_sorted]
+    index_order = np.argsort(new_group_for_sorted, kind="stable")
+    indices = sorted_positions[index_order].astype(np.int32, copy=False)
+    item_to_group_pos[indices] = new_group_for_sorted[index_order]
+
+    offsets = np.empty(counts.size + 1, dtype=np.int32)
+    offsets[0] = 0
+    offsets[1:] = np.cumsum(counts[group_order], dtype=np.int32)
+    return group_ids_unsorted[group_order], offsets, indices, item_to_group_pos
+
+
 def _build_base_topology_arrays(
     node_ids: np.ndarray,
     node_run_mask: np.ndarray,
-    bus_edge_specs: Sequence[Tuple[np.ndarray, int, int, int, Optional[int]]],
-    island_edge_specs: Sequence[Tuple[np.ndarray, int, int, int, Optional[int]]],
+    bus_edge_specs: Sequence[Tuple],
+    island_edge_specs: Sequence[Tuple],
+    node_lookup=None,
 ) -> GridTopologyArrays:
     node_ids = np.asarray(node_ids, dtype=np.int32)
     node_run_mask = np.asarray(node_run_mask, dtype=bool)
     n_nodes = int(node_ids.size)
-    node_lookup = _make_node_pos_lookup(node_ids)
-    bus_groups = _component_position_groups(node_ids, node_run_mask, bus_edge_specs, node_lookup)
-    island_node_groups = _component_position_groups(node_ids, node_run_mask, island_edge_specs, node_lookup)
+    if node_lookup is None:
+        node_lookup = _make_node_pos_lookup(node_ids)
+    bus_ids, bus_node_offsets, bus_node_indices, node_to_bus_pos = _component_position_group_arrays(
+        node_ids,
+        node_run_mask,
+        bus_edge_specs,
+        node_lookup,
+    )
+    _island_node_ids, _island_node_offsets, _island_node_indices, node_to_island_pos = _component_position_group_arrays(
+        node_ids,
+        node_run_mask,
+        island_edge_specs,
+        node_lookup,
+    )
 
-    node_to_bus_pos = np.full(n_nodes, -1, dtype=np.int32)
-    bus_ids = np.empty(len(bus_groups), dtype=np.int32)
-    for bus_pos, group in enumerate(bus_groups):
-        bus_ids[bus_pos] = int(node_ids[group[0]])
-        node_to_bus_pos[np.asarray(group, dtype=np.intp)] = int(bus_pos)
-    bus_node_offsets, bus_node_indices = _flatten_position_groups(bus_groups)
+    bus_to_island_pos = np.full(bus_ids.size, -1, dtype=np.int32)
+    if bus_ids.size:
+        bus_first_node_pos = bus_node_indices[bus_node_offsets[:-1]]
+        bus_to_island_pos[:] = node_to_island_pos[bus_first_node_pos]
 
-    node_to_island_pos = np.full(n_nodes, -1, dtype=np.int32)
-    for island_pos, group in enumerate(island_node_groups):
-        node_to_island_pos[np.asarray(group, dtype=np.intp)] = int(island_pos)
-    island_bus_groups = [[] for _group in island_node_groups]
-    bus_to_island_pos = np.full(len(bus_groups), -1, dtype=np.int32)
-    for bus_pos, group in enumerate(bus_groups):
-        island_pos = int(node_to_island_pos[int(group[0])])
-        if island_pos < 0:
-            continue
-        bus_to_island_pos[bus_pos] = island_pos
-        island_bus_groups[island_pos].append(bus_pos)
+    island_count = int(_island_node_ids.size)
+    island_ids = np.arange(1, island_count + 1, dtype=np.int32)
+    valid_bus = bus_to_island_pos >= 0
+    if np.any(valid_bus):
+        bus_positions = np.flatnonzero(valid_bus).astype(np.int32, copy=False)
+        island_for_bus = bus_to_island_pos[bus_positions]
+        order = np.lexsort((bus_positions, island_for_bus))
+        island_bus_indices = bus_positions[order].astype(np.int32, copy=False)
+        counts = np.bincount(island_for_bus, minlength=island_count).astype(np.int32, copy=False)
+        island_bus_offsets = np.empty(island_count + 1, dtype=np.int32)
+        island_bus_offsets[0] = 0
+        island_bus_offsets[1:] = np.cumsum(counts, dtype=np.int32)
+    else:
+        island_bus_offsets = np.zeros(island_count + 1, dtype=np.int32)
+        island_bus_indices = _EMPTY_INT
 
-    island_ids = np.arange(1, len(island_bus_groups) + 1, dtype=np.int32)
-    island_bus_offsets, island_bus_indices = _flatten_position_groups(island_bus_groups)
-
-    false_islands = np.zeros(len(island_bus_groups), dtype=bool)
-    false_buses = np.zeros(len(bus_groups), dtype=bool)
+    false_islands = np.zeros(island_count, dtype=bool)
+    false_buses = np.zeros(bus_ids.size, dtype=bool)
     false_nodes = np.zeros(n_nodes, dtype=bool)
-    reference = np.full(len(island_bus_groups), -1, dtype=np.int32)
+    reference = np.full(island_count, -1, dtype=np.int32)
     return GridTopologyArrays(
         node_ids=node_ids,
         node_run_mask=node_run_mask,
@@ -337,12 +518,18 @@ def _single_device_arrays(
     run_col: int,
     node_lookup,
     topology: GridTopologyArrays,
+    precomputed: Optional[SingleDeviceTopologyInput] = None,
 ) -> SingleDeviceTopologyArrays:
     rows = np.asarray(table)
     count = int(rows.shape[0]) if rows.size else 0
     if count == 0:
         return _empty_single_device(0)
-    node_pos = _map_node_positions(rows[:, node_col], node_lookup)
+    if _compatible_single_input(precomputed, count):
+        node_pos = precomputed.node_pos
+        run_mask = precomputed.run_mask
+    else:
+        node_pos = _map_node_positions(rows[:, node_col], node_lookup)
+        run_mask = rows[:, run_col].astype(np.int64, copy=False) == 1
     bus_pos = np.full(count, -1, dtype=np.int32)
     island_pos = np.full(count, -1, dtype=np.int32)
     valid = node_pos >= 0
@@ -352,7 +539,7 @@ def _single_device_arrays(
     node_alive = np.zeros(count, dtype=bool)
     if np.any(valid):
         node_alive[valid] = topology.node_alive_mask[node_pos[valid]]
-    alive = (rows[:, run_col].astype(np.int64, copy=False) == 1) & valid & (island_pos >= 0) & node_alive
+    alive = run_mask & valid & (island_pos >= 0) & node_alive
     return SingleDeviceTopologyArrays(node_pos, bus_pos, island_pos, alive)
 
 
@@ -364,13 +551,22 @@ def _terminal_device_arrays(
     node_lookup,
     topology: GridTopologyArrays,
     status_col: Optional[int] = None,
+    precomputed: Optional[TerminalDeviceTopologyInput] = None,
 ) -> TerminalDeviceTopologyArrays:
     rows = np.asarray(table)
     count = int(rows.shape[0]) if rows.size else 0
     if count == 0:
         return _empty_terminal_device(0)
-    i_node_pos = _map_node_positions(rows[:, i_col], node_lookup)
-    j_node_pos = _map_node_positions(rows[:, j_col], node_lookup)
+    if _compatible_terminal_input(precomputed, count):
+        i_node_pos = precomputed.i_node_pos
+        j_node_pos = precomputed.j_node_pos
+        run_mask = precomputed.run_mask
+    else:
+        i_node_pos = _map_node_positions(rows[:, i_col], node_lookup)
+        j_node_pos = _map_node_positions(rows[:, j_col], node_lookup)
+        run_mask = rows[:, run_col].astype(np.int64, copy=False) == 1
+        if status_col is not None:
+            run_mask &= rows[:, status_col].astype(np.int64, copy=False) == 1
     i_bus_pos = np.full(count, -1, dtype=np.int32)
     j_bus_pos = np.full(count, -1, dtype=np.int32)
     i_island_pos = np.full(count, -1, dtype=np.int32)
@@ -383,9 +579,6 @@ def _terminal_device_arrays(
     if np.any(j_valid):
         j_bus_pos[j_valid] = topology.node_to_bus_pos[j_node_pos[j_valid]]
         j_island_pos[j_valid] = topology.node_to_island_pos[j_node_pos[j_valid]]
-    run_mask = rows[:, run_col].astype(np.int64, copy=False) == 1
-    if status_col is not None:
-        run_mask &= rows[:, status_col].astype(np.int64, copy=False) == 1
     valid = (
         run_mask
         & i_valid
@@ -421,21 +614,34 @@ def _mark_reference_bus(reference: np.ndarray, island_pos: int, bus_pos: int, bu
         reference[island_pos] = int(bus_pos)
 
 
-def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
-    """Build AC bus/island topology directly from ``ac_ppc_v1`` arrays."""
-    from ac_array_model import (
-        BREAK_COLS,
-        BRANCH_COLS,
-        BUS_COLS,
-        CTRL_SLACK,
-        GEN_COLS,
-        LOAD_COLS,
-        SHUNT_COLS,
-        SWITCH_COLS,
-        TRANSFORMER_COLS,
-        ZERO_BRANCH_COLS,
-        _empty,
-    )
+def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
+    """Precompute AC PPC node positions and run/status masks for topology."""
+    try:
+        from .ac_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            SWITCH_COLS,
+            TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
+    except ImportError:  # pragma: no cover - top-level module import path
+        from ac_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            SWITCH_COLS,
+            TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
 
     bus = np.asarray(ppc["bus"], dtype=np.float64)
     branch = np.asarray(ppc["branch"], dtype=np.float64)
@@ -448,20 +654,161 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
     breaker = np.asarray(ppc.get("break", _empty(len(BREAK_COLS))), dtype=np.float64)
     node_ids = bus[:, BUS_COLS["idx"]].astype(np.int32, copy=False)
     node_run_mask = bus[:, BUS_COLS["run_stat"]].astype(np.int64, copy=False) == 1
+    node_lookup = _make_node_pos_lookup(node_ids)
+    terminals = {
+        "branch": _terminal_topology_input(
+            branch,
+            BRANCH_COLS["i_node"],
+            BRANCH_COLS["j_node"],
+            BRANCH_COLS["run_stat"],
+            node_lookup,
+        ),
+        "transformer": _terminal_topology_input(
+            transformer,
+            TRANSFORMER_COLS["i_node"],
+            TRANSFORMER_COLS["j_node"],
+            TRANSFORMER_COLS["run_stat"],
+            node_lookup,
+        ),
+        "zero_branch": _terminal_topology_input(
+            zero_branch,
+            ZERO_BRANCH_COLS["i_node"],
+            ZERO_BRANCH_COLS["j_node"],
+            ZERO_BRANCH_COLS["run_stat"],
+            node_lookup,
+        ),
+        "switch": _terminal_topology_input(
+            switch,
+            SWITCH_COLS["i_node"],
+            SWITCH_COLS["j_node"],
+            SWITCH_COLS["run_stat"],
+            node_lookup,
+            status_col=SWITCH_COLS["status"],
+        ),
+        "break": _terminal_topology_input(
+            breaker,
+            BREAK_COLS["i_node"],
+            BREAK_COLS["j_node"],
+            BREAK_COLS["run_stat"],
+            node_lookup,
+            status_col=BREAK_COLS["status"],
+        ),
+    }
+    singles = {
+        "gen": _single_topology_input(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup),
+        "load": _single_topology_input(load, LOAD_COLS["node"], LOAD_COLS["run_stat"], node_lookup),
+        "shunt": _single_topology_input(shunt, SHUNT_COLS["node"], SHUNT_COLS["run_stat"], node_lookup),
+    }
+    return GridTopologyInput(node_ids, node_run_mask, node_lookup, terminals=terminals, singles=singles)
+
+
+def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
+    """Build AC bus/island topology directly from ``ac_ppc_v1`` arrays."""
+    try:
+        from .ac_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            CTRL_SLACK,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            SWITCH_COLS,
+            TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
+    except ImportError:  # pragma: no cover - top-level module import path
+        from ac_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            CTRL_SLACK,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            SWITCH_COLS,
+            TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
+
+    bus = np.asarray(ppc["bus"], dtype=np.float64)
+    branch = np.asarray(ppc["branch"], dtype=np.float64)
+    transformer = np.asarray(ppc["transformer"], dtype=np.float64)
+    gen = np.asarray(ppc["gen"], dtype=np.float64)
+    load = np.asarray(ppc["load"], dtype=np.float64)
+    shunt = np.asarray(ppc["shunt"], dtype=np.float64)
+    zero_branch = np.asarray(ppc["zero_branch"], dtype=np.float64)
+    switch = np.asarray(ppc["switch"], dtype=np.float64)
+    breaker = np.asarray(ppc.get("break", _empty(len(BREAK_COLS))), dtype=np.float64)
+    topology_input = ppc.get("_topology_input")
+    if not _compatible_grid_topology_input(topology_input, bus.shape[0] if bus.size else 0):
+        topology_input = build_ac_topology_input_ppc(ppc)
+        ppc["_topology_input"] = topology_input
+    node_ids = topology_input.node_ids
+    node_run_mask = topology_input.node_run_mask
+    terminals = topology_input.terminals
+    singles = topology_input.singles
+    node_lookup = topology_input.node_lookup
     topology = _build_base_topology_arrays(
         node_ids,
         node_run_mask,
-        bus_edge_specs=((switch, SWITCH_COLS["i_node"], SWITCH_COLS["j_node"], SWITCH_COLS["run_stat"], SWITCH_COLS["status"]),),
-        island_edge_specs=(
-            (switch, SWITCH_COLS["i_node"], SWITCH_COLS["j_node"], SWITCH_COLS["run_stat"], SWITCH_COLS["status"]),
-            (branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], None),
-            (transformer, TRANSFORMER_COLS["i_node"], TRANSFORMER_COLS["j_node"], TRANSFORMER_COLS["run_stat"], None),
-            (zero_branch, ZERO_BRANCH_COLS["i_node"], ZERO_BRANCH_COLS["j_node"], ZERO_BRANCH_COLS["run_stat"], None),
-            (breaker, BREAK_COLS["i_node"], BREAK_COLS["j_node"], BREAK_COLS["run_stat"], BREAK_COLS["status"]),
+        bus_edge_specs=(
+            (
+                switch,
+                SWITCH_COLS["i_node"],
+                SWITCH_COLS["j_node"],
+                SWITCH_COLS["run_stat"],
+                SWITCH_COLS["status"],
+                terminals.get("switch"),
+            ),
         ),
+        island_edge_specs=(
+            (
+                switch,
+                SWITCH_COLS["i_node"],
+                SWITCH_COLS["j_node"],
+                SWITCH_COLS["run_stat"],
+                SWITCH_COLS["status"],
+                terminals.get("switch"),
+            ),
+            (branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], None, terminals.get("branch")),
+            (
+                transformer,
+                TRANSFORMER_COLS["i_node"],
+                TRANSFORMER_COLS["j_node"],
+                TRANSFORMER_COLS["run_stat"],
+                None,
+                terminals.get("transformer"),
+            ),
+            (
+                zero_branch,
+                ZERO_BRANCH_COLS["i_node"],
+                ZERO_BRANCH_COLS["j_node"],
+                ZERO_BRANCH_COLS["run_stat"],
+                None,
+                terminals.get("zero_branch"),
+            ),
+            (
+                breaker,
+                BREAK_COLS["i_node"],
+                BREAK_COLS["j_node"],
+                BREAK_COLS["run_stat"],
+                BREAK_COLS["status"],
+                terminals.get("break"),
+            ),
+        ),
+        node_lookup=node_lookup,
     )
-    node_lookup = _make_node_pos_lookup(topology.node_ids)
-    gen_nodes = _map_node_positions(gen[:, GEN_COLS["node"]], node_lookup) if gen.size else _EMPTY_INT
+    gen_input = singles.get("gen")
+    gen_count = gen.shape[0] if gen.size else 0
+    if _compatible_single_input(gen_input, gen_count):
+        gen_nodes = gen_input.node_pos
+    elif gen.size:
+        gen_nodes = _map_node_positions(gen[:, GEN_COLS["node"]], node_lookup)
+    else:
+        gen_nodes = _EMPTY_INT
     if gen_nodes.size:
         valid_gen = gen_nodes >= 0
         gen_islands = np.full(gen_nodes.shape, -1, dtype=np.int32)
@@ -469,8 +816,12 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         if np.any(valid_gen):
             gen_islands[valid_gen] = topology.node_to_island_pos[gen_nodes[valid_gen]]
             gen_buses[valid_gen] = topology.node_to_bus_pos[gen_nodes[valid_gen]]
+        if _compatible_single_input(gen_input, gen.shape[0]):
+            gen_run_mask = gen_input.run_mask
+        else:
+            gen_run_mask = gen[:, GEN_COLS["run_stat"]].astype(np.int64, copy=False) == 1
         slack_mask = (
-            (gen[:, GEN_COLS["run_stat"]].astype(np.int64, copy=False) == 1)
+            gen_run_mask
             & valid_gen
             & (gen_islands >= 0)
             & (gen[:, GEN_COLS["control_type"]].astype(np.int64, copy=False) == CTRL_SLACK)
@@ -489,7 +840,15 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         )
 
     topology.devices = {
-        "branch": _terminal_device_arrays(branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], node_lookup, topology),
+        "branch": _terminal_device_arrays(
+            branch,
+            BRANCH_COLS["i_node"],
+            BRANCH_COLS["j_node"],
+            BRANCH_COLS["run_stat"],
+            node_lookup,
+            topology,
+            precomputed=terminals.get("branch"),
+        ),
         "transformer": _terminal_device_arrays(
             transformer,
             TRANSFORMER_COLS["i_node"],
@@ -497,6 +856,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             TRANSFORMER_COLS["run_stat"],
             node_lookup,
             topology,
+            precomputed=terminals.get("transformer"),
         ),
         "zero_branch": _terminal_device_arrays(
             zero_branch,
@@ -505,6 +865,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             ZERO_BRANCH_COLS["run_stat"],
             node_lookup,
             topology,
+            precomputed=terminals.get("zero_branch"),
         ),
         "switch": _terminal_device_arrays(
             switch,
@@ -514,6 +875,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             node_lookup,
             topology,
             status_col=SWITCH_COLS["status"],
+            precomputed=terminals.get("switch"),
         ),
         "break": _terminal_device_arrays(
             breaker,
@@ -523,28 +885,62 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             node_lookup,
             topology,
             status_col=BREAK_COLS["status"],
+            precomputed=terminals.get("break"),
         ),
-        "gen": _single_device_arrays(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup, topology),
-        "load": _single_device_arrays(load, LOAD_COLS["node"], LOAD_COLS["run_stat"], node_lookup, topology),
-        "shunt": _single_device_arrays(shunt, SHUNT_COLS["node"], SHUNT_COLS["run_stat"], node_lookup, topology),
+        "gen": _single_device_arrays(
+            gen,
+            GEN_COLS["node"],
+            GEN_COLS["run_stat"],
+            node_lookup,
+            topology,
+            precomputed=singles.get("gen"),
+        ),
+        "load": _single_device_arrays(
+            load,
+            LOAD_COLS["node"],
+            LOAD_COLS["run_stat"],
+            node_lookup,
+            topology,
+            precomputed=singles.get("load"),
+        ),
+        "shunt": _single_device_arrays(
+            shunt,
+            SHUNT_COLS["node"],
+            SHUNT_COLS["run_stat"],
+            node_lookup,
+            topology,
+            precomputed=singles.get("shunt"),
+        ),
     }
     return topology
 
 
-def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
-    """Build DC bus/island topology directly from ``dc_ppc_v1`` arrays."""
-    from dc_array_model import (
-        BREAK_COLS,
-        BRANCH_COLS,
-        BUS_COLS,
-        CTRL_V,
-        DCDC_COLS,
-        GEN_COLS,
-        LOAD_COLS,
-        SWITCH_COLS,
-        ZERO_BRANCH_COLS,
-        _empty,
-    )
+def build_dc_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
+    """Precompute DC PPC node positions and run/status masks for topology."""
+    try:
+        from .dc_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            DCDC_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SWITCH_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
+    except ImportError:  # pragma: no cover - top-level module import path
+        from dc_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            DCDC_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SWITCH_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
 
     bus = np.asarray(ppc["bus"], dtype=np.float64)
     branch = np.asarray(ppc["branch"], dtype=np.float64)
@@ -556,19 +952,149 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
     dcdc = np.asarray(ppc["dcdc"], dtype=np.float64)
     node_ids = bus[:, BUS_COLS["idx"]].astype(np.int32, copy=False)
     node_run_mask = bus[:, BUS_COLS["run_stat"]].astype(np.int64, copy=False) == 1
+    node_lookup = _make_node_pos_lookup(node_ids)
+    terminals = {
+        "branch": _terminal_topology_input(
+            branch,
+            BRANCH_COLS["i_node"],
+            BRANCH_COLS["j_node"],
+            BRANCH_COLS["run_stat"],
+            node_lookup,
+        ),
+        "zero_branch": _terminal_topology_input(
+            zero_branch,
+            ZERO_BRANCH_COLS["i_node"],
+            ZERO_BRANCH_COLS["j_node"],
+            ZERO_BRANCH_COLS["run_stat"],
+            node_lookup,
+        ),
+        "switch": _terminal_topology_input(
+            switch,
+            SWITCH_COLS["i_node"],
+            SWITCH_COLS["j_node"],
+            SWITCH_COLS["run_stat"],
+            node_lookup,
+            status_col=SWITCH_COLS["status"],
+        ),
+        "break": _terminal_topology_input(
+            breaker,
+            BREAK_COLS["i_node"],
+            BREAK_COLS["j_node"],
+            BREAK_COLS["run_stat"],
+            node_lookup,
+            status_col=BREAK_COLS["status"],
+        ),
+        "dcdc": _terminal_topology_input(
+            dcdc,
+            DCDC_COLS["i_node"],
+            DCDC_COLS["j_node"],
+            DCDC_COLS["run_stat"],
+            node_lookup,
+        ),
+    }
+    singles = {
+        "gen": _single_topology_input(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup),
+        "load": _single_topology_input(load, LOAD_COLS["node"], LOAD_COLS["run_stat"], node_lookup),
+    }
+    return GridTopologyInput(node_ids, node_run_mask, node_lookup, terminals=terminals, singles=singles)
+
+
+def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
+    """Build DC bus/island topology directly from ``dc_ppc_v1`` arrays."""
+    try:
+        from .dc_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            CTRL_V,
+            DCDC_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SWITCH_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
+    except ImportError:  # pragma: no cover - top-level module import path
+        from dc_array_model import (
+            BREAK_COLS,
+            BRANCH_COLS,
+            BUS_COLS,
+            CTRL_V,
+            DCDC_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SWITCH_COLS,
+            ZERO_BRANCH_COLS,
+            _empty,
+        )
+
+    bus = np.asarray(ppc["bus"], dtype=np.float64)
+    branch = np.asarray(ppc["branch"], dtype=np.float64)
+    gen = np.asarray(ppc["gen"], dtype=np.float64)
+    load = np.asarray(ppc["load"], dtype=np.float64)
+    zero_branch = np.asarray(ppc["zero_branch"], dtype=np.float64)
+    switch = np.asarray(ppc["switch"], dtype=np.float64)
+    breaker = np.asarray(ppc.get("break", _empty(len(BREAK_COLS))), dtype=np.float64)
+    dcdc = np.asarray(ppc["dcdc"], dtype=np.float64)
+    topology_input = ppc.get("_topology_input")
+    if not _compatible_grid_topology_input(topology_input, bus.shape[0] if bus.size else 0):
+        topology_input = build_dc_topology_input_ppc(ppc)
+        ppc["_topology_input"] = topology_input
+    node_ids = topology_input.node_ids
+    node_run_mask = topology_input.node_run_mask
+    terminals = topology_input.terminals
+    singles = topology_input.singles
+    node_lookup = topology_input.node_lookup
     topology = _build_base_topology_arrays(
         node_ids,
         node_run_mask,
-        bus_edge_specs=((switch, SWITCH_COLS["i_node"], SWITCH_COLS["j_node"], SWITCH_COLS["run_stat"], SWITCH_COLS["status"]),),
-        island_edge_specs=(
-            (switch, SWITCH_COLS["i_node"], SWITCH_COLS["j_node"], SWITCH_COLS["run_stat"], SWITCH_COLS["status"]),
-            (branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], None),
-            (zero_branch, ZERO_BRANCH_COLS["i_node"], ZERO_BRANCH_COLS["j_node"], ZERO_BRANCH_COLS["run_stat"], None),
-            (breaker, BREAK_COLS["i_node"], BREAK_COLS["j_node"], BREAK_COLS["run_stat"], BREAK_COLS["status"]),
+        bus_edge_specs=(
+            (
+                switch,
+                SWITCH_COLS["i_node"],
+                SWITCH_COLS["j_node"],
+                SWITCH_COLS["run_stat"],
+                SWITCH_COLS["status"],
+                terminals.get("switch"),
+            ),
         ),
+        island_edge_specs=(
+            (
+                switch,
+                SWITCH_COLS["i_node"],
+                SWITCH_COLS["j_node"],
+                SWITCH_COLS["run_stat"],
+                SWITCH_COLS["status"],
+                terminals.get("switch"),
+            ),
+            (branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], None, terminals.get("branch")),
+            (
+                zero_branch,
+                ZERO_BRANCH_COLS["i_node"],
+                ZERO_BRANCH_COLS["j_node"],
+                ZERO_BRANCH_COLS["run_stat"],
+                None,
+                terminals.get("zero_branch"),
+            ),
+            (
+                breaker,
+                BREAK_COLS["i_node"],
+                BREAK_COLS["j_node"],
+                BREAK_COLS["run_stat"],
+                BREAK_COLS["status"],
+                terminals.get("break"),
+            ),
+        ),
+        node_lookup=node_lookup,
     )
-    node_lookup = _make_node_pos_lookup(topology.node_ids)
-    gen_nodes = _map_node_positions(gen[:, GEN_COLS["node"]], node_lookup) if gen.size else _EMPTY_INT
+    gen_input = singles.get("gen")
+    gen_count = gen.shape[0] if gen.size else 0
+    if _compatible_single_input(gen_input, gen_count):
+        gen_nodes = gen_input.node_pos
+    elif gen.size:
+        gen_nodes = _map_node_positions(gen[:, GEN_COLS["node"]], node_lookup)
+    else:
+        gen_nodes = _EMPTY_INT
     if gen_nodes.size:
         valid_gen = gen_nodes >= 0
         gen_islands = np.full(gen_nodes.shape, -1, dtype=np.int32)
@@ -576,8 +1102,12 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         if np.any(valid_gen):
             gen_islands[valid_gen] = topology.node_to_island_pos[gen_nodes[valid_gen]]
             gen_buses[valid_gen] = topology.node_to_bus_pos[gen_nodes[valid_gen]]
+        if _compatible_single_input(gen_input, gen.shape[0]):
+            gen_run_mask = gen_input.run_mask
+        else:
+            gen_run_mask = gen[:, GEN_COLS["run_stat"]].astype(np.int64, copy=False) == 1
         v_mask = (
-            (gen[:, GEN_COLS["run_stat"]].astype(np.int64, copy=False) == 1)
+            gen_run_mask
             & valid_gen
             & (gen_islands >= 0)
             & (gen[:, GEN_COLS["control_type"]].astype(np.int64, copy=False) == CTRL_V)
@@ -586,9 +1116,21 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         for island_pos, bus_pos in zip(gen_islands[v_mask], gen_buses[v_mask]):
             _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
 
-    dcdc_nodes = _map_node_positions(dcdc[:, DCDC_COLS["i_node"]], node_lookup) if dcdc.size else _EMPTY_INT
+    dcdc_input = terminals.get("dcdc")
+    dcdc_count = dcdc.shape[0] if dcdc.size else 0
+    if _compatible_terminal_input(dcdc_input, dcdc_count):
+        dcdc_nodes = dcdc_input.i_node_pos
+    elif dcdc.size:
+        dcdc_nodes = _map_node_positions(dcdc[:, DCDC_COLS["i_node"]], node_lookup)
+    else:
+        dcdc_nodes = _EMPTY_INT
     if dcdc_nodes.size:
-        dcdc_j_nodes = _map_node_positions(dcdc[:, DCDC_COLS["j_node"]], node_lookup)
+        if _compatible_terminal_input(dcdc_input, dcdc.shape[0]):
+            dcdc_j_nodes = dcdc_input.j_node_pos
+            dcdc_run_mask = dcdc_input.run_mask
+        else:
+            dcdc_j_nodes = _map_node_positions(dcdc[:, DCDC_COLS["j_node"]], node_lookup)
+            dcdc_run_mask = dcdc[:, DCDC_COLS["run_stat"]].astype(np.int64, copy=False) == 1
         valid_dcdc = (dcdc_nodes >= 0) & (dcdc_j_nodes >= 0)
         dcdc_islands = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
         dcdc_buses = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
@@ -596,7 +1138,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             dcdc_islands[valid_dcdc] = topology.node_to_island_pos[dcdc_nodes[valid_dcdc]]
             dcdc_buses[valid_dcdc] = topology.node_to_bus_pos[dcdc_nodes[valid_dcdc]]
         v_mask = (
-            (dcdc[:, DCDC_COLS["run_stat"]].astype(np.int64, copy=False) == 1)
+            dcdc_run_mask
             & valid_dcdc
             & (dcdc_islands >= 0)
             & (dcdc[:, DCDC_COLS["control_type"]].astype(np.int64, copy=False) == CTRL_V)
@@ -615,7 +1157,15 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         )
 
     topology.devices = {
-        "branch": _terminal_device_arrays(branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], node_lookup, topology),
+        "branch": _terminal_device_arrays(
+            branch,
+            BRANCH_COLS["i_node"],
+            BRANCH_COLS["j_node"],
+            BRANCH_COLS["run_stat"],
+            node_lookup,
+            topology,
+            precomputed=terminals.get("branch"),
+        ),
         "zero_branch": _terminal_device_arrays(
             zero_branch,
             ZERO_BRANCH_COLS["i_node"],
@@ -623,6 +1173,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             ZERO_BRANCH_COLS["run_stat"],
             node_lookup,
             topology,
+            precomputed=terminals.get("zero_branch"),
         ),
         "switch": _terminal_device_arrays(
             switch,
@@ -632,6 +1183,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             node_lookup,
             topology,
             status_col=SWITCH_COLS["status"],
+            precomputed=terminals.get("switch"),
         ),
         "break": _terminal_device_arrays(
             breaker,
@@ -641,6 +1193,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             node_lookup,
             topology,
             status_col=BREAK_COLS["status"],
+            precomputed=terminals.get("break"),
         ),
         "dcdc": _terminal_device_arrays(
             dcdc,
@@ -649,9 +1202,10 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             DCDC_COLS["run_stat"],
             node_lookup,
             topology,
+            precomputed=terminals.get("dcdc"),
         ),
-        "gen": _single_device_arrays(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup, topology),
-        "load": _single_device_arrays(load, LOAD_COLS["node"], LOAD_COLS["run_stat"], node_lookup, topology),
+        "gen": _single_device_arrays(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup, topology, precomputed=singles.get("gen")),
+        "load": _single_device_arrays(load, LOAD_COLS["node"], LOAD_COLS["run_stat"], node_lookup, topology, precomputed=singles.get("load")),
     }
     return topology
 

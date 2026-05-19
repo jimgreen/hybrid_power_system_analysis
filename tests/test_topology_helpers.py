@@ -71,6 +71,22 @@ class TopologyHelperTest(unittest.TestCase):
 
         self.assertTrue(arrays.bus_ids.size)
 
+    def test_ac_ppc_topology_consumes_precomputed_terminal_positions(self):
+        from unittest.mock import patch
+
+        import model.topology as topology
+        from model.ac_array_model import build_ac_ppc_from_e_file
+        from model.topology import prepare_ac_topology_ppc
+
+        ppc = build_ac_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "ac" / "ieee39.e")
+        self.assertIn("_topology_input", ppc)
+
+        with patch.object(topology, "_map_node_positions", side_effect=AssertionError("precomputed topology input should be reused")):
+            arrays = prepare_ac_topology_ppc(ppc)
+
+        self.assertTrue(arrays.bus_ids.size)
+        self.assertTrue(arrays.devices["branch"].i_node_pos.size)
+
     def test_ac_apply_ppc_topology_arrays_matches_object_topology(self):
         from model.ac_array_model import build_ac_network_from_ppc, build_ac_ppc_from_e_file
         from model.topology import apply_ac_topology_arrays, prepare_ac_topology, prepare_ac_topology_ppc

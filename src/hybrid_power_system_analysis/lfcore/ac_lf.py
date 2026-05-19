@@ -2,7 +2,7 @@ import argparse
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix, diags, hstack, vstack
+from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags, hstack, vstack
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu, spsolve
 
@@ -26,6 +26,18 @@ for path in (ROOT_DIR, MODEL_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+try:
+    from _sparse_pattern import (
+        apply_raw_sum_plan,
+        build_compressed_pattern_from_raw_coords,
+        build_raw_sum_plan,
+    )
+except ImportError:  # pragma: no cover - package import path
+    from ._sparse_pattern import (
+        apply_raw_sum_plan,
+        build_compressed_pattern_from_raw_coords,
+        build_raw_sum_plan,
+    )
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
 from model import topology as network_topology
@@ -76,37 +88,13 @@ def _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, n_rows: int):
     ``raw_rows``/``raw_cols`` may contain duplicate coordinates.  The returned
     ``raw_to_csr`` array maps each raw coordinate to the corresponding entry in
     the unique CSR pattern so runtime values can be accumulated with
-    ``np.bincount``.
+    a precomputed copy/reduce plan.
     """
-    raw_rows = np.asarray(raw_rows, dtype=np.int32)
-    raw_cols = np.asarray(raw_cols, dtype=np.int32)
-    if raw_rows.size != raw_cols.size:
-        raise ValueError("raw_rows and raw_cols must have the same length")
-    raw_count = int(raw_rows.size)
-    if raw_count == 0:
-        return (
-            np.array([], dtype=np.int32),
-            np.zeros(int(n_rows) + 1, dtype=np.int32),
-            np.array([], dtype=np.intp),
-        )
+    return build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, n_rows)
 
-    order = np.lexsort((raw_cols, raw_rows))
-    sorted_rows = raw_rows[order]
-    sorted_cols = raw_cols[order]
 
-    is_new = np.empty(raw_count, dtype=bool)
-    is_new[0] = True
-    is_new[1:] = (sorted_rows[1:] != sorted_rows[:-1]) | (sorted_cols[1:] != sorted_cols[:-1])
-    sorted_group = np.cumsum(is_new, dtype=np.intp) - 1
-    raw_to_csr = np.empty(raw_count, dtype=np.intp)
-    raw_to_csr[order] = sorted_group
-
-    indices = sorted_cols[is_new].astype(np.int32, copy=True)
-    row_counts = np.bincount(sorted_rows[is_new], minlength=int(n_rows))
-    indptr = np.empty(int(n_rows) + 1, dtype=np.int32)
-    indptr[0] = 0
-    indptr[1:] = np.cumsum(row_counts, dtype=np.int64)
-    return indices, indptr, raw_to_csr
+def _as_solver_csc(matrix):
+    return matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
 
 
 _SPARSE_SOLVER = None
@@ -154,7 +142,7 @@ def _load_named_sparse_solver(solver_name):
                 klu_cls = solver
 
                 def solver(matrix, rhs, _klu_cls=klu_cls):
-                    return _klu_cls(matrix.tocsc()).solve(rhs)
+                    return _klu_cls(_as_solver_csc(matrix)).solve(rhs)
 
             _OPTIONAL_SPARSE_SOLVERS[solver_name] = solver
             return solver
@@ -228,12 +216,12 @@ def _factor_jacobian(matrix, resolved_name, solver_fn):
     (re-use one factorization across several iterations).
     """
     if resolved_name in {"scipy", "superlu", "default"}:
-        return splu(matrix.tocsc())
+        return splu(_as_solver_csc(matrix))
     # pyklu 在 auto 模式下会被选中；其 .solve(b) 直接复用因子。
     if resolved_name in {"pyklu", "auto"}:
         klu_cls = _get_pyklu_cls()
         if klu_cls is not None:
-            return klu_cls(matrix.tocsc())
+            return klu_cls(_as_solver_csc(matrix))
     # 通用回退：包装成单次解算的 Factor，不复用因子但语义一致。
     return _CallableFactor(matrix, solver_fn)
 
@@ -575,12 +563,25 @@ class ACPowerFlowCalc:
         self.standard_jac_csr_indices = np.array([], dtype=np.int32)
         self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
         self.standard_jac_csr_order = np.array([], dtype=np.intp)
+        self.standard_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.standard_jac_csr_data = np.array([], dtype=np.float64)
+        self.standard_jac_csr_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csr_pos, 0)
+        self.standard_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+        self.standard_jac_csc_indices = np.array([], dtype=np.int32)
+        self.standard_jac_csc_indptr = np.array([], dtype=np.int32)
+        self.standard_jac_csc_data = np.array([], dtype=np.float64)
+        self.standard_jac_csc_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csc_pos, 0)
         self.full_jac_raw_data = np.array([], dtype=np.float64)
         self.full_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.full_jac_csr_indices = np.array([], dtype=np.int32)
         self.full_jac_csr_indptr = np.array([], dtype=np.int32)
         self.full_jac_csr_data = np.array([], dtype=np.float64)
+        self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, 0)
+        self.full_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+        self.full_jac_csc_indices = np.array([], dtype=np.int32)
+        self.full_jac_csc_indptr = np.array([], dtype=np.int32)
+        self.full_jac_csc_data = np.array([], dtype=np.float64)
+        self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, 0)
         self.full_jac_standard_slice = slice(0, 0)
         self.full_jac_zero_top_left_slice = slice(0, 0)
         self.full_jac_zero_top_right_slice = slice(0, 0)
@@ -1100,12 +1101,25 @@ class ACPowerFlowCalc:
             "standard_jac_csr_indices": self.standard_jac_csr_indices,
             "standard_jac_csr_indptr": self.standard_jac_csr_indptr,
             "standard_jac_csr_order": self.standard_jac_csr_order,
+            "standard_jac_raw_to_csr_pos": self.standard_jac_raw_to_csr_pos,
             "standard_jac_csr_data": self.standard_jac_csr_data,
+            "standard_jac_csr_sum_plan": self.standard_jac_csr_sum_plan,
+            "standard_jac_raw_to_csc_pos": self.standard_jac_raw_to_csc_pos,
+            "standard_jac_csc_indices": self.standard_jac_csc_indices,
+            "standard_jac_csc_indptr": self.standard_jac_csc_indptr,
+            "standard_jac_csc_data": self.standard_jac_csc_data,
+            "standard_jac_csc_sum_plan": self.standard_jac_csc_sum_plan,
             "full_jac_raw_data": self.full_jac_raw_data,
             "full_jac_raw_to_csr_pos": self.full_jac_raw_to_csr_pos,
             "full_jac_csr_indices": self.full_jac_csr_indices,
             "full_jac_csr_indptr": self.full_jac_csr_indptr,
             "full_jac_csr_data": self.full_jac_csr_data,
+            "full_jac_csr_sum_plan": self.full_jac_csr_sum_plan,
+            "full_jac_raw_to_csc_pos": self.full_jac_raw_to_csc_pos,
+            "full_jac_csc_indices": self.full_jac_csc_indices,
+            "full_jac_csc_indptr": self.full_jac_csc_indptr,
+            "full_jac_csc_data": self.full_jac_csc_data,
+            "full_jac_csc_sum_plan": self.full_jac_csc_sum_plan,
             "full_jac_standard_slice": self.full_jac_standard_slice,
             "full_jac_zero_top_left_slice": self.full_jac_zero_top_left_slice,
             "full_jac_zero_top_right_slice": self.full_jac_zero_top_right_slice,
@@ -1214,9 +1228,13 @@ class ACPowerFlowCalc:
             "std_jac_q_vm_idx", "std_jac_p_theta_slice", "std_jac_p_vm_slice",
             "std_jac_q_theta_slice", "std_jac_q_vm_slice", "std_jac_load_p_slice",
             "std_jac_load_q_slice", "standard_jac_csr_indices", "standard_jac_csr_indptr",
-            "standard_jac_csr_order", "standard_jac_csr_data", "full_jac_raw_data",
-            "full_jac_raw_to_csr_pos", "full_jac_csr_indices", "full_jac_csr_indptr",
-            "full_jac_csr_data", "full_jac_standard_slice", "full_jac_zero_top_left_slice",
+            "standard_jac_csr_order", "standard_jac_raw_to_csr_pos", "standard_jac_csr_data",
+            "standard_jac_csr_sum_plan", "standard_jac_raw_to_csc_pos", "standard_jac_csc_indices",
+            "standard_jac_csc_indptr", "standard_jac_csc_data", "standard_jac_csc_sum_plan",
+            "full_jac_raw_data", "full_jac_raw_to_csr_pos", "full_jac_csr_indices", "full_jac_csr_indptr",
+            "full_jac_csr_data", "full_jac_csr_sum_plan", "full_jac_raw_to_csc_pos",
+            "full_jac_csc_indices", "full_jac_csc_indptr", "full_jac_csc_data", "full_jac_csc_sum_plan",
+            "full_jac_standard_slice", "full_jac_zero_top_left_slice",
             "full_jac_zero_top_right_slice", "full_jac_zero_bottom_left_slice",
             "full_jac_zero_bottom_right_slice", "std_jac_load_nodes",
             "std_jac_load_extra_nodes", "std_jac_load_p_pos", "std_jac_load_q_pos", "pq_Bp", "pq_Bpp", "pq_Bp_factor", "pq_Bpp_factor",
@@ -1239,6 +1257,9 @@ class ACPowerFlowCalc:
         self.zero_bottom_right_data = static["zero_bottom_right_data"].copy()
         self.full_jac_raw_data = static["full_jac_raw_data"].copy()
         self.full_jac_csr_data = static["full_jac_csr_data"].copy()
+        self.standard_jac_csr_data = static["standard_jac_csr_data"].copy()
+        self.standard_jac_csc_data = static["standard_jac_csc_data"].copy()
+        self.full_jac_csc_data = static["full_jac_csc_data"].copy()
         self._cache_zero_jacobian_runtime_arrays()
         # 残差扁平索引：与 _finalize_prepared_arrays 中的逻辑保持一致。
         if self.comp_tree_edges:
@@ -1598,7 +1619,14 @@ class ACPowerFlowCalc:
         self.standard_jac_csr_indices = np.array([], dtype=np.int32)
         self.standard_jac_csr_indptr = np.array([], dtype=np.int32)
         self.standard_jac_csr_order = np.array([], dtype=np.intp)
+        self.standard_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.standard_jac_csr_data = np.array([], dtype=np.float64)
+        self.standard_jac_csr_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csr_pos, 0)
+        self.standard_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+        self.standard_jac_csc_indices = np.array([], dtype=np.int32)
+        self.standard_jac_csc_indptr = np.array([], dtype=np.int32)
+        self.standard_jac_csc_data = np.array([], dtype=np.float64)
+        self.standard_jac_csc_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csc_pos, 0)
         self.std_jac_load_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_p_pos = np.array([], dtype=np.intp)
@@ -1668,15 +1696,30 @@ class ACPowerFlowCalc:
         self.standard_jac_cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
         self.standard_jac_data = np.empty(cursor, dtype=np.float64)
         if cursor:
-            marker = np.arange(cursor, dtype=np.float64)
-            pattern = coo_matrix(
-                (marker, (self.standard_jac_rows, self.standard_jac_cols)),
-                shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
-            ).tocsr()
-            self.standard_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
-            self.standard_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
-            self.standard_jac_csr_order = pattern.data.astype(np.intp, copy=True)
-            self.standard_jac_csr_data = np.empty_like(self.standard_jac_data)
+            n_dim = self.n_theta + self.n_V
+            (
+                self.standard_jac_csr_indices,
+                self.standard_jac_csr_indptr,
+                self.standard_jac_raw_to_csr_pos,
+            ) = build_compressed_pattern_from_raw_coords(self.standard_jac_rows, self.standard_jac_cols, n_dim)
+            (
+                self.standard_jac_csc_indices,
+                self.standard_jac_csc_indptr,
+                self.standard_jac_raw_to_csc_pos,
+            ) = build_compressed_pattern_from_raw_coords(self.standard_jac_cols, self.standard_jac_rows, n_dim)
+            # Kept for compatibility with existing cached-static fields; runtime
+            # now uses the structured raw-to-slot plans below.
+            self.standard_jac_csr_order = self.standard_jac_raw_to_csr_pos
+            self.standard_jac_csr_data = np.empty(self.standard_jac_csr_indices.size, dtype=np.float64)
+            self.standard_jac_csc_data = np.empty(self.standard_jac_csc_indices.size, dtype=np.float64)
+            self.standard_jac_csr_sum_plan = build_raw_sum_plan(
+                self.standard_jac_raw_to_csr_pos,
+                self.standard_jac_csr_data.size,
+            )
+            self.standard_jac_csc_sum_plan = build_raw_sum_plan(
+                self.standard_jac_raw_to_csc_pos,
+                self.standard_jac_csc_data.size,
+            )
             y_nnz = self.Y_jac_rows.size
             self._jac_delta = np.empty(y_nnz, dtype=np.float64)
             self._jac_cos_delta = np.empty(y_nnz, dtype=np.float64)
@@ -1936,12 +1979,20 @@ class ACPowerFlowCalc:
         self.full_jac_csr_indices = np.array([], dtype=np.int32)
         self.full_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
         self.full_jac_csr_data = np.array([], dtype=np.float64)
+        self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, 0)
+        self.full_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+        self.full_jac_csc_indices = np.array([], dtype=np.int32)
+        self.full_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
+        self.full_jac_csc_data = np.array([], dtype=np.float64)
+        self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, 0)
         self.full_jac_standard_slice = slice(0, 0)
         self.full_jac_zero_top_left_slice = slice(0, 0)
         self.full_jac_zero_top_right_slice = slice(0, 0)
         self.full_jac_zero_bottom_left_slice = slice(0, 0)
         self.full_jac_zero_bottom_right_slice = slice(0, 0)
 
+        if self.N_phi == 0:
+            return
         if self.total_eq == 0 or self.total_vars == 0 or self.standard_jac_rows.size == 0:
             return
 
@@ -1982,7 +2033,15 @@ class ACPowerFlowCalc:
             self.full_jac_csr_indptr,
             self.full_jac_raw_to_csr_pos,
         ) = _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        (
+            self.full_jac_csc_indices,
+            self.full_jac_csc_indptr,
+            self.full_jac_raw_to_csc_pos,
+        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
         self.full_jac_csr_data = np.empty(self.full_jac_csr_indices.size, dtype=np.float64)
+        self.full_jac_csc_data = np.empty(self.full_jac_csc_indices.size, dtype=np.float64)
+        self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, self.full_jac_csr_data.size)
+        self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, self.full_jac_csc_data.size)
 
     def _cache_pq_decoupled_matrices(self):
         """Cache fixed susceptance matrices for the fast-decoupled PQ method."""
@@ -2762,10 +2821,15 @@ class ACPowerFlowCalc:
             dQ[:] = np.bincount(self.load_pos, weights=values, minlength=self.N)
         return dP, dQ
 
-    def _get_standard_jacobi_sparse(self, V: np.ndarray, Sbus=None):
+    def _get_standard_jacobi_sparse(self, V: np.ndarray, Sbus=None, *, matrix_format="csr", build_matrix=True):
         """标准P/Q方程对theta/V变量的稀疏雅可比，采用MATPOWER矩阵化公式。"""
         if self.Y_jac_rows.size:
-            return self._get_standard_jacobi_direct(V, Sbus=Sbus)
+            return self._get_standard_jacobi_direct(
+                V,
+                Sbus=Sbus,
+                matrix_format=matrix_format,
+                build_matrix=build_matrix,
+            )
 
         Vc = self._cache['Vc']
         Ibus = self.Y.dot(Vc)
@@ -2792,7 +2856,10 @@ class ACPowerFlowCalc:
             J12 = J12 + coo_matrix((dPload_dV[pq], (self.pq_theta_rows, self.pq_v_cols)), shape=(self.n_theta, self.n_V)).tocsr()
             J22 = J22 + diags(dQload_dV[pq], 0, shape=(pq.size, pq.size), format='csr')
 
-        return vstack((hstack((J11, J12), format='csr'), hstack((J21, J22), format='csr')), format='csr')
+        jac = vstack((hstack((J11, J12), format='csr'), hstack((J21, J22), format='csr')), format='csr')
+        if matrix_format == "csc":
+            jac = jac.tocsc()
+        return jac if build_matrix else None
 
     def _fill_standard_jacobian_data(self, V: np.ndarray, Sbus=None):
         """Refresh the standard P/Q Jacobian raw data in the cached coordinate order."""
@@ -2885,19 +2952,37 @@ class ACPowerFlowCalc:
 
         return data
 
-    def _get_standard_jacobi_direct(self, V: np.ndarray, Sbus=None):
+    def _get_standard_jacobi_direct(self, V: np.ndarray, Sbus=None, *, matrix_format="csr", build_matrix=True):
         """Build the standard P/Q Jacobian directly from Y nonzeros."""
         data = self._fill_standard_jacobian_data(V, Sbus=Sbus)
-        if self.standard_jac_csr_order.size:
-            self.standard_jac_csr_data[:] = data[self.standard_jac_csr_order]
-            return csr_matrix(
-                (self.standard_jac_csr_data, self.standard_jac_csr_indices, self.standard_jac_csr_indptr),
-                shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
+        shape = (self.n_theta + self.n_V, self.n_theta + self.n_V)
+        if matrix_format == "csc":
+            if self.standard_jac_raw_to_csc_pos.size:
+                apply_raw_sum_plan(self.standard_jac_csc_data, data, self.standard_jac_csc_sum_plan)
+            if not build_matrix:
+                return self.standard_jac_csc_data
+            if not self.standard_jac_csc_indptr.size:
+                return csc_matrix(shape, dtype=np.float64)
+            return csc_matrix(
+                (self.standard_jac_csc_data, self.standard_jac_csc_indices, self.standard_jac_csc_indptr),
+                shape=shape,
                 copy=False,
             )
+
+        if self.standard_jac_raw_to_csr_pos.size:
+            apply_raw_sum_plan(self.standard_jac_csr_data, data, self.standard_jac_csr_sum_plan)
+            if not build_matrix:
+                return self.standard_jac_csr_data
+            return csr_matrix(
+                (self.standard_jac_csr_data, self.standard_jac_csr_indices, self.standard_jac_csr_indptr),
+                shape=shape,
+                copy=False,
+            )
+        if not build_matrix:
+            return self.standard_jac_csr_data
         return coo_matrix(
             (data, (self.standard_jac_rows, self.standard_jac_cols)),
-            shape=(self.n_theta + self.n_V, self.n_theta + self.n_V),
+            shape=shape,
         ).tocsr()
 
     def _refresh_zero_edge_jacobian_work(self, V, phi_re, phi_im, cos_theta, sin_theta):
@@ -3057,7 +3142,18 @@ class ACPowerFlowCalc:
             theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
         return self._get_jacobi_from_cached_state(theta, V, phi_re, phi_im)
 
-    def _get_jacobi_from_precomputed_pattern(self, V, phi_re, phi_im, cos_theta, sin_theta, Sbus=None):
+    def _get_jacobi_from_precomputed_pattern(
+        self,
+        V,
+        phi_re,
+        phi_im,
+        cos_theta,
+        sin_theta,
+        Sbus=None,
+        *,
+        matrix_format="csr",
+        build_matrix=True,
+    ):
         if self.full_jac_raw_data.size == 0:
             return None
 
@@ -3071,27 +3167,58 @@ class ACPowerFlowCalc:
             raw[self.full_jac_zero_bottom_left_slice] = self.zero_bottom_left_data
             raw[self.full_jac_zero_bottom_right_slice] = self.zero_bottom_right_data
 
-        # bincount 比 np.add.at 快很多（且每次迭代都要执行），目标尺寸固定。
-        self.full_jac_csr_data[:] = np.bincount(
-            self.full_jac_raw_to_csr_pos,
-            weights=raw,
-            minlength=self.full_jac_csr_data.size,
-        )
+        if matrix_format == "csc":
+            apply_raw_sum_plan(self.full_jac_csc_data, raw, self.full_jac_csc_sum_plan)
+            if not build_matrix:
+                return self.full_jac_csc_data
+            return csc_matrix(
+                (self.full_jac_csc_data, self.full_jac_csc_indices, self.full_jac_csc_indptr),
+                shape=(self.total_eq, self.total_vars),
+                copy=False,
+            )
+
+        apply_raw_sum_plan(self.full_jac_csr_data, raw, self.full_jac_csr_sum_plan)
+        if not build_matrix:
+            return self.full_jac_csr_data
         return csr_matrix(
             (self.full_jac_csr_data, self.full_jac_csr_indices, self.full_jac_csr_indptr),
             shape=(self.total_eq, self.total_vars),
             copy=False,
         )
 
-    def _get_jacobi_from_cached_state(self, theta, V, phi_re, phi_im, Sbus=None) -> csr_matrix:
+    def _get_jacobi_from_cached_state(
+        self,
+        theta,
+        V,
+        phi_re,
+        phi_im,
+        Sbus=None,
+        *,
+        matrix_format="csr",
+        build_matrix=True,
+    ) -> csr_matrix:
         """Build Jacobian using state arrays already extracted for the current Newton step."""
         cos_theta, sin_theta = self._cache['cos_theta'], self._cache['sin_theta']
 
-        precomputed = self._get_jacobi_from_precomputed_pattern(V, phi_re, phi_im, cos_theta, sin_theta, Sbus=Sbus)
+        precomputed = self._get_jacobi_from_precomputed_pattern(
+            V,
+            phi_re,
+            phi_im,
+            cos_theta,
+            sin_theta,
+            Sbus=Sbus,
+            matrix_format=matrix_format,
+            build_matrix=build_matrix,
+        )
         if precomputed is not None:
             return precomputed
 
-        J_standard = self._get_standard_jacobi_sparse(V, Sbus=Sbus)
+        J_standard = self._get_standard_jacobi_sparse(
+            V,
+            Sbus=Sbus,
+            matrix_format=matrix_format,
+            build_matrix=build_matrix,
+        )
         if self.N_phi == 0:
             return J_standard
 
@@ -3122,20 +3249,31 @@ class ACPowerFlowCalc:
             (self.zero_bottom_right_data, (self.zero_bottom_right_rows, self.zero_bottom_right_cols)),
             shape=(zero_eq, phi_vars),
         ).tocsr()
-        return vstack(
+        jac = vstack(
             (
                 hstack((J_standard, J_phi_top), format='csr'),
                 hstack((J_zero_left, J_zero_right), format='csr'),
             ),
             format='csr',
         )
+        if matrix_format == "csc":
+            jac = jac.tocsc()
+        return jac if build_matrix else None
 
-    def _build_newton_system(self, x: np.ndarray):
+    def _build_newton_system(self, x: np.ndarray, *, return_jacobian=True, jacobian_format="csc"):
         """Compute residual and Jacobian together for one Newton iteration."""
         theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
         dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
         F = self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
-        J = self._get_jacobi_from_cached_state(theta, V, phi_re, phi_im, Sbus=self._last_Sbus)
+        J = self._get_jacobi_from_cached_state(
+            theta,
+            V,
+            phi_re,
+            phi_im,
+            Sbus=self._last_Sbus,
+            matrix_format=jacobian_format,
+            build_matrix=return_jacobian,
+        )
         return F, J
 
     # --------------------------------------------------------------------------

@@ -2842,13 +2842,21 @@ class ACStateEstimator:
         scale_array = np.ones(value_array.size, dtype=np.float64)
         unavailable_mask = np.ones(value_array.size, dtype=bool)
 
+        _TERMINAL_POWER_TUPLE = tuple(_TERMINAL_POWER_MEASUREMENT_TYPES)
+
         def rows_for_type(device_type: str) -> np.ndarray:
             return np.flatnonzero(device_type_array == device_type)
 
         def mark_named_rows(rows: np.ndarray, mapping: Dict[str, object]) -> np.ndarray:
             if rows.size == 0:
                 return rows
-            found = np.asarray([str(device_name_array[int(row)]) in mapping for row in rows], dtype=bool)
+            # 用 .tolist() 后做 Python 集合判定，避免逐元素 int()/str() 的 ufunc 开销。
+            name_list = device_name_array[rows].tolist()
+            found = np.fromiter(
+                (str(n) in mapping for n in name_list),
+                dtype=bool,
+                count=rows.size,
+            )
             available = rows[found]
             unavailable_mask[available] = False
             return available
@@ -2857,47 +2865,70 @@ class ACStateEstimator:
         node_v_rows = node_rows[meas_type_array[node_rows] == "V"]
         if node_v_rows.size:
             scale_array[node_v_rows] = np.asarray(
-                [float(node_voltage_scale_by_name[str(device_name_array[int(row)])]) for row in node_v_rows],
+                [
+                    float(node_voltage_scale_by_name[str(n)])
+                    for n in device_name_array[node_v_rows].tolist()
+                ],
                 dtype=np.float64,
             )
 
         for terminal_type, scale_by_name in terminal_maps.items():
             terminal_rows = mark_named_rows(rows_for_type(terminal_type), scale_by_name)
-            for row in terminal_rows:
-                mtype = str(meas_type_array[int(row)])
-                terminal_scales = scale_by_name[str(device_name_array[int(row)])]
-                if mtype in _TERMINAL_POWER_MEASUREMENT_TYPES:
-                    scale_array[int(row)] = power_scale
-                elif mtype == "V_FROM":
-                    scale_array[int(row)] = terminal_scales[0]
-                elif mtype == "I_FROM":
-                    scale_array[int(row)] = terminal_scales[1]
-                elif mtype == "V_TO":
-                    scale_array[int(row)] = terminal_scales[2]
-                elif mtype == "I_TO":
-                    scale_array[int(row)] = terminal_scales[3]
+            if terminal_rows.size == 0:
+                continue
+            mtypes = meas_type_array[terminal_rows]
+            names_list = device_name_array[terminal_rows].tolist()
+            # 收集每行的 (v_from, i_from, v_to, i_to) 四元组成各列数组。
+            scales_tuples = [scale_by_name[str(n)] for n in names_list]
+            v_from_arr = np.fromiter((t[0] for t in scales_tuples), dtype=np.float64, count=terminal_rows.size)
+            i_from_arr = np.fromiter((t[1] for t in scales_tuples), dtype=np.float64, count=terminal_rows.size)
+            v_to_arr = np.fromiter((t[2] for t in scales_tuples), dtype=np.float64, count=terminal_rows.size)
+            i_to_arr = np.fromiter((t[3] for t in scales_tuples), dtype=np.float64, count=terminal_rows.size)
+            # 根据 mtype 选列；其它情况保持默认 1.0。
+            scales_subset = np.ones(terminal_rows.size, dtype=np.float64)
+            power_mask = np.isin(mtypes, _TERMINAL_POWER_TUPLE)
+            scales_subset[power_mask] = power_scale
+            v_from_mask = mtypes == "V_FROM"
+            scales_subset[v_from_mask] = v_from_arr[v_from_mask]
+            i_from_mask = mtypes == "I_FROM"
+            scales_subset[i_from_mask] = i_from_arr[i_from_mask]
+            v_to_mask = mtypes == "V_TO"
+            scales_subset[v_to_mask] = v_to_arr[v_to_mask]
+            i_to_mask = mtypes == "I_TO"
+            scales_subset[i_to_mask] = i_to_arr[i_to_mask]
+            scale_array[terminal_rows] = scales_subset
 
         gen_rows = mark_named_rows(rows_for_type("ACGenerator"), generator_node_scale_by_name)
-        for row in gen_rows:
-            mtype = str(meas_type_array[int(row)])
-            node_scales = generator_node_scale_by_name[str(device_name_array[int(row)])]
-            if mtype in ("P_GEN", "Q_GEN"):
-                scale_array[int(row)] = power_scale
-            elif mtype == "V_GEN":
-                scale_array[int(row)] = node_scales[0]
-            elif mtype == "I_GEN":
-                scale_array[int(row)] = node_scales[1]
+        if gen_rows.size:
+            mtypes = meas_type_array[gen_rows]
+            names_list = device_name_array[gen_rows].tolist()
+            scales_tuples = [generator_node_scale_by_name[str(n)] for n in names_list]
+            v_arr = np.fromiter((t[0] for t in scales_tuples), dtype=np.float64, count=gen_rows.size)
+            i_arr = np.fromiter((t[1] for t in scales_tuples), dtype=np.float64, count=gen_rows.size)
+            scales_subset = np.ones(gen_rows.size, dtype=np.float64)
+            power_mask = (mtypes == "P_GEN") | (mtypes == "Q_GEN")
+            scales_subset[power_mask] = power_scale
+            v_mask = mtypes == "V_GEN"
+            scales_subset[v_mask] = v_arr[v_mask]
+            i_mask = mtypes == "I_GEN"
+            scales_subset[i_mask] = i_arr[i_mask]
+            scale_array[gen_rows] = scales_subset
 
         load_rows = mark_named_rows(rows_for_type("ACLoad"), load_node_scale_by_name)
-        for row in load_rows:
-            mtype = str(meas_type_array[int(row)])
-            node_scales = load_node_scale_by_name[str(device_name_array[int(row)])]
-            if mtype in ("P_LOAD", "Q_LOAD"):
-                scale_array[int(row)] = power_scale
-            elif mtype == "V_LOAD":
-                scale_array[int(row)] = node_scales[0]
-            elif mtype == "I_LOAD":
-                scale_array[int(row)] = node_scales[1]
+        if load_rows.size:
+            mtypes = meas_type_array[load_rows]
+            names_list = device_name_array[load_rows].tolist()
+            scales_tuples = [load_node_scale_by_name[str(n)] for n in names_list]
+            v_arr = np.fromiter((t[0] for t in scales_tuples), dtype=np.float64, count=load_rows.size)
+            i_arr = np.fromiter((t[1] for t in scales_tuples), dtype=np.float64, count=load_rows.size)
+            scales_subset = np.ones(load_rows.size, dtype=np.float64)
+            power_mask = (mtypes == "P_LOAD") | (mtypes == "Q_LOAD")
+            scales_subset[power_mask] = power_scale
+            v_mask = mtypes == "V_LOAD"
+            scales_subset[v_mask] = v_arr[v_mask]
+            i_mask = mtypes == "I_LOAD"
+            scales_subset[i_mask] = i_arr[i_mask]
+            scale_array[load_rows] = scales_subset
 
         # Vectorize the bulk: classify rows by mask, apply value/=scale and
         # status flag updates en-masse, then loop only over the surviving

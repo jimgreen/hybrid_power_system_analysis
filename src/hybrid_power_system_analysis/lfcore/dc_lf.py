@@ -45,7 +45,7 @@ from types import SimpleNamespace
 from typing import Dict, Optional
 
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import coo_matrix, csc_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu, spsolve
 
@@ -63,6 +63,18 @@ for path in (ROOT_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+try:
+    from _sparse_pattern import (
+        apply_raw_sum_plan,
+        build_compressed_pattern_from_raw_coords,
+        build_raw_sum_plan,
+    )
+except ImportError:  # pragma: no cover - package import path
+    from ._sparse_pattern import (
+        apply_raw_sum_plan,
+        build_compressed_pattern_from_raw_coords,
+        build_raw_sum_plan,
+    )
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
 from model import topology as network_topology
@@ -98,6 +110,48 @@ def _device_key(device) -> str:
     return str(getattr(device, "name", "") or getattr(device, "idx", id(device)))
 
 
+class _DenseNodePositionMap:
+    """Dictionary-like node-id lookup backed by the dense PPC node map."""
+
+    __slots__ = ("lookup", "node_ids", "positions")
+
+    def __init__(self, lookup, node_ids, positions):
+        self.lookup = lookup
+        self.node_ids = node_ids
+        self.positions = positions
+
+    def get(self, key, default=None):
+        key = int(key)
+        if self.lookup is not None and 0 <= key < self.lookup.size:
+            pos = int(self.lookup[key])
+            return pos if pos >= 0 else default
+        return default
+
+    def __contains__(self, key):
+        return self.get(key, -1) >= 0
+
+    def __getitem__(self, key):
+        value = self.get(key, None)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def items(self):
+        for node_id, pos in zip(self.node_ids, self.positions):
+            yield int(node_id), int(pos)
+
+    def keys(self):
+        for node_id in self.node_ids:
+            yield int(node_id)
+
+    def values(self):
+        for pos in self.positions:
+            yield int(pos)
+
+    def __len__(self):
+        return int(self.node_ids.size)
+
+
 def load_dc_ppc_from_e_file(file_name) -> Dict:
     """Read a DC E file into PPC with topology arrays attached."""
     return build_dc_ppc_with_topology_from_e_file(file_name)
@@ -121,6 +175,10 @@ _OPTIONAL_SOLVER_CANDIDATES = {
     "klu": ("sksparse.klu", "spsolve"),
     "klu_alt": ("klu", "solve"),
 }
+
+
+def _as_solver_csc(matrix):
+    return matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
 
 
 def _load_named_sparse_solver(solver_name):
@@ -151,7 +209,7 @@ def _load_named_sparse_solver(solver_name):
                 klu_cls = solver
 
                 def solver(matrix, rhs, _klu_cls=klu_cls):
-                    return _klu_cls(matrix.tocsc()).solve(rhs)
+                    return _klu_cls(_as_solver_csc(matrix)).solve(rhs)
 
             _OPTIONAL_SPARSE_SOLVERS[solver_name] = solver
             return solver
@@ -221,11 +279,11 @@ def _get_pyklu_cls():
 def _factor_jacobian(matrix, resolved_name, solver_fn):
     """Build a factored solver object that supports repeated .solve(b) calls."""
     if resolved_name in {"scipy", "superlu", "default"}:
-        return splu(matrix.tocsc())
+        return splu(_as_solver_csc(matrix))
     if resolved_name in {"pyklu", "auto"}:
         klu_cls = _get_pyklu_cls()
         if klu_cls is not None:
-            return klu_cls(matrix.tocsc())
+            return klu_cls(_as_solver_csc(matrix))
     return _CallableFactor(matrix, solver_fn)
 
 
@@ -262,11 +320,19 @@ class DCPowerFlowCalc:
         "alive_node_dict",
         "alive_node_ids",
         "_alive_node_lookup",
+        "_active_bus_pos",
+        "_bus_pos_to_solver_pos",
         "_dc_jac_csr_indices",
         "_dc_jac_csr_indptr",
         "_dc_jac_csr_data",
+        "_dc_jac_csr_sum_plan",
+        "_dc_jac_csc_indices",
+        "_dc_jac_csc_indptr",
+        "_dc_jac_csc_data",
+        "_dc_jac_csc_sum_plan",
         "_dc_jac_raw_data",
         "_dc_jac_raw_to_csr_pos",
+        "_dc_jac_raw_to_csc_pos",
         "_dc_jac_unknown_slice",
         "_dc_jac_unknown_row_nodes",
         "_dc_jac_unknown_col_nodes",
@@ -489,6 +555,8 @@ class DCPowerFlowCalc:
         }
 
     def _load_direct_ppc_static(self):
+        if not self._should_use_direct_ppc_static_cache():
+            return None
         static = self.ppc.get("_dc_pf_static")
         if not isinstance(static, dict):
             return None
@@ -507,7 +575,17 @@ class DCPowerFlowCalc:
         self._lf_inactive_branch_devices = []
         return self.G, static["x"].copy()
 
+    def _should_use_direct_ppc_static_cache(self) -> bool:
+        """Cache only full-mode direct PPC preparation.
+
+        Array/summary/none cold-start runs execute ``prepare()`` once and do not
+        benefit from copying a large static cache back into the input ppc.
+        """
+        return bool(self._direct_ppc_mode and self.keep_node_objects)
+
     def _store_direct_ppc_static(self, x):
+        if not self._should_use_direct_ppc_static_cache():
+            return
         attrs = {
             name: self._clone_static_value(getattr(self, name))
             for name in self._DIRECT_PPC_STATIC_ATTRS
@@ -548,6 +626,88 @@ class DCPowerFlowCalc:
         valid = (node_ids >= 0) & (node_ids < lookup.size)
         mapped[valid] = lookup[node_ids[valid]]
         return mapped
+
+    def _topology_terminal_solver_positions(self, key: str, count: int, *, require_distinct_solver: bool = False):
+        if not (self._direct_ppc_mode and not self.keep_node_objects):
+            return None
+        topology = getattr(self, "_ppc_topology", None)
+        device_topology = getattr(topology, "devices", {}).get(key) if topology is not None else None
+        solver_lookup = getattr(self, "_bus_pos_to_solver_pos", None)
+        if device_topology is None or solver_lookup is None or solver_lookup.size == 0:
+            return None
+        alive = np.asarray(getattr(device_topology, "alive_mask", np.zeros(int(count), dtype=bool)), dtype=bool)
+        if alive.size != int(count):
+            return None
+        i_bus = np.asarray(device_topology.i_bus_pos, dtype=np.int32)
+        j_bus = np.asarray(device_topology.j_bus_pos, dtype=np.int32)
+        if i_bus.size != int(count) or j_bus.size != int(count):
+            return None
+        i_solver = np.full(int(count), -1, dtype=np.int32)
+        j_solver = np.full(int(count), -1, dtype=np.int32)
+        i_valid = (i_bus >= 0) & (i_bus < solver_lookup.size)
+        j_valid = (j_bus >= 0) & (j_bus < solver_lookup.size)
+        if np.any(i_valid):
+            i_solver[i_valid] = solver_lookup[i_bus[i_valid]]
+        if np.any(j_valid):
+            j_solver[j_valid] = solver_lookup[j_bus[j_valid]]
+        mask = alive & (i_solver >= 0) & (j_solver >= 0)
+        if require_distinct_solver:
+            mask &= i_solver != j_solver
+        rows = np.nonzero(mask)[0].astype(np.int32)
+        return rows, i_solver[mask].astype(np.int32, copy=False), j_solver[mask].astype(np.int32, copy=False)
+
+    def _topology_single_solver_positions(self, key: str, count: int):
+        if not (self._direct_ppc_mode and not self.keep_node_objects):
+            return None
+        topology = getattr(self, "_ppc_topology", None)
+        device_topology = getattr(topology, "devices", {}).get(key) if topology is not None else None
+        solver_lookup = getattr(self, "_bus_pos_to_solver_pos", None)
+        if device_topology is None or solver_lookup is None or solver_lookup.size == 0:
+            return None
+        alive = np.asarray(getattr(device_topology, "alive_mask", np.zeros(int(count), dtype=bool)), dtype=bool)
+        if alive.size != int(count):
+            return None
+        bus_pos = np.asarray(device_topology.bus_pos, dtype=np.int32)
+        if bus_pos.size != int(count):
+            return None
+        solver_pos = np.full(int(count), -1, dtype=np.int32)
+        valid = (bus_pos >= 0) & (bus_pos < solver_lookup.size)
+        if np.any(valid):
+            solver_pos[valid] = solver_lookup[bus_pos[valid]]
+        mask = alive & (solver_pos >= 0)
+        rows = np.nonzero(mask)[0].astype(np.int32)
+        return rows, solver_pos[mask].astype(np.int32, copy=False)
+
+    def _should_eliminate_dcdc_j_power(self) -> bool:
+        return bool(self.array_mode and self._direct_ppc_mode and not self.keep_node_objects)
+
+    def _dcdc_j_power_from_loss(self, pi, vi, vj):
+        pi = np.asarray(pi, dtype=np.float64)
+        vi = np.asarray(vi, dtype=np.float64)
+        vj = np.asarray(vj, dtype=np.float64)
+        vi2 = vi * vi
+        vj2 = vj * vj
+        a = self.dcdc_r2 * vi2
+        b = vi2 * vj2
+        c = vj2 * pi * (vi2 - self.dcdc_r1 * pi)
+        disc = np.maximum(b * b + 4.0 * a * c, 0.0)
+        sqrt_disc = np.sqrt(disc)
+        pj_linear = np.divide(-c, b, out=np.zeros_like(c), where=np.abs(b) > 1e-12)
+        pj_quad = np.divide(b - sqrt_disc, 2.0 * a, out=pj_linear.copy(), where=np.abs(a) > 1e-12)
+
+        denom = b - 2.0 * self.dcdc_r2 * pj_quad * vi2
+        safe = np.abs(denom) > 1e-12
+        dpj_dpi = np.divide(
+            -vj2 * (vi2 - 2.0 * self.dcdc_r1 * pi),
+            denom,
+            out=np.zeros_like(pi),
+            where=safe,
+        )
+        df_dvi = 2.0 * vi * vj2 * (pi + pj_quad) - 2.0 * self.dcdc_r2 * pj_quad * pj_quad * vi
+        df_dvj = 2.0 * vj * vi2 * (pi + pj_quad) - 2.0 * self.dcdc_r1 * pi * pi * vj
+        dpj_dvi = np.divide(-df_dvi, denom, out=np.zeros_like(pi), where=safe)
+        dpj_dvj = np.divide(-df_dvj, denom, out=np.zeros_like(pi), where=safe)
+        return pj_quad, dpj_dpi, dpj_dvi, dpj_dvj
 
     @staticmethod
     def _find_parent(parent, item):
@@ -655,30 +815,37 @@ class DCPowerFlowCalc:
                 self._alive_node_lookup = np.array([], dtype=np.int32)
         else:
             active_bus_pos = np.flatnonzero(topology.bus_alive_mask).astype(np.int32)
+            self._active_bus_pos = active_bus_pos
+            self._bus_pos_to_solver_pos = np.full(topology.bus_alive_mask.size, -1, dtype=np.int32)
             if active_bus_pos.size:
-                self.alive_node_dict = {}
-                alive_ids = []
-                alive_pos_values = []
-                for solver_pos, bus_pos in enumerate(active_bus_pos):
-                    start = int(topology.bus_node_offsets[bus_pos])
-                    end = int(topology.bus_node_offsets[bus_pos + 1])
-                    group_nodes = topology.node_ids[topology.bus_node_indices[start:end]].astype(np.int32, copy=False)
-                    alive_ids.extend(int(node_id) for node_id in group_nodes)
-                    alive_pos_values.extend([int(solver_pos)] * int(group_nodes.size))
-                    for node_id in group_nodes:
-                        self.alive_node_dict[int(node_id)] = int(solver_pos)
-                self.alive_node_ids = np.asarray(alive_ids, dtype=np.int32)
+                self._bus_pos_to_solver_pos[active_bus_pos] = np.arange(active_bus_pos.size, dtype=np.int32)
+            if active_bus_pos.size:
+                node_bus_pos = topology.node_to_bus_pos.astype(np.int32, copy=False)
+                node_mask = topology.node_alive_mask & (node_bus_pos >= 0)
+                node_pos = np.flatnonzero(node_mask).astype(np.int32, copy=False)
+                alive_pos_values = self._bus_pos_to_solver_pos[node_bus_pos[node_pos]]
+                valid = alive_pos_values >= 0
+                node_pos = node_pos[valid]
+                alive_pos_values = alive_pos_values[valid].astype(np.int32, copy=False)
+                self.alive_node_ids = topology.node_ids[node_pos].astype(np.int32, copy=True)
                 self.N = int(active_bus_pos.size)
                 if self.alive_node_ids.size and np.all(self.alive_node_ids >= 0):
                     self._alive_node_lookup = np.full(int(self.alive_node_ids.max()) + 1, -1, dtype=np.int32)
-                    self._alive_node_lookup[self.alive_node_ids.astype(np.intp)] = np.asarray(alive_pos_values, dtype=np.int32)
+                    self._alive_node_lookup[self.alive_node_ids.astype(np.intp)] = alive_pos_values
                 else:
                     self._alive_node_lookup = np.array([], dtype=np.int32)
+                self.alive_node_dict = _DenseNodePositionMap(
+                    self._alive_node_lookup,
+                    self.alive_node_ids,
+                    alive_pos_values,
+                )
             else:
                 self.alive_node_dict = {}
                 self.alive_node_ids = np.array([], dtype=np.int32)
                 self.N = 0
                 self._alive_node_lookup = np.array([], dtype=np.int32)
+                self._active_bus_pos = np.array([], dtype=np.int32)
+                self._bus_pos_to_solver_pos = np.array([], dtype=np.int32)
 
         # Direct ppc result/writeback paths use alive_node_dict and result arrays; constructing
         # SimpleNamespace node facades here is pure cold-start overhead for large ppc cases.
@@ -730,16 +897,22 @@ class DCPowerFlowCalc:
 
             branch = ppc["branch"]
             if branch.size:
-                branch_i_all = self._map_nodes_with_lookup(branch[:, DC_BRANCH_COLS["i_node"]], node_lookup)
-                branch_j_all = self._map_nodes_with_lookup(branch[:, DC_BRANCH_COLS["j_node"]], node_lookup)
-                branch_mask = (
-                    (branch[:, DC_BRANCH_COLS["run_stat"]] == 1)
-                    & (branch_i_all >= 0)
-                    & (branch_j_all >= 0)
-                )
-                self.branch_idx = np.nonzero(branch_mask)[0].astype(np.int32)
-                self.branch_i = branch_i_all[branch_mask].astype(np.int32, copy=False)
-                self.branch_j = branch_j_all[branch_mask].astype(np.int32, copy=False)
+                branch_positions = self._topology_terminal_solver_positions("branch", branch.shape[0])
+                if branch_positions is not None:
+                    self.branch_idx, self.branch_i, self.branch_j = branch_positions
+                    branch_mask = np.zeros(branch.shape[0], dtype=bool)
+                    branch_mask[self.branch_idx] = True
+                else:
+                    branch_i_all = self._map_nodes_with_lookup(branch[:, DC_BRANCH_COLS["i_node"]], node_lookup)
+                    branch_j_all = self._map_nodes_with_lookup(branch[:, DC_BRANCH_COLS["j_node"]], node_lookup)
+                    branch_mask = (
+                        (branch[:, DC_BRANCH_COLS["run_stat"]] == 1)
+                        & (branch_i_all >= 0)
+                        & (branch_j_all >= 0)
+                    )
+                    self.branch_idx = np.nonzero(branch_mask)[0].astype(np.int32)
+                    self.branch_i = branch_i_all[branch_mask].astype(np.int32, copy=False)
+                    self.branch_j = branch_j_all[branch_mask].astype(np.int32, copy=False)
                 self.branch_r = branch[branch_mask, DC_BRANCH_COLS["r"]].astype(np.float64, copy=False)
             else:
                 branch_mask = np.array([], dtype=bool)
@@ -759,9 +932,15 @@ class DCPowerFlowCalc:
 
             load = ppc["load"]
             if load.size:
-                load_pos_all = self._map_nodes_with_lookup(load[:, DC_LOAD_COLS["node"]], node_lookup)
-                load_mask = (load[:, DC_LOAD_COLS["run_stat"]] == 1) & (load_pos_all >= 0)
-                load_pos = load_pos_all[load_mask]
+                load_positions = self._topology_single_solver_positions("load", load.shape[0])
+                if load_positions is not None:
+                    load_rows, load_pos = load_positions
+                    load_mask = np.zeros(load.shape[0], dtype=bool)
+                    load_mask[load_rows] = True
+                else:
+                    load_pos_all = self._map_nodes_with_lookup(load[:, DC_LOAD_COLS["node"]], node_lookup)
+                    load_mask = (load[:, DC_LOAD_COLS["run_stat"]] == 1) & (load_pos_all >= 0)
+                    load_pos = load_pos_all[load_mask]
                 load_pbase = load[load_mask, DC_LOAD_COLS["pbase"]].astype(np.float64, copy=False)
                 load_pv0 = load_pbase * load[load_mask, DC_LOAD_COLS["pv0"]]
                 load_pv1 = load_pbase * load[load_mask, DC_LOAD_COLS["pv1"]]
@@ -777,12 +956,18 @@ class DCPowerFlowCalc:
 
             gen = ppc["gen"]
             if gen.size:
-                gen_pos_all = self._map_nodes_with_lookup(gen[:, DC_GEN_COLS["node"]], node_lookup)
-                gen_mask = (gen[:, DC_GEN_COLS["run_stat"]] == 1) & (gen_pos_all >= 0)
-                gen_pos = gen_pos_all[gen_mask]
+                gen_positions = self._topology_single_solver_positions("gen", gen.shape[0])
+                if gen_positions is not None:
+                    gen_rows, gen_pos = gen_positions
+                    gen_mask = np.zeros(gen.shape[0], dtype=bool)
+                    gen_mask[gen_rows] = True
+                else:
+                    gen_pos_all = self._map_nodes_with_lookup(gen[:, DC_GEN_COLS["node"]], node_lookup)
+                    gen_mask = (gen[:, DC_GEN_COLS["run_stat"]] == 1) & (gen_pos_all >= 0)
+                    gen_pos = gen_pos_all[gen_mask]
+                    gen_rows = np.nonzero(gen_mask)[0]
                 gen_active = gen[gen_mask]
                 gen_ctrl = gen_active[:, DC_GEN_COLS["control_type"]].astype(np.int8, copy=False)
-                gen_rows = np.nonzero(gen_mask)[0]
                 p_mask = gen_ctrl == DC_CTRL_P
                 i_mask = gen_ctrl == DC_CTRL_I
                 v_mask = gen_ctrl == DC_CTRL_V
@@ -900,72 +1085,41 @@ class DCPowerFlowCalc:
 
         # ---------- 2. 零阻抗支路处理（节点电位法） ----------
         if self.array_mode:
-            zero_branch = self.ppc["zero_branch"]
-            zero_parts = []
-            if zero_branch.size:
-                zero_i_all = self._map_nodes_with_lookup(zero_branch[:, DC_ZERO_BRANCH_COLS["i_node"]], node_lookup)
-                zero_j_all = self._map_nodes_with_lookup(zero_branch[:, DC_ZERO_BRANCH_COLS["j_node"]], node_lookup)
-                zero_mask = (
-                    (zero_branch[:, DC_ZERO_BRANCH_COLS["run_stat"]] == 1)
-                    & (zero_i_all >= 0)
-                    & (zero_j_all >= 0)
-                    & (zero_i_all != zero_j_all)
+            self.zero_edges = []
+
+            def append_zero_edges(table_key, table, cols, code):
+                if table is None or not table.size:
+                    return
+                positions = self._topology_terminal_solver_positions(
+                    table_key,
+                    table.shape[0],
+                    require_distinct_solver=True,
                 )
-                if np.any(zero_mask):
-                    zero_parts.extend(
-                        zip(
-                            np.repeat("Z", int(np.count_nonzero(zero_mask))),
-                            np.nonzero(zero_mask)[0].astype(np.int32),
-                            zero_i_all[zero_mask],
-                            zero_j_all[zero_mask],
-                        )
+                if positions is not None:
+                    rows, i_pos, j_pos = positions
+                else:
+                    i_all = self._map_nodes_with_lookup(table[:, cols["i_node"]], node_lookup)
+                    j_all = self._map_nodes_with_lookup(table[:, cols["j_node"]], node_lookup)
+                    mask = (
+                        (table[:, cols["run_stat"]] == 1)
+                        & (i_all >= 0)
+                        & (j_all >= 0)
+                        & (i_all != j_all)
+                    )
+                    if "status" in cols:
+                        mask &= table[:, cols["status"]] == 1
+                    rows = np.nonzero(mask)[0].astype(np.int32)
+                    i_pos = i_all[mask].astype(np.int32, copy=False)
+                    j_pos = j_all[mask].astype(np.int32, copy=False)
+                if rows.size:
+                    self.zero_edges.extend(
+                        (code, int(dev_idx), int(i_node), int(j_node))
+                        for dev_idx, i_node, j_node in zip(rows, i_pos, j_pos)
                     )
 
-            switch = self.ppc["switch"]
-            if switch.size:
-                switch_i_all = self._map_nodes_with_lookup(switch[:, DC_SWITCH_COLS["i_node"]], node_lookup)
-                switch_j_all = self._map_nodes_with_lookup(switch[:, DC_SWITCH_COLS["j_node"]], node_lookup)
-                switch_mask = (
-                    (switch[:, DC_SWITCH_COLS["run_stat"]] == 1)
-                    & (switch[:, DC_SWITCH_COLS["status"]] == 1)
-                    & (switch_i_all >= 0)
-                    & (switch_j_all >= 0)
-                    & (switch_i_all != switch_j_all)
-                )
-                if np.any(switch_mask):
-                    zero_parts.extend(
-                        zip(
-                            np.repeat("S", int(np.count_nonzero(switch_mask))),
-                            np.nonzero(switch_mask)[0].astype(np.int32),
-                            switch_i_all[switch_mask],
-                            switch_j_all[switch_mask],
-                        )
-                    )
-            self.zero_edges = [
-                (str(tp), int(dev_idx), int(i_node), int(j_node))
-                for tp, dev_idx, i_node, j_node in zero_parts
-            ]
-            breaker = self.ppc.get("break")
-            if breaker is not None and breaker.size:
-                break_i_all = self._map_nodes_with_lookup(breaker[:, DC_BREAK_COLS["i_node"]], node_lookup)
-                break_j_all = self._map_nodes_with_lookup(breaker[:, DC_BREAK_COLS["j_node"]], node_lookup)
-                break_mask = (
-                    (breaker[:, DC_BREAK_COLS["run_stat"]] == 1)
-                    & (breaker[:, DC_BREAK_COLS["status"]] == 1)
-                    & (break_i_all >= 0)
-                    & (break_j_all >= 0)
-                    & (break_i_all != break_j_all)
-                )
-                if np.any(break_mask):
-                    self.zero_edges.extend(
-                        (str(tp), int(dev_idx), int(i_node), int(j_node))
-                        for tp, dev_idx, i_node, j_node in zip(
-                            np.repeat("B", int(np.count_nonzero(break_mask))),
-                            np.nonzero(break_mask)[0].astype(np.int32),
-                            break_i_all[break_mask],
-                            break_j_all[break_mask],
-                        )
-                    )
+            append_zero_edges("zero_branch", self.ppc["zero_branch"], DC_ZERO_BRANCH_COLS, "Z")
+            append_zero_edges("switch", self.ppc["switch"], DC_SWITCH_COLS, "S")
+            append_zero_edges("break", self.ppc.get("break"), DC_BREAK_COLS, "B")
         else:
             self.zero_edges = [
                 ('Z', zb_idx, self.alive_node_dict[zb.i_node], self.alive_node_dict[zb.j_node])
@@ -1085,17 +1239,23 @@ class DCPowerFlowCalc:
         if self.array_mode:
             dcdc = self.ppc["dcdc"]
             if dcdc.size:
-                dcdc_i_all = self._map_nodes_with_lookup(dcdc[:, DC_DCDC_COLS["i_node"]], node_lookup)
-                dcdc_j_all = self._map_nodes_with_lookup(dcdc[:, DC_DCDC_COLS["j_node"]], node_lookup)
-                dcdc_mask = (
-                    (dcdc[:, DC_DCDC_COLS["run_stat"]] == 1)
-                    & (dcdc_i_all >= 0)
-                    & (dcdc_j_all >= 0)
-                )
+                dcdc_positions = self._topology_terminal_solver_positions("dcdc", dcdc.shape[0])
+                if dcdc_positions is not None:
+                    self.dcdc_idx, self.dcdc_i, self.dcdc_j = dcdc_positions
+                    dcdc_mask = np.zeros(dcdc.shape[0], dtype=bool)
+                    dcdc_mask[self.dcdc_idx] = True
+                else:
+                    dcdc_i_all = self._map_nodes_with_lookup(dcdc[:, DC_DCDC_COLS["i_node"]], node_lookup)
+                    dcdc_j_all = self._map_nodes_with_lookup(dcdc[:, DC_DCDC_COLS["j_node"]], node_lookup)
+                    dcdc_mask = (
+                        (dcdc[:, DC_DCDC_COLS["run_stat"]] == 1)
+                        & (dcdc_i_all >= 0)
+                        & (dcdc_j_all >= 0)
+                    )
+                    self.dcdc_idx = np.nonzero(dcdc_mask)[0].astype(np.int32)
+                    self.dcdc_i = dcdc_i_all[dcdc_mask].astype(np.int32, copy=False)
+                    self.dcdc_j = dcdc_j_all[dcdc_mask].astype(np.int32, copy=False)
                 dcdc_active = dcdc[dcdc_mask]
-                self.dcdc_idx = np.nonzero(dcdc_mask)[0].astype(np.int32)
-                self.dcdc_i = dcdc_i_all[dcdc_mask].astype(np.int32, copy=False)
-                self.dcdc_j = dcdc_j_all[dcdc_mask].astype(np.int32, copy=False)
                 self.dcdc_ctrl_code = dcdc_active[:, DC_DCDC_COLS["control_type"]].astype(np.int8, copy=False)
                 self.dcdc_p_set = dcdc_active[:, DC_DCDC_COLS["p_set"]].astype(np.float64, copy=False)
                 self.dcdc_i_set = dcdc_active[:, DC_DCDC_COLS["i_set"]].astype(np.float64, copy=False)
@@ -1163,9 +1323,12 @@ class DCPowerFlowCalc:
             print("self.N_dcdc = ", self.N_dcdc)
 
         # ---------- 5. 变量定义 ----------
-        # 前 N 个变量是节点电压；随后是零阻抗连通分量的 phi；最后每台
-        # DCDC 有两端端口功率未知量，用于同时表达控制模式和损耗方程。
-        self.total_vars = self.N + self.N_phi + self.N_dcdc * 2
+        # 前 N 个变量是节点电压；随后是零阻抗连通分量的 phi。array-only
+        # direct PPC 模式下消去 DCDC j 端功率，j 端由损耗方程闭式回算；
+        # full/object 路径保留双端功率未知量，便于完整回填和对照。
+        self.dcdc_eliminate_pj = bool(self.N_dcdc and self._should_eliminate_dcdc_j_power())
+        dcdc_var_count = self.N_dcdc if self.dcdc_eliminate_pj else self.N_dcdc * 2
+        self.total_vars = self.N + self.N_phi + dcdc_var_count
         x = np.zeros(self.total_vars, dtype=np.float64)
         x[:self.N] = 1.0
         if self.slack_node_arr.size:
@@ -1188,7 +1351,8 @@ class DCPowerFlowCalc:
         self.n_phi_fix = self.ref_phi_idx.size
         self.n_dcdc = self.N_dcdc
 
-        self.total_eq = self.n_unknown + self.n_known + self.n_zero_constraint + self.n_phi_fix + self.n_dcdc * 2
+        dcdc_eq_count = self.n_dcdc if self.dcdc_eliminate_pj else self.n_dcdc * 2
+        self.total_eq = self.n_unknown + self.n_known + self.n_zero_constraint + self.n_phi_fix + dcdc_eq_count
         if self.total_vars != self.total_eq:
             if self.verbose:
                 print(f"警告：变量数({self.total_vars})与方程数({self.total_eq})不匹配，请检查零阻抗支路设置。")
@@ -1203,14 +1367,23 @@ class DCPowerFlowCalc:
         self.eq_phi_start = self.eq_zero_start + self.n_zero_constraint
         self.eq_dcdc_start = self.eq_phi_start + self.n_phi_fix
 
-        self.unknown_map = {int(node): int(i) for i, node in enumerate(self.unknown_nodes)}
+        if self.array_mode and self._direct_ppc_mode and not self.keep_node_objects:
+            self.unknown_map = {}
+        else:
+            self.unknown_map = {int(node): int(i) for i, node in enumerate(self.unknown_nodes)}
         self.zero_con_rows = self.eq_zero_start + np.arange(self.n_zero_constraint, dtype=np.int32)
         self.phi_fix_rows = self.eq_phi_start + np.arange(self.n_phi_fix, dtype=np.int32)
         self.dcdc_seq = np.arange(self.N_dcdc, dtype=np.int32)
-        self.dcdc_p_col = self.N + self.N_phi + 2 * self.dcdc_seq
-        self.dcdc_q_col = self.dcdc_p_col + 1
-        self.dcdc_eq_ctrl = self.eq_dcdc_start + 2 * self.dcdc_seq
-        self.dcdc_eq_loss = self.dcdc_eq_ctrl + 1
+        if self.dcdc_eliminate_pj:
+            self.dcdc_p_col = self.N + self.N_phi + self.dcdc_seq
+            self.dcdc_q_col = np.array([], dtype=np.int32)
+            self.dcdc_eq_ctrl = self.eq_dcdc_start + self.dcdc_seq
+            self.dcdc_eq_loss = np.array([], dtype=np.int32)
+        else:
+            self.dcdc_p_col = self.N + self.N_phi + 2 * self.dcdc_seq
+            self.dcdc_q_col = self.dcdc_p_col + 1
+            self.dcdc_eq_ctrl = self.eq_dcdc_start + 2 * self.dcdc_seq
+            self.dcdc_eq_loss = self.dcdc_eq_ctrl + 1
         self.dcdc_ctrl_p_mask = self.dcdc_ctrl_code == 0
         self.dcdc_ctrl_v_mask = self.dcdc_ctrl_code == 1
         self.dcdc_ctrl_i_mask = self.dcdc_ctrl_code == 2
@@ -1281,11 +1454,19 @@ class DCPowerFlowCalc:
             self.dcdc_i_unknown_idx = np.where(self.dcdc_i_unknown_mask)[0].astype(np.int32)
             self.dcdc_j_unknown_idx = np.where(self.dcdc_j_unknown_mask)[0].astype(np.int32)
             self.dcdc_i_eq_rows_jac = self.dcdc_i_eq[self.dcdc_i_unknown_mask]
-            self.dcdc_j_eq_rows_jac = self.dcdc_j_eq[self.dcdc_j_unknown_mask]
             self.dcdc_i_eq_cols_jac = self.dcdc_p_col[self.dcdc_i_unknown_idx]
-            self.dcdc_j_eq_cols_jac = self.dcdc_q_col[self.dcdc_j_unknown_idx]
             self.dcdc_i_eq_data_jac = np.ones(self.dcdc_i_unknown_idx.size, dtype=np.float64)
-            self.dcdc_j_eq_data_jac = np.ones(self.dcdc_j_unknown_idx.size, dtype=np.float64)
+            if self.dcdc_eliminate_pj:
+                self.dcdc_j_eq_rows_jac = np.repeat(self.dcdc_j_eq[self.dcdc_j_unknown_mask], 3)
+                self.dcdc_j_eq_cols_jac = np.empty(3 * self.dcdc_j_unknown_idx.size, dtype=np.int32)
+                self.dcdc_j_eq_cols_jac[0::3] = self.dcdc_p_col[self.dcdc_j_unknown_idx]
+                self.dcdc_j_eq_cols_jac[1::3] = self.dcdc_i[self.dcdc_j_unknown_idx]
+                self.dcdc_j_eq_cols_jac[2::3] = self.dcdc_j[self.dcdc_j_unknown_idx]
+                self.dcdc_j_eq_data_jac = np.empty(3 * self.dcdc_j_unknown_idx.size, dtype=np.float64)
+            else:
+                self.dcdc_j_eq_rows_jac = self.dcdc_j_eq[self.dcdc_j_unknown_mask]
+                self.dcdc_j_eq_cols_jac = self.dcdc_q_col[self.dcdc_j_unknown_idx]
+                self.dcdc_j_eq_data_jac = np.ones(self.dcdc_j_unknown_idx.size, dtype=np.float64)
 
             self.dcdc_ctrl_p_count = int(np.count_nonzero(self.dcdc_ctrl_p_mask))
             self.dcdc_ctrl_v_count = int(np.count_nonzero(self.dcdc_ctrl_v_mask))
@@ -1303,12 +1484,16 @@ class DCPowerFlowCalc:
             else:
                 self.dcdc_ctrl_i_cols_jac = np.array([], dtype=np.int32)
                 self.dcdc_ctrl_i_data_jac = np.array([], dtype=np.float64)
-            self.dcdc_loss_rows_jac = np.repeat(self.dcdc_eq_loss, 4)
-            self.dcdc_loss_cols_jac = np.empty(self.N_dcdc * 4, dtype=np.int32)
-            self.dcdc_loss_cols_jac[0::4] = self.dcdc_p_col
-            self.dcdc_loss_cols_jac[1::4] = self.dcdc_q_col
-            self.dcdc_loss_cols_jac[2::4] = self.dcdc_i
-            self.dcdc_loss_cols_jac[3::4] = self.dcdc_j
+            if self.dcdc_eliminate_pj:
+                self.dcdc_loss_rows_jac = np.array([], dtype=np.int32)
+                self.dcdc_loss_cols_jac = np.array([], dtype=np.int32)
+            else:
+                self.dcdc_loss_rows_jac = np.repeat(self.dcdc_eq_loss, 4)
+                self.dcdc_loss_cols_jac = np.empty(self.N_dcdc * 4, dtype=np.int32)
+                self.dcdc_loss_cols_jac[0::4] = self.dcdc_p_col
+                self.dcdc_loss_cols_jac[1::4] = self.dcdc_q_col
+                self.dcdc_loss_cols_jac[2::4] = self.dcdc_i
+                self.dcdc_loss_cols_jac[3::4] = self.dcdc_j
         else:
             self.dcdc_i_unknown_idx = self.dcdc_j_unknown_idx = np.array([], dtype=np.int32)
         self._prepare_jacobian_csr_pattern()
@@ -1339,28 +1524,46 @@ class DCPowerFlowCalc:
         unknown_g_data = []
         if self.n_unknown:
             G_csr = self.G.tocsr()
-            for eq_row, node in enumerate(self.unknown_nodes):
-                node = int(node)
-                start = int(G_csr.indptr[node])
-                end = int(G_csr.indptr[node + 1])
-                row_cols = G_csr.indices[start:end]
-                row_data = G_csr.data[start:end]
-                has_diag = False
-                for col, value in zip(row_cols, row_data):
-                    col = int(col)
-                    unknown_rows.append(eq_row)
-                    unknown_cols.append(col)
-                    unknown_row_nodes.append(node)
-                    unknown_col_nodes.append(col)
-                    unknown_g_data.append(float(value))
-                    if col == node:
-                        has_diag = True
-                if not has_diag:
-                    unknown_rows.append(eq_row)
-                    unknown_cols.append(node)
-                    unknown_row_nodes.append(node)
-                    unknown_col_nodes.append(node)
-                    unknown_g_data.append(0.0)
+            counts = np.diff(G_csr.indptr).astype(np.int32, copy=False)
+            if G_csr.indices.size:
+                all_row_nodes = np.repeat(np.arange(self.N, dtype=np.int32), counts)
+                all_eq_rows = self.node_eq[all_row_nodes]
+                keep = all_eq_rows >= 0
+                if np.any(keep):
+                    unknown_rows = all_eq_rows[keep].astype(np.int32, copy=True)
+                    unknown_cols = G_csr.indices[keep].astype(np.int32, copy=True)
+                    unknown_row_nodes = all_row_nodes[keep].astype(np.int32, copy=True)
+                    unknown_col_nodes = unknown_cols.copy()
+                    unknown_g_data = G_csr.data[keep].astype(np.float64, copy=True)
+                else:
+                    unknown_rows = np.array([], dtype=np.int32)
+                    unknown_cols = np.array([], dtype=np.int32)
+                    unknown_row_nodes = np.array([], dtype=np.int32)
+                    unknown_col_nodes = np.array([], dtype=np.int32)
+                    unknown_g_data = np.array([], dtype=np.float64)
+            else:
+                unknown_rows = np.array([], dtype=np.int32)
+                unknown_cols = np.array([], dtype=np.int32)
+                unknown_row_nodes = np.array([], dtype=np.int32)
+                unknown_col_nodes = np.array([], dtype=np.int32)
+                unknown_g_data = np.array([], dtype=np.float64)
+
+            diag_seen = np.zeros(self.n_unknown, dtype=bool)
+            if np.asarray(unknown_rows).size:
+                diag_mask = np.asarray(unknown_col_nodes) == np.asarray(unknown_row_nodes)
+                if np.any(diag_mask):
+                    diag_seen[np.asarray(unknown_rows, dtype=np.int32)[diag_mask]] = True
+            missing_diag = np.flatnonzero(~diag_seen).astype(np.int32, copy=False)
+            if missing_diag.size:
+                missing_nodes = self.unknown_nodes[missing_diag].astype(np.int32, copy=False)
+                unknown_rows = np.concatenate((np.asarray(unknown_rows, dtype=np.int32), missing_diag))
+                unknown_cols = np.concatenate((np.asarray(unknown_cols, dtype=np.int32), missing_nodes))
+                unknown_row_nodes = np.concatenate((np.asarray(unknown_row_nodes, dtype=np.int32), missing_nodes))
+                unknown_col_nodes = np.concatenate((np.asarray(unknown_col_nodes, dtype=np.int32), missing_nodes))
+                unknown_g_data = np.concatenate((
+                    np.asarray(unknown_g_data, dtype=np.float64),
+                    np.zeros(missing_diag.size, dtype=np.float64),
+                ))
         self._dc_jac_unknown_row_nodes = np.asarray(unknown_row_nodes, dtype=np.int32)
         self._dc_jac_unknown_col_nodes = np.asarray(unknown_col_nodes, dtype=np.int32)
         self._dc_jac_unknown_g_data = np.asarray(unknown_g_data, dtype=np.float64)
@@ -1393,30 +1596,30 @@ class DCPowerFlowCalc:
             self._dc_jac_csr_indices = np.array([], dtype=np.int32)
             self._dc_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
             self._dc_jac_csr_data = np.array([], dtype=np.float64)
+            self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, 0)
+            self._dc_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+            self._dc_jac_csc_indices = np.array([], dtype=np.int32)
+            self._dc_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
+            self._dc_jac_csc_data = np.array([], dtype=np.float64)
+            self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, 0)
             return
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        pattern = coo_matrix(
-            (np.ones(raw_count, dtype=np.float64), (raw_rows, raw_cols)),
-            shape=(self.total_eq, self.total_vars),
-        ).tocsr()
-        pattern.sum_duplicates()
-        self._dc_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
-        self._dc_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
+        (
+            self._dc_jac_csr_indices,
+            self._dc_jac_csr_indptr,
+            self._dc_jac_raw_to_csr_pos,
+        ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        (
+            self._dc_jac_csc_indices,
+            self._dc_jac_csc_indptr,
+            self._dc_jac_raw_to_csc_pos,
+        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
         self._dc_jac_csr_data = np.empty(self._dc_jac_csr_indices.size, dtype=np.float64)
-
-        positions = {}
-        for row in range(self.total_eq):
-            start = int(self._dc_jac_csr_indptr[row])
-            end = int(self._dc_jac_csr_indptr[row + 1])
-            for pos in range(start, end):
-                positions[(row, int(self._dc_jac_csr_indices[pos]))] = pos
-        self._dc_jac_raw_to_csr_pos = np.fromiter(
-            (positions[(int(row), int(col))] for row, col in zip(raw_rows, raw_cols)),
-            dtype=np.intp,
-            count=raw_count,
-        )
+        self._dc_jac_csc_data = np.empty(self._dc_jac_csc_indices.size, dtype=np.float64)
+        self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, self._dc_jac_csr_data.size)
+        self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, self._dc_jac_csc_data.size)
 
     @staticmethod
     def _slice_len(part_slice):
@@ -1460,7 +1663,14 @@ class DCPowerFlowCalc:
             raw[part_slice] = self.dcdc_i_eq_data_jac
         part_slice = self._dc_jac_dcdc_j_slice
         if self._slice_len(part_slice):
-            raw[part_slice] = self.dcdc_j_eq_data_jac
+            if getattr(self, "dcdc_eliminate_pj", False):
+                idx = self.dcdc_j_unknown_idx
+                data = raw[part_slice]
+                data[0::3] = terms["dcdc_dpj_dpi"][idx]
+                data[1::3] = terms["dcdc_dpj_dvi"][idx]
+                data[2::3] = terms["dcdc_dpj_dvj"][idx]
+            else:
+                raw[part_slice] = self.dcdc_j_eq_data_jac
         part_slice = self._dc_jac_known_slice
         if self._slice_len(part_slice):
             raw[part_slice] = self.known_data_jac
@@ -1482,32 +1692,44 @@ class DCPowerFlowCalc:
             if self._slice_len(part_slice):
                 raw[part_slice] = self.dcdc_ctrl_i_data_jac
 
-            vi = terms["dcdc_vi"]
-            vj = terms["dcdc_vj"]
-            pi = terms["dcdc_pi"]
-            pj = terms["dcdc_pj"]
-            vi2 = terms["dcdc_vi2"]
-            vj2 = terms["dcdc_vj2"]
-            pi2 = terms["dcdc_pi2"]
-            pj2 = terms["dcdc_pj2"]
-            data = raw[self._dc_jac_dcdc_loss_slice]
-            data[0::4] = vi2 * vj2 - 2.0 * self.dcdc_r1 * pi * vj2
-            data[1::4] = vi2 * vj2 - 2.0 * self.dcdc_r2 * pj * vi2
-            data[2::4] = 2.0 * vi * vj2 * (pi + pj) - 2.0 * self.dcdc_r2 * pj2 * vi
-            data[3::4] = 2.0 * vj * vi2 * (pi + pj) - 2.0 * self.dcdc_r1 * pi2 * vj
+            if not getattr(self, "dcdc_eliminate_pj", False):
+                vi = terms["dcdc_vi"]
+                vj = terms["dcdc_vj"]
+                pi = terms["dcdc_pi"]
+                pj = terms["dcdc_pj"]
+                vi2 = terms["dcdc_vi2"]
+                vj2 = terms["dcdc_vj2"]
+                pi2 = terms["dcdc_pi2"]
+                pj2 = terms["dcdc_pj2"]
+                data = raw[self._dc_jac_dcdc_loss_slice]
+                data[0::4] = vi2 * vj2 - 2.0 * self.dcdc_r1 * pi * vj2
+                data[1::4] = vi2 * vj2 - 2.0 * self.dcdc_r2 * pj * vi2
+                data[2::4] = 2.0 * vi * vj2 * (pi + pj) - 2.0 * self.dcdc_r2 * pj2 * vi
+                data[3::4] = 2.0 * vj * vi2 * (pi + pj) - 2.0 * self.dcdc_r1 * pi2 * vj
 
-    def _get_jacobi_from_precomputed_pattern(self, terms):
+    def _get_jacobi_from_precomputed_pattern(self, terms, *, matrix_format="csr", build_matrix=True):
         if not hasattr(self, "_dc_jac_raw_data"):
             return None
         if self._dc_jac_raw_data.size == 0:
-            return csr_matrix((self.total_eq, self.total_vars), dtype=np.float64)
+            if not build_matrix:
+                return np.array([], dtype=np.float64)
+            shape = (self.total_eq, self.total_vars)
+            return csc_matrix(shape, dtype=np.float64) if matrix_format == "csc" else csr_matrix(shape, dtype=np.float64)
         self._fill_jacobian_raw_data(terms)
-        # bincount 比 np.add.at 快很多，且每次迭代都要执行。
-        self._dc_jac_csr_data[:] = np.bincount(
-            self._dc_jac_raw_to_csr_pos,
-            weights=self._dc_jac_raw_data,
-            minlength=self._dc_jac_csr_data.size,
-        )
+
+        if matrix_format == "csc":
+            apply_raw_sum_plan(self._dc_jac_csc_data, self._dc_jac_raw_data, self._dc_jac_csc_sum_plan)
+            if not build_matrix:
+                return self._dc_jac_csc_data
+            return csc_matrix(
+                (self._dc_jac_csc_data, self._dc_jac_csc_indices, self._dc_jac_csc_indptr),
+                shape=(self.total_eq, self.total_vars),
+                copy=False,
+            )
+
+        apply_raw_sum_plan(self._dc_jac_csr_data, self._dc_jac_raw_data, self._dc_jac_csr_sum_plan)
+        if not build_matrix:
+            return self._dc_jac_csr_data
         return csr_matrix(
             (self._dc_jac_csr_data, self._dc_jac_csr_indices, self._dc_jac_csr_indptr),
             shape=(self.total_eq, self.total_vars),
@@ -1518,7 +1740,11 @@ class DCPowerFlowCalc:
         """Evaluate DC Newton quantities shared by residual and Jacobian."""
         V = x[:self.N]
         phi = x[self.N:self.N + self.N_phi]
-        Pdc = x[self.N + self.N_phi:self.N + self.N_phi + self.N_dcdc * 2] if self.N_dcdc > 0 else np.array([])
+        if self.N_dcdc > 0:
+            dcdc_width = self.N_dcdc if getattr(self, "dcdc_eliminate_pj", False) else self.N_dcdc * 2
+            Pdc = x[self.N + self.N_phi:self.N + self.N_phi + dcdc_width]
+        else:
+            Pdc = np.array([])
         GV = G.dot(V)
         terms = {
             "V": V,
@@ -1533,13 +1759,21 @@ class DCPowerFlowCalc:
         if self.N_dcdc:
             vi = V[self.dcdc_i]
             vj = V[self.dcdc_j]
-            pi = Pdc[0::2]
-            pj = Pdc[1::2]
+            if getattr(self, "dcdc_eliminate_pj", False):
+                pi = Pdc
+                pj, dpj_dpi, dpj_dvi, dpj_dvj = self._dcdc_j_power_from_loss(pi, vi, vj)
+            else:
+                pi = Pdc[0::2]
+                pj = Pdc[1::2]
+                dpj_dpi = dpj_dvi = dpj_dvj = np.array([], dtype=np.float64)
             terms.update(
                 dcdc_vi=vi,
                 dcdc_vj=vj,
                 dcdc_pi=pi,
                 dcdc_pj=pj,
+                dcdc_dpj_dpi=dpj_dpi,
+                dcdc_dpj_dvi=dpj_dvi,
+                dcdc_dpj_dvj=dpj_dvj,
                 dcdc_vi2=vi * vi,
                 dcdc_vj2=vj * vj,
                 dcdc_pi2=pi * pi,
@@ -1547,9 +1781,13 @@ class DCPowerFlowCalc:
             )
         return terms
 
-    def _get_jacobi_from_terms(self, G, x, terms):
+    def _get_jacobi_from_terms(self, G, x, terms, *, matrix_format="csr", build_matrix=True):
         """组装 DC Newton 方程的稀疏 Jacobian。"""
-        precomputed = self._get_jacobi_from_precomputed_pattern(terms)
+        precomputed = self._get_jacobi_from_precomputed_pattern(
+            terms,
+            matrix_format=matrix_format,
+            build_matrix=build_matrix,
+        )
         if precomputed is not None:
             return precomputed
 
@@ -1599,7 +1837,15 @@ class DCPowerFlowCalc:
             if self.dcdc_j_unknown_idx.size:
                 rows_parts.append(self.dcdc_j_eq_rows_jac)
                 cols_parts.append(self.dcdc_j_eq_cols_jac)
-                data_parts.append(self.dcdc_j_eq_data_jac)
+                if getattr(self, "dcdc_eliminate_pj", False):
+                    idx = self.dcdc_j_unknown_idx
+                    data = np.empty(3 * idx.size, dtype=np.float64)
+                    data[0::3] = terms["dcdc_dpj_dpi"][idx]
+                    data[1::3] = terms["dcdc_dpj_dvi"][idx]
+                    data[2::3] = terms["dcdc_dpj_dvj"][idx]
+                    data_parts.append(data)
+                else:
+                    data_parts.append(self.dcdc_j_eq_data_jac)
 
         # 8.4 松弛节点电压方程行
         if self.n_known:
@@ -1634,22 +1880,23 @@ class DCPowerFlowCalc:
                 cols_parts.append(self.dcdc_ctrl_i_cols_jac)
                 data_parts.append(self.dcdc_ctrl_i_data_jac)
 
-            vi = terms["dcdc_vi"]
-            vj = terms["dcdc_vj"]
-            pi = terms["dcdc_pi"]
-            pj = terms["dcdc_pj"]
-            vi2 = terms["dcdc_vi2"]
-            vj2 = terms["dcdc_vj2"]
-            pi2 = terms["dcdc_pi2"]
-            pj2 = terms["dcdc_pj2"]
-            loss_data = np.empty(self.N_dcdc * 4, dtype=np.float64)
-            loss_data[0::4] = vi2 * vj2 - 2.0 * self.dcdc_r1 * pi * vj2
-            loss_data[1::4] = vi2 * vj2 - 2.0 * self.dcdc_r2 * pj * vi2
-            loss_data[2::4] = 2.0 * vi * vj2 * (pi + pj) - 2.0 * self.dcdc_r2 * pj2 * vi
-            loss_data[3::4] = 2.0 * vj * vi2 * (pi + pj) - 2.0 * self.dcdc_r1 * pi2 * vj
-            rows_parts.append(self.dcdc_loss_rows_jac)
-            cols_parts.append(self.dcdc_loss_cols_jac)
-            data_parts.append(loss_data)
+            if not getattr(self, "dcdc_eliminate_pj", False):
+                vi = terms["dcdc_vi"]
+                vj = terms["dcdc_vj"]
+                pi = terms["dcdc_pi"]
+                pj = terms["dcdc_pj"]
+                vi2 = terms["dcdc_vi2"]
+                vj2 = terms["dcdc_vj2"]
+                pi2 = terms["dcdc_pi2"]
+                pj2 = terms["dcdc_pj2"]
+                loss_data = np.empty(self.N_dcdc * 4, dtype=np.float64)
+                loss_data[0::4] = vi2 * vj2 - 2.0 * self.dcdc_r1 * pi * vj2
+                loss_data[1::4] = vi2 * vj2 - 2.0 * self.dcdc_r2 * pj * vi2
+                loss_data[2::4] = 2.0 * vi * vj2 * (pi + pj) - 2.0 * self.dcdc_r2 * pj2 * vi
+                loss_data[3::4] = 2.0 * vj * vi2 * (pi + pj) - 2.0 * self.dcdc_r1 * pi2 * vj
+                rows_parts.append(self.dcdc_loss_rows_jac)
+                cols_parts.append(self.dcdc_loss_cols_jac)
+                data_parts.append(loss_data)
 
         if rows_parts:
             J_rows = np.concatenate(rows_parts)
@@ -1659,7 +1906,8 @@ class DCPowerFlowCalc:
             J_rows = J_cols = np.array([], dtype=np.int32)
             J_data = np.array([], dtype=np.float64)
 
-        return coo_matrix((J_data, (J_rows, J_cols)), shape=(self.total_eq, self.total_vars)).tocsr()
+        jac = coo_matrix((J_data, (J_rows, J_cols)), shape=(self.total_eq, self.total_vars)).tocsr()
+        return jac.tocsc() if matrix_format == "csc" else jac
 
     def get_jacobi(self, G, x, terms=None):
         """Public Jacobian API for tests and external callers."""
@@ -1680,8 +1928,8 @@ class DCPowerFlowCalc:
             P_inj += np.bincount(self.zero_j, weights=-V[self.zero_j] * current, minlength=P_inj.size)
 
         if self.N_dcdc:
-            P_inj += np.bincount(self.dcdc_i, weights=Pdc[0::2], minlength=P_inj.size)
-            P_inj += np.bincount(self.dcdc_j, weights=Pdc[1::2], minlength=P_inj.size)
+            P_inj += np.bincount(self.dcdc_i, weights=terms["dcdc_pi"], minlength=P_inj.size)
+            P_inj += np.bincount(self.dcdc_j, weights=terms["dcdc_pj"], minlength=P_inj.size)
 
         F = np.zeros(self.total_eq, dtype=np.float64)
 
@@ -1698,8 +1946,8 @@ class DCPowerFlowCalc:
             F[self.eq_phi_start:self.eq_dcdc_start] = phi[self.ref_phi_idx]
 
         if self.N_dcdc:
-            p_from = Pdc[0::2]
-            p_to = Pdc[1::2]
+            p_from = terms["dcdc_pi"]
+            p_to = terms["dcdc_pj"]
             vi = terms["dcdc_vi"]
             ctrl_values = np.empty(self.N_dcdc, dtype=np.float64)
             ctrl_values[self.dcdc_ctrl_p_mask] = p_from[self.dcdc_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_ctrl_p_mask]
@@ -1710,14 +1958,15 @@ class DCPowerFlowCalc:
             )
             F[self.dcdc_eq_ctrl] = ctrl_values
 
-            vi2 = terms["dcdc_vi2"]
-            vj2 = terms["dcdc_vj2"]
-            # 第二条方程保证两端端口功率与 r1/r2 损耗模型一致。
-            F[self.dcdc_eq_loss] = (
-                vi2 * vj2 * (p_from + p_to)
-                - self.dcdc_r1 * p_from * p_from * vj2
-                - self.dcdc_r2 * p_to * p_to * vi2
-            )
+            if not getattr(self, "dcdc_eliminate_pj", False):
+                vi2 = terms["dcdc_vi2"]
+                vj2 = terms["dcdc_vj2"]
+                # 第二条方程保证两端端口功率与 r1/r2 损耗模型一致。
+                F[self.dcdc_eq_loss] = (
+                    vi2 * vj2 * (p_from + p_to)
+                    - self.dcdc_r1 * p_from * p_from * vj2
+                    - self.dcdc_r2 * p_to * p_to * vi2
+                )
 
         return F
 
@@ -1731,7 +1980,11 @@ class DCPowerFlowCalc:
         ppc = self.ppc
         V_final = x[:self.N]
         phi_final = x[self.N:self.N + self.N_phi] if self.N_phi > 0 else np.array([])
-        Pdc_final = x[self.N + self.N_phi:self.N + self.N_phi + self.N_dcdc * 2] if self.N_dcdc > 0 else np.array([])
+        if self.N_dcdc > 0:
+            dcdc_width = self.N_dcdc if getattr(self, "dcdc_eliminate_pj", False) else self.N_dcdc * 2
+            Pdc_final = x[self.N + self.N_phi:self.N + self.N_phi + dcdc_width]
+        else:
+            Pdc_final = np.array([])
         node_lookup = self._alive_node_lookup_array()
 
         bus = ppc["bus"].copy()
@@ -1838,10 +2091,14 @@ class DCPowerFlowCalc:
         if dcdc.size:
             dcdc[:, [DC_DCDC_COLS["i_p"], DC_DCDC_COLS["j_p"], DC_DCDC_COLS["i_c"], DC_DCDC_COLS["j_c"]]] = 0.0
         if self.N_dcdc:
-            dcdc_i_p = Pdc_final[0::2]
-            dcdc_j_p = Pdc_final[1::2]
             dcdc_vi = V_final[self.dcdc_i]
             dcdc_vj = V_final[self.dcdc_j]
+            if getattr(self, "dcdc_eliminate_pj", False):
+                dcdc_i_p = Pdc_final
+                dcdc_j_p = self._dcdc_j_power_from_loss(dcdc_i_p, dcdc_vi, dcdc_vj)[0]
+            else:
+                dcdc_i_p = Pdc_final[0::2]
+                dcdc_j_p = Pdc_final[1::2]
             dcdc_i_c = np.divide(
                 dcdc_i_p,
                 dcdc_vi,
@@ -2345,11 +2602,17 @@ class DCPowerFlowCalc:
             )
         return result
 
-    def _build_newton_system(self, G, x):
+    def _build_newton_system(self, G, x, *, return_jacobian=True, jacobian_format="csc"):
         """Compute residual and Jacobian together for one DC Newton iteration."""
         terms = self._eval_newton_terms(G, x)
         F = self._get_f_from_terms(x, terms)
-        J = self._get_jacobi_from_terms(G, x, terms)
+        J = self._get_jacobi_from_terms(
+            G,
+            x,
+            terms,
+            matrix_format=jacobian_format,
+            build_matrix=return_jacobian,
+        )
         return F, J
 
 
@@ -2626,7 +2889,7 @@ def main(argv=None) -> int:
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
     parser.add_argument("--linear-solver", default="scipy")
-    parser.add_argument("--result-mode", default="full", choices=("full", "summary", "none"))
+    parser.add_argument("--result-mode", default="full", choices=("full", "array", "summary", "none"))
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 

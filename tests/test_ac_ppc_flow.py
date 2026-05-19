@@ -424,6 +424,8 @@ class ACPPCFlowTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
         self.assertEqual(0, calc.N_phi)
+        self.assertEqual(0, calc.full_jac_raw_data.size)
+        self.assertEqual(0, calc.full_jac_csr_indices.size)
 
         original_hstack = ac_lf.hstack
         original_vstack = ac_lf.vstack
@@ -465,6 +467,22 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_array_equal(first.indptr, second.indptr)
         np.testing.assert_array_equal(first.indices, second.indices)
         np.testing.assert_allclose(first.data, second.data, atol=1e-12)
+
+    def test_newton_system_returns_solver_ready_csc_jacobian(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        _f, solver_jac = calc._build_newton_system(calc.x)
+        public_jac = calc.get_jacobi(calc.x)
+
+        self.assertEqual("csc", solver_jac.format)
+        np.testing.assert_allclose(solver_jac.toarray(), public_jac.toarray(), atol=1e-12)
 
     def test_ppc_zero_branch_jacobian_caches_coordinate_pattern(self):
         from hybrid_array_model import build_hybrid_ppc_from_e_file

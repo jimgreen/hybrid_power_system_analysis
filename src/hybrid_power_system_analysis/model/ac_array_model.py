@@ -679,6 +679,12 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "switch_name": switch_names,
         "break_name": breaker_names,
     }
+    try:
+        from .topology import build_ac_topology_input_ppc
+    except ImportError:  # pragma: no cover - top-level module import path
+        from topology import build_ac_topology_input_ppc
+
+    ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
 
@@ -904,6 +910,12 @@ def build_ac_ppc_from_network(network) -> Dict:
         switch_name=_name_array(switches, "switch"),
         break_name=_name_array(breakers, "break"),
     )
+    try:
+        from .topology import build_ac_topology_input_ppc
+    except ImportError:  # pragma: no cover - top-level module import path
+        from topology import build_ac_topology_input_ppc
+
+    ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
 

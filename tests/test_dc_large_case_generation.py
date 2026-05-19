@@ -124,6 +124,22 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             _again_G, again_x = DCPowerFlowCalc(ppc).prepare()
         self.assertNotEqual(123.0, again_x[0])
 
+    def test_dc_array_mode_skips_full_static_cache_and_uses_dense_lookup(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        ppc.pop("_dc_pf_static", None)
+
+        calc = DCPowerFlowCalc(ppc, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        self.assertNotIn("_dc_pf_static", ppc)
+        self.assertNotIsInstance(calc.alive_node_dict, dict)
+        self.assertIn(1, calc.alive_node_dict)
+        self.assertEqual(calc.alive_node_dict[1], calc.alive_node_dict.get(1))
+
     def test_dc_jacobian_reuses_precomputed_csr_pattern(self):
         import numpy as np
         import lfcore.dc_lf as dc_lf
@@ -151,6 +167,23 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             dc_lf.coo_matrix = original_coo_matrix
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+    def test_newton_system_returns_solver_ready_csc_jacobian(self):
+        import numpy as np
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        ppc.pop("_dc_pf_static", None)
+        calc = DCPowerFlowCalc(ppc)
+        with contextlib.redirect_stdout(io.StringIO()):
+            G, x = calc.prepare()
+
+        _f, solver_jac = calc._build_newton_system(G, x)
+        public_jac = calc.get_jacobi(G, x)
+
+        self.assertEqual("csc", solver_jac.format)
+        np.testing.assert_allclose(solver_jac.toarray(), public_jac.toarray(), atol=1e-12)
 
     def test_result_mode_skips_full_dc_result_backfill(self):
         from lfcore.dc_lf import DCPowerFlowCalc
@@ -362,6 +395,125 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         self.assertEqual("dc_ppc_v1", ppc["format"])
         self.assertEqual(30, ppc["bus"].shape[0])
+
+    def test_dc_rows_for_uses_cached_column_rows_like_ac_model(self):
+        from efile_read import _read_efile_rows
+        from model import dc_array_model
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
+        rows = _read_efile_rows(e_file)
+        columns, table_rows = dc_array_model._rows_for(rows, "DCNode")
+
+        self.assertTrue(hasattr(table_rows, "raw_column"))
+        idx_col = columns["idx"]
+        first = table_rows.raw_column(idx_col, "")
+        second = table_rows.raw_column(idx_col, "")
+
+        self.assertIs(first, second)
+
+    def test_dc_ppc_builds_and_reuses_topology_input_like_ac_model(self):
+        import numpy as np
+        from model import topology
+        from model.dc_array_model import build_dc_ppc_from_e_file, clear_dc_ppc_cache
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
+        clear_dc_ppc_cache(e_file)
+        ppc = build_dc_ppc_from_e_file(e_file)
+
+        self.assertIn("_topology_input", ppc)
+        self.assertIn("branch", ppc["_topology_input"].terminals)
+        self.assertIn("dcdc", ppc["_topology_input"].terminals)
+        self.assertIn("gen", ppc["_topology_input"].singles)
+
+        expected = topology.prepare_dc_topology_ppc({key: value for key, value in ppc.items() if key != "_topology_input"})
+        original_mapper = topology._map_node_positions
+
+        def reject_mapping(*_args, **_kwargs):
+            raise AssertionError("DC topology should reuse precomputed PPC topology input")
+
+        topology._map_node_positions = reject_mapping
+        try:
+            actual = topology.prepare_dc_topology_ppc(ppc)
+        finally:
+            topology._map_node_positions = original_mapper
+
+        np.testing.assert_array_equal(actual.node_to_bus_pos, expected.node_to_bus_pos)
+        np.testing.assert_array_equal(actual.node_to_island_pos, expected.node_to_island_pos)
+
+    def test_dc_e_file_name_arrays_are_lazy_until_materialized(self):
+        import numpy as np
+        from model.dc_array_model import build_dc_ppc_from_e_file, clear_dc_ppc_cache
+
+        e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
+        clear_dc_ppc_cache(e_file)
+        ppc = build_dc_ppc_from_e_file(e_file)
+        bus_names = ppc["bus_name"]
+
+        self.assertNotIsInstance(bus_names, np.ndarray)
+        self.assertEqual(30, len(bus_names))
+        self.assertEqual("nd_1", bus_names[0])
+        np.testing.assert_array_equal(bus_names[:3], np.asarray(["nd_1", "nd_2", "nd_3"], dtype=object))
+        np.testing.assert_array_equal(np.asarray(bus_names)[:3], np.asarray(["nd_1", "nd_2", "nd_3"], dtype=object))
+
+    def test_dc_array_prepare_reuses_ppc_topology_device_positions(self):
+        import contextlib
+        import io
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        with contextlib.redirect_stdout(io.StringIO()):
+            expected_G, expected_x = DCPowerFlowCalc(ppc, result_mode="array").prepare()
+
+        original_mapper = DCPowerFlowCalc.__dict__["_map_nodes_with_lookup"]
+
+        def reject_mapping(*_args, **_kwargs):
+            raise AssertionError("direct DC array prepare should reuse PPC topology device positions")
+
+        DCPowerFlowCalc._map_nodes_with_lookup = staticmethod(reject_mapping)
+        try:
+            calc = DCPowerFlowCalc(ppc, result_mode="array")
+            with contextlib.redirect_stdout(io.StringIO()):
+                G, x = calc.prepare()
+        finally:
+            DCPowerFlowCalc._map_nodes_with_lookup = original_mapper
+
+        self.assertEqual(expected_G.shape, G.shape)
+        self.assertEqual(expected_x.size, x.size)
+
+    def test_dc_array_mode_eliminates_dcdc_j_power_variables_and_matches_full(self):
+        import contextlib
+        import io
+        import numpy as np
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+
+        full_calc = DCPowerFlowCalc(ppc, result_mode="full")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, full_calc.run())
+
+        array_calc = DCPowerFlowCalc(ppc, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            G, x = array_calc.prepare()
+
+        self.assertEqual(array_calc.N + array_calc.N_phi + array_calc.N_dcdc, array_calc.total_vars)
+        self.assertEqual(array_calc.total_vars, x.size)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, array_calc.run())
+
+        np.testing.assert_allclose(
+            array_calc.result["bus"][:, 2],
+            full_calc.result["bus"][:, 2],
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            array_calc.result["dcdc"][:, [10, 11]],
+            full_calc.result["dcdc"][:, [10, 11]],
+            atol=1e-8,
+        )
 
     def test_dcdc_residual_and_jacobian_use_vectorized_control_arrays(self):
         import numpy as np

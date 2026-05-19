@@ -19,6 +19,7 @@ from ac_lf import (
     ACPowerFlowCalc,
     _device_key as _lf_device_key,
     coo_matrix,
+    csc_matrix,
     csr_matrix,
     solve_sparse_system,
     _resolve_linear_solver,
@@ -28,6 +29,18 @@ from ac_lf import (
 )
 from scipy.sparse.linalg import spsolve as _scipy_spsolve
 from dc_lf import DCLFResult, DCPowerFlowCalc
+try:
+    from _sparse_pattern import (
+        apply_raw_sum_plan,
+        build_compressed_pattern_from_raw_coords,
+        build_raw_sum_plan,
+    )
+except ImportError:  # pragma: no cover - package import path
+    from ._sparse_pattern import (
+        apply_raw_sum_plan,
+        build_compressed_pattern_from_raw_coords,
+        build_raw_sum_plan,
+    )
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
 from hybrid_model import ACAC_CONTROL_TYPES, HybridPowerNetwork
@@ -1085,6 +1098,12 @@ class HybridPowerFlowCalc:
         self.global_jac_csr_indices = np.array([], dtype=np.int32)
         self.global_jac_csr_indptr = np.array([], dtype=np.int32)
         self.global_jac_csr_data = np.array([], dtype=np.float64)
+        self.global_jac_csr_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csr_pos, 0)
+        self.global_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+        self.global_jac_csc_indices = np.array([], dtype=np.int32)
+        self.global_jac_csc_indptr = np.array([], dtype=np.int32)
+        self.global_jac_csc_data = np.array([], dtype=np.float64)
+        self.global_jac_csc_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csc_pos, 0)
         self.global_jac_ac_slice = slice(0, 0)
         self.global_jac_dc_slice = slice(0, 0)
         self.global_jac_dcac_ac_p_slice = slice(0, 0)
@@ -1246,31 +1265,25 @@ class HybridPowerFlowCalc:
         self.global_jac_raw_data = np.empty(raw_count, dtype=np.float64)
         if raw_count == 0:
             self.global_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
+            self.global_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
             return
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        pattern = coo_matrix(
-            (np.ones(raw_count, dtype=np.float64), (raw_rows, raw_cols)),
-            shape=(self.total_eq, self.total_vars),
-        ).tocsr()
-        pattern.sum_duplicates()
-        self.global_jac_csr_indices = pattern.indices.astype(np.int32, copy=True)
-        self.global_jac_csr_indptr = pattern.indptr.astype(np.int32, copy=True)
+        (
+            self.global_jac_csr_indices,
+            self.global_jac_csr_indptr,
+            self.global_jac_raw_to_csr_pos,
+        ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        (
+            self.global_jac_csc_indices,
+            self.global_jac_csc_indptr,
+            self.global_jac_raw_to_csc_pos,
+        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
         self.global_jac_csr_data = np.empty(self.global_jac_csr_indices.size, dtype=np.float64)
-
-        # 把 (row, col) 编码成 row*total_vars+col，并对全 CSR 键做 searchsorted。
-        # 替换掉原先用 Python dict + fromiter 的查找：hybrid_net_4w 上 1.2s -> 几十 ms。
-        indptr = self.global_jac_csr_indptr
-        indices = self.global_jac_csr_indices
-        csr_rows = np.repeat(
-            np.arange(self.total_eq, dtype=np.int64),
-            np.diff(indptr).astype(np.int64, copy=False),
-        )
-        stride = np.int64(self.total_vars)
-        csr_key = csr_rows * stride + indices.astype(np.int64, copy=False)
-        raw_key = raw_rows.astype(np.int64, copy=False) * stride + raw_cols.astype(np.int64, copy=False)
-        self.global_jac_raw_to_csr_pos = np.searchsorted(csr_key, raw_key).astype(np.intp, copy=False)
+        self.global_jac_csc_data = np.empty(self.global_jac_csc_indices.size, dtype=np.float64)
+        self.global_jac_csr_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csr_pos, self.global_jac_csr_data.size)
+        self.global_jac_csc_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csc_pos, self.global_jac_csc_data.size)
 
     def _cache_acac_arrays(self):
         """Cache ACAC converter metadata as arrays for residual/Jacobian assembly."""
@@ -1479,6 +1492,14 @@ class HybridPowerFlowCalc:
     def _slice_len(part_slice):
         return int(part_slice.stop - part_slice.start)
 
+    @staticmethod
+    def _jacobian_values(jac_or_data):
+        if jac_or_data is None:
+            return None
+        if getattr(jac_or_data, "format", None) is not None:
+            return jac_or_data.data
+        return np.asarray(jac_or_data, dtype=np.float64)
+
     def _fill_dcac_global_jacobian_data(self, raw, dcac_x, ac_V, dc_V):
         if not self.N_dcac:
             return
@@ -1549,36 +1570,50 @@ class HybridPowerFlowCalc:
         data[4::6] = 2.0 * vi * vj2 * (i_p + j_p) - 2.0 * self.acac_r2 * j_s2 * vi
         data[5::6] = 2.0 * vj * vi2 * (i_p + j_p) - 2.0 * self.acac_r1 * i_s2 * vj
 
-    def _assemble_jacobian_from_precomputed_pattern(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None, ac_V=None, dc_V=None):
+    def _assemble_jacobian_from_precomputed_pattern(
+        self,
+        ac_x,
+        dc_x,
+        dcac_x,
+        acac_x,
+        ac_j=None,
+        dc_j=None,
+        ac_V=None,
+        dc_V=None,
+        *,
+        matrix_format="csr",
+    ):
         if self.global_jac_raw_data.size == 0:
             return None
         raw = self.global_jac_raw_data
         if ac_j is not None and self._slice_len(self.global_jac_ac_slice):
-            raw[self.global_jac_ac_slice] = ac_j.data
+            raw[self.global_jac_ac_slice] = self._jacobian_values(ac_j)
         if dc_j is not None and self._slice_len(self.global_jac_dc_slice):
-            raw[self.global_jac_dc_slice] = dc_j.data
+            raw[self.global_jac_dc_slice] = self._jacobian_values(dc_j)
 
         if (self.N_dcac or self.N_acac) and (ac_V is None or (self.N_dcac and dc_V is None)):
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
         self._fill_dcac_global_jacobian_data(raw, dcac_x, ac_V, dc_V)
         self._fill_acac_global_jacobian_data(raw, acac_x, ac_V)
 
-        self.global_jac_csr_data.fill(0.0)
-        # bincount 比 np.add.at 快得多；目标尺寸固定，雅可比 CSR 每次迭代散射。
-        self.global_jac_csr_data[:] = np.bincount(
-            self.global_jac_raw_to_csr_pos,
-            weights=raw,
-            minlength=self.global_jac_csr_data.size,
-        )
-        jac = csr_matrix(
-            (self.global_jac_csr_data, self.global_jac_csr_indices, self.global_jac_csr_indptr),
-            shape=(self.total_eq, self.total_vars),
-            copy=False,
-        )
+        if matrix_format == "csc":
+            apply_raw_sum_plan(self.global_jac_csc_data, raw, self.global_jac_csc_sum_plan)
+            jac = csc_matrix(
+                (self.global_jac_csc_data, self.global_jac_csc_indices, self.global_jac_csc_indptr),
+                shape=(self.total_eq, self.total_vars),
+                copy=False,
+            )
+        else:
+            apply_raw_sum_plan(self.global_jac_csr_data, raw, self.global_jac_csr_sum_plan)
+            jac = csr_matrix(
+                (self.global_jac_csr_data, self.global_jac_csr_indices, self.global_jac_csr_indptr),
+                shape=(self.total_eq, self.total_vars),
+                copy=False,
+            )
         self.last_jacobian_shape = jac.shape
         return jac
 
-    def _assemble_jacobian(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None, ac_V=None, dc_V=None):
+    def _assemble_jacobian(self, ac_x, dc_x, dcac_x, acac_x, ac_j=None, dc_j=None, ac_V=None, dc_V=None, *, matrix_format="csr"):
         """Build the global sparse Jacobian from prepared sub-solver blocks."""
         precomputed = self._assemble_jacobian_from_precomputed_pattern(
             ac_x,
@@ -1589,6 +1624,7 @@ class HybridPowerFlowCalc:
             dc_j=dc_j,
             ac_V=ac_V,
             dc_V=dc_V,
+            matrix_format=matrix_format,
         )
         if precomputed is not None:
             return precomputed
@@ -1627,6 +1663,8 @@ class HybridPowerFlowCalc:
             jac = coo_matrix((data, (rows, cols)), shape=target_shape).tocsr()
         else:
             jac = coo_matrix(target_shape, dtype=np.float64).tocsr()
+        if matrix_format == "csc":
+            jac = jac.tocsc()
         self.last_jacobian_shape = jac.shape
         return jac
 
@@ -1644,16 +1682,39 @@ class HybridPowerFlowCalc:
         ac_f = ac_j = None
         dc_f = dc_j = None
         if self.ac_calc is not None:
-            ac_f, ac_j = self.ac_calc._build_newton_system(ac_x)
+            ac_f, ac_j = self.ac_calc._build_newton_system(
+                ac_x,
+                return_jacobian=False,
+                jacobian_format="csr",
+            )
+            if ac_j is None and self._slice_len(self.global_jac_ac_slice):
+                ac_j = self.ac_calc.get_jacobi(ac_x)
         if self.dc_calc is not None:
-            dc_f, dc_j = self.dc_calc._build_newton_system(self.dc_G, dc_x)
+            dc_f, dc_j = self.dc_calc._build_newton_system(
+                self.dc_G,
+                dc_x,
+                return_jacobian=False,
+                jacobian_format="csr",
+            )
+            if dc_j is None and self._slice_len(self.global_jac_dc_slice):
+                dc_j = self.dc_calc.get_jacobi(self.dc_G, dc_x)
 
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
 
         F = self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
-        J = self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j, ac_V, dc_V)
+        J = self._assemble_jacobian(
+            ac_x,
+            dc_x,
+            dcac_x,
+            acac_x,
+            ac_j,
+            dc_j,
+            ac_V,
+            dc_V,
+            matrix_format="csc",
+        )
         return F, J
 
     def _append_dcac_jacobian_terms(self, row_parts, col_parts, data_parts, dcac_x, ac_V, dc_V):
