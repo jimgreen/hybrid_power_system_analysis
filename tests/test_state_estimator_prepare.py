@@ -94,22 +94,20 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         self.assertEqual(Path("case.meas"), estimator.meas_file)
         self.assertTrue(estimator._prepared)
 
-    def test_ac_load_network_uses_ppc_topology_array_applier(self):
+    def test_ac_load_network_returns_ppc_namespace_without_object_topology(self):
         import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
-        calls = []
         original_apply_topology = ac_se.network_topology.apply_ac_topology_arrays
         original_prepare_topology = ac_se.network_topology.prepare_ac_topology
 
-        def apply_topology(network, topology, **kwargs):
-            calls.append((network, topology, kwargs))
-            return original_apply_topology(network, topology, **kwargs)
+        def reject_array_object_topology(*_args, **_kwargs):
+            raise AssertionError("AC SE PPC namespace load should not materialize object topology")
 
         def reject_object_topology(*_args, **_kwargs):
             raise AssertionError("AC SE load should not rerun object topology")
 
-        ac_se.network_topology.apply_ac_topology_arrays = apply_topology
+        ac_se.network_topology.apply_ac_topology_arrays = reject_array_object_topology
         ac_se.network_topology.prepare_ac_topology = reject_object_topology
         try:
             loader = ACStateEstimator.__new__(ACStateEstimator)
@@ -120,10 +118,11 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             ac_se.network_topology.apply_ac_topology_arrays = original_apply_topology
             ac_se.network_topology.prepare_ac_topology = original_prepare_topology
 
-        self.assertEqual(1, len(calls))
-        self.assertIs(network, calls[0][0])
-        self.assertIs(network._topology_arrays, calls[0][1])
-        self.assertTrue(calls[0][2].get("compact"))
+        self.assertEqual("ac_ppc_v1", network.ppc["format"])
+        self.assertIs(network.topology, network.ppc["_topology_arrays"])
+        self.assertIs(network.base, network.ppc["base"])
+        self.assertFalse(hasattr(network, "nodes"))
+        self.assertFalse(hasattr(network, "generators"))
 
     def test_dc_load_network_uses_ppc_topology_array_applier(self):
         import secore.dc_se as dc_se

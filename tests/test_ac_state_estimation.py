@@ -3247,6 +3247,32 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(branch_name, estimator.branch_by_name[branch_name].name)
         self.assertEqual(1, estimator.branch_by_name.materialized_count)
 
+    def test_ppc_array_run_keeps_single_device_orders_lazy(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+
+        estimator.run(
+            return_mode="array",
+            skip_bad_data=True,
+            final_diagnostics=False,
+            verbose=False,
+        )
+
+        for attr in ("generator_order", "load_order", "shunt_compensators"):
+            order = getattr(estimator, attr)
+            self.assertTrue(hasattr(order, "materialized_count"), attr)
+            self.assertEqual(0, order.materialized_count, attr)
+        self.assertEqual(0, estimator.voltage_control_shunt_order.materialized_count)
+        self.assertEqual(0, estimator.generator_by_name.materialized_count)
+        self.assertEqual(0, estimator.load_by_name.materialized_count)
+        self.assertEqual(0, estimator.shunt_by_name.materialized_count)
+
     def test_node_incident_degrees_use_ppc_topology_not_branch_device_maps(self):
         from secore.ac_se import ACStateEstimator
 

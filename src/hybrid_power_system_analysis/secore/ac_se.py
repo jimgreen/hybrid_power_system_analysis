@@ -384,6 +384,136 @@ class _LazyTerminalDeviceMap:
         return [(name, self[name]) for name in self._name_to_row]
 
 
+class _LazySingleDeviceOrder:
+    """Index-ordered single-terminal device view that materializes objects on access."""
+
+    __slots__ = ("devices", "names")
+
+    def __init__(self, devices, names: Optional[Sequence[str]] = None) -> None:
+        self.devices = devices
+        self.names = tuple(str(name) for name in (devices.names if names is None else names))
+
+    @property
+    def materialized_count(self) -> int:
+        return self.devices.materialized_count
+
+    def __bool__(self) -> bool:
+        return bool(self.names)
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def __iter__(self):
+        for name in self.names:
+            yield self.devices[name]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self.devices[name] for name in self.names[index]]
+        return self.devices[self.names[index]]
+
+
+class _LazySingleDeviceMap:
+    """Name-keyed generator/load/shunt map backed by PPC rows."""
+
+    __slots__ = ("table", "names", "rows", "cols", "device_kind", "node_by_idx", "_name_to_pos", "_cache")
+
+    def __init__(
+        self,
+        table: np.ndarray,
+        names: Sequence[str],
+        rows: np.ndarray,
+        cols: Dict[str, int],
+        device_kind: str,
+        node_by_idx: Dict[int, object],
+    ) -> None:
+        self.table = table
+        self.names = tuple(str(name) for name in names)
+        self.rows = np.asarray(rows, dtype=np.int64)
+        self.cols = cols
+        self.device_kind = str(device_kind)
+        self.node_by_idx = node_by_idx
+        self._name_to_pos = {name: int(pos) for pos, name in enumerate(self.names)}
+        self._cache: Dict[str, object] = {}
+
+    @property
+    def materialized_count(self) -> int:
+        return len(self._cache)
+
+    def order(self, names: Optional[Sequence[str]] = None) -> _LazySingleDeviceOrder:
+        return _LazySingleDeviceOrder(self, names)
+
+    def __bool__(self) -> bool:
+        return bool(self._name_to_pos)
+
+    def __len__(self) -> int:
+        return len(self._name_to_pos)
+
+    def __iter__(self):
+        return iter(self._name_to_pos)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._name_to_pos
+
+    def _device_from_position(self, pos: int):
+        values = self.table[int(self.rows[int(pos)])]
+        cols = self.cols
+        name = self.names[int(pos)]
+        dev = _ACArrayObject()
+        dev.idx = int(values[cols["idx"]])
+        dev.name = str(name)
+        dev.run_stat = int(values[cols["run_stat"]])
+        dev.is_alive = True
+        dev.node = int(values[cols["node"]])
+        dev.node_obj = self.node_by_idx.get(dev.node)
+        dev.p = float(values[cols["p"]]) if "p" in cols else 0.0
+        dev.q = float(values[cols["q"]]) if "q" in cols else 0.0
+        dev.current = float(values[cols["current"]]) if "current" in cols else 0.0
+        if self.device_kind == "gen":
+            dev.control_type = _CTRL_NAME_BY_CODE.get(int(values[GEN_COLS["control_type"]]), "PQ")
+            dev.p_set = float(values[GEN_COLS["p_set"]])
+            dev.q_set = float(values[GEN_COLS["q_set"]])
+            dev.v_set = float(values[GEN_COLS["v_set"]])
+            dev.alpha = float(values[GEN_COLS["alpha"]])
+        elif self.device_kind == "load":
+            dev.pbase = float(values[LOAD_COLS["pbase"]])
+            dev.pv0 = float(values[LOAD_COLS["pv0"]])
+            dev.pv1 = float(values[LOAD_COLS["pv1"]])
+            dev.pv2 = float(values[LOAD_COLS["pv2"]])
+            dev.qbase = float(values[LOAD_COLS["qbase"]])
+            dev.qv0 = float(values[LOAD_COLS["qv0"]])
+            dev.qv1 = float(values[LOAD_COLS["qv1"]])
+            dev.qv2 = float(values[LOAD_COLS["qv2"]])
+        elif self.device_kind == "shunt":
+            dev.control_type = _SHUNT_NAME_BY_CODE.get(int(values[SHUNT_COLS["control_type"]]), "Q")
+            dev.q_set = float(values[SHUNT_COLS["q_set"]])
+            dev.g_set = float(values[SHUNT_COLS["g_set"]])
+            dev.b_set = float(values[SHUNT_COLS["b_set"]])
+            dev.v_set = float(values[SHUNT_COLS["v_set"]])
+        return dev
+
+    def __getitem__(self, key: str):
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        pos = self._name_to_pos[key]
+        device = self._device_from_position(pos)
+        self._cache[key] = device
+        return device
+
+    def get(self, key: str, default=None):
+        return self[key] if key in self._name_to_pos else default
+
+    def keys(self):
+        return self._name_to_pos.keys()
+
+    def values(self):
+        return [self[name] for name in self._name_to_pos]
+
+    def items(self):
+        return [(name, self[name]) for name in self._name_to_pos]
+
+
 def _read_standard_measurement_file_vectorized(file_name: Path, measurement_cls, table_only: bool = False):
     raw = Path(file_name).read_bytes()
     block_start = raw.find(b"<Measurement>")
@@ -1282,79 +1412,64 @@ class ACStateEstimator:
         self.switches = sorted(self.switch_by_name.values(), key=lambda item: item.idx)
         self.breakers = sorted(self.break_by_name.values(), key=lambda item: item.idx)
 
-        def single_devices(table_name: str, name_key: str, device_key: str, cols: Dict[str, int], builder):
+        def single_device_arrays(table_name: str, name_key: str, device_key: str, cols: Dict[str, int]):
             table, _device_topology, rows = self._ppc_sorted_alive_rows_for(ppc, table_name, device_key, cols["idx"])
-            names = self._ppc_names_for_rows(ppc[name_key], rows)
-            devices = []
-            for row_pos, name in zip(rows, names):
-                devices.append(builder(table[int(row_pos)], str(name)))
-            return devices
+            names = self._ppc_names_for_rows(ppc.get(name_key, np.asarray([], dtype=object)), rows)
+            if rows.size:
+                nodes = table[rows.astype(np.intp, copy=False), cols["node"]].astype(np.int64, copy=False)
+                valid = np.fromiter((int(node) in self.node_pos for node in nodes), dtype=bool, count=nodes.size)
+                if not np.all(valid):
+                    rows = rows[valid]
+                    names = names[valid]
+                    nodes = nodes[valid]
+                pos = np.asarray([self.node_pos[int(node)] for node in nodes], dtype=np.int32)
+            else:
+                nodes = np.asarray([], dtype=np.int64)
+                pos = np.asarray([], dtype=np.int32)
+            return table, rows.astype(np.int64, copy=False), names.astype(object, copy=False), nodes, pos
 
-        def build_gen(values, name):
-            gen = _ACArrayObject()
-            gen.idx = int(values[GEN_COLS["idx"]])
-            gen.name = name
-            gen.node = int(values[GEN_COLS["node"]])
-            gen.control_type = _CTRL_NAME_BY_CODE.get(int(values[GEN_COLS["control_type"]]), "PQ")
-            gen.p_set = float(values[GEN_COLS["p_set"]])
-            gen.q_set = float(values[GEN_COLS["q_set"]])
-            gen.v_set = float(values[GEN_COLS["v_set"]])
-            gen.alpha = float(values[GEN_COLS["alpha"]])
-            gen.run_stat = int(values[GEN_COLS["run_stat"]])
-            gen.p = float(values[GEN_COLS["p"]])
-            gen.q = float(values[GEN_COLS["q"]])
-            gen.current = float(values[GEN_COLS["current"]])
-            gen.node_obj = self.node_by_idx.get(gen.node)
-            gen.is_alive = True
-            return gen
-
-        def build_load(values, name):
-            load = _ACArrayObject()
-            load.idx = int(values[LOAD_COLS["idx"]])
-            load.name = name
-            load.node = int(values[LOAD_COLS["node"]])
-            load.pbase = float(values[LOAD_COLS["pbase"]])
-            load.pv0 = float(values[LOAD_COLS["pv0"]])
-            load.pv1 = float(values[LOAD_COLS["pv1"]])
-            load.pv2 = float(values[LOAD_COLS["pv2"]])
-            load.qbase = float(values[LOAD_COLS["qbase"]])
-            load.qv0 = float(values[LOAD_COLS["qv0"]])
-            load.qv1 = float(values[LOAD_COLS["qv1"]])
-            load.qv2 = float(values[LOAD_COLS["qv2"]])
-            load.run_stat = int(values[LOAD_COLS["run_stat"]])
-            load.p = float(values[LOAD_COLS["p"]])
-            load.q = float(values[LOAD_COLS["q"]])
-            load.current = float(values[LOAD_COLS["current"]])
-            load.node_obj = self.node_by_idx.get(load.node)
-            load.is_alive = True
-            return load
-
-        def build_shunt(values, name):
-            shunt = _ACArrayObject()
-            shunt.idx = int(values[SHUNT_COLS["idx"]])
-            shunt.name = name
-            shunt.node = int(values[SHUNT_COLS["node"]])
-            shunt.control_type = _SHUNT_NAME_BY_CODE.get(int(values[SHUNT_COLS["control_type"]]), "Q")
-            shunt.q_set = float(values[SHUNT_COLS["q_set"]])
-            shunt.g_set = float(values[SHUNT_COLS["g_set"]])
-            shunt.b_set = float(values[SHUNT_COLS["b_set"]])
-            shunt.v_set = float(values[SHUNT_COLS["v_set"]])
-            shunt.run_stat = int(values[SHUNT_COLS["run_stat"]])
-            shunt.p = float(values[SHUNT_COLS["p"]])
-            shunt.q = float(values[SHUNT_COLS["q"]])
-            shunt.current = float(values[SHUNT_COLS["current"]])
-            shunt.node_obj = self.node_by_idx.get(shunt.node)
-            shunt.is_alive = True
-            return shunt
-
-        self.generator_order = single_devices("gen", "gen_name", "gen", GEN_COLS, build_gen)
-        self.load_order = single_devices("load", "load_name", "load", LOAD_COLS, build_load)
-        self.voltage_control_shunt_order = []
-        self.shunt_compensators = single_devices("shunt", "shunt_name", "shunt", SHUNT_COLS, build_shunt)
-        self.generator_by_name = {gen.name: gen for gen in self.generator_order}
-        self.load_by_name = {load.name: load for load in self.load_order}
-        self.generator_pos_array = np.asarray([self.node_pos[gen.node] for gen in self.generator_order], dtype=np.int32)
-        self.load_pos_array = np.asarray([self.node_pos[load.node] for load in self.load_order], dtype=np.int32)
+        gen_table, gen_rows, gen_names, gen_nodes, gen_pos = single_device_arrays(
+            "gen",
+            "gen_name",
+            "gen",
+            GEN_COLS,
+        )
+        load_table, load_rows, load_names, load_nodes, load_pos = single_device_arrays(
+            "load",
+            "load_name",
+            "load",
+            LOAD_COLS,
+        )
+        shunt_table, shunt_rows, shunt_names, shunt_nodes, shunt_pos = single_device_arrays(
+            "shunt",
+            "shunt_name",
+            "shunt",
+            SHUNT_COLS,
+        )
+        self._ac_generator_rows = gen_rows
+        self._ac_load_rows = load_rows
+        self._ac_shunt_rows = shunt_rows
+        self.generator_name_array = gen_names
+        self.load_name_array = load_names
+        self.shunt_name_array = shunt_names
+        self.generator_node_array = gen_nodes
+        self.load_node_array = load_nodes
+        self.shunt_node_array = shunt_nodes
+        self.generator_pos_array = gen_pos
+        self.load_pos_array = load_pos
+        self.shunt_pos_array = shunt_pos
+        self.generator_alpha_array = (
+            gen_table[gen_rows.astype(np.intp, copy=False), GEN_COLS["alpha"]].astype(np.float64, copy=False)
+            if gen_rows.size
+            else np.asarray([], dtype=np.float64)
+        )
+        self.generator_by_name = _LazySingleDeviceMap(gen_table, gen_names, gen_rows, GEN_COLS, "gen", self.node_by_idx)
+        self.load_by_name = _LazySingleDeviceMap(load_table, load_names, load_rows, LOAD_COLS, "load", self.node_by_idx)
+        self.shunt_by_name = _LazySingleDeviceMap(shunt_table, shunt_names, shunt_rows, SHUNT_COLS, "shunt", self.node_by_idx)
+        self.generator_order = self.generator_by_name.order()
+        self.load_order = self.load_by_name.order()
+        self.shunt_compensators = self.shunt_by_name.order()
+        self.voltage_control_shunt_order = self.shunt_by_name.order(())
 
     def prepare(
         self,
@@ -1600,25 +1715,34 @@ class ACStateEstimator:
             state_meta.append(
                 StateMeta("ac", state_kind, device_type, dev.name, component="im", legacy_label=f"I_{kind}_IM:{dev.name}")
             )
+        gen_names = tuple(str(name) for name in getattr(self, "generator_name_array", ()))
+        load_names = tuple(str(name) for name in getattr(self, "load_name_array", ()))
+        shunt_q_names = tuple(str(name) for name in getattr(self, "voltage_control_shunt_name_array", ()))
+        if not gen_names:
+            gen_names = tuple(gen.name for gen in self.generator_order)
+        if not load_names:
+            load_names = tuple(load.name for load in self.load_order)
+        if not shunt_q_names:
+            shunt_q_names = tuple(shunt.name for shunt in self.voltage_control_shunt_order)
         state_meta.extend(
-            StateMeta("ac", "generator_p", "ACGenerator", gen.name, component="p", legacy_label=f"P_GEN:{gen.name}")
-            for gen in self.generator_order
+            StateMeta("ac", "generator_p", "ACGenerator", name, component="p", legacy_label=f"P_GEN:{name}")
+            for name in gen_names
         )
         state_meta.extend(
-            StateMeta("ac", "generator_q", "ACGenerator", gen.name, component="q", legacy_label=f"Q_GEN:{gen.name}")
-            for gen in self.generator_order
+            StateMeta("ac", "generator_q", "ACGenerator", name, component="q", legacy_label=f"Q_GEN:{name}")
+            for name in gen_names
         )
         state_meta.extend(
-            StateMeta("ac", "load_p", "ACLoad", load.name, component="p", legacy_label=f"P_LOAD:{load.name}")
-            for load in self.load_order
+            StateMeta("ac", "load_p", "ACLoad", name, component="p", legacy_label=f"P_LOAD:{name}")
+            for name in load_names
         )
         state_meta.extend(
-            StateMeta("ac", "load_q", "ACLoad", load.name, component="q", legacy_label=f"Q_LOAD:{load.name}")
-            for load in self.load_order
+            StateMeta("ac", "load_q", "ACLoad", name, component="q", legacy_label=f"Q_LOAD:{name}")
+            for name in load_names
         )
         state_meta.extend(
-            StateMeta("ac", "shunt_q", "ACShuntCompensator", shunt.name, component="q", legacy_label=f"Q_SHUNT:{shunt.name}")
-            for shunt in self.voltage_control_shunt_order
+            StateMeta("ac", "shunt_q", "ACShuntCompensator", name, component="q", legacy_label=f"Q_SHUNT:{name}")
+            for name in shunt_q_names
         )
         return state_meta
 
@@ -1727,14 +1851,33 @@ class ACStateEstimator:
             [self.node_pos[dev.j_node] for _, dev in self.zero_current_devices],
             dtype=np.int32,
         )
-        gen_seed = [self._generator_pseudo_power(gen) for gen in self.generator_order]
-        load_seed = [self._load_pseudo_power(load) for load in self.load_order]
-        self.initial_gen_p_array = np.asarray([p for p, _q in gen_seed], dtype=np.float64)
-        self.initial_gen_q_array = np.asarray([q for _p, q in gen_seed], dtype=np.float64)
-        self.initial_load_p_array = np.asarray([p for p, _q in load_seed], dtype=np.float64)
-        self.initial_load_q_array = np.asarray([q for _p, q in load_seed], dtype=np.float64)
-        self.n_generator_power = len(self.generator_order)
-        self.n_load_power = len(self.load_order)
+        ppc = self._ac_ppc_dict()
+        if ppc is not None and hasattr(self, "_ac_generator_rows") and hasattr(self, "_ac_load_rows"):
+            self.initial_gen_p_array, self.initial_gen_q_array = self._ppc_generator_pseudo_power_arrays(
+                ppc,
+                self._ac_generator_rows,
+            )
+            load_voltage = (
+                self.file_voltage[self.load_pos_array.astype(np.intp, copy=False)]
+                if self.load_pos_array.size
+                else np.asarray([], dtype=np.float64)
+            )
+            self.initial_load_p_array, self.initial_load_q_array = self._ppc_load_pseudo_power_arrays(
+                ppc,
+                self._ac_load_rows,
+                load_voltage,
+            )
+            self.n_generator_power = int(self._ac_generator_rows.size)
+            self.n_load_power = int(self._ac_load_rows.size)
+        else:
+            gen_seed = [self._generator_pseudo_power(gen) for gen in self.generator_order]
+            load_seed = [self._load_pseudo_power(load) for load in self.load_order]
+            self.initial_gen_p_array = np.asarray([p for p, _q in gen_seed], dtype=np.float64)
+            self.initial_gen_q_array = np.asarray([q for _p, q in gen_seed], dtype=np.float64)
+            self.initial_load_p_array = np.asarray([p for p, _q in load_seed], dtype=np.float64)
+            self.initial_load_q_array = np.asarray([q for _p, q in load_seed], dtype=np.float64)
+            self.n_generator_power = len(self.generator_order)
+            self.n_load_power = len(self.load_order)
         self.n_switch_current = len(self.zero_current_devices)
         self.switch_current_idx_array = np.arange(self.n_switch_current, dtype=np.int32)
         self.switch_balance_end_pos = np.concatenate((self.zero_current_i, self.zero_current_j)).astype(
@@ -1752,12 +1895,42 @@ class ACStateEstimator:
         )
         self.generator_power_idx_array = np.arange(self.n_generator_power, dtype=np.int32)
         self.load_power_idx_array = np.arange(self.n_load_power, dtype=np.int32)
-        self.voltage_control_shunt_order = self._voltage_control_shunts()
-        self.n_shunt_q = len(self.voltage_control_shunt_order)
-        self.shunt_q_pos_array = np.asarray(
-            [self.node_pos[shunt.node] for shunt in self.voltage_control_shunt_order],
-            dtype=np.int32,
-        )
+        if ppc is not None and hasattr(self, "_ac_shunt_rows"):
+            shunt_rows = np.asarray(self._ac_shunt_rows, dtype=np.int64)
+            if shunt_rows.size:
+                shunt_table = np.asarray(ppc["shunt"], dtype=np.float64)
+                control_type = shunt_table[shunt_rows.astype(np.intp, copy=False), SHUNT_COLS["control_type"]].astype(
+                    np.int64,
+                    copy=False,
+                )
+                v_mask = control_type == SHUNT_V
+                voltage_control_rows = shunt_rows[v_mask]
+                voltage_control_names = np.asarray(self.shunt_name_array, dtype=object)[v_mask]
+                self.shunt_q_pos_array = np.asarray(self.shunt_pos_array, dtype=np.int32)[v_mask]
+                self.initial_shunt_q_array = shunt_table[
+                    voltage_control_rows.astype(np.intp, copy=False),
+                    SHUNT_COLS["q"],
+                ].astype(np.float64, copy=False)
+            else:
+                voltage_control_rows = np.asarray([], dtype=np.int64)
+                voltage_control_names = np.asarray([], dtype=object)
+                self.shunt_q_pos_array = np.asarray([], dtype=np.int32)
+                self.initial_shunt_q_array = np.asarray([], dtype=np.float64)
+            self._ac_voltage_control_shunt_rows = voltage_control_rows
+            self.voltage_control_shunt_name_array = voltage_control_names
+            self.voltage_control_shunt_order = self.shunt_by_name.order(voltage_control_names)
+            self.n_shunt_q = int(voltage_control_rows.size)
+        else:
+            self.voltage_control_shunt_order = self._voltage_control_shunts()
+            self.n_shunt_q = len(self.voltage_control_shunt_order)
+            self.shunt_q_pos_array = np.asarray(
+                [self.node_pos[shunt.node] for shunt in self.voltage_control_shunt_order],
+                dtype=np.int32,
+            )
+            self.initial_shunt_q_array = np.asarray(
+                [self._initial_voltage_control_shunt_q(shunt) for shunt in self.voltage_control_shunt_order],
+                dtype=np.float64,
+            )
         self.shunt_q_idx_array = np.arange(self.n_shunt_q, dtype=np.int32)
         self.generator_balance_minus_ones = -np.ones(self.n_generator_power, dtype=np.float64)
         self.load_balance_ones = np.ones(self.n_load_power, dtype=np.float64)
@@ -1770,34 +1943,23 @@ class ACStateEstimator:
         self.base_load_q = self.base_load_p + self.n_load_power
         self.base_shunt_q = self.base_load_q + self.n_load_power
         self.n_state = self.base_shunt_q + self.n_shunt_q
-        self.gen_p_col_by_name = {
-            gen.name: self.base_gen_p + idx for idx, gen in enumerate(self.generator_order)
-        }
-        self.gen_q_col_by_name = {
-            gen.name: self.base_gen_q + idx for idx, gen in enumerate(self.generator_order)
-        }
-        self.generator_state_index_by_name = {
-            gen.name: idx for idx, gen in enumerate(self.generator_order)
-        }
-        self.load_p_col_by_name = {
-            load.name: self.base_load_p + idx for idx, load in enumerate(self.load_order)
-        }
-        self.load_q_col_by_name = {
-            load.name: self.base_load_q + idx for idx, load in enumerate(self.load_order)
-        }
-        self.load_state_index_by_name = {
-            load.name: idx for idx, load in enumerate(self.load_order)
-        }
-        self.shunt_q_col_by_name = {
-            shunt.name: self.base_shunt_q + idx for idx, shunt in enumerate(self.voltage_control_shunt_order)
-        }
-        self.shunt_q_state_index_by_name = {
-            shunt.name: idx for idx, shunt in enumerate(self.voltage_control_shunt_order)
-        }
-        self.initial_shunt_q_array = np.asarray(
-            [self._initial_voltage_control_shunt_q(shunt) for shunt in self.voltage_control_shunt_order],
-            dtype=np.float64,
-        )
+        gen_names = tuple(str(name) for name in getattr(self, "generator_name_array", ()))
+        load_names = tuple(str(name) for name in getattr(self, "load_name_array", ()))
+        shunt_q_names = tuple(str(name) for name in getattr(self, "voltage_control_shunt_name_array", ()))
+        if not gen_names:
+            gen_names = tuple(gen.name for gen in self.generator_order)
+        if not load_names:
+            load_names = tuple(load.name for load in self.load_order)
+        if not shunt_q_names:
+            shunt_q_names = tuple(shunt.name for shunt in self.voltage_control_shunt_order)
+        self.gen_p_col_by_name = {name: self.base_gen_p + idx for idx, name in enumerate(gen_names)}
+        self.gen_q_col_by_name = {name: self.base_gen_q + idx for idx, name in enumerate(gen_names)}
+        self.generator_state_index_by_name = {name: idx for idx, name in enumerate(gen_names)}
+        self.load_p_col_by_name = {name: self.base_load_p + idx for idx, name in enumerate(load_names)}
+        self.load_q_col_by_name = {name: self.base_load_q + idx for idx, name in enumerate(load_names)}
+        self.load_state_index_by_name = {name: idx for idx, name in enumerate(load_names)}
+        self.shunt_q_col_by_name = {name: self.base_shunt_q + idx for idx, name in enumerate(shunt_q_names)}
+        self.shunt_q_state_index_by_name = {name: idx for idx, name in enumerate(shunt_q_names)}
         self._state_meta_cache = None
         self._state_labels_cache = None
 
@@ -2929,6 +3091,29 @@ class ACStateEstimator:
                 setattr(obj, attr, value)
 
     def _refresh_load_parameter_arrays(self) -> None:
+        ppc = self._ac_ppc_dict()
+        rows = getattr(self, "_ac_load_rows", None)
+        if ppc is not None and rows is not None:
+            rows = np.asarray(rows, dtype=np.int64)
+            if rows.size:
+                load = np.asarray(ppc["load"], dtype=np.float64)[rows.astype(np.intp, copy=False)]
+                pbase = load[:, LOAD_COLS["pbase"]]
+                qbase = load[:, LOAD_COLS["qbase"]]
+                self.load_pv0_array = pbase * load[:, LOAD_COLS["pv0"]]
+                self.load_pv1_array = pbase * load[:, LOAD_COLS["pv1"]]
+                self.load_pv2_array = pbase * load[:, LOAD_COLS["pv2"]]
+                self.load_qv0_array = qbase * load[:, LOAD_COLS["qv0"]]
+                self.load_qv1_array = qbase * load[:, LOAD_COLS["qv1"]]
+                self.load_qv2_array = qbase * load[:, LOAD_COLS["qv2"]]
+            else:
+                empty = np.asarray([], dtype=np.float64)
+                self.load_pv0_array = empty
+                self.load_pv1_array = empty
+                self.load_pv2_array = empty
+                self.load_qv0_array = empty
+                self.load_qv1_array = empty
+                self.load_qv2_array = empty
+            return
         self.load_pv0_array = np.asarray(
             [getattr(load, "pbase", 1.0) * load.pv0 for load in self.load_order],
             dtype=np.float64,
@@ -3867,6 +4052,34 @@ class ACStateEstimator:
                 scales.append((voltage_scale_by_node[device_node_idx], current_scale_by_node[device_node_idx]))
             return name_to_pos, np.asarray(scales, dtype=np.float64) if scales else np.empty((0, 2), dtype=np.float64)
 
+        def node_device_lookup_from_ppc(
+            table_name: str,
+            name_key: str,
+            device_key: str,
+            cols: Dict[str, int],
+        ) -> Tuple[Dict[str, int], np.ndarray]:
+            if ppc_for_lookup is None:
+                return {}, np.empty((0, 2), dtype=np.float64)
+            table, _device_topology, rows = self._ppc_sorted_alive_rows_for(
+                ppc_for_lookup,
+                table_name,
+                device_key,
+                cols["idx"],
+            )
+            if rows.size == 0:
+                return {}, np.empty((0, 2), dtype=np.float64)
+            names = self._ppc_names_for_rows(ppc_for_lookup.get(name_key, np.asarray([], dtype=object)), rows)
+            nodes = table[rows.astype(np.intp, copy=False), cols["node"]].astype(np.int64, copy=False)
+            name_to_pos: Dict[str, int] = {}
+            scales = []
+            for name, device_node_raw in zip(names, nodes):
+                device_node_idx = int(device_node_raw)
+                if device_node_idx not in voltage_scale_by_node:
+                    continue
+                name_to_pos[str(name)] = len(scales)
+                scales.append((voltage_scale_by_node[device_node_idx], current_scale_by_node[device_node_idx]))
+            return name_to_pos, np.asarray(scales, dtype=np.float64) if scales else np.empty((0, 2), dtype=np.float64)
+
         node_name_to_pos, node_voltage_scales = node_voltage_lookup()
         if ppc_for_lookup is not None:
             branch_name_to_pos, branch_terminal_scales = terminal_lookup_from_ppc(
@@ -3893,13 +4106,25 @@ class ACStateEstimator:
                 "break",
                 BREAK_COLS,
             )
+            generator_name_to_pos, generator_node_scales = node_device_lookup_from_ppc(
+                "gen",
+                "gen_name",
+                "gen",
+                GEN_COLS,
+            )
+            load_name_to_pos, load_node_scales = node_device_lookup_from_ppc(
+                "load",
+                "load_name",
+                "load",
+                LOAD_COLS,
+            )
         else:
             branch_name_to_pos, branch_terminal_scales = terminal_lookup_from(self.branch_by_name)
             transformer_name_to_pos, transformer_terminal_scales = terminal_lookup_from(self.transformer_by_name)
             zero_branch_name_to_pos, zero_branch_terminal_scales = terminal_lookup_from(self.zero_branch_by_name)
             break_name_to_pos, break_terminal_scales = terminal_lookup_from(getattr(self, "break_by_name", {}))
-        generator_name_to_pos, generator_node_scales = node_device_lookup(self.generator_by_name)
-        load_name_to_pos, load_node_scales = node_device_lookup(self.load_by_name)
+            generator_name_to_pos, generator_node_scales = node_device_lookup(self.generator_by_name)
+            load_name_to_pos, load_node_scales = node_device_lookup(self.load_by_name)
 
         node_rows, node_pos_by_row = mark_named_rows(rows_for_type("ACNode"), node_name_to_pos)
         if node_rows.size:
@@ -4273,6 +4498,18 @@ class ACStateEstimator:
         p = getattr(load, "pbase", 1.0) * (load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage)
         q = getattr(load, "qbase", 1.0) * (load.qv0 + load.qv1 * voltage + load.qv2 * voltage * voltage)
         return float(p), float(q)
+
+    def _generator_pseudo_power_by_name(self, name: str) -> Tuple[float, float]:
+        state_idx = getattr(self, "generator_state_index_by_name", {}).get(name)
+        if state_idx is not None:
+            return float(self.initial_gen_p_array[int(state_idx)]), float(self.initial_gen_q_array[int(state_idx)])
+        return self._generator_pseudo_power(self.generator_by_name[name])
+
+    def _load_pseudo_power_by_name(self, name: str) -> Tuple[float, float]:
+        state_idx = getattr(self, "load_state_index_by_name", {}).get(name)
+        if state_idx is not None:
+            return float(self.initial_load_p_array[int(state_idx)]), float(self.initial_load_q_array[int(state_idx)])
+        return self._load_pseudo_power(self.load_by_name[name])
 
     def _voltage_measurement_node_idx(
         self,
@@ -5165,11 +5402,11 @@ class ACStateEstimator:
             next_idx, added_q_to = add("ACBreak", name, "Q_TO", -float(getattr(dev, "q", 0.0) or 0.0))
             return next_idx, added_p + added_q + added_p_to + added_q_to
         if meta.kind in ("generator_p", "generator_q") and name in self.generator_by_name:
-            p, q = self._generator_pseudo_power(self.generator_by_name[name])
+            p, q = self._generator_pseudo_power_by_name(name)
             meas_type = "P_GEN" if meta.kind == "generator_p" else "Q_GEN"
             return add("ACGenerator", name, meas_type, p if meas_type == "P_GEN" else q)
         if meta.kind in ("load_p", "load_q") and name in self.load_by_name:
-            p, q = self._load_pseudo_power(self.load_by_name[name])
+            p, q = self._load_pseudo_power_by_name(name)
             meas_type = "P_LOAD" if meta.kind == "load_p" else "Q_LOAD"
             return add("ACLoad", name, meas_type, p if meas_type == "P_LOAD" else q)
         return next_idx, 0
@@ -5627,24 +5864,45 @@ class ACStateEstimator:
                 col_chunks.append(np.asarray(cols, dtype=np.int64))
                 data_chunks.append(np.asarray(data, dtype=np.complex128))
 
-        shunt_rows = []
-        shunt_data = []
-        for sc in getattr(self, "shunt_compensators", getattr(self.network, "shunt_compensators", [])):
-            if not getattr(sc, "is_alive", False):
-                continue
-            if sc.node not in self.node_pos:
-                continue
-            if sc.control_type in ("B", "Z") or sc.g_set != 0.0:
-                y_sh = complex(sc.g_set, sc.b_set)
-                if y_sh != 0.0:
-                    pos = self.node_pos[sc.node]
-                    shunt_rows.append(pos)
-                    shunt_data.append(y_sh)
-        if shunt_data:
-            shunt_rows_array = np.asarray(shunt_rows, dtype=np.int64)
-            row_chunks.append(shunt_rows_array)
-            col_chunks.append(shunt_rows_array)
-            data_chunks.append(np.asarray(shunt_data, dtype=np.complex128))
+        ppc = self._ac_ppc_dict()
+        if ppc is not None and hasattr(self, "_ac_shunt_rows"):
+            shunt_rows = np.asarray(self._ac_shunt_rows, dtype=np.int64)
+            if shunt_rows.size:
+                shunt = np.asarray(ppc["shunt"], dtype=np.float64)[shunt_rows.astype(np.intp, copy=False)]
+                control_type = shunt[:, SHUNT_COLS["control_type"]].astype(np.int64, copy=False)
+                g_set = shunt[:, SHUNT_COLS["g_set"]]
+                b_set = shunt[:, SHUNT_COLS["b_set"]]
+                stamp_mask = (
+                    (control_type == SHUNT_B)
+                    | (control_type == SHUNT_Z)
+                    | (np.abs(g_set) > 0.0)
+                )
+                y_values = g_set[stamp_mask] + 1j * b_set[stamp_mask]
+                nonzero = np.abs(y_values) > 0.0
+                if np.any(nonzero):
+                    shunt_rows_array = np.asarray(self.shunt_pos_array, dtype=np.int64)[stamp_mask][nonzero]
+                    row_chunks.append(shunt_rows_array)
+                    col_chunks.append(shunt_rows_array)
+                    data_chunks.append(np.asarray(y_values[nonzero], dtype=np.complex128))
+        else:
+            shunt_rows = []
+            shunt_data = []
+            for sc in getattr(self, "shunt_compensators", getattr(self.network, "shunt_compensators", [])):
+                if not getattr(sc, "is_alive", False):
+                    continue
+                if sc.node not in self.node_pos:
+                    continue
+                if sc.control_type in ("B", "Z") or sc.g_set != 0.0:
+                    y_sh = complex(sc.g_set, sc.b_set)
+                    if y_sh != 0.0:
+                        pos = self.node_pos[sc.node]
+                        shunt_rows.append(pos)
+                        shunt_data.append(y_sh)
+            if shunt_data:
+                shunt_rows_array = np.asarray(shunt_rows, dtype=np.int64)
+                row_chunks.append(shunt_rows_array)
+                col_chunks.append(shunt_rows_array)
+                data_chunks.append(np.asarray(shunt_data, dtype=np.complex128))
         if row_chunks:
             rows = np.concatenate(row_chunks)
             cols = np.concatenate(col_chunks)
@@ -5683,6 +5941,29 @@ class ACStateEstimator:
 
     def _generator_shares(self) -> Dict[str, float]:
         """Split a node-level solved injection among co-located generators."""
+        names_array = getattr(self, "generator_name_array", None)
+        alpha_array = getattr(self, "generator_alpha_array", None)
+        if names_array is not None and alpha_array is not None:
+            names = [str(name) for name in np.asarray(names_array, dtype=object).tolist()]
+            positions = np.asarray(self.generator_pos_array, dtype=np.int32)
+            alpha_values = np.asarray(alpha_array, dtype=np.float64)
+            if not names:
+                return {}
+            count_by_pos: Dict[int, int] = {}
+            alpha_sum_by_pos: Dict[int, float] = {}
+            for pos_raw, alpha in zip(positions, alpha_values):
+                pos = int(pos_raw)
+                count_by_pos[pos] = count_by_pos.get(pos, 0) + 1
+                alpha_sum_by_pos[pos] = alpha_sum_by_pos.get(pos, 0.0) + float(alpha)
+            shares: Dict[str, float] = {}
+            for name, pos_raw, alpha in zip(names, positions, alpha_values):
+                pos = int(pos_raw)
+                total_alpha = alpha_sum_by_pos.get(pos, 0.0)
+                if total_alpha > 0.0:
+                    shares[name] = float(alpha) / total_alpha
+                else:
+                    shares[name] = 1.0 / float(count_by_pos[pos])
+            return shares
         count_by_pos: Dict[int, int] = {}
         alpha_sum_by_pos: Dict[int, float] = {}
         alpha_by_name: Dict[str, Optional[float]] = {}
@@ -5829,10 +6110,17 @@ class ACStateEstimator:
         if self.load_pos_array.size:
             p_load = np.bincount(self.load_pos_array, weights=p_values, minlength=self.n_nodes)
             q_load = np.bincount(self.load_pos_array, weights=q_values, minlength=self.n_nodes)
-        load_power = {
-            load.name: (float(p_values[idx]), float(q_values[idx]))
-            for idx, load in enumerate(self.load_order)
-        }
+        load_names = getattr(self, "load_name_array", None)
+        if load_names is not None:
+            load_power = {
+                str(name): (float(p_values[idx]), float(q_values[idx]))
+                for idx, name in enumerate(np.asarray(load_names, dtype=object).tolist())
+            }
+        else:
+            load_power = {
+                load.name: (float(p_values[idx]), float(q_values[idx]))
+                for idx, load in enumerate(self.load_order)
+            }
         return load_power, p_load, q_load
 
     def _load_power_totals_from_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -5863,10 +6151,17 @@ class ACStateEstimator:
         if self.generator_pos_array.size:
             p_gen = np.bincount(self.generator_pos_array, weights=p_values, minlength=self.n_nodes)
             q_gen = np.bincount(self.generator_pos_array, weights=q_values, minlength=self.n_nodes)
-        gen_power = {
-            gen.name: (float(p_values[idx]), float(q_values[idx]))
-            for idx, gen in enumerate(self.generator_order)
-        }
+        gen_names = getattr(self, "generator_name_array", None)
+        if gen_names is not None:
+            gen_power = {
+                str(name): (float(p_values[idx]), float(q_values[idx]))
+                for idx, name in enumerate(np.asarray(gen_names, dtype=object).tolist())
+            }
+        else:
+            gen_power = {
+                gen.name: (float(p_values[idx]), float(q_values[idx]))
+                for idx, gen in enumerate(self.generator_order)
+            }
         return gen_power, p_gen, q_gen
 
     def _generator_power_totals_from_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
