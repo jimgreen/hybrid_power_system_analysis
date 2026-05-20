@@ -64,6 +64,23 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
                 )
         self.assertIn("return self._run_newton_raphson()", inspect.getsource(ACPowerFlowCalc.run))
         self.assertIn("return self._run_newton_raphson()", inspect.getsource(DCPowerFlowCalc.run))
+        self.assertTrue(hasattr(DCPowerFlowCalc, "_prepare_from_ppc"))
+        self.assertIn("self._prepare_from_ppc()", inspect.getsource(DCPowerFlowCalc.prepare))
+        self.assertEqual(
+            inspect.signature(ACPowerFlowCalc._write_summary_result),
+            inspect.signature(DCPowerFlowCalc._write_summary_result),
+        )
+        self.assertEqual(
+            inspect.signature(ACPowerFlowCalc._write_back),
+            inspect.signature(DCPowerFlowCalc._write_back),
+        )
+
+        dc_source = inspect.getsource(DCPowerFlowCalc._run_newton_raphson)
+        self.assertIn("self._write_back()", dc_source)
+        self.assertNotIn("update_lf_info", dc_source)
+        self.assertNotIn("runtime_params", dc_source)
+        self.assertNotIn("divergence_threshold", dc_source)
+        self.assertNotIn("np.linalg.lstsq", dc_source)
 
     def test_lf_refresh_period_and_algorithm_branches_are_removed(self):
         from lfcore.ac_lf import ACPowerFlowCalc
@@ -296,8 +313,20 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
 
     def test_lf_old_compatibility_hooks_are_removed(self):
         checked_files = {
-            "src/hybrid_power_system_analysis/lfcore/ac_lf.py": ("def _cache_static_arrays",),
-            "src/hybrid_power_system_analysis/lfcore/dc_lf.py": ("_build_dc_ppc_from_e_file",),
+            "src/hybrid_power_system_analysis/lfcore/ac_lf.py": (
+                "def _cache_static_arrays",
+                "def _load_ppc_static",
+                "def _store_ppc_static",
+                "_pf_static",
+            ),
+            "src/hybrid_power_system_analysis/lfcore/dc_lf.py": (
+                "_build_dc_ppc_from_e_file",
+                "_DIRECT_PPC_STATIC_ATTRS",
+                "_DIRECT_PPC_SHAPE_KEYS",
+                "def _load_direct_ppc_static",
+                "def _store_direct_ppc_static",
+                "_dc_pf_static",
+            ),
             "src/hybrid_power_system_analysis/lfcore/hybrid_lf.py": (),
         }
         for rel_path, extra_tokens in checked_files.items():

@@ -26,6 +26,12 @@ from model.hybrid_array_model import (
     DCAC_CONTROL_LABEL,
 )
 from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+from model.meas_array_model import (
+    build_meas_ppc_from_e_file,
+    copy_meas_ppc,
+    measurement_list_from_meas_ppc,
+    sync_meas_ppc_from_measurement_table,
+)
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -46,7 +52,6 @@ from model.meas_model import (
 from secore.ac_se import (
     ACStateEstimator,
     _build_ac_se_network_from_ppc_dict,
-    _read_measurements_direct as _read_table_measurements_direct,
 )
 from secore.dc_se import DCStateEstimator, _build_dc_se_network_from_ppc_dict
 from secore.se_array_plan import (
@@ -86,8 +91,8 @@ DEFAULT_MEAS = measurement_file("hybrid", "qinling.meas")
 
 
 def _read_measurements_direct(meas_file: Path):
-    """Read Measurement rows through the shared table-backed SE parser."""
-    return _read_table_measurements_direct(meas_file, Measurement, table_only=True)
+    """Read Measurement rows through the shared PPC parser."""
+    return measurement_list_from_meas_ppc(copy_meas_ppc(build_meas_ppc_from_e_file(meas_file)))
 
 
 def _measurement_table_from_measurements(measurements: Sequence[Measurement]):
@@ -495,7 +500,8 @@ class HybridStateEstimator:
         self.p_scale = float(getattr(self.network, "p_scale", 1.0))
         self.i_scale = float(getattr(self.network, "i_scale", 1.0))
         stage_start = time.perf_counter()
-        self.measurements = self._load_measurements(self.meas_file)
+        self.meas_ppc = copy_meas_ppc(build_meas_ppc_from_e_file(self.meas_file))
+        self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self._sub_measurement_sources_by_side = None
         self._sub_measurement_source_rows_by_side = None
@@ -1503,6 +1509,9 @@ class HybridStateEstimator:
         if hasattr(self.measurements, "normalized"):
             self.measurements.normalized = True
         self._measurements_normalized = True
+        if getattr(self, "meas_ppc", None) is not None and getattr(self.measurements, "table", None) is not None:
+            self.meas_ppc["normalized"] = True
+            sync_meas_ppc_from_measurement_table(self.meas_ppc, self.measurements.table)
 
     def _finalize_sub_estimators_after_measurement_prepare(self) -> None:
         if self._ac_sub_estimator is not None and getattr(

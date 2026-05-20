@@ -359,6 +359,7 @@ class DCStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(getattr(estimator.network, "_se_lightweight", False))
         self.assertEqual("dc_ppc_v1", estimator.network.ppc["format"])
+        self.assertEqual("meas_ppc_v1", estimator.meas_ppc["format"])
 
     def test_dc_network_load_uses_dc_lf_efile_loader(self):
         import secore.dc_se as dc_se

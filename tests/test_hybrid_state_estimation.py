@@ -409,6 +409,18 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual("ACNode", measurements[0].device_type)
         self.assertEqual("V", measurements[0].meas_type)
 
+    def test_hybrid_prepare_uses_meas_ppc_source(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+            flat_start=True,
+        )
+
+        self.assertEqual("meas_ppc_v1", estimator.meas_ppc["format"])
+        self.assertTrue(estimator.meas_ppc["normalized"])
+
     def test_hybrid_side_measurement_slices_preserve_table_cache(self):
         from model.meas_model import MeasurementList, MeasurementView
         from secore.hybrid_se import HybridStateEstimator, Measurement

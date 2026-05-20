@@ -57,7 +57,35 @@ def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) ->
         angle_mask=np.concatenate((head.angle_mask, tail.angle_mask)),
         status_code=np.concatenate((measurement_table_status_code(head), measurement_table_status_code(tail))),
         rows_by_device_type_code=None,
+        device_name_id=_concat_optional_int_field(head, tail, "device_name_id"),
+        meas_type_code=_concat_optional_int_field(head, tail, "meas_type_code"),
     )
+
+
+def _concat_optional_int_field(head: MeasurementTable, tail: MeasurementTable, field_name: str):
+    head_values = getattr(head, field_name, None)
+    tail_values = getattr(tail, field_name, None)
+    if head_values is None and tail_values is None:
+        return None
+    if head_values is None:
+        head_array = np.full(head.idx.size, -1, dtype=np.int64)
+    else:
+        head_array = np.asarray(head_values, dtype=np.int64)
+    if tail_values is None:
+        tail_array = np.full(tail.idx.size, -1, dtype=np.int64)
+    else:
+        tail_array = np.asarray(tail_values, dtype=np.int64)
+    return np.concatenate((head_array, tail_array))
+
+
+def _take_optional_int_field(table: MeasurementTable, row_idx: np.ndarray, field_name: str):
+    values = getattr(table, field_name, None)
+    if values is None:
+        return None
+    values = np.asarray(values)
+    if values.size != table.idx.size:
+        return None
+    return values[row_idx]
 
 
 def _slice_cached_rows_by_device_type_code(
@@ -124,6 +152,8 @@ def measurement_table_take(
         angle_mask=table.angle_mask[row_idx],
         status_code=measurement_table_status_code(table)[row_idx],
         rows_by_device_type_code=code_rows,
+        device_name_id=_take_optional_int_field(table, row_idx, "device_name_id"),
+        meas_type_code=_take_optional_int_field(table, row_idx, "meas_type_code"),
     )
 
 

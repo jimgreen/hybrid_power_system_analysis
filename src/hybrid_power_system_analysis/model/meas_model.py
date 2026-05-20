@@ -154,6 +154,8 @@ class MeasurementTable:
     angle_mask: np.ndarray
     status_code: Optional[np.ndarray] = None
     rows_by_device_type_code: Optional[Dict[int, np.ndarray]] = None
+    device_name_id: Optional[np.ndarray] = None
+    meas_type_code: Optional[np.ndarray] = None
 
 
 class MeasurementList(list):
@@ -314,8 +316,16 @@ def measurement_table_from_measurements(
             measurement_table_status_code(table)
             return table
         if table_size < measurement_count:
+            if isinstance(measurements, TableBackedMeasurementList):
+                incorporated = measurements._incorporated_tail_size()
+                tail_measurements = list.__getitem__(
+                    measurements,
+                    slice(incorporated, list.__len__(measurements)),
+                )
+            else:
+                tail_measurements = tuple(measurements[table_size:])
             tail_table = measurement_table_from_measurements(
-                tuple(measurements[table_size:]),
+                tail_measurements,
                 device_type_codes=device_type_codes,
                 angle_measurement_types=angle_measurement_types,
             )
@@ -332,6 +342,8 @@ def measurement_table_from_measurements(
                 angle_mask=np.concatenate((table.angle_mask, tail_table.angle_mask)),
                 status_code=np.concatenate((measurement_table_status_code(table), measurement_table_status_code(tail_table))),
                 rows_by_device_type_code=None,
+                device_name_id=_concat_optional_int_field(table, tail_table, "device_name_id"),
+                meas_type_code=_concat_optional_int_field(table, tail_table, "meas_type_code"),
             )
             try:
                 measurements.table = table
@@ -380,6 +392,22 @@ def measurement_table_from_measurements(
         angle_mask=np.asarray(angle_mask_list, dtype=bool),
         status_code=np.asarray(status_list, dtype=np.int16),
     )
+
+
+def _concat_optional_int_field(head: MeasurementTable, tail: MeasurementTable, field_name: str):
+    head_values = getattr(head, field_name, None)
+    tail_values = getattr(tail, field_name, None)
+    if head_values is None and tail_values is None:
+        return None
+    if head_values is None:
+        head_array = np.full(head.idx.size, -1, dtype=np.int64)
+    else:
+        head_array = np.asarray(head_values, dtype=np.int64)
+    if tail_values is None:
+        tail_array = np.full(tail.idx.size, -1, dtype=np.int64)
+    else:
+        tail_array = np.asarray(tail_values, dtype=np.int64)
+    return np.concatenate((head_array, tail_array))
 
 
 @dataclass

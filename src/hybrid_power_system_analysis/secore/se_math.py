@@ -31,6 +31,7 @@ ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF
 _NORMAL_EQUATION_PATTERN_CACHE = {}
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
 _SPARSE_PATTERN_LINEAR_INDEX_CACHE = {}
+_MAX_DIRECT_NORMAL_ASSEMBLY_PAIRS = 2_000_000
 
 def targeted_redundancy_count(state_count: int, ratio: float) -> int:
     """Return the configured pseudo-measurement redundancy target as a row count."""
@@ -160,6 +161,7 @@ class SparseJacobianBuilder:
         self._cached_duplicate_slots: Optional[np.ndarray] = None
         self._cached_duplicate_data_positions: Optional[np.ndarray] = None
         self._cached_chunk_slices: Optional[List[Tuple[int, int]]] = None
+        self._cached_chunk_slot_plans: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
         self._cached_has_unique_slots = False
         self._cached_has_duplicate_slots = False
         self._cached_csr_data: Optional[np.ndarray] = None
@@ -170,6 +172,7 @@ class SparseJacobianBuilder:
     def _set_cached_slot_positions(self, slot: np.ndarray) -> None:
         self._cached_slot_positions = slot
         self._cached_chunk_slices = self._current_chunk_slices()
+        self._cached_chunk_slot_plans = []
         if slot.size == 0:
             self._cached_unique_slot_mask = np.array([], dtype=bool)
             self._cached_duplicate_slot_mask = np.array([], dtype=bool)
@@ -200,6 +203,18 @@ class SparseJacobianBuilder:
         else:
             self._cached_duplicate_data_positions = np.array([], dtype=np.int64)
             self._cached_duplicate_slots = np.array([], dtype=np.int64)
+        for start, end in self._cached_chunk_slices:
+            if start == end:
+                empty = np.array([], dtype=np.int64)
+                self._cached_chunk_slot_plans.append((empty, empty, empty, empty))
+                continue
+            chunk_unique_mask = self._cached_unique_slot_mask[start:end]
+            unique_pos = np.nonzero(chunk_unique_mask)[0].astype(np.int64, copy=False)
+            duplicate_pos = np.nonzero(~chunk_unique_mask)[0].astype(np.int64, copy=False)
+            chunk_slots = slot[start:end]
+            unique_slots = chunk_slots[unique_pos].astype(np.int64, copy=False)
+            duplicate_slots = chunk_slots[duplicate_pos].astype(np.int64, copy=False)
+            self._cached_chunk_slot_plans.append((unique_pos, unique_slots, duplicate_pos, duplicate_slots))
 
     def _current_chunk_slices(self) -> List[Tuple[int, int]]:
         slices: List[Tuple[int, int]] = []
@@ -305,6 +320,7 @@ class SparseJacobianBuilder:
             scalar_values = np.asarray(self.data, dtype=np.float64)
             np.add.at(values, self._cached_slot_positions[:scalar_count], scalar_values)
         chunk_slices = self._cached_chunk_slices
+        chunk_slot_plans = self._cached_chunk_slot_plans
         if chunk_slices is None or len(chunk_slices) != len(self._data_chunks):
             data = self._data_array()
             unique_mask = self._cached_unique_slot_mask
@@ -315,6 +331,16 @@ class SparseJacobianBuilder:
                 values[self._cached_unique_slots] = data[self._cached_unique_data_positions]
             if self._cached_has_duplicate_slots:
                 np.add.at(values, self._cached_duplicate_slots, data[self._cached_duplicate_data_positions])
+            return
+        if chunk_slot_plans is not None and len(chunk_slot_plans) == len(self._data_chunks):
+            for chunk, (unique_pos, unique_slots, duplicate_pos, duplicate_slots) in zip(
+                self._data_chunks,
+                chunk_slot_plans,
+            ):
+                if unique_pos.size:
+                    values[unique_slots] = chunk[unique_pos]
+                if duplicate_pos.size:
+                    np.add.at(values, duplicate_slots, chunk[duplicate_pos])
             return
         for chunk, (start, end) in zip(self._data_chunks, chunk_slices):
             if start == end:
@@ -535,6 +561,216 @@ def _expand_sparse_matrix_to_pattern(matrix, pattern):
     data = np.zeros(int(pattern_csc.nnz), dtype=np.float64)
     data[target_positions] = matrix_csc.data
     return SP_CSC_MATRIX((data, pattern_csc.indices, pattern_csc.indptr), shape=pattern_csc.shape, copy=False)
+
+
+class NormalEquationAssemblyPlan:
+    """Precomputed sparse assembly plan for repeated ``H.T W H`` builds.
+
+    State-estimation iterations keep the active measurement layout fixed, so the
+    Jacobian sparsity pattern is normally stable.  This plan turns the row-wise
+    Jacobian pattern into raw normal-equation coordinate slots once, then each
+    iteration only refreshes numeric values with vectorized reductions.
+    """
+
+    def __init__(
+        self,
+        *,
+        shape: Tuple[int, int],
+        h_indptr: np.ndarray,
+        h_indices: np.ndarray,
+        h_rows: np.ndarray,
+        h_cols: np.ndarray,
+        pair_left_pos: np.ndarray,
+        pair_right_pos: np.ndarray,
+        pair_rows: np.ndarray,
+        pair_slot: np.ndarray,
+        gain_indptr: np.ndarray,
+        gain_indices: np.ndarray,
+        pair_count: int,
+        use_direct_assembly: bool,
+    ):
+        self.shape = tuple(int(item) for item in shape)
+        self.h_indptr = np.asarray(h_indptr, dtype=np.int32)
+        self.h_indices = np.asarray(h_indices, dtype=np.int32)
+        self.h_rows = np.asarray(h_rows, dtype=np.int32)
+        self.h_cols = np.asarray(h_cols, dtype=np.int32)
+        self.pair_left_pos = np.asarray(pair_left_pos, dtype=np.int32)
+        self.pair_right_pos = np.asarray(pair_right_pos, dtype=np.int32)
+        self.pair_rows = np.asarray(pair_rows, dtype=np.int32)
+        self.pair_slot = np.asarray(pair_slot, dtype=np.int32)
+        self.gain_indptr = np.asarray(gain_indptr, dtype=np.int32)
+        self.gain_indices = np.asarray(gain_indices, dtype=np.int32)
+        self.gain_shape = (self.shape[1], self.shape[1])
+        self.gain_nnz = int(self.gain_indices.size)
+        self.pair_count = int(pair_count)
+        self.use_direct_assembly = bool(use_direct_assembly)
+
+    @classmethod
+    def _row_pair_count(cls, H) -> int:
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        counts = np.diff(H_csr.indptr).astype(np.int64, copy=False)
+        return int(np.dot(counts, counts))
+
+    @classmethod
+    def direct_assembly_is_reasonable(cls, H, max_pair_count: int = _MAX_DIRECT_NORMAL_ASSEMBLY_PAIRS) -> bool:
+        if not is_sparse_matrix(H):
+            return False
+        return cls._row_pair_count(H) <= int(max_pair_count)
+
+    @classmethod
+    def from_jacobian(
+        cls,
+        H,
+        *,
+        max_direct_pair_count: int = _MAX_DIRECT_NORMAL_ASSEMBLY_PAIRS,
+    ) -> "NormalEquationAssemblyPlan":
+        if not is_sparse_matrix(H):
+            raise TypeError("NormalEquationAssemblyPlan requires a sparse Jacobian")
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            H_csr = H_csr.copy()
+            H_csr.sort_indices()
+        indptr = H_csr.indptr.astype(np.int32, copy=True)
+        indices = H_csr.indices.astype(np.int32, copy=True)
+        counts = np.diff(indptr).astype(np.int32, copy=False)
+        pair_count = int(np.dot(counts.astype(np.int64, copy=False), counts.astype(np.int64, copy=False)))
+        h_rows = np.repeat(np.arange(H_csr.shape[0], dtype=np.int32), counts)
+        h_cols = indices.copy()
+
+        left_chunks = []
+        right_chunks = []
+        row_chunks = []
+        for count in np.unique(counts):
+            k = int(count)
+            if k <= 0:
+                continue
+            rows = np.nonzero(counts == k)[0].astype(np.int32, copy=False)
+            if rows.size == 0:
+                continue
+            positions = indptr[rows, None] + np.arange(k, dtype=np.int32)
+            left = np.repeat(positions, k, axis=1).ravel()
+            right = np.tile(positions, (1, k)).ravel()
+            left_chunks.append(left.astype(np.int32, copy=False))
+            right_chunks.append(right.astype(np.int32, copy=False))
+            row_chunks.append(np.repeat(rows, k * k).astype(np.int32, copy=False))
+
+        if left_chunks:
+            pair_left_pos = np.concatenate(left_chunks).astype(np.int32, copy=False)
+            pair_right_pos = np.concatenate(right_chunks).astype(np.int32, copy=False)
+            pair_rows = np.concatenate(row_chunks).astype(np.int32, copy=False)
+            n_state = int(H_csr.shape[1])
+            gain_rows = indices[pair_left_pos].astype(np.int64, copy=False)
+            gain_cols = indices[pair_right_pos].astype(np.int64, copy=False)
+            raw_linear = gain_cols * np.int64(n_state) + gain_rows
+            gain_linear, pair_slot = np.unique(raw_linear, return_inverse=True)
+            gain_indices = (gain_linear % np.int64(n_state)).astype(np.int32, copy=False)
+            gain_cols_unique = (gain_linear // np.int64(n_state)).astype(np.int64, copy=False)
+            gain_indptr = np.zeros(n_state + 1, dtype=np.int32)
+            np.add.at(gain_indptr, gain_cols_unique + 1, 1)
+            np.cumsum(gain_indptr, out=gain_indptr)
+            pair_slot = pair_slot.astype(np.int32, copy=False)
+        else:
+            pair_left_pos = np.array([], dtype=np.int32)
+            pair_right_pos = np.array([], dtype=np.int32)
+            pair_rows = np.array([], dtype=np.int32)
+            pair_slot = np.array([], dtype=np.int32)
+            gain_indices = np.array([], dtype=np.int32)
+            gain_indptr = np.zeros(H_csr.shape[1] + 1, dtype=np.int32)
+
+        return cls(
+            shape=H_csr.shape,
+            h_indptr=indptr,
+            h_indices=indices,
+            h_rows=h_rows,
+            h_cols=h_cols,
+            pair_left_pos=pair_left_pos,
+            pair_right_pos=pair_right_pos,
+            pair_rows=pair_rows,
+            pair_slot=pair_slot,
+            gain_indptr=gain_indptr,
+            gain_indices=gain_indices,
+            pair_count=pair_count,
+            use_direct_assembly=pair_count <= int(max_direct_pair_count),
+        )
+
+    def matches(self, H) -> bool:
+        if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
+            return False
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            return False
+        return (
+            int(H_csr.nnz) == int(self.h_indices.size)
+            and H_csr.indptr.shape == self.h_indptr.shape
+            and H_csr.indices.shape == self.h_indices.shape
+            and np.array_equal(H_csr.indptr, self.h_indptr)
+            and np.array_equal(H_csr.indices, self.h_indices)
+        )
+
+    def assemble(
+        self,
+        H,
+        residual: np.ndarray,
+        weight: np.ndarray,
+        *,
+        uniform_weight: Optional[float] = None,
+        weights_are_uniform: Optional[bool] = None,
+        weighted_residual: Optional[np.ndarray] = None,
+        dense_gain_limit: int = 1000,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        data = np.asarray(H_csr.data, dtype=np.float64)
+        residual = np.asarray(residual, dtype=np.float64)
+        weight = np.asarray(weight, dtype=np.float64)
+
+        if weight.size == 0:
+            row_weight = None
+            weighted_residual_values = residual
+            scale = 1.0
+        elif weights_are_uniform is True or uniform_weight is not None:
+            scale = float(weight[0] if uniform_weight is None else uniform_weight)
+            row_weight = None
+            weighted_residual_values = residual if scale == 1.0 else residual * scale
+        else:
+            if weights_are_uniform is None and weight.size:
+                first_weight = float(weight[0])
+                if np.all(weight == first_weight):
+                    scale = first_weight
+                    row_weight = None
+                    weighted_residual_values = residual if scale == 1.0 else residual * scale
+                else:
+                    scale = 1.0
+                    row_weight = weight
+                    weighted_residual_values = weight * residual if weighted_residual is None else weighted_residual
+            else:
+                scale = 1.0
+                row_weight = weight
+                weighted_residual_values = weight * residual if weighted_residual is None else weighted_residual
+
+        if self.pair_slot.size:
+            gain_values = data[self.pair_left_pos] * data[self.pair_right_pos]
+            if row_weight is not None:
+                gain_values = gain_values * row_weight[self.pair_rows]
+            elif scale != 1.0:
+                gain_values = gain_values * scale
+            gain_data = np.bincount(
+                self.pair_slot,
+                weights=gain_values,
+                minlength=self.gain_nnz,
+            ).astype(np.float64, copy=False)
+        else:
+            gain_data = np.array([], dtype=np.float64)
+
+        rhs_weights = data * weighted_residual_values[self.h_rows] if data.size else np.array([], dtype=np.float64)
+        rhs = np.bincount(self.h_cols, weights=rhs_weights, minlength=self.shape[1]).astype(np.float64, copy=False)
+        gain = SP_CSC_MATRIX(
+            (gain_data, self.gain_indices, self.gain_indptr),
+            shape=self.gain_shape,
+            copy=False,
+        )
+        if gain.shape[0] <= dense_gain_limit:
+            return gain.toarray(), rhs
+        return gain, rhs
 
 
 def measurement_leverage(H, gain_inv: np.ndarray) -> np.ndarray:
@@ -891,9 +1127,24 @@ def build_normal_equations(
     weighted_residual: Optional[np.ndarray] = None,
     normal_pattern=None,
     assume_normal_pattern_matches: bool = False,
+    normal_assembly_plan: Optional[NormalEquationAssemblyPlan] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build WLS normal equations while avoiding WH allocation for uniform weights."""
     if is_sparse_matrix(H):
+        if (
+            normal_assembly_plan is not None
+            and normal_assembly_plan.use_direct_assembly
+            and normal_assembly_plan.matches(H)
+        ):
+            return normal_assembly_plan.assemble(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+                dense_gain_limit=dense_gain_limit,
+            )
         if weight.size == 0:
             gain = H.T @ H
             rhs = H.T @ residual

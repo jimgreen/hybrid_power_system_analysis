@@ -112,35 +112,28 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertIn("bus", calc.result)
         self.assertEqual(ppc["bus"].shape, calc.result["bus"].shape)
 
-    def test_dc_ppc_prepare_reuses_static_cache_for_second_calc(self):
+    def test_dc_ppc_prepare_ignores_static_cache_field(self):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
-        ppc.pop("_dc_pf_static", None)
 
         with contextlib.redirect_stdout(io.StringIO()):
             cold_calc = DCPowerFlowCalc(ppc)
             cold_calc.prepare()
             cold_G = cold_calc.G
             cold_x = cold_calc.x
-        self.assertIn("_dc_pf_static", ppc)
+        self.assertNotIn("_dc_pf_static", ppc)
 
-        original_topology = DCPowerFlowCalc._prepare_direct_ppc_topology
+        stale_static = {"N": -1}
+        ppc["_dc_pf_static"] = stale_static
+        with contextlib.redirect_stdout(io.StringIO()):
+            warm_calc = DCPowerFlowCalc(ppc)
+            warm_calc.prepare()
+            warm_G = warm_calc.G
+            warm_x = warm_calc.x
 
-        def reject_topology(*_args, **_kwargs):
-            raise AssertionError("warm DC ppc prepare should reuse cached static topology")
-
-        DCPowerFlowCalc._prepare_direct_ppc_topology = reject_topology
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                warm_calc = DCPowerFlowCalc(ppc)
-                warm_calc.prepare()
-                warm_G = warm_calc.G
-                warm_x = warm_calc.x
-        finally:
-            DCPowerFlowCalc._prepare_direct_ppc_topology = original_topology
-
+        self.assertIs(stale_static, ppc["_dc_pf_static"])
         self.assertEqual(cold_G.shape, warm_G.shape)
         self.assertEqual(cold_x.shape, warm_x.shape)
         self.assertFalse(hasattr(warm_calc, "array_mode"))
@@ -153,12 +146,11 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             again_x = again_calc.x
         self.assertNotEqual(123.0, again_x[0])
 
-    def test_dc_array_mode_skips_full_static_cache_and_uses_dense_lookup(self):
+    def test_dc_array_mode_uses_dense_lookup(self):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_array_model import build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
-        ppc.pop("_dc_pf_static", None)
 
         calc = DCPowerFlowCalc(ppc, result_mode="array")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -176,7 +168,6 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
-        ppc.pop("_dc_pf_static", None)
         calc = DCPowerFlowCalc(ppc)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -204,7 +195,6 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
-        ppc.pop("_dc_pf_static", None)
         calc = DCPowerFlowCalc(ppc)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -220,7 +210,6 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model.dc_array_model import build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
-        ppc.pop("_dc_pf_static", None)
 
         calc = DCPowerFlowCalc(ppc, result_mode="none")
 
@@ -295,7 +284,6 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         case_path = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         ppc = build_dc_ppc_from_e_file(case_path)
-        ppc.pop("_dc_pf_static", None)
         ppc.pop("_topology_arrays", None)
         calc = DCPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         original_prepare_topology = DCPowerFlowCalc._prepare_direct_ppc_topology
@@ -620,7 +608,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         np.testing.assert_allclose(calc.get_f(x), expected_f, atol=1e-12)
         np.testing.assert_allclose(calc.get_jacobi(x).toarray(), expected_j, atol=1e-12)
 
-    def test_update_lf_info_uses_cached_branch_arrays(self):
+    def test_write_back_uses_cached_branch_arrays(self):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_model import DCPowerNetwork
 
@@ -635,10 +623,10 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
             x = calc.x
-        calc.runtime_params = calc.params
         network.branches = NonIterableBranches()
 
-        calc.update_lf_info(x)
+        calc.x = x
+        calc._write_back()
 
         self.assertTrue(all(node.voltage > 0.0 for node in network.nodes if node.is_alive))
 
@@ -653,9 +641,9 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
             x = calc.x
-        calc.runtime_params = calc.params
         calc.skip_lf_result = True
-        calc.update_lf_info(x)
+        calc.x = x
+        calc._write_back()
 
         def reject_node_voltage(*_args, **_kwargs):
             raise AssertionError("DC LF result building should use a cached voltage lookup")

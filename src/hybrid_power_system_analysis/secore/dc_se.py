@@ -35,6 +35,12 @@ from model.dc_array_model import (
 )
 from model.dc_model import DCPowerNetwork
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
+from model.meas_array_model import (
+    build_meas_ppc_from_e_file,
+    copy_meas_ppc,
+    measurement_list_from_meas_ppc,
+    sync_meas_ppc_from_measurement_table,
+)
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -665,11 +671,17 @@ class DCStateEstimator:
         self._record_profile_time("init.load_network", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
         if measurements is None:
-            self.measurements = self._load_measurements(self.meas_file)
+            self.meas_ppc = copy_meas_ppc(build_meas_ppc_from_e_file(self.meas_file))
+            self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
+        elif isinstance(measurements, dict) and measurements.get("format") == "meas_ppc_v1":
+            self.meas_ppc = copy_meas_ppc(measurements)
+            self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         elif isinstance(measurements, MeasurementList):
             self.measurements = measurements
+            self.meas_ppc = None
         else:
             self.measurements = list(measurements)
+            self.meas_ppc = None
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
@@ -2236,7 +2248,7 @@ class DCStateEstimator:
 
     @staticmethod
     def _load_measurements(meas_file: Path) -> MeasurementList:
-        return _read_measurements_direct(meas_file, table_only=True)
+        return measurement_list_from_meas_ppc(copy_meas_ppc(build_meas_ppc_from_e_file(meas_file)))
 
     def _voltage_base(self, node_idx: int) -> float:
         return self._node_vbase_by_idx[int(node_idx)]
@@ -2346,6 +2358,9 @@ class DCStateEstimator:
                 ):
                     seed_rows.append((meas.device_type, meas.device_name, mtype, float(meas.value)))
             self._power_flow_seed_rows = seed_rows
+            if getattr(self, "meas_ppc", None) is not None:
+                self.meas_ppc["normalized"] = True
+                sync_meas_ppc_from_measurement_table(self.meas_ppc, self.measurements.table)
             return
         table = _measurement_table_from_measurements(self.measurements)
         self.measurement_table = table
@@ -2503,6 +2518,9 @@ class DCStateEstimator:
             node_idx: value for node_idx, (_weight, value) in real_voltage_best.items()
         }
         self._power_flow_seed_rows = seed_rows
+        if getattr(self, "meas_ppc", None) is not None:
+            self.meas_ppc["normalized"] = True
+            sync_meas_ppc_from_measurement_table(self.meas_ppc, table)
 
     def _active_device_keys(self) -> set:
         """Return devices that already have at least one usable real measurement."""

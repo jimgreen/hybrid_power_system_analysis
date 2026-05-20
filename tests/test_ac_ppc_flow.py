@@ -654,8 +654,7 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertIn("_topology_arrays", ppc)
         self.assertGreater(calc.N, 0)
 
-    def test_ppc_prepare_reuses_static_cache_for_second_calc(self):
-        import ac_lf
+    def test_ppc_prepare_ignores_static_cache_field(self):
         from ac_lf import ACPowerFlowCalc
         from hybrid_array_model import build_hybrid_ppc_from_e_file
 
@@ -665,21 +664,15 @@ class ACPPCFlowTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             first.prepare()
 
-        self.assertIn("_pf_static", ppc)
+        self.assertNotIn("_pf_static", ppc)
 
-        original_ensure_topology = ac_lf.ensure_ac_ppc_topology
+        stale_static = {"N": -1}
+        ppc["_pf_static"] = stale_static
+        second = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            second.prepare()
 
-        def reject_ensure_topology(*_args, **_kwargs):
-            raise AssertionError("second PPC prepare should reuse cached static data")
-
-        ac_lf.ensure_ac_ppc_topology = reject_ensure_topology
-        try:
-            second = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
-            with contextlib.redirect_stdout(io.StringIO()):
-                second.prepare()
-        finally:
-            ac_lf.ensure_ac_ppc_topology = original_ensure_topology
-
+        self.assertIs(stale_static, ppc["_pf_static"])
         self.assertEqual(first.total_vars, second.total_vars)
         self.assertEqual(first.total_eq, second.total_eq)
 

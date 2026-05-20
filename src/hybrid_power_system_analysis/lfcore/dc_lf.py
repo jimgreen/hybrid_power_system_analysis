@@ -193,148 +193,6 @@ class DCPowerFlowCalc:
     在同一个 Newton 系统中求解。
     """
 
-    _DIRECT_PPC_STATIC_ATTRS = (
-        "alive_nodes",
-        "alive_node_dict",
-        "alive_node_ids",
-        "_alive_node_lookup",
-        "_active_bus_pos",
-        "_bus_pos_to_solver_pos",
-        "_dc_jac_csr_indices",
-        "_dc_jac_csr_indptr",
-        "_dc_jac_csr_data",
-        "_dc_jac_csr_sum_plan",
-        "_dc_jac_csc_indices",
-        "_dc_jac_csc_indptr",
-        "_dc_jac_csc_data",
-        "_dc_jac_csc_sum_plan",
-        "_dc_jac_raw_data",
-        "_dc_jac_raw_to_csr_pos",
-        "_dc_jac_raw_to_csc_pos",
-        "_dc_jac_unknown_slice",
-        "_dc_jac_unknown_row_nodes",
-        "_dc_jac_unknown_col_nodes",
-        "_dc_jac_unknown_g_data",
-        "_dc_jac_unknown_diag_mask",
-        "_dc_jac_zero_i_slice",
-        "_dc_jac_zero_j_slice",
-        "_dc_jac_dcdc_i_slice",
-        "_dc_jac_dcdc_j_slice",
-        "_dc_jac_known_slice",
-        "_dc_jac_zero_con_slice",
-        "_dc_jac_phi_fix_slice",
-        "_dc_jac_dcdc_ctrl_p_slice",
-        "_dc_jac_dcdc_ctrl_v_slice",
-        "_dc_jac_dcdc_ctrl_i_slice",
-        "_dc_jac_dcdc_loss_slice",
-        "N",
-        "P_const",
-        "I_shunt",
-        "slack_gen_info",
-        "branch_idx",
-        "branch_i",
-        "branch_j",
-        "branch_r",
-        "alive_loads",
-        "alive_generators",
-        "G",
-        "zero_edges",
-        "comp_nodes",
-        "comp_tree_edges",
-        "N_phi",
-        "ref_phi_idx",
-        "zero_branch_info",
-        "zero_type",
-        "zero_dev_idx",
-        "zero_i",
-        "zero_j",
-        "zero_phi_a",
-        "zero_phi_b",
-        "zero_con_i",
-        "zero_con_j",
-        "dcdc_idx",
-        "dcdc_i",
-        "dcdc_j",
-        "dcdc_ctrl_code",
-        "dcdc_p_set",
-        "dcdc_i_set",
-        "dcdc_v_set",
-        "dcdc_r1",
-        "dcdc_r2",
-        "N_dcdc",
-        "dcdc_ctrl",
-        "slack_nodes",
-        "slack_node_arr",
-        "slack_value_arr",
-        "total_vars",
-        "unknown_nodes",
-        "n_unknown",
-        "n_known",
-        "node_eq",
-        "n_zero_constraint",
-        "n_phi_fix",
-        "n_dcdc",
-        "total_eq",
-        "eq_unknown_start",
-        "eq_known_start",
-        "eq_zero_start",
-        "eq_phi_start",
-        "eq_dcdc_start",
-        "unknown_map",
-        "zero_con_rows",
-        "phi_fix_rows",
-        "dcdc_seq",
-        "dcdc_p_col",
-        "dcdc_q_col",
-        "dcdc_eq_ctrl",
-        "dcdc_eq_loss",
-        "dcdc_ctrl_p_mask",
-        "dcdc_ctrl_v_mask",
-        "dcdc_ctrl_i_mask",
-        "dcdc_ones",
-        "zero_i_eq",
-        "zero_j_eq",
-        "zero_i_unknown_mask",
-        "zero_j_unknown_mask",
-        "zero_i_unknown_count",
-        "zero_j_unknown_count",
-        "zero_i_rows_jac",
-        "zero_i_cols_jac",
-        "zero_j_rows_jac",
-        "zero_j_cols_jac",
-        "known_rows_jac",
-        "known_cols_jac",
-        "known_data_jac",
-        "zero_con_rows_jac",
-        "zero_con_cols_jac",
-        "zero_con_data_jac",
-        "phi_fix_cols_jac",
-        "phi_fix_data_jac",
-        "dcdc_i_eq",
-        "dcdc_j_eq",
-        "dcdc_i_unknown_mask",
-        "dcdc_j_unknown_mask",
-        "dcdc_i_unknown_idx",
-        "dcdc_j_unknown_idx",
-        "dcdc_i_eq_rows_jac",
-        "dcdc_j_eq_rows_jac",
-        "dcdc_i_eq_cols_jac",
-        "dcdc_j_eq_cols_jac",
-        "dcdc_i_eq_data_jac",
-        "dcdc_j_eq_data_jac",
-        "dcdc_ctrl_p_count",
-        "dcdc_ctrl_v_count",
-        "dcdc_ctrl_i_count",
-        "dcdc_ctrl_p_data_jac",
-        "dcdc_ctrl_v_data_jac",
-        "dcdc_ctrl_i_rows_jac",
-        "dcdc_ctrl_i_cols_jac",
-        "dcdc_ctrl_i_data_jac",
-        "dcdc_loss_rows_jac",
-        "dcdc_loss_cols_jac",
-    )
-    _DIRECT_PPC_SHAPE_KEYS = ("bus", "branch", "load", "gen", "zero_branch", "switch", "break", "dcdc")
-
     def __init__(
         self,
         network,
@@ -368,7 +226,6 @@ class DCPowerFlowCalc:
             max_iter=max_iter,
             min_voltage=min_voltage,
         )
-        self.runtime_params = self.params
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
@@ -391,75 +248,6 @@ class DCPowerFlowCalc:
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
         return _normalize_lf_result_mode(result_mode, "DC")
-
-    @staticmethod
-    def _clone_static_value(value):
-        if isinstance(value, np.ndarray):
-            return value.copy()
-        if isinstance(value, dict):
-            return dict(value)
-        if isinstance(value, list):
-            return list(value)
-        return value
-
-    def _direct_ppc_shape_signature(self):
-        return {
-            key: tuple(self.ppc[key].shape)
-            for key in self._DIRECT_PPC_SHAPE_KEYS
-            if key in self.ppc
-        }
-
-    def _direct_ppc_array_id_signature(self):
-        return {
-            key: id(self.ppc[key])
-            for key in self._DIRECT_PPC_SHAPE_KEYS
-            if key in self.ppc
-        }
-
-    def _load_direct_ppc_static(self):
-        if not self._should_use_direct_ppc_static_cache():
-            return None
-        static = self.ppc.get("_dc_pf_static")
-        if not isinstance(static, dict):
-            return None
-        if static.get("format") != "dc_pf_static_v1":
-            return None
-        if static.get("keep_node_objects") != self.keep_node_objects:
-            return None
-        if static.get("shapes") != self._direct_ppc_shape_signature():
-            return None
-        if static.get("array_ids") != self._direct_ppc_array_id_signature():
-            return None
-
-        for name, value in static["attrs"].items():
-            setattr(self, name, self._clone_static_value(value))
-        self.x = static["x"].copy()
-        return True
-
-    def _should_use_direct_ppc_static_cache(self) -> bool:
-        """Cache only full-mode direct PPC preparation.
-
-        Array/summary/none cold-start runs execute ``prepare()`` once and do not
-        benefit from copying a large static cache back into the input ppc.
-        """
-        return bool(self.keep_node_objects)
-
-    def _store_direct_ppc_static(self, x):
-        if not self._should_use_direct_ppc_static_cache():
-            return
-        attrs = {
-            name: self._clone_static_value(getattr(self, name))
-            for name in self._DIRECT_PPC_STATIC_ATTRS
-            if hasattr(self, name)
-        }
-        self.ppc["_dc_pf_static"] = {
-            "format": "dc_pf_static_v1",
-            "keep_node_objects": self.keep_node_objects,
-            "shapes": self._direct_ppc_shape_signature(),
-            "array_ids": self._direct_ppc_array_id_signature(),
-            "attrs": attrs,
-            "x": x.copy(),
-        }
 
     def _alive_node_lookup_array(self):
         """Return a dense node-id to active solver-position lookup when possible."""
@@ -632,15 +420,11 @@ class DCPowerFlowCalc:
         self.alive_nodes = []
 
     def prepare(self):
-        """
-        运行潮流计算（修正版，采用节点电位法处理零阻抗支路）
-        变量：V (N个) + φ (N_phi个) + Pdc (N_dcdc个)
-        方程：功率平衡（除松弛节点外各节点） + 松弛节点电压方程 + 零阻抗电压约束（树支） + φ参考固定 + DC-DC方程
-        变量数与方程数严格相等。
-        """
-        cached = self._load_direct_ppc_static()
-        if cached is not None:
-            return
+        """预处理：合并带电拓扑岛，初始化参数并定义变量/方程索引。"""
+        self._prepare_from_ppc()
+
+    def _prepare_from_ppc(self):
+        """Prepare a Newton system from an already arrayized DC ppc dictionary."""
         ensure_dc_ppc_topology(self.ppc)
         self._prepare_direct_ppc_topology()
 
@@ -1011,7 +795,6 @@ class DCPowerFlowCalc:
         self._prepare_static_jacobian_indices()
         self.G = G
         self.x = x
-        self._store_direct_ppc_static(x)
 
         return
 
@@ -1676,7 +1459,7 @@ class DCPowerFlowCalc:
                     p,
                     v,
                     out=np.zeros_like(p),
-                    where=np.abs(v) > self.runtime_params.min_voltage,
+                    where=np.abs(v) > self.min_voltage,
                 )
                 load[load_mask, DC_LOAD_COLS["p"]] = p
                 load[load_mask, DC_LOAD_COLS["current"]] = current
@@ -1699,7 +1482,7 @@ class DCPowerFlowCalc:
                     p_values,
                     v,
                     out=np.zeros_like(p_values),
-                    where=np.abs(v) > self.runtime_params.min_voltage,
+                    where=np.abs(v) > self.min_voltage,
                 )
                 active_rows = np.nonzero(gen_mask)[0]
                 non_slack = p_mask | i_mask
@@ -1724,13 +1507,13 @@ class DCPowerFlowCalc:
                 dcdc_i_p,
                 dcdc_vi,
                 out=np.zeros_like(dcdc_i_p),
-                where=np.abs(dcdc_vi) > self.runtime_params.min_voltage,
+                where=np.abs(dcdc_vi) > self.min_voltage,
             )
             dcdc_j_c = np.divide(
                 dcdc_j_p,
                 dcdc_vj,
                 out=np.zeros_like(dcdc_j_p),
-                where=np.abs(dcdc_vj) > self.runtime_params.min_voltage,
+                where=np.abs(dcdc_vj) > self.min_voltage,
             )
             dcdc[self.dcdc_idx, DC_DCDC_COLS["i_p"]] = dcdc_i_p
             dcdc[self.dcdc_idx, DC_DCDC_COLS["j_p"]] = dcdc_j_p
@@ -1744,7 +1527,7 @@ class DCPowerFlowCalc:
                 continue
             share = P_inj[node] / len(gens)
             v = V_final[node]
-            current = share / v if abs(v) > self.runtime_params.min_voltage else 0.0
+            current = share / v if abs(v) > self.min_voltage else 0.0
             for gen_ref in gens:
                 if isinstance(gen_ref, (int, np.integer)):
                     gen[int(gen_ref), DC_GEN_COLS["p"]] = share
@@ -1991,7 +1774,8 @@ class DCPowerFlowCalc:
                     node_ids[pos] = int(getattr(node, "idx", pos))
         return node_ids
 
-    def _write_summary_result(self, x):
+    def _write_summary_result(self):
+        x = self.x
         voltage = x[:self.N].copy()
         self.result = {
             "node_id": self._summary_node_ids(),
@@ -2009,18 +1793,18 @@ class DCPowerFlowCalc:
             },
         }
 
-    def update_lf_info(self, x):
-        """将求解后的电压、电流和功率写回 DC 模型对象。"""
+    def _write_back(self):
+        """结果回填；数值计算批量完成，Python 循环只负责对象属性赋值。"""
         if self.result_mode == "none":
             self.result = {}
             self.lf_result = None
             return
         if self.result_mode == "summary":
-            self._write_summary_result(x)
+            self._write_summary_result()
             self.lf_result = None
             return
 
-        self._write_back_ppc(x)
+        self._write_back_ppc(self.x)
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
         return
@@ -2041,7 +1825,6 @@ class DCPowerFlowCalc:
         )
         return F, J
 
-
     def run(self, result_mode=None) -> int:
         """执行直流 Newton 迭代并在收敛后回填结果。"""
         if result_mode is not None:
@@ -2055,76 +1838,41 @@ class DCPowerFlowCalc:
 
     def _run_newton_raphson(self) -> int:
         """执行牛顿-拉夫逊迭代求解。"""
-        params = self.params
-        self.runtime_params = params
-        self.tol = params.tol
-        self.max_iter = params.max_iter
-        self.min_voltage = params.min_voltage
-        x = self.x.copy()
         self.converged = False
         self.iterations = 0
+        x = self.x.copy()
 
-        solver_name = self._linear_solver_resolved
-        solver_fn = self._linear_solver_fn
-
-        # ---------- 7. 牛顿-拉夫逊迭代 ----------
-        for it in range(params.max_iter):
+        for it in range(self.max_iter):
+            self.iterations += 1
             F, J = self._build_newton_system(x)
-
-            # 收敛检查
             self.normF = np.linalg.norm(F, np.inf)
-
             if self.verbose:
-                print("it:", it, f"eps:{self.normF:.3e}")
+                print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
 
-            self.iterations = it + 1
-            if self.normF < params.tol:
+            if self.normF < self.tol:
                 if self.verbose:
-                    print(f"\n收敛于第 {it+1} 次迭代，最大残差 = {self.normF:.2e}")
+                    print(f"收敛于第 {it + 1} 次迭代")
                 self.converged = True
                 self.x = x
-                self.update_lf_info(x)
+                self._write_back()
                 return 0
-            if self.normF > params.divergence_threshold:
-                if self.verbose:
-                    print(f"\n警告：残差过大 ({self.normF:.2e})，迭代发散")
-                self.converged = False
-                break
 
             try:
-                factor = _factor_jacobian(J, solver_name, solver_fn)
+                factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
                 delta = factor.solve(-F)
-            except Exception as e:
-                if self.verbose:
-                    print(f"\n线性方程组求解失败: {e}")
-                # 可选求解器失败时退回到 SuperLU；再不行就走最小二乘。
-                _OPTIONAL_SPARSE_SOLVERS.pop(solver_name, None)
-                _OPTIONAL_SPARSE_MISSING.add(solver_name)
-                solver_name = "scipy"
-                solver_fn = spsolve
+            except Exception:
+                _OPTIONAL_SPARSE_SOLVERS.pop(self._linear_solver_resolved, None)
+                _OPTIONAL_SPARSE_MISSING.add(self._linear_solver_resolved)
                 self._linear_solver_resolved = "scipy"
                 self._linear_solver_fn = spsolve
-                try:
-                    delta = spsolve(J, -F)
-                except Exception:
-                    J_dense = J.toarray()
-                    try:
-                        delta = np.linalg.lstsq(J_dense, -F, rcond=None)[0]
-                    except Exception:
-                        if self.verbose:
-                            print("最小二乘也失败，迭代终止")
-                        break
+                delta = spsolve(J, -F)
 
-            # 更新变量
             x += delta
 
-        else:
-            if self.verbose:
-                print(f"\n警告：达到最大迭代次数 {params.max_iter}，未收敛")
-            self.converged = False
-
+        if self.verbose:
+            print(f"达到最大迭代次数 {self.max_iter}，未收敛")
         self.x = x
-        self.update_lf_info(x)
+        self._write_back()
         return -1
 
 def print_dc_result(calc: DCPowerFlowCalc) -> None:

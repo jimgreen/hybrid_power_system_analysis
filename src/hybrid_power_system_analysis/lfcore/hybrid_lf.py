@@ -1967,7 +1967,7 @@ class HybridPowerFlowCalc:
             self.dc_calc.x = dc_x
             self.dc_calc.converged = self.converged
             self.dc_calc.iterations = self.iterations
-            self.dc_calc._write_summary_result(dc_x)
+            self.dc_calc._write_summary_result()
             dc_result = self.dc_calc.result
         self.lf_result = {
             "ac": ac_result,
@@ -1992,7 +1992,7 @@ class HybridPowerFlowCalc:
             self.dc_calc.converged = self.converged
             self.dc_calc.iterations = self.iterations
             self.dc_calc.skip_lf_result = True
-            self.dc_calc.update_lf_info(dc_x)
+            self.dc_calc._write_back()
             dc_result = self.dc_calc.result
 
         dcac_result = np.zeros((self.N_dcac, 5), dtype=np.float64)
@@ -2159,7 +2159,7 @@ class HybridPowerFlowCalc:
             self.dc_calc.converged = self.converged
             if skip_lf_result:
                 self.dc_calc.skip_lf_result = True
-            self.dc_calc.update_lf_info(dc_x)
+            self.dc_calc._write_back()
             self._write_dc_ppc_result_to_network()
         ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
