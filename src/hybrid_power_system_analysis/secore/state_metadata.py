@@ -13,6 +13,9 @@ class StateMeta:
     terminal: str = ""
     component: str = ""
     legacy_label: str = ""
+    device_pos: int = -1
+    device_type_code: int = 0
+    meas_type_code: int = 0
 
 
 def state_labels_from_metadata(state_meta: Sequence[StateMeta]) -> List[str]:
@@ -50,4 +53,7 @@ def with_legacy_label(meta: StateMeta, legacy_label: str, side: Optional[str] = 
         terminal=meta.terminal,
         component=meta.component,
         legacy_label=legacy_label,
+        device_pos=meta.device_pos,
+        device_type_code=meta.device_type_code,
+        meas_type_code=meta.meas_type_code,
     )

@@ -132,12 +132,11 @@ class Measurement:
 
     @classmethod
     def read_from_file(cls, file_name: Path, scale_context=None):
-        # Import lazily to keep the model layer independent from estimator-specific scaling code.
-        from secore.ac_se import _read_measurements_direct
+        if scale_context is not None:
+            raise ValueError("scale_context normalization is handled by the SE estimator load path")
+        from model.meas_array_model import build_meas_ppc_from_e_file, copy_meas_ppc, measurement_list_from_meas_ppc
 
-        if scale_context is None:
-            return _read_measurements_direct(file_name, cls)
-        return _read_measurements_direct(file_name, cls, scale_context)
+        return measurement_list_from_meas_ppc(copy_meas_ppc(build_meas_ppc_from_e_file(file_name)))
 
 
 @dataclass
@@ -156,6 +155,7 @@ class MeasurementTable:
     rows_by_device_type_code: Optional[Dict[int, np.ndarray]] = None
     device_name_id: Optional[np.ndarray] = None
     meas_type_code: Optional[np.ndarray] = None
+    device_pos: Optional[np.ndarray] = None
 
 
 class MeasurementList(list):
@@ -165,6 +165,32 @@ class MeasurementList(list):
         super().__init__(measurements)
         self.table = table
         self.normalized = bool(normalized)
+
+
+class MeasurementTableView:
+    """Array-only measurement handle backed solely by a MeasurementTable."""
+
+    __slots__ = ("table", "normalized")
+
+    def __init__(self, table: MeasurementTable, normalized: bool = False):
+        self.table = table
+        self.normalized = bool(normalized)
+
+    def __len__(self) -> int:
+        table = self.table
+        return 0 if table is None else int(table.idx.size)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    def __iter__(self):
+        raise RuntimeError("MeasurementTableView is array-only; Measurement object iteration is disabled")
+
+    def __getitem__(self, _index):
+        raise RuntimeError("MeasurementTableView is array-only; Measurement object indexing is disabled")
+
+    def append(self, _measurement) -> None:
+        raise RuntimeError("MeasurementTableView is array-only; Measurement object append is disabled")
 
 
 def measurement_from_table_row(table: MeasurementTable, row: int) -> Measurement:
@@ -344,6 +370,7 @@ def measurement_table_from_measurements(
                 rows_by_device_type_code=None,
                 device_name_id=_concat_optional_int_field(table, tail_table, "device_name_id"),
                 meas_type_code=_concat_optional_int_field(table, tail_table, "meas_type_code"),
+                device_pos=_concat_optional_int_field(table, tail_table, "device_pos"),
             )
             try:
                 measurements.table = table
@@ -435,6 +462,8 @@ class EstimateResult:
     gain: Optional[np.ndarray]
     measurements: List[Measurement]
     observability: ObservabilityResult
+    measurement_plan_tables: Optional[object] = None
+    measurement_table: Optional[MeasurementTable] = None
 
 
 @dataclass
@@ -444,6 +473,7 @@ class BadDataItem:
     normalized_residual: float
     estimated_value: float
     measured_value: float
+    row_pos: int = -1
 
 
 def print_iteration_header() -> None:

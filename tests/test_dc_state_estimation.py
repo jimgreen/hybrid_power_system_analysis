@@ -1843,7 +1843,7 @@ class DCStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(0, code)
 
-    def test_run_summary_return_mode_limits_seresult_only(self):
+    def test_run_summary_result_mode_limits_seresult_only(self):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
@@ -1853,13 +1853,13 @@ class DCStateEstimationTest(unittest.TestCase):
         )
         self.assertFalse(estimator._prepared)
         estimator.prepare()
-        se_result = estimator.run(return_mode="summary", verbose=False, skip_bad_data=True)
+        se_result = estimator.run(result_mode="summary", verbose=False, skip_bad_data=True)
         result = estimator.estimate_result
 
         self.assertIs(se_result, estimator.se_result)
         self.assertTrue(result.converged)
         self.assertIs(estimator.observability_result, result.observability)
-        self.assertFalse(hasattr(result, "return_mode"))
+        self.assertFalse(hasattr(result, "result_mode"))
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
@@ -1869,7 +1869,7 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, len(se_result.bad_data))
         self.assertEqual(0, len(se_result.normal_measurements))
 
-    def test_run_array_return_mode_keeps_estimate_arrays_only(self):
+    def test_run_array_result_mode_keeps_estimate_arrays_only(self):
         import secore.dc_se as dc_se_module
         from secore.dc_se import DCStateEstimator
         from secore.se_result import SEResult
@@ -1887,16 +1887,16 @@ class DCStateEstimationTest(unittest.TestCase):
         original_apply_state = DCStateEstimator.apply_state
 
         def reject_seresult_path(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not build SEResult payloads")
+            raise AssertionError("array result_mode should not build SEResult payloads")
 
         def reject_bad_data(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not run post-estimation bad-data analysis")
+            raise AssertionError("array result_mode should not run post-estimation bad-data analysis")
 
         def reject_apply_state(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not write estimated state back to model objects")
+            raise AssertionError("array result_mode should not write estimated state back to model objects")
 
         def reject_full_tables(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not build full SEResult measurement tables")
+            raise AssertionError("array result_mode should not build full SEResult measurement tables")
 
         DCStateEstimator.build_se_result = reject_seresult_path
         dc_se_module.build_seresult_summary = reject_seresult_path
@@ -1904,7 +1904,7 @@ class DCStateEstimationTest(unittest.TestCase):
         DCStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
         try:
-            se_result = estimator.run(return_mode="array", verbose=False)
+            se_result = estimator.run(result_mode="array", verbose=False)
         finally:
             DCStateEstimator.build_se_result = original_build
             dc_se_module.build_seresult_summary = original_summary

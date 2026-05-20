@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -7,6 +8,7 @@ from model.meas_model import (
     Measurement,
     MeasurementList,
     MeasurementTable,
+    MeasurementTableView,
     TableBackedMeasurementList,
     MeasurementView,
     measurement_table_from_measurements,
@@ -17,7 +19,7 @@ from model.meas_model import (
 @dataclass(frozen=True)
 class ActiveMeasurementView:
     source_table: MeasurementTable
-    measurements: MeasurementList
+    measurements: object
     table: MeasurementTable
     source_rows: np.ndarray
     z: np.ndarray
@@ -59,6 +61,7 @@ def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) ->
         rows_by_device_type_code=None,
         device_name_id=_concat_optional_int_field(head, tail, "device_name_id"),
         meas_type_code=_concat_optional_int_field(head, tail, "meas_type_code"),
+        device_pos=_concat_optional_int_field(head, tail, "device_pos"),
     )
 
 
@@ -154,6 +157,7 @@ def measurement_table_take(
         rows_by_device_type_code=code_rows,
         device_name_id=_take_optional_int_field(table, row_idx, "device_name_id"),
         meas_type_code=_take_optional_int_field(table, row_idx, "meas_type_code"),
+        device_pos=_take_optional_int_field(table, row_idx, "device_pos"),
     )
 
 
@@ -212,6 +216,9 @@ def build_measurement_plan_table(
     *,
     device_pos_by_type_code: Mapping[int, Mapping[str, int]],
     meas_kind_by_type_code: Mapping[int, Mapping[str, int]],
+    device_pos_by_type_code_id: Optional[Mapping[int, np.ndarray]] = None,
+    meas_kind_code_by_type_code: Optional[Mapping[int, np.ndarray]] = None,
+    require_index_arrays: bool = False,
     table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
 ) -> MeasurementPlanTable:
     table = measurement_table_for(measurements, table_builder)
@@ -221,8 +228,18 @@ def build_measurement_plan_table(
         pass
     row = np.arange(len(table.idx), dtype=np.int64)
     device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
-    meas_kind = _cached_measurement_kind(table, meas_kind_by_type_code)
-    device_pos = _cached_measurement_device_pos(table, device_pos_by_type_code)
+    meas_kind = _cached_measurement_kind(
+        table,
+        meas_kind_by_type_code,
+        meas_kind_code_by_type_code=meas_kind_code_by_type_code,
+        require_index_arrays=require_index_arrays,
+    )
+    device_pos = _cached_measurement_device_pos(
+        table,
+        device_pos_by_type_code,
+        device_pos_by_type_code_id=device_pos_by_type_code_id,
+        require_index_arrays=require_index_arrays,
+    )
 
     return MeasurementPlanTable(
         table=table,
@@ -241,8 +258,21 @@ def _mapping_identity_key(mapping: Mapping[int, Mapping[str, int]]) -> Tuple[Tup
 def _cached_measurement_device_pos(
     table: MeasurementTable,
     device_pos_by_type_code: Mapping[int, Mapping[str, int]],
+    *,
+    device_pos_by_type_code_id: Optional[Mapping[int, np.ndarray]] = None,
+    require_index_arrays: bool = False,
 ) -> np.ndarray:
-    key = _mapping_identity_key(device_pos_by_type_code)
+    id_key = (
+        ()
+        if device_pos_by_type_code_id is None
+        else tuple(sorted((int(code), id(values)) for code, values in device_pos_by_type_code_id.items()))
+    )
+    key = (_mapping_identity_key(device_pos_by_type_code), id_key, bool(require_index_arrays))
+    precomputed = getattr(table, "device_pos", None)
+    if precomputed is not None:
+        precomputed = np.asarray(precomputed, dtype=np.int64)
+        if precomputed.size == table.idx.size:
+            return precomputed
     cache = getattr(table, "_device_pos_plan_cache", None)
     if cache is not None:
         cached = cache.get(key)
@@ -250,6 +280,41 @@ def _cached_measurement_device_pos(
             return cached
     device_pos = np.empty(table.idx.size, dtype=np.int64)
     device_pos.fill(-1)
+    device_name_id = getattr(table, "device_name_id", None)
+    if device_name_id is not None:
+        device_name_id = np.asarray(device_name_id, dtype=np.int64)
+        if device_name_id.size != table.idx.size:
+            device_name_id = None
+    if require_index_arrays:
+        if device_name_id is None or not device_pos_by_type_code_id:
+            warnings.warn(
+                "Measurement device position lookup requires device_name_id and indexed device maps; "
+                "string fallback is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            for code_int, code_rows in rows_by_device_type_code(table).items():
+                rows = np.asarray(code_rows, dtype=np.int64)
+                if rows.size == 0:
+                    continue
+                lookup = device_pos_by_type_code_id.get(int(code_int))
+                if lookup is None or lookup.size == 0:
+                    continue
+                ids = device_name_id[rows]
+                values = np.empty(rows.size, dtype=np.int64)
+                values.fill(-1)
+                in_range = (ids >= 0) & (ids < lookup.size)
+                if np.any(in_range):
+                    values[in_range] = lookup[ids[in_range].astype(np.intp, copy=False)]
+                device_pos[rows] = values
+        if cache is None:
+            cache = {}
+            setattr(table, "_device_pos_plan_cache", cache)
+        if len(cache) > 16:
+            cache.clear()
+        cache[key] = device_pos
+        return device_pos
     for code_int, code_rows in rows_by_device_type_code(table).items():
         rows = np.asarray(code_rows, dtype=np.int64)
         if rows.size == 0:
@@ -278,8 +343,16 @@ def _cached_measurement_device_pos(
 def _cached_measurement_kind(
     table: MeasurementTable,
     meas_kind_by_type_code: Mapping[int, Mapping[str, int]],
+    *,
+    meas_kind_code_by_type_code: Optional[Mapping[int, np.ndarray]] = None,
+    require_index_arrays: bool = False,
 ) -> np.ndarray:
-    key = _mapping_identity_key(meas_kind_by_type_code)
+    code_key = (
+        ()
+        if meas_kind_code_by_type_code is None
+        else tuple(sorted((int(code), id(values)) for code, values in meas_kind_code_by_type_code.items()))
+    )
+    key = (_mapping_identity_key(meas_kind_by_type_code), code_key, bool(require_index_arrays))
     cache = getattr(table, "_meas_kind_plan_cache", None)
     if cache is not None:
         cached = cache.get(key)
@@ -287,6 +360,40 @@ def _cached_measurement_kind(
             return cached
     meas_kind = np.empty(table.idx.size, dtype=np.int16)
     meas_kind.fill(-1)
+    meas_type_code = getattr(table, "meas_type_code", None)
+    if meas_type_code is not None:
+        meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
+        if meas_type_code.size != table.idx.size:
+            meas_type_code = None
+    if require_index_arrays:
+        if meas_type_code is None or not meas_kind_code_by_type_code:
+            warnings.warn(
+                "Measurement kind lookup requires meas_type_code and indexed kind maps; string fallback is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            for code_int, code_rows in rows_by_device_type_code(table).items():
+                rows = np.asarray(code_rows, dtype=np.int64)
+                if rows.size == 0:
+                    continue
+                lookup = meas_kind_code_by_type_code.get(int(code_int))
+                if lookup is None or lookup.size == 0:
+                    continue
+                codes = meas_type_code[rows].astype(np.int64, copy=False)
+                values = np.empty(rows.size, dtype=np.int16)
+                values.fill(-1)
+                in_range = (codes >= 0) & (codes < lookup.size)
+                if np.any(in_range):
+                    values[in_range] = lookup[codes[in_range].astype(np.intp, copy=False)]
+                meas_kind[rows] = values
+        if cache is None:
+            cache = {}
+            setattr(table, "_meas_kind_plan_cache", cache)
+        if len(cache) > 16:
+            cache.clear()
+        cache[key] = meas_kind
+        return meas_kind
     for code_int, code_rows in rows_by_device_type_code(table).items():
         rows = np.asarray(code_rows, dtype=np.int64)
         if rows.size == 0:
@@ -311,6 +418,8 @@ def _cached_measurement_kind(
 def build_active_measurement_view(
     measurements: Sequence[Measurement],
     table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
+    *,
+    materialize_measurements: bool = True,
 ) -> ActiveMeasurementView:
     table = measurement_table_for(measurements, table_builder)
     try:
@@ -322,19 +431,42 @@ def build_active_measurement_view(
     if all_active:
         source_rows = np.arange(active_mask.size, dtype=np.int64)
         active_table = table
-        if isinstance(measurements, MeasurementList):
-            active_measurements = measurements
-            active_measurements.table = active_table
-        else:
-            active_measurements = MeasurementList(
-                list(measurements),
+        if not materialize_measurements:
+            active_measurements = MeasurementTableView(
                 active_table,
                 normalized=getattr(measurements, "normalized", False),
             )
+        elif isinstance(measurements, MeasurementList):
+            active_measurements = measurements
+            active_measurements.table = active_table
+        else:
+            source_table = getattr(measurements, "table", None)
+            if source_table is not None and len(source_table.idx) == len(measurements):
+                active_measurements = TableBackedMeasurementList(
+                    active_table,
+                    normalized=getattr(measurements, "normalized", False),
+                )
+            else:
+                active_measurements = MeasurementList(
+                    list(measurements),
+                    active_table,
+                    normalized=getattr(measurements, "normalized", False),
+                )
     else:
         source_rows = np.flatnonzero(active_mask)
-        active_measurements = take_measurement_view(measurements, source_rows)
-        active_table = active_measurements.table
+        if materialize_measurements:
+            active_measurements = take_measurement_view(measurements, source_rows)
+            active_table = active_measurements.table
+        else:
+            rows_by_code = _slice_cached_rows_by_device_type_code(
+                getattr(table, "rows_by_device_type_code", None),
+                source_rows,
+            )
+            active_table = measurement_table_take(table, source_rows, rows_by_device_type_code=rows_by_code)
+            active_measurements = MeasurementTableView(
+                active_table,
+                normalized=getattr(measurements, "normalized", False),
+            )
     return ActiveMeasurementView(
         source_table=table,
         measurements=active_measurements,
@@ -354,6 +486,7 @@ def append_active_measurement_view(
     *,
     source_row_start: Optional[int] = None,
     table_builder: Optional[Callable[[Sequence[Measurement]], MeasurementTable]] = None,
+    materialize_measurements: bool = True,
 ) -> ActiveMeasurementView:
     if not additions:
         return view
@@ -367,10 +500,16 @@ def append_active_measurement_view(
     active_rows_in_additions = np.flatnonzero(active_mask)
     source_table = concat_measurement_tables(view.source_table, additions_table)
     if active_rows_in_additions.size == 0:
-        measurements = TableBackedMeasurementList(
-            view.table,
-            normalized=getattr(view.measurements, "normalized", False),
-        )
+        if materialize_measurements:
+            measurements = TableBackedMeasurementList(
+                view.table,
+                normalized=getattr(view.measurements, "normalized", False),
+            )
+        else:
+            measurements = MeasurementTableView(
+                view.table,
+                normalized=getattr(view.measurements, "normalized", False),
+            )
         return ActiveMeasurementView(
             source_table=source_table,
             measurements=measurements,
@@ -384,10 +523,16 @@ def append_active_measurement_view(
         )
     active_additions_table = measurement_table_take(additions_table, active_rows_in_additions)
     active_table = concat_measurement_tables(view.table, active_additions_table)
-    measurements = TableBackedMeasurementList(
-        active_table,
-        normalized=getattr(view.measurements, "normalized", False),
-    )
+    if materialize_measurements:
+        measurements = TableBackedMeasurementList(
+            active_table,
+            normalized=getattr(view.measurements, "normalized", False),
+        )
+    else:
+        measurements = MeasurementTableView(
+            active_table,
+            normalized=getattr(view.measurements, "normalized", False),
+        )
     source_rows = np.concatenate((view.source_rows, source_start + active_rows_in_additions.astype(np.int64, copy=False)))
     return ActiveMeasurementView(
         source_table=source_table,

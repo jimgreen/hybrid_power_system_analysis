@@ -13,6 +13,7 @@ from scipy.sparse import coo_matrix as SP_COO_MATRIX
 from scipy.sparse import csc_matrix as SP_CSC_MATRIX
 from scipy.sparse import csr_matrix as SP_CSR_MATRIX
 from scipy.sparse import issparse as SP_ISSPARSE
+from scipy.sparse.csgraph import connected_components as SP_CONNECTED_COMPONENTS
 from scipy.sparse.csgraph import structural_rank as SP_STRUCTURAL_RANK
 from scipy.sparse.linalg import MatrixRankWarning as SP_MATRIX_RANK_WARNING
 from scipy.sparse.linalg import eigsh as SP_EIGSH
@@ -31,6 +32,7 @@ ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF
 _NORMAL_EQUATION_PATTERN_CACHE = {}
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
 _SPARSE_PATTERN_LINEAR_INDEX_CACHE = {}
+_SPARSE_CSR_ROW_INDEX_CACHE = {}
 _MAX_DIRECT_NORMAL_ASSEMBLY_PAIRS = 2_000_000
 
 def targeted_redundancy_count(state_count: int, ratio: float) -> int:
@@ -162,6 +164,9 @@ class SparseJacobianBuilder:
         self._cached_duplicate_data_positions: Optional[np.ndarray] = None
         self._cached_chunk_slices: Optional[List[Tuple[int, int]]] = None
         self._cached_chunk_slot_plans: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+        self._cached_direct_chunk_slots: Optional[List[Optional[np.ndarray]]] = None
+        self._cached_duplicate_dest_slots: Optional[np.ndarray] = None
+        self._cached_slots_cover_pattern = False
         self._cached_has_unique_slots = False
         self._cached_has_duplicate_slots = False
         self._cached_csr_data: Optional[np.ndarray] = None
@@ -173,6 +178,7 @@ class SparseJacobianBuilder:
         self._cached_slot_positions = slot
         self._cached_chunk_slices = self._current_chunk_slices()
         self._cached_chunk_slot_plans = []
+        self._cached_direct_chunk_slots = []
         if slot.size == 0:
             self._cached_unique_slot_mask = np.array([], dtype=bool)
             self._cached_duplicate_slot_mask = np.array([], dtype=bool)
@@ -180,6 +186,8 @@ class SparseJacobianBuilder:
             self._cached_unique_data_positions = np.array([], dtype=np.int64)
             self._cached_duplicate_slots = np.array([], dtype=np.int64)
             self._cached_duplicate_data_positions = np.array([], dtype=np.int64)
+            self._cached_duplicate_dest_slots = np.array([], dtype=np.int64)
+            self._cached_slots_cover_pattern = self._cached_pattern_linear is not None and self._cached_pattern_linear.size == 0
             self._cached_has_unique_slots = False
             self._cached_has_duplicate_slots = False
             return
@@ -203,10 +211,16 @@ class SparseJacobianBuilder:
         else:
             self._cached_duplicate_data_positions = np.array([], dtype=np.int64)
             self._cached_duplicate_slots = np.array([], dtype=np.int64)
+        self._cached_duplicate_dest_slots = np.unique(self._cached_duplicate_slots).astype(np.int64, copy=False)
+        self._cached_slots_cover_pattern = (
+            self._cached_pattern_linear is not None
+            and np.count_nonzero(counts) == int(self._cached_pattern_linear.size)
+        )
         for start, end in self._cached_chunk_slices:
             if start == end:
                 empty = np.array([], dtype=np.int64)
                 self._cached_chunk_slot_plans.append((empty, empty, empty, empty))
+                self._cached_direct_chunk_slots.append(empty)
                 continue
             chunk_unique_mask = self._cached_unique_slot_mask[start:end]
             unique_pos = np.nonzero(chunk_unique_mask)[0].astype(np.int64, copy=False)
@@ -215,6 +229,10 @@ class SparseJacobianBuilder:
             unique_slots = chunk_slots[unique_pos].astype(np.int64, copy=False)
             duplicate_slots = chunk_slots[duplicate_pos].astype(np.int64, copy=False)
             self._cached_chunk_slot_plans.append((unique_pos, unique_slots, duplicate_pos, duplicate_slots))
+            if duplicate_pos.size == 0 and unique_pos.size == chunk_slots.size:
+                self._cached_direct_chunk_slots.append(chunk_slots.astype(np.int64, copy=False))
+            else:
+                self._cached_direct_chunk_slots.append(None)
 
     def _current_chunk_slices(self) -> List[Tuple[int, int]]:
         slices: List[Tuple[int, int]] = []
@@ -314,8 +332,13 @@ class SparseJacobianBuilder:
         return out_data[:total_count]
 
     def _refresh_fixed_pattern_values(self, values: np.ndarray) -> None:
-        values.fill(0.0)
         scalar_count = len(self.data)
+        if scalar_count or not self._cached_slots_cover_pattern:
+            values.fill(0.0)
+        else:
+            duplicate_dest_slots = self._cached_duplicate_dest_slots
+            if duplicate_dest_slots is not None and duplicate_dest_slots.size:
+                values[duplicate_dest_slots] = 0.0
         if scalar_count:
             scalar_values = np.asarray(self.data, dtype=np.float64)
             np.add.at(values, self._cached_slot_positions[:scalar_count], scalar_values)
@@ -333,6 +356,22 @@ class SparseJacobianBuilder:
                 np.add.at(values, self._cached_duplicate_slots, data[self._cached_duplicate_data_positions])
             return
         if chunk_slot_plans is not None and len(chunk_slot_plans) == len(self._data_chunks):
+            direct_chunk_slots = self._cached_direct_chunk_slots
+            if direct_chunk_slots is not None and len(direct_chunk_slots) == len(self._data_chunks):
+                for chunk, direct_slots, (unique_pos, unique_slots, duplicate_pos, duplicate_slots) in zip(
+                    self._data_chunks,
+                    direct_chunk_slots,
+                    chunk_slot_plans,
+                ):
+                    if direct_slots is not None:
+                        if direct_slots.size:
+                            values[direct_slots] = chunk
+                        continue
+                    if unique_pos.size:
+                        values[unique_slots] = chunk[unique_pos]
+                    if duplicate_pos.size:
+                        np.add.at(values, duplicate_slots, chunk[duplicate_pos])
+                return
             for chunk, (unique_pos, unique_slots, duplicate_pos, duplicate_slots) in zip(
                 self._data_chunks,
                 chunk_slot_plans,
@@ -561,6 +600,36 @@ def _expand_sparse_matrix_to_pattern(matrix, pattern):
     data = np.zeros(int(pattern_csc.nnz), dtype=np.float64)
     data[target_positions] = matrix_csc.data
     return SP_CSC_MATRIX((data, pattern_csc.indices, pattern_csc.indptr), shape=pattern_csc.shape, copy=False)
+
+
+def _csr_row_index_for_data(matrix_csr) -> np.ndarray:
+    """Return the row index for every CSR data slot, cached by row pointer pattern."""
+    indptr = matrix_csr.indptr
+    digest = hashlib.blake2b(indptr.tobytes(), digest_size=16).digest()
+    key = (matrix_csr.shape[0], int(matrix_csr.nnz), digest)
+    cached = _SPARSE_CSR_ROW_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    counts = np.diff(indptr).astype(np.intp, copy=False)
+    row_index = np.repeat(np.arange(matrix_csr.shape[0], dtype=np.intp), counts)
+    if len(_SPARSE_CSR_ROW_INDEX_CACHE) > 16:
+        _SPARSE_CSR_ROW_INDEX_CACHE.clear()
+    _SPARSE_CSR_ROW_INDEX_CACHE[key] = row_index
+    return row_index
+
+
+def _row_weighted_sparse_matrix(matrix, weight: np.ndarray):
+    """Return W*H with the same CSR structure, avoiding scipy's broadcast multiply path."""
+    matrix_csr = matrix if getattr(matrix, "format", None) == "csr" else matrix.tocsr()
+    weight = np.asarray(weight, dtype=np.float64)
+    row_index = _csr_row_index_for_data(matrix_csr)
+    weighted_data = np.empty(int(matrix_csr.nnz), dtype=np.float64)
+    np.multiply(matrix_csr.data, weight[row_index], out=weighted_data)
+    return SP_CSR_MATRIX(
+        (weighted_data, matrix_csr.indices, matrix_csr.indptr),
+        shape=matrix_csr.shape,
+        copy=False,
+    )
 
 
 class NormalEquationAssemblyPlan:
@@ -920,13 +989,59 @@ def unanchored_angle_state_indices(
     angle_cols = [int(idx) for idx in angle_cols]
     if not angle_cols:
         return []
+    angle_cols_array = np.asarray(angle_cols, dtype=np.int64)
 
     if is_sparse_matrix(H):
         sub = H[:, angle_cols].tocsr()
+        nnz_by_row = np.diff(sub.indptr)
+        active_rows = np.flatnonzero(nnz_by_row).astype(np.int64, copy=False)
         degree = np.bincount(sub.indices, minlength=len(angle_cols)) if sub.indices.size else np.zeros(len(angle_cols), dtype=np.int64)
+        n = len(angle_cols)
+        if sub.indices.size:
+            positions = np.arange(sub.indices.size, dtype=np.int64)
+            entry_rows = np.repeat(np.arange(sub.shape[0], dtype=np.int64), nnz_by_row)
+            row_start_for_entry = sub.indptr[entry_rows]
+            nonfirst = positions > row_start_for_entry
+            if np.any(nonfirst):
+                left = sub.indices[row_start_for_entry[nonfirst]]
+                right = sub.indices[positions[nonfirst]]
+                graph = SP_COO_MATRIX(
+                    (
+                        np.ones(left.size * 2, dtype=np.int8),
+                        (np.concatenate((left, right)), np.concatenate((right, left))),
+                    ),
+                    shape=(n, n),
+                ).tocsr()
+            else:
+                graph = SP_CSR_MATRIX((n, n), dtype=np.int8)
+            n_components, labels = SP_CONNECTED_COMPONENTS(graph, directed=False, return_labels=True)
+            anchored = np.zeros(int(n_components), dtype=bool)
+            if active_rows.size:
+                starts = sub.indptr[active_rows]
+                row_sums = np.add.reduceat(sub.data, starts)
+                anchor_rows = np.abs(row_sums) > tol
+                if np.any(anchor_rows):
+                    first_cols = sub.indices[starts]
+                    anchored[labels[first_cols[anchor_rows]]] = True
+        else:
+            n_components = n
+            labels = np.arange(n, dtype=np.int32)
+            anchored = np.zeros(n, dtype=bool)
+        state_indices = []
+        for component in np.flatnonzero(~anchored).tolist():
+            local_cols = np.flatnonzero(labels == int(component))
+            if local_cols.size == 0:
+                continue
+            local_degree = degree[local_cols]
+            best = local_cols[local_degree == int(np.max(local_degree))]
+            representative = int(best[np.argmin(angle_cols_array[best])])
+            state_indices.append((int(local_cols.size), int(angle_cols_array[representative])))
+        state_indices.sort(key=lambda item: (-item[0], item[1]))
+        return [idx for _size, idx in state_indices]
     else:
         matrix = np.asarray(H)
         sub = matrix[:, angle_cols]
+        active_rows = None
         degree = np.count_nonzero(np.abs(sub) > tol, axis=0)
 
     n = len(angle_cols)
@@ -947,32 +1062,17 @@ def unanchored_angle_state_indices(
             anchored[root_l] = anchored[root_l] or anchored[root_r]
         return root_l
 
-    if is_sparse_matrix(sub):
-        for row in range(sub.shape[0]):
-            start = int(sub.indptr[row])
-            end = int(sub.indptr[row + 1])
-            if start == end:
-                continue
-            cols = sub.indices[start:end]
-            vals = sub.data[start:end]
-            root = int(cols[0])
-            for col in cols[1:]:
-                root = union(root, int(col))
-            root = find(root)
-            if abs(float(np.sum(vals))) > tol:
-                anchored[root] = True
-    else:
-        for row in range(sub.shape[0]):
-            vals = sub[row, :]
-            cols = np.flatnonzero(np.abs(vals) > tol)
-            if cols.size == 0:
-                continue
-            root = int(cols[0])
-            for col in cols[1:]:
-                root = union(root, int(col))
-            root = find(root)
-            if abs(float(np.sum(vals[cols]))) > tol:
-                anchored[root] = True
+    for row in range(sub.shape[0]):
+        vals = sub[row, :]
+        cols = np.flatnonzero(np.abs(vals) > tol)
+        if cols.size == 0:
+            continue
+        root = int(cols[0])
+        for col in cols[1:]:
+            root = union(root, int(col))
+        root = find(root)
+        if abs(float(np.sum(vals[cols]))) > tol:
+            anchored[root] = True
 
     components = {}
     for local_col in range(n):
@@ -1158,7 +1258,7 @@ def build_normal_equations(
                 rhs = uniform_weight * rhs
         elif weights_are_uniform is False:
             weighted_residual = weight * residual if weighted_residual is None else weighted_residual
-            weighted_H = H.multiply(weight[:, None])
+            weighted_H = _row_weighted_sparse_matrix(H, weight)
             gain = H.T @ weighted_H
             rhs = H.T @ weighted_residual
         else:
@@ -1171,7 +1271,7 @@ def build_normal_equations(
                     rhs = first_weight * rhs
             else:
                 weighted_residual = weight * residual if weighted_residual is None else weighted_residual
-                weighted_H = H.multiply(weight[:, None])
+                weighted_H = _row_weighted_sparse_matrix(H, weight)
                 gain = H.T @ weighted_H
                 rhs = H.T @ weighted_residual
         if is_sparse_matrix(gain):

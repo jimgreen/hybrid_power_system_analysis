@@ -13,6 +13,9 @@ class StateMetadataTest(unittest.TestCase):
             terminal="from",
             component="magnitude",
             legacy_label="old",
+            device_pos=3,
+            device_type_code=1,
+            meas_type_code=1,
         )
 
         updated = with_legacy_label(source, "new", side="hybrid")
@@ -24,6 +27,9 @@ class StateMetadataTest(unittest.TestCase):
         self.assertEqual("from", updated.terminal)
         self.assertEqual("magnitude", updated.component)
         self.assertEqual("new", updated.legacy_label)
+        self.assertEqual(3, updated.device_pos)
+        self.assertEqual(1, updated.device_type_code)
+        self.assertEqual(1, updated.meas_type_code)
         self.assertEqual("ac", source.side)
         self.assertEqual("old", source.legacy_label)
 

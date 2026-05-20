@@ -3797,7 +3797,7 @@ class HybridStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(0, code)
 
-    def test_run_summary_return_mode_limits_hybrid_seresult_only(self):
+    def test_run_summary_result_mode_limits_hybrid_seresult_only(self):
         from secore.hybrid_se import HybridStateEstimator
 
         estimator = HybridStateEstimator(
@@ -3809,7 +3809,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertFalse(estimator._prepared)
         estimator.prepare()
         se_result = estimator.run(
-            return_mode="summary",
+            result_mode="summary",
             verbose=False,
             skip_bad_data=True,
             final_diagnostics=False,
@@ -3819,7 +3819,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertIs(se_result, estimator.se_result)
         self.assertTrue(result.converged)
         self.assertIs(estimator.observability_result, result.observability)
-        self.assertFalse(hasattr(result, "return_mode"))
+        self.assertFalse(hasattr(result, "result_mode"))
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
@@ -3829,7 +3829,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, len(se_result.bad_data))
         self.assertEqual(0, len(se_result.normal_measurements))
 
-    def test_run_array_return_mode_keeps_estimate_arrays_only(self):
+    def test_run_array_result_mode_keeps_estimate_arrays_only(self):
         import secore.hybrid_se as hybrid_se_module
         from secore.hybrid_se import HybridStateEstimator
         from secore.se_result import SEResult
@@ -3847,13 +3847,13 @@ class HybridStateEstimationTest(unittest.TestCase):
         original_from_estimate = SEResult.from_estimate_result
 
         def reject_seresult_path(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not build SEResult payloads")
+            raise AssertionError("array result_mode should not build SEResult payloads")
 
         def reject_bad_data(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not run post-estimation bad-data analysis")
+            raise AssertionError("array result_mode should not run post-estimation bad-data analysis")
 
         def reject_full_tables(*_args, **_kwargs):
-            raise AssertionError("array return_mode should not build full SEResult measurement tables")
+            raise AssertionError("array result_mode should not build full SEResult measurement tables")
 
         HybridStateEstimator.build_se_result = reject_seresult_path
         hybrid_se_module.build_seresult_summary = reject_seresult_path
@@ -3861,7 +3861,7 @@ class HybridStateEstimationTest(unittest.TestCase):
         SEResult.from_estimate_result = reject_full_tables
         try:
             se_result = estimator.run(
-                return_mode="array",
+                result_mode="array",
                 verbose=False,
             )
         finally:

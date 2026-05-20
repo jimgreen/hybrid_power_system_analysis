@@ -47,7 +47,7 @@ def run_case(
         )
         estimator.prepare()
         estimator.run(
-            return_mode="none",
+            result_mode="none",
             skip_bad_data=skip_bad_data,
             verbose=False,
             final_diagnostics=not skip_bad_data,

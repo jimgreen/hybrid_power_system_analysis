@@ -7,8 +7,8 @@ import numpy as np
 from model.meas_model import BadDataItem, EstimateResult, Measurement, is_pseudo_measurement
 
 
-def normalize_seresult_return_mode(return_mode: str) -> str:
-    mode = str(return_mode or "full").strip().lower()
+def normalize_seresult_result_mode(result_mode: str) -> str:
+    mode = str(result_mode or "full").strip().lower()
     aliases = {
         "all": "full",
         "full": "full",
@@ -24,7 +24,7 @@ def normalize_seresult_return_mode(return_mode: str) -> str:
         "raw": "none",
     }
     if mode not in aliases:
-        raise ValueError(f"Unsupported SEResult return_mode: {return_mode!r}")
+        raise ValueError(f"Unsupported SEResult result_mode: {result_mode!r}")
     return aliases[mode]
 
 

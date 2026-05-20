@@ -95,11 +95,11 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         self.assertTrue(estimator._prepared)
 
     def test_ac_load_network_returns_ppc_namespace_without_object_topology(self):
-        import secore.ac_se as ac_se
+        from model import topology as network_topology
         from secore.ac_se import ACStateEstimator
 
-        original_apply_topology = ac_se.network_topology.apply_ac_topology_arrays
-        original_prepare_topology = ac_se.network_topology.prepare_ac_topology
+        original_apply_topology = network_topology.apply_ac_topology_arrays
+        original_prepare_topology = network_topology.prepare_ac_topology
 
         def reject_array_object_topology(*_args, **_kwargs):
             raise AssertionError("AC SE PPC namespace load should not materialize object topology")
@@ -107,16 +107,16 @@ class StateEstimatorPrepareTest(unittest.TestCase):
         def reject_object_topology(*_args, **_kwargs):
             raise AssertionError("AC SE load should not rerun object topology")
 
-        ac_se.network_topology.apply_ac_topology_arrays = reject_array_object_topology
-        ac_se.network_topology.prepare_ac_topology = reject_object_topology
+        network_topology.apply_ac_topology_arrays = reject_array_object_topology
+        network_topology.prepare_ac_topology = reject_object_topology
         try:
             loader = ACStateEstimator.__new__(ACStateEstimator)
             network = loader._load_network(
                 Path(__file__).resolve().parents[1] / "data" / "model" / "ac" / "ieee39.e"
             )
         finally:
-            ac_se.network_topology.apply_ac_topology_arrays = original_apply_topology
-            ac_se.network_topology.prepare_ac_topology = original_prepare_topology
+            network_topology.apply_ac_topology_arrays = original_apply_topology
+            network_topology.prepare_ac_topology = original_prepare_topology
 
         self.assertEqual("ac_ppc_v1", network.ppc["format"])
         self.assertIs(network.topology, network.ppc["_topology_arrays"])

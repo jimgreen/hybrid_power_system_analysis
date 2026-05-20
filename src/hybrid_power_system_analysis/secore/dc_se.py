@@ -90,7 +90,7 @@ from secore.se_array_plan import (
     concat_measurement_tables,
     take_measurement_view,
 )
-from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_return_mode
+from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_result_mode
 from unit_system import dc_current_base_ka
 
 
@@ -4414,10 +4414,10 @@ class DCStateEstimator:
         bad_items: Optional[Sequence[BadDataItem]] = None,
         normalized_residual: Optional[Sequence[float]] = None,
         threshold: Optional[float] = None,
-        return_mode: str = "full",
+        result_mode: str = "full",
     ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
-        mode = normalize_seresult_return_mode(return_mode)
+        mode = normalize_seresult_result_mode(result_mode)
         if mode in ("none", "array"):
             self.se_result = None
             return None
@@ -4445,7 +4445,7 @@ class DCStateEstimator:
     def run(
         self,
         *,
-        return_mode: str = "full",
+        result_mode: str = "full",
         remove_bad_data: bool = False,
         bad_threshold: Optional[float] = None,
         max_remove: Optional[int] = None,
@@ -4454,11 +4454,11 @@ class DCStateEstimator:
         observability: Optional[ObservabilityResult] = None,
     ) -> Optional[SEResult]:
         self._require_prepared("run()")
-        mode = normalize_seresult_return_mode(return_mode)
+        mode = normalize_seresult_result_mode(result_mode)
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
         array_only = mode == "array"
         if array_only and remove_bad_data:
-            raise ValueError("return_mode='array' cannot be combined with remove_bad_data=True")
+            raise ValueError("result_mode='array' cannot be combined with remove_bad_data=True")
         needs_bad_data = (not skip_bad_data) and not array_only
         if observability is None:
             observability = self.observability_analysis()
@@ -4497,7 +4497,7 @@ class DCStateEstimator:
             result,
             bad_items=bad_items,
             normalized_residual=normalized,
-            return_mode=mode,
+            result_mode=mode,
         )
 
     def estimate_with_bad_data_removal(
@@ -4709,7 +4709,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated DC states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
-    parser.add_argument("--return-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
+    parser.add_argument("--result-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
@@ -4728,7 +4728,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
     se_result = estimator.run(
-        return_mode=args.return_mode if args.se_result else "none",
+        result_mode=args.result_mode if args.se_result else "none",
         remove_bad_data=args.remove_bad_data,
         bad_threshold=bad_threshold,
         max_remove=args.max_remove,

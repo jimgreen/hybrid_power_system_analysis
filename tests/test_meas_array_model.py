@@ -66,30 +66,27 @@ class MeasurementArrayModelTest(unittest.TestCase):
             np.array([0], dtype=np.int64),
         )
 
-    def test_build_meas_ppc_matches_existing_parser_for_ieee39_core_columns(self):
-        from model.meas_array_model import MEAS_COLS, build_meas_ppc_from_e_file
-        from model.meas_model import Measurement
-        from secore.ac_se import _read_measurements_direct
+    def test_build_meas_ppc_populates_ieee39_core_table_columns(self):
+        from model.meas_array_model import MEAS_COLS, build_meas_ppc_from_e_file, measurement_table_from_meas_ppc
 
         meas_file = ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas"
         ppc = build_meas_ppc_from_e_file(meas_file)
-        old_measurements = _read_measurements_direct(meas_file, Measurement, table_only=True)
-        old_table = old_measurements.table
+        table = measurement_table_from_meas_ppc(ppc)
 
-        self.assertEqual(old_table.idx.size, ppc["meas"].shape[0])
-        np.testing.assert_array_equal(ppc["meas"][:, MEAS_COLS["idx"]].astype(np.int64), old_table.idx)
-        np.testing.assert_array_equal(ppc["name"], old_table.name)
-        np.testing.assert_array_equal(ppc["device_name"], old_table.device_name)
-        np.testing.assert_array_equal(ppc["device_type"], old_table.device_type)
-        np.testing.assert_array_equal(ppc["meas_type"], old_table.meas_type)
-        np.testing.assert_allclose(ppc["meas"][:, MEAS_COLS["weight"]], old_table.weight)
-        np.testing.assert_array_equal(ppc["meas"][:, MEAS_COLS["valid"]].astype(bool), old_table.valid)
-        np.testing.assert_allclose(ppc["meas"][:, MEAS_COLS["value"]], old_table.value)
+        self.assertEqual(table.idx.size, ppc["meas"].shape[0])
+        np.testing.assert_array_equal(ppc["meas"][:, MEAS_COLS["idx"]].astype(np.int64), table.idx)
+        np.testing.assert_array_equal(ppc["name"], table.name)
+        np.testing.assert_array_equal(ppc["device_name"], table.device_name)
+        np.testing.assert_array_equal(ppc["device_type"], table.device_type)
+        np.testing.assert_array_equal(ppc["meas_type"], table.meas_type)
+        np.testing.assert_allclose(ppc["meas"][:, MEAS_COLS["weight"]], table.weight)
+        np.testing.assert_array_equal(ppc["meas"][:, MEAS_COLS["valid"]].astype(bool), table.valid)
+        np.testing.assert_allclose(ppc["meas"][:, MEAS_COLS["value"]], table.value)
         np.testing.assert_array_equal(
             ppc["meas"][:, MEAS_COLS["device_type_code"]].astype(np.int16),
-            old_table.device_type_code,
+            table.device_type_code,
         )
-        np.testing.assert_array_equal(ppc["meas"][:, MEAS_COLS["angle_mask"]].astype(bool), old_table.angle_mask)
+        np.testing.assert_array_equal(ppc["meas"][:, MEAS_COLS["angle_mask"]].astype(bool), table.angle_mask)
 
     def test_standard_parser_reuses_repeated_device_name_strings(self):
         from model.meas_array_model import build_meas_ppc_from_e_file
@@ -113,6 +110,29 @@ class MeasurementArrayModelTest(unittest.TestCase):
             ppc = build_meas_ppc_from_e_file(meas_file)
 
         self.assertIs(ppc["device_name"][0], ppc["device_name"][1])
+
+    def test_build_meas_ppc_from_efile_rows_accepts_variable_width_rows(self):
+        from model.meas_array_model import MEAS_COLS, MEAS_TYPE_CODES, build_meas_ppc_from_efile_rows
+
+        rows = {
+            "Measurement": {
+                "header_list": ["idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value"],
+                "rows": [
+                    ["1", "p1", "ACLoad", "load_1", "P_LOAD", "1.0", "1", "2.0"],
+                    ["2", "q1", "ACLoad", "load_1", "Q_LOAD", "1.0", "1", "1.0", "ignored_extra"],
+                ],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ppc = build_meas_ppc_from_efile_rows(Path(tmp_dir) / "case.meas", rows)
+
+        self.assertEqual((2, len(MEAS_COLS)), ppc["meas"].shape)
+        np.testing.assert_array_equal(
+            ppc["meas"][:, MEAS_COLS["meas_type_code"]],
+            np.array([MEAS_TYPE_CODES["P_LOAD"], MEAS_TYPE_CODES["Q_LOAD"]], dtype=np.float64),
+        )
+        np.testing.assert_allclose(ppc["meas"][:, MEAS_COLS["value"]], np.array([2.0, 1.0]))
 
 
 if __name__ == "__main__":
