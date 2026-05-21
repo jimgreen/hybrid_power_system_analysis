@@ -48,10 +48,10 @@ class MeasurementPlanTable:
 def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) -> MeasurementTable:
     return MeasurementTable(
         idx=np.concatenate((head.idx, tail.idx)),
-        name=np.concatenate((head.name, tail.name)),
-        device_type=np.concatenate((head.device_type, tail.device_type)),
-        device_name=np.concatenate((head.device_name, tail.device_name)),
-        meas_type=np.concatenate((head.meas_type, tail.meas_type)),
+        name=_concat_optional_object_field(head, tail, "name"),
+        device_type=_concat_optional_object_field(head, tail, "device_type"),
+        device_name=_concat_optional_object_field(head, tail, "device_name"),
+        meas_type=_concat_optional_object_field(head, tail, "meas_type"),
         weight=np.concatenate((head.weight, tail.weight)),
         valid=np.concatenate((head.valid, tail.valid)),
         value=np.concatenate((head.value, tail.value)),
@@ -63,6 +63,14 @@ def concat_measurement_tables(head: MeasurementTable, tail: MeasurementTable) ->
         meas_type_code=_concat_optional_int_field(head, tail, "meas_type_code"),
         device_pos=_concat_optional_int_field(head, tail, "device_pos"),
     )
+
+
+def _concat_optional_object_field(head: MeasurementTable, tail: MeasurementTable, field_name: str) -> np.ndarray:
+    head_values = np.asarray(getattr(head, field_name), dtype=object)
+    tail_values = np.asarray(getattr(tail, field_name), dtype=object)
+    if head_values.size != head.idx.size or tail_values.size != tail.idx.size:
+        return np.asarray([], dtype=object)
+    return np.concatenate((head_values, tail_values))
 
 
 def _concat_optional_int_field(head: MeasurementTable, tail: MeasurementTable, field_name: str):
@@ -88,6 +96,13 @@ def _take_optional_int_field(table: MeasurementTable, row_idx: np.ndarray, field
     values = np.asarray(values)
     if values.size != table.idx.size:
         return None
+    return values[row_idx]
+
+
+def _take_optional_object_field(table: MeasurementTable, row_idx: np.ndarray, field_name: str) -> np.ndarray:
+    values = np.asarray(getattr(table, field_name), dtype=object)
+    if values.size != table.idx.size:
+        return np.asarray([], dtype=object)
     return values[row_idx]
 
 
@@ -144,10 +159,10 @@ def measurement_table_take(
     )
     return MeasurementTable(
         idx=table.idx[row_idx],
-        name=table.name[row_idx],
-        device_type=table.device_type[row_idx],
-        device_name=table.device_name[row_idx],
-        meas_type=table.meas_type[row_idx],
+        name=_take_optional_object_field(table, row_idx, "name"),
+        device_type=_take_optional_object_field(table, row_idx, "device_type"),
+        device_name=_take_optional_object_field(table, row_idx, "device_name"),
+        meas_type=_take_optional_object_field(table, row_idx, "meas_type"),
         weight=table.weight[row_idx],
         valid=table.valid[row_idx],
         value=table.value[row_idx],

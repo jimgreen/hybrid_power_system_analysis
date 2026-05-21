@@ -954,7 +954,11 @@ class ACStateEstimationTest(unittest.TestCase):
             setattr(estimator, attr, RejectDeviceMap())
 
         candidates = estimator._observability_pseudo_candidate_measurements()
-        candidate_keys = {(meas.device_type, meas.device_name, meas.meas_type) for meas in candidates}
+        table = candidates.table
+        candidate_keys = {
+            (str(table.device_type[row]), str(table.device_name[row]), str(table.meas_type[row]))
+            for row in range(int(table.idx.size))
+        }
 
         self.assertIn(("ACNode", "bus_1", "V"), candidate_keys)
         self.assertIn(("ACLoad", "load_1", "P_LOAD"), candidate_keys)
@@ -964,6 +968,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
     def test_observability_pseudo_candidates_are_table_backed(self):
         from model.meas_model import MEAS_STATUS_PSEUDO
+        from model.meas_model import MeasurementTableView
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -976,12 +981,15 @@ class ACStateEstimationTest(unittest.TestCase):
 
         candidates = estimator._observability_pseudo_candidate_measurements()
 
+        self.assertIsInstance(candidates, MeasurementTableView)
         table = getattr(candidates, "table", None)
         self.assertIsNotNone(table)
         self.assertEqual(len(candidates), table.idx.size)
         self.assertTrue(np.all(table.valid))
         self.assertTrue(np.all(table.status_code == MEAS_STATUS_PSEUDO))
         self.assertIsNotNone(table.meas_type_code)
+        with self.assertRaisesRegex(RuntimeError, "array-only"):
+            list(candidates)
 
     def test_observability_pseudo_candidates_pass_integer_codes_to_table_builder(self):
         import secore.ac_se as ac_se
@@ -2628,6 +2636,7 @@ class ACStateEstimationTest(unittest.TestCase):
             "_complex_array",
             "_refresh_load_parameter_arrays",
             "_generator_shares",
+            "_build_measurement_device_indexes",
         ):
             self.assertFalse(hasattr(ACStateEstimator, name), name)
 
@@ -3516,9 +3525,11 @@ class ACStateEstimationTest(unittest.TestCase):
                 prepare_active_measurements=False,
             )
 
+        candidates = estimator._observability_pseudo_candidate_measurements()
+        table = candidates.table
         keys = {
-            (meas.device_type, meas.meas_type)
-            for meas in estimator._observability_pseudo_candidate_measurements()
+            (str(table.device_type[row]), str(table.meas_type[row]))
+            for row in range(int(table.idx.size))
         }
 
         self.assertIn(("ACLoad", "V_LOAD"), keys)
@@ -5948,7 +5959,8 @@ class ACStateEstimationTest(unittest.TestCase):
 
     def test_incremental_updater_reuses_shared_se_array_plan_helpers(self):
         import secore.ac_se as ac_se
-        from secore.ac_se import ACStateEstimator, Measurement
+        from model.meas_model import MeasurementTableView
+        from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
@@ -5957,8 +5969,21 @@ class ACStateEstimationTest(unittest.TestCase):
             prepare_active_measurements=False,
         )
         estimator._refresh_active_measurement_indexes()
-        additions = [Measurement(500000, "ac_v2", "ACNode", "bus_2", "V", 5.0, True, 1.01)]
-        estimator.measurements.extend(additions)
+        additions = MeasurementTableView(
+            estimator._pseudo_measurement_table(
+                ["ac_v2"],
+                ["ACNode"],
+                ["bus_2"],
+                ["V"],
+                [1.01],
+                5.0,
+                idx_start=500000,
+                device_type_codes=[ac_se.DEVICE_TYPE_CODES_ACNODE],
+                meas_type_codes=[ac_se.MEAS_TYPE_CODES_V],
+                device_positions=[1],
+            ),
+            normalized=True,
+        )
         calls = {"active": 0}
         original_active = ac_se.append_active_measurement_view
 
@@ -5976,7 +6001,9 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(1, calls["active"])
 
     def test_incremental_updater_reuses_existing_active_measurement_plans(self):
-        from secore.ac_se import ACStateEstimator, Measurement
+        import secore.ac_se as ac_se
+        from model.meas_model import MeasurementTableView
+        from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
@@ -5985,8 +6012,21 @@ class ACStateEstimationTest(unittest.TestCase):
             prepare_active_measurements=False,
         )
         estimator._refresh_active_measurement_indexes()
-        additions = [Measurement(500001, "ac_v3", "ACNode", "bus_2", "V", 5.0, True, 1.02)]
-        estimator.measurements.extend(additions)
+        additions = MeasurementTableView(
+            estimator._pseudo_measurement_table(
+                ["ac_v3"],
+                ["ACNode"],
+                ["bus_2"],
+                ["V"],
+                [1.02],
+                5.0,
+                idx_start=500001,
+                device_type_codes=[ac_se.DEVICE_TYPE_CODES_ACNODE],
+                meas_type_codes=[ac_se.MEAS_TYPE_CODES_V],
+                device_positions=[1],
+            ),
+            normalized=True,
+        )
         active_len = len(estimator.active_measurements)
         calls = {
             "branch_full": 0,
@@ -6281,6 +6321,60 @@ class ACStateEstimationTest(unittest.TestCase):
             self.assertIsNone(estimator._observability_matrix_cache.get("lower_normal_plan"))
         finally:
             ac_se._AAT_NORMAL_SOLVER_MIN_STATE = original_min_state
+
+    def test_array_only_file_measurements_keep_string_columns_out_of_runtime_tables(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+
+        estimator.run(
+            result_mode="array",
+            skip_bad_data=True,
+            final_diagnostics=False,
+            verbose=False,
+        )
+
+        for key in ("name", "device_type", "device_name", "meas_type"):
+            self.assertEqual(0, estimator.meas_ppc[key].size)
+
+        for table in (
+            estimator.measurements.table,
+            estimator.measurement_table,
+            estimator.active_measurements.table,
+        ):
+            self.assertEqual(0, table.name.size)
+            self.assertEqual(0, table.device_type.size)
+            self.assertEqual(0, table.device_name.size)
+            self.assertEqual(0, table.meas_type.size)
+            self.assertEqual(table.idx.size, table.device_type_code.size)
+            self.assertEqual(table.idx.size, table.meas_type_code.size)
+            self.assertEqual(table.idx.size, table.device_name_id.size)
+
+    def test_array_only_file_measurements_skip_separate_device_index_stage(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+
+        self.assertFalse(hasattr(ACStateEstimator, "_build_measurement_device_indexes"))
+        estimator.run(
+            result_mode="array",
+            skip_bad_data=True,
+            final_diagnostics=False,
+            verbose=False,
+        )
+
+        self.assertIsNotNone(estimator.measurement_table.device_pos)
+        self.assertEqual(estimator.measurement_table.idx.size, estimator.measurement_table.device_pos.size)
 
     def test_sparse_observability_disables_dynamic_pivoting_for_speed(self):
         from scipy.sparse import csc_matrix, eye

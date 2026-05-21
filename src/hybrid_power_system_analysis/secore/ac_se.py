@@ -48,6 +48,7 @@ from model.meas_array_model import (
 )
 from model.meas_type import (
     DEVICE_TYPE_CODES,
+    DEVICE_TYPE_NAMES,
     DEVICE_TYPE_ACNode,
     DEVICE_TYPE_ACBranch,
     DEVICE_TYPE_ACTransformer,
@@ -59,6 +60,7 @@ from model.meas_type import (
     DEVICE_TYPE_ACBreak,
     DEVICE_TYPE_ACBreakConstraint,
     MEAS_TYPE_CODES,
+    MEAS_TYPE_NAMES,
     MEAS_TYPE_V,
     MEAS_TYPE_ANGLE,
     MEAS_TYPE_THETA,
@@ -649,10 +651,15 @@ class ACStateEstimator:
         self._record_profile_time("init.load_network", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
         if measurements is None:
-            self.meas_ppc = copy_meas_ppc(build_meas_ppc_from_e_file(self.meas_file))
+            self.meas_ppc = copy_meas_ppc(
+                build_meas_ppc_from_e_file(
+                    self.meas_file,
+                    include_strings=not bool(getattr(self, "_array_only_runtime", False)),
+                )
+            )
             if bool(getattr(self, "_array_only_runtime", False)):
                 self.measurements = self._measurement_sequence_from_table(
-                    measurement_table_from_meas_ppc(self.meas_ppc),
+                    measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
                     normalized=bool(self.meas_ppc.get("normalized", False)),
                 )
             else:
@@ -661,7 +668,7 @@ class ACStateEstimator:
             self.meas_ppc = copy_meas_ppc(measurements)
             if bool(getattr(self, "_array_only_runtime", False)):
                 self.measurements = self._measurement_sequence_from_table(
-                    measurement_table_from_meas_ppc(self.meas_ppc),
+                    measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
                     normalized=bool(self.meas_ppc.get("normalized", False)),
                 )
             else:
@@ -960,13 +967,28 @@ class ACStateEstimator:
         prepare_active_measurements: bool = True,
         measurements_already_normalized: bool = False,
     ) -> "ACStateEstimator":
-        stage_start = time.perf_counter()
-        self._build_measurement_device_indexes()
-        self._record_profile_time("init.measurement_device_indexes", time.perf_counter() - stage_start)
-        if not measurements_already_normalized:
+        if measurements_already_normalized:
+            table = _measurement_table_from_measurements(self.measurements)
+            self.measurement_table = table
+            self._record_profile_time("init.measurement_device_indexes", 0.0)
+        else:
+            self._record_profile_time("init.measurement_device_indexes", 0.0)
             stage_start = time.perf_counter()
             self._convert_measurements_to_pu()
             self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
+            table = getattr(self, "measurement_table", None)
+        device_pos = getattr(table, "device_pos", None) if table is not None else None
+        if (
+            table is None
+            or device_pos is None
+            or np.asarray(device_pos).size != int(getattr(table, "idx", np.asarray([])).size)
+        ):
+            warnings.warn(
+                "AC SE measurement table is missing device_pos after normalization; "
+                "name-based index rebuild is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.power_flow_seed_converged = False
         if not self.flat_start:
             seed_start = time.perf_counter()
@@ -1514,40 +1536,64 @@ class ACStateEstimator:
             )
         )
 
-    def _incremental_update_active_measurement_indexes(self, appended_measurements: Sequence[Measurement]) -> bool:
+    def _incremental_update_active_measurement_indexes(
+        self,
+        appended_measurements: Sequence[Measurement],
+        *,
+        source_row_start: Optional[int] = None,
+        master_table: Optional[MeasurementTable] = None,
+    ) -> bool:
         if not appended_measurements:
             return True
         if not hasattr(self, "active_measurements"):
             self._warn_missing_required_active_measurements("incremental active measurement update")
             return False
-        if any((not meas.valid) or float(meas.weight) <= 0.0 for meas in appended_measurements):
+        appended_table = _measurement_table_from_measurements(appended_measurements)
+        if np.any(
+            (~np.asarray(appended_table.valid, dtype=bool))
+            | (np.asarray(appended_table.weight, dtype=np.float64) <= 0.0)
+        ):
             return False
-        master_table = getattr(self, "measurement_table", getattr(self.measurements, "table", None))
+        appended_device_pos = getattr(appended_table, "device_pos", None)
+        if appended_device_pos is None or np.asarray(appended_device_pos).size != int(appended_table.idx.size):
+            warnings.warn(
+                "AC SE incremental active update requires appended measurement device_pos; "
+                "name-based index rebuild is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        master_table = master_table if master_table is not None else getattr(
+            self,
+            "measurement_table",
+            getattr(self.measurements, "table", None),
+        )
         active_table = getattr(self, "active_measurement_table", getattr(self.active_measurements, "table", None))
         if master_table is None or active_table is None:
             return False
-        if len(master_table.idx) != len(self.measurements) - len(appended_measurements):
+        source_row_start = int(len(master_table.idx) if source_row_start is None else source_row_start)
+        if len(master_table.idx) != source_row_start:
             return False
         if len(active_table.idx) != len(self.active_measurements):
             return False
 
-        appended_list = MeasurementList(
-            list(appended_measurements),
-            _measurement_table_from_measurements(appended_measurements),
+        appended_view = MeasurementTableView(
+            appended_table,
             normalized=getattr(self.measurements, "normalized", False),
         )
-        self._build_measurement_device_indexes(appended_list)
-        self.measurement_table = concat_measurement_tables(master_table, appended_list.table)
-        self.measurements.table = self.measurement_table
-        self._build_measurement_device_indexes(self.measurements)
+        self.measurement_table = concat_measurement_tables(master_table, appended_table)
+        try:
+            self.measurements.table = self.measurement_table
+        except AttributeError:
+            pass
         active_view = append_active_measurement_view(
             build_active_measurement_view(
                 self.active_measurements,
                 table_builder=_measurement_table_from_measurements,
                 materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
             ),
-            appended_list,
-            source_row_start=len(master_table.idx),
+            appended_view,
+            source_row_start=source_row_start,
             table_builder=_measurement_table_from_measurements,
             materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
         )
@@ -1580,7 +1626,7 @@ class ACStateEstimator:
         else:
             self._active_branch_transformer_vector_plan = self._merge_active_plan_dict(
                 previous_branch_plan,
-                self._build_branch_transformer_vector_plan(appended_list),
+                self._build_branch_transformer_vector_plan(appended_view),
                 row_offset=row_offset,
                 row_keys=("voltage_rows", "power_rows", "current_rows"),
             )
@@ -1593,7 +1639,7 @@ class ACStateEstimator:
         else:
             self._active_simple_jacobian_plan = self._merge_active_plan_dict(
                 previous_simple_plan,
-                self._build_simple_jacobian_plan(appended_list),
+                self._build_simple_jacobian_plan(appended_view),
                 row_offset=row_offset,
                 row_keys=(
                     "scalar_rows",
@@ -1613,7 +1659,7 @@ class ACStateEstimator:
         else:
             self._active_zero_current_vector_plan = self._merge_active_plan_dict(
                 previous_zero_plan,
-                self._build_zero_current_vector_plan(appended_list),
+                self._build_zero_current_vector_plan(appended_view),
                 row_offset=row_offset,
                 row_keys=(
                     "scalar_rows",
@@ -1633,7 +1679,7 @@ class ACStateEstimator:
         else:
             self._active_generator_measurement_plan = self._merge_active_plan_dict(
                 previous_generator_plan,
-                self._build_generator_measurement_plan(appended_list),
+                self._build_generator_measurement_plan(appended_view),
                 row_offset=row_offset,
                 row_keys=("value_rows",),
             )
@@ -1646,7 +1692,7 @@ class ACStateEstimator:
         else:
             self._active_balance_measurement_plan = self._merge_active_plan_dict(
                 previous_balance_plan,
-                self._build_balance_measurement_plan(appended_list),
+                self._build_balance_measurement_plan(appended_view),
                 row_offset=row_offset,
                 row_keys=("rows",),
                 mapped_row_keys=("p_row_by_pos", "q_row_by_pos"),
@@ -2180,27 +2226,6 @@ class ACStateEstimator:
             if np.any(in_range):
                 values[in_range] = lookup[ids[in_range].astype(np.intp, copy=False)]
             device_pos[rows] = values
-        return device_pos
-
-    def _build_measurement_device_indexes(
-        self,
-        measurements: Optional[Sequence[Measurement]] = None,
-    ) -> np.ndarray:
-        """Attach measurement-to-device compact indexes once after measurement loading."""
-        measurements = self.measurements if measurements is None else measurements
-        table = _measurement_table_from_measurements(measurements)
-        table.device_pos = None
-        device_pos = self._measurement_device_pos_array(table)
-        table.device_pos = device_pos
-        cache = getattr(table, "_device_pos_plan_cache", None)
-        if cache is not None:
-            cache.clear()
-        try:
-            measurements.table = table
-        except AttributeError:
-            pass
-        if measurements is self.measurements:
-            self.measurement_table = table
         return device_pos
 
     def _node_scale_arrays_by_pos(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -3201,6 +3226,18 @@ class ACStateEstimator:
             meas_type_codes=meas_type_codes,
             device_positions=device_positions,
         )
+        self._append_pseudo_measurement_table(appended_table, record_summary=record_summary)
+        return int(next_idx) + row_count
+
+    def _append_pseudo_measurement_table(
+        self,
+        appended_table: MeasurementTable,
+        *,
+        record_summary: bool = True,
+    ) -> MeasurementTable:
+        row_count = int(appended_table.idx.size)
+        if row_count == 0:
+            return _measurement_table_from_measurements(self.measurements)
         base_table = _measurement_table_from_measurements(self.measurements)
         base_count = int(base_table.idx.size)
         total_count = base_count + row_count
@@ -3255,7 +3292,8 @@ class ACStateEstimator:
             normalized=getattr(self.measurements, "normalized", False),
         )
         self.measurement_table = combined_table
-        self._max_measurement_idx = int(next_idx) + row_count - 1
+        if row_count:
+            self._max_measurement_idx = int(np.max(appended_table.idx))
         if record_summary:
             device_key_cache = self._active_device_keys_ref()
             measurement_key_cache = self._active_measurement_keys_ref()
@@ -3275,7 +3313,7 @@ class ACStateEstimator:
                 tail_meas[valid_tail].tolist(),
             ):
                 measurement_key_cache.add(self._active_measurement_key(code, pos, meas_code))
-        return int(next_idx) + row_count
+        return base_table
 
     def _real_voltage_observation_nodes(self) -> Dict[int, float]:
         """Return nodes covered by real usable voltage measurements on any AC device."""
@@ -3669,6 +3707,7 @@ class ACStateEstimator:
             added = 0
             refreshed = False
             measurement_count_before = len(self.measurements)
+            base_table_before = _measurement_table_from_measurements(self.measurements)
             remaining = batch_limit
             for state_idx, _score in observability.weak_states:
                 if added >= remaining:
@@ -3690,9 +3729,16 @@ class ACStateEstimator:
                 break
             total_added += added
             if not refreshed:
-                refreshed = self._incremental_update_active_measurement_indexes(
-                    self.measurements[measurement_count_before:]
-                )
+                current_table = _measurement_table_from_measurements(self.measurements)
+                current_count = int(current_table.idx.size)
+                if current_count > measurement_count_before:
+                    tail_rows = np.arange(measurement_count_before, current_count, dtype=np.int64)
+                    tail_table = measurement_table_take(current_table, tail_rows)
+                    refreshed = self._incremental_update_active_measurement_indexes(
+                        MeasurementTableView(tail_table, normalized=getattr(self.measurements, "normalized", False)),
+                        source_row_start=measurement_count_before,
+                        master_table=base_table_before,
+                    )
             if not refreshed:
                 self._refresh_active_measurement_indexes()
             observability = None
@@ -3714,22 +3760,28 @@ class ACStateEstimator:
         candidates = self._observability_pseudo_candidate_measurements()
         if not candidates:
             return 0
-        selected = self._select_weak_direction_pseudo_candidates(observability, candidates, max_add)
-        if not selected:
+        selected_rows = self._select_weak_direction_pseudo_candidates(observability, candidates, max_add)
+        if selected_rows.size == 0:
             return 0
         next_idx = self._next_measurement_idx()
-        measurement_count_before = len(self.measurements)
-        for candidate in selected:
-            candidate.idx = next_idx
-            next_idx += 1
-            self.measurements.append(candidate)
+        base_table_before = _measurement_table_from_measurements(self.measurements)
+        measurement_count_before = int(base_table_before.idx.size)
+        candidate_table = getattr(candidates, "table", None)
+        if candidate_table is None:
+            return 0
+        selected_table = measurement_table_take(candidate_table, selected_rows)
+        selected_count = int(selected_table.idx.size)
+        selected_table.idx = np.arange(next_idx, next_idx + selected_count, dtype=np.int64)
+        self._append_pseudo_measurement_table(selected_table)
         if refresh:
             refreshed = self._incremental_update_active_measurement_indexes(
-                self.measurements[measurement_count_before:]
+                MeasurementTableView(selected_table, normalized=True),
+                source_row_start=measurement_count_before,
+                master_table=base_table_before,
             )
             if not refreshed:
                 self._refresh_active_measurement_indexes()
-        return len(selected)
+        return selected_count
 
     def _observability_pseudo_candidate_measurements(self) -> Sequence[Measurement]:
         """Build low-weight candidate pseudo rows for weak-direction observability repair."""
@@ -3908,7 +3960,7 @@ class ACStateEstimator:
         add_terminal_candidates(DEVICE_TYPE_CODES_ACBRANCH, "ACBranch", "branch", "branch_name", "branch", BRANCH_COLS)
         add_terminal_candidates(DEVICE_TYPE_CODES_ACTRANSFORMER, "ACTransformer", "transformer", "transformer_name", "transformer", TRANSFORMER_COLS)
 
-        return self._table_backed_pseudo_measurements(
+        candidate_table = self._pseudo_measurement_table(
             candidate_rows.names,
             candidate_rows.device_types,
             candidate_rows.device_names,
@@ -3919,21 +3971,23 @@ class ACStateEstimator:
             meas_type_codes=candidate_rows.meas_type_codes,
             device_positions=candidate_rows.device_positions,
         )
+        return MeasurementTableView(candidate_table, normalized=True)
 
     def _select_weak_direction_pseudo_candidates(
         self,
         observability: ObservabilityResult,
         candidates: Sequence[Measurement],
         max_add: int,
-    ) -> List[Measurement]:
+    ) -> np.ndarray:
         if max_add <= 0 or not candidates:
-            return []
+            return np.asarray([], dtype=np.int64)
+        candidate_count = int(len(candidates))
         x = self.initial_state()
         cache = self._observability_matrix_cache_for(observability, None, x)
         H = cache.get("H") if cache is not None else self.jacobian_sparse(x, None)
         direction = observability_weak_direction(H, self.n_state, observability.weak_states)
         if direction.size != self.n_state or not np.any(direction):
-            return list(candidates[:max_add])
+            return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
         cache = getattr(self, "_weak_direction_candidate_jacobian_cache", None)
         table = getattr(candidates, "table", None)
         cache_key = (id(candidates), id(table), len(candidates), self.n_state)
@@ -3955,17 +4009,19 @@ class ACStateEstimator:
         if start is not None:
             self._record_profile_time("init.weak_direction_candidate_scores", time.perf_counter() - start)
         if scores.size != len(candidates) or not np.any(scores > 0.0):
-            return list(candidates[:max_add])
+            return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
         positive = np.flatnonzero(scores > 0.0)
         if positive.size > max_add:
             top = positive[np.argpartition(-scores[positive], max_add - 1)[:max_add]]
             order = top[np.argsort(-scores[top], kind="stable")]
         else:
             order = positive[np.argsort(-scores[positive], kind="stable")]
-        selected = [candidates[int(pos)] for pos in order[:max_add]]
-        return selected or list(candidates[:max_add])
+        selected = np.asarray(order[:max_add], dtype=np.int64)
+        if selected.size:
+            return selected
+        return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
 
-    def _rank_restoring_candidate_measurements(self) -> List[Measurement]:
+    def _rank_restoring_candidate_measurements(self) -> MeasurementTableView:
         """Build low-weight candidates from invalid real device rows, excluding node V and angles."""
         table = _measurement_table_from_measurements(self.measurements)
         device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
@@ -3977,22 +4033,47 @@ class ACStateEstimator:
             meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
         device_pos = getattr(table, "device_pos", None)
         if device_pos is None or np.asarray(device_pos).size != int(table.idx.size):
-            device_pos = self._measurement_device_pos_array(table)
-            table.device_pos = device_pos
+            warnings.warn(
+                "AC SE rank-restoring candidates require measurement device_pos; "
+                "name-based index rebuild is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
         else:
             device_pos = np.asarray(device_pos, dtype=np.int64)
         existing_keys = self._active_measurement_keys_ref()
         seen_keys = set()
-        candidates: List[Measurement] = []
         next_idx = self._next_measurement_idx()
-        invalid_rows = np.flatnonzero((~np.asarray(table.valid, dtype=bool)) & (np.asarray(table.weight, dtype=np.float64) > 0.0))
+        invalid_rows = np.flatnonzero(
+            (~np.asarray(table.valid, dtype=bool))
+            & (np.asarray(table.weight, dtype=np.float64) > 0.0)
+        )
         if invalid_rows.size == 0:
-            return candidates
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
         available, scale, _from_pos, _to_pos = self._measurement_scale_for_codes(
             device_type_code[invalid_rows],
             device_pos[invalid_rows],
             meas_type_code[invalid_rows],
         )
+        candidate_rows = []
+        candidate_values = []
         for local_idx, row in enumerate(invalid_rows.tolist()):
             row = int(row)
             if int(device_pos[row]) < 0 or not bool(available[local_idx]):
@@ -4004,22 +4085,57 @@ class ACStateEstimator:
             key = self._active_measurement_key(device_type_code[row], device_pos[row], meas_type_code[row])
             if key in existing_keys or key in seen_keys:
                 continue
-            pseudo_name = f"pseudo_rank_{table.name[row]}"
             seen_keys.add(key)
-            candidates.append(
-                Measurement(
-                    idx=next_idx + len(candidates),
-                    name=pseudo_name,
-                    device_type=str(table.device_type[row]),
-                    device_name=str(table.device_name[row]),
-                    meas_type=str(table.meas_type[row]),
-                    weight=self.pseudo_measurement_weight,
-                    valid=True,
-                    value=float(table.value[row]) / float(scale[local_idx]),
-                    status=MEAS_STATUS_PSEUDO,
-                )
+            candidate_rows.append(row)
+            candidate_values.append(float(table.value[row]) / float(scale[local_idx]))
+        if not candidate_rows:
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
             )
-        return candidates
+            return MeasurementTableView(empty_table, normalized=True)
+        rows = np.asarray(candidate_rows, dtype=np.int64)
+        values = np.asarray(candidate_values, dtype=np.float64)
+
+        def optional_object_values(values_array: np.ndarray, fallback):
+            if values_array.size == int(table.idx.size):
+                return values_array[rows]
+            return np.asarray([fallback(int(row)) for row in rows], dtype=object)
+
+        names = optional_object_values(
+            np.asarray(table.name, dtype=object),
+            lambda row: f"rank_{int(table.idx[row])}",
+        )
+        names = np.asarray([f"pseudo_rank_{name}" for name in names.tolist()], dtype=object)
+        device_types = optional_object_values(
+            np.asarray(table.device_type, dtype=object),
+            lambda row: DEVICE_TYPE_NAMES.get(int(device_type_code[row]), f"DeviceType{int(device_type_code[row])}"),
+        )
+        device_names = optional_object_values(
+            np.asarray(table.device_name, dtype=object),
+            lambda row: f"device_pos_{int(device_pos[row])}",
+        )
+        meas_types = optional_object_values(
+            np.asarray(table.meas_type, dtype=object),
+            lambda row: MEAS_TYPE_NAMES.get(int(meas_type_code[row]), f"MEAS_{int(meas_type_code[row])}"),
+        )
+        candidate_table = self._pseudo_measurement_table(
+            names,
+            device_types,
+            device_names,
+            meas_types,
+            values,
+            self.pseudo_measurement_weight,
+            idx_start=next_idx,
+            device_type_codes=device_type_code[rows],
+            meas_type_codes=meas_type_code[rows],
+            device_positions=device_pos[rows],
+        )
+        return MeasurementTableView(candidate_table, normalized=True)
 
     def _rank_restoring_candidate_indices(self, candidates: Sequence[Measurement], max_add: int) -> List[int]:
         """Select candidate rows that participate in a higher structural-rank matching."""
@@ -4032,7 +4148,12 @@ class ACStateEstimator:
         if base_rank is None or base_rank >= self.n_state:
             return []
 
-        combined_measurements = list(base_measurements) + list(candidates)
+        base_table = _measurement_table_from_measurements(base_measurements)
+        candidate_table = _measurement_table_from_measurements(candidates)
+        combined_measurements = MeasurementTableView(
+            concat_measurement_tables(base_table, candidate_table),
+            normalized=getattr(base_measurements, "normalized", False),
+        )
         combined_h = self.jacobian_sparse(x, combined_measurements)
         combined_rank = sparse_structural_rank(combined_h)
         if combined_rank is None or combined_rank <= base_rank:
@@ -4047,20 +4168,26 @@ class ACStateEstimator:
             return selected
 
         selected_set = set(selected)
-        selected_measurements = [candidates[idx] for idx in selected]
-        remaining_candidates = [candidate for idx, candidate in enumerate(candidates) if idx not in selected_set]
-        if not remaining_candidates:
+        selected_rows = np.asarray(selected, dtype=np.int64)
+        all_candidate_rows = np.arange(len(candidates), dtype=np.int64)
+        remaining_rows = all_candidate_rows[[int(idx) not in selected_set for idx in all_candidate_rows.tolist()]]
+        if remaining_rows.size == 0:
             return selected
 
-        current_measurements = list(base_measurements) + selected_measurements
+        selected_table = measurement_table_take(candidate_table, selected_rows)
+        remaining_table = measurement_table_take(candidate_table, remaining_rows)
+        current_measurements = MeasurementTableView(
+            concat_measurement_tables(base_table, selected_table),
+            normalized=getattr(base_measurements, "normalized", False),
+        )
         current_h = self.jacobian_sparse(x, current_measurements)
+        remaining_candidates = MeasurementTableView(remaining_table, normalized=True)
         candidate_h = self.jacobian_sparse(x, remaining_candidates)
         anchor_local_indices = self._angle_anchor_candidate_indices(current_h, candidate_h, remaining)
         if not anchor_local_indices:
             return selected
 
-        original_by_identity = {id(candidate): idx for idx, candidate in enumerate(candidates)}
-        selected.extend(original_by_identity[id(remaining_candidates[idx])] for idx in anchor_local_indices)
+        selected.extend(int(remaining_rows[int(idx)]) for idx in anchor_local_indices)
         return sorted(set(selected))
 
     def _angle_anchor_candidate_indices(self, current_h, candidate_h, max_add: int) -> List[int]:
@@ -4177,18 +4304,24 @@ class ACStateEstimator:
         if not selected_indices:
             return 0
         next_idx = self._next_measurement_idx()
-        measurement_count_before = len(self.measurements)
-        for local_idx in selected_indices:
-            candidate = candidates[int(local_idx)]
-            candidate.idx = next_idx
-            next_idx += 1
-            self.measurements.append(candidate)
+        base_table_before = _measurement_table_from_measurements(self.measurements)
+        measurement_count_before = int(base_table_before.idx.size)
+        candidate_table = getattr(candidates, "table", None)
+        if candidate_table is None:
+            return 0
+        selected_rows = np.asarray(selected_indices, dtype=np.int64)
+        selected_table = measurement_table_take(candidate_table, selected_rows)
+        selected_count = int(selected_table.idx.size)
+        selected_table.idx = np.arange(next_idx, next_idx + selected_count, dtype=np.int64)
+        self._append_pseudo_measurement_table(selected_table)
         refreshed = self._incremental_update_active_measurement_indexes(
-            self.measurements[measurement_count_before:]
+            MeasurementTableView(selected_table, normalized=True),
+            source_row_start=measurement_count_before,
+            master_table=base_table_before,
         )
         if not refreshed:
             self._refresh_active_measurement_indexes()
-        return len(selected_indices)
+        return selected_count
 
     def _append_targeted_observability_pseudo(
         self,

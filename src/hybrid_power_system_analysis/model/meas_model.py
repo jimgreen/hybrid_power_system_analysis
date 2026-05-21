@@ -324,10 +324,10 @@ def measurement_table_from_measurements(
             )
             table = MeasurementTable(
                 idx=np.concatenate((table.idx, tail_table.idx)),
-                name=np.concatenate((table.name, tail_table.name)),
-                device_type=np.concatenate((table.device_type, tail_table.device_type)),
-                device_name=np.concatenate((table.device_name, tail_table.device_name)),
-                meas_type=np.concatenate((table.meas_type, tail_table.meas_type)),
+                name=_concat_optional_object_field(table, tail_table, "name"),
+                device_type=_concat_optional_object_field(table, tail_table, "device_type"),
+                device_name=_concat_optional_object_field(table, tail_table, "device_name"),
+                meas_type=_concat_optional_object_field(table, tail_table, "meas_type"),
                 weight=np.concatenate((table.weight, tail_table.weight)),
                 valid=np.concatenate((table.valid, tail_table.valid)),
                 value=np.concatenate((table.value, tail_table.value)),
@@ -386,6 +386,14 @@ def measurement_table_from_measurements(
         angle_mask=np.asarray(angle_mask_list, dtype=bool),
         status_code=np.asarray(status_list, dtype=np.int16),
     )
+
+
+def _concat_optional_object_field(head: MeasurementTable, tail: MeasurementTable, field_name: str) -> np.ndarray:
+    head_values = np.asarray(getattr(head, field_name), dtype=object)
+    tail_values = np.asarray(getattr(tail, field_name), dtype=object)
+    if head_values.size != head.idx.size or tail_values.size != tail.idx.size:
+        return np.asarray([], dtype=object)
+    return np.concatenate((head_values, tail_values))
 
 
 def _concat_optional_int_field(head: MeasurementTable, tail: MeasurementTable, field_name: str):

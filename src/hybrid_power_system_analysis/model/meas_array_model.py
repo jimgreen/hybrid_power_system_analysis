@@ -56,6 +56,8 @@ def clear_meas_ppc_cache(file_path=None) -> None:
             return
         path = resolve_project_file(file_path).resolve()
         _MEAS_PPC_CACHE.pop(path, None)
+        _MEAS_PPC_CACHE.pop((path, True), None)
+        _MEAS_PPC_CACHE.pop((path, False), None)
 
 
 def _file_cache_key(file_path) -> Tuple[Path, int, int]:
@@ -106,14 +108,15 @@ def _build_ppc(
     *,
     source: Path,
     idx: np.ndarray,
-    name: np.ndarray,
-    device_type: np.ndarray,
-    device_name: np.ndarray,
-    meas_type: np.ndarray,
+    name: Optional[np.ndarray],
+    device_type: Optional[np.ndarray],
+    device_name: Optional[np.ndarray],
+    meas_type: Optional[np.ndarray],
     weight: np.ndarray,
     valid: np.ndarray,
     value: np.ndarray,
     status: np.ndarray,
+    include_strings: bool = True,
     rows_by_device_type_code: Optional[Dict[int, np.ndarray]] = None,
     device_type_code: Optional[np.ndarray] = None,
     meas_type_code: Optional[np.ndarray] = None,
@@ -122,6 +125,8 @@ def _build_ppc(
 ) -> Dict:
     count = int(idx.size)
     if device_type_code is None:
+        if device_type is None:
+            raise RuntimeError("device_type_code is required when device_type strings are omitted")
         device_type_code, computed_rows_by_code = _device_type_codes_from_names(device_type)
     else:
         device_type_code = np.asarray(device_type_code, dtype=np.int16)
@@ -135,16 +140,30 @@ def _build_ppc(
         else:
             rows_by_device_type_code = computed_rows_by_code
     if meas_type_code is None:
+        if meas_type is None:
+            raise RuntimeError("meas_type_code is required when meas_type strings are omitted")
         meas_type_code = _meas_type_codes_from_names(meas_type)
     else:
         meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
     if device_name_id is None or device_names is None:
+        if device_name is None:
+            raise RuntimeError("device_name_id and device_names are required when device_name strings are omitted")
         device_name_id, device_names = _encode_device_names(device_name)
     else:
         device_name_id = np.asarray(device_name_id, dtype=np.int32)
         device_names = np.asarray(device_names, dtype=object)
-    if device_name_id.size == count and device_names.size:
-        device_name = device_names[device_name_id.astype(np.intp, copy=False)]
+    if include_strings:
+        name = np.asarray(name if name is not None else (), dtype=object)
+        device_type = np.asarray(device_type if device_type is not None else (), dtype=object)
+        device_name = np.asarray(device_name if device_name is not None else (), dtype=object)
+        meas_type = np.asarray(meas_type if meas_type is not None else (), dtype=object)
+        if device_name.size != count and device_name_id.size == count and device_names.size:
+            device_name = device_names[device_name_id.astype(np.intp, copy=False)]
+    else:
+        name = np.asarray([], dtype=object)
+        device_type = np.asarray([], dtype=object)
+        device_name = np.asarray([], dtype=object)
+        meas_type = np.asarray([], dtype=object)
     angle_mask = np.isin(meas_type_code, ANGLE_MEASUREMENT_TYPE_CODES)
     meas = np.zeros((count, len(MEAS_COLS)), dtype=np.float64)
     if count:
@@ -322,17 +341,17 @@ def _measurement_block_name(line: str) -> Optional[str]:
     return name
 
 
-def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
+def _build_meas_ppc_from_measurement_file(source: Path, *, include_strings: bool = True) -> Dict:
     header = ()
     idx_col = name_col = device_type_col = device_name_col = meas_type_col = -1
     weight_col = valid_col = value_col = -1
     status_col = -1
     required_max_col = -1
     idx_values = []
-    name_values = []
-    device_type_values = []
-    device_name_values = []
-    meas_type_values = []
+    name_values = [] if include_strings else None
+    device_type_values = [] if include_strings else None
+    device_name_values = [] if include_strings else None
+    meas_type_values = [] if include_strings else None
     weight_values = []
     valid_values = []
     value_values = []
@@ -348,10 +367,10 @@ def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
     device_code_get = DEVICE_TYPE_CODES.get
     meas_code_get = MEAS_TYPE_CODES.get
     idx_append = idx_values.append
-    name_append = name_values.append
-    device_type_append = device_type_values.append
-    device_name_append = device_name_values.append
-    meas_type_append = meas_type_values.append
+    name_append = name_values.append if include_strings else None
+    device_type_append = device_type_values.append if include_strings else None
+    device_name_append = device_name_values.append if include_strings else None
+    meas_type_append = meas_type_values.append if include_strings else None
     weight_append = weight_values.append
     valid_append = valid_values.append
     value_append = value_values.append
@@ -421,13 +440,15 @@ def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
                 if len(fields) <= required_max_col:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
                 idx_append(int(fields[idx_col]))
-                name_append(fields[name_col])
+                if include_strings:
+                    name_append(fields[name_col])
                 device_type = intern(fields[device_type_col])
                 device_name = intern(fields[device_name_col])
                 meas_type = intern(fields[meas_type_col].upper())
-                device_type_append(device_type)
-                device_name_append(device_name)
-                meas_type_append(meas_type)
+                if include_strings:
+                    device_type_append(device_type)
+                    device_name_append(device_name)
+                    meas_type_append(meas_type)
                 weight_append(float(fields[weight_col]))
                 valid = fields[valid_col] == "1"
                 value_append(float(fields[value_col]))
@@ -464,14 +485,15 @@ def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
     return _build_ppc(
         source=source,
         idx=idx_array,
-        name=np.asarray(name_values, dtype=object),
-        device_type=np.asarray(device_type_values, dtype=object),
-        device_name=np.asarray(device_name_values, dtype=object),
-        meas_type=np.asarray(meas_type_values, dtype=object),
+        name=np.asarray(name_values, dtype=object) if include_strings else None,
+        device_type=np.asarray(device_type_values, dtype=object) if include_strings else None,
+        device_name=np.asarray(device_name_values, dtype=object) if include_strings else None,
+        meas_type=np.asarray(meas_type_values, dtype=object) if include_strings else None,
         weight=np.asarray(weight_values, dtype=np.float64),
         valid=np.asarray(valid_values, dtype=bool),
         value=np.asarray(value_values, dtype=np.float64),
         status=np.asarray(status_values, dtype=np.int16),
+        include_strings=include_strings,
         rows_by_device_type_code=rows_by_code,
         device_type_code=device_type_code_array,
         meas_type_code=meas_type_code_array,
@@ -486,17 +508,18 @@ def build_meas_ppc_from_efile_rows(file_path, rows) -> Dict:
     return _build_meas_ppc_from_rows_dict(rows, path)
 
 
-def build_meas_ppc_from_e_file(file_path) -> Dict:
+def build_meas_ppc_from_e_file(file_path, *, include_strings: bool = True) -> Dict:
     """Read a measurement file directly into a PPC-style NumPy dictionary."""
     file_key = _file_cache_key(file_path)
+    cache_key = (file_key[0], bool(include_strings))
     with _MEAS_PPC_CACHE_LOCK:
-        cached = _MEAS_PPC_CACHE.get(file_key[0])
+        cached = _MEAS_PPC_CACHE.get(cache_key)
         if cached is not None and cached[0] == file_key:
             return cached[1]
 
-    ppc = _build_meas_ppc_from_measurement_file(file_key[0])
+    ppc = _build_meas_ppc_from_measurement_file(file_key[0], include_strings=bool(include_strings))
     with _MEAS_PPC_CACHE_LOCK:
-        _MEAS_PPC_CACHE[file_key[0]] = (file_key, ppc)
+        _MEAS_PPC_CACHE[cache_key] = (file_key, ppc)
     return ppc
 
 
@@ -522,7 +545,7 @@ def copy_meas_ppc(ppc: Dict) -> Dict:
     return copied
 
 
-def measurement_table_from_meas_ppc(ppc: Dict) -> MeasurementTable:
+def measurement_table_from_meas_ppc(ppc: Dict, *, include_strings: bool = True) -> MeasurementTable:
     meas = ppc["meas"]
     cols = ppc.get("meas_cols", MEAS_COLS)
     row_count = int(meas.shape[0])
@@ -546,12 +569,22 @@ def measurement_table_from_meas_ppc(ppc: Dict) -> MeasurementTable:
         device_pos = device_pos.astype(np.int64, copy=False)
     else:
         device_pos = None
+    if include_strings:
+        name = np.asarray(ppc.get("name", ()), dtype=object)
+        device_type = np.asarray(ppc.get("device_type", ()), dtype=object)
+        device_name = np.asarray(ppc.get("device_name", ()), dtype=object)
+        meas_type = np.asarray(ppc.get("meas_type", ()), dtype=object)
+    else:
+        name = np.asarray([], dtype=object)
+        device_type = np.asarray([], dtype=object)
+        device_name = np.asarray([], dtype=object)
+        meas_type = np.asarray([], dtype=object)
     table = MeasurementTable(
         idx=idx_array,
-        name=np.asarray(ppc.get("name", ()), dtype=object),
-        device_type=np.asarray(ppc.get("device_type", ()), dtype=object),
-        device_name=np.asarray(ppc.get("device_name", ()), dtype=object),
-        meas_type=np.asarray(ppc.get("meas_type", ()), dtype=object),
+        name=name,
+        device_type=device_type,
+        device_name=device_name,
+        meas_type=meas_type,
         weight=meas[:, cols["weight"]],
         valid=meas[:, cols["valid"]].astype(bool, copy=False),
         value=meas[:, cols["value"]],
