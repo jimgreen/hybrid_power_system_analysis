@@ -136,9 +136,10 @@ class ACStateEstimationTest(unittest.TestCase):
             )
             >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
         )
+        self.assertIsNone(estimator._active_device_code_pos_cache)
         self.assertEqual(
             {node0_key, node1_key},
-            estimator._active_device_code_pos_cache,
+            estimator._active_device_keys_ref(),
         )
         self.assertEqual(2, estimator._max_measurement_idx)
         self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)

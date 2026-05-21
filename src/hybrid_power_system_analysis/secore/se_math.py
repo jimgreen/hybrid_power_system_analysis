@@ -1276,6 +1276,7 @@ class CholmodAAtNormalEquationPlan:
         self.a_data = np.zeros(int(self.h_indices.size), dtype=np.float64)
         self.rhs = np.zeros(self.shape[1], dtype=np.float64)
         self._rhs_values = np.empty(int(self.h_cols.size), dtype=np.float64)
+        self._weighted_residual = np.empty(self.shape[0], dtype=np.float64)
         self._fixed_sqrt_weight = None
         self._fixed_h_weight = None
         self.A = SP_CSC_MATRIX(
@@ -1399,10 +1400,10 @@ class CholmodAAtNormalEquationPlan:
                 self.a_data[:] = data
 
             if weighted_residual_values is None and row_weight is not None and assume_fixed_weights:
-                if self._fixed_h_weight is None or self._fixed_h_weight.shape[0] != self.h_rows.size:
-                    self.prepare_fixed_weights(row_weight)
-                np.multiply(data, residual[self.h_rows], out=self._rhs_values)
-                np.multiply(self._rhs_values, self._fixed_h_weight, out=self._rhs_values)
+                if self._weighted_residual.shape[0] != residual.shape[0]:
+                    self._weighted_residual = np.empty(residual.shape[0], dtype=np.float64)
+                np.multiply(residual, row_weight, out=self._weighted_residual)
+                np.multiply(data, self._weighted_residual[self.h_rows], out=self._rhs_values)
             else:
                 np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
             self.rhs[:] = np.bincount(

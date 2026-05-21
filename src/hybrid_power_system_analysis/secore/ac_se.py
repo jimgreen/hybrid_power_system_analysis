@@ -2626,6 +2626,14 @@ class ACStateEstimator:
         """Map PPC table rows back to SE measurement plan positions for numeric key checks."""
         rows = np.asarray(rows, dtype=np.int64)
         out = np.full(rows.size, -1, dtype=np.int64)
+        plan_pos_by_row = getattr(self, "_ac_measurement_plan_pos_by_ppc_row", None)
+        if plan_pos_by_row:
+            lookup = plan_pos_by_row.get(int(device_type_code))
+            if lookup is not None and rows.size:
+                in_range = (rows >= 0) & (rows < lookup.size)
+                if np.any(in_range):
+                    out[in_range] = lookup[rows[in_range].astype(np.intp, copy=False)]
+                return out
         plan_name_rows = getattr(self, "_ac_measurement_plan_name_rows_by_type_code", None)
         if not plan_name_rows or rows.size == 0:
             return out
@@ -2643,8 +2651,8 @@ class ACStateEstimator:
             out[in_range] = lookup[rows[in_range].astype(np.intp, copy=False)]
         return out
 
-    def _set_active_key_caches(self, device_keys: set, measurement_keys: set) -> None:
-        self._active_device_keys = device_keys
+    def _set_active_key_caches(self, device_keys: Optional[set], measurement_keys: set) -> None:
+        self._active_device_keys = set() if device_keys is None else device_keys
         self._active_measurement_keys = measurement_keys
         self._active_device_code_pos_cache = device_keys
         self._active_measurement_code_pos_cache = measurement_keys
@@ -2678,7 +2686,7 @@ class ACStateEstimator:
         device_pos: np.ndarray,
         meas_type_code: np.ndarray,
         active_mask: np.ndarray,
-    ) -> Tuple[set, set]:
+    ) -> Tuple[Optional[set], set]:
         valid = np.asarray(active_mask, dtype=bool)
         rows = np.flatnonzero(valid).astype(np.int64, copy=False)
         if rows.size == 0:
@@ -2693,9 +2701,8 @@ class ACStateEstimator:
         valid_pos_values = pos_values[valid_pos]
         valid_meas = meas_values[valid_pos]
         measurement_keys = ACStateEstimator._active_measurement_key_array(valid_type, valid_pos_values, valid_meas)
-        device_cache = set((measurement_keys >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS).tolist())
         measurement_cache = set(measurement_keys.tolist())
-        return device_cache, measurement_cache
+        return None, measurement_cache
 
     def _voltage_best_from_arrays(
         self,
@@ -3149,12 +3156,28 @@ class ACStateEstimator:
 
     def _active_device_keys_ref(self) -> set:
         """Return active devices as packed integer (device_type_code, device_pos) keys."""
-        if hasattr(self, "_active_device_code_pos_cache"):
-            self._active_device_keys = self._active_device_code_pos_cache
-            return self._active_device_code_pos_cache
-        if not hasattr(self, "_active_device_keys"):
+        cache = getattr(self, "_active_device_code_pos_cache", None)
+        if cache is not None:
+            self._active_device_keys = cache
+            return cache
+        measurement_keys = getattr(self, "_active_measurement_code_pos_cache", None)
+        if measurement_keys is None:
+            measurement_keys = getattr(self, "_active_measurement_keys", None)
+        if measurement_keys is None:
             self._refresh_measurement_summary_cache()
-        return self._active_device_keys
+            measurement_keys = getattr(self, "_active_measurement_code_pos_cache", None)
+        if measurement_keys:
+            key_array = np.fromiter(
+                (int(key) for key in measurement_keys),
+                dtype=np.int64,
+                count=len(measurement_keys),
+            )
+            cache = set((key_array >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS).tolist())
+        else:
+            cache = set()
+        self._active_device_keys = cache
+        self._active_device_code_pos_cache = cache
+        return cache
 
     def _active_measurement_keys_ref(self) -> set:
         """Return active measurements as packed integer (device_type_code, device_pos, meas_type_code) keys."""
@@ -5172,7 +5195,36 @@ class ACStateEstimator:
             self._voltage_unpack_cols = empty_i32.copy()
             return
 
-        if left.size:
+        if left.size and int(left.size) <= max(4096, n // 4):
+            parent = np.arange(n, dtype=np.int32)
+            rank = np.zeros(n, dtype=np.int8)
+
+            def find_root(pos: int) -> int:
+                while int(parent[pos]) != pos:
+                    parent[pos] = parent[int(parent[pos])]
+                    pos = int(parent[pos])
+                return int(pos)
+
+            for left_pos, right_pos in zip(left, right):
+                root_l = find_root(int(left_pos))
+                root_r = find_root(int(right_pos))
+                if root_l == root_r:
+                    continue
+                rank_l = int(rank[root_l])
+                rank_r = int(rank[root_r])
+                if rank_l < rank_r:
+                    parent[root_l] = root_r
+                elif rank_l > rank_r:
+                    parent[root_r] = root_l
+                else:
+                    parent[root_r] = root_l
+                    rank[root_l] = rank_l + 1
+            for pos in range(n):
+                parent[pos] = find_root(pos)
+            _roots, labels = np.unique(parent, return_inverse=True)
+            labels = np.asarray(labels, dtype=np.int32)
+            n_components = int(_roots.size)
+        elif left.size:
             graph_rows = np.concatenate((left, right)).astype(np.int32, copy=False)
             graph_cols = np.concatenate((right, left)).astype(np.int32, copy=False)
             graph_data = np.ones(graph_rows.size, dtype=np.int8)
@@ -6017,6 +6069,18 @@ class ACStateEstimator:
             DEVICE_TYPE_CODES_ACBREAKCONSTRAINT: (ppc.get("break_name", np.asarray([], dtype=object)), break_rows),
             DEVICE_TYPE_CODES_ACPOWERBALANCE: (ppc["bus_name"], node_rows),
         }
+        plan_pos_by_row = {}
+        for code, name_rows in self._ac_measurement_plan_name_rows_by_type_code.items():
+            names, rows = name_rows
+            rows = np.asarray(rows, dtype=np.int64)
+            table_size = int(np.asarray(names, dtype=object).size)
+            if rows.size:
+                table_size = max(table_size, int(rows.max()) + 1)
+            lookup = np.full(table_size, -1, dtype=np.int64)
+            if rows.size:
+                lookup[rows.astype(np.intp, copy=False)] = np.arange(rows.size, dtype=np.int64)
+            plan_pos_by_row[int(code)] = lookup
+        self._ac_measurement_plan_pos_by_ppc_row = plan_pos_by_row
         self._ac_measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
         self._ac_branch_transformer_plan_kind_by_type_code = {
             DEVICE_TYPE_CODES_ACBRANCH: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
