@@ -345,6 +345,20 @@ class SparseJacobianBuilder:
         self._data_only_chunk_cursor += 1
         return True
 
+    def _try_append_fixed_data_chunk(self, values) -> bool:
+        """Fast path for fixed CSR refresh when the current block shape is unchanged."""
+        if not self._data_only_refresh_active:
+            return False
+        chunk_slices = self._cached_chunk_slices
+        if chunk_slices is None or self._data_only_chunk_cursor >= len(chunk_slices):
+            return False
+        start, end = chunk_slices[self._data_only_chunk_cursor]
+        expected = int(end) - int(start)
+        value_size = int(values.size) if isinstance(values, np.ndarray) else int(np.asarray(values).size)
+        if value_size != expected:
+            return False
+        return self._append_data_only_chunk(values)
+
     def _append_arrays(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray) -> None:
         """Keep vectorized writes as NumPy chunks until final COO/CSR construction."""
         if rows.size == 0:
@@ -542,6 +556,8 @@ class SparseJacobianBuilder:
             self.data.append(float(value))
 
     def add_many(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray, mask: np.ndarray = None) -> None:
+        if mask is None and self._try_append_fixed_data_chunk(values):
+            return
         rows = _as_array_dtype(rows, np.int32)
         cols = _as_array_dtype(cols, np.int32)
         values = _as_array_dtype(values, np.float64)
@@ -1276,8 +1292,9 @@ class CholmodAAtNormalEquationPlan:
         self.a_data = np.zeros(int(self.h_indices.size), dtype=np.float64)
         self.rhs = np.zeros(self.shape[1], dtype=np.float64)
         self._rhs_values = np.empty(int(self.h_cols.size), dtype=np.float64)
-        self._weighted_residual = np.empty(self.shape[0], dtype=np.float64)
+        self._sqrt_weighted_residual = np.empty(self.shape[0], dtype=np.float64)
         self._fixed_sqrt_weight = None
+        self._fixed_sqrt_row_weight = None
         self.A = SP_CSC_MATRIX(
             (self.a_data, self.a_indices, self.a_indptr),
             shape=self.a_shape,
@@ -1307,13 +1324,15 @@ class CholmodAAtNormalEquationPlan:
 
     def prepare_fixed_weights(self, weight: np.ndarray) -> None:
         weight = np.asarray(weight, dtype=np.float64)
+        self._fixed_sqrt_row_weight = np.sqrt(weight).astype(np.float64, copy=True)
         if self.h_rows.size:
-            self._fixed_sqrt_weight = np.sqrt(weight[self.h_rows]).astype(np.float64, copy=True)
+            self._fixed_sqrt_weight = self._fixed_sqrt_row_weight[self.h_rows].astype(np.float64, copy=True)
         else:
             self._fixed_sqrt_weight = np.array([], dtype=np.float64)
 
     def clear_fixed_weights(self) -> None:
         self._fixed_sqrt_weight = None
+        self._fixed_sqrt_row_weight = None
 
     def matches(self, H) -> bool:
         if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
@@ -1396,17 +1415,21 @@ class CholmodAAtNormalEquationPlan:
                 self.a_data[:] = data
 
             if weighted_residual_values is None and row_weight is not None and assume_fixed_weights:
-                if self._weighted_residual.shape[0] != residual.shape[0]:
-                    self._weighted_residual = np.empty(residual.shape[0], dtype=np.float64)
-                np.multiply(residual, row_weight, out=self._weighted_residual)
-                np.multiply(data, self._weighted_residual[self.h_rows], out=self._rhs_values)
+                sqrt_row_weight = self._fixed_sqrt_row_weight
+                if sqrt_row_weight is None or sqrt_row_weight.shape[0] != residual.shape[0]:
+                    self.prepare_fixed_weights(row_weight)
+                    sqrt_row_weight = self._fixed_sqrt_row_weight
+                if self._sqrt_weighted_residual.shape[0] != residual.shape[0]:
+                    self._sqrt_weighted_residual = np.empty(residual.shape[0], dtype=np.float64)
+                np.multiply(residual, sqrt_row_weight, out=self._sqrt_weighted_residual)
+                self.rhs[:] = self.A @ self._sqrt_weighted_residual
             else:
                 np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
-            self.rhs[:] = np.bincount(
-                self.h_cols,
-                weights=self._rhs_values,
-                minlength=self.shape[1],
-            )
+                self.rhs[:] = np.bincount(
+                    self.h_cols,
+                    weights=self._rhs_values,
+                    minlength=self.shape[1],
+                )
         else:
             self.a_data.fill(0.0)
             self.rhs.fill(0.0)
