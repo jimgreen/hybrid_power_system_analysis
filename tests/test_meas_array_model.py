@@ -134,6 +134,28 @@ class MeasurementArrayModelTest(unittest.TestCase):
         )
         np.testing.assert_allclose(ppc["meas"][:, MEAS_COLS["value"]], np.array([2.0, 1.0]))
 
+    def test_measurement_table_from_meas_ppc_carries_runtime_index_arrays(self):
+        from model.meas_array_model import copy_meas_ppc, build_meas_ppc_from_e_file, measurement_table_from_meas_ppc
+
+        meas_file = ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas"
+        ppc = build_meas_ppc_from_e_file(meas_file)
+        row_count = int(ppc["meas"].shape[0])
+        ppc["device_pos"] = np.arange(row_count, dtype=np.int64)
+        ppc["scale"] = np.linspace(1.0, 2.0, row_count, dtype=np.float64)
+        ppc["from_pos"] = np.arange(row_count, dtype=np.int64) + 10
+        ppc["to_pos"] = np.arange(row_count, dtype=np.int64) + 20
+
+        copied = copy_meas_ppc(ppc)
+        table = measurement_table_from_meas_ppc(copied)
+
+        np.testing.assert_array_equal(table.device_pos, ppc["device_pos"])
+        np.testing.assert_array_equal(copied["device_pos"], ppc["device_pos"])
+        np.testing.assert_array_equal(copied["scale"], ppc["scale"])
+        np.testing.assert_array_equal(copied["from_pos"], ppc["from_pos"])
+        np.testing.assert_array_equal(copied["to_pos"], ppc["to_pos"])
+        self.assertIsNot(copied["device_pos"], ppc["device_pos"])
+        self.assertIsNot(copied["scale"], ppc["scale"])
+
 
 if __name__ == "__main__":
     unittest.main()

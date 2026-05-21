@@ -45,25 +45,25 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._ac_measurement_plan_device_pos_by_type_code = name_maps
         estimator._ac_measurement_plan_device_pos_by_type_code_id = id_maps
         estimator._ac_branch_transformer_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACBRANCH: ac_se._AC_TERMINAL_MEASUREMENT_KIND,
-            ac_se.DEVICE_TYPE_CODES_ACTRANSFORMER: ac_se._AC_TERMINAL_MEASUREMENT_KIND,
+            ac_se.DEVICE_TYPE_CODES_ACBRANCH: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
+            ac_se.DEVICE_TYPE_CODES_ACTRANSFORMER: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_zero_current_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACZEROBRANCH: ac_se._AC_ZERO_MEASUREMENT_KIND,
-            ac_se.DEVICE_TYPE_CODES_ACBREAK: ac_se._AC_TERMINAL_MEASUREMENT_KIND,
+            ac_se.DEVICE_TYPE_CODES_ACZEROBRANCH: ac_se._AC_ZERO_MEAS_TYPE_LOOKUP,
+            ac_se.DEVICE_TYPE_CODES_ACBREAK: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_simple_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACNODE: ac_se._AC_NODE_MEASUREMENT_KIND,
-            ac_se.DEVICE_TYPE_CODES_ACGENERATOR: ac_se._AC_GENERATOR_SIMPLE_MEASUREMENT_KIND,
-            ac_se.DEVICE_TYPE_CODES_ACLOAD: ac_se._AC_LOAD_MEASUREMENT_KIND,
-            ac_se.DEVICE_TYPE_CODES_ACZEROBRANCHCONSTRAINT: ac_se._AC_CONSTRAINT_MEASUREMENT_KIND,
-            ac_se.DEVICE_TYPE_CODES_ACBREAKCONSTRAINT: ac_se._AC_CONSTRAINT_MEASUREMENT_KIND,
+            ac_se.DEVICE_TYPE_CODES_ACNODE: ac_se._AC_NODE_MEAS_TYPE_LOOKUP,
+            ac_se.DEVICE_TYPE_CODES_ACGENERATOR: ac_se._AC_GENERATOR_SIMPLE_MEAS_TYPE_LOOKUP,
+            ac_se.DEVICE_TYPE_CODES_ACLOAD: ac_se._AC_LOAD_MEAS_TYPE_LOOKUP,
+            ac_se.DEVICE_TYPE_CODES_ACZEROBRANCHCONSTRAINT: ac_se._AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
+            ac_se.DEVICE_TYPE_CODES_ACBREAKCONSTRAINT: ac_se._AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_generator_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACGENERATOR: ac_se._AC_GENERATOR_POWER_MEASUREMENT_KIND,
+            ac_se.DEVICE_TYPE_CODES_ACGENERATOR: ac_se._AC_GENERATOR_POWER_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_balance_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE: ac_se._AC_BALANCE_MEASUREMENT_KIND,
+            ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE: ac_se._AC_BALANCE_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_measurement_plan_kind_codes = {
             "branch_transformer": estimator._measurement_kind_code_maps_for(estimator._ac_branch_transformer_plan_kind_by_type_code),
@@ -537,6 +537,28 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(plan._fixed_pair_weight, weight[plan.pair_rows])
         np.testing.assert_allclose(cached_gain.toarray(), np.tril(refreshed_full_gain.toarray()))
         np.testing.assert_allclose(cached_rhs, refreshed_full_rhs)
+
+    def test_lower_normal_equation_csc_plan_can_reuse_rhs_buffer(self):
+        from scipy.sparse import csr_matrix
+        from secore.se_math import LowerNormalEquationCscPlan
+
+        H = csr_matrix(
+            np.array(
+                [
+                    [2.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [1.0, 1.0, 0.0],
+                ],
+                dtype=np.float64,
+            )
+        )
+        residual = np.array([0.5, -1.5, 2.0], dtype=np.float64)
+        weight = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+
+        plan = LowerNormalEquationCscPlan.from_jacobian(H)
+        _gain, rhs = plan.assemble(H, residual, weight, dense_gain_limit=0, copy_rhs=False)
+
+        self.assertTrue(np.shares_memory(rhs, plan.rhs))
 
     def test_full_normal_equation_from_lower_restores_symmetric_matrix(self):
         from scipy.sparse import csc_matrix, isspmatrix_csc
@@ -2923,7 +2945,6 @@ class ACStateEstimationTest(unittest.TestCase):
             (target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_FROM),
             (target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_FROM),
         }
-        existing_names = set()
 
         class RejectDeviceMap(dict):
             def __contains__(self, _key):
@@ -2941,7 +2962,6 @@ class ACStateEstimationTest(unittest.TestCase):
             next_idx,
             target_col,
             existing_keys,
-            existing_names,
             2,
         )
 
@@ -2974,7 +2994,6 @@ class ACStateEstimationTest(unittest.TestCase):
             )
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
         existing_keys = set()
-        existing_names = set()
         target_col, target_meta = next(
             (idx, meta)
             for idx, meta in enumerate(estimator.state_meta)
@@ -2997,7 +3016,6 @@ class ACStateEstimationTest(unittest.TestCase):
             next_idx,
             target_col,
             existing_keys,
-            existing_names,
             1,
         )
 
@@ -4156,6 +4174,54 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(plan.device_pos, table.device_pos)
+
+    def test_prepare_builds_measurement_name_id_lookup_once(self):
+        from secore.ac_se import ACStateEstimator
+
+        original = ACStateEstimator._measurement_plan_device_id_lookup_arrays
+        calls = 0
+
+        def counted(self):
+            nonlocal calls
+            calls += 1
+            return original(self)
+
+        ACStateEstimator._measurement_plan_device_id_lookup_arrays = counted
+        try:
+            ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+                flat_start=True,
+                prepare_active_measurements=False,
+            )
+        finally:
+            ACStateEstimator._measurement_plan_device_id_lookup_arrays = original
+
+        self.assertEqual(1, calls)
+
+    def test_prepare_resolves_measurement_device_positions_once(self):
+        from secore.ac_se import ACStateEstimator
+
+        original = ACStateEstimator._measurement_device_pos_array
+        calls = 0
+
+        def counted(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(self, *args, **kwargs)
+
+        ACStateEstimator._measurement_device_pos_array = counted
+        try:
+            ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+                flat_start=True,
+                prepare_active_measurements=False,
+            )
+        finally:
+            ACStateEstimator._measurement_device_pos_array = original
+
+        self.assertEqual(1, calls)
 
     def test_measurement_plan_uses_meas_type_codes_not_strings(self):
         from secore.ac_se import ACStateEstimator
@@ -5383,7 +5449,7 @@ class ACStateEstimationTest(unittest.TestCase):
             ac_se.LowerNormalEquationCscPlan.assemble = original_lower_assemble
 
         self.assertTrue(result.converged)
-        self.assertEqual(1, len(lower_plan_builds))
+        self.assertEqual(0, len(lower_plan_builds))
         self.assertGreater(len(lower_assemblies), 0)
 
     def test_active_estimate_keeps_gain_csc_pattern_stable_for_cholmod_reuse(self):
@@ -5897,6 +5963,27 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(result.observable)
         self.assertEqual(0, calls)
+
+    def test_active_observability_cache_prepares_lower_normal_plan(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+        )
+        estimator._active_lower_normal_plan = None
+
+        result = estimator.observability_analysis()
+        cache = estimator._observability_matrix_cache_for(
+            result,
+            estimator._active_measurement_plan_tables_cache,
+            estimator.initial_state(),
+        )
+
+        self.assertIsNotNone(cache)
+        self.assertIsNotNone(cache.get("lower_normal_plan"))
+        self.assertIs(cache.get("lower_normal_plan"), estimator._active_lower_normal_plan)
 
     def test_sparse_observability_disables_dynamic_pivoting_for_speed(self):
         from scipy.sparse import csc_matrix, eye

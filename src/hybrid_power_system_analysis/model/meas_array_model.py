@@ -5,12 +5,13 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from efile_read import _read_efile_rows
+from efile_read import _read_efile_rows, _split_data_row
 from paths import resolve_project_file
+from model.meas_type import DEVICE_TYPE_CODES, MEAS_TYPE_CODES, MEAS_TYPE_NAMES
 from model.meas_model import (
-    DEVICE_TYPE_CODES,
     MEAS_STATUS_INVALID,
     MEAS_STATUS_NORMAL,
+    MEAS_STATUS_PSEUDO,
     MEAS_STATUS_REMOVED,
     MeasurementTable,
     TableBackedMeasurementList,
@@ -31,45 +32,6 @@ MEAS_COLS = {
     "angle_mask": 8,
     "source_row": 9,
 }
-
-MEAS_TYPE_CODES = {
-    "UNKNOWN": 0,
-    "V": 1,
-    "ANGLE": 2,
-    "THETA": 3,
-    "P_FROM": 4,
-    "Q_FROM": 5,
-    "V_FROM": 6,
-    "I_FROM": 7,
-    "P_TO": 8,
-    "Q_TO": 9,
-    "V_TO": 10,
-    "I_TO": 11,
-    "P_LOAD": 12,
-    "Q_LOAD": 13,
-    "V_LOAD": 14,
-    "I_LOAD": 15,
-    "P_GEN": 16,
-    "Q_GEN": 17,
-    "V_GEN": 18,
-    "I_GEN": 19,
-    "P_BALANCE": 20,
-    "Q_BALANCE": 21,
-    "V_DIFF": 22,
-    "ANGLE_DIFF": 23,
-    "THETA_DIFF": 24,
-    "P_DC": 25,
-    "V_DC": 26,
-    "I_DC": 27,
-    "P_AC": 28,
-    "Q_AC": 29,
-    "V_AC": 30,
-    "I_AC": 31,
-    "P_IN": 32,
-    "P_OUT": 33,
-    "I_OUT": 34,
-}
-MEAS_TYPE_NAMES = {code: name for name, code in MEAS_TYPE_CODES.items()}
 
 ANGLE_MEASUREMENT_TYPE_CODES = np.asarray(
     [
@@ -328,6 +290,176 @@ def _build_meas_ppc_from_rows_dict(rows_dict: Dict, source: Path) -> Dict:
     )
 
 
+def _normalize_status_text(status_text, valid: bool) -> int:
+    if isinstance(status_text, str):
+        text = status_text.strip().upper()
+        if not text:
+            return MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+        if text == "0":
+            return MEAS_STATUS_NORMAL
+        if text == "1":
+            return MEAS_STATUS_INVALID
+        if text == "2":
+            return MEAS_STATUS_PSEUDO
+        if text == "3":
+            return MEAS_STATUS_REMOVED
+    return normalize_measurement_status(status_text, valid=valid)
+
+
+def _measurement_block_name(line: str) -> Optional[str]:
+    if not line.startswith("<") or not line.endswith(">"):
+        return None
+    name = line[1:-1].strip()
+    if name.startswith("/"):
+        name = name[1:].strip()
+    if " lv " in name:
+        name = name.split(" lv ", 1)[0].strip()
+    return name
+
+
+def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
+    header = ()
+    idx_col = name_col = device_type_col = device_name_col = meas_type_col = -1
+    weight_col = valid_col = value_col = -1
+    status_col = -1
+    required_max_col = -1
+    idx_values = []
+    name_values = []
+    device_type_values = []
+    device_name_values = []
+    meas_type_values = []
+    weight_values = []
+    valid_values = []
+    value_values = []
+    status_values = []
+    device_type_code_values = []
+    meas_type_code_values = []
+    device_name_id = []
+    device_names_list = []
+    device_name_lookup = {}
+
+    intern = sys.intern
+    split_data_row = _split_data_row
+    device_code_get = DEVICE_TYPE_CODES.get
+    meas_code_get = MEAS_TYPE_CODES.get
+    in_measurement = False
+
+    try:
+        with open(source, mode="rt", encoding="utf8") as fp:
+            for line_no, raw_line in enumerate(fp, start=1):
+                first = raw_line[0] if raw_line else ""
+                if first == "#" and in_measurement:
+                    text = raw_line[1:]
+                else:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    first = line[0]
+                    if first == "<":
+                        block_name = _measurement_block_name(line)
+                        if not line.startswith("</") and block_name == "Measurement":
+                            in_measurement = True
+                            header = ()
+                        elif line.startswith("</") and block_name == "Measurement" and in_measurement:
+                            break
+                        elif in_measurement and line.startswith("</"):
+                            break
+                        continue
+                    if first == "@" and in_measurement:
+                        header = tuple(line[1:].split())
+                        header_index = {name: idx for idx, name in enumerate(header)}
+                        missing = [name for name in _REQUIRED_COLUMNS if name not in header_index]
+                        if missing:
+                            raise RuntimeError(f"{source} Measurement header is missing columns: {missing}")
+                        idx_col = header_index["idx"]
+                        name_col = header_index["name"]
+                        device_type_col = header_index["dev_type"]
+                        device_name_col = header_index["dev_name"]
+                        meas_type_col = header_index["meas_type"]
+                        weight_col = header_index["weight"]
+                        valid_col = header_index["valid"]
+                        value_col = header_index["value"]
+                        status_col = header_index.get("status", -1)
+                        required_max_col = max(
+                            idx_col,
+                            name_col,
+                            device_type_col,
+                            device_name_col,
+                            meas_type_col,
+                            weight_col,
+                            valid_col,
+                            value_col,
+                        )
+                        continue
+                    if first != "#" or not in_measurement:
+                        continue
+                    text = line[1:]
+
+                fields = text.split() if "'" not in text else split_data_row(text)
+                if not header:
+                    raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
+                if len(fields) <= required_max_col:
+                    raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
+                idx_values.append(int(fields[idx_col]))
+                name_values.append(fields[name_col])
+                device_type = intern(fields[device_type_col])
+                device_name = intern(fields[device_name_col])
+                meas_type = intern(fields[meas_type_col].upper())
+                device_type_values.append(device_type)
+                device_name_values.append(device_name)
+                meas_type_values.append(meas_type)
+                weight_values.append(float(fields[weight_col]))
+                valid = fields[valid_col] == "1"
+                value_values.append(float(fields[value_col]))
+                if status_col >= 0 and len(fields) > status_col:
+                    status = _normalize_status_text(fields[status_col], valid)
+                else:
+                    status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+                if not measurement_status_is_active(status):
+                    valid = False
+                valid_values.append(valid)
+                status_values.append(status)
+                device_type_code_values.append(int(device_code_get(device_type, 0)))
+                meas_type_code_values.append(int(meas_code_get(meas_type, 0)))
+                name_id = device_name_lookup.get(device_name)
+                if name_id is None:
+                    name_id = len(device_names_list)
+                    device_name_lookup[device_name] = name_id
+                    device_names_list.append(device_name)
+                device_name_id.append(name_id)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Malformed Measurement row in {source}") from exc
+
+    if not header:
+        raise RuntimeError(f"{source} does not contain a <Measurement> block")
+    if not idx_values:
+        return _empty_meas_ppc(source)
+    idx_array = np.asarray(idx_values, dtype=np.int64)
+    device_type_code_array = np.asarray(device_type_code_values, dtype=np.int16)
+    meas_type_code_array = np.asarray(meas_type_code_values, dtype=np.int16)
+    rows_by_code = {
+        int(code): np.flatnonzero(device_type_code_array == int(code)).astype(np.int64, copy=False)
+        for code in np.unique(device_type_code_array)
+    }
+    return _build_ppc(
+        source=source,
+        idx=idx_array,
+        name=np.asarray(name_values, dtype=object),
+        device_type=np.asarray(device_type_values, dtype=object),
+        device_name=np.asarray(device_name_values, dtype=object),
+        meas_type=np.asarray(meas_type_values, dtype=object),
+        weight=np.asarray(weight_values, dtype=np.float64),
+        valid=np.asarray(valid_values, dtype=bool),
+        value=np.asarray(value_values, dtype=np.float64),
+        status=np.asarray(status_values, dtype=np.int16),
+        rows_by_device_type_code=rows_by_code,
+        device_type_code=device_type_code_array,
+        meas_type_code=meas_type_code_array,
+        device_name_id=np.asarray(device_name_id, dtype=np.int32),
+        device_names=np.asarray(device_names_list, dtype=object),
+    )
+
+
 def build_meas_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build measurement ppc from E rows that are already loaded in memory."""
     path = resolve_project_file(file_path).resolve()
@@ -342,7 +474,7 @@ def build_meas_ppc_from_e_file(file_path) -> Dict:
         if cached is not None and cached[0] == file_key:
             return cached[1]
 
-    ppc = _build_meas_ppc_from_rows_dict(_read_efile_rows(file_key[0]), file_key[0])
+    ppc = _build_meas_ppc_from_measurement_file(file_key[0])
     with _MEAS_PPC_CACHE_LOCK:
         _MEAS_PPC_CACHE[file_key[0]] = (file_key, ppc)
     return ppc
@@ -351,24 +483,22 @@ def build_meas_ppc_from_e_file(file_path) -> Dict:
 def copy_meas_ppc(ppc: Dict) -> Dict:
     """Return a shallow PPC copy with mutable measurement arrays copied."""
     copied = dict(ppc)
-    for key in ("meas", "name", "device_type", "device_name", "device_names", "meas_type"):
+    for key in ("meas", "device_pos", "scale", "from_pos", "to_pos", "available"):
         value = ppc.get(key)
         if isinstance(value, np.ndarray):
             copied[key] = value.copy()
-    if isinstance(ppc.get("device_name_id_by_name"), dict):
-        copied["device_name_id_by_name"] = dict(ppc["device_name_id_by_name"])
-    rows = ppc.get("rows_by_device_type_code")
-    if isinstance(rows, dict):
-        copied["rows_by_device_type_code"] = {
-            int(code): np.asarray(values, dtype=np.int64).copy()
-            for code, values in rows.items()
-        }
     return copied
 
 
 def measurement_table_from_meas_ppc(ppc: Dict) -> MeasurementTable:
     meas = ppc["meas"]
     cols = ppc.get("meas_cols", MEAS_COLS)
+    row_count = int(meas.shape[0])
+    device_pos = ppc.get("device_pos")
+    if isinstance(device_pos, np.ndarray) and int(device_pos.size) == row_count:
+        device_pos = device_pos.astype(np.int64, copy=False)
+    else:
+        device_pos = None
     table = MeasurementTable(
         idx=meas[:, cols["idx"]].astype(np.int64, copy=False),
         name=np.asarray(ppc.get("name", ()), dtype=object),
@@ -384,7 +514,12 @@ def measurement_table_from_meas_ppc(ppc: Dict) -> MeasurementTable:
         rows_by_device_type_code=ppc.get("rows_by_device_type_code"),
         device_name_id=meas[:, cols["device_name_id"]].astype(np.int64, copy=False),
         meas_type_code=meas[:, cols["meas_type_code"]].astype(np.int16, copy=False),
+        device_pos=device_pos,
     )
+    for key in ("scale", "from_pos", "to_pos", "available"):
+        value = ppc.get(key)
+        if isinstance(value, np.ndarray) and int(value.size) == row_count:
+            setattr(table, key, value)
     return table
 
 

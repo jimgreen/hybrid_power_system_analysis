@@ -41,13 +41,27 @@ from model.meas_array_model import (
     measurement_list_from_meas_ppc,
     sync_meas_ppc_from_measurement_table,
 )
+from model.meas_type import (
+    DEVICE_TYPE_CODES,
+    MEAS_TYPE_CODES,
+    MEAS_TYPE_V,
+    MEAS_TYPE_P_FROM,
+    MEAS_TYPE_V_FROM,
+    MEAS_TYPE_I_FROM,
+    MEAS_TYPE_P_TO,
+    MEAS_TYPE_V_TO,
+    MEAS_TYPE_I_TO,
+    MEAS_TYPE_P_LOAD,
+    MEAS_TYPE_V_LOAD,
+    MEAS_TYPE_I_LOAD,
+    MEAS_TYPE_P_GEN,
+    MEAS_TYPE_V_GEN,
+    MEAS_TYPE_I_GEN,
+    MEAS_TYPE_V_DIFF,
+)
 from model.meas_model import (
     BadDataItem,
-    DEVICE_TYPE_CODES,
     EstimateResult,
-    GEN_CONTROL_KIND,
-    GEN_MEASUREMENT_KIND,
-    LOAD_MEASUREMENT_KIND,
     MEAS_STATUS_INVALID,
     MEAS_STATUS_NORMAL,
     MEAS_STATUS_PSEUDO,
@@ -56,7 +70,6 @@ from model.meas_model import (
     MeasurementTable,
     ObservabilityResult,
     TableBackedMeasurementList,
-    TERMINAL_MEASUREMENT_KIND,
     is_pseudo_measurement,
     mark_measurement_invalid,
     mark_measurement_pseudo,
@@ -98,11 +111,29 @@ DEFAULT_CASE = model_file("dc", "dc_net_30.e")
 DEFAULT_MEAS = measurement_file("dc", "dc_net_30.meas")
 
 _MEASUREMENT_REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
-_TERMINAL_KIND = TERMINAL_MEASUREMENT_KIND
-_LOAD_MEASUREMENT_KIND = LOAD_MEASUREMENT_KIND
-_GEN_MEASUREMENT_KIND = GEN_MEASUREMENT_KIND
-_GEN_CONTROL_KIND = GEN_CONTROL_KIND
 _DEVICE_TYPE_CODES = DEVICE_TYPE_CODES
+_DC_TERMINAL_MEAS_TYPE_CODES = {
+    "P_FROM": MEAS_TYPE_P_FROM,
+    "V_FROM": MEAS_TYPE_V_FROM,
+    "I_FROM": MEAS_TYPE_I_FROM,
+    "P_TO": MEAS_TYPE_P_TO,
+    "V_TO": MEAS_TYPE_V_TO,
+    "I_TO": MEAS_TYPE_I_TO,
+}
+_DC_LOAD_MEAS_TYPE_CODES = {
+    "P_LOAD": MEAS_TYPE_P_LOAD,
+    "V_LOAD": MEAS_TYPE_V_LOAD,
+    "I_LOAD": MEAS_TYPE_I_LOAD,
+}
+_DC_GEN_MEAS_TYPE_CODES = {
+    "P_GEN": MEAS_TYPE_P_GEN,
+    "V_GEN": MEAS_TYPE_V_GEN,
+    "I_GEN": MEAS_TYPE_I_GEN,
+}
+_DC_NODE_MEAS_TYPE_CODES = {"V": MEAS_TYPE_V}
+_DC_CONSTRAINT_MEAS_TYPE_CODES = {"V_DIFF": MEAS_TYPE_V_DIFF}
+_GEN_CONTROL_CODE_BY_NAME = {"V": 0, "P": 1, "I": 2}
+_MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
 _VOLTAGE_MEASUREMENT_TYPES = frozenset(("V", "V_FROM", "V_TO", "V_GEN", "V_LOAD"))
 _VOLTAGE_MEASUREMENT_TYPE_TUPLE = tuple(_VOLTAGE_MEASUREMENT_TYPES)
 
@@ -967,12 +998,12 @@ class DCStateEstimator:
         ``section_kind == k`` mask. Called after every plan build / merge /
         shrink so the masks always reflect the current kind arrays."""
         for key, max_kind in (
-            ("branch_kind", 5),
-            ("load_kind", 2),
-            ("gen_kind", 2),
+            ("branch_kind", MEAS_TYPE_I_TO),
+            ("load_kind", MEAS_TYPE_I_LOAD),
+            ("gen_kind", MEAS_TYPE_I_GEN),
             ("gen_ctrl", 2),
-            ("switch_kind", 5),
-            ("dcdc_kind", 5),
+            ("switch_kind", MEAS_TYPE_I_TO),
+            ("dcdc_kind", MEAS_TYPE_I_TO),
         ):
             kind = plan.get(key)
             if kind is None:
@@ -1578,7 +1609,7 @@ class DCStateEstimator:
             )
         self._generator_plan_by_name = {}
         for gen in self.generator_by_name.values():
-            ctrl = _GEN_CONTROL_KIND.get(gen.control_type)
+            ctrl = _GEN_CONTROL_CODE_BY_NAME.get(gen.control_type)
             if ctrl is None:
                 continue
             pos = self.node_pos[gen.node]
@@ -1725,15 +1756,15 @@ class DCStateEstimator:
             _DEVICE_TYPE_CODES["DCDCConverter"]: self._dcdc_plan_name_to_pos,
         }
         self._measurement_plan_meas_kind_by_type_code = {
-            _DEVICE_TYPE_CODES["DCNode"]: {"V": 0},
-            _DEVICE_TYPE_CODES["DCBranch"]: _TERMINAL_KIND,
-            _DEVICE_TYPE_CODES["DCLoad"]: _LOAD_MEASUREMENT_KIND,
-            _DEVICE_TYPE_CODES["DCGenerator"]: _GEN_MEASUREMENT_KIND,
-            _DEVICE_TYPE_CODES["DCZeroBranch"]: _TERMINAL_KIND,
-            _DEVICE_TYPE_CODES["DCBreak"]: _TERMINAL_KIND,
-            _DEVICE_TYPE_CODES["DCZeroBranchConstraint"]: {"V_DIFF": 0},
-            _DEVICE_TYPE_CODES["DCBreakConstraint"]: {"V_DIFF": 0},
-            _DEVICE_TYPE_CODES["DCDCConverter"]: _TERMINAL_KIND,
+            _DEVICE_TYPE_CODES["DCNode"]: _DC_NODE_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCBranch"]: _DC_TERMINAL_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCLoad"]: _DC_LOAD_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCGenerator"]: _DC_GEN_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCZeroBranch"]: _DC_TERMINAL_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCBreak"]: _DC_TERMINAL_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCZeroBranchConstraint"]: _DC_CONSTRAINT_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCBreakConstraint"]: _DC_CONSTRAINT_MEAS_TYPE_CODES,
+            _DEVICE_TYPE_CODES["DCDCConverter"]: _DC_TERMINAL_MEAS_TYPE_CODES,
         }
 
     def _ensure_measurement_plan_lookup_arrays(self) -> None:
@@ -2271,15 +2302,24 @@ class DCStateEstimator:
             for node_idx, vbase in self._node_vbase_by_idx.items()
         }
 
-    def _terminal_scale_tuple(self, i_node: int, j_node: int) -> Tuple[float, float, float, float, float, float]:
-        """Return scale values ordered by _TERMINAL_KIND."""
-        return (
-            self.p_base,
-            self._voltage_file_base_by_idx[int(i_node)],
-            self._current_file_base_by_idx[int(i_node)],
-            self.p_base,
-            self._voltage_file_base_by_idx[int(j_node)],
-            self._current_file_base_by_idx[int(j_node)],
+    @staticmethod
+    def _measurement_scale_tuple(assignments: Dict[int, float]) -> Tuple[float, ...]:
+        scale = np.ones(_MAX_MEAS_TYPE_CODE + 1, dtype=np.float64)
+        for code, value in assignments.items():
+            scale[int(code)] = float(value)
+        return tuple(scale.tolist())
+
+    def _terminal_scale_tuple(self, i_node: int, j_node: int) -> Tuple[float, ...]:
+        """Return scale values indexed by MEAS_TYPE code."""
+        return self._measurement_scale_tuple(
+            {
+                MEAS_TYPE_P_FROM: self.p_base,
+                MEAS_TYPE_V_FROM: self._voltage_file_base_by_idx[int(i_node)],
+                MEAS_TYPE_I_FROM: self._current_file_base_by_idx[int(i_node)],
+                MEAS_TYPE_P_TO: self.p_base,
+                MEAS_TYPE_V_TO: self._voltage_file_base_by_idx[int(j_node)],
+                MEAS_TYPE_I_TO: self._current_file_base_by_idx[int(j_node)],
+            }
         )
 
     def _build_measurement_scale_cache(self) -> None:
@@ -2305,18 +2345,22 @@ class DCStateEstimator:
             for conv in self.dcdc_by_name.values()
         }
         self._generator_measurement_scale_by_name = {
-            gen.name: (
-                self.p_base,
-                self._voltage_file_base_by_idx[int(gen.node)],
-                self._current_file_base_by_idx[int(gen.node)],
+            gen.name: self._measurement_scale_tuple(
+                {
+                    MEAS_TYPE_P_GEN: self.p_base,
+                    MEAS_TYPE_V_GEN: self._voltage_file_base_by_idx[int(gen.node)],
+                    MEAS_TYPE_I_GEN: self._current_file_base_by_idx[int(gen.node)],
+                }
             )
             for gen in self.generator_by_name.values()
         }
         self._load_measurement_scale_by_name = {
-            load.name: (
-                self.p_base,
-                self._voltage_file_base_by_idx[int(load.node)],
-                self._current_file_base_by_idx[int(load.node)],
+            load.name: self._measurement_scale_tuple(
+                {
+                    MEAS_TYPE_P_LOAD: self.p_base,
+                    MEAS_TYPE_V_LOAD: self._voltage_file_base_by_idx[int(load.node)],
+                    MEAS_TYPE_I_LOAD: self._current_file_base_by_idx[int(load.node)],
+                }
             )
             for load in self.load_by_name.values()
         }
@@ -2408,17 +2452,17 @@ class DCStateEstimator:
         fill_tuple(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBranch"])),
             self._branch_measurement_scale_by_name,
-            _TERMINAL_KIND,
+            _DC_TERMINAL_MEAS_TYPE_CODES,
         )
         fill_tuple(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreak"])),
             self._break_measurement_scale_by_name,
-            _TERMINAL_KIND,
+            _DC_TERMINAL_MEAS_TYPE_CODES,
         )
         fill_tuple(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranch"])),
             self._zero_branch_measurement_scale_by_name,
-            _TERMINAL_KIND,
+            _DC_TERMINAL_MEAS_TYPE_CODES,
         )
         fill_scalar(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranchConstraint"])),
@@ -2433,17 +2477,17 @@ class DCStateEstimator:
         fill_tuple(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCDCConverter"])),
             self._dcdc_measurement_scale_by_name,
-            _TERMINAL_KIND,
+            _DC_TERMINAL_MEAS_TYPE_CODES,
         )
         fill_tuple(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCGenerator"])),
             self._generator_measurement_scale_by_name,
-            _GEN_MEASUREMENT_KIND,
+            _DC_GEN_MEAS_TYPE_CODES,
         )
         fill_tuple(
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCLoad"])),
             self._load_measurement_scale_by_name,
-            _LOAD_MEASUREMENT_KIND,
+            _DC_LOAD_MEAS_TYPE_CODES,
         )
         value[active] = np.divide(value[active], scale[active], out=value[active].copy(), where=np.abs(scale[active]) > 1e-12)
         object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
@@ -3330,7 +3374,7 @@ class DCStateEstimator:
             positions = device_pos[rows]
             kind = meas_kind[rows]
             current_pos = plan_current_pos[positions]
-            keep = (current_pos >= 0) | (kind == _TERMINAL_KIND["V_FROM"]) | (kind == _TERMINAL_KIND["V_TO"])
+            keep = (current_pos >= 0) | (kind == MEAS_TYPE_V_FROM) | (kind == MEAS_TYPE_V_TO)
             if keep.size and not np.all(keep):
                 handled[rows[~keep]] = False
             rows = rows[keep]
@@ -3498,22 +3542,22 @@ class DCStateEstimator:
             inv_r = plan["branch_inv_r"]
             current = (vi - vj) * inv_r
             out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[0]
+            m = kind_masks[MEAS_TYPE_P_FROM]
             if m.any():
                 out[m] = vi[m] * current[m]
-            m = kind_masks[1]
+            m = kind_masks[MEAS_TYPE_V_FROM]
             if m.any():
                 out[m] = vi[m]
-            m = kind_masks[2]
+            m = kind_masks[MEAS_TYPE_I_FROM]
             if m.any():
                 out[m] = current[m]
-            m = kind_masks[3]
+            m = kind_masks[MEAS_TYPE_P_TO]
             if m.any():
                 out[m] = -vj[m] * current[m]
-            m = kind_masks[4]
+            m = kind_masks[MEAS_TYPE_V_TO]
             if m.any():
                 out[m] = vj[m]
-            m = kind_masks[5]
+            m = kind_masks[MEAS_TYPE_I_TO]
             if m.any():
                 out[m] = -current[m]
             values[rows] = out
@@ -3524,13 +3568,13 @@ class DCStateEstimator:
             v = voltage[plan["load_pos"]]
             p = plan["load_pv0"] + plan["load_pv1"] * v + plan["load_pv2"] * v * v
             out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[0]
+            m = kind_masks[MEAS_TYPE_P_LOAD]
             if m.any():
                 out[m] = p[m]
-            m = kind_masks[1]
+            m = kind_masks[MEAS_TYPE_V_LOAD]
             if m.any():
                 out[m] = v[m]
-            i_mask = kind_masks[2]
+            i_mask = kind_masks[MEAS_TYPE_I_LOAD]
             if i_mask.any():
                 out[i_mask] = 0.0
                 v_i = v[i_mask]
@@ -3568,13 +3612,13 @@ class DCStateEstimator:
                     idx = np.flatnonzero(derived_current)
                     current[idx[valid]] = p_d[valid] / v_d[valid]
             out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[0]
+            m = kind_masks[MEAS_TYPE_P_GEN]
             if m.any():
                 out[m] = p[m]
-            m = kind_masks[1]
+            m = kind_masks[MEAS_TYPE_V_GEN]
             if m.any():
                 out[m] = v[m]
-            m = kind_masks[2]
+            m = kind_masks[MEAS_TYPE_I_GEN]
             if m.any():
                 out[m] = current[m]
             values[rows] = out
@@ -3589,22 +3633,22 @@ class DCStateEstimator:
             if current_mask.any():
                 current[current_mask] = switch_current[plan["switch_pos"][current_mask]]
             out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[0]
+            m = kind_masks[MEAS_TYPE_P_FROM]
             if m.any():
                 out[m] = vi[m] * current[m]
-            m = kind_masks[1]
+            m = kind_masks[MEAS_TYPE_V_FROM]
             if m.any():
                 out[m] = vi[m]
-            m = kind_masks[2]
+            m = kind_masks[MEAS_TYPE_I_FROM]
             if m.any():
                 out[m] = current[m]
-            m = kind_masks[3]
+            m = kind_masks[MEAS_TYPE_P_TO]
             if m.any():
                 out[m] = -vj[m] * current[m]
-            m = kind_masks[4]
+            m = kind_masks[MEAS_TYPE_V_TO]
             if m.any():
                 out[m] = vj[m]
-            m = kind_masks[5]
+            m = kind_masks[MEAS_TYPE_I_TO]
             if m.any():
                 out[m] = -current[m]
             values[rows] = out
@@ -3622,13 +3666,13 @@ class DCStateEstimator:
             v_from = voltage[plan["dcdc_i"]]
             v_to = voltage[plan["dcdc_j"]]
             out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[0]
+            m = kind_masks[MEAS_TYPE_P_FROM]
             if m.any():
                 out[m] = p_from[m]
-            m = kind_masks[1]
+            m = kind_masks[MEAS_TYPE_V_FROM]
             if m.any():
                 out[m] = v_from[m]
-            m = kind_masks[2]
+            m = kind_masks[MEAS_TYPE_I_FROM]
             if m.any():
                 v_f = v_from[m]
                 valid = np.abs(v_f) > self.min_current_voltage
@@ -3637,13 +3681,13 @@ class DCStateEstimator:
                 if valid.any():
                     tmp[valid] = p_from[m][valid] / v_f[valid]
                 out[idx] = tmp
-            m = kind_masks[3]
+            m = kind_masks[MEAS_TYPE_P_TO]
             if m.any():
                 out[m] = p_to[m]
-            m = kind_masks[4]
+            m = kind_masks[MEAS_TYPE_V_TO]
             if m.any():
                 out[m] = v_to[m]
-            m = kind_masks[5]
+            m = kind_masks[MEAS_TYPE_I_TO]
             if m.any():
                 v_t = v_to[m]
                 valid = np.abs(v_t) > self.min_current_voltage
@@ -3807,20 +3851,20 @@ class DCStateEstimator:
             vj = voltage[j]
             inv_r = plan["branch_inv_r"]
 
-            mask = kind_masks[0]
+            mask = kind_masks[MEAS_TYPE_P_FROM]
             self._add_indexed_values(H, rows, i_col, (2.0 * vi - vj) * inv_r, mask)
             self._add_indexed_values(H, rows, j_col, -vi * inv_r, mask)
-            mask = kind_masks[1]
+            mask = kind_masks[MEAS_TYPE_V_FROM]
             self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[2]
+            mask = kind_masks[MEAS_TYPE_I_FROM]
             self._add_indexed_values(H, rows, i_col, inv_r, mask)
             self._add_indexed_values(H, rows, j_col, -inv_r, mask)
-            mask = kind_masks[3]
+            mask = kind_masks[MEAS_TYPE_P_TO]
             self._add_indexed_values(H, rows, i_col, -vj * inv_r, mask)
             self._add_indexed_values(H, rows, j_col, (-vi + 2.0 * vj) * inv_r, mask)
-            mask = kind_masks[4]
+            mask = kind_masks[MEAS_TYPE_V_TO]
             self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[5]
+            mask = kind_masks[MEAS_TYPE_I_TO]
             self._add_indexed_values(H, rows, i_col, -inv_r, mask)
             self._add_indexed_values(H, rows, j_col, inv_r, mask)
 
@@ -3830,9 +3874,13 @@ class DCStateEstimator:
             pos = plan["load_pos"]
             col = plan["load_col"]
             v = voltage[pos]
-            self._add_indexed_values(H, rows, col, plan["load_pv1"] + 2.0 * plan["load_pv2"] * v, kind_masks[0])
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[1])
-            self._add_indexed_values(H, rows, col, plan["load_pv2"] - plan["load_pv0"] / (v * v), kind_masks[2])
+            self._add_indexed_values(
+                H, rows, col, plan["load_pv1"] + 2.0 * plan["load_pv2"] * v, kind_masks[MEAS_TYPE_P_LOAD]
+            )
+            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_LOAD])
+            self._add_indexed_values(
+                H, rows, col, plan["load_pv2"] - plan["load_pv0"] / (v * v), kind_masks[MEAS_TYPE_I_LOAD]
+            )
 
         rows = plan["gen_rows"]
         if rows.size:
@@ -3853,12 +3901,16 @@ class DCStateEstimator:
             if i_ctrl.any():
                 p[i_ctrl] = plan["gen_i_set"][i_ctrl] * v[i_ctrl]
 
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[1])
-            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[0] & v_ctrl)
-            self._add_indexed_values(H, rows, col, plan["gen_i_set"], kind_masks[0] & i_ctrl)
-            self._add_indexed_values(H, rows, p_col, 1.0 / v, kind_masks[2] & v_ctrl)
-            self._add_indexed_values(H, rows, col, -p / (v * v), kind_masks[2] & v_ctrl)
-            self._add_indexed_values(H, rows, col, -plan["gen_p_set"] / (v * v), kind_masks[2] & p_ctrl)
+            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_GEN])
+            self._add_indexed_values(
+                H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_P_GEN] & v_ctrl
+            )
+            self._add_indexed_values(H, rows, col, plan["gen_i_set"], kind_masks[MEAS_TYPE_P_GEN] & i_ctrl)
+            self._add_indexed_values(H, rows, p_col, 1.0 / v, kind_masks[MEAS_TYPE_I_GEN] & v_ctrl)
+            self._add_indexed_values(H, rows, col, -p / (v * v), kind_masks[MEAS_TYPE_I_GEN] & v_ctrl)
+            self._add_indexed_values(
+                H, rows, col, -plan["gen_p_set"] / (v * v), kind_masks[MEAS_TYPE_I_GEN] & p_ctrl
+            )
 
         rows = plan["switch_rows"]
         if rows.size:
@@ -3875,19 +3927,19 @@ class DCStateEstimator:
             if current_mask.any():
                 current[current_mask] = switch_current[plan["switch_pos"][current_mask]]
 
-            mask = kind_masks[0]
+            mask = kind_masks[MEAS_TYPE_P_FROM]
             self._add_indexed_values(H, rows, i_col, current, mask)
             self._add_indexed_values(H, rows, col, vi, mask)
-            mask = kind_masks[1]
+            mask = kind_masks[MEAS_TYPE_V_FROM]
             self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[2]
+            mask = kind_masks[MEAS_TYPE_I_FROM]
             self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[3]
+            mask = kind_masks[MEAS_TYPE_P_TO]
             self._add_indexed_values(H, rows, j_col, -current, mask)
             self._add_indexed_values(H, rows, col, -vj, mask)
-            mask = kind_masks[4]
+            mask = kind_masks[MEAS_TYPE_V_TO]
             self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[5]
+            mask = kind_masks[MEAS_TYPE_I_TO]
             self._add_indexed_values(H, rows, col, -np.ones(rows.size, dtype=np.float64), mask)
 
         rows = plan["constraint_rows"]
@@ -3910,14 +3962,14 @@ class DCStateEstimator:
             v_from = voltage[i]
             v_to = voltage[j]
 
-            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[0])
-            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), kind_masks[1])
-            mask = kind_masks[2]
+            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_P_FROM])
+            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_FROM])
+            mask = kind_masks[MEAS_TYPE_I_FROM]
             self._add_indexed_values(H, rows, p_col, 1.0 / v_from, mask)
             self._add_indexed_values(H, rows, i_col, -p_from / (v_from * v_from), mask)
-            self._add_indexed_values(H, rows, q_col, np.ones(rows.size, dtype=np.float64), kind_masks[3])
-            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), kind_masks[4])
-            mask = kind_masks[5]
+            self._add_indexed_values(H, rows, q_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_P_TO])
+            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_TO])
+            mask = kind_masks[MEAS_TYPE_I_TO]
             self._add_indexed_values(H, rows, q_col, 1.0 / v_to, mask)
             self._add_indexed_values(H, rows, j_col, -p_to / (v_to * v_to), mask)
 

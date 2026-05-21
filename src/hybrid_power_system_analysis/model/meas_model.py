@@ -4,34 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-
-DEVICE_TYPE_CODES = {
-    "ACNode": 1,
-    "ACBranch": 2,
-    "ACTransformer": 3,
-    "ACLoad": 4,
-    "ACGenerator": 5,
-    "ACZeroBranch": 6,
-    "ACZeroBranchConstraint": 7,
-    "ACSwitchConstraint": 8,
-    "ACSwitch": 9,
-    "ACPowerBalance": 10,
-    "DCNode": 11,
-    "DCBranch": 12,
-    "DCSwitch": 13,
-    "DCZeroBranch": 14,
-    "DCZeroBranchConstraint": 15,
-    "DCSwitchConstraint": 16,
-    "DCGenerator": 17,
-    "DCLoad": 18,
-    "DCDCConverter": 19,
-    "DCACConverter": 20,
-    "ACACConverter": 21,
-    "ACBreak": 22,
-    "ACBreakConstraint": 23,
-    "DCBreak": 24,
-    "DCBreakConstraint": 25,
-}
+from model.meas_type import DEVICE_TYPE_CODES
 
 MEAS_STATUS_NORMAL = 0
 MEAS_STATUS_INVALID = 1
@@ -48,12 +21,6 @@ MEAS_STATUS_BY_NAME = {
     "BAD": MEAS_STATUS_REMOVED,
     "REMOVED": MEAS_STATUS_REMOVED,
 }
-
-TERMINAL_MEASUREMENT_KIND = {"P_FROM": 0, "V_FROM": 1, "I_FROM": 2, "P_TO": 3, "V_TO": 4, "I_TO": 5}
-LOAD_MEASUREMENT_KIND = {"P_LOAD": 0, "V_LOAD": 1, "I_LOAD": 2}
-GEN_MEASUREMENT_KIND = {"P_GEN": 0, "V_GEN": 1, "I_GEN": 2}
-GEN_CONTROL_KIND = {"V": 0, "P": 1, "I": 2}
-
 
 def measurement_status_from_valid(valid: bool) -> int:
     return MEAS_STATUS_NORMAL if bool(valid) else MEAS_STATUS_INVALID

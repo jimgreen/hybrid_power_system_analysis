@@ -1028,6 +1028,7 @@ class LowerNormalEquationCscPlan:
         weighted_residual: Optional[np.ndarray] = None,
         dense_gain_limit: int = 1000,
         assume_fixed_weights: bool = False,
+        copy_rhs: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray]:
         H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
         data = np.asarray(H_csr.data, dtype=np.float64)
@@ -1086,9 +1087,10 @@ class LowerNormalEquationCscPlan:
             )
         else:
             self.rhs.fill(0.0)
+        rhs = self.rhs.copy() if copy_rhs else self.rhs
         if self.gain.shape[0] <= dense_gain_limit:
-            return self.gain.toarray(), self.rhs.copy()
-        return self.gain, self.rhs.copy()
+            return self.gain.toarray(), rhs
+        return self.gain, rhs
 
 
 def measurement_leverage(H, gain_inv: np.ndarray) -> np.ndarray:
