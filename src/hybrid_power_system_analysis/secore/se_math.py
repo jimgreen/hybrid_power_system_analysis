@@ -178,8 +178,14 @@ class SparseJacobianBuilder:
         self._cached_has_unique_slots = False
         self._cached_has_duplicate_slots = False
         self._cached_csr_data: Optional[np.ndarray] = None
+        self._cached_csr_matrix = None
         self._data_buffer: Optional[np.ndarray] = None
         self._assume_fixed_pattern = False
+        self._data_only_refresh_enabled = False
+        self._data_only_refresh_active = False
+        self._data_only_direct_active = False
+        self._data_only_direct_initialized = False
+        self._data_only_chunk_cursor = 0
         self.reset()
 
     def _set_cached_slot_positions(self, slot: np.ndarray) -> None:
@@ -258,6 +264,86 @@ class SparseJacobianBuilder:
         self._row_chunks = []
         self._col_chunks = []
         self._data_chunks = []
+        self._data_only_chunk_cursor = 0
+        self._data_only_refresh_active = bool(
+            self._data_only_refresh_enabled
+            and self._assume_fixed_pattern
+            and self._cached_pattern_indptr is not None
+            and self._cached_pattern_indices is not None
+            and self._cached_chunk_slices is not None
+        )
+        first_chunk_starts_after_scalars = (
+            self._cached_chunk_slices is not None
+            and len(self._cached_chunk_slices) > 0
+            and int(self._cached_chunk_slices[0][0]) == 0
+        )
+        self._data_only_direct_active = bool(self._data_only_refresh_active and first_chunk_starts_after_scalars)
+        self._data_only_direct_initialized = False
+
+    def _initialize_data_only_direct_buffer(self) -> Optional[np.ndarray]:
+        if not self._data_only_direct_active:
+            return None
+        pattern = self._cached_pattern_linear
+        if pattern is None:
+            return None
+        if self._cached_csr_data is None or self._cached_csr_data.size != pattern.size:
+            self._cached_csr_data = np.zeros(pattern.size, dtype=np.float64)
+            self._cached_csr_matrix = None
+        values = self._cached_csr_data
+        if not self._data_only_direct_initialized:
+            if not self._cached_slots_cover_pattern:
+                values.fill(0.0)
+            else:
+                duplicate_dest_slots = self._cached_duplicate_dest_slots
+                if duplicate_dest_slots is not None and duplicate_dest_slots.size:
+                    values[duplicate_dest_slots] = 0.0
+            self._data_only_direct_initialized = True
+        return values
+
+    def _append_data_only_chunk(self, values: np.ndarray) -> bool:
+        if not self._data_only_refresh_active:
+            return False
+        chunk_slices = self._cached_chunk_slices
+        if chunk_slices is None or self._data_only_chunk_cursor >= len(chunk_slices):
+            raise RuntimeError("SparseJacobianBuilder fixed CSR data refresh received too many chunks")
+        start, end = chunk_slices[self._data_only_chunk_cursor]
+        expected = int(end) - int(start)
+        if int(values.size) != expected:
+            raise RuntimeError(
+                "SparseJacobianBuilder fixed CSR data refresh pattern changed: "
+                f"expected chunk size {expected}, got {int(values.size)}"
+            )
+        values = _as_array_dtype(values, np.float64)
+        target = self._initialize_data_only_direct_buffer()
+        if target is not None:
+            direct_slots = (
+                self._cached_direct_chunk_slots[self._data_only_chunk_cursor]
+                if self._cached_direct_chunk_slots is not None
+                and self._data_only_chunk_cursor < len(self._cached_direct_chunk_slots)
+                else None
+            )
+            chunk_plan = (
+                self._cached_chunk_slot_plans[self._data_only_chunk_cursor]
+                if self._cached_chunk_slot_plans is not None
+                and self._data_only_chunk_cursor < len(self._cached_chunk_slot_plans)
+                else None
+            )
+            if direct_slots is not None:
+                if direct_slots.size:
+                    target[direct_slots] = values
+            elif chunk_plan is not None:
+                unique_pos, unique_slots, duplicate_pos, duplicate_slots = chunk_plan
+                if unique_pos.size:
+                    target[unique_slots] = values[unique_pos]
+                if duplicate_pos.size:
+                    np.add.at(target, duplicate_slots, values[duplicate_pos])
+            else:
+                slot = self._cached_slot_positions[int(start) : int(end)]
+                np.add.at(target, slot, values)
+        else:
+            self._data_chunks.append(values)
+        self._data_only_chunk_cursor += 1
+        return True
 
     def _append_arrays(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray) -> None:
         """Keep vectorized writes as NumPy chunks until final COO/CSR construction."""
@@ -270,13 +356,18 @@ class SparseJacobianBuilder:
         if not mask.any():
             return
         if mask.all():
+            if self._append_data_only_chunk(values):
+                return
             self._row_chunks.append(rows)
             self._col_chunks.append(cols)
             self._data_chunks.append(values)
             return
+        masked_values = values[mask].astype(np.float64, copy=False)
+        if self._append_data_only_chunk(masked_values):
+            return
         self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
         self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
-        self._data_chunks.append(values[mask].astype(np.float64, copy=False))
+        self._data_chunks.append(masked_values)
 
     def _coo_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not self.rows and not self._row_chunks:
@@ -460,25 +551,62 @@ class SparseJacobianBuilder:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
         if mask.any():
             if mask.all():
+                if self._append_data_only_chunk(values):
+                    return
                 self._row_chunks.append(rows)
                 self._col_chunks.append(cols)
                 self._data_chunks.append(values)
                 return
+            masked_values = values[mask].astype(np.float64, copy=False)
+            if self._append_data_only_chunk(masked_values):
+                return
             self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
             self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
-            self._data_chunks.append(values[mask].astype(np.float64, copy=False))
+            self._data_chunks.append(masked_values)
 
     def to_csr(self):
         if self._assume_fixed_pattern and self._cached_slot_positions is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
+            if self._data_only_refresh_active and self._cached_chunk_slices is not None:
+                expected_chunks = len(self._cached_chunk_slices)
+                if self._data_only_chunk_cursor != expected_chunks:
+                    raise RuntimeError(
+                        "SparseJacobianBuilder fixed CSR data refresh pattern changed: "
+                        f"expected {expected_chunks} chunks, got {self._data_only_chunk_cursor}"
+                    )
+                if self._data_only_direct_initialized and self._cached_csr_data is not None:
+                    if self.rows:
+                        n_cols = int(self.shape[1])
+                        rows = np.asarray(self.rows, dtype=np.int64)
+                        cols = np.asarray(self.cols, dtype=np.int64)
+                        linear = rows * np.int64(n_cols) + cols
+                        slot = np.searchsorted(self._cached_pattern_linear, linear)
+                        if (
+                            slot.size
+                            and int(slot.max()) < self._cached_pattern_linear.size
+                            and np.array_equal(self._cached_pattern_linear[slot], linear)
+                        ):
+                            np.add.at(self._cached_csr_data, slot, np.asarray(self.data, dtype=np.float64))
+                        elif slot.size:
+                            raise RuntimeError("SparseJacobianBuilder fixed CSR data refresh scalar pattern changed")
+                    if self._cached_csr_matrix is None:
+                        self._cached_csr_matrix = SP_CSR_MATRIX(
+                            (self._cached_csr_data, self._cached_pattern_indices, self._cached_pattern_indptr),
+                            shape=self.shape,
+                            copy=False,
+                        )
+                    return self._cached_csr_matrix
             if self._cached_csr_data is None or self._cached_csr_data.size != self._cached_pattern_linear.size:
                 self._cached_csr_data = np.zeros(self._cached_pattern_linear.size, dtype=np.float64)
+                self._cached_csr_matrix = None
             values = self._cached_csr_data
             self._refresh_fixed_pattern_values(values)
-            return SP_CSR_MATRIX(
-                (values, self._cached_pattern_indices, self._cached_pattern_indptr),
-                shape=self.shape,
-                copy=False,
-            )
+            if self._cached_csr_matrix is None:
+                self._cached_csr_matrix = SP_CSR_MATRIX(
+                    (values, self._cached_pattern_indices, self._cached_pattern_indptr),
+                    shape=self.shape,
+                    copy=False,
+                )
+            return self._cached_csr_matrix
         rows, cols, data = self._coo_arrays()
         if self._cached_pattern_linear is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
             n_cols = int(self.shape[1])
@@ -504,6 +632,7 @@ class SparseJacobianBuilder:
         self._cached_pattern_linear = pattern_linear
         self._cached_pattern_indptr = indptr
         self._cached_pattern_indices = indices
+        self._cached_csr_matrix = None
         if self._assume_fixed_pattern:
             n_cols = int(self.shape[1])
             linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
@@ -511,6 +640,8 @@ class SparseJacobianBuilder:
             if slot.size and int(slot.max()) < pattern_linear.size and np.array_equal(pattern_linear[slot], linear):
                 self._set_cached_slot_positions(slot)
                 self._cached_csr_data = csr.data
+                self._cached_csr_matrix = csr
+                self._data_only_refresh_enabled = True
         return csr
 
 
@@ -1212,12 +1343,13 @@ class CholmodAAtNormalEquationPlan:
         weighted_residual: Optional[np.ndarray] = None,
         assume_fixed_weights: bool = False,
         copy_rhs: bool = False,
+        assume_pattern_matches: bool = False,
     ):
         H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
         if not H_csr.has_sorted_indices:
             H_csr = H_csr.copy()
             H_csr.sort_indices()
-        if not self.matches(H_csr):
+        if not assume_pattern_matches and not self.matches(H_csr):
             raise ValueError("Jacobian sparse pattern does not match the AAt plan")
 
         data = np.asarray(H_csr.data, dtype=np.float64)
@@ -1367,6 +1499,7 @@ class CholmodAAtNormalEquationSolver:
         weighted_residual: Optional[np.ndarray] = None,
         assume_fixed_weights: bool = False,
         return_factor_diag: bool = False,
+        assume_pattern_matches: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         A, rhs = plan.assemble(
             H,
@@ -1377,6 +1510,7 @@ class CholmodAAtNormalEquationSolver:
             weighted_residual=weighted_residual,
             assume_fixed_weights=assume_fixed_weights,
             copy_rhs=False,
+            assume_pattern_matches=assume_pattern_matches,
         )
         return self.solve(A, rhs, return_factor_diag=return_factor_diag)
 

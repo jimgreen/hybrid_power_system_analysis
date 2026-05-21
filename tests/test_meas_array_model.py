@@ -143,6 +143,37 @@ class MeasurementArrayModelTest(unittest.TestCase):
             np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID], dtype=np.float64),
         )
 
+    def test_build_meas_ppc_from_e_file_can_skip_dense_meas_matrix(self):
+        from model.meas_array_model import MEAS_TYPE_CODES, build_meas_ppc_from_e_file, measurement_table_from_meas_ppc
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 p1 ACLoad load_1 P_LOAD 1.0 1 2.0",
+                        "# 2 q1 ACLoad load_1 q_load 1.0 1 1.0",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            ppc = build_meas_ppc_from_e_file(meas_file, include_strings=False, include_matrix=False, use_cache=False)
+
+        self.assertIsNone(ppc["meas"])
+        table = measurement_table_from_meas_ppc(ppc, include_strings=False)
+        self.assertEqual(2, table.idx.size)
+        self.assertEqual(0, table.name.size)
+        np.testing.assert_array_equal(
+            table.meas_type_code,
+            np.array([MEAS_TYPE_CODES["P_LOAD"], MEAS_TYPE_CODES["Q_LOAD"]], dtype=np.int16),
+        )
+        np.testing.assert_allclose(table.value, np.array([2.0, 1.0]))
+
     def test_standard_parser_reuses_repeated_device_name_strings(self):
         from model.meas_array_model import build_meas_ppc_from_e_file
 

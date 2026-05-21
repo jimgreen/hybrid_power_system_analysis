@@ -121,8 +121,8 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(
             {
-                (ac_se.DEVICE_TYPE_CODES_ACNODE, 0),
-                (ac_se.DEVICE_TYPE_CODES_ACNODE, 1),
+                ACStateEstimator._active_device_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 0),
+                ACStateEstimator._active_device_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 1),
             },
             estimator._active_device_code_pos_cache,
         )
@@ -255,7 +255,11 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual({1: 1.02}, estimator._real_voltage_observation_node_cache)
         self.assertIn(
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD),
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                0,
+                ac_se.MEAS_TYPE_CODES_P_LOAD,
+            ),
             estimator._active_measurement_code_pos_cache,
         )
 
@@ -3104,9 +3108,10 @@ class ACStateEstimationTest(unittest.TestCase):
         )
         target_meta = estimator.state_meta[target_col]
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
+        active_key = ACStateEstimator._active_measurement_key
         existing_keys = {
-            (target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_FROM),
-            (target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_FROM),
+            active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_FROM),
+            active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_FROM),
         }
 
         _, added = estimator._append_targeted_observability_pseudo(
@@ -3117,8 +3122,8 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         self.assertEqual(2, added)
-        self.assertIn((target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_TO), existing_keys)
-        self.assertIn((target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_TO), existing_keys)
+        self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_TO), existing_keys)
+        self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_TO), existing_keys)
 
     def test_targeted_node_voltage_state_adds_pseudo_measurement(self):
         from secore import ac_se
@@ -3171,7 +3176,14 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         self.assertEqual(1, added)
-        self.assertIn((ac_se.DEVICE_TYPE_CODES_ACNODE, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_V), existing_keys)
+        self.assertIn(
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                target_meta.device_pos,
+                ac_se.MEAS_TYPE_CODES_V,
+            ),
+            existing_keys,
+        )
 
     def test_targeted_observability_uses_state_meta_arrays_without_object_list(self):
         from secore import ac_se
@@ -3218,7 +3230,14 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertEqual(1, added)
         self.assertIsNone(estimator._state_meta_cache)
-        self.assertIn((ac_se.DEVICE_TYPE_CODES_ACNODE, target_device_pos, ac_se.MEAS_TYPE_CODES_V), existing_keys)
+        self.assertIn(
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                target_device_pos,
+                ac_se.MEAS_TYPE_CODES_V,
+            ),
+            existing_keys,
+        )
 
     def test_ac_state_meta_contains_device_position_and_codes(self):
         from secore import ac_se
@@ -3340,6 +3359,30 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(builder._cached_direct_chunk_slots)
         self.assertIsNotNone(builder._cached_direct_chunk_slots[0])
         np.testing.assert_allclose(second.toarray(), np.array([[10.0, 0.0, 20.0, 0.0], [0.0, 30.0, 0.0, 40.0]]))
+
+    def test_sparse_jacobian_builder_refreshes_fixed_csr_data_without_row_col_chunks(self):
+        from secore.se_math import SparseJacobianBuilder
+
+        builder = SparseJacobianBuilder((2, 3))
+        builder._assume_fixed_pattern = True
+        rows = np.array([0, 0, 1, 1, 1], dtype=np.int32)
+        cols = np.array([0, 2, 0, 0, 2], dtype=np.int32)
+        builder.add_many(rows, cols, np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64))
+
+        first = builder.to_csr()
+        np.testing.assert_allclose(first.toarray(), np.array([[1.0, 0.0, 2.0], [7.0, 0.0, 5.0]]))
+
+        builder.reset()
+        builder.add_many(rows, cols, np.array([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float64))
+
+        self.assertTrue(builder._data_only_refresh_enabled)
+        self.assertEqual(0, len(builder._row_chunks))
+        self.assertEqual(0, len(builder._col_chunks))
+        self.assertEqual(0, len(builder._data_chunks))
+        self.assertTrue(builder._data_only_direct_initialized)
+        second = builder.to_csr()
+
+        np.testing.assert_allclose(second.toarray(), np.array([[10.0, 0.0, 20.0], [70.0, 0.0, 50.0]]))
 
     def test_adds_low_weight_pseudo_power_measurements_for_unmetered_generators_and_loads(self):
         from secore.ac_se import ACStateEstimator
@@ -4325,10 +4368,26 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._ac_generator_plan_index = np.array([1, 0], dtype=np.int64)
         estimator._ac_load_plan_index = np.array([1, 0], dtype=np.int64)
         estimator._real_power_measurement_seed_cache = {
-            (ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN): (2.0, 0.7),
-            (ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN): (2.0, 0.2),
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 1, ac_se.MEAS_TYPE_CODES_P_LOAD): (2.0, 0.3),
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 1, ac_se.MEAS_TYPE_CODES_Q_LOAD): (2.0, 0.1),
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
+                0,
+                ac_se.MEAS_TYPE_CODES_P_GEN,
+            ): (2.0, 0.7),
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
+                0,
+                ac_se.MEAS_TYPE_CODES_Q_GEN,
+            ): (2.0, 0.2),
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                1,
+                ac_se.MEAS_TYPE_CODES_P_LOAD,
+            ): (2.0, 0.3),
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                1,
+                ac_se.MEAS_TYPE_CODES_Q_LOAD,
+            ): (2.0, 0.1),
         }
 
         estimator._seed_power_state_arrays_from_measurements()
@@ -5738,6 +5797,28 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(result.converged)
         self.assertEqual(0, len(lower_plan_builds))
         self.assertGreater(len(lower_assemblies), 0)
+
+    def test_active_jacobian_uses_fixed_csr_data_refresh(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+        )
+        x = estimator.initial_state()
+
+        first = estimator.jacobian_sparse(x, None)
+        second = estimator.jacobian_sparse(x, None)
+        builder = estimator._jacobian_builder
+
+        self.assertEqual(first.shape, second.shape)
+        self.assertTrue(builder._data_only_refresh_enabled)
+        self.assertTrue(builder._data_only_refresh_active)
+        self.assertEqual(0, len(builder._row_chunks))
+        self.assertEqual(0, len(builder._col_chunks))
+        self.assertEqual(0, len(builder._data_chunks))
+        self.assertTrue(builder._data_only_direct_initialized)
 
     def test_active_estimate_keeps_gain_csc_pattern_stable_for_cholmod_reuse(self):
         import secore.ac_se as ac_se
