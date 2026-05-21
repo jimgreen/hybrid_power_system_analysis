@@ -415,7 +415,6 @@ class _LazyTerminalDeviceMap:
         "rows",
         "cols",
         "extra_cols",
-        "node_by_idx",
         "_name_to_row",
         "_name_to_pos",
         "_cache",
@@ -428,14 +427,12 @@ class _LazyTerminalDeviceMap:
         rows: np.ndarray,
         cols: Dict[str, int],
         extra_cols: Sequence[Tuple[str, int]],
-        node_by_idx: Dict[int, object],
     ) -> None:
         self.table = table
         self.names = tuple(str(name) for name in names)
         self.rows = np.asarray(rows, dtype=np.int64)
         self.cols = cols
         self.extra_cols = tuple(extra_cols)
-        self.node_by_idx = node_by_idx
         self._name_to_row = {name: int(row) for name, row in zip(self.names, self.rows)}
         self._name_to_pos = {name: int(pos) for pos, name in enumerate(self.names)}
         self._cache: Dict[str, object] = {}
@@ -468,8 +465,8 @@ class _LazyTerminalDeviceMap:
         dev.j_node = int(values[cols["j_node"]])
         dev.run_stat = int(values[cols["run_stat"]])
         dev.is_alive = True
-        dev.i_node_obj = self.node_by_idx.get(dev.i_node)
-        dev.j_node_obj = self.node_by_idx.get(dev.j_node)
+        dev.i_node_obj = None
+        dev.j_node_obj = None
         dev.p = float(values[cols["p"]]) if "p" in cols else 0.0
         dev.q = float(values[cols["q"]]) if "q" in cols else 0.0
         dev.current = float(values[cols["current"]]) if "current" in cols else 0.0
@@ -539,7 +536,7 @@ class _LazySingleDeviceOrder:
 class _LazySingleDeviceMap:
     """Name-keyed generator/load/shunt map backed by PPC rows."""
 
-    __slots__ = ("table", "names", "rows", "cols", "device_kind", "node_by_idx", "_name_to_pos", "_cache")
+    __slots__ = ("table", "names", "rows", "cols", "device_kind", "_name_to_pos", "_cache")
 
     def __init__(
         self,
@@ -548,14 +545,12 @@ class _LazySingleDeviceMap:
         rows: np.ndarray,
         cols: Dict[str, int],
         device_kind: str,
-        node_by_idx: Dict[int, object],
     ) -> None:
         self.table = table
         self.names = tuple(str(name) for name in names)
         self.rows = np.asarray(rows, dtype=np.int64)
         self.cols = cols
         self.device_kind = str(device_kind)
-        self.node_by_idx = node_by_idx
         self._name_to_pos = {name: int(pos) for pos, name in enumerate(self.names)}
         self._cache: Dict[str, object] = {}
 
@@ -588,7 +583,7 @@ class _LazySingleDeviceMap:
         dev.run_stat = int(values[cols["run_stat"]])
         dev.is_alive = True
         dev.node = int(values[cols["node"]])
-        dev.node_obj = self.node_by_idx.get(dev.node)
+        dev.node_obj = None
         dev.p = float(values[cols["p"]]) if "p" in cols else 0.0
         dev.q = float(values[cols["q"]]) if "q" in cols else 0.0
         dev.current = float(values[cols["current"]]) if "current" in cols else 0.0
@@ -743,54 +738,63 @@ class ACStateEstimator:
             bus_solver_pos[active_bus_pos] = np.arange(active_bus_pos.size, dtype=np.int32)
         self._ac_bus_solver_pos_by_topology_bus = bus_solver_pos
 
-        islands = []
-        for island_idx, is_alive in zip(topology_arrays.island_ids, topology_arrays.island_alive_mask):
-            islands.append(
-                SimpleNamespace(
-                    idx=int(island_idx),
-                    is_alive=bool(is_alive),
-                    buses=[],
-                    slack_nodes=[],
-                )
-            )
-        self._ac_islands = islands
-
-        self.nodes = []
-        bus_obj_by_topology_pos: Dict[int, object] = {}
+        self._ac_island_ids = np.asarray(topology_arrays.island_ids, dtype=np.int64)
+        self._ac_island_alive_mask = np.asarray(topology_arrays.island_alive_mask, dtype=bool)
+        self._ac_active_bus_pos = active_bus_pos.astype(np.int32, copy=True)
+        node_ids = np.asarray(topology_arrays.bus_ids, dtype=np.int64)[active_bus_pos.astype(np.intp, copy=False)]
+        node_names = np.empty(active_bus_pos.size, dtype=object)
+        node_vbase = np.ones(active_bus_pos.size, dtype=np.float64)
+        node_voltage = np.ones(active_bus_pos.size, dtype=np.float64)
+        node_angle = np.zeros(active_bus_pos.size, dtype=np.float64)
+        node_island_pos = np.full(active_bus_pos.size, -1, dtype=np.int32)
+        node_island_ids = np.zeros(active_bus_pos.size, dtype=np.int64)
+        first_node_row_by_solver_pos = np.full(active_bus_pos.size, -1, dtype=np.int32)
         for bus_pos in active_bus_pos:
             bus_pos_int = int(bus_pos)
+            solver_pos = int(bus_solver_pos[bus_pos_int])
+            if solver_pos < 0:
+                continue
             start = int(topology_arrays.bus_node_offsets[bus_pos_int])
             end = int(topology_arrays.bus_node_offsets[bus_pos_int + 1])
             if end <= start:
                 continue
             node_row = int(topology_arrays.bus_node_indices[start])
             row = bus[node_row]
-            obj = _ACArrayObject()
-            obj.idx = int(topology_arrays.bus_ids[bus_pos_int])
-            obj.name = str(bus_names[node_row])
-            obj.vbase = float(row[BUS_COLS["vbase"]])
-            obj.voltage = float(row[BUS_COLS["voltage"]])
-            obj.angle = float(row[BUS_COLS["angle"]])
-            obj.run_stat = 1
-            obj.is_alive = True
             island_pos = int(topology_arrays.bus_to_island_pos[bus_pos_int])
-            obj.isl = int(topology_arrays.island_ids[island_pos]) if island_pos >= 0 else 0
-            obj.isl_obj = islands[island_pos] if 0 <= island_pos < len(islands) else None
-            obj.bus = obj.idx
-            obj.bus_obj = obj
-            bus_obj_by_topology_pos[bus_pos_int] = obj
-            self.nodes.append(obj)
-            if obj.isl_obj is not None:
-                obj.isl_obj.buses.append(obj)
-
+            first_node_row_by_solver_pos[solver_pos] = node_row
+            node_names[solver_pos] = str(bus_names[node_row])
+            node_vbase[solver_pos] = float(row[BUS_COLS["vbase"]])
+            node_voltage[solver_pos] = float(row[BUS_COLS["voltage"]])
+            node_angle[solver_pos] = float(row[BUS_COLS["angle"]])
+            node_island_pos[solver_pos] = island_pos
+            node_island_ids[solver_pos] = (
+                int(topology_arrays.island_ids[island_pos])
+                if 0 <= island_pos < len(topology_arrays.island_ids)
+                else 0
+            )
+        missing_names = first_node_row_by_solver_pos < 0
+        if np.any(missing_names):
+            node_names[missing_names] = [
+                f"bus_{int(node_id)}" for node_id in node_ids[missing_names]
+            ]
+        self._ac_node_ids = node_ids.astype(np.int64, copy=False)
+        self._ac_node_names = node_names
+        self._ac_node_vbase_by_pos = node_vbase
+        self.file_theta = node_angle
+        self.file_voltage = node_voltage
+        self._ac_node_island_pos = node_island_pos
+        self._ac_node_island_ids = node_island_ids
+        self._ac_first_node_row_by_solver_pos = first_node_row_by_solver_pos
+        self._ac_island_reference_solver_pos = np.full(
+            len(topology_arrays.island_ids),
+            -1,
+            dtype=np.int32,
+        )
         for island_pos, ref_bus_pos in enumerate(np.asarray(topology_arrays.island_reference_bus_pos, dtype=np.int32)):
-            bus_obj = bus_obj_by_topology_pos.get(int(ref_bus_pos))
-            if bus_obj is not None and 0 <= island_pos < len(islands):
-                islands[island_pos].slack_nodes.append(bus_obj)
+            if 0 <= int(ref_bus_pos) < bus_solver_pos.size:
+                self._ac_island_reference_solver_pos[int(island_pos)] = int(bus_solver_pos[int(ref_bus_pos)])
 
         self.node_pos = {}
-        self.node_by_name = {}
-        self.node_by_idx = {}
         self._node_vbase_by_idx: Dict[int, float] = {}
         self._node_voltage_by_idx: Dict[int, float] = {}
         self._node_angle_by_idx: Dict[int, float] = {}
@@ -803,17 +807,10 @@ class ACStateEstimator:
                 continue
             node_idx = int(row[BUS_COLS["idx"]])
             node_name = str(bus_names[node_row])
-            bus_obj = self.nodes[solver_pos]
             self.node_pos[node_idx] = solver_pos
-            self.node_by_idx[node_idx] = bus_obj
-            self.node_by_name[node_name] = bus_obj
-            self.node_by_name.setdefault(str(bus_obj.name), bus_obj)
             self._node_vbase_by_idx[node_idx] = float(row[BUS_COLS["vbase"]])
             self._node_voltage_by_idx[node_idx] = float(row[BUS_COLS["voltage"]])
             self._node_angle_by_idx[node_idx] = float(row[BUS_COLS["angle"]])
-
-        self.file_theta = np.asarray([float(node.angle) for node in self.nodes], dtype=np.float64)
-        self.file_voltage = np.asarray([float(node.voltage) for node in self.nodes], dtype=np.float64)
 
         def terminal_devices(table_name: str, name_key: str, device_key: str, cols: Dict[str, int], extra_cols=()):
             table, _device_topology, rows = self._ppc_sorted_alive_rows_for(ppc, table_name, device_key, cols["idx"])
@@ -828,8 +825,8 @@ class ACStateEstimator:
                 dev.j_node = int(values[cols["j_node"]])
                 dev.run_stat = int(values[cols["run_stat"]])
                 dev.is_alive = True
-                dev.i_node_obj = self.node_by_idx.get(dev.i_node)
-                dev.j_node_obj = self.node_by_idx.get(dev.j_node)
+                dev.i_node_obj = None
+                dev.j_node_obj = None
                 dev.p = float(values[cols["p"]]) if "p" in cols else 0.0
                 dev.q = float(values[cols["q"]]) if "q" in cols else 0.0
                 dev.current = float(values[cols["current"]]) if "current" in cols else 0.0
@@ -849,7 +846,7 @@ class ACStateEstimator:
         def terminal_device_map(table_name: str, name_key: str, device_key: str, cols: Dict[str, int], extra_cols=()):
             table, _device_topology, rows = self._ppc_sorted_alive_rows_for(ppc, table_name, device_key, cols["idx"])
             names = self._ppc_names_for_rows(ppc.get(name_key, np.asarray([], dtype=object)), rows)
-            return _LazyTerminalDeviceMap(table, names, rows, cols, extra_cols, self.node_by_idx)
+            return _LazyTerminalDeviceMap(table, names, rows, cols, extra_cols)
 
         self.branch_by_name = terminal_device_map(
             "branch",
@@ -930,9 +927,9 @@ class ACStateEstimator:
         self.generator_pos_array = gen_pos
         self.load_pos_array = load_pos
         self.shunt_pos_array = shunt_pos
-        self.generator_by_name = _LazySingleDeviceMap(gen_table, gen_names, gen_rows, GEN_COLS, "gen", self.node_by_idx)
-        self.load_by_name = _LazySingleDeviceMap(load_table, load_names, load_rows, LOAD_COLS, "load", self.node_by_idx)
-        self.shunt_by_name = _LazySingleDeviceMap(shunt_table, shunt_names, shunt_rows, SHUNT_COLS, "shunt", self.node_by_idx)
+        self.generator_by_name = _LazySingleDeviceMap(gen_table, gen_names, gen_rows, GEN_COLS, "gen")
+        self.load_by_name = _LazySingleDeviceMap(load_table, load_names, load_rows, LOAD_COLS, "load")
+        self.shunt_by_name = _LazySingleDeviceMap(shunt_table, shunt_names, shunt_rows, SHUNT_COLS, "shunt")
         self.generator_order = self.generator_by_name.order()
         self.load_order = self.load_by_name.order()
         self.shunt_compensators = self.shunt_by_name.order()
@@ -1020,9 +1017,9 @@ class ACStateEstimator:
         stage_start = time.perf_counter()
         self._ppc_runtime_node_and_device_context(ppc, topology_arrays)
         self._record_profile_time("init.ppc_runtime_context", time.perf_counter() - stage_start)
-        if not self.nodes:
+        if int(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)).size) == 0:
             raise RuntimeError("No alive AC nodes are available for state estimation")
-        self.n_nodes = len(self.nodes)
+        self.n_nodes = int(self._ac_node_ids.size)
         self._defer_prepare_finalize_pending = bool(defer_prepare_finalize)
         if defer_prepare_finalize:
             self.power_flow_seed_converged = False
@@ -1053,7 +1050,7 @@ class ACStateEstimator:
 
         node_plan_by_solver_pos = inverse_plan_pos(
             getattr(self, "_ac_node_plan_pos", np.asarray([], dtype=np.int64)),
-            len(getattr(self, "nodes", ())),
+            int(getattr(self, "n_nodes", 0)),
         )
         zero_plan_by_current_pos = inverse_plan_pos(
             getattr(self, "_ac_zero_branch_plan_current_pos", np.asarray([], dtype=np.int64)),
@@ -1073,30 +1070,30 @@ class ACStateEstimator:
         )
 
         for pos in self.angle_state_pos:
-            node = self.nodes[int(pos)]
+            node_name = str(self._ac_node_names[int(pos)])
             state_meta.append(
                 StateMeta(
                     "ac",
                     "angle",
                     "ACNode",
-                    node.name,
+                    node_name,
                     component="theta",
-                    legacy_label=f"theta:{node.name}",
+                    legacy_label=f"theta:{node_name}",
                     device_pos=plan_pos_for_state(node_plan_by_solver_pos, int(pos)),
                     device_type_code=DEVICE_TYPE_CODES_ACNODE,
                     meas_type_code=MEAS_TYPE_CODES_ANGLE,
                 )
             )
         for pos in self.voltage_state_pos:
-            node = self.nodes[int(pos)]
+            node_name = str(self._ac_node_names[int(pos)])
             state_meta.append(
                 StateMeta(
                     "ac",
                     "voltage",
                     "ACNode",
-                    node.name,
+                    node_name,
                     component="magnitude",
-                    legacy_label=f"V:{node.name}",
+                    legacy_label=f"V:{node_name}",
                     device_pos=plan_pos_for_state(node_plan_by_solver_pos, int(pos)),
                     device_type_code=DEVICE_TYPE_CODES_ACNODE,
                     meas_type_code=MEAS_TYPE_CODES_V,
@@ -1285,12 +1282,14 @@ class ACStateEstimator:
         stage_start = time.perf_counter()
         self.node_voltage_measurements = self._node_voltage_measurements()
         self.node_degrees = self._node_incident_degrees()
-        self.references = self._select_reference_nodes()
-        self.ref_idx = {self.node_pos[node.idx] for node in self.references}
+        self.reference_pos = self._select_reference_positions()
+        self.references = self.reference_pos
+        self.ref_idx = {int(pos) for pos in self.reference_pos}
         self.reference_voltage_by_pos = {
-            self.node_pos[node.idx]: self.node_voltage_measurements[node.idx]
-            for node in self.references
-            if node.idx in self.node_voltage_measurements and node.idx in self.node_pos
+            int(pos): self.node_voltage_measurements[int(self._ac_node_ids[int(pos)])]
+            for pos in self.reference_pos
+            if 0 <= int(pos) < self._ac_node_ids.size
+            and int(self._ac_node_ids[int(pos)]) in self.node_voltage_measurements
         }
         self.reference_angle_by_pos = self._reference_angle_offsets()
         self._rebase_angle_measurements()
@@ -1304,7 +1303,7 @@ class ACStateEstimator:
         self.zero_branch_pos = {zbr.name: self.zero_current_pos[("Z", zbr.name)] for zbr in self.zero_branches}
         self.switch_pos = {}
         self.break_pos = {brk.name: self.zero_current_pos[("B", brk.name)] for brk in self.breakers}
-        self.zero_current_by_node = {pos: [] for pos in range(len(self.nodes))}
+        self.zero_current_by_node = {pos: [] for pos in range(self.n_nodes)}
         for idx, (_, dev) in enumerate(self.zero_current_devices):
             if dev.i_node in self.node_pos:
                 self.zero_current_by_node[self.node_pos[dev.i_node]].append((idx, True))
@@ -1398,10 +1397,6 @@ class ACStateEstimator:
             load_names = tuple(load.name for load in self.load_order)
         if not shunt_q_names:
             shunt_q_names = tuple(shunt.name for shunt in self.voltage_control_shunt_order)
-        self.gen_p_col_by_name = {name: self.base_gen_p + idx for idx, name in enumerate(gen_names)}
-        self.gen_q_col_by_name = {name: self.base_gen_q + idx for idx, name in enumerate(gen_names)}
-        self.load_p_col_by_name = {name: self.base_load_p + idx for idx, name in enumerate(load_names)}
-        self.load_q_col_by_name = {name: self.base_load_q + idx for idx, name in enumerate(load_names)}
         self._state_meta_cache = None
         self._state_labels_cache = None
 
@@ -2492,11 +2487,11 @@ class ACStateEstimator:
         bus_solver_pos = getattr(self, "_ac_bus_solver_pos_by_topology_bus", None)
         if bus_solver_pos is None:
             self._warn_required_runtime_missing("_ac_bus_solver_pos_by_topology_bus", "file-state refresh")
-        file_theta = np.zeros(len(self.nodes), dtype=np.float64)
-        file_voltage = np.ones(len(self.nodes), dtype=np.float64)
+        file_theta = np.zeros(self.n_nodes, dtype=np.float64)
+        file_voltage = np.ones(self.n_nodes, dtype=np.float64)
         for bus_pos, solver_pos in enumerate(np.asarray(bus_solver_pos, dtype=np.int32)):
             solver_pos_int = int(solver_pos)
-            if solver_pos_int < 0 or solver_pos_int >= len(self.nodes):
+            if solver_pos_int < 0 or solver_pos_int >= self.n_nodes:
                 continue
             start = int(topology.bus_node_offsets[bus_pos])
             if start >= int(topology.bus_node_offsets[bus_pos + 1]):
@@ -2504,9 +2499,6 @@ class ACStateEstimator:
             row = int(topology.bus_node_indices[start])
             voltage = max(float(bus[row, BUS_COLS["voltage"]] or 1.0), self.voltage_floor)
             angle = float(bus[row, BUS_COLS["angle"]] or 0.0)
-            node = self.nodes[solver_pos_int]
-            node.voltage = voltage
-            node.angle = angle
             file_voltage[solver_pos_int] = voltage
             file_theta[solver_pos_int] = angle
         self.file_theta = file_theta
@@ -2715,9 +2707,9 @@ class ACStateEstimator:
 
     def _node_scale_arrays_by_pos(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         cache_key = (
-            len(getattr(self, "nodes", ())),
+            int(getattr(self, "n_nodes", 0)),
             id(getattr(self, "node_pos", None)),
-            id(getattr(self, "_node_vbase_by_idx", None)),
+            id(getattr(self, "_ac_node_vbase_by_pos", None)),
             float(self.p_base_kW),
             float(self.u_scale),
             float(self.i_scale),
@@ -2725,7 +2717,7 @@ class ACStateEstimator:
         cached = getattr(self, "_ac_node_scale_by_pos_cache", None)
         if cached is not None and cached[0] == cache_key:
             return cached[1]
-        n_nodes = len(getattr(self, "nodes", ()))
+        n_nodes = int(getattr(self, "n_nodes", 0))
         node_idx_by_pos = np.empty(n_nodes, dtype=np.int64)
         node_idx_by_pos.fill(-1)
         voltage_scale = np.empty(n_nodes, dtype=np.float64)
@@ -2733,22 +2725,21 @@ class ACStateEstimator:
         current_scale = np.empty(n_nodes, dtype=np.float64)
         current_scale.fill(np.nan)
         valid = np.zeros(n_nodes, dtype=bool)
-        node_vbase = getattr(self, "_node_vbase_by_idx", {})
-        for node_idx_raw, pos_raw in getattr(self, "node_pos", {}).items():
-            pos = int(pos_raw)
-            if pos < 0 or pos >= n_nodes:
-                continue
-            node_idx = int(node_idx_raw)
-            vbase = node_vbase.get(node_idx)
-            if vbase is None and pos < len(self.nodes):
-                vbase = getattr(self.nodes[pos], "vbase", None)
-            if vbase is None:
-                continue
-            vbase = float(vbase)
-            node_idx_by_pos[pos] = node_idx
-            voltage_scale[pos] = self.u_scale * vbase
-            current_scale[pos] = self.i_scale * ac_current_base_ka(self.p_base_kW, vbase)
-            valid[pos] = True
+        node_ids = np.asarray(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        node_vbase = np.asarray(getattr(self, "_ac_node_vbase_by_pos", np.asarray([], dtype=np.float64)), dtype=np.float64)
+        count = min(n_nodes, node_ids.size, node_vbase.size)
+        if count:
+            vbase_values = node_vbase[:count].astype(np.float64, copy=False)
+            valid[:count] = np.isfinite(vbase_values) & (vbase_values > 0.0)
+            node_idx_by_pos[:count] = node_ids[:count]
+            voltage_scale[:count] = self.u_scale * vbase_values
+            current_scale[:count] = self.i_scale * np.fromiter(
+                (ac_current_base_ka(self.p_base_kW, float(vbase)) for vbase in vbase_values),
+                dtype=np.float64,
+                count=count,
+            )
+            current_scale[:count][~valid[:count]] = np.nan
+            voltage_scale[:count][~valid[:count]] = np.nan
         result = (valid, voltage_scale, current_scale, node_idx_by_pos)
         self._ac_node_scale_by_pos_cache = (cache_key, result)
         return result
@@ -3813,7 +3804,7 @@ class ACStateEstimator:
             return None
         component = components[int(component_by_pos[int(pos)])]
         for member_pos in component:
-            member_idx = self.nodes[int(member_pos)].idx
+            member_idx = int(self._ac_node_ids[int(member_pos)])
             if member_idx in observed:
                 return float(observed[member_idx])
         return None
@@ -4816,12 +4807,12 @@ class ACStateEstimator:
     def _add_power_balance_constraint_measurements(self) -> None:
         """Add nodal AC power-balance equations that tie P/Q states to the grid."""
         next_idx = self._next_measurement_idx()
-        node_count = len(self.nodes)
+        node_count = int(getattr(self, "n_nodes", 0))
         if node_count == 0:
             return
         row_count = 2 * node_count
         weight = 10.0
-        node_names = np.asarray([node.name for node in self.nodes], dtype=object)
+        node_names = np.asarray(getattr(self, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
         names = np.empty(row_count, dtype=object)
         names[0::2] = [f"constraint_p_balance_{name}" for name in node_names]
         names[1::2] = [f"constraint_q_balance_{name}" for name in node_names]
@@ -4902,7 +4893,8 @@ class ACStateEstimator:
             self._warn_required_runtime_missing("PPC topology arrays", "node incident degree build")
         if bus_solver_pos is None:
             self._warn_required_runtime_missing("_ac_bus_solver_pos_by_topology_bus", "node incident degree build")
-        degree_array = np.zeros(len(self.nodes), dtype=np.int32)
+        node_ids = np.asarray(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        degree_array = np.zeros(node_ids.size, dtype=np.int32)
         for device_key in ("branch", "transformer", "zero_branch", "switch", "break"):
             device_topology = topology.devices.get(device_key)
             if device_topology is None:
@@ -4918,52 +4910,73 @@ class ACStateEstimator:
                 i_pos = bus_solver_pos[i_bus[i_valid].astype(np.intp, copy=False)]
                 i_pos = i_pos[i_pos >= 0]
                 if i_pos.size:
-                    np.add.at(degree_array, i_pos.astype(np.intp, copy=False), 1)
+                    i_pos = i_pos[i_pos < degree_array.size]
+                    if i_pos.size:
+                        np.add.at(degree_array, i_pos.astype(np.intp, copy=False), 1)
             if np.any(j_valid):
                 j_pos = bus_solver_pos[j_bus[j_valid].astype(np.intp, copy=False)]
                 j_pos = j_pos[j_pos >= 0]
                 if j_pos.size:
-                    np.add.at(degree_array, j_pos.astype(np.intp, copy=False), 1)
-        return {node.idx: int(degree_array[pos]) for pos, node in enumerate(self.nodes)}
+                    j_pos = j_pos[j_pos < degree_array.size]
+                    if j_pos.size:
+                        np.add.at(degree_array, j_pos.astype(np.intp, copy=False), 1)
+        return {int(node_ids[pos]): int(degree_array[pos]) for pos in range(int(node_ids.size))}
 
-    def _select_reference_nodes(self):
-        """Choose a measured high-degree V/angle reference for every live AC island."""
+    def _select_reference_positions(self) -> np.ndarray:
+        """Choose one reference solver position per live AC island using topology arrays."""
+        node_ids = np.asarray(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        node_island_pos = np.asarray(getattr(self, "_ac_node_island_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        island_alive = np.asarray(getattr(self, "_ac_island_alive_mask", np.asarray([], dtype=bool)), dtype=bool)
+        island_ref_pos = np.asarray(getattr(self, "_ac_island_reference_solver_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        if node_ids.size == 0:
+            return np.asarray([], dtype=np.int32)
         references = []
-        for island in getattr(self, "_ac_islands", getattr(self.network, "islands", [])):
-            if not island.is_alive:
+        for island_pos in range(int(island_alive.size)):
+            if not bool(island_alive[island_pos]):
                 continue
-            candidates = [
-                node
-                for node in island.buses
-                if node.idx in self.node_pos and node.idx in self.node_voltage_measurements
-            ]
-            if candidates:
-                references.append(
-                    max(
-                        candidates,
-                        key=lambda node: (self.node_degrees.get(node.idx, 0), -int(node.idx)),
-                    )
+            candidates = np.flatnonzero(node_island_pos == island_pos).astype(np.int32, copy=False)
+            if candidates.size == 0:
+                continue
+            measured_mask = np.fromiter(
+                (int(node_ids[int(pos)]) in self.node_voltage_measurements for pos in candidates),
+                dtype=bool,
+                count=int(candidates.size),
+            )
+            measured = candidates[measured_mask]
+            if measured.size:
+                best = max(
+                    (int(pos) for pos in measured),
+                    key=lambda pos: (
+                        self.node_degrees.get(int(node_ids[pos]), 0),
+                        -int(node_ids[pos]),
+                    ),
                 )
-            elif island.slack_nodes:
-                references.append(sorted(island.slack_nodes, key=lambda item: item.idx)[0])
-            elif island.buses:
-                references.append(sorted(island.buses, key=lambda item: item.idx)[0])
-        return references
+                references.append(best)
+                continue
+            ref_pos = int(island_ref_pos[island_pos]) if island_pos < island_ref_pos.size else -1
+            if 0 <= ref_pos < node_ids.size:
+                references.append(ref_pos)
+                continue
+            references.append(int(candidates[np.argmin(node_ids[candidates.astype(np.intp, copy=False)])]))
+        return np.asarray(references, dtype=np.int32)
 
     def _reference_angle_offsets(self) -> Dict[int, float]:
         """Map each node position to the original island reference angle."""
-        ref_by_island = {getattr(node, "isl", None): node for node in self.references}
+        reference_pos = np.asarray(getattr(self, "reference_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        node_island_pos = np.asarray(getattr(self, "_ac_node_island_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        file_theta = np.asarray(getattr(self, "file_theta", np.asarray([], dtype=np.float64)), dtype=np.float64)
         offsets: Dict[int, float] = {}
-        for island in getattr(self, "_ac_islands", getattr(self.network, "islands", [])):
-            if not getattr(island, "is_alive", False):
+        for ref_pos in reference_pos:
+            ref_pos_int = int(ref_pos)
+            if ref_pos_int < 0 or ref_pos_int >= node_island_pos.size:
                 continue
-            ref = ref_by_island.get(getattr(island, "idx", None))
-            if ref is None:
+            island_pos = int(node_island_pos[ref_pos_int])
+            if island_pos < 0:
                 continue
-            offset = float(getattr(ref, "angle", 0.0) or 0.0)
-            for node in island.buses:
-                if node.idx in self.node_pos:
-                    offsets[self.node_pos[node.idx]] = offset
+            offset = float(file_theta[ref_pos_int]) if ref_pos_int < file_theta.size else 0.0
+            member_pos = np.flatnonzero(node_island_pos == island_pos)
+            for pos in member_pos:
+                offsets[int(pos)] = offset
         return offsets
 
     def _rebase_angle_measurements(self) -> None:
@@ -5072,7 +5085,7 @@ class ACStateEstimator:
 
     def _build_zero_tie_state_layout(self) -> None:
         """Compress AC voltage/angle states across ideal switches and zero branches."""
-        n = len(self.nodes)
+        n = int(getattr(self, "n_nodes", 0))
         parent = np.arange(n, dtype=np.int32)
 
         def find(pos: int) -> int:
@@ -5133,7 +5146,8 @@ class ACStateEstimator:
 
             voltage_ref_positions = [pos for pos in component if pos in self.reference_voltage_by_pos]
             if voltage_ref_positions:
-                ref_pos = min(voltage_ref_positions, key=lambda pos: self.nodes[pos].idx)
+                node_ids = np.asarray(getattr(self, "_ac_node_ids", np.arange(n)), dtype=np.int64)
+                ref_pos = min(voltage_ref_positions, key=lambda pos: int(node_ids[int(pos)]))
                 ref_voltage = max(float(self.reference_voltage_by_pos[ref_pos]), self.voltage_floor)
                 for pos in component:
                     self.ref_voltages[pos] = ref_voltage
@@ -5168,7 +5182,7 @@ class ACStateEstimator:
 
     def _build_y_matrix(self) -> np.ndarray:
         """Build the estimator admittance matrix with the same stamps as load flow."""
-        n = len(self.nodes)
+        n = int(getattr(self, "n_nodes", 0))
         row_chunks = []
         col_chunks = []
         data_chunks = []
@@ -5257,7 +5271,7 @@ class ACStateEstimator:
 
     def _prepare_y_row_cache(self) -> None:
         """Cache sparse Y-row topology used repeatedly by generator Jacobian rows."""
-        n = len(self.nodes)
+        n = int(getattr(self, "n_nodes", 0))
         self._y_row_nodes = []
         self._y_row_y_conj = []
         self._y_row_diag_conj = np.conj(self.Y.diagonal()).astype(np.complex128, copy=False)
@@ -5280,8 +5294,8 @@ class ACStateEstimator:
 
     def initial_state(self) -> np.ndarray:
         if self.flat_start:
-            theta = np.zeros(len(self.nodes), dtype=np.float64)
-            voltage = np.ones(len(self.nodes), dtype=np.float64)
+            theta = np.zeros(self.n_nodes, dtype=np.float64)
+            voltage = np.ones(self.n_nodes, dtype=np.float64)
             return self._pack_state(theta, voltage, rebase_angles=False)
         return self._file_state()
 
@@ -5363,7 +5377,7 @@ class ACStateEstimator:
 
     def _unpack_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Restore full theta/V arrays from the compact WLS state vector."""
-        n = len(self.nodes)
+        n = int(getattr(self, "n_nodes", 0))
         theta = np.zeros(n, dtype=np.float64)
         if self._angle_ref_nodes.size:
             theta[self._angle_ref_nodes] = self._angle_ref_values
@@ -7208,8 +7222,8 @@ class ACStateEstimator:
         device_pos = plan_table.device_pos[rows]
         pos = self._ac_node_plan_pos[device_pos]
         kind = plan_table.meas_kind[rows]
-        p_row_by_pos = np.empty(len(self.nodes), dtype=np.int32)
-        q_row_by_pos = np.empty(len(self.nodes), dtype=np.int32)
+        p_row_by_pos = np.empty(self.n_nodes, dtype=np.int32)
+        q_row_by_pos = np.empty(self.n_nodes, dtype=np.int32)
         p_row_by_pos.fill(-1)
         q_row_by_pos.fill(-1)
         if rows.size:
@@ -8337,31 +8351,49 @@ class ACStateEstimator:
 
     def apply_state(self, x: np.ndarray) -> None:
         theta, voltage = self._unpack_state(x)
-        for pos, node in enumerate(self.nodes):
-            node.angle = float(theta[pos])
-            node.voltage = float(voltage[pos])
-            for member in getattr(node, "nodes", ()):
-                member.angle = node.angle
-                member.voltage = node.voltage
-        for idx, gen in enumerate(self.generator_order):
-            gen.p = float(x[self.base_gen_p + idx])
-            gen.q = float(x[self.base_gen_q + idx])
-        for idx, load in enumerate(self.load_order):
-            load.p = float(x[self.base_load_p + idx])
-            load.q = float(x[self.base_load_q + idx])
-        for idx, shunt in enumerate(self.voltage_control_shunt_order):
-            shunt.p = 0.0
-            shunt.q = float(x[self.base_shunt_q + idx])
-            voltage_value = float(getattr(getattr(shunt, "node_obj", None), "voltage", 1.0) or 1.0)
-            shunt.current = abs(shunt.q) / voltage_value if abs(voltage_value) > self.min_current_voltage else 0.0
+        ppc = self._ac_ppc_dict()
+        bus = np.asarray(ppc["bus"], dtype=np.float64)
+        topology = ppc.get("_topology_arrays")
+        first_rows = np.asarray(getattr(self, "_ac_first_node_row_by_solver_pos", ()), dtype=np.int32)
+        for solver_pos, row in enumerate(first_rows):
+            row_int = int(row)
+            if 0 <= row_int < bus.shape[0]:
+                bus[row_int, BUS_COLS["angle"]] = float(theta[int(solver_pos)])
+                bus[row_int, BUS_COLS["voltage"]] = float(voltage[int(solver_pos)])
+        if topology is not None:
+            bus_solver_pos = np.asarray(getattr(self, "_ac_bus_solver_pos_by_topology_bus", ()), dtype=np.int32)
+            for node_row in range(bus.shape[0]):
+                bus_pos = int(topology.node_to_bus_pos[node_row])
+                if 0 <= bus_pos < bus_solver_pos.size:
+                    solver_pos = int(bus_solver_pos[bus_pos])
+                    if 0 <= solver_pos < voltage.size:
+                        bus[node_row, BUS_COLS["angle"]] = float(theta[solver_pos])
+                        bus[node_row, BUS_COLS["voltage"]] = float(voltage[solver_pos])
+        gen_rows = np.asarray(getattr(self, "_ac_generator_rows", ()), dtype=np.int64)
+        if gen_rows.size:
+            gen = np.asarray(ppc["gen"], dtype=np.float64)
+            gen[gen_rows.astype(np.intp, copy=False), GEN_COLS["p"]] = x[self.base_gen_p : self.base_gen_q]
+            gen[gen_rows.astype(np.intp, copy=False), GEN_COLS["q"]] = x[self.base_gen_q : self.base_load_p]
+        load_rows = np.asarray(getattr(self, "_ac_load_rows", ()), dtype=np.int64)
+        if load_rows.size:
+            load = np.asarray(ppc["load"], dtype=np.float64)
+            load[load_rows.astype(np.intp, copy=False), LOAD_COLS["p"]] = x[self.base_load_p : self.base_load_q]
+            load[load_rows.astype(np.intp, copy=False), LOAD_COLS["q"]] = x[self.base_load_q : self.base_shunt_q]
+        shunt_rows = np.asarray(getattr(self, "_ac_shunt_rows", ()), dtype=np.int64)
+        if shunt_rows.size and self.n_shunt_q:
+            shunt = np.asarray(ppc["shunt"], dtype=np.float64)
+            shunt[shunt_rows.astype(np.intp, copy=False), SHUNT_COLS["q"]] = x[self.base_shunt_q : self.n_state]
 
     def print_state(self, x: np.ndarray, limit: int = 20) -> None:
         theta, voltage = self._unpack_state(x)
+        node_names = np.asarray(getattr(self, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
         print("Estimated states:")
-        for pos, node in enumerate(self.nodes[:limit]):
-            print(f"  {node.name:10s} V={voltage[pos]:.9f} theta={theta[pos]:.9f} rad")
-        if len(self.nodes) > limit:
-            print(f"  ... {len(self.nodes) - limit} more nodes")
+        count = min(int(limit), int(self.n_nodes))
+        for pos in range(count):
+            name = str(node_names[pos]) if pos < node_names.size else f"bus_{pos + 1}"
+            print(f"  {name:10s} V={voltage[pos]:.9f} theta={theta[pos]:.9f} rad")
+        if self.n_nodes > limit:
+            print(f"  ... {self.n_nodes - limit} more nodes")
 
 
 _ORIGINAL_AC_RUN_POWER_FLOW_SEED = ACStateEstimator._run_power_flow_seed

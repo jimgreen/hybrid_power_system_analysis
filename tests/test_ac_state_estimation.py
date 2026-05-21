@@ -560,6 +560,133 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertTrue(np.shares_memory(rhs, plan.rhs))
 
+    def test_cholmod_aat_plan_builds_weighted_transpose_for_normal_equations(self):
+        from scipy.sparse import csr_matrix
+        from secore.se_math import CholmodAAtNormalEquationPlan, build_normal_equations
+
+        H = csr_matrix(
+            np.array(
+                [
+                    [2.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [1.0, 1.0, 0.0],
+                    [0.0, 2.0, 4.0],
+                ],
+                dtype=np.float64,
+            )
+        )
+        residual = np.array([0.5, -1.5, 2.0, -0.25], dtype=np.float64)
+        weight = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+
+        plan = CholmodAAtNormalEquationPlan.from_jacobian(H)
+        A, rhs = plan.assemble(H, residual, weight, assume_fixed_weights=True)
+        full_gain, full_rhs = build_normal_equations(H, residual, weight, dense_gain_limit=0)
+
+        self.assertTrue(np.shares_memory(A.data, plan.a_data))
+        np.testing.assert_allclose((A @ A.T).toarray(), full_gain.toarray())
+        np.testing.assert_allclose(rhs, full_rhs)
+
+        H_updated = H.copy()
+        H_updated.data = H_updated.data * np.linspace(0.75, 1.5, H_updated.nnz)
+        residual_updated = residual * np.array([1.2, -0.7, 0.5, 1.3])
+        old_indptr = A.indptr.copy()
+        old_indices = A.indices.copy()
+        refreshed_A, refreshed_rhs = plan.assemble(
+            H_updated,
+            residual_updated,
+            weight,
+            assume_fixed_weights=True,
+        )
+        refreshed_gain, refreshed_full_rhs = build_normal_equations(
+            H_updated,
+            residual_updated,
+            weight,
+            dense_gain_limit=0,
+        )
+
+        np.testing.assert_array_equal(refreshed_A.indptr, old_indptr)
+        np.testing.assert_array_equal(refreshed_A.indices, old_indices)
+        self.assertTrue(np.shares_memory(refreshed_A.data, plan.a_data))
+        np.testing.assert_allclose((refreshed_A @ refreshed_A.T).toarray(), refreshed_gain.toarray())
+        np.testing.assert_allclose(refreshed_rhs, refreshed_full_rhs)
+
+    def test_cholmod_aat_solver_reuses_symbolic_analysis_for_same_jacobian_pattern(self):
+        from scipy.sparse import csr_matrix
+        import secore.se_math as se_math
+
+        H = csr_matrix(
+            np.array(
+                [
+                    [2.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [1.0, 1.0, 0.0],
+                    [0.0, 2.0, 4.0],
+                ],
+                dtype=np.float64,
+            )
+        )
+        residual = np.array([0.5, -1.5, 2.0, -0.25], dtype=np.float64)
+        weight = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+        analyze_patterns = []
+        numeric_patterns = []
+        original_cholmod_analyze_aat = se_math.CHOLMOD_ANALYZE_AAT
+        original_cholmod_cholesky_aat = se_math.CHOLMOD_CHOLESKY_AAT
+
+        def sparse_pattern(matrix):
+            csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+            return (
+                csc.shape,
+                int(csc.nnz),
+                csc.indptr.copy(),
+                csc.indices.copy(),
+            )
+
+        def same_pattern(left, right):
+            return (
+                left[0] == right[0]
+                and left[1] == right[1]
+                and np.array_equal(left[2], right[2])
+                and np.array_equal(left[3], right[3])
+            )
+
+        class FakeAAtFactor:
+            def __init__(self, matrix):
+                analyze_patterns.append(sparse_pattern(matrix))
+                self.matrix = matrix.copy()
+
+            def cholesky_AAt_inplace(self, matrix):
+                numeric_patterns.append(sparse_pattern(matrix))
+                self.matrix = matrix.copy()
+
+            def __call__(self, rhs):
+                gain = self.matrix @ self.matrix.T
+                return np.linalg.solve(gain.toarray(), rhs)
+
+        def fake_analyze_aat(matrix):
+            return FakeAAtFactor(matrix)
+
+        se_math.CHOLMOD_ANALYZE_AAT = fake_analyze_aat
+        se_math.CHOLMOD_CHOLESKY_AAT = None
+        try:
+            plan = se_math.CholmodAAtNormalEquationPlan.from_jacobian(H)
+            solver = se_math.CholmodAAtNormalEquationSolver(assume_fixed_pattern=True)
+            dx_1, _ = solver.solve_from_plan(plan, H, residual, weight)
+            H2 = H.copy()
+            H2.data = H2.data * np.linspace(0.8, 1.4, H2.nnz)
+            residual2 = residual * np.array([1.1, 0.9, -0.5, 1.7])
+            dx_2, _ = solver.solve_from_plan(plan, H2, residual2, weight)
+        finally:
+            se_math.CHOLMOD_ANALYZE_AAT = original_cholmod_analyze_aat
+            se_math.CHOLMOD_CHOLESKY_AAT = original_cholmod_cholesky_aat
+
+        gain_1, rhs_1 = se_math.build_normal_equations(H, residual, weight, dense_gain_limit=0)
+        gain_2, rhs_2 = se_math.build_normal_equations(H2, residual2, weight, dense_gain_limit=0)
+        self.assertEqual(1, len(analyze_patterns))
+        self.assertEqual(2, len(numeric_patterns))
+        np.testing.assert_allclose(dx_1, np.linalg.solve(gain_1.toarray(), rhs_1))
+        np.testing.assert_allclose(dx_2, np.linalg.solve(gain_2.toarray(), rhs_2))
+        self.assertTrue(all(same_pattern(pattern, analyze_patterns[0]) for pattern in numeric_patterns))
+
     def test_full_normal_equation_from_lower_restores_symmetric_matrix(self):
         from scipy.sparse import csc_matrix, isspmatrix_csc
         from secore.se_math import full_normal_equation_from_lower
@@ -1773,7 +1900,11 @@ class ACStateEstimationTest(unittest.TestCase):
             secore.ac_se.build_ac_ppc_with_topology_from_e_file = previous_common_loader
 
         self.assertEqual(["ieee39.e"], calls)
-        self.assertTrue(estimator.nodes)
+        self.assertGreater(estimator.n_nodes, 0)
+        self.assertFalse(hasattr(estimator, "nodes"))
+        self.assertFalse(hasattr(estimator, "_ac_islands"))
+        self.assertEqual(estimator.n_nodes, estimator._ac_node_ids.size)
+        self.assertEqual(estimator.n_nodes, estimator._ac_node_names.size)
         self.assertTrue(hasattr(estimator.network, "ppc"))
         self.assertTrue(hasattr(estimator.network, "topology"))
         self.assertIn("_topology_arrays", estimator.network.ppc)
@@ -1871,7 +2002,6 @@ class ACStateEstimationTest(unittest.TestCase):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.ac_se import ACStateEstimator
 
-        node = type("Node", (), {"idx": 1, "name": "n1"})()
         measurements = MeasurementList(
             [
                 Measurement(1, "bad", "ACPowerBalance", "missing", "P_BALANCE", 1.0, True, 0.0),
@@ -1882,9 +2012,10 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator = ACStateEstimator.__new__(ACStateEstimator)
         estimator.active_measurements = measurements
         estimator.active_measurement_table = measurements.table
-        estimator.node_by_name = {"n1": node}
         estimator.node_pos = {1: 0}
-        estimator.nodes = [node]
+        estimator.n_nodes = 1
+        estimator._ac_node_ids = np.array([1], dtype=np.int64)
+        estimator._ac_node_names = np.array(["n1"], dtype=object)
         estimator._y_row_nodes = [np.array([], dtype=np.int32)]
         estimator._y_row_y_conj = [np.array([], dtype=np.complex128)]
         estimator.measurements = measurements
@@ -1904,7 +2035,6 @@ class ACStateEstimationTest(unittest.TestCase):
         from model.meas_model import Measurement, MeasurementList, measurement_table_from_measurements
         from secore.ac_se import ACStateEstimator
 
-        node = type("Node", (), {"idx": 1, "name": "n1"})()
         measurements = MeasurementList(
             [
                 Measurement(1, "p", "ACPowerBalance", "n1", "P_BALANCE", 1.0, True, 0.0),
@@ -1915,9 +2045,10 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator = ACStateEstimator.__new__(ACStateEstimator)
         estimator.active_measurements = measurements
         estimator.active_measurement_table = measurements.table
-        estimator.node_by_name = {"n1": node}
         estimator.node_pos = {1: 0}
-        estimator.nodes = [node]
+        estimator.n_nodes = 1
+        estimator._ac_node_ids = np.array([1], dtype=np.int64)
+        estimator._ac_node_names = np.array(["n1"], dtype=object)
         estimator._y_row_nodes = [np.array([0, 1], dtype=np.int32)]
         estimator._y_row_y_conj = [np.array([1.0 + 0.0j, 2.0 + 0.0j], dtype=np.complex128)]
         estimator.measurements = measurements
@@ -2041,7 +2172,8 @@ class ACStateEstimationTest(unittest.TestCase):
         finally:
             ac_se.ACPowerNetwork.check_topo = original_check_topo
 
-        self.assertTrue(estimator.nodes)
+        self.assertGreater(estimator.n_nodes, 0)
+        self.assertFalse(hasattr(estimator, "nodes"))
 
     def test_estimator_load_network_uses_ppc_topology_arrays_without_object_topology(self):
         from model import topology as network_topology
@@ -2062,7 +2194,8 @@ class ACStateEstimationTest(unittest.TestCase):
         finally:
             network_topology.prepare_ac_topology = original_prepare_topology
 
-        self.assertTrue(estimator.nodes)
+        self.assertGreater(estimator.n_nodes, 0)
+        self.assertFalse(hasattr(estimator, "nodes"))
         self.assertIsNotNone(getattr(estimator.network, "topology", None))
 
     def test_measurement_unit_conversion_uses_precomputed_node_scales(self):
@@ -2242,7 +2375,7 @@ class ACStateEstimationTest(unittest.TestCase):
             prepare_active_measurements=False,
         )
         before_count = len(estimator.measurements)
-        expected_added = 2 * len(estimator.nodes)
+        expected_added = 2 * estimator.n_nodes
         original_measurement = ac_se.Measurement
 
         class RejectMeasurement:
@@ -2292,15 +2425,15 @@ class ACStateEstimationTest(unittest.TestCase):
 
         table = estimator.measurements.table
         balance_rows = np.flatnonzero(table.device_type_code == ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE)
-        expected_pos = np.repeat(np.arange(len(estimator.nodes), dtype=np.int64), 2)
+        expected_pos = np.repeat(np.arange(estimator.n_nodes, dtype=np.int64), 2)
         np.testing.assert_array_equal(table.device_pos[balance_rows], expected_pos)
         np.testing.assert_array_equal(
             table.meas_type_code[balance_rows][0::2],
-            np.full(len(estimator.nodes), ac_se.MEAS_TYPE_CODES_P_BALANCE, dtype=np.int16),
+            np.full(estimator.n_nodes, ac_se.MEAS_TYPE_CODES_P_BALANCE, dtype=np.int16),
         )
         np.testing.assert_array_equal(
             table.meas_type_code[balance_rows][1::2],
-            np.full(len(estimator.nodes), ac_se.MEAS_TYPE_CODES_Q_BALANCE, dtype=np.int16),
+            np.full(estimator.n_nodes, ac_se.MEAS_TYPE_CODES_Q_BALANCE, dtype=np.int16),
         )
 
     def test_pseudo_append_with_device_positions_skips_full_device_index_rebuild(self):
@@ -2622,7 +2755,7 @@ class ACStateEstimationTest(unittest.TestCase):
             idx=-1,
             name="angle_wrap_probe",
             device_type="ACNode",
-            device_name=estimator.nodes[0].name,
+            device_name=str(estimator._ac_node_names[0]),
             meas_type="ANGLE",
             weight=1.0,
             valid=True,
@@ -2661,8 +2794,7 @@ class ACStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             flat_start=True,
         )
-        ref = estimator.node_by_name["bus_16"]
-        ref_pos = estimator.node_pos[ref.idx]
+        ref_pos = int(np.where(estimator._ac_node_names == "bus_16")[0][0])
         ref_voltage = next(
             meas.value
             for meas in estimator.measurements
@@ -2672,7 +2804,7 @@ class ACStateEstimationTest(unittest.TestCase):
             and meas.valid
         )
 
-        self.assertEqual(["bus_16"], [node.name for node in estimator.references])
+        self.assertEqual(["bus_16"], [str(estimator._ac_node_names[int(pos)]) for pos in estimator.reference_pos])
         self.assertEqual(-1, int(estimator.angle_col[ref_pos]))
         self.assertEqual(-1, int(estimator.voltage_col[ref_pos]))
 
@@ -3610,11 +3742,13 @@ class ACStateEstimationTest(unittest.TestCase):
 
         H = estimator.jacobian_sparse(estimator.initial_state(), measurements).toarray()
 
+        gen_state_index = int(estimator._ac_generator_plan_index[0])
+        load_state_index = int(estimator._ac_load_plan_index[0])
         expected_cols = [
-            estimator.gen_p_col_by_name[gen.name],
-            estimator.gen_q_col_by_name[gen.name],
-            estimator.load_p_col_by_name[load.name],
-            estimator.load_q_col_by_name[load.name],
+            estimator.base_gen_p + gen_state_index,
+            estimator.base_gen_q + gen_state_index,
+            estimator.base_load_p + load_state_index,
+            estimator.base_load_q + load_state_index,
         ]
         for row, col in enumerate(expected_cols):
             nz = np.flatnonzero(np.abs(H[row]) > 1e-12)
@@ -3628,21 +3762,27 @@ class ACStateEstimationTest(unittest.TestCase):
             e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
-        gen = next(
-            item
-            for item in estimator.generator_order
+        gen_pos, gen = next(
+            (idx, item)
+            for idx, item in enumerate(estimator.generator_order)
             if estimator.voltage_col[estimator.node_pos[item.node]] >= 0
         )
-        load = next(
-            item
-            for item in estimator.load_order
+        load_pos, load = next(
+            (idx, item)
+            for idx, item in enumerate(estimator.load_order)
             if estimator.voltage_col[estimator.node_pos[item.node]] >= 0
         )
+        gen_state_index = int(estimator._ac_generator_plan_index[gen_pos])
+        load_state_index = int(estimator._ac_load_plan_index[load_pos])
+        gen_p_col = estimator.base_gen_p + gen_state_index
+        gen_q_col = estimator.base_gen_q + gen_state_index
+        load_p_col = estimator.base_load_p + load_state_index
+        load_q_col = estimator.base_load_q + load_state_index
         x = estimator.initial_state()
-        x[estimator.gen_p_col_by_name[gen.name]] = 1.2
-        x[estimator.gen_q_col_by_name[gen.name]] = 0.5
-        x[estimator.load_p_col_by_name[load.name]] = 0.8
-        x[estimator.load_q_col_by_name[load.name]] = 0.3
+        x[gen_p_col] = 1.2
+        x[gen_q_col] = 0.5
+        x[load_p_col] = 0.8
+        x[load_q_col] = 0.3
         measurements = [
             Measurement(1, "gen_i", "ACGenerator", gen.name, "I_GEN", 1.0, True, 0.0),
             Measurement(2, "load_i", "ACLoad", load.name, "I_LOAD", 1.0, True, 0.0),
@@ -3652,11 +3792,11 @@ class ACStateEstimationTest(unittest.TestCase):
 
         gen_voltage_col = estimator.voltage_col[estimator.node_pos[gen.node]]
         load_voltage_col = estimator.voltage_col[estimator.node_pos[load.node]]
-        self.assertNotEqual(0.0, H[0, estimator.gen_p_col_by_name[gen.name]])
-        self.assertNotEqual(0.0, H[0, estimator.gen_q_col_by_name[gen.name]])
+        self.assertNotEqual(0.0, H[0, gen_p_col])
+        self.assertNotEqual(0.0, H[0, gen_q_col])
         self.assertNotEqual(0.0, H[0, gen_voltage_col])
-        self.assertNotEqual(0.0, H[1, estimator.load_p_col_by_name[load.name]])
-        self.assertNotEqual(0.0, H[1, estimator.load_q_col_by_name[load.name]])
+        self.assertNotEqual(0.0, H[1, load_p_col])
+        self.assertNotEqual(0.0, H[1, load_q_col])
         self.assertNotEqual(0.0, H[1, load_voltage_col])
 
     def test_adds_power_balance_equations_for_every_ac_node(self):
@@ -3674,10 +3814,10 @@ class ACStateEstimationTest(unittest.TestCase):
         ]
         balance_keys = {(meas.device_name, meas.meas_type) for meas in balance_rows}
 
-        self.assertEqual(2 * len(estimator.nodes), len(balance_rows))
-        for node in estimator.nodes:
-            self.assertIn((node.name, "P_BALANCE"), balance_keys)
-            self.assertIn((node.name, "Q_BALANCE"), balance_keys)
+        self.assertEqual(2 * estimator.n_nodes, len(balance_rows))
+        for name in estimator._ac_node_names:
+            self.assertIn((str(name), "P_BALANCE"), balance_keys)
+            self.assertIn((str(name), "Q_BALANCE"), balance_keys)
 
     def test_sparse_jacobian_batches_generator_power_measurements(self):
         from scipy.sparse import issparse
@@ -5660,8 +5800,7 @@ class ACStateEstimationTest(unittest.TestCase):
             singular_values=np.ones(1, dtype=np.float64),
             weak_states=[],
         )
-        target_node = estimator.node_by_name["bus_2"]
-        target_pos = estimator.node_pos[target_node.idx]
+        target_pos = int(np.where(estimator._ac_node_names == "bus_2")[0][0])
         target_col = int(estimator.voltage_col[target_pos])
         estimator.state_labels = [f"opaque_state_{idx}" for idx in range(estimator.n_state)]
         non_observable_result = ObservabilityResult(

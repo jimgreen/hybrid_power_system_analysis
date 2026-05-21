@@ -28,6 +28,13 @@ except Exception:
     CHOLMOD_CHOLESKY = None
     CHOLMOD_ANALYZE = None
 
+try:
+    from sksparse.cholmod import cholesky_AAt as CHOLMOD_CHOLESKY_AAT
+    from sksparse.cholmod import analyze_AAt as CHOLMOD_ANALYZE_AAT
+except Exception:
+    CHOLMOD_CHOLESKY_AAT = None
+    CHOLMOD_ANALYZE_AAT = None
+
 
 ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
 _NORMAL_EQUATION_PATTERN_CACHE = {}
@@ -1107,6 +1114,271 @@ class LowerNormalEquationCscPlan:
         if self.gain.shape[0] <= dense_gain_limit:
             return self.gain.toarray(), rhs
         return self.gain, rhs
+
+
+class CholmodAAtNormalEquationPlan:
+    """Prototype CHOLMOD ``A A.T`` plan for ``H.T W H`` normal equations.
+
+    ``A`` is the weighted transpose of the measurement Jacobian:
+    ``A = H.T * sqrt(W)``.  CHOLMOD's AAt factorization then solves the same
+    system as ``H.T W H`` without explicitly assembling the lower normal CSC.
+    The plan keeps the transposed CSC structure fixed and refreshes only data.
+    """
+
+    def __init__(
+        self,
+        *,
+        shape: Tuple[int, int],
+        h_indptr: np.ndarray,
+        h_indices: np.ndarray,
+        h_rows: np.ndarray,
+        h_cols: np.ndarray,
+    ):
+        self.shape = tuple(int(item) for item in shape)
+        self.h_indptr = np.asarray(h_indptr, dtype=np.int32)
+        self.h_indices = np.asarray(h_indices, dtype=np.int32)
+        self.h_rows = np.asarray(h_rows, dtype=np.int32)
+        self.h_cols = np.asarray(h_cols, dtype=np.int32)
+        self.a_indptr = self.h_indptr
+        self.a_indices = self.h_indices
+        self.a_shape = (self.shape[1], self.shape[0])
+        self.a_data = np.zeros(int(self.h_indices.size), dtype=np.float64)
+        self.rhs = np.zeros(self.shape[1], dtype=np.float64)
+        self._rhs_values = np.empty(int(self.h_cols.size), dtype=np.float64)
+        self._fixed_sqrt_weight = None
+        self._fixed_h_weight = None
+        self.A = SP_CSC_MATRIX(
+            (self.a_data, self.a_indices, self.a_indptr),
+            shape=self.a_shape,
+            copy=False,
+        )
+
+    @classmethod
+    def from_jacobian(cls, H) -> "CholmodAAtNormalEquationPlan":
+        if not is_sparse_matrix(H):
+            raise TypeError("CholmodAAtNormalEquationPlan requires a sparse Jacobian")
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            H_csr = H_csr.copy()
+            H_csr.sort_indices()
+        indptr = H_csr.indptr.astype(np.int32, copy=True)
+        indices = H_csr.indices.astype(np.int32, copy=True)
+        counts = np.diff(indptr).astype(np.int32, copy=False)
+        h_rows = np.repeat(np.arange(H_csr.shape[0], dtype=np.int32), counts)
+        h_cols = indices.copy()
+        return cls(
+            shape=H_csr.shape,
+            h_indptr=indptr,
+            h_indices=indices,
+            h_rows=h_rows,
+            h_cols=h_cols,
+        )
+
+    def prepare_fixed_weights(self, weight: np.ndarray) -> None:
+        weight = np.asarray(weight, dtype=np.float64)
+        if self.h_rows.size:
+            self._fixed_sqrt_weight = np.sqrt(weight[self.h_rows]).astype(np.float64, copy=True)
+            self._fixed_h_weight = weight[self.h_rows].copy()
+        else:
+            self._fixed_sqrt_weight = np.array([], dtype=np.float64)
+            self._fixed_h_weight = np.array([], dtype=np.float64)
+
+    def clear_fixed_weights(self) -> None:
+        self._fixed_sqrt_weight = None
+        self._fixed_h_weight = None
+
+    def matches(self, H) -> bool:
+        if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
+            return False
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            return False
+        return (
+            int(H_csr.nnz) == int(self.h_indices.size)
+            and H_csr.indptr.shape == self.h_indptr.shape
+            and H_csr.indices.shape == self.h_indices.shape
+            and np.array_equal(H_csr.indptr, self.h_indptr)
+            and np.array_equal(H_csr.indices, self.h_indices)
+        )
+
+    def assemble(
+        self,
+        H,
+        residual: np.ndarray,
+        weight: np.ndarray,
+        *,
+        uniform_weight: Optional[float] = None,
+        weights_are_uniform: Optional[bool] = None,
+        weighted_residual: Optional[np.ndarray] = None,
+        assume_fixed_weights: bool = False,
+        copy_rhs: bool = False,
+    ):
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            H_csr = H_csr.copy()
+            H_csr.sort_indices()
+        if not self.matches(H_csr):
+            raise ValueError("Jacobian sparse pattern does not match the AAt plan")
+
+        data = np.asarray(H_csr.data, dtype=np.float64)
+        residual = np.asarray(residual, dtype=np.float64)
+        weight = np.asarray(weight, dtype=np.float64)
+
+        if weight.size == 0:
+            row_weight = None
+            sqrt_scale = 1.0
+            weighted_residual_values = residual
+        elif weights_are_uniform is True or uniform_weight is not None:
+            scale = float(weight[0] if uniform_weight is None else uniform_weight)
+            row_weight = None
+            sqrt_scale = math.sqrt(scale)
+            weighted_residual_values = residual if scale == 1.0 else residual * scale
+        else:
+            if weights_are_uniform is None and weight.size:
+                first_weight = float(weight[0])
+                if np.all(weight == first_weight):
+                    row_weight = None
+                    sqrt_scale = math.sqrt(first_weight)
+                    weighted_residual_values = residual if first_weight == 1.0 else residual * first_weight
+                else:
+                    row_weight = weight
+                    sqrt_scale = 1.0
+                    weighted_residual_values = None if (assume_fixed_weights and weighted_residual is None) else (
+                        weight * residual if weighted_residual is None else weighted_residual
+                    )
+            else:
+                row_weight = weight
+                sqrt_scale = 1.0
+                weighted_residual_values = None if (assume_fixed_weights and weighted_residual is None) else (
+                    weight * residual if weighted_residual is None else weighted_residual
+                )
+
+        if data.size:
+            if row_weight is not None:
+                if assume_fixed_weights:
+                    if self._fixed_sqrt_weight is None or self._fixed_sqrt_weight.shape[0] != self.h_rows.size:
+                        self.prepare_fixed_weights(row_weight)
+                    np.multiply(data, self._fixed_sqrt_weight, out=self.a_data)
+                else:
+                    np.multiply(data, np.sqrt(row_weight[self.h_rows]), out=self.a_data)
+            elif sqrt_scale != 1.0:
+                np.multiply(data, sqrt_scale, out=self.a_data)
+            else:
+                self.a_data[:] = data
+
+            if weighted_residual_values is None and row_weight is not None and assume_fixed_weights:
+                if self._fixed_h_weight is None or self._fixed_h_weight.shape[0] != self.h_rows.size:
+                    self.prepare_fixed_weights(row_weight)
+                np.multiply(data, residual[self.h_rows], out=self._rhs_values)
+                np.multiply(self._rhs_values, self._fixed_h_weight, out=self._rhs_values)
+            else:
+                np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
+            self.rhs[:] = np.bincount(
+                self.h_cols,
+                weights=self._rhs_values,
+                minlength=self.shape[1],
+            )
+        else:
+            self.a_data.fill(0.0)
+            self.rhs.fill(0.0)
+
+        rhs = self.rhs.copy() if copy_rhs else self.rhs
+        return self.A, rhs
+
+
+class CholmodAAtNormalEquationSolver:
+    """Prototype normal-equation solver backed by CHOLMOD ``A A.T`` factorization."""
+
+    def __init__(self, assume_fixed_pattern: bool = False):
+        self._cholmod_factor = None
+        self._cholmod_pattern = None
+        self._cholmod_disabled = False
+        self.assume_fixed_pattern = bool(assume_fixed_pattern)
+        self._fallback_solver = NormalEquationSolver(assume_fixed_pattern=assume_fixed_pattern)
+
+    @staticmethod
+    def _sparse_pattern(matrix) -> Tuple[Tuple[int, int], int, np.ndarray, np.ndarray]:
+        csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+        return (
+            csc.shape,
+            int(csc.nnz),
+            csc.indptr.astype(np.int64, copy=True),
+            csc.indices.astype(np.int64, copy=True),
+        )
+
+    @staticmethod
+    def _same_sparse_pattern(pattern, matrix) -> bool:
+        if pattern is None:
+            return False
+        csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+        shape, nnz, indptr, indices = pattern
+        return (
+            shape == csc.shape
+            and nnz == int(csc.nnz)
+            and indptr.shape == csc.indptr.shape
+            and indices.shape == csc.indices.shape
+            and np.array_equal(indptr, csc.indptr)
+            and np.array_equal(indices, csc.indices)
+        )
+
+    def _solve_sparse_cholmod_aat(self, A_csc, rhs: np.ndarray):
+        if CHOLMOD_ANALYZE_AAT is not None:
+            if self._cholmod_factor is None or (
+                not self.assume_fixed_pattern and not self._same_sparse_pattern(self._cholmod_pattern, A_csc)
+            ):
+                self._cholmod_factor = CHOLMOD_ANALYZE_AAT(A_csc)
+                if not self.assume_fixed_pattern:
+                    self._cholmod_pattern = self._sparse_pattern(A_csc)
+            self._cholmod_factor.cholesky_AAt_inplace(A_csc)
+            return self._cholmod_factor(rhs), None
+        if CHOLMOD_CHOLESKY_AAT is not None:
+            factor = CHOLMOD_CHOLESKY_AAT(A_csc)
+            return factor(rhs), None
+        raise RuntimeError("CHOLMOD AAt is not available")
+
+    def solve(
+        self,
+        A,
+        rhs: np.ndarray,
+        return_factor_diag: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if not is_sparse_matrix(A):
+            raise TypeError("CholmodAAtNormalEquationSolver requires a sparse weighted transpose matrix")
+        A_csc = A if getattr(A, "format", None) == "csc" else A.tocsc()
+        if not self._cholmod_disabled and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None):
+            try:
+                return self._solve_sparse_cholmod_aat(A_csc, rhs)
+            except Exception:
+                self._cholmod_factor = None
+                self._cholmod_pattern = None
+                self._cholmod_disabled = True
+        gain = A_csc @ A_csc.T
+        return self._fallback_solver.solve(gain.tocsc(), rhs, return_factor_diag=return_factor_diag)
+
+    def solve_from_plan(
+        self,
+        plan: CholmodAAtNormalEquationPlan,
+        H,
+        residual: np.ndarray,
+        weight: np.ndarray,
+        *,
+        uniform_weight: Optional[float] = None,
+        weights_are_uniform: Optional[bool] = None,
+        weighted_residual: Optional[np.ndarray] = None,
+        assume_fixed_weights: bool = False,
+        return_factor_diag: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        A, rhs = plan.assemble(
+            H,
+            residual,
+            weight,
+            uniform_weight=uniform_weight,
+            weights_are_uniform=weights_are_uniform,
+            weighted_residual=weighted_residual,
+            assume_fixed_weights=assume_fixed_weights,
+            copy_rhs=False,
+        )
+        return self.solve(A, rhs, return_factor_diag=return_factor_diag)
 
 
 def measurement_leverage(H, gain_inv: np.ndarray) -> np.ndarray:
