@@ -208,10 +208,9 @@ def _build_ppc(
         "device_type": device_type,
         "device_name": device_name,
         "device_names": device_names,
-        "device_name_id_by_name": {
-            name: int(pos)
-            for pos, name in enumerate(device_names.astype(object, copy=False).tolist())
-        },
+        "device_name_id_by_name": dict(
+            zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
+        ),
         "meas_type": meas_type,
         "rows_by_device_type_code": rows_by_device_type_code,
         "normalized": False,

@@ -2959,17 +2959,28 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator.network = type("Network", (), {"ppc": {"format": "ac_ppc_v1"}})()
         estimator._ac_ppc_dict = lambda: estimator.network.ppc
         estimator.measurements = FailingMeasurements()
-        estimator._power_flow_seed_rows = [
-            (ac_se.DEVICE_TYPE_CODES_ACNODE, 0, ac_se.MEAS_TYPE_CODES_V, 1.05),
-            (ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN, 0.7),
-            (ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN, 0.2),
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD, 0.3),
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_Q_LOAD, 0.1),
-        ]
+        estimator._power_flow_seed_rows = {
+            "measurement_key": np.asarray(
+                [
+                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 0, ac_se.MEAS_TYPE_CODES_V),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN
+                    ),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN
+                    ),
+                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD),
+                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_Q_LOAD),
+                ],
+                dtype=np.int64,
+            ),
+            "ppc_row": np.asarray([0, 0, 0, 0, 0], dtype=np.int64),
+            "value": np.asarray([1.05, 0.7, 0.2, 0.3, 0.1], dtype=np.float64),
+        }
 
         estimator._apply_measurement_seed_to_network()
 
-        self.assertEqual(tuple(estimator._power_flow_seed_rows), estimator.network._se_power_flow_seed_rows)
+        self.assertIs(estimator._power_flow_seed_rows, estimator.network._se_power_flow_seed_rows)
 
     def test_array_power_flow_seed_defers_object_seed_application(self):
         from secore.ac_se import ACStateEstimator
@@ -2978,11 +2989,18 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator.network = type("Network", (), {"ppc": {"format": "ac_ppc_v1"}})()
         estimator._ac_ppc_dict = lambda: estimator.network.ppc
         estimator.measurements = []
-        estimator._power_flow_seed_rows = [("ACNode", "n1", "V", 1.05)]
+        estimator._power_flow_seed_rows = {
+            "measurement_key": np.asarray(
+                [ACStateEstimator._active_measurement_key(1, 0, 1)],
+                dtype=np.int64,
+            ),
+            "ppc_row": np.asarray([0], dtype=np.int64),
+            "value": np.asarray([1.05], dtype=np.float64),
+        }
 
         estimator._apply_measurement_seed_to_network()
 
-        self.assertEqual(tuple(estimator._power_flow_seed_rows), estimator.network._se_power_flow_seed_rows)
+        self.assertIs(estimator._power_flow_seed_rows, estimator.network._se_power_flow_seed_rows)
 
     def test_power_flow_seed_rows_apply_to_ppc_by_integer_rows(self):
         import secore.ac_se as ac_se
@@ -3003,13 +3021,24 @@ class ACStateEstimationTest(unittest.TestCase):
             ),
             "load_name": RejectNames(),
         }
-        rows = (
-            (ac_se.DEVICE_TYPE_CODES_ACNODE, 0, ac_se.MEAS_TYPE_CODES_V, 1.05),
-            (ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN, 0.7),
-            (ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN, 0.2),
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD, 0.3),
-            (ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_Q_LOAD, 0.1),
-        )
+        rows = {
+            "measurement_key": np.asarray(
+                [
+                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 0, ac_se.MEAS_TYPE_CODES_V),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN
+                    ),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN
+                    ),
+                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD),
+                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_Q_LOAD),
+                ],
+                dtype=np.int64,
+            ),
+            "ppc_row": np.asarray([0, 0, 0, 0, 0], dtype=np.int64),
+            "value": np.asarray([1.05, 0.7, 0.2, 0.3, 0.1], dtype=np.float64),
+        }
 
         ACStateEstimator._apply_power_flow_seed_rows_to_ppc(ppc, rows)
 

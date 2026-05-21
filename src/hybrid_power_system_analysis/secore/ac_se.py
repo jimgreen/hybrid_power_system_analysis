@@ -563,24 +563,27 @@ class ACStateEstimator:
         node_angle = np.zeros(active_bus_pos.size, dtype=np.float64)
         node_island_pos = np.full(active_bus_pos.size, -1, dtype=np.int32)
         first_node_row_by_solver_pos = np.full(active_bus_pos.size, -1, dtype=np.int32)
-        for bus_pos in active_bus_pos:
-            bus_pos_int = int(bus_pos)
-            solver_pos = int(bus_solver_pos[bus_pos_int])
-            if solver_pos < 0:
-                continue
-            start = int(topology_arrays.bus_node_offsets[bus_pos_int])
-            end = int(topology_arrays.bus_node_offsets[bus_pos_int + 1])
-            if end <= start:
-                continue
-            node_row = int(topology_arrays.bus_node_indices[start])
-            row = bus[node_row]
-            island_pos = int(topology_arrays.bus_to_island_pos[bus_pos_int])
-            first_node_row_by_solver_pos[solver_pos] = node_row
-            node_names[solver_pos] = str(bus_names[node_row])
-            node_vbase[solver_pos] = float(row[BUS_COLS["vbase"]])
-            node_voltage[solver_pos] = float(row[BUS_COLS["voltage"]])
-            node_angle[solver_pos] = float(row[BUS_COLS["angle"]])
-            node_island_pos[solver_pos] = island_pos
+        if active_bus_pos.size:
+            offsets = np.asarray(topology_arrays.bus_node_offsets, dtype=np.int64)
+            starts = offsets[active_bus_pos.astype(np.intp, copy=False)]
+            ends = offsets[active_bus_pos.astype(np.intp, copy=False) + 1]
+            has_node = ends > starts
+            if np.any(has_node):
+                valid_bus_pos = active_bus_pos[has_node].astype(np.intp, copy=False)
+                solver_pos = bus_solver_pos[valid_bus_pos].astype(np.intp, copy=False)
+                node_rows = np.asarray(topology_arrays.bus_node_indices, dtype=np.int64)[starts[has_node]].astype(
+                    np.intp,
+                    copy=False,
+                )
+                row_values = bus[node_rows]
+                first_node_row_by_solver_pos[solver_pos] = node_rows.astype(np.int32, copy=False)
+                node_names[solver_pos] = bus_names[node_rows].astype(str, copy=False)
+                node_vbase[solver_pos] = row_values[:, BUS_COLS["vbase"]]
+                node_voltage[solver_pos] = row_values[:, BUS_COLS["voltage"]]
+                node_angle[solver_pos] = row_values[:, BUS_COLS["angle"]]
+                node_island_pos[solver_pos] = np.asarray(topology_arrays.bus_to_island_pos, dtype=np.int32)[
+                    valid_bus_pos
+                ]
         missing_names = first_node_row_by_solver_pos < 0
         if np.any(missing_names):
             node_names[missing_names] = [
@@ -598,9 +601,12 @@ class ACStateEstimator:
             -1,
             dtype=np.int32,
         )
-        for island_pos, ref_bus_pos in enumerate(np.asarray(topology_arrays.island_reference_bus_pos, dtype=np.int32)):
-            if 0 <= int(ref_bus_pos) < bus_solver_pos.size:
-                self._ac_island_reference_solver_pos[int(island_pos)] = int(bus_solver_pos[int(ref_bus_pos)])
+        ref_bus_pos = np.asarray(topology_arrays.island_reference_bus_pos, dtype=np.int32)
+        valid_ref = (ref_bus_pos >= 0) & (ref_bus_pos < bus_solver_pos.size)
+        if np.any(valid_ref):
+            self._ac_island_reference_solver_pos[np.flatnonzero(valid_ref).astype(np.intp, copy=False)] = (
+                bus_solver_pos[ref_bus_pos[valid_ref].astype(np.intp, copy=False)]
+            )
 
         node_bus_pos = np.asarray(topology_arrays.node_to_bus_pos, dtype=np.int32)
         node_solver_pos = np.full(bus.shape[0], -1, dtype=np.int32)
@@ -1892,17 +1898,7 @@ class ACStateEstimator:
     @staticmethod
     def _copy_ppc_for_power_flow_seed(ppc):
         copied = dict(ppc)
-        for key in (
-            "bus",
-            "gen",
-            "load",
-            "shunt",
-            "branch",
-            "transformer",
-            "zero_branch",
-            "switch",
-            "break",
-        ):
+        for key in ("bus", "gen", "load"):
             value = ppc.get(key)
             if isinstance(value, np.ndarray):
                 copied[key] = value.copy()
@@ -1941,59 +1937,117 @@ class ACStateEstimator:
         bus = ppc.get("bus")
         if bus is None:
             return
-        bus_by_idx = ACStateEstimator._row_by_idx(bus, BUS_COLS["idx"])
+        if not isinstance(seed_rows, dict):
+            warnings.warn(
+                "AC SE power-flow seed requires packed key arrays; row tuple fallback is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        measurement_key = np.asarray(seed_rows.get("measurement_key", ()), dtype=np.int64)
+        device_row = np.asarray(seed_rows.get("ppc_row", ()), dtype=np.int64)
+        values = np.asarray(seed_rows.get("value", ()), dtype=np.float64)
+        if measurement_key.size == 0:
+            return
+        if device_row.size != measurement_key.size or values.size != measurement_key.size:
+            warnings.warn(
+                "AC SE power-flow seed requires same-sized measurement_key, ppc_row and value arrays.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        meas_mask = (1 << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS) - 1
+        device_key = measurement_key >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS
+        meas_type = (measurement_key & meas_mask).astype(np.int16, copy=False)
+        device_type = (device_key >> _ACTIVE_DEVICE_KEY_POS_BITS).astype(np.int16, copy=False)
+
         gen = ppc.get("gen")
         load = ppc.get("load")
 
-        def set_bus_voltage_by_idx(node_idx, value):
-            row = bus_by_idx.get(int(node_idx))
-            if row is not None:
-                bus[row, BUS_COLS["voltage"]] = max(float(value), 0.0)
+        def valid_rows(mask: np.ndarray, row_count: int) -> Tuple[np.ndarray, np.ndarray]:
+            rows = device_row[mask]
+            valid = (rows >= 0) & (rows < row_count)
+            return rows[valid].astype(np.intp, copy=False), values[mask][valid]
 
-        for device_type_code, device_row, meas_type_code, value in seed_rows:
-            device_type_code = int(device_type_code)
-            device_row = int(device_row)
-            meas_type_code = int(meas_type_code)
-            value = float(value)
-            if device_type_code == DEVICE_TYPE_CODES_ACNODE:
-                if meas_type_code == MEAS_TYPE_CODES_V and 0 <= device_row < bus.shape[0]:
-                    bus[device_row, BUS_COLS["voltage"]] = max(value, 0.0)
-                continue
-            if device_type_code == DEVICE_TYPE_CODES_ACGENERATOR and gen is not None:
-                if device_row < 0 or device_row >= gen.shape[0]:
-                    continue
-                if meas_type_code == MEAS_TYPE_CODES_P_GEN:
-                    gen[device_row, GEN_COLS["p_set"]] = value
-                    gen[device_row, GEN_COLS["p"]] = value
-                elif meas_type_code == MEAS_TYPE_CODES_Q_GEN:
-                    gen[device_row, GEN_COLS["q_set"]] = value
-                    gen[device_row, GEN_COLS["q"]] = value
-                elif meas_type_code == MEAS_TYPE_CODES_V_GEN:
-                    voltage = max(value, 0.0)
-                    gen[device_row, GEN_COLS["v_set"]] = voltage
-                    set_bus_voltage_by_idx(gen[device_row, GEN_COLS["node"]], voltage)
-                elif meas_type_code == MEAS_TYPE_CODES_I_GEN:
-                    gen[device_row, GEN_COLS["current"]] = value
-                continue
-            if device_type_code == DEVICE_TYPE_CODES_ACLOAD and load is not None:
-                if device_row < 0 or device_row >= load.shape[0]:
-                    continue
-                if meas_type_code == MEAS_TYPE_CODES_P_LOAD:
-                    load[device_row, LOAD_COLS["pbase"]] = 1.0
-                    load[device_row, LOAD_COLS["pv0"]] = value
-                    load[device_row, LOAD_COLS["pv1"]] = 0.0
-                    load[device_row, LOAD_COLS["pv2"]] = 0.0
-                    load[device_row, LOAD_COLS["p"]] = value
-                elif meas_type_code == MEAS_TYPE_CODES_Q_LOAD:
-                    load[device_row, LOAD_COLS["qbase"]] = 1.0
-                    load[device_row, LOAD_COLS["qv0"]] = value
-                    load[device_row, LOAD_COLS["qv1"]] = 0.0
-                    load[device_row, LOAD_COLS["qv2"]] = 0.0
-                    load[device_row, LOAD_COLS["q"]] = value
-                elif meas_type_code == MEAS_TYPE_CODES_V_LOAD:
-                    set_bus_voltage_by_idx(load[device_row, LOAD_COLS["node"]], value)
-                elif meas_type_code == MEAS_TYPE_CODES_I_LOAD:
-                    load[device_row, LOAD_COLS["current"]] = value
+        bus_idx = None
+        bus_order = None
+        sorted_bus_idx = None
+
+        def set_bus_voltage_by_idx(node_idx_values: np.ndarray, voltage_values: np.ndarray) -> None:
+            nonlocal bus_idx, bus_order, sorted_bus_idx
+            if node_idx_values.size == 0:
+                return
+            if bus_idx is None:
+                bus_idx = bus[:, BUS_COLS["idx"]].astype(np.int64, copy=False)
+                bus_order = np.argsort(bus_idx, kind="stable")
+                sorted_bus_idx = bus_idx[bus_order]
+            node_idx_values = np.asarray(node_idx_values, dtype=np.int64)
+            pos = np.searchsorted(sorted_bus_idx, node_idx_values)
+            in_range = pos < sorted_bus_idx.size
+            if not np.any(in_range):
+                return
+            valid_pos = pos[in_range]
+            valid_nodes = node_idx_values[in_range]
+            hit = sorted_bus_idx[valid_pos] == valid_nodes
+            if not np.any(hit):
+                return
+            bus_rows = bus_order[valid_pos[hit]].astype(np.intp, copy=False)
+            bus[bus_rows, BUS_COLS["voltage"]] = np.maximum(voltage_values[in_range][hit], 0.0)
+
+        mask = (device_type == DEVICE_TYPE_CODES_ACNODE) & (meas_type == MEAS_TYPE_CODES_V)
+        rows, row_values = valid_rows(mask, bus.shape[0])
+        if rows.size:
+            bus[rows, BUS_COLS["voltage"]] = np.maximum(row_values, 0.0)
+
+        if isinstance(gen, np.ndarray) and gen.size:
+            gen_device = device_type == DEVICE_TYPE_CODES_ACGENERATOR
+            mask = gen_device & (meas_type == MEAS_TYPE_CODES_P_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                gen[rows, GEN_COLS["p_set"]] = row_values
+                gen[rows, GEN_COLS["p"]] = row_values
+            mask = gen_device & (meas_type == MEAS_TYPE_CODES_Q_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                gen[rows, GEN_COLS["q_set"]] = row_values
+                gen[rows, GEN_COLS["q"]] = row_values
+            mask = gen_device & (meas_type == MEAS_TYPE_CODES_V_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                voltage = np.maximum(row_values, 0.0)
+                gen[rows, GEN_COLS["v_set"]] = voltage
+                set_bus_voltage_by_idx(gen[rows, GEN_COLS["node"]], voltage)
+            mask = gen_device & (meas_type == MEAS_TYPE_CODES_I_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                gen[rows, GEN_COLS["current"]] = row_values
+
+        if isinstance(load, np.ndarray) and load.size:
+            load_device = device_type == DEVICE_TYPE_CODES_ACLOAD
+            mask = load_device & (meas_type == MEAS_TYPE_CODES_P_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                load[rows, LOAD_COLS["pbase"]] = 1.0
+                load[rows, LOAD_COLS["pv0"]] = row_values
+                load[rows, LOAD_COLS["pv1"]] = 0.0
+                load[rows, LOAD_COLS["pv2"]] = 0.0
+                load[rows, LOAD_COLS["p"]] = row_values
+            mask = load_device & (meas_type == MEAS_TYPE_CODES_Q_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                load[rows, LOAD_COLS["qbase"]] = 1.0
+                load[rows, LOAD_COLS["qv0"]] = row_values
+                load[rows, LOAD_COLS["qv1"]] = 0.0
+                load[rows, LOAD_COLS["qv2"]] = 0.0
+                load[rows, LOAD_COLS["q"]] = row_values
+            mask = load_device & (meas_type == MEAS_TYPE_CODES_V_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                set_bus_voltage_by_idx(load[rows, LOAD_COLS["node"]], row_values)
+            mask = load_device & (meas_type == MEAS_TYPE_CODES_I_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                load[rows, LOAD_COLS["current"]] = row_values
 
     @staticmethod
     def _overlay_power_flow_seed_result_ppc(seed_ppc, result):
@@ -2043,18 +2097,21 @@ class ACStateEstimator:
         bus_solver_pos = self._topology_bus_solver_pos(topology)
         file_theta = np.zeros(self.n_nodes, dtype=np.float64)
         file_voltage = np.ones(self.n_nodes, dtype=np.float64)
-        for bus_pos, solver_pos in enumerate(np.asarray(bus_solver_pos, dtype=np.int32)):
-            solver_pos_int = int(solver_pos)
-            if solver_pos_int < 0 or solver_pos_int >= self.n_nodes:
-                continue
-            start = int(topology.bus_node_offsets[bus_pos])
-            if start >= int(topology.bus_node_offsets[bus_pos + 1]):
-                continue
-            row = int(topology.bus_node_indices[start])
-            voltage = max(float(bus[row, BUS_COLS["voltage"]] or 1.0), self.voltage_floor)
-            angle = float(bus[row, BUS_COLS["angle"]] or 0.0)
-            file_voltage[solver_pos_int] = voltage
-            file_theta[solver_pos_int] = angle
+        bus_solver_pos = np.asarray(bus_solver_pos, dtype=np.int32)
+        offsets = np.asarray(topology.bus_node_offsets, dtype=np.int64)
+        starts = offsets[:-1]
+        valid = (
+            (bus_solver_pos >= 0)
+            & (bus_solver_pos < self.n_nodes)
+            & (starts < offsets[1:])
+        )
+        if np.any(valid):
+            solver_pos = bus_solver_pos[valid].astype(np.intp, copy=False)
+            node_rows = np.asarray(topology.bus_node_indices, dtype=np.int64)[starts[valid]].astype(np.intp, copy=False)
+            voltage = bus[node_rows, BUS_COLS["voltage"]]
+            voltage = np.maximum(np.where(voltage != 0.0, voltage, 1.0), self.voltage_floor)
+            file_voltage[solver_pos] = voltage
+            file_theta[solver_pos] = bus[node_rows, BUS_COLS["angle"]]
         self.file_theta = file_theta
         self.file_voltage = file_voltage
 
@@ -2062,7 +2119,6 @@ class ACStateEstimator:
         """Apply valid normalized measurements to network fields used by the LF seed."""
         seed_rows = getattr(self, "_power_flow_seed_rows", None)
         if seed_rows is not None:
-            seed_rows = tuple(seed_rows)
             setattr(self.network, "_se_power_flow_seed_rows", seed_rows)
             self._ac_ppc_dict()
             return
@@ -2110,10 +2166,9 @@ class ACStateEstimator:
             "device_type": np.asarray(table.device_type, dtype=object),
             "device_name": device_name_array,
             "device_names": np.asarray(device_names, dtype=object),
-            "device_name_id_by_name": {
-                name: int(pos)
-                for pos, name in enumerate(np.asarray(device_names, dtype=object).tolist())
-            },
+            "device_name_id_by_name": dict(
+                zip(np.asarray(device_names, dtype=object).tolist(), range(int(device_names.size)))
+            ),
             "meas_type": np.asarray(table.meas_type, dtype=object),
             "rows_by_device_type_code": rows_by_device_type_code(table),
             "normalized": bool(getattr(getattr(self, "measurements", None), "normalized", False)),
@@ -2153,10 +2208,9 @@ class ACStateEstimator:
                 meas_ppc["device_names"] = np.concatenate((device_names, missing_names.astype(object, copy=False)))
                 id_by_name = meas_ppc.get("device_name_id_by_name")
                 if not isinstance(id_by_name, dict):
-                    id_by_name = {
-                        name: int(pos)
-                        for pos, name in enumerate(device_names.astype(object, copy=False).tolist())
-                    }
+                    id_by_name = dict(
+                        zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
+                    )
                 start_pos = int(device_names.size)
                 for offset, name in enumerate(missing_names.astype(object, copy=False).tolist()):
                     id_by_name[name] = start_pos + int(offset)
@@ -2588,6 +2642,27 @@ class ACStateEstimator:
         )
 
     @staticmethod
+    def _active_device_key_array(device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
+        type_values = np.asarray(device_type_code, dtype=np.int64)
+        pos_values = np.asarray(device_pos, dtype=np.int64)
+        return (type_values << _ACTIVE_DEVICE_KEY_POS_BITS) | pos_values
+
+    @staticmethod
+    def _active_measurement_key_array(
+        device_type_code: np.ndarray,
+        device_pos: np.ndarray,
+        meas_type_code: np.ndarray,
+    ) -> np.ndarray:
+        type_values = np.asarray(device_type_code, dtype=np.int64)
+        pos_values = np.asarray(device_pos, dtype=np.int64)
+        meas_values = np.asarray(meas_type_code, dtype=np.int64)
+        return (
+            (type_values << (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS))
+            | (pos_values << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
+            | meas_values
+        )
+
+    @staticmethod
     def _active_device_key_from_measurement_key(key: int) -> int:
         return int(key) >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS
 
@@ -2611,15 +2686,9 @@ class ACStateEstimator:
         valid_type = type_values[valid_pos]
         valid_pos_values = pos_values[valid_pos]
         valid_meas = meas_values[valid_pos]
-        device_cache = set(
-            ((valid_type << _ACTIVE_DEVICE_KEY_POS_BITS) | valid_pos_values).tolist()
-        )
+        device_cache = set(ACStateEstimator._active_device_key_array(valid_type, valid_pos_values).tolist())
         measurement_cache = set(
-            (
-                (valid_type << (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS))
-                | (valid_pos_values << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
-                | valid_meas
-            ).tolist()
+            ACStateEstimator._active_measurement_key_array(valid_type, valid_pos_values, valid_meas).tolist()
         )
         return device_cache, measurement_cache
 
@@ -2665,10 +2734,7 @@ class ACStateEstimator:
 
         def best_dict(best_weight: np.ndarray, best_value: np.ndarray) -> Dict[int, float]:
             valid = np.flatnonzero(np.isfinite(best_weight) & (node_idx_by_pos >= 0)).astype(np.int64, copy=False)
-            return {
-                int(node_idx_by_pos[int(pos)]): float(best_value[int(pos)])
-                for pos in valid.tolist()
-            }
+            return dict(zip(node_idx_by_pos[valid].tolist(), best_value[valid].tolist()))
 
         node_v_rows = row_index[
             real_mask
@@ -2731,16 +2797,13 @@ class ACStateEstimator:
         key_type = device_type_code[power_rows].astype(np.int64, copy=False)
         key_pos = device_pos[power_rows].astype(np.int64, copy=False)
         key_meas = meas_type_code[power_rows].astype(np.int64, copy=False)
-        keys = (
-            (key_type << (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS))
-            | (key_pos << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
-            | key_meas
-        )
-        for row, key in zip(power_rows.tolist(), keys.tolist()):
-            weight = float(table.weight[row])
+        keys = self._active_measurement_key_array(key_type, key_pos, key_meas)
+        weight_values = np.asarray(table.weight, dtype=np.float64)[power_rows].tolist()
+        value_values = np.asarray(table.value, dtype=np.float64)[power_rows].tolist()
+        for key, weight, value in zip(keys.tolist(), weight_values, value_values):
             current = best.get(key)
             if current is None or weight > current[0]:
-                best[key] = (weight, float(table.value[row]))
+                best[key] = (weight, value)
         return best
 
     def _power_flow_seed_rows_from_arrays(
@@ -2750,9 +2813,16 @@ class ACStateEstimator:
         device_type_code: np.ndarray,
         meas_type_code: np.ndarray,
         device_pos: np.ndarray,
-    ) -> List[Tuple[int, int, int, float]]:
+    ) -> Dict[str, np.ndarray]:
+        def empty_seed() -> Dict[str, np.ndarray]:
+            return {
+                "measurement_key": np.empty(0, dtype=np.int64),
+                "ppc_row": np.empty(0, dtype=np.int64),
+                "value": np.empty(0, dtype=np.float64),
+            }
+
         if getattr(self, "flat_start", True):
-            return []
+            return empty_seed()
         seed_rows_mask = (
             (device_type_code == DEVICE_TYPE_CODES_ACNODE)
             & (meas_type_code == MEAS_TYPE_CODES_V)
@@ -2781,20 +2851,21 @@ class ACStateEstimator:
         )
         seed_rows = np.flatnonzero(processable_mask & seed_rows_mask & (device_pos >= 0)).astype(np.int64, copy=False)
         if seed_rows.size == 0:
-            return []
+            return empty_seed()
         ppc_rows = self._measurement_ppc_rows_for_device_positions(device_type_code[seed_rows], device_pos[seed_rows])
         valid = ppc_rows >= 0
         if not np.any(valid):
-            return []
+            return empty_seed()
         rows = seed_rows[valid]
-        return list(
-            zip(
-                device_type_code[rows].astype(np.int64, copy=False).tolist(),
-                ppc_rows[valid].astype(np.int64, copy=False).tolist(),
-                meas_type_code[rows].astype(np.int64, copy=False).tolist(),
-                np.asarray(table.value, dtype=np.float64)[rows].tolist(),
-            )
-        )
+        return {
+            "measurement_key": self._active_measurement_key_array(
+                device_type_code[rows],
+                device_pos[rows],
+                meas_type_code[rows],
+            ).astype(np.int64, copy=False),
+            "ppc_row": ppc_rows[valid].astype(np.int64, copy=False),
+            "value": np.asarray(table.value, dtype=np.float64)[rows],
+        }
 
     def _meas_device_name_ids_for_ppc_names(self, meas_ppc: Dict, names: np.ndarray) -> np.ndarray:
         names = np.asarray(names, dtype=object)
@@ -3040,7 +3111,11 @@ class ACStateEstimator:
         self._node_voltage_measurement_cache = {}
         self._real_voltage_observation_node_cache = {}
         self._real_power_measurement_seed_cache = {}
-        self._power_flow_seed_rows = []
+        self._power_flow_seed_rows = {
+            "measurement_key": np.empty(0, dtype=np.int64),
+            "ppc_row": np.empty(0, dtype=np.int64),
+            "value": np.empty(0, dtype=np.float64),
+        }
         self._has_valid_angle_measurements = bool(np.any(table.valid & table.angle_mask))
         warnings.warn(
             "AC SE measurement normalization requires measurement PPC arrays; name-based fallback is disabled.",
@@ -3080,8 +3155,12 @@ class ACStateEstimator:
         active_measurement_keys = set()
         node_voltage_best: Dict[int, float] = {}
         real_voltage_best: Dict[int, float] = {}
-        power_seed_best: Dict[Tuple[int, int, int], Tuple[float, float]] = {}
-        power_flow_seed_rows: List[Tuple[int, int, int, float]] = []
+        power_seed_best: Dict[int, Tuple[float, float]] = {}
+        power_flow_seed_rows: Dict[str, np.ndarray] = {
+            "measurement_key": np.empty(0, dtype=np.int64),
+            "ppc_row": np.empty(0, dtype=np.int64),
+            "value": np.empty(0, dtype=np.float64),
+        }
         table = getattr(self.measurements, "table", None)
         if table is not None and len(table.idx) == len(self.measurements):
             max_idx = int(table.idx.max()) if table.idx.size else 0
@@ -3383,15 +3462,9 @@ class ACStateEstimator:
                 valid_type = tail_type[valid_tail].astype(np.int64, copy=False)
                 valid_pos = tail_pos[valid_tail].astype(np.int64, copy=False)
                 valid_meas = tail_meas[valid_tail].astype(np.int64, copy=False)
-                device_key_cache.update(
-                    ((valid_type << _ACTIVE_DEVICE_KEY_POS_BITS) | valid_pos).tolist()
-                )
+                device_key_cache.update(self._active_device_key_array(valid_type, valid_pos).tolist())
                 measurement_key_cache.update(
-                    (
-                        (valid_type << (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS))
-                        | (valid_pos << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
-                        | valid_meas
-                    ).tolist()
+                    self._active_measurement_key_array(valid_type, valid_pos, valid_meas).tolist()
                 )
         return base_table
 
@@ -4256,10 +4329,12 @@ class ACStateEstimator:
         if remaining <= 0:
             return selected
 
-        selected_set = set(selected)
         selected_rows = np.asarray(selected, dtype=np.int64)
         all_candidate_rows = np.arange(len(candidates), dtype=np.int64)
-        remaining_rows = all_candidate_rows[[int(idx) not in selected_set for idx in all_candidate_rows.tolist()]]
+        remaining_mask = np.ones(all_candidate_rows.size, dtype=bool)
+        if selected_rows.size:
+            remaining_mask[selected_rows.astype(np.intp, copy=False)] = False
+        remaining_rows = all_candidate_rows[remaining_mask]
         if remaining_rows.size == 0:
             return selected
 
