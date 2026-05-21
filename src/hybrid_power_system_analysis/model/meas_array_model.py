@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from efile_read import _read_efile_rows, _split_data_row
+from efile_read import _split_data_row
 from paths import resolve_project_file
 from model.meas_type import DEVICE_TYPE_CODES, MEAS_TYPE_CODES, MEAS_TYPE_NAMES
 from model.meas_model import (

@@ -111,6 +111,42 @@ class MeasurementArrayModelTest(unittest.TestCase):
 
         self.assertIs(ppc["device_name"][0], ppc["device_name"][1])
 
+    def test_direct_measurement_parser_accepts_variable_width_rows(self):
+        from model.meas_model import MEAS_STATUS_INVALID, MEAS_STATUS_NORMAL
+        from model.meas_array_model import MEAS_COLS, MEAS_TYPE_CODES, build_meas_ppc_from_e_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "case.meas"
+            meas_file.write_text(
+                "\n".join(
+                    (
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value status",
+                        "# 1 p1 ACLoad load_1 P_LOAD 1.0 1 2.0",
+                        "# 2 q1 ACLoad load_1 Q_LOAD 1.0 1 1.0 0 extra_col",
+                        "# 3 i1 ACLoad load_1 I_LOAD 1.0 1 0.1 1",
+                        "</Measurement>",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            ppc = build_meas_ppc_from_e_file(meas_file)
+
+        self.assertEqual((3, len(MEAS_COLS)), ppc["meas"].shape)
+        np.testing.assert_array_equal(
+            ppc["meas"][:, MEAS_COLS["meas_type_code"]],
+            np.array(
+                [MEAS_TYPE_CODES["P_LOAD"], MEAS_TYPE_CODES["Q_LOAD"], MEAS_TYPE_CODES["I_LOAD"]],
+                dtype=np.float64,
+            ),
+        )
+        np.testing.assert_array_equal(
+            ppc["meas"][:, MEAS_COLS["status"]],
+            np.array([MEAS_STATUS_NORMAL, MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID], dtype=np.float64),
+        )
+
     def test_build_meas_ppc_from_efile_rows_accepts_variable_width_rows(self):
         from model.meas_array_model import MEAS_COLS, MEAS_TYPE_CODES, build_meas_ppc_from_efile_rows
 
