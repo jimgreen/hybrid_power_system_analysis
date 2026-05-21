@@ -167,6 +167,11 @@ def _build_ppc(
         "meas_type_names": MEAS_TYPE_NAMES,
         "device_type_codes": DEVICE_TYPE_CODES,
         "device_type_names": {code: name for name, code in DEVICE_TYPE_CODES.items()},
+        "idx_array": idx,
+        "device_type_code_array": device_type_code,
+        "device_name_id_array": device_name_id,
+        "meas_type_code_array": meas_type_code,
+        "angle_mask_array": angle_mask,
         "name": name,
         "device_type": device_type,
         "device_name": device_name,
@@ -342,6 +347,21 @@ def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
     split_data_row = _split_data_row
     device_code_get = DEVICE_TYPE_CODES.get
     meas_code_get = MEAS_TYPE_CODES.get
+    idx_append = idx_values.append
+    name_append = name_values.append
+    device_type_append = device_type_values.append
+    device_name_append = device_name_values.append
+    meas_type_append = meas_type_values.append
+    weight_append = weight_values.append
+    valid_append = valid_values.append
+    value_append = value_values.append
+    status_append = status_values.append
+    device_type_code_append = device_type_code_values.append
+    meas_type_code_append = meas_type_code_values.append
+    device_name_id_append = device_name_id.append
+    device_name_lookup_get = device_name_lookup.get
+    device_names_list_append = device_names_list.append
+    status_is_active = measurement_status_is_active
     in_measurement = False
 
     try:
@@ -400,33 +420,33 @@ def _build_meas_ppc_from_measurement_file(source: Path) -> Dict:
                     raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
                 if len(fields) <= required_max_col:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
-                idx_values.append(int(fields[idx_col]))
-                name_values.append(fields[name_col])
+                idx_append(int(fields[idx_col]))
+                name_append(fields[name_col])
                 device_type = intern(fields[device_type_col])
                 device_name = intern(fields[device_name_col])
                 meas_type = intern(fields[meas_type_col].upper())
-                device_type_values.append(device_type)
-                device_name_values.append(device_name)
-                meas_type_values.append(meas_type)
-                weight_values.append(float(fields[weight_col]))
+                device_type_append(device_type)
+                device_name_append(device_name)
+                meas_type_append(meas_type)
+                weight_append(float(fields[weight_col]))
                 valid = fields[valid_col] == "1"
-                value_values.append(float(fields[value_col]))
+                value_append(float(fields[value_col]))
                 if status_col >= 0 and len(fields) > status_col:
                     status = _normalize_status_text(fields[status_col], valid)
                 else:
                     status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
-                if not measurement_status_is_active(status):
+                if not status_is_active(status):
                     valid = False
-                valid_values.append(valid)
-                status_values.append(status)
-                device_type_code_values.append(int(device_code_get(device_type, 0)))
-                meas_type_code_values.append(int(meas_code_get(meas_type, 0)))
-                name_id = device_name_lookup.get(device_name)
+                valid_append(valid)
+                status_append(status)
+                device_type_code_append(int(device_code_get(device_type, 0)))
+                meas_type_code_append(int(meas_code_get(meas_type, 0)))
+                name_id = device_name_lookup_get(device_name)
                 if name_id is None:
                     name_id = len(device_names_list)
                     device_name_lookup[device_name] = name_id
-                    device_names_list.append(device_name)
-                device_name_id.append(name_id)
+                    device_names_list_append(device_name)
+                device_name_id_append(name_id)
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Malformed Measurement row in {source}") from exc
 
@@ -483,7 +503,19 @@ def build_meas_ppc_from_e_file(file_path) -> Dict:
 def copy_meas_ppc(ppc: Dict) -> Dict:
     """Return a shallow PPC copy with mutable measurement arrays copied."""
     copied = dict(ppc)
-    for key in ("meas", "device_pos", "scale", "from_pos", "to_pos", "available"):
+    for key in (
+        "meas",
+        "idx_array",
+        "device_type_code_array",
+        "device_name_id_array",
+        "meas_type_code_array",
+        "angle_mask_array",
+        "device_pos",
+        "scale",
+        "from_pos",
+        "to_pos",
+        "available",
+    ):
         value = ppc.get(key)
         if isinstance(value, np.ndarray):
             copied[key] = value.copy()
@@ -494,13 +526,28 @@ def measurement_table_from_meas_ppc(ppc: Dict) -> MeasurementTable:
     meas = ppc["meas"]
     cols = ppc.get("meas_cols", MEAS_COLS)
     row_count = int(meas.shape[0])
+    idx_array = ppc.get("idx_array")
+    if not isinstance(idx_array, np.ndarray) or int(idx_array.size) != row_count:
+        idx_array = meas[:, cols["idx"]].astype(np.int64, copy=False)
+    device_type_code = ppc.get("device_type_code_array")
+    if not isinstance(device_type_code, np.ndarray) or int(device_type_code.size) != row_count:
+        device_type_code = meas[:, cols["device_type_code"]].astype(np.int16, copy=False)
+    angle_mask = ppc.get("angle_mask_array")
+    if not isinstance(angle_mask, np.ndarray) or int(angle_mask.size) != row_count:
+        angle_mask = meas[:, cols["angle_mask"]].astype(bool, copy=False)
+    device_name_id = ppc.get("device_name_id_array")
+    if not isinstance(device_name_id, np.ndarray) or int(device_name_id.size) != row_count:
+        device_name_id = meas[:, cols["device_name_id"]].astype(np.int64, copy=False)
+    meas_type_code = ppc.get("meas_type_code_array")
+    if not isinstance(meas_type_code, np.ndarray) or int(meas_type_code.size) != row_count:
+        meas_type_code = meas[:, cols["meas_type_code"]].astype(np.int16, copy=False)
     device_pos = ppc.get("device_pos")
     if isinstance(device_pos, np.ndarray) and int(device_pos.size) == row_count:
         device_pos = device_pos.astype(np.int64, copy=False)
     else:
         device_pos = None
     table = MeasurementTable(
-        idx=meas[:, cols["idx"]].astype(np.int64, copy=False),
+        idx=idx_array,
         name=np.asarray(ppc.get("name", ()), dtype=object),
         device_type=np.asarray(ppc.get("device_type", ()), dtype=object),
         device_name=np.asarray(ppc.get("device_name", ()), dtype=object),
@@ -508,12 +555,12 @@ def measurement_table_from_meas_ppc(ppc: Dict) -> MeasurementTable:
         weight=meas[:, cols["weight"]],
         valid=meas[:, cols["valid"]].astype(bool, copy=False),
         value=meas[:, cols["value"]],
-        device_type_code=meas[:, cols["device_type_code"]].astype(np.int16, copy=False),
-        angle_mask=meas[:, cols["angle_mask"]].astype(bool, copy=False),
+        device_type_code=device_type_code.astype(np.int16, copy=False),
+        angle_mask=angle_mask.astype(bool, copy=False),
         status_code=meas[:, cols["status"]].astype(np.int16, copy=False),
         rows_by_device_type_code=ppc.get("rows_by_device_type_code"),
-        device_name_id=meas[:, cols["device_name_id"]].astype(np.int64, copy=False),
-        meas_type_code=meas[:, cols["meas_type_code"]].astype(np.int16, copy=False),
+        device_name_id=device_name_id.astype(np.int64, copy=False),
+        meas_type_code=meas_type_code.astype(np.int16, copy=False),
         device_pos=device_pos,
     )
     for key in ("scale", "from_pos", "to_pos", "available"):

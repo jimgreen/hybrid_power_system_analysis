@@ -900,23 +900,22 @@ class ACStateEstimator:
                     nodes = nodes[valid]
                 pos = np.asarray([self.node_pos[int(node)] for node in nodes], dtype=np.int32)
             else:
-                nodes = np.asarray([], dtype=np.int64)
                 pos = np.asarray([], dtype=np.int32)
-            return table, rows.astype(np.int64, copy=False), names.astype(object, copy=False), nodes, pos
+            return table, rows.astype(np.int64, copy=False), names.astype(object, copy=False), pos
 
-        gen_table, gen_rows, gen_names, gen_nodes, gen_pos = single_device_arrays(
+        gen_table, gen_rows, gen_names, gen_pos = single_device_arrays(
             "gen",
             "gen_name",
             "gen",
             GEN_COLS,
         )
-        load_table, load_rows, load_names, load_nodes, load_pos = single_device_arrays(
+        load_table, load_rows, load_names, load_pos = single_device_arrays(
             "load",
             "load_name",
             "load",
             LOAD_COLS,
         )
-        shunt_table, shunt_rows, shunt_names, shunt_nodes, shunt_pos = single_device_arrays(
+        shunt_table, shunt_rows, shunt_names, shunt_pos = single_device_arrays(
             "shunt",
             "shunt_name",
             "shunt",
@@ -928,17 +927,9 @@ class ACStateEstimator:
         self.generator_name_array = gen_names
         self.load_name_array = load_names
         self.shunt_name_array = shunt_names
-        self.generator_node_array = gen_nodes
-        self.load_node_array = load_nodes
-        self.shunt_node_array = shunt_nodes
         self.generator_pos_array = gen_pos
         self.load_pos_array = load_pos
         self.shunt_pos_array = shunt_pos
-        self.generator_alpha_array = (
-            gen_table[gen_rows.astype(np.intp, copy=False), GEN_COLS["alpha"]].astype(np.float64, copy=False)
-            if gen_rows.size
-            else np.asarray([], dtype=np.float64)
-        )
         self.generator_by_name = _LazySingleDeviceMap(gen_table, gen_names, gen_rows, GEN_COLS, "gen", self.node_by_idx)
         self.load_by_name = _LazySingleDeviceMap(load_table, load_names, load_rows, LOAD_COLS, "load", self.node_by_idx)
         self.shunt_by_name = _LazySingleDeviceMap(shunt_table, shunt_names, shunt_rows, SHUNT_COLS, "shunt", self.node_by_idx)
@@ -1292,7 +1283,6 @@ class ACStateEstimator:
             self._record_profile_time("seed.refresh_file_state", time.perf_counter() - stage_start)
             self._record_profile_time("seed.total", time.perf_counter() - seed_start)
         stage_start = time.perf_counter()
-        self._refresh_load_parameter_arrays()
         self.node_voltage_measurements = self._node_voltage_measurements()
         self.node_degrees = self._node_incident_degrees()
         self.references = self._select_reference_nodes()
@@ -1384,7 +1374,6 @@ class ACStateEstimator:
             voltage_control_names = np.asarray([], dtype=object)
             self.shunt_q_pos_array = np.asarray([], dtype=np.int32)
             self.initial_shunt_q_array = np.asarray([], dtype=np.float64)
-        self._ac_voltage_control_shunt_rows = voltage_control_rows
         self.voltage_control_shunt_name_array = voltage_control_names
         self.voltage_control_shunt_order = self.shunt_by_name.order(voltage_control_names)
         self.n_shunt_q = int(voltage_control_rows.size)
@@ -1411,12 +1400,8 @@ class ACStateEstimator:
             shunt_q_names = tuple(shunt.name for shunt in self.voltage_control_shunt_order)
         self.gen_p_col_by_name = {name: self.base_gen_p + idx for idx, name in enumerate(gen_names)}
         self.gen_q_col_by_name = {name: self.base_gen_q + idx for idx, name in enumerate(gen_names)}
-        self.generator_state_index_by_name = {name: idx for idx, name in enumerate(gen_names)}
         self.load_p_col_by_name = {name: self.base_load_p + idx for idx, name in enumerate(load_names)}
         self.load_q_col_by_name = {name: self.base_load_q + idx for idx, name in enumerate(load_names)}
-        self.load_state_index_by_name = {name: idx for idx, name in enumerate(load_names)}
-        self.shunt_q_col_by_name = {name: self.base_shunt_q + idx for idx, name in enumerate(shunt_q_names)}
-        self.shunt_q_state_index_by_name = {name: idx for idx, name in enumerate(shunt_q_names)}
         self._state_meta_cache = None
         self._state_labels_cache = None
 
@@ -1430,7 +1415,6 @@ class ACStateEstimator:
         stage_start = time.perf_counter()
         self.Y = self._build_y_matrix()
         self._prepare_y_row_cache()
-        self.generator_share_by_name = self._generator_shares()
         self._record_profile_time("init.network_matrices", time.perf_counter() - stage_start)
         self._initial_observability_cache = None
         self._observability_matrix_cache = None
@@ -1694,6 +1678,9 @@ class ACStateEstimator:
             int(self._max_measurement_idx),
             int(self.n_state),
         )
+
+    def _observability_cache_allowed(self) -> bool:
+        return "jacobian_sparse" not in getattr(self, "__dict__", {})
 
     def _cache_observability_matrix(
         self,
@@ -2006,12 +1993,12 @@ class ACStateEstimator:
         row_keys: Sequence[str],
         mapped_row_keys: Sequence[str] = (),
     ) -> Dict[str, object]:
-        row_key_set = set(row_keys)
-        mapped_key_set = set(mapped_row_keys)
+        row_key_tuple = tuple(row_keys)
+        mapped_key_tuple = tuple(mapped_row_keys)
         merged: Dict[str, object] = {}
         for key, head_value in head.items():
             tail_value = tail[key]
-            if key in row_key_set:
+            if key in row_key_tuple:
                 merged[key] = np.concatenate(
                     (
                         np.asarray(head_value, dtype=np.int64),
@@ -2019,7 +2006,7 @@ class ACStateEstimator:
                     )
                 ).astype(np.int64, copy=False)
                 continue
-            if key in mapped_key_set:
+            if key in mapped_key_tuple:
                 mapped = np.asarray(head_value, dtype=np.int32).copy()
                 tail_rows = np.asarray(tail_value, dtype=np.int32)
                 valid = tail_rows >= 0
@@ -2051,17 +2038,17 @@ class ACStateEstimator:
         shrunk: Dict[str, object] = {
             "handled_mask": np.delete(np.asarray(plan["handled_mask"], dtype=bool), int(removed_pos))
         }
-        used_keys = {"handled_mask"}
+        used_keys = ["handled_mask"]
         for row_key, value_keys in groups:
             shrunk_rows, keep = self._shrink_plan_rows(plan[row_key], removed_pos)
             shrunk[row_key] = shrunk_rows
-            used_keys.add(row_key)
+            used_keys.append(row_key)
             for value_key in value_keys:
                 shrunk[value_key] = np.asarray(plan[value_key])[keep]
-                used_keys.add(value_key)
+                used_keys.append(value_key)
         for key in passthrough_keys:
             shrunk[key] = np.asarray(plan[key]).copy()
-            used_keys.add(key)
+            used_keys.append(key)
         for key, value in plan.items():
             if key not in used_keys:
                 shrunk[key] = np.asarray(value).copy()
@@ -2495,28 +2482,6 @@ class ACStateEstimator:
             return
         result_ppc = ACStateEstimator._overlay_power_flow_seed_result_ppc(ppc, getattr(calc, "result", None))
         ACStateEstimator._apply_power_flow_seed_ppc_to_network(network, result_ppc)
-
-    def _refresh_load_parameter_arrays(self) -> None:
-        ppc = self._ac_ppc_dict()
-        rows = self._required_array_attr("_ac_load_rows", dtype=np.int64, context="load parameter refresh")
-        if rows.size:
-            load = np.asarray(ppc["load"], dtype=np.float64)[rows.astype(np.intp, copy=False)]
-            pbase = load[:, LOAD_COLS["pbase"]]
-            qbase = load[:, LOAD_COLS["qbase"]]
-            self.load_pv0_array = pbase * load[:, LOAD_COLS["pv0"]]
-            self.load_pv1_array = pbase * load[:, LOAD_COLS["pv1"]]
-            self.load_pv2_array = pbase * load[:, LOAD_COLS["pv2"]]
-            self.load_qv0_array = qbase * load[:, LOAD_COLS["qv0"]]
-            self.load_qv1_array = qbase * load[:, LOAD_COLS["qv1"]]
-            self.load_qv2_array = qbase * load[:, LOAD_COLS["qv2"]]
-        else:
-            empty = np.asarray([], dtype=np.float64)
-            self.load_pv0_array = empty
-            self.load_pv1_array = empty
-            self.load_pv2_array = empty
-            self.load_qv0_array = empty
-            self.load_qv1_array = empty
-            self.load_qv2_array = empty
 
     def _refresh_file_state_from_network(self) -> None:
         ppc = self._ac_ppc_dict()
@@ -5122,7 +5087,6 @@ class ACStateEstimator:
             if root_l != root_r:
                 parent[root_r] = root_l
 
-        node_pos = self.node_pos
         ppc_edges = self._zero_tie_solver_edges_from_ppc()
         for i, j in zip(ppc_edges[0], ppc_edges[1]):
             union(int(i), int(j))
@@ -5155,7 +5119,6 @@ class ACStateEstimator:
         for component in components:
             ref_positions = [pos for pos in component if pos in self.ref_idx]
             if ref_positions:
-                ref_pos = min(ref_positions, key=lambda pos: self.nodes[pos].idx)
                 for pos in component:
                     self.ref_angles[pos] = 0.0
             else:
@@ -5297,8 +5260,6 @@ class ACStateEstimator:
         n = len(self.nodes)
         self._y_row_nodes = []
         self._y_row_y_conj = []
-        self._y_row_off_mask = [None] * n
-        self._y_row_off_nodes = [None] * n
         self._y_row_diag_conj = np.conj(self.Y.diagonal()).astype(np.complex128, copy=False)
         y_indices = self.Y.indices if issparse(self.Y) else None
         y_data_conj = np.conj(self.Y.data) if issparse(self.Y) else None
@@ -5316,54 +5277,6 @@ class ACStateEstimator:
 
             self._y_row_nodes.append(nodes)
             self._y_row_y_conj.append(y_conj)
-
-    def _generator_shares(self) -> Dict[str, float]:
-        """Split a node-level solved injection among co-located generators."""
-        names_array = getattr(self, "generator_name_array", None)
-        alpha_array = getattr(self, "generator_alpha_array", None)
-        if names_array is not None and alpha_array is not None:
-            names = [str(name) for name in np.asarray(names_array, dtype=object).tolist()]
-            positions = np.asarray(self.generator_pos_array, dtype=np.int32)
-            alpha_values = np.asarray(alpha_array, dtype=np.float64)
-            if not names:
-                return {}
-            count_by_pos: Dict[int, int] = {}
-            alpha_sum_by_pos: Dict[int, float] = {}
-            for pos_raw, alpha in zip(positions, alpha_values):
-                pos = int(pos_raw)
-                count_by_pos[pos] = count_by_pos.get(pos, 0) + 1
-                alpha_sum_by_pos[pos] = alpha_sum_by_pos.get(pos, 0.0) + float(alpha)
-            shares: Dict[str, float] = {}
-            for name, pos_raw, alpha in zip(names, positions, alpha_values):
-                pos = int(pos_raw)
-                total_alpha = alpha_sum_by_pos.get(pos, 0.0)
-                if total_alpha > 0.0:
-                    shares[name] = float(alpha) / total_alpha
-                else:
-                    shares[name] = 1.0 / float(count_by_pos[pos])
-            return shares
-        count_by_pos: Dict[int, int] = {}
-        alpha_sum_by_pos: Dict[int, float] = {}
-        alpha_by_name: Dict[str, Optional[float]] = {}
-        pos_by_name: Dict[str, int] = {}
-        for gen, pos_raw in zip(self.generator_order, self.generator_pos_array):
-            pos = int(pos_raw)
-            count_by_pos[pos] = count_by_pos.get(pos, 0) + 1
-            alpha = getattr(gen, "alpha", None)
-            alpha_value = None if alpha is None else float(alpha)
-            alpha_by_name[gen.name] = alpha_value
-            pos_by_name[gen.name] = pos
-            if alpha_value is not None:
-                alpha_sum_by_pos[pos] = alpha_sum_by_pos.get(pos, 0.0) + alpha_value
-        shares: Dict[str, float] = {}
-        for name, pos in pos_by_name.items():
-            alpha = alpha_by_name[name]
-            total_alpha = alpha_sum_by_pos.get(pos, 0.0)
-            if total_alpha > 0.0 and alpha is not None:
-                shares[name] = float(alpha) / total_alpha
-            else:
-                shares[name] = 1.0 / float(count_by_pos[pos])
-        return shares
 
     def initial_state(self) -> np.ndarray:
         if self.flat_start:
@@ -7356,7 +7269,6 @@ class ACStateEstimator:
             return plan["handled_mask"]
 
         pos = plan["pos_i64"]
-        kind = plan["kind"]
         p_row_by_pos = plan["p_row_by_pos"]
         q_row_by_pos = plan["q_row_by_pos"]
         balance_pos = np.asarray(plan.get("balance_pos_i64", pos), dtype=np.int64)
@@ -7886,7 +7798,11 @@ class ACStateEstimator:
         x = self.initial_state() if x0 is None else x0.copy()
         if observability is None:
             start = time.perf_counter() if self.profile_enabled else None
-            if self._measurement_plan_tables_are_active(measurement_plan_tables) and x0 is None:
+            if (
+                self._measurement_plan_tables_are_active(measurement_plan_tables)
+                and x0 is None
+                and self._observability_cache_allowed()
+            ):
                 observability = self.observability_analysis()
             else:
                 observability = self.observability_analysis(x, measurement_plan_tables)
@@ -7898,7 +7814,7 @@ class ACStateEstimator:
         active_measurement_run = self._measurement_plan_tables_are_active(measurement_plan_tables)
         uniform_weight = self.active_uniform_weight if active_measurement_run else self._uniform_weight(weight)
         weights_are_uniform = self.active_weights_are_uniform if active_measurement_run else uniform_weight is not None
-        weighted_residual = None if weights_are_uniform else np.empty_like(weight)
+        weighted_residual = None if (weights_are_uniform or active_measurement_run) else np.empty_like(weight)
         converged = False
         max_correction = np.inf
         objective = np.inf
@@ -7914,6 +7830,13 @@ class ACStateEstimator:
             and observability_cache.get("lower_normal_plan") is not None
         ):
             lower_normal_plan = observability_cache["lower_normal_plan"]
+        if (
+            self.profile_enabled
+            and active_measurement_run
+            and lower_normal_plan is not None
+            and "solve.lower_normal_plan_build" not in self.profile_times
+        ):
+            self._record_profile_time("solve.lower_normal_plan_build", 0.0)
         normal_pattern = self._active_normal_pattern if active_measurement_run else None
         if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
             normal_pattern = observability_cache["normal_pattern"]
@@ -8007,7 +7930,8 @@ class ACStateEstimator:
                     self._active_normal_pattern = normal_pattern
                 if observability_cache is not None:
                     observability_cache["normal_pattern"] = normal_pattern
-            if weighted_residual is not None:
+            lower_plan_can_weight_rhs = lower_normal_plan is not None and active_measurement_run
+            if weighted_residual is not None and not lower_plan_can_weight_rhs:
                 np.multiply(weight, residual, out=weighted_residual)
             start = time.perf_counter() if self.profile_enabled else None
             if lower_normal_plan is not None:
@@ -8017,7 +7941,7 @@ class ACStateEstimator:
                     weight,
                     uniform_weight=uniform_weight,
                     weights_are_uniform=weights_are_uniform,
-                    weighted_residual=weighted_residual,
+                    weighted_residual=None if lower_plan_can_weight_rhs else weighted_residual,
                     dense_gain_limit=0,
                     assume_fixed_weights=active_measurement_run,
                     copy_rhs=False,

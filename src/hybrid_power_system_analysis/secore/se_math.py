@@ -901,6 +901,7 @@ class LowerNormalEquationCscPlan:
         self._pair_values = np.empty(int(self.pair_slot.size), dtype=np.float64)
         self._rhs_values = np.empty(int(self.h_cols.size), dtype=np.float64)
         self._fixed_pair_weight = None
+        self._fixed_h_weight = None
         self.gain = SP_CSC_MATRIX(
             (self.gain_data, self.gain_indices, self.gain_indptr),
             shape=self.gain_shape,
@@ -999,9 +1000,14 @@ class LowerNormalEquationCscPlan:
             self._fixed_pair_weight = weight[self.pair_rows].copy()
         else:
             self._fixed_pair_weight = np.array([], dtype=np.float64)
+        if self.h_rows.size:
+            self._fixed_h_weight = weight[self.h_rows].copy()
+        else:
+            self._fixed_h_weight = np.array([], dtype=np.float64)
 
     def clear_fixed_weights(self) -> None:
         self._fixed_pair_weight = None
+        self._fixed_h_weight = None
 
     def matches(self, H) -> bool:
         if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
@@ -1053,11 +1059,15 @@ class LowerNormalEquationCscPlan:
                 else:
                     scale = 1.0
                     row_weight = weight
-                    weighted_residual_values = weight * residual if weighted_residual is None else weighted_residual
+                    weighted_residual_values = None if (assume_fixed_weights and weighted_residual is None) else (
+                        weight * residual if weighted_residual is None else weighted_residual
+                    )
             else:
                 scale = 1.0
                 row_weight = weight
-                weighted_residual_values = weight * residual if weighted_residual is None else weighted_residual
+                weighted_residual_values = None if (assume_fixed_weights and weighted_residual is None) else (
+                    weight * residual if weighted_residual is None else weighted_residual
+                )
 
         if self.pair_slot.size:
             np.multiply(data[self.pair_left_pos], data[self.pair_right_pos], out=self._pair_values)
@@ -1079,7 +1089,13 @@ class LowerNormalEquationCscPlan:
             self.gain_data.fill(0.0)
 
         if data.size:
-            np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
+            if weighted_residual_values is None and row_weight is not None and assume_fixed_weights:
+                if self._fixed_h_weight is None or self._fixed_h_weight.shape[0] != self.h_rows.size:
+                    self.prepare_fixed_weights(row_weight)
+                np.multiply(data, residual[self.h_rows], out=self._rhs_values)
+                np.multiply(self._rhs_values, self._fixed_h_weight, out=self._rhs_values)
+            else:
+                np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
             self.rhs[:] = np.bincount(
                 self.h_cols,
                 weights=self._rhs_values,
@@ -1243,11 +1259,67 @@ def unanchored_angle_state_indices(
     angle_cols_array = np.asarray(angle_cols, dtype=np.int64)
 
     if is_sparse_matrix(H):
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        n = len(angle_cols)
+        if np.array_equal(angle_cols_array, np.arange(n, dtype=np.int64)):
+            mask = H_csr.indices < n
+            if np.any(mask):
+                row_nnz = np.diff(H_csr.indptr).astype(np.int64, copy=False)
+                entry_rows = np.repeat(np.arange(H_csr.shape[0], dtype=np.int64), row_nnz)
+                angle_rows = entry_rows[mask]
+                angle_indices = H_csr.indices[mask].astype(np.int64, copy=False)
+                angle_data = H_csr.data[mask]
+                nnz_by_row = np.bincount(angle_rows, minlength=H_csr.shape[0])
+                active_rows = np.flatnonzero(nnz_by_row).astype(np.int64, copy=False)
+                degree = np.bincount(angle_indices, minlength=n)
+                filtered_indptr = np.empty(H_csr.shape[0] + 1, dtype=np.int64)
+                filtered_indptr[0] = 0
+                np.cumsum(nnz_by_row, out=filtered_indptr[1:])
+                positions = np.arange(angle_indices.size, dtype=np.int64)
+                row_start_for_entry = filtered_indptr[angle_rows]
+                nonfirst = positions > row_start_for_entry
+                if np.any(nonfirst):
+                    left = angle_indices[row_start_for_entry[nonfirst]]
+                    right = angle_indices[positions[nonfirst]]
+                    graph = SP_COO_MATRIX(
+                        (
+                            np.ones(left.size * 2, dtype=np.int8),
+                            (np.concatenate((left, right)), np.concatenate((right, left))),
+                        ),
+                        shape=(n, n),
+                    ).tocsr()
+                else:
+                    graph = SP_CSR_MATRIX((n, n), dtype=np.int8)
+                n_components, labels = SP_CONNECTED_COMPONENTS(graph, directed=False, return_labels=True)
+                anchored = np.zeros(int(n_components), dtype=bool)
+                if active_rows.size:
+                    starts = filtered_indptr[active_rows]
+                    row_sums = np.add.reduceat(angle_data, starts)
+                    anchor_rows = np.abs(row_sums) > tol
+                    if np.any(anchor_rows):
+                        first_cols = angle_indices[starts]
+                        anchored[labels[first_cols[anchor_rows]]] = True
+            else:
+                degree = np.zeros(n, dtype=np.int64)
+                n_components = n
+                labels = np.arange(n, dtype=np.int32)
+                anchored = np.zeros(n, dtype=bool)
+            state_indices = []
+            for component in np.flatnonzero(~anchored).tolist():
+                local_cols = np.flatnonzero(labels == int(component))
+                if local_cols.size == 0:
+                    continue
+                local_degree = degree[local_cols]
+                best = local_cols[local_degree == int(np.max(local_degree))]
+                representative = int(best[np.argmin(angle_cols_array[best])])
+                state_indices.append((int(local_cols.size), int(angle_cols_array[representative])))
+            state_indices.sort(key=lambda item: (-item[0], item[1]))
+            return [idx for _size, idx in state_indices]
+
         sub = H[:, angle_cols].tocsr()
         nnz_by_row = np.diff(sub.indptr)
         active_rows = np.flatnonzero(nnz_by_row).astype(np.int64, copy=False)
         degree = np.bincount(sub.indices, minlength=len(angle_cols)) if sub.indices.size else np.zeros(len(angle_cols), dtype=np.int64)
-        n = len(angle_cols)
         if sub.indices.size:
             positions = np.arange(sub.indices.size, dtype=np.int64)
             entry_rows = np.repeat(np.arange(sub.shape[0], dtype=np.int64), nnz_by_row)

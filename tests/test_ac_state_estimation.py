@@ -2464,6 +2464,8 @@ class ACStateEstimationTest(unittest.TestCase):
             "_voltage_control_shunts",
             "_initial_voltage_control_shunt_q",
             "_complex_array",
+            "_refresh_load_parameter_arrays",
+            "_generator_shares",
         ):
             self.assertFalse(hasattr(ACStateEstimator, name), name)
 
@@ -2476,17 +2478,6 @@ class ACStateEstimationTest(unittest.TestCase):
         with self.assertWarnsRegex(RuntimeWarning, "PPC-backed network"):
             with self.assertRaisesRegex(RuntimeError, "PPC-backed network"):
                 estimator._ac_ppc_dict()
-
-    def test_refresh_load_parameter_arrays_requires_cached_ppc_load_rows(self):
-        from secore.ac_se import ACStateEstimator
-
-        estimator = ACStateEstimator.__new__(ACStateEstimator)
-        estimator._ac_ppc_dict = lambda: {"load": np.zeros((0, 1), dtype=np.float64)}
-        estimator.load_order = [SimpleNamespace(pbase=1.0, pv0=1.0, pv1=0.0, pv2=0.0)]
-
-        with self.assertWarnsRegex(RuntimeWarning, "_ac_load_rows"):
-            with self.assertRaisesRegex(RuntimeError, "_ac_load_rows"):
-                estimator._refresh_load_parameter_arrays()
 
     def test_incremental_active_update_warns_when_active_measurements_are_missing(self):
         from model.meas_model import Measurement
@@ -4356,6 +4347,32 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, estimator.generator_by_name.materialized_count)
         self.assertEqual(0, estimator.load_by_name.materialized_count)
         self.assertEqual(0, estimator.shunt_by_name.materialized_count)
+
+    def test_prepare_does_not_keep_unused_legacy_member_arrays(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+
+        for name in (
+            "generator_node_array",
+            "load_node_array",
+            "shunt_node_array",
+            "generator_alpha_array",
+            "generator_share_by_name",
+            "_ac_voltage_control_shunt_rows",
+            "generator_state_index_by_name",
+            "load_state_index_by_name",
+            "shunt_q_col_by_name",
+            "shunt_q_state_index_by_name",
+            "_y_row_off_mask",
+            "_y_row_off_nodes",
+        ):
+            self.assertFalse(hasattr(estimator, name), name)
 
     def test_node_incident_degrees_use_ppc_topology_not_branch_device_maps(self):
         from secore.ac_se import ACStateEstimator
