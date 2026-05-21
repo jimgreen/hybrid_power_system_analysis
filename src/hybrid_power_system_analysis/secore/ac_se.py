@@ -6547,11 +6547,16 @@ class ACStateEstimator:
         switch_current = self._switch_current_from_state(x)
         voltage_complex = self._complex_voltage(theta, voltage)
         n_meas = self._measurement_count(measurement_plan_tables)
+        active_vectorized = (
+            self._measurement_plan_tables_are_active(measurement_plan_tables)
+            and bool(getattr(self, "active_measurements_are_vectorized", False))
+        )
         if out is None:
-            values = np.zeros(n_meas, dtype=np.float64)
+            values = np.empty(n_meas, dtype=np.float64) if active_vectorized else np.zeros(n_meas, dtype=np.float64)
         else:
             values = out
-            values.fill(0.0)
+            if not active_vectorized:
+                values.fill(0.0)
         vectorized_branch_rows = self._fill_branch_transformer_values_vectorized(
             values,
             vector_plans["branch_transformer"],
@@ -6586,6 +6591,8 @@ class ACStateEstimator:
             voltage_complex,
             switch_current,
         )
+        if active_vectorized:
+            return values
         vectorized_rows = (
             vectorized_branch_rows
             | vectorized_zero_rows
@@ -7359,6 +7366,36 @@ class ACStateEstimator:
                 np.array([], dtype=np.int64),
                 np.array([], dtype=np.complex128),
             )
+        if issparse(getattr(self, "Y", None)):
+            y_csr = self.Y.tocsr()
+            indptr = y_csr.indptr
+            if (
+                pos_array[0] >= 0
+                and pos_array[-1] + 1 < indptr.size
+                and (pos_array.size == 1 or np.all(pos_array[1:] == pos_array[:-1] + 1))
+            ):
+                first = int(pos_array[0])
+                last = int(pos_array[-1])
+                row_indptr = indptr[first : last + 2]
+                counts = np.diff(row_indptr).astype(np.int64, copy=False)
+                total = int(counts.sum())
+                if total == 0:
+                    return (
+                        np.array([], dtype=np.int32),
+                        np.array([], dtype=np.int32),
+                        np.array([], dtype=np.int64),
+                        np.array([], dtype=np.complex128),
+                    )
+                start = int(row_indptr[0])
+                end = int(row_indptr[-1])
+                y_balance = np.repeat(np.arange(pos_array.size, dtype=np.int32), counts)
+                y_nodes = y_csr.indices[start:end].astype(np.int32, copy=False)
+                return (
+                    y_balance,
+                    y_nodes,
+                    y_nodes.astype(np.int64, copy=False),
+                    np.conj(y_csr.data[start:end]).astype(np.complex128, copy=False),
+                )
         counts = np.fromiter(
             (int(self._y_row_nodes[int(node_pos)].size) for node_pos in pos_array),
             dtype=np.int64,
@@ -7927,6 +7964,7 @@ class ACStateEstimator:
         voltage_complex = self._complex_voltage(theta, voltage)
         n_meas = self._measurement_count(measurement_plan_tables)
         active_plan_run = self._measurement_plan_tables_are_active(measurement_plan_tables)
+        active_vectorized = active_plan_run and bool(getattr(self, "active_measurements_are_vectorized", False))
         if sparse and active_plan_run:
             H = self._jacobian_builder
             H.shape = (n_meas, self.n_state)
@@ -7989,6 +8027,8 @@ class ACStateEstimator:
             voltage_complex,
             switch_current,
         )
+        if active_vectorized:
+            return H.to_csr() if sparse else H
         vectorized_rows = (
             vectorized_branch_rows
             | vectorized_simple_rows

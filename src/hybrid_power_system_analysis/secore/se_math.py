@@ -1278,7 +1278,6 @@ class CholmodAAtNormalEquationPlan:
         self._rhs_values = np.empty(int(self.h_cols.size), dtype=np.float64)
         self._weighted_residual = np.empty(self.shape[0], dtype=np.float64)
         self._fixed_sqrt_weight = None
-        self._fixed_h_weight = None
         self.A = SP_CSC_MATRIX(
             (self.a_data, self.a_indices, self.a_indptr),
             shape=self.a_shape,
@@ -1310,14 +1309,11 @@ class CholmodAAtNormalEquationPlan:
         weight = np.asarray(weight, dtype=np.float64)
         if self.h_rows.size:
             self._fixed_sqrt_weight = np.sqrt(weight[self.h_rows]).astype(np.float64, copy=True)
-            self._fixed_h_weight = weight[self.h_rows].copy()
         else:
             self._fixed_sqrt_weight = np.array([], dtype=np.float64)
-            self._fixed_h_weight = np.array([], dtype=np.float64)
 
     def clear_fixed_weights(self) -> None:
         self._fixed_sqrt_weight = None
-        self._fixed_h_weight = None
 
     def matches(self, H) -> bool:
         if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
