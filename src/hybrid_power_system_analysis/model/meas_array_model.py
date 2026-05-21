@@ -44,9 +44,12 @@ ANGLE_MEASUREMENT_TYPE_CODES = np.asarray(
 )
 ANGLE_MEASUREMENT_TYPES = frozenset(MEAS_TYPE_NAMES[int(code)] for code in ANGLE_MEASUREMENT_TYPE_CODES)
 
+_DEVICE_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in DEVICE_TYPE_CODES.items()}
+_MEAS_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in MEAS_TYPE_CODES.items()}
 _MEAS_PPC_CACHE = {}
 _MEAS_PPC_CACHE_LOCK = threading.Lock()
 _REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
+_REQUIRED_COLUMNS_BYTES = tuple(name.encode("utf8") for name in _REQUIRED_COLUMNS)
 
 
 def clear_meas_ppc_cache(file_path=None) -> None:
@@ -346,6 +349,21 @@ def _normalize_status_text(status_text, valid: bool) -> int:
     return normalize_measurement_status(status_text, valid=valid)
 
 
+def _normalize_status_bytes(status_text: bytes, valid: bool) -> int:
+    text = status_text.strip().upper()
+    if not text:
+        return MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+    if text == b"0":
+        return MEAS_STATUS_NORMAL
+    if text == b"1":
+        return MEAS_STATUS_INVALID
+    if text == b"2":
+        return MEAS_STATUS_PSEUDO
+    if text == b"3":
+        return MEAS_STATUS_REMOVED
+    return _normalize_status_text(text.decode("utf8"), valid)
+
+
 def _measurement_block_name(line: str) -> Optional[str]:
     if not line.startswith("<") or not line.endswith(">"):
         return None
@@ -357,7 +375,218 @@ def _measurement_block_name(line: str) -> Optional[str]:
     return name
 
 
-def _build_meas_ppc_from_measurement_file(source: Path, *, include_strings: bool = True, include_matrix: bool = True) -> Dict:
+def _measurement_block_name_bytes(line: bytes) -> Optional[bytes]:
+    if not line.startswith(b"<") or not line.endswith(b">"):
+        return None
+    name = line[1:-1].strip()
+    if name.startswith(b"/"):
+        name = name[1:].strip()
+    marker = b" lv "
+    if marker in name:
+        name = name.split(marker, 1)[0].strip()
+    return name
+
+
+def _initial_measurement_capacity(source: Path) -> int:
+    """Estimate a growable row capacity without scanning the measurement file twice."""
+    try:
+        return max(1024, int(source.stat().st_size // 96) + 128)
+    except OSError:
+        return 1024
+
+
+def _grow_measurement_arrays(arrays: Tuple[np.ndarray, ...], new_size: int) -> Tuple[np.ndarray, ...]:
+    grown = []
+    for array in arrays:
+        array.resize(new_size, refcheck=False)
+        grown.append(array)
+    return tuple(grown)
+
+
+def _build_meas_ppc_from_measurement_file_array_only(
+    source: Path,
+    *,
+    include_matrix: bool = True,
+) -> Dict:
+    """Read measurement rows into numeric arrays using one variable-width byte scan."""
+    header = ()
+    idx_col = device_type_col = device_name_col = meas_type_col = -1
+    weight_col = valid_col = value_col = -1
+    status_col = -1
+    required_max_col = -1
+    capacity = _initial_measurement_capacity(source)
+    idx_values = np.empty(capacity, dtype=np.int64)
+    weight_values = np.empty(capacity, dtype=np.float64)
+    valid_values = np.empty(capacity, dtype=bool)
+    value_values = np.empty(capacity, dtype=np.float64)
+    status_values = np.empty(capacity, dtype=np.int16)
+    device_type_code_values = np.empty(capacity, dtype=np.int16)
+    meas_type_code_values = np.empty(capacity, dtype=np.int16)
+    device_name_id = np.empty(capacity, dtype=np.int32)
+    row_count = 0
+    device_names_list = []
+    device_name_lookup = {}
+
+    intern = sys.intern
+    to_int = int
+    to_float = float
+    device_code_get = _DEVICE_TYPE_CODES_BYTES.get
+    meas_code_get = _MEAS_TYPE_CODES_BYTES.get
+    device_name_lookup_get = device_name_lookup.get
+    device_names_list_append = device_names_list.append
+    status_is_active = measurement_status_is_active
+    in_measurement = False
+
+    try:
+        with open(source, mode="rb") as fp:
+            for line_no, raw_line in enumerate(fp, start=1):
+                first = raw_line[:1]
+                if first == b"#" and in_measurement:
+                    text = raw_line[1:]
+                else:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    first = line[:1]
+                    if first == b"<":
+                        block_name = _measurement_block_name_bytes(line)
+                        if not line.startswith(b"</") and block_name == b"Measurement":
+                            in_measurement = True
+                            header = ()
+                        elif line.startswith(b"</") and block_name == b"Measurement" and in_measurement:
+                            break
+                        elif in_measurement and line.startswith(b"</"):
+                            break
+                        continue
+                    if first == b"@" and in_measurement:
+                        header = tuple(line[1:].split())
+                        header_index = {name: idx for idx, name in enumerate(header)}
+                        missing = [name.decode("utf8") for name in _REQUIRED_COLUMNS_BYTES if name not in header_index]
+                        if missing:
+                            raise RuntimeError(f"{source} Measurement header is missing columns: {missing}")
+                        idx_col = header_index[b"idx"]
+                        device_type_col = header_index[b"dev_type"]
+                        device_name_col = header_index[b"dev_name"]
+                        meas_type_col = header_index[b"meas_type"]
+                        weight_col = header_index[b"weight"]
+                        valid_col = header_index[b"valid"]
+                        value_col = header_index[b"value"]
+                        status_col = header_index.get(b"status", -1)
+                        required_max_col = max(
+                            idx_col,
+                            device_type_col,
+                            device_name_col,
+                            meas_type_col,
+                            weight_col,
+                            valid_col,
+                            value_col,
+                        )
+                        continue
+                    if first != b"#" or not in_measurement:
+                        continue
+                    text = line[1:]
+
+                fields = text.split()
+                if not header:
+                    raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
+                if len(fields) <= required_max_col:
+                    raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
+                if row_count >= capacity:
+                    capacity *= 2
+                    grow_arrays = (
+                        idx_values,
+                        weight_values,
+                        valid_values,
+                        value_values,
+                        status_values,
+                        device_type_code_values,
+                        meas_type_code_values,
+                        device_name_id,
+                    )
+                    grown = _grow_measurement_arrays(grow_arrays, capacity)
+                    (
+                        idx_values,
+                        weight_values,
+                        valid_values,
+                        value_values,
+                        status_values,
+                        device_type_code_values,
+                        meas_type_code_values,
+                        device_name_id,
+                    ) = grown[:8]
+
+                idx_values[row_count] = to_int(fields[idx_col])
+                device_type_code_values[row_count] = device_code_get(fields[device_type_col], 0)
+                device_name = fields[device_name_col]
+                name_id = device_name_lookup_get(device_name)
+                if name_id is None:
+                    device_name_text = intern(device_name.decode("utf8"))
+                    name_id = len(device_names_list)
+                    device_name_lookup[device_name] = name_id
+                    device_names_list_append(device_name_text)
+                device_name_id[row_count] = name_id
+                meas_type = fields[meas_type_col]
+                meas_code = meas_code_get(meas_type, 0)
+                if meas_code == 0:
+                    meas_code = meas_code_get(meas_type.upper(), 0)
+                meas_type_code_values[row_count] = meas_code
+                weight_values[row_count] = to_float(fields[weight_col])
+                valid = fields[valid_col] == b"1"
+                value_values[row_count] = to_float(fields[value_col])
+                if status_col >= 0 and len(fields) > status_col:
+                    status = _normalize_status_bytes(fields[status_col], valid)
+                    if not status_is_active(status):
+                        valid = False
+                else:
+                    status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+                valid_values[row_count] = valid
+                status_values[row_count] = status
+                row_count += 1
+    except (IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Malformed Measurement row in {source}") from exc
+
+    if not header:
+        raise RuntimeError(f"{source} does not contain a <Measurement> block")
+    if row_count == 0:
+        return _empty_meas_ppc(source, include_matrix=include_matrix)
+    idx_array = idx_values[:row_count]
+    device_type_code_array = device_type_code_values[:row_count]
+    meas_type_code_array = meas_type_code_values[:row_count]
+    rows_by_code = {
+        int(code): np.flatnonzero(device_type_code_array == int(code)).astype(np.int64, copy=False)
+        for code in np.unique(device_type_code_array)
+    }
+    device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
+    return _build_ppc(
+        source=source,
+        idx=idx_array,
+        name=None,
+        device_type=None,
+        device_name=None,
+        meas_type=None,
+        weight=weight_values[:row_count],
+        valid=valid_values[:row_count],
+        value=value_values[:row_count],
+        status=status_values[:row_count],
+        include_strings=False,
+        rows_by_device_type_code=rows_by_code,
+        device_type_code=device_type_code_array,
+        meas_type_code=meas_type_code_array,
+        device_name_id=device_name_id[:row_count],
+        device_names=np.asarray(device_names_list, dtype=object),
+        device_name_id_by_name=device_name_id_by_name,
+        include_matrix=include_matrix,
+    )
+
+
+def _build_meas_ppc_from_measurement_file(
+    source: Path,
+    *,
+    include_strings: bool = True,
+    include_matrix: bool = True,
+) -> Dict:
+    if not include_strings:
+        return _build_meas_ppc_from_measurement_file_array_only(source, include_matrix=include_matrix)
     header = ()
     idx_col = name_col = device_type_col = device_name_col = meas_type_col = -1
     weight_col = valid_col = value_col = -1

@@ -563,6 +563,20 @@ class ACStateEstimator:
             return MeasurementTableView(table, normalized=normalized)
         return TableBackedMeasurementList(table, normalized=normalized)
 
+    @staticmethod
+    def _clear_meas_ppc_runtime_arrays(meas_ppc: Dict) -> None:
+        """Drop estimator-local measurement runtime arrays copied from a shared file cache."""
+        for key in (
+            "device_pos",
+            "scale",
+            "from_pos",
+            "to_pos",
+            "available",
+            "_ac_se_runtime_cache_key",
+            "_mutable_runtime_arrays",
+        ):
+            meas_ppc.pop(key, None)
+
     def _ppc_runtime_node_and_device_context(self, ppc: Dict, topology_arrays) -> None:
         """Initialize SE runtime arrays from PPC/topology without network device objects."""
         bus = np.asarray(ppc["bus"], dtype=np.float64)
@@ -696,6 +710,7 @@ class ACStateEstimator:
                         include_strings=True,
                     )
                 )
+                self._clear_meas_ppc_runtime_arrays(self.meas_ppc)
                 self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         elif isinstance(measurements, dict):
             self.meas_ppc = copy_meas_ppc(measurements)
@@ -1047,7 +1062,11 @@ class ACStateEstimator:
             if 0 <= int(pos) < self._ac_node_ids.size
             and int(self._ac_node_ids[int(pos)]) in self.node_voltage_measurements
         }
-        self.reference_angle_by_pos = self._reference_angle_offsets()
+        self.reference_angle_by_pos = (
+            self._reference_angle_offsets()
+            if bool(getattr(self, "_has_valid_angle_measurements", False))
+            else {}
+        )
         self._rebase_angle_measurements()
         self._build_zero_tie_state_layout()
         self._record_profile_time("init.state_layout", time.perf_counter() - stage_start)
@@ -2998,6 +3017,7 @@ class ACStateEstimator:
         table.device_name_id = device_name_id
         table.meas_type_code = meas_type_code_array
         table.device_type_code = device_type_code_array
+        self._ensure_measurement_plan_lookup_arrays()
         runtime_cache_key = self._measurement_runtime_array_cache_key()
         cached_runtime = self._cached_measurement_runtime_arrays(meas_ppc, n_rows, runtime_cache_key)
         if cached_runtime is None:
@@ -4803,13 +4823,22 @@ class ACStateEstimator:
             return
         row_count = 2 * node_count
         weight = 10.0
-        node_names = np.asarray(getattr(self, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
-        names = np.empty(row_count, dtype=object)
-        names[0::2] = [f"constraint_p_balance_{name}" for name in node_names]
-        names[1::2] = [f"constraint_q_balance_{name}" for name in node_names]
-        meas_type = np.empty(row_count, dtype=object)
-        meas_type[0::2] = "P_BALANCE"
-        meas_type[1::2] = "Q_BALANCE"
+        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        if store_strings:
+            node_names = np.asarray(getattr(self, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
+            names = np.empty(row_count, dtype=object)
+            names[0::2] = [f"constraint_p_balance_{name}" for name in node_names]
+            names[1::2] = [f"constraint_q_balance_{name}" for name in node_names]
+            meas_type = np.empty(row_count, dtype=object)
+            meas_type[0::2] = "P_BALANCE"
+            meas_type[1::2] = "Q_BALANCE"
+            device_type = np.full(row_count, "ACPowerBalance", dtype=object)
+            device_name = np.repeat(node_names, 2)
+        else:
+            names = np.asarray([], dtype=object)
+            meas_type = np.asarray([], dtype=object)
+            device_type = np.asarray([], dtype=object)
+            device_name = np.asarray([], dtype=object)
         balance_code = DEVICE_TYPE_CODES_ACPOWERBALANCE
         meas_type_code = np.empty(row_count, dtype=np.int16)
         meas_type_code[0::2] = MEAS_TYPE_CODES_P_BALANCE
@@ -4824,8 +4853,8 @@ class ACStateEstimator:
         balance_table = MeasurementTable(
             idx=np.arange(next_idx, next_idx + row_count, dtype=np.int64),
             name=names,
-            device_type=np.full(row_count, "ACPowerBalance", dtype=object),
-            device_name=np.repeat(node_names, 2),
+            device_type=device_type,
+            device_name=device_name,
             meas_type=meas_type,
             weight=np.full(row_count, weight, dtype=np.float64),
             valid=np.ones(row_count, dtype=bool),
@@ -4909,6 +4938,7 @@ class ACStateEstimator:
                     j_pos = j_pos[j_pos < degree_array.size]
                     if j_pos.size:
                         np.add.at(degree_array, j_pos.astype(np.intp, copy=False), 1)
+        self.node_degree_array = degree_array
         return {int(node_ids[pos]): int(degree_array[pos]) for pos in range(int(node_ids.size))}
 
     def _select_reference_positions(self) -> np.ndarray:
@@ -4919,6 +4949,18 @@ class ACStateEstimator:
         island_ref_pos = np.asarray(getattr(self, "_ac_island_reference_solver_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
         if node_ids.size == 0:
             return np.asarray([], dtype=np.int32)
+        voltage_measurements = getattr(self, "node_voltage_measurements", {})
+        measured_by_pos = np.zeros(node_ids.size, dtype=bool)
+        if voltage_measurements:
+            measured_ids = np.fromiter((int(key) for key in voltage_measurements.keys()), dtype=np.int64)
+            if measured_ids.size:
+                measured_by_pos = np.isin(node_ids, measured_ids, assume_unique=False)
+        degree_array = np.asarray(getattr(self, "node_degree_array", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        if degree_array.size != node_ids.size:
+            degree_array = np.asarray(
+                [self.node_degrees.get(int(node_id), 0) for node_id in node_ids],
+                dtype=np.int32,
+            )
         references = []
         for island_pos in range(int(island_alive.size)):
             if not bool(island_alive[island_pos]):
@@ -4926,21 +4968,12 @@ class ACStateEstimator:
             candidates = np.flatnonzero(node_island_pos == island_pos).astype(np.int32, copy=False)
             if candidates.size == 0:
                 continue
-            measured_mask = np.fromiter(
-                (int(node_ids[int(pos)]) in self.node_voltage_measurements for pos in candidates),
-                dtype=bool,
-                count=int(candidates.size),
-            )
+            measured_mask = measured_by_pos[candidates.astype(np.intp, copy=False)]
             measured = candidates[measured_mask]
             if measured.size:
-                best = max(
-                    (int(pos) for pos in measured),
-                    key=lambda pos: (
-                        self.node_degrees.get(int(node_ids[pos]), 0),
-                        -int(node_ids[pos]),
-                    ),
-                )
-                references.append(best)
+                measured_pos = measured.astype(np.intp, copy=False)
+                order = np.lexsort((node_ids[measured_pos], -degree_array[measured_pos]))
+                references.append(int(measured[int(order[0])]))
                 continue
             ref_pos = int(island_ref_pos[island_pos]) if island_pos < island_ref_pos.size else -1
             if 0 <= ref_pos < node_ids.size:
@@ -5635,7 +5668,7 @@ class ACStateEstimator:
         if rows.size == 0:
             return np.asarray([], dtype=object)
         name_array = np.asarray(names, dtype=object)
-        return name_array[rows.astype(np.intp, copy=False)].astype(str, copy=False)
+        return name_array[rows.astype(np.intp, copy=False)]
 
     @staticmethod
     def _ppc_name_to_plan_pos(names, rows: np.ndarray) -> Dict[str, int]:
@@ -6930,7 +6963,8 @@ class ACStateEstimator:
             return
         if hasattr(H, "add_many"):
             for rows, cols, values in blocks:
-                self._add_indexed_values(H, rows, cols, values)
+                if np.asarray(rows).size:
+                    H.add_many(rows, cols, values)
             return
         row_parts = []
         col_parts = []
