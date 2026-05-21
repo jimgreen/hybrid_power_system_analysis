@@ -2650,22 +2650,12 @@ class ACStateEstimator:
         self._active_measurement_code_pos_cache = measurement_keys
 
     @staticmethod
-    def _active_device_key(device_type_code: int, device_pos: int) -> int:
-        return (int(device_type_code) << _ACTIVE_DEVICE_KEY_POS_BITS) | int(device_pos)
-
-    @staticmethod
     def _active_measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
         return (
             (int(device_type_code) << (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS))
             | (int(device_pos) << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
             | int(meas_type_code)
         )
-
-    @staticmethod
-    def _active_device_key_array(device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
-        type_values = np.asarray(device_type_code, dtype=np.int64)
-        pos_values = np.asarray(device_pos, dtype=np.int64)
-        return (type_values << _ACTIVE_DEVICE_KEY_POS_BITS) | pos_values
 
     @staticmethod
     def _active_measurement_key_array(
@@ -2681,10 +2671,6 @@ class ACStateEstimator:
             | (pos_values << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
             | meas_values
         )
-
-    @staticmethod
-    def _active_device_key_from_measurement_key(key: int) -> int:
-        return int(key) >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS
 
     @staticmethod
     def _active_key_cache_from_arrays(
@@ -2706,10 +2692,9 @@ class ACStateEstimator:
         valid_type = type_values[valid_pos]
         valid_pos_values = pos_values[valid_pos]
         valid_meas = meas_values[valid_pos]
-        device_cache = set(ACStateEstimator._active_device_key_array(valid_type, valid_pos_values).tolist())
-        measurement_cache = set(
-            ACStateEstimator._active_measurement_key_array(valid_type, valid_pos_values, valid_meas).tolist()
-        )
+        measurement_keys = ACStateEstimator._active_measurement_key_array(valid_type, valid_pos_values, valid_meas)
+        device_cache = set((measurement_keys >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS).tolist())
+        measurement_cache = set(measurement_keys.tolist())
         return device_cache, measurement_cache
 
     def _voltage_best_from_arrays(
@@ -3530,10 +3515,9 @@ class ACStateEstimator:
                 valid_type = tail_type[valid_tail].astype(np.int64, copy=False)
                 valid_pos = tail_pos[valid_tail].astype(np.int64, copy=False)
                 valid_meas = tail_meas[valid_tail].astype(np.int64, copy=False)
-                device_key_cache.update(self._active_device_key_array(valid_type, valid_pos).tolist())
-                measurement_key_cache.update(
-                    self._active_measurement_key_array(valid_type, valid_pos, valid_meas).tolist()
-                )
+                measurement_keys = self._active_measurement_key_array(valid_type, valid_pos, valid_meas)
+                device_key_cache.update((measurement_keys >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS).tolist())
+                measurement_key_cache.update(measurement_keys.tolist())
         return base_table
 
     def _real_voltage_observation_nodes(self) -> Dict[int, float]:
@@ -3710,9 +3694,8 @@ class ACStateEstimator:
 
     def _add_pseudo_power_measurements(self) -> None:
         """Add weak priors for devices whose file measurements are missing or invalid."""
-        if not hasattr(self, "_active_device_keys") or not hasattr(self, "_active_measurement_keys"):
+        if not hasattr(self, "_active_measurement_keys"):
             self._refresh_measurement_summary_cache()
-        measured_devices = self._active_device_keys_ref()
         measured_keys = self._active_measurement_keys_ref()
         added_keys = set()
         next_idx = self._next_measurement_idx()
@@ -3750,21 +3733,34 @@ class ACStateEstimator:
                 float(value),
             )
 
+        def device_measurement_keys(device_type_code: int, device_pos: np.ndarray, meas_type_code: int) -> np.ndarray:
+            pos = np.asarray(device_pos, dtype=np.int64)
+            return self._active_measurement_key_array(
+                np.full(pos.size, int(device_type_code), dtype=np.int64),
+                pos,
+                np.full(pos.size, int(meas_type_code), dtype=np.int64),
+            )
+
         gen, gen_topology, gen_rows = self._ppc_sorted_alive_rows_for(ppc, "gen", "gen", GEN_COLS["idx"])
         gen_voltage = self._ppc_device_node_voltage_values(ppc, gen_topology, gen_rows)
         gen_p, gen_q = self._ppc_generator_pseudo_power_arrays(ppc, gen_rows)
         gen_nodes = gen[gen_rows.astype(np.intp, copy=False), GEN_COLS["node"]].astype(np.int64, copy=False)
         gen_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACGENERATOR, gen_rows, gen.shape[0])
+        gen_p_keys = device_measurement_keys(DEVICE_TYPE_CODES_ACGENERATOR, gen_plan_pos, MEAS_TYPE_CODES_P_GEN)
+        gen_q_keys = device_measurement_keys(DEVICE_TYPE_CODES_ACGENERATOR, gen_plan_pos, MEAS_TYPE_CODES_Q_GEN)
+        gen_v_keys = device_measurement_keys(DEVICE_TYPE_CODES_ACGENERATOR, gen_plan_pos, MEAS_TYPE_CODES_V_GEN)
         gen_names = (
             self._ppc_names_for_rows(ppc["gen_name"], gen_rows)
             if store_strings
             else repeat("", int(gen_plan_pos.size))
         )
-        for name, pos, p, q, voltage, node_idx in zip(gen_names, gen_plan_pos, gen_p, gen_q, gen_voltage, gen_nodes):
+        for row_pos, (name, pos, p, q, voltage, node_idx) in enumerate(
+            zip(gen_names, gen_plan_pos, gen_p, gen_q, gen_voltage, gen_nodes)
+        ):
             if int(pos) < 0:
                 continue
             device_name = str(name) if store_strings else ""
-            key = self._active_measurement_key(DEVICE_TYPE_CODES_ACGENERATOR, int(pos), MEAS_TYPE_CODES_P_GEN)
+            key = int(gen_p_keys[row_pos])
             if key not in measured_keys and key not in added_keys:
                 pseudo_name = f"pseudo_p_{device_name}" if store_strings else ""
                 queue_pseudo(
@@ -3778,7 +3774,7 @@ class ACStateEstimator:
                     p,
                 )
                 added_keys.add(key)
-            key = self._active_measurement_key(DEVICE_TYPE_CODES_ACGENERATOR, int(pos), MEAS_TYPE_CODES_Q_GEN)
+            key = int(gen_q_keys[row_pos])
             if key not in measured_keys and key not in added_keys:
                 pseudo_name = f"pseudo_q_{device_name}" if store_strings else ""
                 queue_pseudo(
@@ -3792,42 +3788,45 @@ class ACStateEstimator:
                     q,
                 )
                 added_keys.add(key)
-            if self._active_device_key(DEVICE_TYPE_CODES_ACGENERATOR, int(pos)) not in measured_devices:
-                key = self._active_measurement_key(DEVICE_TYPE_CODES_ACGENERATOR, int(pos), MEAS_TYPE_CODES_V_GEN)
-                if (
-                    key not in measured_keys
-                    and key not in added_keys
-                    and self._real_voltage_observation_value_for_node(int(node_idx)) is None
-                ):
-                    pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
-                    queue_pseudo(
-                        pseudo_name,
-                        "ACGenerator",
-                        DEVICE_TYPE_CODES_ACGENERATOR,
-                        device_name,
-                        int(pos),
-                        "V_GEN",
-                        MEAS_TYPE_CODES_V_GEN,
-                        float(voltage or 1.0),
-                    )
-                    added_keys.add(key)
+            key = int(gen_v_keys[row_pos])
+            if (
+                key not in measured_keys
+                and key not in added_keys
+                and self._real_voltage_observation_value_for_node(int(node_idx)) is None
+            ):
+                pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
+                queue_pseudo(
+                    pseudo_name,
+                    "ACGenerator",
+                    DEVICE_TYPE_CODES_ACGENERATOR,
+                    device_name,
+                    int(pos),
+                    "V_GEN",
+                    MEAS_TYPE_CODES_V_GEN,
+                    float(voltage or 1.0),
+                )
+                added_keys.add(key)
 
         load, load_topology, load_rows = self._ppc_sorted_alive_rows_for(ppc, "load", "load", LOAD_COLS["idx"])
         load_voltage = self._ppc_device_node_voltage_values(ppc, load_topology, load_rows)
         load_p, load_q = self._ppc_load_pseudo_power_arrays(ppc, load_rows, load_voltage)
         load_nodes = load[load_rows.astype(np.intp, copy=False), LOAD_COLS["node"]].astype(np.int64, copy=False)
         load_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACLOAD, load_rows, load.shape[0])
+        load_p_keys = device_measurement_keys(DEVICE_TYPE_CODES_ACLOAD, load_plan_pos, MEAS_TYPE_CODES_P_LOAD)
+        load_q_keys = device_measurement_keys(DEVICE_TYPE_CODES_ACLOAD, load_plan_pos, MEAS_TYPE_CODES_Q_LOAD)
+        load_v_keys = device_measurement_keys(DEVICE_TYPE_CODES_ACLOAD, load_plan_pos, MEAS_TYPE_CODES_V_LOAD)
         load_names = (
             self._ppc_names_for_rows(ppc["load_name"], load_rows)
             if store_strings
             else repeat("", int(load_plan_pos.size))
         )
-        for name, pos, p, q, voltage, node_idx in zip(load_names, load_plan_pos, load_p, load_q, load_voltage, load_nodes):
+        for row_pos, (name, pos, p, q, voltage, node_idx) in enumerate(
+            zip(load_names, load_plan_pos, load_p, load_q, load_voltage, load_nodes)
+        ):
             if int(pos) < 0:
                 continue
             device_name = str(name) if store_strings else ""
-            unmetered_load = self._active_device_key(DEVICE_TYPE_CODES_ACLOAD, int(pos)) not in measured_devices
-            key = self._active_measurement_key(DEVICE_TYPE_CODES_ACLOAD, int(pos), MEAS_TYPE_CODES_P_LOAD)
+            key = int(load_p_keys[row_pos])
             if key not in measured_keys and key not in added_keys:
                 pseudo_name = f"pseudo_p_{device_name}" if store_strings else ""
                 queue_pseudo(
@@ -3841,7 +3840,7 @@ class ACStateEstimator:
                     p,
                 )
                 added_keys.add(key)
-            key = self._active_measurement_key(DEVICE_TYPE_CODES_ACLOAD, int(pos), MEAS_TYPE_CODES_Q_LOAD)
+            key = int(load_q_keys[row_pos])
             if key not in measured_keys and key not in added_keys:
                 pseudo_name = f"pseudo_q_{device_name}" if store_strings else ""
                 queue_pseudo(
@@ -3855,25 +3854,24 @@ class ACStateEstimator:
                     q,
                 )
                 added_keys.add(key)
-            if unmetered_load:
-                key = self._active_measurement_key(DEVICE_TYPE_CODES_ACLOAD, int(pos), MEAS_TYPE_CODES_V_LOAD)
-                if (
-                    key not in measured_keys
-                    and key not in added_keys
-                    and self._real_voltage_observation_value_for_node(int(node_idx)) is None
-                ):
-                    pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
-                    queue_pseudo(
-                        pseudo_name,
-                        "ACLoad",
-                        DEVICE_TYPE_CODES_ACLOAD,
-                        device_name,
-                        int(pos),
-                        "V_LOAD",
-                        MEAS_TYPE_CODES_V_LOAD,
-                        float(voltage or 1.0),
-                    )
-                    added_keys.add(key)
+            key = int(load_v_keys[row_pos])
+            if (
+                key not in measured_keys
+                and key not in added_keys
+                and self._real_voltage_observation_value_for_node(int(node_idx)) is None
+            ):
+                pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
+                queue_pseudo(
+                    pseudo_name,
+                    "ACLoad",
+                    DEVICE_TYPE_CODES_ACLOAD,
+                    device_name,
+                    int(pos),
+                    "V_LOAD",
+                    MEAS_TYPE_CODES_V_LOAD,
+                    float(voltage or 1.0),
+                )
+                added_keys.add(key)
         next_idx = self._append_pseudo_measurement_rows(
             next_idx,
             pseudo_rows.names,
@@ -3888,10 +3886,6 @@ class ACStateEstimator:
         )
         if added_keys:
             measured_keys.update(added_keys)
-            measured_devices.update(
-                self._active_device_key_from_measurement_key(key)
-                for key in added_keys
-            )
 
     def _seed_power_state_arrays_from_measurements(self) -> None:
         """Use the best available P/Q rows as initial values for explicit power states."""

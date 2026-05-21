@@ -708,7 +708,6 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from .ac_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
-            BUS_COLS,
             CTRL_SLACK,
             GEN_COLS,
             LOAD_COLS,
@@ -722,7 +721,6 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from ac_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
-            BUS_COLS,
             CTRL_SLACK,
             GEN_COLS,
             LOAD_COLS,
@@ -1005,7 +1003,6 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from .dc_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
-            BUS_COLS,
             CTRL_V,
             DCDC_COLS,
             GEN_COLS,
@@ -1018,7 +1015,6 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from dc_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
-            BUS_COLS,
             CTRL_V,
             DCDC_COLS,
             GEN_COLS,
@@ -1290,6 +1286,12 @@ def _topology_device_mask(topology: GridTopologyArrays, key: str, count: int) ->
     return out
 
 
+def _apply_topology_alive_flags(devices, topology: GridTopologyArrays, key: str) -> None:
+    alive = _topology_device_mask(topology, key, len(devices))
+    for pos, dev in enumerate(devices):
+        dev.is_alive = bool(alive[pos]) if pos < alive.size else False
+
+
 def _topology_terminal_island_pos(topology: GridTopologyArrays, key: str, count: int) -> np.ndarray:
     device_topology = topology.devices.get(key) if topology.devices else None
     if device_topology is None:
@@ -1403,11 +1405,15 @@ def apply_ac_topology_arrays(
     *,
     compact: bool = False,
     build_alive_maps: bool = True,
+    populate_device_links: bool = True,
 ) -> None:
     """Populate AC object topology fields from precomputed ppc topology arrays.
 
     ``compact`` keeps only the object links required by SE compatibility code.
     The full reverse device lists remain the default for LF/full-result callers.
+    ``populate_device_links=False`` skips device ``*_node_obj`` backfill and
+    only refreshes device alive flags, which keeps array-only callers on the
+    cheap topology path.
     """
     from model.ac_model import ACBus, ACIsl
 
@@ -1427,6 +1433,39 @@ def apply_ac_topology_arrays(
         lambda idx, is_alive: _make_ac_island(idx, ACIsl),
         compact=compact,
     )
+
+    def finalize_alive_maps() -> None:
+        if build_alive_maps:
+            network.alive_nodes = [bus for bus in buses if bus.is_alive]
+            network.alive_buses = network.alive_nodes
+            network.alive_branch_by_name = {br.name: br for br in branches if br.is_alive}
+            network.alive_transformer_by_name = {tr.name: tr for tr in transformers if tr.is_alive}
+            network.alive_generator_by_name = {gen.name: gen for gen in generators if gen.is_alive}
+            network.alive_load_by_name = {load.name: load for load in loads if load.is_alive}
+            network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}
+            network.alive_switch_by_name = {sw.name: sw for sw in switches if sw.is_alive}
+            network.alive_break_by_name = {brk.name: brk for brk in breakers if brk.is_alive}
+            network.alive_zero_branches = _sorted_by_idx(network.alive_zero_branch_by_name.values())
+            network.alive_switches = _sorted_by_idx(network.alive_switch_by_name.values())
+            network.alive_breakers = _sorted_by_idx(network.alive_break_by_name.values())
+            network.alive_generator_order = _sorted_by_idx(network.alive_generator_by_name.values())
+            network.alive_load_order = _sorted_by_idx(network.alive_load_by_name.values())
+        else:
+            network.alive_nodes = [bus for bus in buses if bus.is_alive]
+            network.alive_buses = network.alive_nodes
+            network.alive_branch_by_name = {}
+            network.alive_transformer_by_name = {}
+            network.alive_generator_by_name = {}
+            network.alive_load_by_name = {}
+            network.alive_zero_branch_by_name = {}
+            network.alive_switch_by_name = {}
+            network.alive_break_by_name = {}
+            network.alive_zero_branches = []
+            network.alive_switches = []
+            network.alive_breakers = []
+            network.alive_generator_order = []
+            network.alive_load_order = []
+
     if compact:
         network.branch_dict = {}
         network.transformer_dict = {}
@@ -1461,6 +1500,18 @@ def apply_ac_topology_arrays(
             node.transformers = []
             node.shunt_compensators = []
             node.v_gens = []
+
+    if not populate_device_links:
+        _apply_topology_alive_flags(generators, topology, "gen")
+        _apply_topology_alive_flags(loads, topology, "load")
+        _apply_topology_alive_flags(shunts, topology, "shunt")
+        _apply_topology_alive_flags(branches, topology, "branch")
+        _apply_topology_alive_flags(transformers, topology, "transformer")
+        _apply_topology_alive_flags(zero_branches, topology, "zero_branch")
+        _apply_topology_alive_flags(switches, topology, "switch")
+        _apply_topology_alive_flags(breakers, topology, "break")
+        finalize_alive_maps()
+        return
 
     gen_alive = _topology_device_mask(topology, "gen", len(generators))
     gen_node_pos = _topology_single_node_pos(topology, "gen", len(generators))
@@ -1553,36 +1604,7 @@ def apply_ac_topology_arrays(
     finalize_terminal(switches, "switch", "switches", "switches")
     finalize_terminal(breakers, "break", "breakers", "breakers")
 
-    if build_alive_maps:
-        network.alive_nodes = [bus for bus in buses if bus.is_alive]
-        network.alive_buses = network.alive_nodes
-        network.alive_branch_by_name = {br.name: br for br in branches if br.is_alive}
-        network.alive_transformer_by_name = {tr.name: tr for tr in transformers if tr.is_alive}
-        network.alive_generator_by_name = {gen.name: gen for gen in generators if gen.is_alive}
-        network.alive_load_by_name = {load.name: load for load in loads if load.is_alive}
-        network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}
-        network.alive_switch_by_name = {sw.name: sw for sw in switches if sw.is_alive}
-        network.alive_break_by_name = {brk.name: brk for brk in breakers if brk.is_alive}
-        network.alive_zero_branches = _sorted_by_idx(network.alive_zero_branch_by_name.values())
-        network.alive_switches = _sorted_by_idx(network.alive_switch_by_name.values())
-        network.alive_breakers = _sorted_by_idx(network.alive_break_by_name.values())
-        network.alive_generator_order = _sorted_by_idx(network.alive_generator_by_name.values())
-        network.alive_load_order = _sorted_by_idx(network.alive_load_by_name.values())
-    else:
-        network.alive_nodes = [bus for bus in buses if bus.is_alive]
-        network.alive_buses = network.alive_nodes
-        network.alive_branch_by_name = {}
-        network.alive_transformer_by_name = {}
-        network.alive_generator_by_name = {}
-        network.alive_load_by_name = {}
-        network.alive_zero_branch_by_name = {}
-        network.alive_switch_by_name = {}
-        network.alive_break_by_name = {}
-        network.alive_zero_branches = []
-        network.alive_switches = []
-        network.alive_breakers = []
-        network.alive_generator_order = []
-        network.alive_load_order = []
+    finalize_alive_maps()
 
 
 def apply_dc_topology_arrays(
@@ -1591,11 +1613,14 @@ def apply_dc_topology_arrays(
     *,
     compact: bool = False,
     build_alive_maps: bool = True,
+    populate_device_links: bool = True,
 ) -> None:
     """Populate DC object topology fields from precomputed ppc topology arrays.
 
     ``compact`` keeps only the object links required by SE compatibility code.
     The full reverse device lists remain the default for LF/full-result callers.
+    ``populate_device_links=False`` skips device ``*_node_obj`` backfill and
+    only refreshes device alive flags for array-only callers.
     """
     from model.dc_model import DCBus, DCIsl
 
@@ -1614,6 +1639,41 @@ def apply_dc_topology_arrays(
         lambda idx, is_alive: DCIsl(idx, is_alive),
         compact=compact,
     )
+
+    def finalize_alive_maps() -> None:
+        if build_alive_maps:
+            network.alive_buses = [bus for bus in buses if bus.is_alive]
+            network.alive_nodes = network.alive_buses
+            network.alive_branch_by_name = {br.name: br for br in branches if br.is_alive}
+            network.alive_generator_by_name = {gen.name: gen for gen in generators if gen.is_alive}
+            network.alive_load_by_name = {load.name: load for load in loads if load.is_alive}
+            network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}
+            network.alive_switch_by_name = {sw.name: sw for sw in switches if sw.is_alive}
+            network.alive_break_by_name = {brk.name: brk for brk in breakers if brk.is_alive}
+            network.alive_dcdc_by_name = {conv.name: conv for conv in dcdc_converters if conv.is_alive}
+            network.alive_zero_branches = _sorted_by_idx(network.alive_zero_branch_by_name.values())
+            network.alive_switches = _sorted_by_idx(network.alive_switch_by_name.values())
+            network.alive_breakers = _sorted_by_idx(network.alive_break_by_name.values())
+            network.alive_generator_order = _sorted_by_idx(network.alive_generator_by_name.values())
+            network.alive_load_order = _sorted_by_idx(network.alive_load_by_name.values())
+            network.alive_dcdc_order = _sorted_by_idx(network.alive_dcdc_by_name.values())
+        else:
+            network.alive_buses = [bus for bus in buses if bus.is_alive]
+            network.alive_nodes = network.alive_buses
+            network.alive_branch_by_name = {}
+            network.alive_generator_by_name = {}
+            network.alive_load_by_name = {}
+            network.alive_zero_branch_by_name = {}
+            network.alive_switch_by_name = {}
+            network.alive_break_by_name = {}
+            network.alive_dcdc_by_name = {}
+            network.alive_zero_branches = []
+            network.alive_switches = []
+            network.alive_breakers = []
+            network.alive_generator_order = []
+            network.alive_load_order = []
+            network.alive_dcdc_order = []
+
     if compact:
         network.switch_dict = {}
         network.break_dict = {}
@@ -1648,6 +1708,17 @@ def apply_dc_topology_arrays(
             node.zero_branches = []
             node.v_gens = []
             node.v_dcdcs = []
+
+    if not populate_device_links:
+        _apply_topology_alive_flags(generators, topology, "gen")
+        _apply_topology_alive_flags(loads, topology, "load")
+        _apply_topology_alive_flags(dcdc_converters, topology, "dcdc")
+        _apply_topology_alive_flags(branches, topology, "branch")
+        _apply_topology_alive_flags(zero_branches, topology, "zero_branch")
+        _apply_topology_alive_flags(switches, topology, "switch")
+        _apply_topology_alive_flags(breakers, topology, "break")
+        finalize_alive_maps()
+        return
 
     gen_alive = _topology_device_mask(topology, "gen", len(generators))
     gen_node_pos = _topology_single_node_pos(topology, "gen", len(generators))
@@ -1770,38 +1841,7 @@ def apply_dc_topology_arrays(
             if bus not in bus.isl_obj.slack_nodes:
                 bus.isl_obj.slack_nodes.append(bus)
 
-    if build_alive_maps:
-        network.alive_buses = [bus for bus in buses if bus.is_alive]
-        network.alive_nodes = network.alive_buses
-        network.alive_branch_by_name = {br.name: br for br in branches if br.is_alive}
-        network.alive_generator_by_name = {gen.name: gen for gen in generators if gen.is_alive}
-        network.alive_load_by_name = {load.name: load for load in loads if load.is_alive}
-        network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}
-        network.alive_switch_by_name = {sw.name: sw for sw in switches if sw.is_alive}
-        network.alive_break_by_name = {brk.name: brk for brk in breakers if brk.is_alive}
-        network.alive_dcdc_by_name = {conv.name: conv for conv in dcdc_converters if conv.is_alive}
-        network.alive_zero_branches = _sorted_by_idx(network.alive_zero_branch_by_name.values())
-        network.alive_switches = _sorted_by_idx(network.alive_switch_by_name.values())
-        network.alive_breakers = _sorted_by_idx(network.alive_break_by_name.values())
-        network.alive_generator_order = _sorted_by_idx(network.alive_generator_by_name.values())
-        network.alive_load_order = _sorted_by_idx(network.alive_load_by_name.values())
-        network.alive_dcdc_order = _sorted_by_idx(network.alive_dcdc_by_name.values())
-    else:
-        network.alive_buses = [bus for bus in buses if bus.is_alive]
-        network.alive_nodes = network.alive_buses
-        network.alive_branch_by_name = {}
-        network.alive_generator_by_name = {}
-        network.alive_load_by_name = {}
-        network.alive_zero_branch_by_name = {}
-        network.alive_switch_by_name = {}
-        network.alive_break_by_name = {}
-        network.alive_dcdc_by_name = {}
-        network.alive_zero_branches = []
-        network.alive_switches = []
-        network.alive_breakers = []
-        network.alive_generator_order = []
-        network.alive_load_order = []
-        network.alive_dcdc_order = []
+    finalize_alive_maps()
 
 
 def _make_ac_bus(grouped_nodes, bus_cls):

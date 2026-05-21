@@ -173,6 +173,29 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertTrue(network.buses)
         self.assertTrue(all(getattr(bus, "nodes", None) for bus in network.buses))
 
+    def test_ac_apply_ppc_topology_arrays_can_skip_device_object_backfill(self):
+        from model.ac_array_model import build_ac_network_from_ppc, build_ac_ppc_from_e_file
+        from model.topology import apply_ac_topology_arrays, prepare_ac_topology_ppc
+
+        ppc = build_ac_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "ac" / "ieee39.e")
+        network = build_ac_network_from_ppc(ppc)
+        arrays = prepare_ac_topology_ppc(ppc)
+
+        apply_ac_topology_arrays(
+            network,
+            arrays,
+            compact=True,
+            build_alive_maps=False,
+            populate_device_links=False,
+        )
+
+        self.assertTrue(np.array_equal([gen.is_alive for gen in network.generators], arrays.devices["gen"].alive_mask))
+        self.assertTrue(np.array_equal([br.is_alive for br in network.branches], arrays.devices["branch"].alive_mask))
+        self.assertTrue(all(getattr(gen, "node_obj", None) is None for gen in network.generators))
+        self.assertTrue(all(getattr(load, "node_obj", None) is None for load in network.loads))
+        self.assertTrue(all(getattr(branch, "i_node_obj", None) is None for branch in network.branches))
+        self.assertTrue(all(getattr(branch, "j_node_obj", None) is None for branch in network.branches))
+
     def test_dc_ppc_topology_matches_object_topology(self):
         from model.dc_array_model import build_dc_network_from_ppc, build_dc_ppc_from_e_file
         from model.topology import prepare_dc_topology, prepare_dc_topology_ppc
@@ -273,6 +296,32 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertTrue(any(island.slack_nodes for island in network.islands if island.is_alive))
         self.assertTrue(all(getattr(gen, "node_obj", None) is not None for gen in network.generators))
         self.assertTrue(all(getattr(branch, "i_node_obj", None) is not None for branch in network.branches))
+
+    def test_dc_apply_ppc_topology_arrays_can_skip_device_object_backfill(self):
+        from model.dc_array_model import build_dc_network_from_ppc, build_dc_ppc_from_e_file
+        from model.topology import apply_dc_topology_arrays, prepare_dc_topology_ppc
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        network = build_dc_network_from_ppc(ppc)
+        arrays = prepare_dc_topology_ppc(ppc)
+
+        apply_dc_topology_arrays(
+            network,
+            arrays,
+            compact=True,
+            build_alive_maps=False,
+            populate_device_links=False,
+        )
+
+        self.assertTrue(np.array_equal([gen.is_alive for gen in network.generators], arrays.devices["gen"].alive_mask))
+        self.assertTrue(np.array_equal([br.is_alive for br in network.branches], arrays.devices["branch"].alive_mask))
+        self.assertTrue(np.array_equal([conv.is_alive for conv in network.dcdc_converters], arrays.devices["dcdc"].alive_mask))
+        self.assertTrue(all(getattr(gen, "node_obj", None) is None for gen in network.generators))
+        self.assertTrue(all(getattr(load, "node_obj", None) is None for load in network.loads))
+        self.assertTrue(all(getattr(branch, "i_node_obj", None) is None for branch in network.branches))
+        self.assertTrue(all(getattr(branch, "j_node_obj", None) is None for branch in network.branches))
+        self.assertTrue(all(getattr(conv, "i_node_obj", None) is None for conv in network.dcdc_converters))
+        self.assertTrue(all(getattr(conv, "j_node_obj", None) is None for conv in network.dcdc_converters))
 
     def test_common_ppc_topology_builders_attach_topology_arrays(self):
         from model.ppc_topology import (

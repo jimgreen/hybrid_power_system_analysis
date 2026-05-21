@@ -119,11 +119,25 @@ class ACStateEstimationTest(unittest.TestCase):
 
         estimator._refresh_measurement_summary_cache()
 
+        self.assertFalse(hasattr(ACStateEstimator, "_active_device_key"))
+        node0_key = (
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                0,
+                ac_se.MEAS_TYPE_CODES_V,
+            )
+            >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
+        )
+        node1_key = (
+            ACStateEstimator._active_measurement_key(
+                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                1,
+                ac_se.MEAS_TYPE_CODES_V,
+            )
+            >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
+        )
         self.assertEqual(
-            {
-                ACStateEstimator._active_device_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 0),
-                ACStateEstimator._active_device_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 1),
-            },
+            {node0_key, node1_key},
             estimator._active_device_code_pos_cache,
         )
         self.assertEqual(2, estimator._max_measurement_idx)
@@ -1111,6 +1125,24 @@ class ACStateEstimationTest(unittest.TestCase):
         table = estimator.measurements.table
         self.assertGreater(int(table.idx.size), before_count)
         self.assertTrue(np.any(table.status_code[before_count:] == MEAS_STATUS_PSEUDO))
+
+    def test_regular_pseudo_power_measurements_do_not_read_active_device_cache(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+            prepare_active_measurements=False,
+        )
+        estimator._active_measurement_code_pos_cache = set()
+
+        def reject_active_device_cache():
+            raise AssertionError("regular pseudo power generation should not read active device keys")
+
+        estimator._active_device_keys_ref = reject_active_device_cache
+
+        estimator._add_pseudo_power_measurements()
 
     def test_regular_pseudo_measurements_enumerate_ppc_rows_not_device_lists(self):
         from secore.ac_se import ACStateEstimator
