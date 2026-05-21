@@ -396,6 +396,28 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn(0.0, H.data)
         np.testing.assert_allclose(H.toarray(), np.array([[0.0, 0.0, 0.0], [0.0, 2.0, 0.0]]))
 
+    def test_sparse_triplet_dump_preserves_explicit_zero_entries(self):
+        from secore.ac_se import ACStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "j1.txt"
+            ACStateEstimator._write_sparse_triplet_file(
+                path,
+                np.array([0, 0, 1], dtype=np.int64),
+                np.array([0, 1, 1], dtype=np.int64),
+                np.array([0.0, 2.0, 0.0], dtype=np.float64),
+                (2, 2),
+                "jacobian",
+            )
+
+            lines = path.read_text(encoding="utf-8").splitlines()
+            entries = [line.split() for line in lines if line and not line.startswith("#")]
+
+        self.assertIn("# shape 2 2 nnz 3", lines)
+        self.assertEqual(3, len(entries))
+        self.assertEqual(["1", "1", "0.00000000000000000e+00"], entries[0])
+        self.assertEqual(["2", "2", "0.00000000000000000e+00"], entries[2])
+
     def test_sparse_normal_equations_keep_structural_zero_pattern(self):
         from secore.se_math import SparseJacobianBuilder, build_normal_equations
 
@@ -412,6 +434,139 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(4, gain.nnz)
         np.testing.assert_allclose(gain.toarray(), np.array([[1.0, 0.0], [0.0, 0.0]]))
         np.testing.assert_allclose(rhs, np.array([3.0, 0.0]))
+
+    def test_sparse_normal_equations_can_return_lower_triangular_solver_csc(self):
+        from scipy.sparse import csr_matrix, isspmatrix_csc
+        from secore.se_math import NormalEquationSolver, build_normal_equations
+
+        H_dense = np.array(
+            [
+                [2.0, 0.0, 1.0],
+                [0.0, 3.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 2.0, 4.0],
+            ],
+            dtype=np.float64,
+        )
+        H = csr_matrix(H_dense)
+        residual = np.array([0.5, -1.5, 2.0, -0.25], dtype=np.float64)
+        weight = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+
+        full_gain, full_rhs = build_normal_equations(H, residual, weight, dense_gain_limit=0)
+        lower_gain, lower_rhs = build_normal_equations(
+            H,
+            residual,
+            weight,
+            dense_gain_limit=0,
+            triangular="lower",
+        )
+
+        self.assertTrue(isspmatrix_csc(lower_gain))
+        self.assertTrue(np.all(lower_gain.indices >= np.repeat(np.arange(lower_gain.shape[1]), np.diff(lower_gain.indptr))))
+        np.testing.assert_allclose(lower_gain.toarray(), np.tril(full_gain.toarray()))
+        np.testing.assert_allclose(lower_rhs, full_rhs)
+        full_dx, _ = NormalEquationSolver().solve(full_gain, full_rhs, return_factor_diag=False)
+        lower_dx, _ = NormalEquationSolver().solve(lower_gain, lower_rhs, return_factor_diag=False)
+        np.testing.assert_allclose(lower_dx, full_dx, rtol=1e-10, atol=1e-10)
+
+    def test_lower_normal_equation_csc_plan_refreshes_solver_ready_data(self):
+        from scipy.sparse import csr_matrix, isspmatrix_csc
+        from secore.se_math import LowerNormalEquationCscPlan, NormalEquationSolver, build_normal_equations
+
+        H_dense = np.array(
+            [
+                [2.0, 0.0, 1.0],
+                [0.0, 3.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 2.0, 4.0],
+            ],
+            dtype=np.float64,
+        )
+        H = csr_matrix(H_dense)
+        residual = np.array([0.5, -1.5, 2.0, -0.25], dtype=np.float64)
+        weight = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+
+        plan = LowerNormalEquationCscPlan.from_jacobian(H)
+        lower_gain, lower_rhs = plan.assemble(H, residual, weight, dense_gain_limit=0)
+        full_gain, full_rhs = build_normal_equations(H, residual, weight, dense_gain_limit=0)
+
+        self.assertTrue(isspmatrix_csc(lower_gain))
+        self.assertTrue(np.shares_memory(lower_gain.data, plan.gain_data))
+        self.assertTrue(np.shares_memory(lower_gain.indices, plan.gain_indices))
+        self.assertTrue(np.shares_memory(lower_gain.indptr, plan.gain_indptr))
+        self.assertTrue(np.all(lower_gain.indices >= np.repeat(np.arange(lower_gain.shape[1]), np.diff(lower_gain.indptr))))
+        np.testing.assert_allclose(lower_gain.toarray(), np.tril(full_gain.toarray()))
+        np.testing.assert_allclose(lower_rhs, full_rhs)
+
+        full_dx, _ = NormalEquationSolver().solve(full_gain, full_rhs, return_factor_diag=False)
+        lower_dx, _ = NormalEquationSolver(assume_fixed_pattern=True).solve(
+            lower_gain,
+            lower_rhs,
+            return_factor_diag=False,
+        )
+        np.testing.assert_allclose(lower_dx, full_dx, rtol=1e-10, atol=1e-10)
+
+        old_indptr = lower_gain.indptr.copy()
+        old_indices = lower_gain.indices.copy()
+        H_updated = H.copy()
+        H_updated.data = H_updated.data * np.linspace(1.0, 1.7, H_updated.nnz)
+        residual_updated = residual * np.array([1.2, 0.7, -0.5, 1.3])
+        refreshed_gain, refreshed_rhs = plan.assemble(H_updated, residual_updated, weight, dense_gain_limit=0)
+        refreshed_full_gain, refreshed_full_rhs = build_normal_equations(
+            H_updated,
+            residual_updated,
+            weight,
+            dense_gain_limit=0,
+        )
+
+        np.testing.assert_array_equal(refreshed_gain.indptr, old_indptr)
+        np.testing.assert_array_equal(refreshed_gain.indices, old_indices)
+        self.assertTrue(np.shares_memory(refreshed_gain.data, plan.gain_data))
+        np.testing.assert_allclose(refreshed_gain.toarray(), np.tril(refreshed_full_gain.toarray()))
+        np.testing.assert_allclose(refreshed_rhs, refreshed_full_rhs)
+
+        plan.clear_fixed_weights()
+        cached_gain, cached_rhs = plan.assemble(
+            H_updated,
+            residual_updated,
+            weight,
+            dense_gain_limit=0,
+            assume_fixed_weights=True,
+        )
+        self.assertIsNotNone(plan._fixed_pair_weight)
+        np.testing.assert_allclose(plan._fixed_pair_weight, weight[plan.pair_rows])
+        np.testing.assert_allclose(cached_gain.toarray(), np.tril(refreshed_full_gain.toarray()))
+        np.testing.assert_allclose(cached_rhs, refreshed_full_rhs)
+
+    def test_full_normal_equation_from_lower_restores_symmetric_matrix(self):
+        from scipy.sparse import csc_matrix, isspmatrix_csc
+        from secore.se_math import full_normal_equation_from_lower
+
+        lower = csc_matrix(
+            np.array(
+                [
+                    [4.0, 0.0, 0.0],
+                    [1.5, 6.0, 0.0],
+                    [-2.0, 3.0, 5.0],
+                ],
+                dtype=np.float64,
+            )
+        )
+
+        full = full_normal_equation_from_lower(lower)
+
+        self.assertTrue(isspmatrix_csc(full))
+        np.testing.assert_allclose(
+            full.toarray(),
+            np.array(
+                [
+                    [4.0, 1.5, -2.0],
+                    [1.5, 6.0, 3.0],
+                    [-2.0, 3.0, 5.0],
+                ],
+                dtype=np.float64,
+            ),
+        )
 
     def test_build_normal_equations_uses_precomputed_uniform_weight_flag(self):
         from scipy.sparse import csr_matrix
@@ -4223,29 +4378,29 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIs(initial_observability, result.observability)
         self.assertEqual(1, calls)
 
-    def test_estimate_passes_file_weights_to_normal_equation_builder(self):
+    def test_estimate_passes_file_weights_to_lower_normal_plan(self):
         import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
-        self.assertTrue(hasattr(ac_se, "build_normal_equations"))
+        self.assertTrue(hasattr(ac_se, "LowerNormalEquationCscPlan"))
         estimator = ACStateEstimator(
             e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
 
-        original = ac_se.build_normal_equations
+        original = ac_se.LowerNormalEquationCscPlan.assemble
         non_unit_weight_seen = False
 
-        def counted_builder(H, residual, weight, **kwargs):
+        def counted_assemble(self, H, residual, weight, **kwargs):
             nonlocal non_unit_weight_seen
             non_unit_weight_seen = bool(np.any(weight != 1.0))
-            return original(H, residual, weight, **kwargs)
+            return original(self, H, residual, weight, **kwargs)
 
-        ac_se.build_normal_equations = counted_builder
+        ac_se.LowerNormalEquationCscPlan.assemble = counted_assemble
         try:
             result = estimator.estimate()
         finally:
-            ac_se.build_normal_equations = original
+            ac_se.LowerNormalEquationCscPlan.assemble = original
 
         self.assertTrue(result.converged)
         self.assertTrue(non_unit_weight_seen)
@@ -4590,7 +4745,7 @@ class ACStateEstimationTest(unittest.TestCase):
             "init.measurement_plan_lookup",
             "solve.evaluate",
             "solve.jacobian",
-            "solve.normal_pattern",
+            "solve.lower_normal_plan_build",
             "solve.normal_equations",
             "solve.linear_solve",
             "solve.line_search_evaluate",
@@ -4598,6 +4753,47 @@ class ACStateEstimationTest(unittest.TestCase):
             self.assertIn(key, estimator.profile_times)
         self.assertNotIn("solve.normal_assembly_plan_build", estimator.profile_times)
         self.assertGreater(estimator.profile_times["solve.total"], 0.0)
+
+    def test_iteration_matrix_dump_writes_sparse_triplet_files(self):
+        from secore.ac_se import ACStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            estimator = ACStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+                flat_start=True,
+                auto_prepare=False,
+                matrix_dump_dir=tmp_dir,
+            )
+
+            estimator.run(
+                result_mode="array",
+                skip_bad_data=True,
+                final_diagnostics=False,
+                verbose=False,
+            )
+
+            result = estimator.estimate_result
+            self.assertTrue(result.converged)
+            for prefix in ("j", "d", "h"):
+                files = sorted(Path(tmp_dir).glob(f"{prefix}*.txt"))
+                self.assertEqual(result.iterations, len(files))
+                first = files[0]
+                lines = first.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(lines[0].startswith("# sparse_triplet"))
+                self.assertTrue(lines[1].startswith("# shape "))
+                values = next(line for line in lines if line and not line.startswith("#")).split()
+                self.assertEqual(3, len(values))
+                self.assertGreaterEqual(int(values[0]), 1)
+                self.assertGreaterEqual(int(values[1]), 1)
+                float(values[2])
+            d_values = [
+                line.split()
+                for line in (Path(tmp_dir) / "d1.txt").read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            ][:10]
+            self.assertTrue(d_values)
+            self.assertTrue(all(row == col for row, col, _value in d_values))
 
     def test_estimate_uses_cholesky_solver_when_available(self):
         import secore.se_math as se_math
@@ -4628,20 +4824,14 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(result.converged)
         self.assertEqual(0, call_count)
 
-    def test_normal_equation_solver_uses_lapack_posv_when_available(self):
+    def test_dense_normal_equation_solver_uses_lapack_posv_when_available(self):
         import secore.se_math as se_math
-        from secore.ac_se import ACStateEstimator
 
         try:
             from scipy.linalg.lapack import dposv as original_dposv
         except Exception:
             self.skipTest("SciPy LAPACK dposv is not available")
         self.assertIsNotNone(getattr(se_math, "DPOSV", None))
-
-        estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
-        )
 
         call_count = 0
 
@@ -4653,12 +4843,14 @@ class ACStateEstimationTest(unittest.TestCase):
         previous = se_math.DPOSV
         se_math.DPOSV = counted_dposv
         try:
-            result = estimator.estimate()
+            gain = np.array([[4.0, 1.0], [1.0, 3.0]], dtype=np.float64)
+            rhs = np.array([1.0, 2.0], dtype=np.float64)
+            dx, _ = se_math.NormalEquationSolver().solve(gain, rhs, return_factor_diag=False)
         finally:
             se_math.DPOSV = previous
 
-        self.assertTrue(result.converged)
         self.assertGreaterEqual(call_count, 1)
+        np.testing.assert_allclose(dx, np.linalg.solve(gain, rhs))
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.ac_se import ACStateEstimator
@@ -5147,7 +5339,7 @@ class ACStateEstimationTest(unittest.TestCase):
             se_math.NormalEquationAssemblyPlan.direct_assembly_is_reasonable(H, max_pair_count=27)
         )
 
-    def test_estimate_skips_normal_equation_assembly_plan_for_active_measurements(self):
+    def test_active_estimate_uses_lower_csc_plan_instead_of_sparse_multiply_builder(self):
         import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
@@ -5159,29 +5351,40 @@ class ACStateEstimationTest(unittest.TestCase):
 
         original_builder = ac_se.build_normal_equations
         original_from_jacobian = ac_se.NormalEquationAssemblyPlan.from_jacobian
-        plans_seen = []
-        patterns_seen = []
+        original_lower_from_jacobian = ac_se.LowerNormalEquationCscPlan.from_jacobian
+        original_lower_assemble = ac_se.LowerNormalEquationCscPlan.assemble
+        lower_plan_builds = []
+        lower_assemblies = []
 
-        def counted_builder(*args, **kwargs):
-            plans_seen.append(kwargs.get("normal_assembly_plan"))
-            patterns_seen.append(kwargs.get("normal_pattern"))
-            return original_builder(*args, **kwargs)
+        def reject_builder(*_args, **_kwargs):
+            raise AssertionError("active AC SE should assemble solver-ready lower CSC directly")
 
         def reject_plan_build(*_args, **_kwargs):
             raise AssertionError("active AC SE should use cached normal pattern instead of assembly plan")
 
-        ac_se.build_normal_equations = counted_builder
+        def counted_lower_from_jacobian(*args, **kwargs):
+            lower_plan_builds.append(True)
+            return original_lower_from_jacobian(*args, **kwargs)
+
+        def counted_lower_assemble(self, *args, **kwargs):
+            lower_assemblies.append(True)
+            return original_lower_assemble(self, *args, **kwargs)
+
+        ac_se.build_normal_equations = reject_builder
         ac_se.NormalEquationAssemblyPlan.from_jacobian = reject_plan_build
+        ac_se.LowerNormalEquationCscPlan.from_jacobian = counted_lower_from_jacobian
+        ac_se.LowerNormalEquationCscPlan.assemble = counted_lower_assemble
         try:
             result = estimator.estimate(final_diagnostics=False)
         finally:
             ac_se.build_normal_equations = original_builder
             ac_se.NormalEquationAssemblyPlan.from_jacobian = original_from_jacobian
+            ac_se.LowerNormalEquationCscPlan.from_jacobian = original_lower_from_jacobian
+            ac_se.LowerNormalEquationCscPlan.assemble = original_lower_assemble
 
         self.assertTrue(result.converged)
-        self.assertTrue(plans_seen)
-        self.assertTrue(all(plan is None for plan in plans_seen))
-        self.assertTrue(any(pattern is not None for pattern in patterns_seen))
+        self.assertEqual(1, len(lower_plan_builds))
+        self.assertGreater(len(lower_assemblies), 0)
 
     def test_active_estimate_keeps_gain_csc_pattern_stable_for_cholmod_reuse(self):
         import secore.ac_se as ac_se
@@ -5206,15 +5409,16 @@ class ACStateEstimationTest(unittest.TestCase):
             )
 
         original_builder = ac_se.build_normal_equations
+        original_lower_assemble = ac_se.LowerNormalEquationCscPlan.assemble
         original_cholmod_analyze = se_math.CHOLMOD_ANALYZE
         original_cholmod_cholesky = se_math.CHOLMOD_CHOLESKY
         gain_patterns = []
         analyze_patterns = []
         numeric_patterns = []
 
-        def sparse_builder(*args, **kwargs):
+        def sparse_lower_assemble(self, *args, **kwargs):
             kwargs["dense_gain_limit"] = 0
-            gain, rhs = original_builder(*args, **kwargs)
+            gain, rhs = original_lower_assemble(self, *args, **kwargs)
             gain_patterns.append(sparse_pattern(gain))
             return gain, rhs
 
@@ -5227,14 +5431,17 @@ class ACStateEstimationTest(unittest.TestCase):
                 self.matrix = matrix.copy()
 
             def __call__(self, rhs):
-                lu = se_math.SP_SPLU(self.matrix.tocsc(), diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
+                lower = self.matrix.tocsc()
+                full = lower + lower.T
+                full.setdiag(lower.diagonal())
+                lu = se_math.SP_SPLU(full.tocsc(), diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
                 return lu.solve(rhs)
 
         def fake_analyze(matrix):
             analyze_patterns.append(sparse_pattern(matrix))
             return FakeCholmodFactor(matrix)
 
-        ac_se.build_normal_equations = sparse_builder
+        ac_se.LowerNormalEquationCscPlan.assemble = sparse_lower_assemble
         se_math.CHOLMOD_ANALYZE = fake_analyze
         se_math.CHOLMOD_CHOLESKY = None
         try:
@@ -5248,6 +5455,7 @@ class ACStateEstimationTest(unittest.TestCase):
             result = estimator.estimate(final_diagnostics=False)
         finally:
             ac_se.build_normal_equations = original_builder
+            ac_se.LowerNormalEquationCscPlan.assemble = original_lower_assemble
             se_math.CHOLMOD_ANALYZE = original_cholmod_analyze
             se_math.CHOLMOD_CHOLESKY = original_cholmod_cholesky
 

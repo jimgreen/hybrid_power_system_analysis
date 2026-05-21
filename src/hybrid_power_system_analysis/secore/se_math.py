@@ -13,6 +13,7 @@ from scipy.sparse import coo_matrix as SP_COO_MATRIX
 from scipy.sparse import csc_matrix as SP_CSC_MATRIX
 from scipy.sparse import csr_matrix as SP_CSR_MATRIX
 from scipy.sparse import issparse as SP_ISSPARSE
+from scipy.sparse import tril as SP_TRIL
 from scipy.sparse.csgraph import connected_components as SP_CONNECTED_COMPONENTS
 from scipy.sparse.csgraph import structural_rank as SP_STRUCTURAL_RANK
 from scipy.sparse.linalg import MatrixRankWarning as SP_MATRIX_RANK_WARNING
@@ -521,22 +522,38 @@ def matrix_is_empty(matrix) -> bool:
     return matrix.shape[0] == 0 or matrix.shape[1] == 0
 
 
-def _normal_equation_structural_pattern(H):
+def full_normal_equation_from_lower(matrix):
+    """Expand a lower-triangular normal-equation matrix into full symmetry."""
+    if is_sparse_matrix(matrix):
+        lower = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+        full = lower + lower.T
+        full.setdiag(lower.diagonal())
+        return full.tocsc()
+    lower = np.tril(np.asarray(matrix, dtype=np.float64))
+    return lower + lower.T - np.diag(np.diag(lower))
+
+
+def _normal_equation_structural_pattern(H, triangular: Optional[str] = None):
     """Return the structural pattern implied by H.T @ H, retaining zero entries."""
     if not is_sparse_matrix(H):
         return None
+    triangular_mode = None if triangular is None else str(triangular).lower()
+    if triangular_mode not in (None, "lower"):
+        raise ValueError(f"Unsupported normal-equation triangular mode: {triangular!r}")
     H_csc = H if getattr(H, "format", None) == "csc" else H.tocsc()
     digest = hashlib.blake2b(
         H_csc.indptr.tobytes() + H_csc.indices.tobytes(),
         digest_size=16,
     ).digest()
-    key = (H_csc.shape, int(H_csc.nnz), digest)
+    key = (H_csc.shape, int(H_csc.nnz), digest, triangular_mode)
     cached = _NORMAL_EQUATION_PATTERN_CACHE.get(key)
     if cached is not None:
         return cached
     H_pattern = H_csc.copy()
     H_pattern.data = np.ones(int(H_pattern.nnz), dtype=np.float64)
     pattern = (H_pattern.T @ H_pattern).tocsc()
+    if triangular_mode == "lower":
+        pattern = SP_TRIL(pattern, format="csc")
     pattern.data = np.zeros(int(pattern.nnz), dtype=np.float64)
     if len(_NORMAL_EQUATION_PATTERN_CACHE) > 16:
         _NORMAL_EQUATION_PATTERN_CACHE.clear()
@@ -840,6 +857,238 @@ class NormalEquationAssemblyPlan:
         if gain.shape[0] <= dense_gain_limit:
             return gain.toarray(), rhs
         return gain, rhs
+
+
+class LowerNormalEquationCscPlan:
+    """Solver-ready lower-CSC assembly plan for repeated ``H.T W H`` builds.
+
+    The plan owns the CSC ``indptr``/``indices`` and a reusable ``data`` buffer.
+    Iterations refresh only numeric values for the lower triangle; they do not
+    build the full normal matrix, call ``tril()``, or expand into a cached
+    structural pattern.
+    """
+
+    def __init__(
+        self,
+        *,
+        shape: Tuple[int, int],
+        h_indptr: np.ndarray,
+        h_indices: np.ndarray,
+        h_rows: np.ndarray,
+        h_cols: np.ndarray,
+        pair_left_pos: np.ndarray,
+        pair_right_pos: np.ndarray,
+        pair_rows: np.ndarray,
+        pair_slot: np.ndarray,
+        gain_indptr: np.ndarray,
+        gain_indices: np.ndarray,
+    ):
+        self.shape = tuple(int(item) for item in shape)
+        self.h_indptr = np.asarray(h_indptr, dtype=np.int32)
+        self.h_indices = np.asarray(h_indices, dtype=np.int32)
+        self.h_rows = np.asarray(h_rows, dtype=np.int32)
+        self.h_cols = np.asarray(h_cols, dtype=np.int32)
+        self.pair_left_pos = np.asarray(pair_left_pos, dtype=np.int32)
+        self.pair_right_pos = np.asarray(pair_right_pos, dtype=np.int32)
+        self.pair_rows = np.asarray(pair_rows, dtype=np.int32)
+        self.pair_slot = np.asarray(pair_slot, dtype=np.int32)
+        self.gain_indptr = np.asarray(gain_indptr, dtype=np.int32)
+        self.gain_indices = np.asarray(gain_indices, dtype=np.int32)
+        self.gain_shape = (self.shape[1], self.shape[1])
+        self.gain_nnz = int(self.gain_indices.size)
+        self.gain_data = np.zeros(self.gain_nnz, dtype=np.float64)
+        self.rhs = np.zeros(self.shape[1], dtype=np.float64)
+        self._pair_values = np.empty(int(self.pair_slot.size), dtype=np.float64)
+        self._rhs_values = np.empty(int(self.h_cols.size), dtype=np.float64)
+        self._fixed_pair_weight = None
+        self.gain = SP_CSC_MATRIX(
+            (self.gain_data, self.gain_indices, self.gain_indptr),
+            shape=self.gain_shape,
+            copy=False,
+        )
+        self.pair_count = int(self.pair_slot.size)
+
+    @classmethod
+    def from_jacobian(cls, H) -> "LowerNormalEquationCscPlan":
+        if not is_sparse_matrix(H):
+            raise TypeError("LowerNormalEquationCscPlan requires a sparse Jacobian")
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            H_csr = H_csr.copy()
+            H_csr.sort_indices()
+        indptr = H_csr.indptr.astype(np.int32, copy=True)
+        indices = H_csr.indices.astype(np.int32, copy=True)
+        counts = np.diff(indptr).astype(np.int32, copy=False)
+        h_rows = np.repeat(np.arange(H_csr.shape[0], dtype=np.int32), counts)
+        h_cols = indices.copy()
+
+        pair_counts = (counts.astype(np.int64, copy=False) * (counts.astype(np.int64, copy=False) + 1)) // 2
+        total_pairs = int(pair_counts.sum())
+        if total_pairs:
+            pair_left_pos = np.empty(total_pairs, dtype=np.int32)
+            pair_right_pos = np.empty(total_pairs, dtype=np.int32)
+            pair_rows = np.empty(total_pairs, dtype=np.int32)
+            nonzero_rows = np.flatnonzero(counts).astype(np.int32, copy=False)
+            width_order = np.argsort(counts[nonzero_rows], kind="stable")
+            rows_by_width = nonzero_rows[width_order]
+            widths_by_row = counts[rows_by_width]
+            width_breaks = np.concatenate(
+                (
+                    np.array([0], dtype=np.int64),
+                    np.nonzero(widths_by_row[1:] != widths_by_row[:-1])[0] + 1,
+                    np.array([rows_by_width.size], dtype=np.int64),
+                )
+            )
+            offset = 0
+            for group_start, group_stop in zip(width_breaks[:-1], width_breaks[1:]):
+                rows = rows_by_width[int(group_start) : int(group_stop)]
+                k = int(counts[rows[0]])
+                per_row_pairs = (k * (k + 1)) // 2
+                out_stop = offset + int(rows.size) * per_row_pairs
+                if k == 1:
+                    source = indptr[rows]
+                    pair_left_pos[offset:out_stop] = source
+                    pair_right_pos[offset:out_stop] = source
+                    pair_rows[offset:out_stop] = rows
+                else:
+                    lower_left, lower_right = np.tril_indices(k)
+                    lower_left = lower_left.astype(np.int32, copy=False)
+                    lower_right = lower_right.astype(np.int32, copy=False)
+                    starts = indptr[rows]
+                    pair_left_pos[offset:out_stop] = (starts[:, None] + lower_left[None, :]).ravel()
+                    pair_right_pos[offset:out_stop] = (starts[:, None] + lower_right[None, :]).ravel()
+                    pair_rows[offset:out_stop].reshape(rows.size, per_row_pairs)[:] = rows[:, None]
+                offset = out_stop
+            n_state = int(H_csr.shape[1])
+            gain_rows = indices[pair_left_pos].astype(np.int64, copy=False)
+            gain_cols = indices[pair_right_pos].astype(np.int64, copy=False)
+            raw_linear = gain_cols * np.int64(n_state) + gain_rows
+            gain_linear, pair_slot = np.unique(raw_linear, return_inverse=True)
+            gain_indices = (gain_linear % np.int64(n_state)).astype(np.int32, copy=False)
+            gain_cols_unique = (gain_linear // np.int64(n_state)).astype(np.int64, copy=False)
+            gain_indptr = np.zeros(n_state + 1, dtype=np.int32)
+            np.add.at(gain_indptr, gain_cols_unique + 1, 1)
+            np.cumsum(gain_indptr, out=gain_indptr)
+            pair_slot = pair_slot.astype(np.int32, copy=False)
+        else:
+            pair_left_pos = np.array([], dtype=np.int32)
+            pair_right_pos = np.array([], dtype=np.int32)
+            pair_rows = np.array([], dtype=np.int32)
+            pair_slot = np.array([], dtype=np.int32)
+            gain_indices = np.array([], dtype=np.int32)
+            gain_indptr = np.zeros(H_csr.shape[1] + 1, dtype=np.int32)
+
+        return cls(
+            shape=H_csr.shape,
+            h_indptr=indptr,
+            h_indices=indices,
+            h_rows=h_rows,
+            h_cols=h_cols,
+            pair_left_pos=pair_left_pos,
+            pair_right_pos=pair_right_pos,
+            pair_rows=pair_rows,
+            pair_slot=pair_slot,
+            gain_indptr=gain_indptr,
+            gain_indices=gain_indices,
+        )
+
+    def prepare_fixed_weights(self, weight: np.ndarray) -> None:
+        """Cache ``weight[pair_rows]`` for repeated fixed-weight assemblies."""
+        weight = np.asarray(weight, dtype=np.float64)
+        if self.pair_rows.size:
+            self._fixed_pair_weight = weight[self.pair_rows].copy()
+        else:
+            self._fixed_pair_weight = np.array([], dtype=np.float64)
+
+    def clear_fixed_weights(self) -> None:
+        self._fixed_pair_weight = None
+
+    def matches(self, H) -> bool:
+        if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
+            return False
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        if not H_csr.has_sorted_indices:
+            return False
+        return (
+            int(H_csr.nnz) == int(self.h_indices.size)
+            and H_csr.indptr.shape == self.h_indptr.shape
+            and H_csr.indices.shape == self.h_indices.shape
+            and np.array_equal(H_csr.indptr, self.h_indptr)
+            and np.array_equal(H_csr.indices, self.h_indices)
+        )
+
+    def assemble(
+        self,
+        H,
+        residual: np.ndarray,
+        weight: np.ndarray,
+        *,
+        uniform_weight: Optional[float] = None,
+        weights_are_uniform: Optional[bool] = None,
+        weighted_residual: Optional[np.ndarray] = None,
+        dense_gain_limit: int = 1000,
+        assume_fixed_weights: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+        data = np.asarray(H_csr.data, dtype=np.float64)
+        residual = np.asarray(residual, dtype=np.float64)
+        weight = np.asarray(weight, dtype=np.float64)
+
+        if weight.size == 0:
+            row_weight = None
+            weighted_residual_values = residual
+            scale = 1.0
+        elif weights_are_uniform is True or uniform_weight is not None:
+            scale = float(weight[0] if uniform_weight is None else uniform_weight)
+            row_weight = None
+            weighted_residual_values = residual if scale == 1.0 else residual * scale
+        else:
+            if weights_are_uniform is None and weight.size:
+                first_weight = float(weight[0])
+                if np.all(weight == first_weight):
+                    scale = first_weight
+                    row_weight = None
+                    weighted_residual_values = residual if scale == 1.0 else residual * scale
+                else:
+                    scale = 1.0
+                    row_weight = weight
+                    weighted_residual_values = weight * residual if weighted_residual is None else weighted_residual
+            else:
+                scale = 1.0
+                row_weight = weight
+                weighted_residual_values = weight * residual if weighted_residual is None else weighted_residual
+
+        if self.pair_slot.size:
+            np.multiply(data[self.pair_left_pos], data[self.pair_right_pos], out=self._pair_values)
+            if row_weight is not None:
+                if assume_fixed_weights:
+                    if self._fixed_pair_weight is None or self._fixed_pair_weight.shape[0] != self.pair_rows.size:
+                        self.prepare_fixed_weights(row_weight)
+                    np.multiply(self._pair_values, self._fixed_pair_weight, out=self._pair_values)
+                else:
+                    np.multiply(self._pair_values, row_weight[self.pair_rows], out=self._pair_values)
+            elif scale != 1.0:
+                self._pair_values *= scale
+            self.gain_data[:] = np.bincount(
+                self.pair_slot,
+                weights=self._pair_values,
+                minlength=self.gain_nnz,
+            )
+        else:
+            self.gain_data.fill(0.0)
+
+        if data.size:
+            np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
+            self.rhs[:] = np.bincount(
+                self.h_cols,
+                weights=self._rhs_values,
+                minlength=self.shape[1],
+            )
+        else:
+            self.rhs.fill(0.0)
+        if self.gain.shape[0] <= dense_gain_limit:
+            return self.gain.toarray(), self.rhs.copy()
+        return self.gain, self.rhs.copy()
 
 
 def measurement_leverage(H, gain_inv: np.ndarray) -> np.ndarray:
@@ -1228,8 +1477,12 @@ def build_normal_equations(
     normal_pattern=None,
     assume_normal_pattern_matches: bool = False,
     normal_assembly_plan: Optional[NormalEquationAssemblyPlan] = None,
+    triangular: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build WLS normal equations while avoiding WH allocation for uniform weights."""
+    triangular_mode = None if triangular is None else str(triangular).lower()
+    if triangular_mode not in (None, "lower"):
+        raise ValueError(f"Unsupported normal-equation triangular mode: {triangular!r}")
     if is_sparse_matrix(H):
         if (
             normal_assembly_plan is not None
@@ -1275,11 +1528,15 @@ def build_normal_equations(
                 gain = H.T @ weighted_H
                 rhs = H.T @ weighted_residual
         if is_sparse_matrix(gain):
+            if triangular_mode == "lower":
+                gain = SP_TRIL(gain, format="csc")
+                if normal_pattern is not None:
+                    normal_pattern = SP_TRIL(normal_pattern, format="csc")
             if assume_normal_pattern_matches:
                 gain = gain.tocsc() if getattr(gain, "format", None) != "csc" else gain
             else:
                 if normal_pattern is None:
-                    normal_pattern = _normal_equation_structural_pattern(H)
+                    normal_pattern = _normal_equation_structural_pattern(H, triangular=triangular_mode)
                 gain = _expand_sparse_matrix_to_pattern(gain, normal_pattern)
             gain = gain.toarray() if gain.shape[0] <= dense_gain_limit else gain.tocsc()
         return gain, np.asarray(rhs, dtype=np.float64).ravel()
@@ -1287,6 +1544,8 @@ def build_normal_equations(
     if weight.size == 0:
         gain = H.T @ H
         rhs = H.T @ residual
+        if triangular_mode == "lower":
+            gain = np.tril(gain)
         return gain, rhs
 
     if weights_are_uniform is True or uniform_weight is not None:
@@ -1297,6 +1556,8 @@ def build_normal_equations(
         if uniform_weight != 1.0:
             gain = uniform_weight * gain
             rhs = uniform_weight * rhs
+        if triangular_mode == "lower":
+            gain = np.tril(gain)
         return gain, rhs
 
     if weights_are_uniform is False:
@@ -1304,6 +1565,8 @@ def build_normal_equations(
         WH = weight[:, None] * H
         gain = H.T @ WH
         rhs = H.T @ weighted_residual
+        if triangular_mode == "lower":
+            gain = np.tril(gain)
         return gain, rhs
 
     first_weight = float(weight[0])
@@ -1313,10 +1576,14 @@ def build_normal_equations(
         if first_weight != 1.0:
             gain = first_weight * gain
             rhs = first_weight * rhs
+        if triangular_mode == "lower":
+            gain = np.tril(gain)
         return gain, rhs
 
     WH = weight[:, None] * H
     gain = H.T @ WH
     weighted_residual = weight * residual if weighted_residual is None else weighted_residual
     rhs = H.T @ weighted_residual
+    if triangular_mode == "lower":
+        gain = np.tril(gain)
     return gain, rhs

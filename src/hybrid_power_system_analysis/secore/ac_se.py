@@ -82,10 +82,12 @@ from secore.se_math import (
     SparseJacobianBuilder,
     angle_residual_mask,
     build_normal_equations,
+    full_normal_equation_from_lower,
     inverse_gain_for_bad_data,
     matrix_is_empty,
     measurement_leverage,
     measurement_residual as build_measurement_residual,
+    LowerNormalEquationCscPlan,
     NormalEquationAssemblyPlan,
     NormalEquationSolver,
     _normal_equation_structural_pattern,
@@ -666,6 +668,7 @@ class ACStateEstimator:
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
         auto_prepare: bool = True,
+        matrix_dump_dir: Optional[Path] = None,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -696,6 +699,7 @@ class ACStateEstimator:
         self._prepare_active_measurements = bool(prepare_active_measurements)
         self._prepare_defer_finalize = bool(defer_prepare_finalize)
         self._array_only_runtime = False
+        self.matrix_dump_dir = Path(matrix_dump_dir) if matrix_dump_dir is not None else None
         self.observability_result = None
         self.estimate_result = None
         self.removed_bad_data: List[BadDataItem] = []
@@ -1414,6 +1418,7 @@ class ACStateEstimator:
         self._observability_matrix_cache = None
         self._active_normal_pattern = None
         self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         stage_start = time.perf_counter()
         self._seed_power_state_arrays_from_measurements()
         self._record_profile_time("init.seed_power_states", time.perf_counter() - stage_start)
@@ -1454,6 +1459,7 @@ class ACStateEstimator:
             self._active_balance_measurement_plan = None
             self._active_normal_pattern = None
             self._active_normal_assembly_plan = None
+            self._active_lower_normal_plan = None
             self.active_measurements_are_vectorized = False
         self._prepared = True
         return self
@@ -1461,6 +1467,81 @@ class ACStateEstimator:
     def _record_profile_time(self, name: str, elapsed: float) -> None:
         if self.profile_enabled:
             self.profile_times[name] = self.profile_times.get(name, 0.0) + float(elapsed)
+
+    @staticmethod
+    def _write_sparse_triplet_file(
+        path: Path,
+        rows: np.ndarray,
+        cols: np.ndarray,
+        values: np.ndarray,
+        shape: Tuple[int, int],
+        label: str,
+    ) -> None:
+        rows = np.asarray(rows, dtype=np.int64)
+        cols = np.asarray(cols, dtype=np.int64)
+        values = np.asarray(values, dtype=np.float64)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write("# sparse_triplet row col value\n")
+            handle.write(f"# shape {int(shape[0])} {int(shape[1])} nnz {int(values.size)}\n")
+            handle.write(f"# matrix {label}\n")
+            if values.size == 0:
+                return
+            rows = rows + 1
+            cols = cols + 1
+            chunk_size = 200_000
+            for start in range(0, int(values.size), chunk_size):
+                end = min(start + chunk_size, int(values.size))
+                block = np.column_stack((rows[start:end], cols[start:end], values[start:end]))
+                np.savetxt(handle, block, fmt=("%d", "%d", "%.17e"))
+
+    @staticmethod
+    def _sparse_triplets_from_matrix(matrix) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
+        if issparse(matrix):
+            coo = matrix.tocoo(copy=False)
+            return coo.row, coo.col, coo.data, tuple(int(item) for item in matrix.shape)
+        arr = np.asarray(matrix, dtype=np.float64)
+        rows, cols = np.nonzero(arr)
+        return rows, cols, arr[rows, cols], tuple(int(item) for item in arr.shape)
+
+    @staticmethod
+    def _sparse_matrix_stores_lower_triangle(matrix) -> bool:
+        if not issparse(matrix) or matrix.shape[0] != matrix.shape[1]:
+            return False
+        csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+        counts = np.diff(csc.indptr).astype(np.int64, copy=False)
+        cols = np.repeat(np.arange(int(csc.shape[1]), dtype=np.int64), counts)
+        return bool(cols.size == 0 or np.all(csc.indices.astype(np.int64, copy=False) >= cols))
+
+    def _dump_iteration_matrices(self, iteration: int, H, weight: np.ndarray, gain) -> None:
+        dump_dir = self.matrix_dump_dir
+        if dump_dir is None:
+            return
+        dump_dir = Path(dump_dir)
+        rows, cols, values, shape = self._sparse_triplets_from_matrix(H)
+        self._write_sparse_triplet_file(dump_dir / f"j{int(iteration)}.txt", rows, cols, values, shape, "jacobian")
+
+        weight = np.asarray(weight, dtype=np.float64)
+        diag = np.arange(int(weight.size), dtype=np.int64)
+        self._write_sparse_triplet_file(
+            dump_dir / f"d{int(iteration)}.txt",
+            diag,
+            diag,
+            weight,
+            (int(weight.size), int(weight.size)),
+            "weight_diagonal",
+        )
+
+        info_matrix = full_normal_equation_from_lower(gain) if self._sparse_matrix_stores_lower_triangle(gain) else gain
+        rows, cols, values, shape = self._sparse_triplets_from_matrix(info_matrix)
+        self._write_sparse_triplet_file(
+            dump_dir / f"h{int(iteration)}.txt",
+            rows,
+            cols,
+            values,
+            shape,
+            "information_matrix",
+        )
 
     def _warn_required_runtime_missing(self, name: str, context: str) -> None:
         message = (
@@ -1610,6 +1691,7 @@ class ACStateEstimator:
             "H": H,
             "normal_pattern": None,
             "normal_assembly_plan": None,
+            "lower_normal_plan": None,
         }
 
     def _observability_matrix_cache_for(
@@ -1697,6 +1779,7 @@ class ACStateEstimator:
         self._jacobian_builder._assume_fixed_pattern = True
         self._active_normal_pattern = None
         self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         self._observability_matrix_cache = None
         self.active_measurements_are_vectorized = bool(
             np.all(
@@ -1853,6 +1936,7 @@ class ACStateEstimator:
         self._jacobian_builder._assume_fixed_pattern = True
         self._active_normal_pattern = None
         self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         self._observability_matrix_cache = None
         self.active_measurements_are_vectorized = bool(
             np.all(
@@ -1994,6 +2078,7 @@ class ACStateEstimator:
         self._jacobian_builder._assume_fixed_pattern = True
         self._active_normal_pattern = None
         self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         self._observability_matrix_cache = None
         if hasattr(self, "_active_branch_transformer_vector_plan"):
             self._active_branch_transformer_vector_plan = self._shrink_active_plan_group(
@@ -7653,9 +7738,16 @@ class ACStateEstimator:
         objective = np.inf
         iteration = 0
         H = None
-        gain = np.zeros((self.n_state, self.n_state), dtype=np.float64)
+        gain = None
         final_quantities_current = False
         normal_solver = NormalEquationSolver(assume_fixed_pattern=active_measurement_run)
+        lower_normal_plan = self._active_lower_normal_plan if active_measurement_run else None
+        if (
+            active_measurement_run
+            and observability_cache is not None
+            and observability_cache.get("lower_normal_plan") is not None
+        ):
+            lower_normal_plan = observability_cache["lower_normal_plan"]
         normal_pattern = self._active_normal_pattern if active_measurement_run else None
         if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
             normal_pattern = observability_cache["normal_pattern"]
@@ -7710,6 +7802,24 @@ class ACStateEstimator:
                     self._active_normal_assembly_plan = None
                 if observability_cache is not None:
                     observability_cache["normal_assembly_plan"] = None
+            if lower_normal_plan is not None and (
+                not issparse(H)
+                or tuple(H.shape) != lower_normal_plan.shape
+                or int(H.nnz) != int(lower_normal_plan.h_indices.size)
+            ):
+                lower_normal_plan = None
+                if active_measurement_run:
+                    self._active_lower_normal_plan = None
+                if observability_cache is not None:
+                    observability_cache["lower_normal_plan"] = None
+            if active_measurement_run and lower_normal_plan is None and issparse(H):
+                start = time.perf_counter() if self.profile_enabled else None
+                lower_normal_plan = LowerNormalEquationCscPlan.from_jacobian(H)
+                if start is not None:
+                    self._record_profile_time("solve.lower_normal_plan_build", time.perf_counter() - start)
+                self._active_lower_normal_plan = lower_normal_plan
+                if observability_cache is not None:
+                    observability_cache["lower_normal_plan"] = lower_normal_plan
             if normal_assembly_plan is None and issparse(H) and not normal_assembly_plan_disabled:
                 if not NormalEquationAssemblyPlan.direct_assembly_is_reasonable(H):
                     normal_assembly_plan_disabled = True
@@ -7722,7 +7832,7 @@ class ACStateEstimator:
                         self._active_normal_assembly_plan = normal_assembly_plan
                     if observability_cache is not None:
                         observability_cache["normal_assembly_plan"] = normal_assembly_plan
-            if normal_pattern is None and issparse(H):
+            if lower_normal_plan is None and normal_pattern is None and issparse(H):
                 start = time.perf_counter() if self.profile_enabled else None
                 normal_pattern = _normal_equation_structural_pattern(H)
                 if start is not None:
@@ -7734,19 +7844,36 @@ class ACStateEstimator:
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
             start = time.perf_counter() if self.profile_enabled else None
-            gain, rhs = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=False,
-                normal_assembly_plan=normal_assembly_plan,
-            )
+            if lower_normal_plan is not None:
+                gain, rhs = lower_normal_plan.assemble(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    dense_gain_limit=0,
+                    assume_fixed_weights=active_measurement_run,
+                )
+            else:
+                gain, rhs = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    assume_normal_pattern_matches=False,
+                    normal_assembly_plan=normal_assembly_plan,
+                )
             if start is not None:
                 self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
+            if self.matrix_dump_dir is not None:
+                start = time.perf_counter() if self.profile_enabled else None
+                self._dump_iteration_matrices(iteration, H, weight, gain)
+                if start is not None:
+                    self._record_profile_time("solve.matrix_dump", time.perf_counter() - start)
             start = time.perf_counter() if self.profile_enabled else None
             dx, _ = normal_solver.solve(
                 gain,
@@ -7860,21 +7987,38 @@ class ACStateEstimator:
             if weighted_residual is not None:
                 np.multiply(weight, residual, out=weighted_residual)
             start = time.perf_counter() if self.profile_enabled else None
-            gain, _ = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                normal_assembly_plan=normal_assembly_plan,
-            )
+            if lower_normal_plan is not None:
+                gain, _ = lower_normal_plan.assemble(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    dense_gain_limit=0,
+                    assume_fixed_weights=active_measurement_run,
+                )
+            else:
+                gain, _ = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    normal_assembly_plan=normal_assembly_plan,
+                )
             if start is not None:
                 self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
         elif not final_diagnostics:
             H = None
             gain = None
+        elif lower_normal_plan is not None and gain is not None:
+            start = time.perf_counter() if self.profile_enabled else None
+            gain = full_normal_equation_from_lower(gain)
+            if start is not None:
+                self._record_profile_time("solve.full_gain_from_lower", time.perf_counter() - start)
         array_only_result = bool(getattr(self, "_array_only_estimate_result", False))
         if not array_only_result:
             self.apply_state(x)
@@ -8174,6 +8318,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
     parser.add_argument(
+        "--matrix-dump-dir",
+        default=None,
+        help="Directory for per-iteration sparse triplet dumps: jN.txt, dN.txt, hN.txt.",
+    )
+    parser.add_argument(
         "--result-mode",
         default=None,
         choices=("full", "summary", "array", "none"),
@@ -8192,6 +8341,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         flat_start=args.flat_start,
         profile=args.profile,
         auto_prepare=False,
+        matrix_dump_dir=Path(args.matrix_dump_dir) if args.matrix_dump_dir else None,
     )
 
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
