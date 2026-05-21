@@ -1183,7 +1183,15 @@ class ACStateEstimator:
             self._refresh_active_measurement_indexes()
             self._record_profile_time("init.refresh_active_measurements", time.perf_counter() - stage_start)
             stage_start = time.perf_counter()
-            self._add_targeted_observability_pseudo_measurements()
+            fast_observability = self._fast_active_observability_certificate()
+            if fast_observability is None:
+                self._add_targeted_observability_pseudo_measurements()
+            else:
+                self._initial_observability_cache = fast_observability
+                initial_state = self.initial_state()
+                active_plan_tables = self._active_measurement_plan_tables_ref()
+                initial_h = self.jacobian_sparse(initial_state, active_plan_tables)
+                self._cache_observability_matrix(fast_observability, initial_state, active_plan_tables, initial_h)
             self._record_profile_time("init.targeted_observability_pseudo", time.perf_counter() - stage_start)
         else:
             self.active_measurements = MeasurementList(
@@ -3989,6 +3997,141 @@ class ACStateEstimator:
         assign(DEVICE_TYPE_CODES_ACGENERATOR, MEAS_TYPE_CODES_Q_GEN, gen_index, self.initial_gen_q_array)
         assign(DEVICE_TYPE_CODES_ACLOAD, MEAS_TYPE_CODES_P_LOAD, load_index, self.initial_load_p_array)
         assign(DEVICE_TYPE_CODES_ACLOAD, MEAS_TYPE_CODES_Q_LOAD, load_index, self.initial_load_q_array)
+
+    @staticmethod
+    def _covers_all_state_indices(indices: np.ndarray, count: int) -> bool:
+        count = int(count)
+        if count <= 0:
+            return True
+        values = np.asarray(indices, dtype=np.int64)
+        if values.size < count:
+            return False
+        valid = (values >= 0) & (values < count)
+        if not np.any(valid):
+            return False
+        seen = np.zeros(count, dtype=bool)
+        seen[values[valid].astype(np.intp, copy=False)] = True
+        return bool(np.all(seen))
+
+    def _fast_active_observability_certificate(self) -> Optional[ObservabilityResult]:
+        """Certify the generated flat-start AC array path without building H."""
+        if not bool(getattr(self, "_array_only_runtime", False)):
+            return None
+        if not bool(getattr(self, "flat_start", False)):
+            return None
+        if not bool(getattr(self, "active_measurements_are_vectorized", False)):
+            return None
+        n_state = int(getattr(self, "n_state", 0))
+        if n_state <= 0:
+            return None
+        measurement_count = self._active_measurement_count()
+        if measurement_count < n_state:
+            return None
+        redundancy_target = targeted_redundancy_count(
+            n_state,
+            getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
+        )
+        if redundancy_target > 0:
+            return None
+        plan_tables = getattr(self, "_active_measurement_plan_tables_cache", None)
+        if not isinstance(plan_tables, dict) or not plan_tables:
+            return None
+        vector_plans = (
+            getattr(self, "_active_branch_transformer_vector_plan", None),
+            getattr(self, "_active_simple_jacobian_plan", None),
+            getattr(self, "_active_zero_current_vector_plan", None),
+            getattr(self, "_active_generator_measurement_plan", None),
+            getattr(self, "_active_balance_measurement_plan", None),
+        )
+        if any(plan is None for plan in vector_plans):
+            return None
+        handled = np.zeros(measurement_count, dtype=bool)
+        for plan in vector_plans:
+            plan_handled = np.asarray(plan.get("handled_mask", ()), dtype=bool)
+            if plan_handled.size != measurement_count:
+                return None
+            handled |= plan_handled
+        if not np.all(handled):
+            return None
+
+        island_alive = np.asarray(getattr(self, "_ac_island_alive_mask", ()), dtype=bool)
+        alive_island_count = int(np.count_nonzero(island_alive))
+        reference_pos = np.asarray(getattr(self, "reference_pos", ()), dtype=np.int64)
+        if alive_island_count and reference_pos.size < alive_island_count:
+            return None
+        if int(getattr(self, "n_voltage", 0)) > 0:
+            reference_voltage = getattr(self, "reference_voltage_by_pos", {})
+            if not reference_voltage:
+                return None
+            if alive_island_count > 1:
+                node_island_pos = np.asarray(getattr(self, "_ac_node_island_pos", ()), dtype=np.int32)
+                voltage_ref_pos = np.fromiter((int(pos) for pos in reference_voltage.keys()), dtype=np.int64)
+                valid_ref = (voltage_ref_pos >= 0) & (voltage_ref_pos < node_island_pos.size)
+                if not np.any(valid_ref):
+                    return None
+                covered_islands = np.unique(node_island_pos[voltage_ref_pos[valid_ref].astype(np.intp, copy=False)])
+                alive_islands = np.flatnonzero(island_alive).astype(np.int32, copy=False)
+                if not np.all(np.isin(alive_islands, covered_islands)):
+                    return None
+
+        balance_plan = self._active_balance_measurement_plan
+        p_row_by_pos = np.asarray(balance_plan.get("p_row_by_pos", ()), dtype=np.int32)
+        q_row_by_pos = np.asarray(balance_plan.get("q_row_by_pos", ()), dtype=np.int32)
+        n_nodes = int(getattr(self, "n_nodes", 0))
+        if p_row_by_pos.size != n_nodes or q_row_by_pos.size != n_nodes:
+            return None
+        if np.any(p_row_by_pos < 0) or np.any(q_row_by_pos < 0):
+            return None
+        required_balance_arrays = (
+            "gen_p_rows",
+            "gen_q_rows",
+            "load_p_rows",
+            "load_q_rows",
+            "switch_p_rows",
+            "switch_q_rows",
+            "shunt_q_rows",
+        )
+        for key in required_balance_arrays:
+            values = np.asarray(balance_plan.get(key, ()), dtype=np.int64)
+            if values.size and np.any(values < 0):
+                return None
+        if int(getattr(self, "n_switch_current", 0)) > 0:
+            expected = 2 * int(self.n_switch_current)
+            if (
+                np.asarray(balance_plan.get("switch_p_rows", ())).size != expected
+                or np.asarray(balance_plan.get("switch_q_rows", ())).size != expected
+            ):
+                return None
+
+        generator_plan = self._active_generator_measurement_plan
+        gen_kind = np.asarray(generator_plan.get("value_kind", ()), dtype=np.int16)
+        gen_index = np.asarray(generator_plan.get("value_index", ()), dtype=np.int64)
+        n_generator_power = int(getattr(self, "n_generator_power", 0))
+        if n_generator_power:
+            if not self._covers_all_state_indices(gen_index[gen_kind == MEAS_TYPE_CODES_P_GEN], n_generator_power):
+                return None
+            if not self._covers_all_state_indices(gen_index[gen_kind == MEAS_TYPE_CODES_Q_GEN], n_generator_power):
+                return None
+
+        simple_plan = self._active_simple_jacobian_plan
+        load_kind = np.asarray(simple_plan.get("load_kind", ()), dtype=np.int16)
+        load_index = np.asarray(simple_plan.get("load_index", ()), dtype=np.int64)
+        n_load_power = int(getattr(self, "n_load_power", 0))
+        if n_load_power:
+            if not self._covers_all_state_indices(load_index[load_kind == MEAS_TYPE_CODES_P_LOAD], n_load_power):
+                return None
+            if not self._covers_all_state_indices(load_index[load_kind == MEAS_TYPE_CODES_Q_LOAD], n_load_power):
+                return None
+
+        return ObservabilityResult(
+            observable=True,
+            rank=n_state,
+            state_count=n_state,
+            measurement_count=measurement_count,
+            deficiency=0,
+            singular_values=np.array([], dtype=np.float64),
+            weak_states=[],
+        )
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch AC rank deficiencies and optional post-observability redundancy."""

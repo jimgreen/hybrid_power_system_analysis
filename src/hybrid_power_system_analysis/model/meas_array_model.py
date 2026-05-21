@@ -414,6 +414,8 @@ def _build_meas_ppc_from_measurement_file_array_only(
     weight_col = valid_col = value_col = -1
     status_col = -1
     required_max_col = -1
+    split_limit = -1
+    has_status = False
     capacity = _initial_measurement_capacity(source)
     idx_values = np.empty(capacity, dtype=np.int64)
     weight_values = np.empty(capacity, dtype=np.float64)
@@ -472,6 +474,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                         valid_col = header_index[b"valid"]
                         value_col = header_index[b"value"]
                         status_col = header_index.get(b"status", -1)
+                        has_status = status_col >= 0
                         required_max_col = max(
                             idx_col,
                             device_type_col,
@@ -481,12 +484,13 @@ def _build_meas_ppc_from_measurement_file_array_only(
                             valid_col,
                             value_col,
                         )
+                        split_limit = status_col + 1 if has_status else required_max_col
                         continue
                     if first != b"#" or not in_measurement:
                         continue
                     text = line[1:]
 
-                fields = text.split()
+                fields = text.split(None, split_limit)
                 if not header:
                     raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
                 if len(fields) <= required_max_col:
@@ -533,7 +537,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                 weight_values[row_count] = to_float(fields[weight_col])
                 valid = fields[valid_col] == b"1"
                 value_values[row_count] = to_float(fields[value_col])
-                if status_col >= 0 and len(fields) > status_col:
+                if has_status and len(fields) > status_col:
                     status = _normalize_status_bytes(fields[status_col], valid)
                     if not status_is_active(status):
                         valid = False
