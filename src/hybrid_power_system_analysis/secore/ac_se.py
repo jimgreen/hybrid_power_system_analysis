@@ -5,6 +5,7 @@ import math
 import sys
 import time
 import warnings
+from itertools import repeat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -340,6 +341,7 @@ class _PseudoMeasurementBuffer:
     """Preallocated row buffer for pseudo-measurement table construction."""
 
     __slots__ = (
+        "store_strings",
         "name",
         "device_type",
         "device_type_code",
@@ -352,14 +354,15 @@ class _PseudoMeasurementBuffer:
         "count",
     )
 
-    def __init__(self, capacity: int, *, with_weights: bool = False) -> None:
+    def __init__(self, capacity: int, *, with_weights: bool = False, store_strings: bool = True) -> None:
         size = max(0, int(capacity))
-        self.name = np.empty(size, dtype=object)
-        self.device_type = np.empty(size, dtype=object)
+        self.store_strings = bool(store_strings)
+        self.name = np.empty(size, dtype=object) if self.store_strings else np.asarray([], dtype=object)
+        self.device_type = np.empty(size, dtype=object) if self.store_strings else np.asarray([], dtype=object)
         self.device_type_code = np.empty(size, dtype=np.int16)
-        self.device_name = np.empty(size, dtype=object)
+        self.device_name = np.empty(size, dtype=object) if self.store_strings else np.asarray([], dtype=object)
         self.device_pos = np.empty(size, dtype=np.int64)
-        self.meas_type = np.empty(size, dtype=object)
+        self.meas_type = np.empty(size, dtype=object) if self.store_strings else np.asarray([], dtype=object)
         self.meas_type_code = np.empty(size, dtype=np.int16)
         self.value = np.empty(size, dtype=np.float64)
         self.weight = np.empty(size, dtype=np.float64) if with_weights else None
@@ -375,15 +378,18 @@ class _PseudoMeasurementBuffer:
         return grown
 
     def _ensure_capacity(self, required: int) -> None:
-        if required <= self.name.size:
+        if required <= self.value.size:
             return
-        size = max(int(required), max(8, int(self.name.size) * 2))
-        self.name = self._resize_array(self.name, size)
-        self.device_type = self._resize_array(self.device_type, size)
+        size = max(int(required), max(8, int(self.value.size) * 2))
+        if self.store_strings:
+            self.name = self._resize_array(self.name, size)
+            self.device_type = self._resize_array(self.device_type, size)
         self.device_type_code = self._resize_array(self.device_type_code, size)
-        self.device_name = self._resize_array(self.device_name, size)
+        if self.store_strings:
+            self.device_name = self._resize_array(self.device_name, size)
         self.device_pos = self._resize_array(self.device_pos, size)
-        self.meas_type = self._resize_array(self.meas_type, size)
+        if self.store_strings:
+            self.meas_type = self._resize_array(self.meas_type, size)
         self.meas_type_code = self._resize_array(self.meas_type_code, size)
         self.value = self._resize_array(self.value, size)
         if self.weight is not None:
@@ -404,12 +410,15 @@ class _PseudoMeasurementBuffer:
     ) -> None:
         pos = int(self.count)
         self._ensure_capacity(pos + 1)
-        self.name[pos] = name
-        self.device_type[pos] = device_type
+        if self.store_strings:
+            self.name[pos] = name
+            self.device_type[pos] = device_type
         self.device_type_code[pos] = int(device_type_code)
-        self.device_name[pos] = device_name
+        if self.store_strings:
+            self.device_name[pos] = device_name
         self.device_pos[pos] = int(device_pos)
-        self.meas_type[pos] = meas_type
+        if self.store_strings:
+            self.meas_type[pos] = meas_type
         self.meas_type_code[pos] = int(meas_type_code)
         self.value[pos] = float(value)
         if self.weight is not None:
@@ -418,10 +427,14 @@ class _PseudoMeasurementBuffer:
 
     @property
     def names(self) -> np.ndarray:
+        if not self.store_strings:
+            return np.asarray([], dtype=object)
         return self.name[: self.count]
 
     @property
     def device_types(self) -> np.ndarray:
+        if not self.store_strings:
+            return np.asarray([], dtype=object)
         return self.device_type[: self.count]
 
     @property
@@ -430,6 +443,8 @@ class _PseudoMeasurementBuffer:
 
     @property
     def device_names(self) -> np.ndarray:
+        if not self.store_strings:
+            return np.asarray([], dtype=object)
         return self.device_name[: self.count]
 
     @property
@@ -438,6 +453,8 @@ class _PseudoMeasurementBuffer:
 
     @property
     def meas_types(self) -> np.ndarray:
+        if not self.store_strings:
+            return np.asarray([], dtype=object)
         return self.meas_type[: self.count]
 
     @property
@@ -1118,7 +1135,10 @@ class ACStateEstimator:
         self._record_profile_time("init.measurement_plan_lookup", time.perf_counter() - stage_start)
 
         stage_start = time.perf_counter()
-        self._state_meta_arrays = self._build_state_meta_arrays()
+        if bool(getattr(self, "_array_only_runtime", False)):
+            self._state_meta_arrays = None
+        else:
+            self._state_meta_arrays = self._build_state_meta_arrays()
         self._state_meta_cache = None
         self._state_labels_cache = None
         self._record_profile_time("init.state_meta_arrays", time.perf_counter() - stage_start)
@@ -2776,8 +2796,14 @@ class ACStateEstimator:
         device_type_code: np.ndarray,
         meas_type_code: np.ndarray,
         device_pos: np.ndarray,
-    ) -> Dict[int, Tuple[float, float]]:
-        best: Dict[int, Tuple[float, float]] = {}
+    ) -> Dict[str, np.ndarray]:
+        def empty_seed() -> Dict[str, np.ndarray]:
+            return {
+                "measurement_key": np.empty(0, dtype=np.int64),
+                "weight": np.empty(0, dtype=np.float64),
+                "value": np.empty(0, dtype=np.float64),
+            }
+
         row_index = np.arange(int(table.idx.size), dtype=np.int64)
         gen_power_rows = row_index[
             processable_mask
@@ -2793,18 +2819,24 @@ class ACStateEstimator:
         ]
         power_rows = np.concatenate((gen_power_rows, load_power_rows))
         if power_rows.size == 0:
-            return best
+            return empty_seed()
         key_type = device_type_code[power_rows].astype(np.int64, copy=False)
         key_pos = device_pos[power_rows].astype(np.int64, copy=False)
         key_meas = meas_type_code[power_rows].astype(np.int64, copy=False)
         keys = self._active_measurement_key_array(key_type, key_pos, key_meas)
-        weight_values = np.asarray(table.weight, dtype=np.float64)[power_rows].tolist()
-        value_values = np.asarray(table.value, dtype=np.float64)[power_rows].tolist()
-        for key, weight, value in zip(keys.tolist(), weight_values, value_values):
-            current = best.get(key)
-            if current is None or weight > current[0]:
-                best[key] = (weight, value)
-        return best
+        weight_values = np.asarray(table.weight, dtype=np.float64)[power_rows]
+        value_values = np.asarray(table.value, dtype=np.float64)[power_rows]
+        order = np.lexsort((-weight_values, keys))
+        sorted_keys = keys[order]
+        keep = np.empty(sorted_keys.size, dtype=bool)
+        keep[0] = True
+        if sorted_keys.size > 1:
+            keep[1:] = sorted_keys[1:] != sorted_keys[:-1]
+        return {
+            "measurement_key": sorted_keys[keep].astype(np.int64, copy=False),
+            "weight": weight_values[order][keep].astype(np.float64, copy=False),
+            "value": value_values[order][keep].astype(np.float64, copy=False),
+        }
 
     def _power_flow_seed_rows_from_arrays(
         self,
@@ -3110,7 +3142,11 @@ class ACStateEstimator:
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache = {}
         self._real_voltage_observation_node_cache = {}
-        self._real_power_measurement_seed_cache = {}
+        self._real_power_measurement_seed_cache = {
+            "measurement_key": np.empty(0, dtype=np.int64),
+            "weight": np.empty(0, dtype=np.float64),
+            "value": np.empty(0, dtype=np.float64),
+        }
         self._power_flow_seed_rows = {
             "measurement_key": np.empty(0, dtype=np.int64),
             "ppc_row": np.empty(0, dtype=np.int64),
@@ -3155,7 +3191,11 @@ class ACStateEstimator:
         active_measurement_keys = set()
         node_voltage_best: Dict[int, float] = {}
         real_voltage_best: Dict[int, float] = {}
-        power_seed_best: Dict[int, Tuple[float, float]] = {}
+        power_seed_best: Dict[str, np.ndarray] = {
+            "measurement_key": np.empty(0, dtype=np.int64),
+            "weight": np.empty(0, dtype=np.float64),
+            "value": np.empty(0, dtype=np.float64),
+        }
         power_flow_seed_rows: Dict[str, np.ndarray] = {
             "measurement_key": np.empty(0, dtype=np.int64),
             "ppc_row": np.empty(0, dtype=np.int64),
@@ -3244,7 +3284,13 @@ class ACStateEstimator:
         meas_type_codes: Optional[Sequence[int]] = None,
         device_positions: Optional[Sequence[int]] = None,
     ) -> TableBackedMeasurementList:
-        row_count = len(names)
+        row_count = max(
+            len(values),
+            len(names),
+            0 if device_type_codes is None else len(device_type_codes),
+            0 if meas_type_codes is None else len(meas_type_codes),
+            0 if device_positions is None else len(device_positions),
+        )
         if row_count == 0:
             empty_i64 = np.asarray([], dtype=np.int64)
             empty_obj = np.asarray([], dtype=object)
@@ -3268,8 +3314,22 @@ class ACStateEstimator:
                 device_pos=empty_i64,
             )
             return table
-        device_type_array = np.asarray(device_types, dtype=object)
+
+        def object_array_or_empty(values_array, field_name: str) -> np.ndarray:
+            array = np.asarray(values_array, dtype=object)
+            if array.size == row_count:
+                return array
+            if array.size == 0:
+                return np.asarray([], dtype=object)
+            raise ValueError(f"pseudo measurement {field_name} array size does not match row count")
+
+        name_array = object_array_or_empty(names, "name")
+        device_type_array = object_array_or_empty(device_types, "device_type")
+        device_name_array = object_array_or_empty(device_names, "device_name")
+        meas_type_array = object_array_or_empty(meas_types, "meas_type")
         if device_type_codes is None:
+            if device_type_array.size != row_count:
+                raise ValueError("pseudo measurement device_type_code is required when device_type strings are omitted")
             device_type_code = np.asarray(
                 [_DEVICE_TYPE_CODES.get(str(device_type), 0) for device_type in device_type_array.tolist()],
                 dtype=np.int16,
@@ -3279,7 +3339,9 @@ class ACStateEstimator:
             if device_type_code.size != row_count:
                 raise ValueError("pseudo measurement device_type_code array size does not match row count")
         if meas_type_codes is None:
-            meas_type_code = _meas_type_code_array(meas_types)
+            if meas_type_array.size != row_count:
+                raise ValueError("pseudo measurement meas_type_code is required when meas_type strings are omitted")
+            meas_type_code = _meas_type_code_array(meas_type_array)
         else:
             meas_type_code = np.asarray(meas_type_codes, dtype=np.int16)
             if meas_type_code.size != row_count:
@@ -3299,10 +3361,10 @@ class ACStateEstimator:
             raise ValueError("pseudo measurement weight array size does not match row count")
         table = MeasurementTable(
             idx=np.arange(int(idx_start), int(idx_start) + row_count, dtype=np.int64),
-            name=np.asarray(names, dtype=object),
+            name=name_array,
             device_type=device_type_array,
-            device_name=np.asarray(device_names, dtype=object),
-            meas_type=np.asarray(meas_types, dtype=object),
+            device_name=device_name_array,
+            meas_type=meas_type_array,
             weight=weight_array,
             valid=np.ones(row_count, dtype=bool),
             value=np.asarray(values, dtype=np.float64),
@@ -3363,7 +3425,13 @@ class ACStateEstimator:
         meas_type_codes: Optional[Sequence[int]] = None,
         device_positions: Optional[Sequence[int]] = None,
     ) -> int:
-        row_count = len(names)
+        row_count = max(
+            len(values),
+            len(names),
+            0 if device_type_codes is None else len(device_type_codes),
+            0 if meas_type_codes is None else len(meas_type_codes),
+            0 if device_positions is None else len(device_positions),
+        )
         if row_count == 0:
             return next_idx
         weight_values = self.pseudo_measurement_weight if weights is None else weights
@@ -3529,6 +3597,7 @@ class ACStateEstimator:
         added_keys = set()
         topology_weight = float(self.pseudo_measurement_weight) * 1e-4
         ppc = self._ac_ppc_dict()
+        store_strings = not bool(getattr(self, "_array_only_runtime", False))
         pseudo_rows = _PseudoMeasurementBuffer(
             3
             * (
@@ -3536,6 +3605,7 @@ class ACStateEstimator:
                 + int(np.asarray(ppc.get("break", np.zeros((0, len(BREAK_COLS)))), dtype=np.float64).shape[0])
             ),
             with_weights=True,
+            store_strings=store_strings,
         )
 
         def queue_topology_pseudo(
@@ -3550,8 +3620,9 @@ class ACStateEstimator:
             key = self._active_measurement_key(device_type_code, int(device_pos), meas_type_code)
             if key in measured_keys or key in added_keys:
                 return
+            pseudo_name = f"pseudo_{meas_type.lower()}_{device_name}" if store_strings else ""
             pseudo_rows.add(
-                f"pseudo_{meas_type.lower()}_{device_name}",
+                pseudo_name,
                 device_type,
                 int(device_type_code),
                 device_name,
@@ -3570,13 +3641,17 @@ class ACStateEstimator:
             table, device_topology, rows = self._ppc_sorted_alive_rows_for(ppc, table_name, device_key, cols["idx"])
             if rows.size == 0 or device_topology is None:
                 continue
-            names = self._ppc_names_for_rows(ppc.get(name_key, np.asarray([], dtype=object)), rows)
+            names = (
+                self._ppc_names_for_rows(ppc.get(name_key, np.asarray([], dtype=object)), rows)
+                if store_strings
+                else repeat("", int(rows.size))
+            )
             plan_pos = self._plan_pos_for_ppc_rows(int(device_type_code), rows, table.shape[0])
             table_rows = table[rows.astype(np.intp, copy=False)]
             for row, name, pos, device_values in zip(rows, names, plan_pos, table_rows):
                 if int(pos) < 0:
                     continue
-                device_name = str(name)
+                device_name = str(name) if store_strings else ""
                 has_terminal_current = any(
                     self._active_measurement_key(device_type_code, int(pos), meas_type_code) in measured_keys
                     for meas_type_code in (MEAS_TYPE_CODES_I_FROM, MEAS_TYPE_CODES_I_TO)
@@ -3644,12 +3719,14 @@ class ACStateEstimator:
         next_idx, topology_added_keys = self._add_pseudo_topology_measurements(next_idx)
         added_keys.update(topology_added_keys)
         ppc = self._ac_ppc_dict()
+        store_strings = not bool(getattr(self, "_array_only_runtime", False))
         pseudo_rows = _PseudoMeasurementBuffer(
             3
             * (
                 int(np.asarray(ppc.get("gen", np.zeros((0, len(GEN_COLS)))), dtype=np.float64).shape[0])
                 + int(np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64).shape[0])
-            )
+            ),
+            store_strings=store_strings,
         )
 
         def queue_pseudo(
@@ -3678,14 +3755,20 @@ class ACStateEstimator:
         gen_p, gen_q = self._ppc_generator_pseudo_power_arrays(ppc, gen_rows)
         gen_nodes = gen[gen_rows.astype(np.intp, copy=False), GEN_COLS["node"]].astype(np.int64, copy=False)
         gen_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACGENERATOR, gen_rows, gen.shape[0])
-        for name, pos, p, q, voltage, node_idx in zip(self._ppc_names_for_rows(ppc["gen_name"], gen_rows), gen_plan_pos, gen_p, gen_q, gen_voltage, gen_nodes):
+        gen_names = (
+            self._ppc_names_for_rows(ppc["gen_name"], gen_rows)
+            if store_strings
+            else repeat("", int(gen_plan_pos.size))
+        )
+        for name, pos, p, q, voltage, node_idx in zip(gen_names, gen_plan_pos, gen_p, gen_q, gen_voltage, gen_nodes):
             if int(pos) < 0:
                 continue
-            device_name = str(name)
+            device_name = str(name) if store_strings else ""
             key = self._active_measurement_key(DEVICE_TYPE_CODES_ACGENERATOR, int(pos), MEAS_TYPE_CODES_P_GEN)
             if key not in measured_keys and key not in added_keys:
+                pseudo_name = f"pseudo_p_{device_name}" if store_strings else ""
                 queue_pseudo(
-                    f"pseudo_p_{device_name}",
+                    pseudo_name,
                     "ACGenerator",
                     DEVICE_TYPE_CODES_ACGENERATOR,
                     device_name,
@@ -3697,8 +3780,9 @@ class ACStateEstimator:
                 added_keys.add(key)
             key = self._active_measurement_key(DEVICE_TYPE_CODES_ACGENERATOR, int(pos), MEAS_TYPE_CODES_Q_GEN)
             if key not in measured_keys and key not in added_keys:
+                pseudo_name = f"pseudo_q_{device_name}" if store_strings else ""
                 queue_pseudo(
-                    f"pseudo_q_{device_name}",
+                    pseudo_name,
                     "ACGenerator",
                     DEVICE_TYPE_CODES_ACGENERATOR,
                     device_name,
@@ -3715,8 +3799,9 @@ class ACStateEstimator:
                     and key not in added_keys
                     and self._real_voltage_observation_value_for_node(int(node_idx)) is None
                 ):
+                    pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
                     queue_pseudo(
-                        f"pseudo_v_{device_name}",
+                        pseudo_name,
                         "ACGenerator",
                         DEVICE_TYPE_CODES_ACGENERATOR,
                         device_name,
@@ -3732,15 +3817,21 @@ class ACStateEstimator:
         load_p, load_q = self._ppc_load_pseudo_power_arrays(ppc, load_rows, load_voltage)
         load_nodes = load[load_rows.astype(np.intp, copy=False), LOAD_COLS["node"]].astype(np.int64, copy=False)
         load_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACLOAD, load_rows, load.shape[0])
-        for name, pos, p, q, voltage, node_idx in zip(self._ppc_names_for_rows(ppc["load_name"], load_rows), load_plan_pos, load_p, load_q, load_voltage, load_nodes):
+        load_names = (
+            self._ppc_names_for_rows(ppc["load_name"], load_rows)
+            if store_strings
+            else repeat("", int(load_plan_pos.size))
+        )
+        for name, pos, p, q, voltage, node_idx in zip(load_names, load_plan_pos, load_p, load_q, load_voltage, load_nodes):
             if int(pos) < 0:
                 continue
-            device_name = str(name)
+            device_name = str(name) if store_strings else ""
             unmetered_load = self._active_device_key(DEVICE_TYPE_CODES_ACLOAD, int(pos)) not in measured_devices
             key = self._active_measurement_key(DEVICE_TYPE_CODES_ACLOAD, int(pos), MEAS_TYPE_CODES_P_LOAD)
             if key not in measured_keys and key not in added_keys:
+                pseudo_name = f"pseudo_p_{device_name}" if store_strings else ""
                 queue_pseudo(
-                    f"pseudo_p_{device_name}",
+                    pseudo_name,
                     "ACLoad",
                     DEVICE_TYPE_CODES_ACLOAD,
                     device_name,
@@ -3752,8 +3843,9 @@ class ACStateEstimator:
                 added_keys.add(key)
             key = self._active_measurement_key(DEVICE_TYPE_CODES_ACLOAD, int(pos), MEAS_TYPE_CODES_Q_LOAD)
             if key not in measured_keys and key not in added_keys:
+                pseudo_name = f"pseudo_q_{device_name}" if store_strings else ""
                 queue_pseudo(
-                    f"pseudo_q_{device_name}",
+                    pseudo_name,
                     "ACLoad",
                     DEVICE_TYPE_CODES_ACLOAD,
                     device_name,
@@ -3770,8 +3862,9 @@ class ACStateEstimator:
                     and key not in added_keys
                     and self._real_voltage_observation_value_for_node(int(node_idx)) is None
                 ):
+                    pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
                     queue_pseudo(
-                        f"pseudo_v_{device_name}",
+                        pseudo_name,
                         "ACLoad",
                         DEVICE_TYPE_CODES_ACLOAD,
                         device_name,
@@ -3802,40 +3895,63 @@ class ACStateEstimator:
 
     def _seed_power_state_arrays_from_measurements(self) -> None:
         """Use the best available P/Q rows as initial values for explicit power states."""
-        best = getattr(self, "_real_power_measurement_seed_cache", None)
-        if best is None:
+        seed = getattr(self, "_real_power_measurement_seed_cache", None)
+        if seed is None:
             self._refresh_measurement_summary_cache()
-            best = getattr(self, "_real_power_measurement_seed_cache", {})
+            seed = getattr(self, "_real_power_measurement_seed_cache", {})
+        if not isinstance(seed, dict):
+            warnings.warn(
+                "AC SE power state seeding requires packed key arrays; skipped power seed.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        keys = np.asarray(seed.get("measurement_key", ()), dtype=np.int64)
+        values = np.asarray(seed.get("value", ()), dtype=np.float64)
+        if keys.size == 0:
+            return
+        if values.size != keys.size:
+            warnings.warn(
+                "AC SE power state seeding requires same-sized measurement_key and value arrays.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
 
         gen_index = np.asarray(getattr(self, "_ac_generator_plan_index", ()), dtype=np.int64)
         load_index = np.asarray(getattr(self, "_ac_load_plan_index", ()), dtype=np.int64)
         meas_mask = (1 << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS) - 1
         pos_mask = (1 << _ACTIVE_DEVICE_KEY_POS_BITS) - 1
-        for key, (_weight, value) in best.items():
-            key = int(key)
-            meas_type_code = key & meas_mask
-            device_pos = (key >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS) & pos_mask
-            device_type_code = key >> (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
-            if device_type_code == DEVICE_TYPE_CODES_ACGENERATOR:
-                if device_pos < 0 or device_pos >= gen_index.size:
-                    continue
-                state_idx = int(gen_index[device_pos])
-                if state_idx < 0:
-                    continue
-                if meas_type_code == MEAS_TYPE_CODES_P_GEN:
-                    self.initial_gen_p_array[state_idx] = value
-                elif meas_type_code == MEAS_TYPE_CODES_Q_GEN:
-                    self.initial_gen_q_array[state_idx] = value
-            elif device_type_code == DEVICE_TYPE_CODES_ACLOAD:
-                if device_pos < 0 or device_pos >= load_index.size:
-                    continue
-                state_idx = int(load_index[device_pos])
-                if state_idx < 0:
-                    continue
-                if meas_type_code == MEAS_TYPE_CODES_P_LOAD:
-                    self.initial_load_p_array[state_idx] = value
-                elif meas_type_code == MEAS_TYPE_CODES_Q_LOAD:
-                    self.initial_load_q_array[state_idx] = value
+        meas_type_code = keys & meas_mask
+        device_pos = (keys >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS) & pos_mask
+        device_type_code = keys >> (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
+
+        def assign(
+            device_code: int,
+            meas_code: int,
+            state_index: np.ndarray,
+            target: np.ndarray,
+        ) -> None:
+            if state_index.size == 0:
+                return
+            mask = (device_type_code == int(device_code)) & (meas_type_code == int(meas_code))
+            if not np.any(mask):
+                return
+            rows = np.flatnonzero(mask).astype(np.intp, copy=False)
+            pos = device_pos[rows]
+            valid_pos = (pos >= 0) & (pos < state_index.size)
+            if not np.any(valid_pos):
+                return
+            state_idx = state_index[pos[valid_pos].astype(np.intp, copy=False)]
+            valid_state = state_idx >= 0
+            if np.any(valid_state):
+                source_rows = rows[valid_pos][valid_state]
+                target[state_idx[valid_state].astype(np.intp, copy=False)] = values[source_rows]
+
+        assign(DEVICE_TYPE_CODES_ACGENERATOR, MEAS_TYPE_CODES_P_GEN, gen_index, self.initial_gen_p_array)
+        assign(DEVICE_TYPE_CODES_ACGENERATOR, MEAS_TYPE_CODES_Q_GEN, gen_index, self.initial_gen_q_array)
+        assign(DEVICE_TYPE_CODES_ACLOAD, MEAS_TYPE_CODES_P_LOAD, load_index, self.initial_load_p_array)
+        assign(DEVICE_TYPE_CODES_ACLOAD, MEAS_TYPE_CODES_Q_LOAD, load_index, self.initial_load_q_array)
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch AC rank deficiencies and optional post-observability redundancy."""
@@ -3953,6 +4069,7 @@ class ACStateEstimator:
         topology = ppc.get("_topology_arrays")
         if topology is None:
             self._warn_required_runtime_missing("PPC topology arrays", "observability pseudo candidate build")
+        store_strings = not bool(getattr(self, "_array_only_runtime", False))
         candidate_rows = _PseudoMeasurementBuffer(
             int(np.asarray(ppc.get("bus", np.zeros((0, len(BUS_COLS)))), dtype=np.float64).shape[0])
             + 3 * int(np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64).shape[0])
@@ -3964,7 +4081,8 @@ class ACStateEstimator:
                     ppc.get("transformer", np.zeros((0, len(TRANSFORMER_COLS)))),
                     dtype=np.float64,
                 ).shape[0]
-            )
+            ),
+            store_strings=store_strings,
         )
 
         def add(
@@ -3979,7 +4097,7 @@ class ACStateEstimator:
             if int(device_pos) < 0:
                 return
             key = self._active_measurement_key(device_type_code, int(device_pos), meas_type_code)
-            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}" if store_strings else ""
             if (
                 int(meas_type_code) in _VOLTAGE_MEASUREMENT_TYPES
                 and self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code)
@@ -4008,11 +4126,16 @@ class ACStateEstimator:
         if node_rows.size > 1:
             node_rows = node_rows[np.argsort(bus[node_rows.astype(np.intp, copy=False), BUS_COLS["idx"]], kind="stable")]
         node_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACNODE, node_rows, bus.shape[0])
-        for row, pos, name in zip(node_rows, node_plan_pos, self._ppc_names_for_rows(ppc["bus_name"], node_rows)):
+        node_names = (
+            self._ppc_names_for_rows(ppc["bus_name"], node_rows)
+            if store_strings
+            else repeat("", int(node_rows.size))
+        )
+        for row, pos, name in zip(node_rows, node_plan_pos, node_names):
             add(
                 DEVICE_TYPE_CODES_ACNODE,
                 "ACNode",
-                str(name),
+                str(name) if store_strings else "",
                 int(pos),
                 MEAS_TYPE_CODES_V,
                 "V",
@@ -4050,14 +4173,19 @@ class ACStateEstimator:
                 + load_table[:, LOAD_COLS["qv2"]] * load_voltage * load_voltage
             )
             load_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACLOAD, load_rows, load.shape[0])
+            load_names = (
+                self._ppc_names_for_rows(ppc["load_name"], load_rows)
+                if store_strings
+                else repeat("", int(load_rows.size))
+            )
             for name, pos, p_value, q_value, voltage_value in zip(
-                self._ppc_names_for_rows(ppc["load_name"], load_rows),
+                load_names,
                 load_plan_pos,
                 p_values,
                 q_values,
                 load_voltage,
             ):
-                device_name = str(name)
+                device_name = str(name) if store_strings else ""
                 add(DEVICE_TYPE_CODES_ACLOAD, "ACLoad", device_name, int(pos), MEAS_TYPE_CODES_P_LOAD, "P_LOAD", float(p_value))
                 add(DEVICE_TYPE_CODES_ACLOAD, "ACLoad", device_name, int(pos), MEAS_TYPE_CODES_Q_LOAD, "Q_LOAD", float(q_value))
                 add(DEVICE_TYPE_CODES_ACLOAD, "ACLoad", device_name, int(pos), MEAS_TYPE_CODES_V_LOAD, "V_LOAD", float(voltage_value or 1.0))
@@ -4081,14 +4209,19 @@ class ACStateEstimator:
                 p_values[setpoint_mask] = gen_table[setpoint_mask, GEN_COLS["p_set"]]
                 q_values[setpoint_mask] = gen_table[setpoint_mask, GEN_COLS["q_set"]]
             gen_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_CODES_ACGENERATOR, gen_rows, gen.shape[0])
+            gen_names = (
+                self._ppc_names_for_rows(ppc["gen_name"], gen_rows)
+                if store_strings
+                else repeat("", int(gen_rows.size))
+            )
             for name, pos, p_value, q_value, voltage_value in zip(
-                self._ppc_names_for_rows(ppc["gen_name"], gen_rows),
+                gen_names,
                 gen_plan_pos,
                 p_values,
                 q_values,
                 gen_voltage,
             ):
-                device_name = str(name)
+                device_name = str(name) if store_strings else ""
                 add(DEVICE_TYPE_CODES_ACGENERATOR, "ACGenerator", device_name, int(pos), MEAS_TYPE_CODES_P_GEN, "P_GEN", float(p_value))
                 add(DEVICE_TYPE_CODES_ACGENERATOR, "ACGenerator", device_name, int(pos), MEAS_TYPE_CODES_Q_GEN, "Q_GEN", float(q_value))
                 add(DEVICE_TYPE_CODES_ACGENERATOR, "ACGenerator", device_name, int(pos), MEAS_TYPE_CODES_V_GEN, "V_GEN", float(voltage_value or 1.0))
@@ -4112,8 +4245,13 @@ class ACStateEstimator:
                 return
             table_rows = table[rows.astype(np.intp, copy=False)]
             plan_pos = self._plan_pos_for_ppc_rows(int(device_type_code), rows, table.shape[0])
-            for name, pos, values in zip(self._ppc_names_for_rows(ppc[name_key], rows), plan_pos, table_rows):
-                device_name = str(name)
+            names = (
+                self._ppc_names_for_rows(ppc[name_key], rows)
+                if store_strings
+                else repeat("", int(rows.size))
+            )
+            for name, pos, values in zip(names, plan_pos, table_rows):
+                device_name = str(name) if store_strings else ""
                 add(device_type_code, device_type, device_name, int(pos), MEAS_TYPE_CODES_P_FROM, "P_FROM", float(values[cols["i_p"]] or 0.0))
                 add(device_type_code, device_type, device_name, int(pos), MEAS_TYPE_CODES_Q_FROM, "Q_FROM", float(values[cols["i_q"]] or 0.0))
                 add(device_type_code, device_type, device_name, int(pos), MEAS_TYPE_CODES_P_TO, "P_TO", float(values[cols["j_p"]] or 0.0))

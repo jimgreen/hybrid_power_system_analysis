@@ -4397,26 +4397,33 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._ac_generator_plan_index = np.array([1, 0], dtype=np.int64)
         estimator._ac_load_plan_index = np.array([1, 0], dtype=np.int64)
         estimator._real_power_measurement_seed_cache = {
-            ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
-                0,
-                ac_se.MEAS_TYPE_CODES_P_GEN,
-            ): (2.0, 0.7),
-            ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
-                0,
-                ac_se.MEAS_TYPE_CODES_Q_GEN,
-            ): (2.0, 0.2),
-            ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACLOAD,
-                1,
-                ac_se.MEAS_TYPE_CODES_P_LOAD,
-            ): (2.0, 0.3),
-            ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACLOAD,
-                1,
-                ac_se.MEAS_TYPE_CODES_Q_LOAD,
-            ): (2.0, 0.1),
+            "measurement_key": np.asarray(
+                [
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
+                        0,
+                        ac_se.MEAS_TYPE_CODES_P_GEN,
+                    ),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
+                        0,
+                        ac_se.MEAS_TYPE_CODES_Q_GEN,
+                    ),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                        1,
+                        ac_se.MEAS_TYPE_CODES_P_LOAD,
+                    ),
+                    ACStateEstimator._active_measurement_key(
+                        ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                        1,
+                        ac_se.MEAS_TYPE_CODES_Q_LOAD,
+                    ),
+                ],
+                dtype=np.int64,
+            ),
+            "weight": np.asarray([2.0, 2.0, 2.0, 2.0], dtype=np.float64),
+            "value": np.asarray([0.7, 0.2, 0.3, 0.1], dtype=np.float64),
         }
 
         estimator._seed_power_state_arrays_from_measurements()

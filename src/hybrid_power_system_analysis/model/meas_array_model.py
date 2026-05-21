@@ -123,6 +123,7 @@ def _build_ppc(
     meas_type_code: Optional[np.ndarray] = None,
     device_name_id: Optional[np.ndarray] = None,
     device_names: Optional[np.ndarray] = None,
+    device_name_id_by_name: Optional[Dict[object, int]] = None,
     include_matrix: bool = True,
 ) -> Dict:
     count = int(idx.size)
@@ -170,6 +171,10 @@ def _build_ppc(
         device_type = np.asarray([], dtype=object)
         device_name = np.asarray([], dtype=object)
         meas_type = np.asarray([], dtype=object)
+    if device_name_id_by_name is None:
+        device_name_id_by_name = dict(
+            zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
+        )
     angle_mask = np.isin(meas_type_code, ANGLE_MEASUREMENT_TYPE_CODES)
     if include_matrix:
         meas = np.zeros((count, len(MEAS_COLS)), dtype=np.float64)
@@ -208,9 +213,7 @@ def _build_ppc(
         "device_type": device_type,
         "device_name": device_name,
         "device_names": device_names,
-        "device_name_id_by_name": dict(
-            zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
-        ),
+        "device_name_id_by_name": device_name_id_by_name,
         "meas_type": meas_type,
         "rows_by_device_type_code": rows_by_device_type_code,
         "normalized": False,
@@ -524,6 +527,7 @@ def _build_meas_ppc_from_measurement_file(source: Path, *, include_strings: bool
         meas_type_code=meas_type_code_array,
         device_name_id=np.asarray(device_name_id, dtype=np.int32),
         device_names=np.asarray(device_names_list, dtype=object),
+        device_name_id_by_name=device_name_lookup,
         include_matrix=include_matrix,
     )
 
