@@ -560,13 +560,16 @@ class HybridPowerFlowCalc:
         tol=None,
         max_iter=None,
         min_voltage=None,
-        verbose=True,
+        island=None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
+        keep_node_objects=True,
         linear_solver: str = "pyklu",
         result_mode: str = "full",
+        verbose=False,
     ):
         self.network = network
+        self.island = island
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -580,6 +583,7 @@ class HybridPowerFlowCalc:
         self.linear_solver = str(linear_solver or "pyklu").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.result_mode = self._normalize_result_mode(result_mode)
+        self.keep_node_objects = bool(keep_node_objects) and self.result_mode == "full"
         self.has_ac = len(network.ac.nodes) > 0
         self.has_dc = len(network.dc.nodes) > 0
         self.ac_calc = self._build_ac_subcalc()
@@ -647,6 +651,7 @@ class HybridPowerFlowCalc:
         return ACPowerFlowCalc(
             source,
             parameters=self.params,
+            keep_node_objects=self.keep_node_objects,
             linear_solver=self.linear_solver,
             result_mode=self.result_mode,
             verbose=self.verbose,
@@ -659,6 +664,7 @@ class HybridPowerFlowCalc:
         calc = DCPowerFlowCalc(
             source,
             parameters=self.params,
+            keep_node_objects=self.keep_node_objects,
             linear_solver=self.linear_solver,
             result_mode=self.result_mode,
             verbose=self.verbose,
@@ -666,8 +672,6 @@ class HybridPowerFlowCalc:
         if hasattr(self.network, "_dc_ppc"):
             dc_writeback_network = None if getattr(self.network.dc, "_lf_lightweight", False) else self.network.dc
             calc._network_writeback = dc_writeback_network
-            calc.model = dc_writeback_network
-            calc.net = dc_writeback_network
         return calc
 
     def _sync_sub_result_modes(self) -> None:
@@ -676,10 +680,14 @@ class HybridPowerFlowCalc:
             self.ac_calc.result_mode = sub_result_mode
             if sub_result_mode != "full":
                 self.ac_calc.keep_node_objects = False
+            else:
+                self.ac_calc.keep_node_objects = self.keep_node_objects
         if self.dc_calc is not None:
             self.dc_calc.result_mode = sub_result_mode
             if sub_result_mode != "full":
                 self.dc_calc.keep_node_objects = False
+            else:
+                self.dc_calc.keep_node_objects = self.keep_node_objects
 
     def prepare(self):
         """Build the global hybrid state vector and block equation layout."""
@@ -1672,15 +1680,25 @@ class HybridPowerFlowCalc:
         self.last_jacobian_shape = jac.shape
         return jac
 
-    def _build_newton_system(self, x):
+    def _build_newton_system(self, x: np.ndarray, *, return_jacobian=True, jacobian_format="csc"):
         """Build residual and Jacobian together, reusing AC/DC sub-solver caches."""
         if self._single_ac_newton_block:
-            F, J = self.ac_calc._build_newton_system(x)
-            self.last_jacobian_shape = J.shape
+            F, J = self.ac_calc._build_newton_system(
+                x,
+                return_jacobian=return_jacobian,
+                jacobian_format=jacobian_format,
+            )
+            if J is not None:
+                self.last_jacobian_shape = J.shape
             return F, J
         if self._single_dc_newton_block:
-            F, J = self.dc_calc._build_newton_system(x)
-            self.last_jacobian_shape = J.shape
+            F, J = self.dc_calc._build_newton_system(
+                x,
+                return_jacobian=return_jacobian,
+                jacobian_format=jacobian_format,
+            )
+            if J is not None:
+                self.last_jacobian_shape = J.shape
             return F, J
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         ac_f = ac_j = None
@@ -1691,7 +1709,7 @@ class HybridPowerFlowCalc:
                 return_jacobian=False,
                 jacobian_format="csc",
             )
-            if ac_j is None and self._slice_len(self.global_jac_ac_slice):
+            if return_jacobian and ac_j is None and self._slice_len(self.global_jac_ac_slice):
                 ac_j = self.ac_calc.get_jacobi(ac_x)
         if self.dc_calc is not None:
             dc_f, dc_j = self.dc_calc._build_newton_system(
@@ -1699,7 +1717,7 @@ class HybridPowerFlowCalc:
                 return_jacobian=False,
                 jacobian_format="csc",
             )
-            if dc_j is None and self._slice_len(self.global_jac_dc_slice):
+            if return_jacobian and dc_j is None and self._slice_len(self.global_jac_dc_slice):
                 dc_j = self.dc_calc.get_jacobi(dc_x)
 
         ac_V = dc_V = None
@@ -1707,6 +1725,8 @@ class HybridPowerFlowCalc:
             _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
 
         F = self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
+        if not return_jacobian:
+            return F, None
         J = self._assemble_jacobian(
             ac_x,
             dc_x,
@@ -1716,7 +1736,7 @@ class HybridPowerFlowCalc:
             dc_j,
             ac_V,
             dc_V,
-            matrix_format="csc",
+            matrix_format=jacobian_format,
         )
         return F, J
 
@@ -1869,7 +1889,8 @@ class HybridPowerFlowCalc:
             self._set_array_result(ac_result, dc_result)
             self.lf_result = None
         elif self.result_mode == "summary":
-            self.lf_result = {"ac": ac_result, "dc": dc_result, "hybrid": self._hybrid_summary()}
+            self.result = {"ac": ac_result, "dc": dc_result, "hybrid": self._hybrid_summary()}
+            self.lf_result = None
         else:
             self.result = {}
             self.lf_result = None
@@ -1886,7 +1907,7 @@ class HybridPowerFlowCalc:
         self._sync_single_subsolver_result(kind)
         return rc
 
-    def run(self, result_mode=None):
+    def run(self, result_mode=None) -> int:
         """Execute unified Newton iterations over the full hybrid state vector."""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
@@ -1902,6 +1923,7 @@ class HybridPowerFlowCalc:
             return self._run_single_subsolver(kind, subcalc, eq_count, var_count)
 
         self.converged = False
+        self.iterations = 0
         x = self.x.copy()
         resolved_name = self._linear_solver_resolved
         solver_fn = self._linear_solver_fn
@@ -1933,12 +1955,12 @@ class HybridPowerFlowCalc:
             if self.normF < self.tol:
                 self.converged = True
                 self.x = x
-                self._finish_result(x)
+                self._finish_result()
                 return 0
 
             try:
                 factor = _factor_jacobian(J, resolved_name, solver_fn)
-                delta = factor.solve(-F)
+                delta = factor.solve(F)
             except Exception:
                 _AC_OPTIONAL_SPARSE_SOLVERS.pop(resolved_name, None)
                 _AC_OPTIONAL_SPARSE_MISSING.add(resolved_name)
@@ -1946,24 +1968,26 @@ class HybridPowerFlowCalc:
                 solver_fn = _scipy_spsolve
                 self._linear_solver_resolved = "scipy"
                 self._linear_solver_fn = _scipy_spsolve
-                delta = _scipy_spsolve(J, -F)
-            x += delta
+                delta = _scipy_spsolve(J, F)
+            # 与 AC/DC 潮流一致：方程定义为 F(x)=0，使用 x_new = x - J^{-1}F。
+            x -= delta
 
         self.x = x
-        self._finish_result(x)
+        self._finish_result()
         return -1
 
-    def _finish_result(self, x):
+    def _finish_result(self):
         if self.result_mode == "full":
-            self._write_back(x)
+            self._write_back()
         elif self.result_mode == "array":
-            self._write_array_result(x)
+            self._write_array_result()
         elif self.result_mode == "summary":
-            self._write_summary_result(x)
+            self._write_summary_result()
         else:
-            self._write_none_result(x)
+            self._write_none_result()
 
-    def _write_none_result(self, x):
+    def _write_none_result(self):
+        x = self.x
         ac_x, dc_x, _dcac_x, _acac_x = self._split_x(x)
         if self.ac_calc is not None:
             self.ac_calc.x = ac_x
@@ -1977,7 +2001,8 @@ class HybridPowerFlowCalc:
             self.dc_calc.lf_result = None
         self.lf_result = None
 
-    def _write_summary_result(self, x):
+    def _write_summary_result(self):
+        x = self.x
         ac_x, dc_x, _dcac_x, _acac_x = self._split_x(x)
         ac_result = None
         dc_result = None
@@ -1993,14 +2018,16 @@ class HybridPowerFlowCalc:
             self.dc_calc.iterations = self.iterations
             self.dc_calc._write_summary_result()
             dc_result = self.dc_calc.result
-        self.lf_result = {
+        self.result = {
             "ac": ac_result,
             "dc": dc_result,
             "hybrid": self._hybrid_summary(),
         }
+        self.lf_result = None
 
-    def _write_array_result(self, x):
+    def _write_array_result(self):
         """Keep sub-solver array results without copying them to object facades."""
+        x = self.x
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         ac_result = None
         dc_result = None
@@ -2167,8 +2194,9 @@ class HybridPowerFlowCalc:
                 breaker.current = float(row[SWITCH_COLS["current"]])
                 breaker.is_alive = int(row[SWITCH_COLS["run_stat"]]) == 1 and int(row[SWITCH_COLS["status"]]) == 1
 
-    def _write_back(self, x):
+    def _write_back(self):
         """Write final global state back into AC, DC and converter model objects."""
+        x = self.x
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
         skip_lf_result = getattr(self, "skip_lf_result", False)
         if self.ac_calc is not None:
@@ -2375,7 +2403,11 @@ class HybridPowerFlowCalc:
         return result
 
 
-def print_hybrid_result(result: HybridLFResult):
+def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int):
+    result = calc.lf_result
+    if result is None:
+        print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, 返回码: {rc}, iter={calc.iterations}, normF={calc.normF:.3e}")
+        return
     print("\n=== 交直流联合潮流计算结果 ===")
     print(f"节点总数: {result.total_nodes} (AC={len(result.ac_network.nodes)}, DC={len(result.dc_network.nodes)})")
 
@@ -2428,7 +2460,10 @@ def print_hybrid_result(result: HybridLFResult):
         print(f"   DC: {'已收敛' if result.dc_calc.converged else '未收敛'}, iter={result.dc_calc.iterations}, normF={result.dc_calc.normF:.3e}")
     else:
         print("   DC: 文件中无 DC 子网")
-    print(f"   Hybrid: {'已收敛' if result.converged else '未收敛'}")
+    print(
+        f"   Hybrid: {'已收敛' if result.converged else '未收敛'}, "
+        f"返回码: {rc}, iter={calc.iterations}, normF={calc.normF:.3e}"
+    )
 
     ac_gen = sum(gen.p for gen in result.ac_network.generators)
     ac_load = sum(load.p for load in result.ac_network.loads)
@@ -2464,7 +2499,7 @@ def main(argv=None) -> int:
     )
     rc = calc.run()
     if not args.quiet and calc.result_mode == "full":
-        print_hybrid_result(calc.lf_result)
+        print_hybrid_result(calc, rc)
     elif not args.quiet:
         print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
     return 0 if rc == 0 else 1

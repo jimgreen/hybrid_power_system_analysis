@@ -376,12 +376,47 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
                 self.assertNotIn(token, source, rel_path)
 
     def test_hybrid_lf_run_matches_ac_dc_control_flow(self):
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
         import lfcore.hybrid_lf as hybrid_lf
+        from lfcore.ac_lf import ACPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
 
         self.assertFalse(hasattr(hybrid_lf, "run_hybrid_power_flow"))
         self.assertFalse(hasattr(hybrid_lf, "_hybrid_result_from_calc"))
         self.assertIn("return self._run_newton_raphson()", inspect.getsource(hybrid_lf.HybridPowerFlowCalc.run))
         self.assertTrue(hasattr(hybrid_lf.HybridPowerFlowCalc, "_run_newton_raphson"))
+
+        ac_init = [name for name in inspect.signature(ACPowerFlowCalc.__init__).parameters if name != "self"]
+        hybrid_init = [name for name in inspect.signature(HybridPowerFlowCalc.__init__).parameters if name != "self"]
+        self.assertEqual(ac_init, hybrid_init)
+        self.assertEqual(inspect.signature(ACPowerFlowCalc._build_newton_system), inspect.signature(HybridPowerFlowCalc._build_newton_system))
+        self.assertEqual(inspect.signature(ACPowerFlowCalc._write_summary_result), inspect.signature(HybridPowerFlowCalc._write_summary_result))
+        self.assertEqual(inspect.signature(ACPowerFlowCalc._write_back), inspect.signature(HybridPowerFlowCalc._write_back))
+        self.assertEqual(
+            list(inspect.signature(ac_lf.print_ac_result).parameters),
+            list(inspect.signature(hybrid_lf.print_hybrid_result).parameters),
+        )
+
+        hybrid_source = inspect.getsource(HybridPowerFlowCalc._run_newton_raphson)
+        self.assertIn("delta = factor.solve(F)", hybrid_source)
+        self.assertIn("x -= delta", hybrid_source)
+        self.assertNotIn("factor.solve(-F)", hybrid_source)
+        self.assertNotIn("x += delta", hybrid_source)
+        self.assertNotIn("self._finish_result(x)", hybrid_source)
+
+        self.assertIn("self.result =", inspect.getsource(HybridPowerFlowCalc._write_summary_result))
+        self.assertIn("self.lf_result = None", inspect.getsource(HybridPowerFlowCalc._write_summary_result))
+        self.assertNotIn(
+            'self.lf_result = {"ac":',
+            inspect.getsource(HybridPowerFlowCalc._sync_single_subsolver_result),
+        )
+        hybrid_main_source = inspect.getsource(hybrid_lf.main)
+        self.assertIn("print_hybrid_result(calc, rc)", hybrid_main_source)
+        self.assertNotIn("print_hybrid_result(calc.lf_result)", hybrid_main_source)
+        self.assertNotIn("calc.model", inspect.getsource(HybridPowerFlowCalc._build_dc_subcalc))
+        self.assertNotIn("calc.net", inspect.getsource(HybridPowerFlowCalc._build_dc_subcalc))
 
         source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "hybrid_lf.py").read_text(
             encoding="utf-8"
