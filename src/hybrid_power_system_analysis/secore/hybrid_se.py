@@ -44,6 +44,7 @@ from model.meas_model import (
     is_pseudo_measurement,
     mark_measurement_invalid,
     mark_measurement_pseudo,
+    measurement_from_table_row,
     measurement_table_from_measurements,
     measurement_table_status_code,
     print_iteration as _print_iteration,
@@ -4546,6 +4547,7 @@ class HybridStateEstimator:
                 measurements if isinstance(measurements, MeasurementList) else list(measurements)
             ),
             observability=observability,
+            measurement_table=getattr(measurements, "table", None),
         )
 
     def identify_bad_data(
@@ -4557,8 +4559,18 @@ class HybridStateEstimator:
         if delegate is not None:
             return delegate.identify_bad_data(result, threshold)
         threshold = self.params.bad_threshold if threshold is None else threshold
-        _z, weights = self._measurement_vectors(result.measurements)
-        H = result.H if result.H is not None else self.jacobian_sparse(result.x, result.measurements)
+        measurement_table = getattr(result, "measurement_table", None)
+        table_weight = getattr(measurement_table, "weight", None)
+        if table_weight is not None and np.asarray(table_weight).size == result.residual.size:
+            weights = np.asarray(table_weight, dtype=np.float64)
+        else:
+            _z, weights = self._measurement_vectors(result.measurements)
+        jacobian_measurements = (
+            result.measurements
+            if len(result.measurements) == result.residual.size
+            else getattr(self, "active_measurements", result.measurements)
+        )
+        H = result.H if result.H is not None else self.jacobian_sparse(result.x, jacobian_measurements)
         gain = result.gain
         if gain is None:
             gain, _rhs = build_normal_equations(H, result.residual, weights)
@@ -4571,14 +4583,25 @@ class HybridStateEstimator:
         normalized = np.abs(result.residual) / np.sqrt(omega_diag)
         bad_items: List[BadDataItem] = []
         for idx in np.where(normalized > threshold)[0]:
-            meas = result.measurements[int(idx)]
+            row_pos = int(idx)
+            meas = (
+                measurement_from_table_row(measurement_table, row_pos)
+                if measurement_table is not None
+                else result.measurements[row_pos]
+            )
+            measured_value = (
+                float(measurement_table.value[row_pos])
+                if measurement_table is not None
+                else float(meas.value)
+            )
             bad_items.append(
                 BadDataItem(
                     measurement=meas,
                     residual=float(result.residual[idx]),
                     normalized_residual=float(normalized[idx]),
                     estimated_value=float(result.z_est[idx]),
-                    measured_value=float(meas.value),
+                    measured_value=measured_value,
+                    row_pos=row_pos,
                 )
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
@@ -4636,7 +4659,7 @@ class HybridStateEstimator:
         array_only = mode == "array"
         if array_only and remove_bad_data:
             raise ValueError("result_mode='array' cannot be combined with remove_bad_data=True")
-        needs_bad_data = (not skip_bad_data) and not array_only
+        needs_bad_data = not skip_bad_data
         if observability is None:
             observability = self.observability_analysis()
         self.observability_result = observability
@@ -4660,7 +4683,7 @@ class HybridStateEstimator:
             self._array_only_estimate_result = previous_array_only
         self.estimate_result = result
         self.removed_bad_data = removed
-        if skip_bad_data or array_only:
+        if skip_bad_data:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:

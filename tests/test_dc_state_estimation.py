@@ -1889,8 +1889,12 @@ class DCStateEstimationTest(unittest.TestCase):
         def reject_seresult_path(*_args, **_kwargs):
             raise AssertionError("array result_mode should not build SEResult payloads")
 
-        def reject_bad_data(*_args, **_kwargs):
-            raise AssertionError("array result_mode should not run post-estimation bad-data analysis")
+        bad_data_calls = 0
+
+        def counted_bad_data(self, result, threshold=None):
+            nonlocal bad_data_calls
+            bad_data_calls += 1
+            return original_identify(self, result, threshold)
 
         def reject_apply_state(*_args, **_kwargs):
             raise AssertionError("array result_mode should not write estimated state back to model objects")
@@ -1900,7 +1904,7 @@ class DCStateEstimationTest(unittest.TestCase):
 
         DCStateEstimator.build_se_result = reject_seresult_path
         dc_se_module.build_seresult_summary = reject_seresult_path
-        DCStateEstimator.identify_bad_data = reject_bad_data
+        DCStateEstimator.identify_bad_data = counted_bad_data
         DCStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
         try:
@@ -1919,11 +1923,12 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
-        self.assertIsNone(result.H)
-        self.assertIsNone(result.gain)
+        self.assertIsNotNone(result.H)
+        self.assertIsNotNone(result.gain)
         self.assertEqual(0, len(result.measurements))
+        self.assertEqual(1, bad_data_calls)
         self.assertEqual([], estimator.bad_items)
-        self.assertEqual(0, estimator.normalized_residual.size)
+        self.assertEqual(result.residual.size, estimator.normalized_residual.size)
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator

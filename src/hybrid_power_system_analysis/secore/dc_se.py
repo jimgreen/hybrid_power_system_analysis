@@ -73,6 +73,7 @@ from model.meas_model import (
     is_pseudo_measurement,
     mark_measurement_invalid,
     mark_measurement_pseudo,
+    measurement_from_table_row,
     measurement_status_is_active,
     measurement_table_from_measurements,
     measurement_table_status_code,
@@ -4423,19 +4424,30 @@ class DCStateEstimator:
             gain=gain,
             measurements=[] if array_only_result else measurements,
             observability=observability,
+            measurement_table=getattr(measurements, "table", None),
         )
 
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
         """Compute largest normalized residuals after accounting for measurement leverage."""
+        measurement_table = getattr(result, "measurement_table", None)
+        table_weight = getattr(measurement_table, "weight", None)
+        if table_weight is not None and np.asarray(table_weight).size == result.residual.size:
+            weights = np.asarray(table_weight, dtype=np.float64)
+        else:
+            weights = np.asarray([meas.weight for meas in result.measurements], dtype=np.float64)
+        jacobian_measurements = (
+            result.measurements
+            if len(result.measurements) == result.residual.size
+            else getattr(self, "active_measurements", result.measurements)
+        )
         if result.H is None or result.gain is None:
-            result.H = self.jacobian_sparse(result.x, result.measurements)
+            result.H = self.jacobian_sparse(result.x, jacobian_measurements)
             result.gain, _ = build_normal_equations(
                 result.H,
                 result.residual,
-                np.asarray([meas.weight for meas in result.measurements], dtype=np.float64),
+                weights,
             )
         threshold = self.params.bad_threshold if threshold is None else threshold
-        weights = np.asarray([meas.weight for meas in result.measurements], dtype=np.float64)
         R_diag = 1.0 / weights
         gain_inv = inverse_gain_for_bad_data(result.gain)
         if gain_inv is None:
@@ -4447,14 +4459,25 @@ class DCStateEstimator:
 
         bad_items = []
         for idx in np.where(normalized > threshold)[0]:
-            meas = result.measurements[int(idx)]
+            row_pos = int(idx)
+            meas = (
+                measurement_from_table_row(measurement_table, row_pos)
+                if measurement_table is not None
+                else result.measurements[row_pos]
+            )
+            measured_value = (
+                float(measurement_table.value[row_pos])
+                if measurement_table is not None
+                else float(meas.value)
+            )
             bad_items.append(
                 BadDataItem(
                     measurement=meas,
                     residual=float(result.residual[idx]),
                     normalized_residual=float(normalized[idx]),
                     estimated_value=float(result.z_est[idx]),
-                    measured_value=float(meas.value),
+                    measured_value=measured_value,
+                    row_pos=row_pos,
                 )
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
@@ -4511,7 +4534,7 @@ class DCStateEstimator:
         array_only = mode == "array"
         if array_only and remove_bad_data:
             raise ValueError("result_mode='array' cannot be combined with remove_bad_data=True")
-        needs_bad_data = (not skip_bad_data) and not array_only
+        needs_bad_data = not skip_bad_data
         if observability is None:
             observability = self.observability_analysis()
         self.observability_result = observability
@@ -4535,7 +4558,7 @@ class DCStateEstimator:
             self._array_only_estimate_result = previous_array_only
         self.estimate_result = result
         self.removed_bad_data = removed
-        if skip_bad_data or array_only:
+        if skip_bad_data:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:

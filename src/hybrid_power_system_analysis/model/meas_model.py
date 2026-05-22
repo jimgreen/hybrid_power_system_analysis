@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from model.meas_type import DEVICE_TYPE_CODES
+from model.meas_type import DEVICE_TYPE_CODES, DEVICE_TYPE_NAMES, MEAS_TYPE_NAMES
 
 MEAS_STATUS_NORMAL = 0
 MEAS_STATUS_INVALID = 1
@@ -163,12 +163,35 @@ class MeasurementTableView:
 def measurement_from_table_row(table: MeasurementTable, row: int) -> Measurement:
     pos = int(row)
     status_code = measurement_table_status_code(table)
+    name = str(table.name[pos]) if int(table.name.size) > pos else f"m{int(table.idx[pos])}"
+    if int(table.device_type.size) > pos:
+        device_type = str(table.device_type[pos])
+    else:
+        device_type = DEVICE_TYPE_NAMES.get(int(table.device_type_code[pos]), "")
+    if int(table.device_name.size) > pos:
+        device_name = str(table.device_name[pos])
+    else:
+        device_pos = getattr(table, "device_pos", None)
+        device_name = (
+            f"pos:{int(device_pos[pos])}"
+            if device_pos is not None and int(np.asarray(device_pos).size) > pos and int(device_pos[pos]) >= 0
+            else ""
+        )
+    if int(table.meas_type.size) > pos:
+        meas_type = str(table.meas_type[pos])
+    else:
+        meas_type_code = getattr(table, "meas_type_code", None)
+        meas_type = (
+            MEAS_TYPE_NAMES.get(int(meas_type_code[pos]), "")
+            if meas_type_code is not None and int(np.asarray(meas_type_code).size) > pos
+            else ""
+        )
     measurement = Measurement.__new__(Measurement)
     measurement.idx = int(table.idx[pos])
-    measurement.name = str(table.name[pos])
-    measurement.device_type = str(table.device_type[pos])
-    measurement.device_name = str(table.device_name[pos])
-    measurement.meas_type = str(table.meas_type[pos])
+    measurement.name = name
+    measurement.device_type = device_type
+    measurement.device_name = device_name
+    measurement.meas_type = meas_type
     measurement.weight = float(table.weight[pos])
     measurement.valid = bool(table.valid[pos])
     measurement.value = float(table.value[pos])

@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from model import meas_type as mt
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
@@ -45,25 +47,25 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._ac_measurement_plan_device_pos_by_type_code = name_maps
         estimator._ac_measurement_plan_device_pos_by_type_code_id = id_maps
         estimator._ac_branch_transformer_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACBRANCH: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
-            ac_se.DEVICE_TYPE_CODES_ACTRANSFORMER: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACBranch: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACTransformer: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_zero_current_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACZEROBRANCH: ac_se._AC_ZERO_MEAS_TYPE_LOOKUP,
-            ac_se.DEVICE_TYPE_CODES_ACBREAK: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACZeroBranch: ac_se._AC_ZERO_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACBreak: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_simple_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACNODE: ac_se._AC_NODE_MEAS_TYPE_LOOKUP,
-            ac_se.DEVICE_TYPE_CODES_ACGENERATOR: ac_se._AC_GENERATOR_SIMPLE_MEAS_TYPE_LOOKUP,
-            ac_se.DEVICE_TYPE_CODES_ACLOAD: ac_se._AC_LOAD_MEAS_TYPE_LOOKUP,
-            ac_se.DEVICE_TYPE_CODES_ACZEROBRANCHCONSTRAINT: ac_se._AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
-            ac_se.DEVICE_TYPE_CODES_ACBREAKCONSTRAINT: ac_se._AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACNode: ac_se._AC_NODE_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACGenerator: ac_se._AC_GENERATOR_SIMPLE_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACLoad: ac_se._AC_LOAD_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACZeroBranchConstraint: ac_se._AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACBreakConstraint: ac_se._AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_generator_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACGENERATOR: ac_se._AC_GENERATOR_POWER_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACGenerator: ac_se._AC_GENERATOR_POWER_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_balance_plan_kind_by_type_code = {
-            ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE: ac_se._AC_BALANCE_MEAS_TYPE_LOOKUP,
+            mt.DEVICE_TYPE_ACPowerBalance: ac_se._AC_BALANCE_MEAS_TYPE_LOOKUP,
         }
         estimator._ac_measurement_plan_kind_codes = {
             "branch_transformer": estimator._measurement_kind_code_maps_for(estimator._ac_branch_transformer_plan_kind_by_type_code),
@@ -122,17 +124,17 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertFalse(hasattr(ACStateEstimator, "_active_device_key"))
         node0_key = (
             ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                mt.DEVICE_TYPE_ACNode,
                 0,
-                ac_se.MEAS_TYPE_CODES_V,
+                mt.MEAS_TYPE_V,
             )
             >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
         )
         node1_key = (
             ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                mt.DEVICE_TYPE_ACNode,
                 1,
-                ac_se.MEAS_TYPE_CODES_V,
+                mt.MEAS_TYPE_V,
             )
             >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
         )
@@ -271,9 +273,9 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual({1: 1.02}, estimator._real_voltage_observation_node_cache)
         self.assertIn(
             ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                mt.DEVICE_TYPE_ACLoad,
                 0,
-                ac_se.MEAS_TYPE_CODES_P_LOAD,
+                mt.MEAS_TYPE_P_LOAD,
             ),
             estimator._active_measurement_code_pos_cache,
         )
@@ -1041,8 +1043,8 @@ class ACStateEstimationTest(unittest.TestCase):
             ac_se._meas_type_code_array = original_meas_type_array
 
         table = candidates.table
-        self.assertTrue(np.any(table.device_type_code == ac_se.DEVICE_TYPE_CODES_ACLOAD))
-        self.assertTrue(np.any(table.meas_type_code == ac_se.MEAS_TYPE_CODES_P_LOAD))
+        self.assertTrue(np.any(table.device_type_code == mt.DEVICE_TYPE_ACLoad))
+        self.assertTrue(np.any(table.meas_type_code == mt.MEAS_TYPE_P_LOAD))
 
     def test_observability_pseudo_candidates_read_cached_keys_without_copy(self):
         import secore.ac_se as ac_se
@@ -1093,8 +1095,8 @@ class ACStateEstimationTest(unittest.TestCase):
             ac_se._meas_type_code_array = original_meas_type_array
 
         table = estimator.measurements.table
-        self.assertTrue(np.any(table.device_type_code == ac_se.DEVICE_TYPE_CODES_ACGENERATOR))
-        self.assertTrue(np.any(table.meas_type_code == ac_se.MEAS_TYPE_CODES_P_GEN))
+        self.assertTrue(np.any(table.device_type_code == mt.DEVICE_TYPE_ACGenerator))
+        self.assertTrue(np.any(table.meas_type_code == mt.MEAS_TYPE_P_GEN))
 
     def test_regular_pseudo_measurements_append_table_rows_without_measurement_objects(self):
         import secore.ac_se as ac_se
@@ -1218,24 +1220,24 @@ class ACStateEstimationTest(unittest.TestCase):
 
         device_type_code = np.asarray(
             [
-                ac_se.DEVICE_TYPE_CODES_ACNODE,
-                ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
-                ac_se.DEVICE_TYPE_CODES_ACLOAD,
-                ac_se.DEVICE_TYPE_CODES_ACBRANCH,
-                ac_se.DEVICE_TYPE_CODES_ACBRANCH,
-                ac_se.DEVICE_TYPE_CODES_ACTRANSFORMER,
+                mt.DEVICE_TYPE_ACNode,
+                mt.DEVICE_TYPE_ACGenerator,
+                mt.DEVICE_TYPE_ACLoad,
+                mt.DEVICE_TYPE_ACBranch,
+                mt.DEVICE_TYPE_ACBranch,
+                mt.DEVICE_TYPE_ACTransformer,
             ],
             dtype=np.int16,
         )
         device_pos = np.asarray([0, 0, 0, 0, 0, 0], dtype=np.int64)
         meas_type_code = np.asarray(
             [
-                ac_se.MEAS_TYPE_CODES_V,
-                ac_se.MEAS_TYPE_CODES_V_GEN,
-                ac_se.MEAS_TYPE_CODES_V_LOAD,
-                ac_se.MEAS_TYPE_CODES_V_FROM,
-                ac_se.MEAS_TYPE_CODES_V_TO,
-                ac_se.MEAS_TYPE_CODES_V_TO,
+                mt.MEAS_TYPE_V,
+                mt.MEAS_TYPE_V_GEN,
+                mt.MEAS_TYPE_V_LOAD,
+                mt.MEAS_TYPE_V_FROM,
+                mt.MEAS_TYPE_V_TO,
+                mt.MEAS_TYPE_V_TO,
             ],
             dtype=np.int16,
         )
@@ -1995,8 +1997,8 @@ class ACStateEstimationTest(unittest.TestCase):
             estimator,
             ac_se,
             {
-                ac_se.DEVICE_TYPE_CODES_ACNODE: ("n1",),
-                ac_se.DEVICE_TYPE_CODES_ACLOAD: ("l1",),
+                mt.DEVICE_TYPE_ACNode: ("n1",),
+                mt.DEVICE_TYPE_ACLoad: ("l1",),
             },
         )
 
@@ -2062,7 +2064,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self._install_minimal_ac_plan_indexes(
             estimator,
             ac_se,
-            {ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE: ("n1",)},
+            {mt.DEVICE_TYPE_ACPowerBalance: ("n1",)},
         )
 
         plan = estimator._build_balance_measurement_plan(measurements)
@@ -2095,7 +2097,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self._install_minimal_ac_plan_indexes(
             estimator,
             ac_se,
-            {ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE: ("n1",)},
+            {mt.DEVICE_TYPE_ACPowerBalance: ("n1",)},
         )
 
         original_full = ac_se.np.full
@@ -2498,16 +2500,16 @@ class ACStateEstimationTest(unittest.TestCase):
             ac_se.np.setdiff1d = original_setdiff
 
         table = estimator.measurements.table
-        balance_rows = np.flatnonzero(table.device_type_code == ac_se.DEVICE_TYPE_CODES_ACPOWERBALANCE)
+        balance_rows = np.flatnonzero(table.device_type_code == mt.DEVICE_TYPE_ACPowerBalance)
         expected_pos = np.repeat(np.arange(estimator.n_nodes, dtype=np.int64), 2)
         np.testing.assert_array_equal(table.device_pos[balance_rows], expected_pos)
         np.testing.assert_array_equal(
             table.meas_type_code[balance_rows][0::2],
-            np.full(estimator.n_nodes, ac_se.MEAS_TYPE_CODES_P_BALANCE, dtype=np.int16),
+            np.full(estimator.n_nodes, mt.MEAS_TYPE_P_BALANCE, dtype=np.int16),
         )
         np.testing.assert_array_equal(
             table.meas_type_code[balance_rows][1::2],
-            np.full(estimator.n_nodes, ac_se.MEAS_TYPE_CODES_Q_BALANCE, dtype=np.int16),
+            np.full(estimator.n_nodes, mt.MEAS_TYPE_Q_BALANCE, dtype=np.int16),
         )
 
     def test_pseudo_append_with_device_positions_skips_full_device_index_rebuild(self):
@@ -2539,16 +2541,16 @@ class ACStateEstimationTest(unittest.TestCase):
             ["P_LOAD"],
             [0.0],
             record_summary=False,
-            device_type_codes=[ac_se.DEVICE_TYPE_CODES_ACLOAD],
-            meas_type_codes=[ac_se.MEAS_TYPE_CODES_P_LOAD],
+            device_type_codes=[mt.DEVICE_TYPE_ACLoad],
+            meas_type_codes=[mt.MEAS_TYPE_P_LOAD],
             device_positions=[0],
         )
 
         table = estimator.measurements.table
         self.assertEqual(before_count + 1, len(estimator.measurements))
         self.assertEqual(0, int(table.device_pos[-1]))
-        self.assertEqual(ac_se.DEVICE_TYPE_CODES_ACLOAD, int(table.device_type_code[-1]))
-        self.assertEqual(ac_se.MEAS_TYPE_CODES_P_LOAD, int(table.meas_type_code[-1]))
+        self.assertEqual(mt.DEVICE_TYPE_ACLoad, int(table.device_type_code[-1]))
+        self.assertEqual(mt.MEAS_TYPE_P_LOAD, int(table.meas_type_code[-1]))
 
     def test_pseudo_append_warns_and_skips_name_lookup_without_device_positions(self):
         import warnings
@@ -2582,8 +2584,8 @@ class ACStateEstimationTest(unittest.TestCase):
                 ["P_LOAD"],
                 [0.0],
                 record_summary=False,
-                device_type_codes=[ac_se.DEVICE_TYPE_CODES_ACLOAD],
-                meas_type_codes=[ac_se.MEAS_TYPE_CODES_P_LOAD],
+                device_type_codes=[mt.DEVICE_TYPE_ACLoad],
+                meas_type_codes=[mt.MEAS_TYPE_P_LOAD],
             )
 
         table = estimator.measurements.table
@@ -2995,15 +2997,15 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._power_flow_seed_rows = {
             "measurement_key": np.asarray(
                 [
-                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 0, ac_se.MEAS_TYPE_CODES_V),
+                    ACStateEstimator._active_measurement_key(mt.DEVICE_TYPE_ACNode, 0, mt.MEAS_TYPE_V),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN
+                        mt.DEVICE_TYPE_ACGenerator, 0, mt.MEAS_TYPE_P_GEN
                     ),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN
+                        mt.DEVICE_TYPE_ACGenerator, 0, mt.MEAS_TYPE_Q_GEN
                     ),
-                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD),
-                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_Q_LOAD),
+                    ACStateEstimator._active_measurement_key(mt.DEVICE_TYPE_ACLoad, 0, mt.MEAS_TYPE_P_LOAD),
+                    ACStateEstimator._active_measurement_key(mt.DEVICE_TYPE_ACLoad, 0, mt.MEAS_TYPE_Q_LOAD),
                 ],
                 dtype=np.int64,
             ),
@@ -3057,15 +3059,15 @@ class ACStateEstimationTest(unittest.TestCase):
         rows = {
             "measurement_key": np.asarray(
                 [
-                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACNODE, 0, ac_se.MEAS_TYPE_CODES_V),
+                    ACStateEstimator._active_measurement_key(mt.DEVICE_TYPE_ACNode, 0, mt.MEAS_TYPE_V),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_P_GEN
+                        mt.DEVICE_TYPE_ACGenerator, 0, mt.MEAS_TYPE_P_GEN
                     ),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR, 0, ac_se.MEAS_TYPE_CODES_Q_GEN
+                        mt.DEVICE_TYPE_ACGenerator, 0, mt.MEAS_TYPE_Q_GEN
                     ),
-                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_P_LOAD),
-                    ACStateEstimator._active_measurement_key(ac_se.DEVICE_TYPE_CODES_ACLOAD, 0, ac_se.MEAS_TYPE_CODES_Q_LOAD),
+                    ACStateEstimator._active_measurement_key(mt.DEVICE_TYPE_ACLoad, 0, mt.MEAS_TYPE_P_LOAD),
+                    ACStateEstimator._active_measurement_key(mt.DEVICE_TYPE_ACLoad, 0, mt.MEAS_TYPE_Q_LOAD),
                 ],
                 dtype=np.int64,
             ),
@@ -3085,6 +3087,7 @@ class ACStateEstimationTest(unittest.TestCase):
         from types import SimpleNamespace
 
         import numpy as np
+
         import secore.ac_se as ac_se
         from ac_array_model import SWITCH_COLS
         from secore.ac_se import ACStateEstimator
@@ -3172,8 +3175,8 @@ class ACStateEstimationTest(unittest.TestCase):
         next_idx = max(meas.idx for meas in estimator.measurements) + 1
         active_key = ACStateEstimator._active_measurement_key
         existing_keys = {
-            active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_FROM),
-            active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_FROM),
+            active_key(target_meta.device_type_code, target_meta.device_pos, mt.MEAS_TYPE_P_FROM),
+            active_key(target_meta.device_type_code, target_meta.device_pos, mt.MEAS_TYPE_Q_FROM),
         }
 
         _, added = estimator._append_targeted_observability_pseudo(
@@ -3184,8 +3187,8 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         self.assertEqual(2, added)
-        self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_P_TO), existing_keys)
-        self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, ac_se.MEAS_TYPE_CODES_Q_TO), existing_keys)
+        self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, mt.MEAS_TYPE_P_TO), existing_keys)
+        self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, mt.MEAS_TYPE_Q_TO), existing_keys)
 
     def test_targeted_node_voltage_state_adds_pseudo_measurement(self):
         from secore import ac_se
@@ -3240,9 +3243,9 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(1, added)
         self.assertIn(
             ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                mt.DEVICE_TYPE_ACNode,
                 target_meta.device_pos,
-                ac_se.MEAS_TYPE_CODES_V,
+                mt.MEAS_TYPE_V,
             ),
             existing_keys,
         )
@@ -3275,7 +3278,7 @@ class ACStateEstimationTest(unittest.TestCase):
         target_col = int(
             np.flatnonzero(
                 (arrays["kind"] == "voltage")
-                & (arrays["device_type_code"] == ac_se.DEVICE_TYPE_CODES_ACNODE)
+                & (arrays["device_type_code"] == mt.DEVICE_TYPE_ACNode)
             )[0]
         )
         target_device_pos = int(arrays["device_pos"][target_col])
@@ -3294,9 +3297,9 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIsNone(estimator._state_meta_cache)
         self.assertIn(
             ACStateEstimator._active_measurement_key(
-                ac_se.DEVICE_TYPE_CODES_ACNODE,
+                mt.DEVICE_TYPE_ACNode,
                 target_device_pos,
-                ac_se.MEAS_TYPE_CODES_V,
+                mt.MEAS_TYPE_V,
             ),
             existing_keys,
         )
@@ -3319,14 +3322,14 @@ class ACStateEstimationTest(unittest.TestCase):
         gen_meta = next(meta for meta in estimator.state_meta if meta.kind == "generator_p")
         load_meta = next(meta for meta in estimator.state_meta if meta.kind == "load_q")
 
-        self.assertEqual(ac_se.DEVICE_TYPE_CODES_ACNODE, node_meta.device_type_code)
-        self.assertEqual(ac_se.MEAS_TYPE_CODES_V, node_meta.meas_type_code)
+        self.assertEqual(mt.DEVICE_TYPE_ACNode, node_meta.device_type_code)
+        self.assertEqual(mt.MEAS_TYPE_V, node_meta.meas_type_code)
         self.assertGreaterEqual(node_meta.device_pos, 0)
-        self.assertEqual(ac_se.DEVICE_TYPE_CODES_ACGENERATOR, gen_meta.device_type_code)
-        self.assertEqual(ac_se.MEAS_TYPE_CODES_P_GEN, gen_meta.meas_type_code)
+        self.assertEqual(mt.DEVICE_TYPE_ACGenerator, gen_meta.device_type_code)
+        self.assertEqual(mt.MEAS_TYPE_P_GEN, gen_meta.meas_type_code)
         self.assertGreaterEqual(gen_meta.device_pos, 0)
-        self.assertEqual(ac_se.DEVICE_TYPE_CODES_ACLOAD, load_meta.device_type_code)
-        self.assertEqual(ac_se.MEAS_TYPE_CODES_Q_LOAD, load_meta.meas_type_code)
+        self.assertEqual(mt.DEVICE_TYPE_ACLoad, load_meta.device_type_code)
+        self.assertEqual(mt.MEAS_TYPE_Q_LOAD, load_meta.meas_type_code)
         self.assertGreaterEqual(load_meta.device_pos, 0)
 
     def test_ieee3w_adds_rank_restoring_pseudos_without_node_voltage_or_angles(self):
@@ -3781,7 +3784,7 @@ class ACStateEstimationTest(unittest.TestCase):
         pseudo_mask = np.char.startswith(np.asarray(table.name, dtype=str), "pseudo_")
         topology_mask = pseudo_mask & np.isin(
             table.device_type_code,
-            np.asarray([ac_se.DEVICE_TYPE_CODES_ACBREAK, ac_se.DEVICE_TYPE_CODES_ACZEROBRANCH], dtype=np.int16),
+            np.asarray([mt.DEVICE_TYPE_ACBreak, mt.DEVICE_TYPE_ACZeroBranch], dtype=np.int16),
         )
 
         self.assertTrue(np.any(topology_mask))
@@ -4393,10 +4396,10 @@ class ACStateEstimationTest(unittest.TestCase):
         table = estimator.measurements.table
         wanted_types = np.asarray(
             [
-                ac_se.MEAS_TYPE_CODES_V_FROM,
-                ac_se.MEAS_TYPE_CODES_I_TO,
-                ac_se.MEAS_TYPE_CODES_V_GEN,
-                ac_se.MEAS_TYPE_CODES_I_LOAD,
+                mt.MEAS_TYPE_V_FROM,
+                mt.MEAS_TYPE_I_TO,
+                mt.MEAS_TYPE_V_GEN,
+                mt.MEAS_TYPE_I_LOAD,
             ],
             dtype=np.int16,
         )
@@ -4433,24 +4436,24 @@ class ACStateEstimationTest(unittest.TestCase):
             "measurement_key": np.asarray(
                 [
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
+                        mt.DEVICE_TYPE_ACGenerator,
                         0,
-                        ac_se.MEAS_TYPE_CODES_P_GEN,
+                        mt.MEAS_TYPE_P_GEN,
                     ),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACGENERATOR,
+                        mt.DEVICE_TYPE_ACGenerator,
                         0,
-                        ac_se.MEAS_TYPE_CODES_Q_GEN,
+                        mt.MEAS_TYPE_Q_GEN,
                     ),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                        mt.DEVICE_TYPE_ACLoad,
                         1,
-                        ac_se.MEAS_TYPE_CODES_P_LOAD,
+                        mt.MEAS_TYPE_P_LOAD,
                     ),
                     ACStateEstimator._active_measurement_key(
-                        ac_se.DEVICE_TYPE_CODES_ACLOAD,
+                        mt.DEVICE_TYPE_ACLoad,
                         1,
-                        ac_se.MEAS_TYPE_CODES_Q_LOAD,
+                        mt.MEAS_TYPE_Q_LOAD,
                     ),
                 ],
                 dtype=np.int64,
@@ -5127,6 +5130,34 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(estimator._prepared)
         self.assertTrue(estimator.estimate_result.converged)
 
+    def test_run_array_result_mode_identifies_bad_data_without_string_columns(self):
+        from secore.ac_se import ACStateEstimator
+
+        estimator = ACStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+
+        se_result = estimator.run(
+            result_mode="array",
+            bad_threshold=0.0,
+            verbose=False,
+        )
+
+        self.assertIsNone(se_result)
+        self.assertTrue(estimator.estimate_result.converged)
+        self.assertEqual(0, estimator.measurement_table.name.size)
+        self.assertEqual(0, estimator.measurement_table.device_type.size)
+        self.assertEqual(0, estimator.measurement_table.device_name.size)
+        self.assertEqual(0, estimator.measurement_table.meas_type.size)
+        self.assertGreater(len(estimator.bad_items), 0)
+        item = estimator.bad_items[0]
+        self.assertNotEqual("", item.measurement.device_type)
+        self.assertNotEqual("", item.measurement.meas_type)
+        self.assertGreater(item.measurement.name.find("m"), -1)
+
     def test_run_array_result_mode_keeps_estimate_arrays_only(self):
         import secore.ac_se as ac_se_module
         from secore.ac_se import ACStateEstimator
@@ -5147,8 +5178,12 @@ class ACStateEstimationTest(unittest.TestCase):
         def reject_seresult_path(*_args, **_kwargs):
             raise AssertionError("array result_mode should not build SEResult payloads")
 
-        def reject_bad_data(*_args, **_kwargs):
-            raise AssertionError("array result_mode should not run post-estimation bad-data analysis")
+        bad_data_calls = 0
+
+        def counted_bad_data(self, result, threshold=None):
+            nonlocal bad_data_calls
+            bad_data_calls += 1
+            return original_identify(self, result, threshold)
 
         def reject_apply_state(*_args, **_kwargs):
             raise AssertionError("array result_mode should not write estimated state back to model objects")
@@ -5158,7 +5193,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
         ACStateEstimator.build_se_result = reject_seresult_path
         ac_se_module.build_seresult_summary = reject_seresult_path
-        ACStateEstimator.identify_bad_data = reject_bad_data
+        ACStateEstimator.identify_bad_data = counted_bad_data
         ACStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
         try:
@@ -5180,11 +5215,12 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
-        self.assertIsNone(result.H)
-        self.assertIsNone(result.gain)
+        self.assertIsNotNone(result.H)
+        self.assertIsNotNone(result.gain)
         self.assertEqual(0, len(result.measurements))
+        self.assertEqual(1, bad_data_calls)
         self.assertEqual([], estimator.bad_items)
-        self.assertEqual(0, estimator.normalized_residual.size)
+        self.assertEqual(result.residual.size, estimator.normalized_residual.size)
 
     def test_profile_breaks_out_prepare_and_solve_hot_stages(self):
         from secore.ac_se import ACStateEstimator
@@ -6128,8 +6164,8 @@ class ACStateEstimationTest(unittest.TestCase):
                 [1.01],
                 5.0,
                 idx_start=500000,
-                device_type_codes=[ac_se.DEVICE_TYPE_CODES_ACNODE],
-                meas_type_codes=[ac_se.MEAS_TYPE_CODES_V],
+                device_type_codes=[mt.DEVICE_TYPE_ACNode],
+                meas_type_codes=[mt.MEAS_TYPE_V],
                 device_positions=[1],
             ),
             normalized=True,
@@ -6171,8 +6207,8 @@ class ACStateEstimationTest(unittest.TestCase):
                 [1.02],
                 5.0,
                 idx_start=500001,
-                device_type_codes=[ac_se.DEVICE_TYPE_CODES_ACNODE],
-                meas_type_codes=[ac_se.MEAS_TYPE_CODES_V],
+                device_type_codes=[mt.DEVICE_TYPE_ACNode],
+                meas_type_codes=[mt.MEAS_TYPE_V],
                 device_positions=[1],
             ),
             normalized=True,
