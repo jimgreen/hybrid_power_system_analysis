@@ -52,9 +52,9 @@ from model.meas_model import (
 )
 from secore.ac_se import (
     ACStateEstimator,
-    _build_ac_se_network_from_ppc_dict,
+    _build_ac_se_ppc_namespace,
 )
-from secore.dc_se import DCStateEstimator, _build_dc_se_network_from_ppc_dict
+from secore.dc_se import DCStateEstimator, _build_dc_se_ppc_namespace
 from secore.se_array_plan import (
     MeasurementPartitions,
     append_active_measurement_view,
@@ -236,8 +236,8 @@ def _assign_se_converter_topology(network: _SELightweightHybridNetwork) -> None:
 
 
 def _build_hybrid_se_network_from_ppc(ppc: Dict) -> _SELightweightHybridNetwork:
-    ac_network = _build_ac_se_network_from_ppc_dict(ppc["ac"], Path(ppc.get("source", "")) if ppc.get("source") else None)
-    dc_network = _build_dc_se_network_from_ppc_dict(ppc["dc"])
+    ac_network = _build_ac_se_ppc_namespace(ppc["ac"], Path(ppc.get("source", "")) if ppc.get("source") else None)
+    dc_network = _build_dc_se_ppc_namespace(ppc["dc"])
     network = _SELightweightHybridNetwork(
         _se_lightweight=True,
         ac=ac_network,

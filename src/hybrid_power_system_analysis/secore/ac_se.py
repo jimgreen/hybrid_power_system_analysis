@@ -3499,7 +3499,6 @@ class ACStateEstimator:
         if row_count:
             self._max_measurement_idx = int(np.max(appended_table.idx))
         if record_summary:
-            device_key_cache = self._active_device_keys_ref()
             measurement_key_cache = self._active_measurement_keys_ref()
             tail_type = np.asarray(appended_table.device_type_code, dtype=np.int16)
             tail_meas = np.asarray(appended_table.meas_type_code, dtype=np.int16)
