@@ -437,6 +437,12 @@ def _build_meas_ppc_from_measurement_file_array_only(
     device_name_lookup_get = device_name_lookup.get
     device_names_list_append = device_names_list.append
     status_is_active = measurement_status_is_active
+    last_device_type = None
+    last_device_type_code = 0
+    last_device_name = None
+    last_device_name_id = -1
+    last_meas_type = None
+    last_meas_type_code = 0
     in_measurement = False
 
     try:
@@ -520,19 +526,36 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     ) = grown[:8]
 
                 idx_values[row_count] = to_int(fields[idx_col])
-                device_type_code_values[row_count] = device_code_get(fields[device_type_col], 0)
+                device_type = fields[device_type_col]
+                if device_type == last_device_type:
+                    device_code = last_device_type_code
+                else:
+                    device_code = device_code_get(device_type, 0)
+                    last_device_type = device_type
+                    last_device_type_code = device_code
+                device_type_code_values[row_count] = device_code
                 device_name = fields[device_name_col]
-                name_id = device_name_lookup_get(device_name)
-                if name_id is None:
-                    device_name_text = intern(device_name.decode("utf8"))
-                    name_id = len(device_names_list)
-                    device_name_lookup[device_name] = name_id
-                    device_names_list_append(device_name_text)
+                if device_name == last_device_name:
+                    name_id = last_device_name_id
+                else:
+                    name_id = device_name_lookup_get(device_name)
+                    if name_id is None:
+                        device_name_text = intern(device_name.decode("utf8"))
+                        name_id = len(device_names_list)
+                        device_name_lookup[device_name] = name_id
+                        device_names_list_append(device_name_text)
+                    last_device_name = device_name
+                    last_device_name_id = name_id
                 device_name_id[row_count] = name_id
                 meas_type = fields[meas_type_col]
-                meas_code = meas_code_get(meas_type, 0)
-                if meas_code == 0:
-                    meas_code = meas_code_get(meas_type.upper(), 0)
+                if meas_type == last_meas_type:
+                    meas_code = last_meas_type_code
+                else:
+                    meas_code = meas_code_get(meas_type, 0)
+                    if meas_code == 0:
+                        meas_code = meas_code_get(meas_type.upper(), 0)
+                    last_meas_type = meas_type
+                    last_meas_type_code = meas_code
                 meas_type_code_values[row_count] = meas_code
                 weight_values[row_count] = to_float(fields[weight_col])
                 valid = fields[valid_col] == b"1"
