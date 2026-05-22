@@ -2163,12 +2163,9 @@ class DCStateEstimator:
             | meas_values
         )
 
-    def _set_active_key_caches(self, device_keys: Optional[set], measurement_keys: set) -> None:
-        self._active_device_keys = set() if device_keys is None else device_keys
+    def _set_active_key_caches(self, measurement_keys: set) -> None:
         self._active_measurement_keys = measurement_keys
-        self._active_device_key_cache = self._active_device_keys
         self._active_measurement_key_cache = measurement_keys
-        self._active_device_code_pos_cache = device_keys
         self._active_measurement_code_pos_cache = measurement_keys
 
     def _seed_ppc_rows_from_device_pos(self, device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
@@ -2375,20 +2372,20 @@ class DCStateEstimator:
         device_pos: np.ndarray,
         meas_type_code: np.ndarray,
         active_mask: np.ndarray,
-    ) -> Tuple[Optional[set], set]:
+    ) -> set:
         rows = np.flatnonzero(np.asarray(active_mask, dtype=bool)).astype(np.int64, copy=False)
         if rows.size == 0:
-            return set(), set()
+            return set()
         pos_values = np.asarray(device_pos, dtype=np.int64)[rows]
         valid_pos = pos_values >= 0
         if not np.any(valid_pos):
-            return set(), set()
+            return set()
         keys = DCStateEstimator._active_measurement_key_array(
             np.asarray(device_type_code, dtype=np.int16)[rows][valid_pos],
             pos_values[valid_pos],
             np.asarray(meas_type_code, dtype=np.int16)[rows][valid_pos],
         )
-        return None, set(keys.tolist())
+        return set(keys.tolist())
 
     def _voltage_best_from_arrays(
         self,
@@ -2606,13 +2603,13 @@ class DCStateEstimator:
             )
         real_mask = processable & (status != MEAS_STATUS_PSEUDO)
         self.measurement_table = table
-        active_device_keys, active_measurement_keys = self._active_key_cache_from_arrays(
+        active_measurement_keys = self._active_key_cache_from_arrays(
             device_type_code,
             device_pos,
             meas_type_code,
             processable,
         )
-        self._set_active_key_caches(active_device_keys, active_measurement_keys)
+        self._set_active_key_caches(active_measurement_keys)
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache, self._real_voltage_observation_node_cache = self._voltage_best_from_arrays(
             table,
@@ -2660,7 +2657,7 @@ class DCStateEstimator:
         if isinstance(getattr(self, "meas_ppc", None), dict) and self._normalize_measurements_to_pu_from_meas_ppc(table, self.meas_ppc):
             return
         self.measurement_table = table
-        self._set_active_key_caches(set(), set())
+        self._set_active_key_caches(set())
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache = {}
         self._real_voltage_observation_node_cache = {}
@@ -2673,31 +2670,6 @@ class DCStateEstimator:
 
     def _convert_measurements_to_pu(self) -> None:
         self._normalize_measurements_to_pu()
-
-    def _active_device_keys_ref(self) -> set:
-        """Return active devices as packed integer (device_type_code, device_pos) keys."""
-        cache = getattr(self, "_active_device_code_pos_cache", None)
-        if cache is not None:
-            self._active_device_keys = cache
-            return cache
-        measurement_keys = getattr(self, "_active_measurement_code_pos_cache", None)
-        if measurement_keys is None:
-            measurement_keys = getattr(self, "_active_measurement_keys", None)
-        if measurement_keys is None:
-            self._refresh_measurement_summary_cache()
-            measurement_keys = getattr(self, "_active_measurement_code_pos_cache", None)
-        if measurement_keys:
-            key_array = np.fromiter(
-                (int(key) for key in measurement_keys),
-                dtype=np.int64,
-                count=len(measurement_keys),
-            )
-            cache = set((key_array >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS).tolist())
-        else:
-            cache = set()
-        self._active_device_keys = cache
-        self._active_device_code_pos_cache = cache
-        return cache
 
     def _active_measurement_keys_ref(self) -> set:
         """Return active measurements as packed integer (device_type_code, device_pos, meas_type_code) keys."""
@@ -2935,7 +2907,6 @@ class DCStateEstimator:
         self._active_measurement_plan_tables_cache = None
         self._active_measurement_plan = None
         if record_summary:
-            device_key_cache = self._active_device_keys_ref()
             measurement_key_cache = self._active_measurement_keys_ref()
             tail_type = np.asarray(appended_table.device_type_code, dtype=np.int16)
             tail_meas = np.asarray(appended_table.meas_type_code, dtype=np.int16)
@@ -2951,13 +2922,11 @@ class DCStateEstimator:
                     tail_pos[valid_tail],
                     tail_meas[valid_tail],
                 )
-                device_key_cache.update((measurement_keys >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS).tolist())
                 measurement_key_cache.update(measurement_keys.tolist())
         return base_table
 
     def _refresh_measurement_summary_cache(self) -> None:
         """Cache active measurement key sets and max row id for initialization scans."""
-        active_device_keys = set()
         active_measurement_keys = set()
         node_voltage_best: Dict[int, float] = {}
         real_voltage_best: Dict[int, float] = {}
@@ -2969,7 +2938,7 @@ class DCStateEstimator:
             meas_type_code = self._ensure_table_meas_type_codes(table)
             device_pos = self._measurement_device_pos_array(table)
             status_code = measurement_table_status_code(table)
-            active_device_keys, active_measurement_keys = self._active_key_cache_from_arrays(
+            active_measurement_keys = self._active_key_cache_from_arrays(
                 device_type_code,
                 device_pos,
                 meas_type_code,
@@ -2995,7 +2964,7 @@ class DCStateEstimator:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        self._set_active_key_caches(active_device_keys, active_measurement_keys)
+        self._set_active_key_caches(active_measurement_keys)
         self._max_measurement_idx = max_idx
         self._node_voltage_measurement_cache = node_voltage_best
         self._real_voltage_observation_node_cache = real_voltage_best
