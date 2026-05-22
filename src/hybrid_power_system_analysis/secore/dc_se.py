@@ -4,6 +4,7 @@ import io
 import sys
 import time
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -216,6 +217,71 @@ class _PackedMeasurementKeyCache:
 
     def update(self, keys) -> None:
         self.extend_array(keys)
+
+
+class _NodeIndexedValueMap(Mapping):
+    """Array-backed mapping from node idx to a cached scalar value."""
+
+    __slots__ = ("_node_ids", "_values", "_dict")
+
+    def __init__(self, node_idx_by_pos: np.ndarray, values_by_pos: np.ndarray, valid_mask: np.ndarray) -> None:
+        node_idx_by_pos = np.asarray(node_idx_by_pos, dtype=np.int64)
+        values_by_pos = np.asarray(values_by_pos)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        valid = np.flatnonzero(valid_mask).astype(np.int64, copy=False)
+        if valid.size:
+            valid = valid[valid < min(node_idx_by_pos.size, values_by_pos.size)]
+            self._node_ids = node_idx_by_pos[valid.astype(np.intp, copy=False)].astype(np.int64, copy=False)
+            self._values = values_by_pos[valid.astype(np.intp, copy=False)]
+        else:
+            self._node_ids = np.empty(0, dtype=np.int64)
+            self._values = np.empty(0, dtype=values_by_pos.dtype)
+        self._dict = None
+
+    @staticmethod
+    def _scalar(value):
+        return value.item() if hasattr(value, "item") else value
+
+    def _materialize(self) -> Dict[int, object]:
+        cache = self._dict
+        if cache is None:
+            cache = {
+                int(node_idx): self._scalar(value)
+                for node_idx, value in zip(self._node_ids, self._values)
+            }
+            self._dict = cache
+        return cache
+
+    def __getitem__(self, key: int):
+        node_id = int(key)
+        pos = int(np.searchsorted(self._node_ids, node_id))
+        if pos < self._node_ids.size and int(self._node_ids[pos]) == node_id:
+            return self._scalar(self._values[pos])
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self._materialize())
+
+    def __len__(self) -> int:
+        return int(self._node_ids.size)
+
+    def __bool__(self) -> bool:
+        return bool(self._node_ids.size)
+
+    def __contains__(self, key) -> bool:
+        node_id = int(key)
+        pos = int(np.searchsorted(self._node_ids, node_id))
+        return bool(pos < self._node_ids.size and int(self._node_ids[pos]) == node_id)
+
+    def get(self, key, default=None):
+        node_id = int(key)
+        pos = int(np.searchsorted(self._node_ids, node_id))
+        if pos < self._node_ids.size and int(self._node_ids[pos]) == node_id:
+            return self._scalar(self._values[pos])
+        return default
+
+    def __eq__(self, other) -> bool:
+        return self._materialize() == other
 
 
 def _measurement_table_from_array_view(measurements) -> MeasurementTable:
@@ -1645,7 +1711,7 @@ class DCStateEstimator:
                 if np.any(valid):
                     np.add.at(degrees, right[valid].astype(np.intp, copy=False), 1)
         self._node_degree_by_pos = degrees
-        return {int(node_idx): int(degree) for node_idx, degree in zip(self._node_idx_by_pos, degrees)}
+        return _NodeIndexedValueMap(self._node_idx_by_pos, degrees, np.ones(degrees.size, dtype=bool))
 
     def _select_reference_nodes(self) -> np.ndarray:
         """Choose one measured high-degree DC voltage reference per live DC topology island."""
@@ -1766,19 +1832,32 @@ class DCStateEstimator:
         ref_valid = (references >= 0) & (references < self._node_idx_by_pos.size)
         if np.any(ref_valid):
             ref_pos = references[ref_valid].astype(np.intp, copy=False)
-            ref_values = np.fromiter(
-                (
-                    float(
-                        self.node_voltage_measurements.get(
-                            int(self._node_idx_by_pos[int(pos)]),
-                            self._node_voltage_by_pos[int(pos)],
+            node_voltage_values = getattr(self, "_node_voltage_measurement_value_by_pos", None)
+            node_voltage_mask = getattr(self, "_node_voltage_measurement_pos_mask_cache", None)
+            if (
+                isinstance(node_voltage_values, np.ndarray)
+                and isinstance(node_voltage_mask, np.ndarray)
+                and node_voltage_values.size == n
+                and node_voltage_mask.size == n
+            ):
+                ref_values = self._node_voltage_by_pos[ref_pos].astype(np.float64, copy=True)
+                measured_ref = node_voltage_mask[ref_pos]
+                if np.any(measured_ref):
+                    ref_values[measured_ref] = node_voltage_values[ref_pos[measured_ref]]
+            else:
+                ref_values = np.fromiter(
+                    (
+                        float(
+                            self.node_voltage_measurements.get(
+                                int(self._node_idx_by_pos[int(pos)]),
+                                self._node_voltage_by_pos[int(pos)],
+                            )
                         )
-                    )
-                    for pos in ref_pos
-                ),
-                dtype=np.float64,
-                count=int(ref_pos.size),
-            )
+                        for pos in ref_pos
+                    ),
+                    dtype=np.float64,
+                    count=int(ref_pos.size),
+                )
             reference_voltage_by_pos[ref_pos] = ref_values
 
         component_sizes = np.diff(component_offsets).astype(np.int64, copy=False)
@@ -2886,7 +2965,7 @@ class DCStateEstimator:
         meas_type_code: np.ndarray,
         from_pos: np.ndarray,
         to_pos: np.ndarray,
-    ) -> Tuple[Dict[int, float], Dict[int, float]]:
+    ) -> Tuple[Mapping[int, float], Mapping[int, float]]:
         n_nodes = int(self._node_idx_by_pos.size)
         node_best_weight = np.full(n_nodes, -np.inf, dtype=np.float64)
         node_best_value = np.zeros(n_nodes, dtype=np.float64)
@@ -2912,13 +2991,6 @@ class DCStateEstimator:
             if np.any(keep):
                 best_value[pos_valid[keep]] = values[keep]
 
-        def best_dict(best_weight: np.ndarray, best_value: np.ndarray) -> Dict[int, float]:
-            valid = np.flatnonzero(np.isfinite(best_weight)).astype(np.int64, copy=False)
-            return {
-                int(self._node_idx_by_pos[int(pos)]): float(best_value[int(pos)])
-                for pos in valid
-            }
-
         node_v_rows = row_index[real_mask & (device_type_code == DEVICE_TYPE_DCNode) & (meas_type_code == MEAS_TYPE_V)]
         update(node_v_rows, from_pos[node_v_rows], node_best_weight, node_best_value)
         update(node_v_rows, from_pos[node_v_rows], real_best_weight, real_best_value)
@@ -2938,8 +3010,13 @@ class DCStateEstimator:
         update(v_to_rows, to_pos[v_to_rows], real_best_weight, real_best_value)
         self._node_voltage_measurement_pos_mask_cache = np.isfinite(node_best_weight)
         self._real_voltage_observation_pos_mask_cache = np.isfinite(real_best_weight)
+        self._node_voltage_measurement_value_by_pos = node_best_value
+        self._real_voltage_observation_value_by_pos = real_best_value
         self._real_voltage_observed_solver_pos_mask_cache = None
-        return best_dict(node_best_weight, node_best_value), best_dict(real_best_weight, real_best_value)
+        return (
+            _NodeIndexedValueMap(self._node_idx_by_pos, node_best_value, self._node_voltage_measurement_pos_mask_cache),
+            _NodeIndexedValueMap(self._node_idx_by_pos, real_best_value, self._real_voltage_observation_pos_mask_cache),
+        )
 
     def _power_flow_seed_rows_from_arrays(
         self,
@@ -3159,6 +3236,8 @@ class DCStateEstimator:
         self._real_voltage_observation_node_cache = {}
         self._node_voltage_measurement_pos_mask_cache = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
         self._real_voltage_observation_pos_mask_cache = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+        self._node_voltage_measurement_value_by_pos = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=np.float64)
+        self._real_voltage_observation_value_by_pos = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=np.float64)
         self._real_voltage_observed_solver_pos_mask_cache = None
         self._power_flow_seed_rows = {
             "measurement_key": np.empty(0, dtype=np.int64),
