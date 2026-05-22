@@ -46,13 +46,11 @@ from model.meas_type import (
     DEVICE_TYPE_DCDCConverter,
     DEVICE_TYPE_DCGenerator,
     DEVICE_TYPE_DCLoad,
-    DEVICE_TYPE_NAMES,
     DEVICE_TYPE_DCNode,
     DEVICE_TYPE_DCSwitchConstraint,
     DEVICE_TYPE_DCZeroBranch,
     DEVICE_TYPE_DCZeroBranchConstraint,
     MEAS_TYPE_CODES,
-    MEAS_TYPE_NAMES,
     MEAS_TYPE_I_FROM,
     MEAS_TYPE_I_TO,
     MEAS_TYPE_I_LOAD,
@@ -79,7 +77,6 @@ from model.meas_model import (
     MeasurementTableView,
     ObservabilityResult,
     TableBackedMeasurementList,
-    mark_measurement_pseudo,
     measurement_from_table_row,
     measurement_table_from_measurements,
     measurement_table_status_code,
@@ -107,6 +104,7 @@ from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
+    measurement_table_take,
     rows_by_device_type_code,
     take_measurement_view,
 )
@@ -139,13 +137,9 @@ _DC_GEN_MEAS_TYPE_CODES = {
 }
 _DC_NODE_MEAS_TYPE_CODES = {"V": MEAS_TYPE_V}
 _DC_CONSTRAINT_MEAS_TYPE_CODES = {"V_DIFF": MEAS_TYPE_V_DIFF}
-_GEN_CONTROL_CODE_BY_NAME = {"V": 0, "P": 1, "I": 2}
 _MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
-_DEFAULT_MEASUREMENT_SCALE_TUPLE = (1.0,) * (_MAX_MEAS_TYPE_CODE + 1)
-_VOLTAGE_MEASUREMENT_TYPES = frozenset(("V", "V_FROM", "V_TO", "V_GEN", "V_LOAD"))
-_VOLTAGE_MEASUREMENT_TYPE_TUPLE = tuple(_VOLTAGE_MEASUREMENT_TYPES)
 _VOLTAGE_MEASUREMENT_TYPE_CODES = np.asarray(
-    [MEAS_TYPE_CODES[name] for name in _VOLTAGE_MEASUREMENT_TYPE_TUPLE],
+    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD],
     dtype=np.int16,
 )
 _ACTIVE_NAME_ID_KEY_BITS = 32
@@ -343,13 +337,15 @@ class DCStateEstimator:
         self._raw_node_names_alive = raw_node_names
         self._raw_node_idx_alive = topology_arrays.node_ids[alive_node_rows.astype(np.intp, copy=False)].astype(np.int64, copy=False)
         self._raw_node_solver_pos_alive = raw_solver_pos[alive_node_rows.astype(np.intp, copy=False)].astype(np.int64, copy=False)
+        self._dc_node_device_pos_by_solver_pos = np.full(self.n_nodes, -1, dtype=np.int64)
+        valid_node_pos = (self._raw_node_solver_pos_alive >= 0) & (self._raw_node_solver_pos_alive < self.n_nodes)
+        if np.any(valid_node_pos):
+            self._dc_node_device_pos_by_solver_pos[
+                self._raw_node_solver_pos_alive[valid_node_pos].astype(np.intp, copy=False)
+            ] = np.flatnonzero(valid_node_pos).astype(np.int64, copy=False)
         self.node_pos = {
             int(node_idx): int(pos)
             for node_idx, pos in zip(self._raw_node_idx_alive.tolist(), self._raw_node_solver_pos_alive.tolist())
-        }
-        self.node_by_name = {
-            str(name): int(node_idx)
-            for name, node_idx in zip(self._raw_node_names_alive.tolist(), self._raw_node_idx_alive.tolist())
         }
         self.node_by_idx = {int(idx): int(idx) for idx in self._raw_node_idx_alive.tolist()}
 
@@ -468,16 +464,6 @@ class DCStateEstimator:
             self._dcdc_i_pos = np.asarray([], dtype=np.int64)
             self._dcdc_j_pos = np.asarray([], dtype=np.int64)
 
-        self.branch_by_name = {str(name): int(pos) for pos, name in enumerate(self._branch_names.tolist())}
-        self.load_by_name = {str(name): int(pos) for pos, name in enumerate(self._load_names.tolist())}
-        self.generator_by_name = {str(name): int(pos) for pos, name in enumerate(self._generator_names.tolist())}
-        self.switch_by_name = {str(name): int(pos) for pos, name in enumerate(self._switch_names.tolist())}
-        self.break_by_name = {str(name): int(pos) for pos, name in enumerate(self._break_names.tolist())}
-        self.zero_branch_by_name = {str(name): int(pos) for pos, name in enumerate(self._zero_branch_names.tolist())}
-        self.dcdc_by_name = {str(name): int(pos) for pos, name in enumerate(self._dcdc_names.tolist())}
-        self.generator_order = np.arange(self._generator_rows.size, dtype=np.int64)
-        self.load_order = np.arange(self._load_rows.size, dtype=np.int64)
-
     @staticmethod
     def _clear_meas_ppc_runtime_arrays(meas_ppc: Dict) -> None:
         """Drop estimator-local measurement runtime arrays copied from a shared file cache."""
@@ -577,7 +563,6 @@ class DCStateEstimator:
         self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
         self._defer_prepare_finalize_pending = bool(defer_prepare_finalize)
         if defer_prepare_finalize:
-            self._build_measurement_scale_cache()
             self.power_flow_seed_converged = False
             self.targeted_observability_pseudo_count = 0
             return self
@@ -601,7 +586,6 @@ class DCStateEstimator:
         if not measurements_already_normalized:
             stage_start = time.perf_counter()
             self._disable_unavailable_measurements()
-            self._build_measurement_scale_cache()
             self._convert_measurements_to_pu()
             self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
         self.power_flow_seed_converged = False
@@ -638,28 +622,97 @@ class DCStateEstimator:
         self.v_generator_start = self.dcdc_start + self.n_dcdc_power
         self.n_state = self.v_generator_start + self.n_v_generator
 
-        state_meta: List[StateMeta] = [
-            StateMeta("dc", "voltage", "DCNode", str(self._node_name_by_pos[int(pos)]), component="magnitude", legacy_label=f"V:{self._node_name_by_pos[int(pos)]}")
-            for pos in self.voltage_state_pos
-        ]
-        state_meta.extend(
-            StateMeta("dc", "zero_current", "DCZeroBranch", str(name), component="current", legacy_label=f"I_ZERO:{name}")
-            for name in self._zero_branch_names.tolist()
-        )
-        state_meta.extend(
-            StateMeta("dc", "break_current", "DCBreak", str(name), component="current", legacy_label=f"I_BREAK:{name}")
-            for name in self._break_names.tolist()
-        )
-        for conv_name in self._dcdc_names.tolist():
-            state_meta.append(
-                StateMeta("dc", "dcdc_p_from", "DCDCConverter", str(conv_name), terminal="from", component="p", legacy_label=f"P_DCDC_FROM:{conv_name}")
+        state_meta: List[StateMeta] = []
+        for pos in self.voltage_state_pos.tolist():
+            solver_pos = int(pos)
+            device_pos = (
+                int(self._dc_node_device_pos_by_solver_pos[solver_pos])
+                if 0 <= solver_pos < self._dc_node_device_pos_by_solver_pos.size
+                else -1
             )
             state_meta.append(
-                StateMeta("dc", "dcdc_p_to", "DCDCConverter", str(conv_name), terminal="to", component="p", legacy_label=f"P_DCDC_TO:{conv_name}")
+                StateMeta(
+                    "dc",
+                    "voltage",
+                    "DCNode",
+                    str(self._node_name_by_pos[solver_pos]),
+                    component="magnitude",
+                    legacy_label=f"V:{self._node_name_by_pos[solver_pos]}",
+                    device_pos=device_pos,
+                    device_type_code=DEVICE_TYPE_DCNode,
+                    meas_type_code=MEAS_TYPE_V,
+                )
             )
         state_meta.extend(
-            StateMeta("dc", "v_generator_p", "DCGenerator", str(name), component="p", legacy_label=f"P_VGEN:{name}")
-            for name in self._v_generator_names.tolist()
+            StateMeta(
+                "dc",
+                "zero_current",
+                "DCZeroBranch",
+                str(name),
+                component="current",
+                legacy_label=f"I_ZERO:{name}",
+                device_pos=int(pos),
+                device_type_code=DEVICE_TYPE_DCZeroBranch,
+                meas_type_code=MEAS_TYPE_I_FROM,
+            )
+            for pos, name in enumerate(self._zero_branch_names.tolist())
+        )
+        state_meta.extend(
+            StateMeta(
+                "dc",
+                "break_current",
+                "DCBreak",
+                str(name),
+                component="current",
+                legacy_label=f"I_BREAK:{name}",
+                device_pos=int(pos),
+                device_type_code=DEVICE_TYPE_DCBreak,
+                meas_type_code=MEAS_TYPE_I_FROM,
+            )
+            for pos, name in enumerate(self._break_names.tolist())
+        )
+        for pos, conv_name in enumerate(self._dcdc_names.tolist()):
+            state_meta.append(
+                StateMeta(
+                    "dc",
+                    "dcdc_p_from",
+                    "DCDCConverter",
+                    str(conv_name),
+                    terminal="from",
+                    component="p",
+                    legacy_label=f"P_DCDC_FROM:{conv_name}",
+                    device_pos=int(pos),
+                    device_type_code=DEVICE_TYPE_DCDCConverter,
+                    meas_type_code=MEAS_TYPE_P_FROM,
+                )
+            )
+            state_meta.append(
+                StateMeta(
+                    "dc",
+                    "dcdc_p_to",
+                    "DCDCConverter",
+                    str(conv_name),
+                    terminal="to",
+                    component="p",
+                    legacy_label=f"P_DCDC_TO:{conv_name}",
+                    device_pos=int(pos),
+                    device_type_code=DEVICE_TYPE_DCDCConverter,
+                    meas_type_code=MEAS_TYPE_P_TO,
+                )
+            )
+        state_meta.extend(
+            StateMeta(
+                "dc",
+                "v_generator_p",
+                "DCGenerator",
+                str(name),
+                component="p",
+                legacy_label=f"P_VGEN:{name}",
+                device_pos=int(device_pos),
+                device_type_code=DEVICE_TYPE_DCGenerator,
+                meas_type_code=MEAS_TYPE_P_GEN,
+            )
+            for device_pos, name in zip(self._v_generator_local_pos.tolist(), self._v_generator_names.tolist())
         )
         self.state_meta = state_meta
         labels = [meta.legacy_label for meta in state_meta]
@@ -1561,18 +1614,6 @@ class DCStateEstimator:
         return {int(row[idx_col]): pos for pos, row in enumerate(array)}
 
     @staticmethod
-    def _row_by_name(names) -> Dict[str, int]:
-        if names is None:
-            return {}
-        return {str(name): pos for pos, name in enumerate(names)}
-
-    @staticmethod
-    def _node_idx_from_lookup_value(value) -> int:
-        if hasattr(value, "idx"):
-            return int(value.idx)
-        return int(value)
-
-    @staticmethod
     def _apply_power_flow_seed_rows_to_ppc(ppc, seed_rows) -> None:
         bus = ppc.get("bus")
         if bus is None:
@@ -1687,16 +1728,6 @@ class DCStateEstimator:
             seed_rows = ()
         setattr(self.network, "_se_power_flow_seed_rows", tuple(seed_rows))
 
-    @staticmethod
-    def _load_measurements(meas_file: Path) -> MeasurementList:
-        return measurement_list_from_meas_ppc(copy_meas_ppc(build_meas_ppc_from_e_file(meas_file)))
-
-    def _voltage_base(self, node_idx: int) -> float:
-        return self._node_vbase_by_idx[int(node_idx)]
-
-    def _node_current_base(self, node_idx: int) -> float:
-        return self._current_file_base_by_idx[int(node_idx)]
-
     def _build_unit_scale_cache(self) -> None:
         """Cache per-node unit bases used by measurement conversion."""
         ppc = self._dc_ppc_dict()
@@ -1716,416 +1747,6 @@ class DCStateEstimator:
             return
         raise RuntimeError("DC SE requires PPC bus arrays for unit scale construction")
 
-    @staticmethod
-    def _measurement_scale_tuple(assignments: Dict[int, float]) -> Tuple[float, ...]:
-        scale = list(_DEFAULT_MEASUREMENT_SCALE_TUPLE)
-        for code, value in assignments.items():
-            scale[int(code)] = float(value)
-        return tuple(scale)
-
-    def _terminal_scale_tuple(self, i_node: int, j_node: int) -> Tuple[float, ...]:
-        """Return scale values indexed by MEAS_TYPE code."""
-        scale = list(_DEFAULT_MEASUREMENT_SCALE_TUPLE)
-        scale[MEAS_TYPE_P_FROM] = self.p_base
-        scale[MEAS_TYPE_V_FROM] = self._voltage_file_base_by_idx[int(i_node)]
-        scale[MEAS_TYPE_I_FROM] = self._current_file_base_by_idx[int(i_node)]
-        scale[MEAS_TYPE_P_TO] = self.p_base
-        scale[MEAS_TYPE_V_TO] = self._voltage_file_base_by_idx[int(j_node)]
-        scale[MEAS_TYPE_I_TO] = self._current_file_base_by_idx[int(j_node)]
-        return tuple(scale)
-
-    def _single_device_scale_tuple(
-        self,
-        node_idx: int,
-        power_code: int,
-        voltage_code: int,
-        current_code: int,
-    ) -> Tuple[float, ...]:
-        scale = list(_DEFAULT_MEASUREMENT_SCALE_TUPLE)
-        node_idx = int(node_idx)
-        scale[int(power_code)] = self.p_base
-        scale[int(voltage_code)] = self._voltage_file_base_by_idx[node_idx]
-        scale[int(current_code)] = self._current_file_base_by_idx[node_idx]
-        return tuple(scale)
-
-    def _empty_name_id_scale_array(self, fill_value: float = 1.0) -> np.ndarray:
-        device_names = self._meas_ppc_device_names()
-        return np.full(int(device_names.size), float(fill_value), dtype=np.float64)
-
-    def _terminal_scale_lookup_by_name_id(self, devices) -> Dict[int, object]:
-        """Build compact MEAS_TYPE-code scale lookups for terminal-like DC devices."""
-        v_from = self._empty_name_id_scale_array()
-        i_from = self._empty_name_id_scale_array()
-        v_to = self._empty_name_id_scale_array()
-        i_to = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for dev in devices:
-            name_id = name_id_by_name.get(dev.name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if not (0 <= idx < v_from.size):
-                continue
-            i_node = int(dev.i_node)
-            j_node = int(dev.j_node)
-            v_from[idx] = self._voltage_file_base_by_idx[i_node]
-            i_from[idx] = self._current_file_base_by_idx[i_node]
-            v_to[idx] = self._voltage_file_base_by_idx[j_node]
-            i_to[idx] = self._current_file_base_by_idx[j_node]
-        return {
-            MEAS_TYPE_P_FROM: float(self.p_base),
-            MEAS_TYPE_V_FROM: v_from,
-            MEAS_TYPE_I_FROM: i_from,
-            MEAS_TYPE_P_TO: float(self.p_base),
-            MEAS_TYPE_V_TO: v_to,
-            MEAS_TYPE_I_TO: i_to,
-        }
-
-    def _single_device_scale_lookup_by_name_id(
-        self,
-        devices,
-        *,
-        node_attr: str,
-        power_code: int,
-        voltage_code: int,
-        current_code: int,
-    ) -> Dict[int, object]:
-        voltage = self._empty_name_id_scale_array()
-        current = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for dev in devices:
-            name_id = name_id_by_name.get(dev.name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if not (0 <= idx < voltage.size):
-                continue
-            node_idx = int(getattr(dev, node_attr))
-            voltage[idx] = self._voltage_file_base_by_idx[node_idx]
-            current[idx] = self._current_file_base_by_idx[node_idx]
-        return {
-            int(power_code): float(self.p_base),
-            int(voltage_code): voltage,
-            int(current_code): current,
-        }
-
-    def _terminal_scale_lookup_by_name_id_arrays(
-        self,
-        names: np.ndarray,
-        i_node: np.ndarray,
-        j_node: np.ndarray,
-    ) -> Dict[int, object]:
-        v_from = self._empty_name_id_scale_array()
-        i_from = self._empty_name_id_scale_array()
-        v_to = self._empty_name_id_scale_array()
-        i_to = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for name, i_idx, j_idx in zip(names.tolist(), i_node.tolist(), j_node.tolist()):
-            name_id = name_id_by_name.get(name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if not (0 <= idx < v_from.size):
-                continue
-            i_idx = int(i_idx)
-            j_idx = int(j_idx)
-            v_from[idx] = self._voltage_file_base_by_idx[i_idx]
-            i_from[idx] = self._current_file_base_by_idx[i_idx]
-            v_to[idx] = self._voltage_file_base_by_idx[j_idx]
-            i_to[idx] = self._current_file_base_by_idx[j_idx]
-        return {
-            MEAS_TYPE_P_FROM: float(self.p_base),
-            MEAS_TYPE_V_FROM: v_from,
-            MEAS_TYPE_I_FROM: i_from,
-            MEAS_TYPE_P_TO: float(self.p_base),
-            MEAS_TYPE_V_TO: v_to,
-            MEAS_TYPE_I_TO: i_to,
-        }
-
-    def _single_device_scale_lookup_by_name_id_arrays(
-        self,
-        names: np.ndarray,
-        node_idx: np.ndarray,
-        *,
-        power_code: int,
-        voltage_code: int,
-        current_code: int,
-    ) -> Dict[int, object]:
-        voltage = self._empty_name_id_scale_array()
-        current = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for name, node_value in zip(names.tolist(), node_idx.tolist()):
-            name_id = name_id_by_name.get(name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if not (0 <= idx < voltage.size):
-                continue
-            node_value = int(node_value)
-            voltage[idx] = self._voltage_file_base_by_idx[node_value]
-            current[idx] = self._current_file_base_by_idx[node_value]
-        return {
-            int(power_code): float(self.p_base),
-            int(voltage_code): voltage,
-            int(current_code): current,
-        }
-
-    def _constraint_scale_lookup_by_name_id_arrays(self, names: np.ndarray, i_node: np.ndarray) -> np.ndarray:
-        scale = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for name, node_value in zip(names.tolist(), i_node.tolist()):
-            name_id = name_id_by_name.get(name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if 0 <= idx < scale.size:
-                scale[idx] = self._voltage_file_base_by_idx[int(node_value)]
-        return scale
-
-    def _constraint_scale_lookup_by_name_id(self, devices) -> np.ndarray:
-        scale = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for dev in devices:
-            name_id = name_id_by_name.get(dev.name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if 0 <= idx < scale.size:
-                scale[idx] = self._voltage_file_base_by_idx[int(dev.i_node)]
-        return scale
-
-    def _node_idx_lookup_for_named_devices(self, devices, node_attr: str) -> np.ndarray:
-        lookup = np.full(self._meas_ppc_device_names().size, -1, dtype=np.int64)
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for dev in devices:
-            name_id = name_id_by_name.get(dev.name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if 0 <= idx < lookup.size:
-                lookup[idx] = int(getattr(dev, node_attr))
-        return lookup
-
-    def _build_voltage_node_idx_lookups_by_name_id(self) -> Dict[int, Dict[int, np.ndarray]]:
-        node_lookup = np.full(self._meas_ppc_device_names().size, -1, dtype=np.int64)
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        raw_names = getattr(self, "_raw_node_names_alive", np.asarray([], dtype=object))
-        raw_idx = getattr(self, "_raw_node_idx_alive", np.asarray([], dtype=np.int64))
-        if raw_names.size:
-            for name, node_idx in zip(raw_names.tolist(), raw_idx.tolist()):
-                name_id = name_id_by_name.get(name)
-                if name_id is None:
-                    continue
-                idx = int(name_id)
-                if 0 <= idx < node_lookup.size:
-                    node_lookup[idx] = int(node_idx)
-            return {
-                _DEVICE_TYPE_CODES["DCNode"]: {MEAS_TYPE_V: node_lookup},
-                _DEVICE_TYPE_CODES["DCBranch"]: {
-                    MEAS_TYPE_V_FROM: self._node_idx_lookup_for_name_arrays(self._branch_names, self._branch_i_node),
-                    MEAS_TYPE_V_TO: self._node_idx_lookup_for_name_arrays(self._branch_names, self._branch_j_node),
-                },
-                _DEVICE_TYPE_CODES["DCBreak"]: {
-                    MEAS_TYPE_V_FROM: self._node_idx_lookup_for_name_arrays(self._break_names, self._break_i_node),
-                    MEAS_TYPE_V_TO: self._node_idx_lookup_for_name_arrays(self._break_names, self._break_j_node),
-                },
-                _DEVICE_TYPE_CODES["DCZeroBranch"]: {
-                    MEAS_TYPE_V_FROM: self._node_idx_lookup_for_name_arrays(self._zero_branch_names, self._zero_branch_i_node),
-                    MEAS_TYPE_V_TO: self._node_idx_lookup_for_name_arrays(self._zero_branch_names, self._zero_branch_j_node),
-                },
-                _DEVICE_TYPE_CODES["DCDCConverter"]: {
-                    MEAS_TYPE_V_FROM: self._node_idx_lookup_for_name_arrays(self._dcdc_names, self._dcdc_i_node),
-                    MEAS_TYPE_V_TO: self._node_idx_lookup_for_name_arrays(self._dcdc_names, self._dcdc_j_node),
-                },
-                _DEVICE_TYPE_CODES["DCGenerator"]: {
-                    MEAS_TYPE_V_GEN: self._node_idx_lookup_for_name_arrays(self._generator_names, self._generator_node)
-                },
-                _DEVICE_TYPE_CODES["DCLoad"]: {
-                    MEAS_TYPE_V_LOAD: self._node_idx_lookup_for_name_arrays(self._load_names, self._load_node)
-                },
-            }
-        for name, node in self.node_by_name.items():
-            name_id = name_id_by_name.get(name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if 0 <= idx < node_lookup.size:
-                node_lookup[idx] = int(node.idx)
-        branch_from = self._node_idx_lookup_for_named_devices(self.branch_by_name.values(), "i_node")
-        branch_to = self._node_idx_lookup_for_named_devices(self.branch_by_name.values(), "j_node")
-        break_from = self._node_idx_lookup_for_named_devices(self.break_by_name.values(), "i_node")
-        break_to = self._node_idx_lookup_for_named_devices(self.break_by_name.values(), "j_node")
-        zero_from = self._node_idx_lookup_for_named_devices(self.zero_branch_by_name.values(), "i_node")
-        zero_to = self._node_idx_lookup_for_named_devices(self.zero_branch_by_name.values(), "j_node")
-        dcdc_from = self._node_idx_lookup_for_named_devices(self.dcdc_by_name.values(), "i_node")
-        dcdc_to = self._node_idx_lookup_for_named_devices(self.dcdc_by_name.values(), "j_node")
-        gen_node = self._node_idx_lookup_for_named_devices(self.generator_by_name.values(), "node")
-        load_node = self._node_idx_lookup_for_named_devices(self.load_by_name.values(), "node")
-        return {
-            _DEVICE_TYPE_CODES["DCNode"]: {MEAS_TYPE_V: node_lookup},
-            _DEVICE_TYPE_CODES["DCBranch"]: {MEAS_TYPE_V_FROM: branch_from, MEAS_TYPE_V_TO: branch_to},
-            _DEVICE_TYPE_CODES["DCBreak"]: {MEAS_TYPE_V_FROM: break_from, MEAS_TYPE_V_TO: break_to},
-            _DEVICE_TYPE_CODES["DCZeroBranch"]: {MEAS_TYPE_V_FROM: zero_from, MEAS_TYPE_V_TO: zero_to},
-            _DEVICE_TYPE_CODES["DCDCConverter"]: {MEAS_TYPE_V_FROM: dcdc_from, MEAS_TYPE_V_TO: dcdc_to},
-            _DEVICE_TYPE_CODES["DCGenerator"]: {MEAS_TYPE_V_GEN: gen_node},
-            _DEVICE_TYPE_CODES["DCLoad"]: {MEAS_TYPE_V_LOAD: load_node},
-        }
-
-    def _node_idx_lookup_for_name_arrays(self, names: np.ndarray, node_idx: np.ndarray) -> np.ndarray:
-        lookup = np.full(self._meas_ppc_device_names().size, -1, dtype=np.int64)
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for name, node_value in zip(names.tolist(), node_idx.tolist()):
-            name_id = name_id_by_name.get(name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if 0 <= idx < lookup.size:
-                lookup[idx] = int(node_value)
-        return lookup
-
-    def _build_array_measurement_scale_cache(self) -> bool:
-        """Build numeric name-id scale caches for the array-only measurement path."""
-        if self._meas_ppc_device_names().size == 0:
-            return False
-        self._node_measurement_scale_by_name = {}
-        self._branch_measurement_scale_by_name = {}
-        self._break_measurement_scale_by_name = {}
-        self._zero_branch_measurement_scale_by_name = {}
-        self._dcdc_measurement_scale_by_name = {}
-        self._generator_measurement_scale_by_name = {}
-        self._load_measurement_scale_by_name = {}
-        self._constraint_measurement_scale_by_name = {}
-        self._node_measurement_scale_by_name_id = self._empty_name_id_scale_array()
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        raw_names = getattr(self, "_raw_node_names_alive", np.asarray([], dtype=object))
-        raw_idx = getattr(self, "_raw_node_idx_alive", np.asarray([], dtype=np.int64))
-        if raw_names.size:
-            for name, node_idx in zip(raw_names.tolist(), raw_idx.tolist()):
-                name_id = name_id_by_name.get(name)
-                if name_id is None:
-                    continue
-                idx = int(name_id)
-                if 0 <= idx < self._node_measurement_scale_by_name_id.size:
-                    self._node_measurement_scale_by_name_id[idx] = self._voltage_file_base_by_idx[int(node_idx)]
-            self._branch_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id_arrays(
-                self._branch_names,
-                self._branch_i_node,
-                self._branch_j_node,
-            )
-            self._break_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id_arrays(
-                self._break_names,
-                self._break_i_node,
-                self._break_j_node,
-            )
-            self._zero_branch_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id_arrays(
-                self._zero_branch_names,
-                self._zero_branch_i_node,
-                self._zero_branch_j_node,
-            )
-            self._dcdc_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id_arrays(
-                self._dcdc_names,
-                self._dcdc_i_node,
-                self._dcdc_j_node,
-            )
-            self._generator_measurement_scale_by_code_name_id = self._single_device_scale_lookup_by_name_id_arrays(
-                self._generator_names,
-                self._generator_node,
-                power_code=MEAS_TYPE_P_GEN,
-                voltage_code=MEAS_TYPE_V_GEN,
-                current_code=MEAS_TYPE_I_GEN,
-            )
-            self._load_measurement_scale_by_code_name_id = self._single_device_scale_lookup_by_name_id_arrays(
-                self._load_names,
-                self._load_node,
-                power_code=MEAS_TYPE_P_LOAD,
-                voltage_code=MEAS_TYPE_V_LOAD,
-                current_code=MEAS_TYPE_I_LOAD,
-            )
-            constraint_names = np.concatenate((self._zero_branch_names, self._switch_names, self._break_names))
-            constraint_i_node = np.concatenate((self._zero_branch_i_node, self._switch_i_node, self._break_i_node))
-            self._constraint_measurement_scale_by_name_id = self._constraint_scale_lookup_by_name_id_arrays(
-                constraint_names,
-                constraint_i_node,
-            )
-            self._voltage_node_idx_by_code_name_id = self._build_voltage_node_idx_lookups_by_name_id()
-            return True
-        for name, node in self.node_by_name.items():
-            name_id = name_id_by_name.get(name)
-            if name_id is None:
-                continue
-            idx = int(name_id)
-            if 0 <= idx < self._node_measurement_scale_by_name_id.size:
-                self._node_measurement_scale_by_name_id[idx] = self._voltage_file_base_by_idx[int(node.idx)]
-        self._branch_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id(
-            self.branch_by_name.values()
-        )
-        self._break_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id(
-            self.break_by_name.values()
-        )
-        self._zero_branch_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id(
-            self.zero_branch_by_name.values()
-        )
-        self._dcdc_measurement_scale_by_code_name_id = self._terminal_scale_lookup_by_name_id(
-            self.dcdc_by_name.values()
-        )
-        self._generator_measurement_scale_by_code_name_id = self._single_device_scale_lookup_by_name_id(
-            self.generator_by_name.values(),
-            node_attr="node",
-            power_code=MEAS_TYPE_P_GEN,
-            voltage_code=MEAS_TYPE_V_GEN,
-            current_code=MEAS_TYPE_I_GEN,
-        )
-        self._load_measurement_scale_by_code_name_id = self._single_device_scale_lookup_by_name_id(
-            self.load_by_name.values(),
-            node_attr="node",
-            power_code=MEAS_TYPE_P_LOAD,
-            voltage_code=MEAS_TYPE_V_LOAD,
-            current_code=MEAS_TYPE_I_LOAD,
-        )
-        constraint_devices = list(self.zero_branch_by_name.values()) + list(self.switch_by_name.values()) + list(
-            self.break_by_name.values()
-        )
-        self._constraint_measurement_scale_by_name_id = self._constraint_scale_lookup_by_name_id(constraint_devices)
-        self._voltage_node_idx_by_code_name_id = self._build_voltage_node_idx_lookups_by_name_id()
-        return True
-
-    def _build_measurement_scale_cache(self) -> None:
-        """Cache file-unit scale factors used by the measurement normalization pass."""
-        if self._build_array_measurement_scale_cache():
-            return
-        self._node_measurement_scale_by_name = {
-            name: self._voltage_file_base_by_idx[int(node.idx)]
-            for name, node in self.node_by_name.items()
-        }
-        self._branch_measurement_scale_by_name = {
-            br.name: self._terminal_scale_tuple(br.i_node, br.j_node)
-            for br in self.branch_by_name.values()
-        }
-        self._break_measurement_scale_by_name = {
-            brk.name: self._terminal_scale_tuple(brk.i_node, brk.j_node)
-            for brk in self.break_by_name.values()
-        }
-        self._zero_branch_measurement_scale_by_name = {
-            zbr.name: self._terminal_scale_tuple(zbr.i_node, zbr.j_node)
-            for zbr in self.zero_branch_by_name.values()
-        }
-        self._dcdc_measurement_scale_by_name = {
-            conv.name: self._terminal_scale_tuple(conv.i_node, conv.j_node)
-            for conv in self.dcdc_by_name.values()
-        }
-        self._generator_measurement_scale_by_name = {
-            gen.name: self._single_device_scale_tuple(gen.node, MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN)
-            for gen in self.generator_by_name.values()
-        }
-        self._load_measurement_scale_by_name = {
-            load.name: self._single_device_scale_tuple(load.node, MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD)
-            for load in self.load_by_name.values()
-        }
-        self._constraint_measurement_scale_by_name = {
-            name: self._voltage_file_base_by_idx[int(dev.i_node)]
-            for name, dev in {**self.zero_branch_by_name, **self.switch_by_name, **self.break_by_name}.items()
-        }
-
     def _meas_ppc_device_names(self) -> np.ndarray:
         meas_ppc = getattr(self, "meas_ppc", None)
         if isinstance(meas_ppc, dict):
@@ -2139,18 +1760,6 @@ class DCStateEstimator:
             if isinstance(lookup, dict):
                 return lookup
         return {}
-
-    @staticmethod
-    def _active_device_name_id_key(device_type_code: int, device_name_id: int) -> int:
-        return (int(device_type_code) << _ACTIVE_NAME_ID_KEY_BITS) | int(device_name_id)
-
-    @staticmethod
-    def _active_measurement_name_id_key(device_type_code: int, device_name_id: int, meas_type_code: int) -> int:
-        return (
-            (int(device_type_code) << (_ACTIVE_NAME_ID_KEY_BITS + _ACTIVE_MEAS_TYPE_KEY_BITS))
-            | (int(device_name_id) << _ACTIVE_MEAS_TYPE_KEY_BITS)
-            | int(meas_type_code)
-        )
 
     @staticmethod
     def _active_device_pos_key(device_type_code: int, device_pos: int) -> int:
@@ -2186,38 +1795,6 @@ class DCStateEstimator:
             | np.asarray(meas_type_code, dtype=np.int64)
         )
 
-    @staticmethod
-    def _active_device_name_id_key_array(device_type_code: np.ndarray, device_name_id: np.ndarray) -> np.ndarray:
-        return (
-            np.asarray(device_type_code, dtype=np.int64) << _ACTIVE_NAME_ID_KEY_BITS
-        ) | np.asarray(device_name_id, dtype=np.int64)
-
-    @staticmethod
-    def _active_measurement_name_id_key_array(
-        device_type_code: np.ndarray,
-        device_name_id: np.ndarray,
-        meas_type_code: np.ndarray,
-    ) -> np.ndarray:
-        return (
-            (np.asarray(device_type_code, dtype=np.int64) << (_ACTIVE_NAME_ID_KEY_BITS + _ACTIVE_MEAS_TYPE_KEY_BITS))
-            | (np.asarray(device_name_id, dtype=np.int64) << _ACTIVE_MEAS_TYPE_KEY_BITS)
-            | np.asarray(meas_type_code, dtype=np.int64)
-        )
-
-    def _active_device_cache_key(self, device_type: str, device_name: str):
-        raise RuntimeError("DC SE active device cache requires device_type_code and device_pos")
-
-    def _active_measurement_cache_key(self, device_type: str, device_name: str, meas_type: str):
-        raise RuntimeError("DC SE active measurement cache requires device_type_code, device_pos and meas_type_code")
-
-    def _active_device_cache_contains(self, device_type: str, device_name: str, keys: set) -> bool:
-        key = self._active_device_cache_key(device_type, device_name)
-        return key is not None and key in keys
-
-    def _active_measurement_cache_contains(self, device_type: str, device_name: str, meas_type: str, keys: set) -> bool:
-        key = self._active_measurement_cache_key(device_type, device_name, meas_type)
-        return key is not None and key in keys
-
     def _seed_ppc_rows_from_device_pos(self, device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
         rows = np.full(np.asarray(device_pos).size, -1, dtype=np.int64)
         codes = np.asarray(device_type_code, dtype=np.int16)
@@ -2238,207 +1815,6 @@ class DCStateEstimator:
         assign(DEVICE_TYPE_DCLoad, self._load_rows)
         assign(DEVICE_TYPE_DCDCConverter, self._dcdc_rows)
         return rows
-
-    def _scalar_scale_lookup_by_name_id(self, scale_by_name: Dict[str, float]) -> np.ndarray:
-        device_names = self._meas_ppc_device_names()
-        scale = np.ones(int(device_names.size), dtype=np.float64)
-        if device_names.size == 0:
-            return scale
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for name, value in scale_by_name.items():
-            name_id = name_id_by_name.get(name)
-            if name_id is not None and 0 <= int(name_id) < scale.size:
-                scale[int(name_id)] = float(value)
-        return scale
-
-    def _tuple_scale_lookup_by_name_id(self, scale_by_name: Dict[str, Tuple[float, ...]]) -> np.ndarray:
-        device_names = self._meas_ppc_device_names()
-        scale = np.ones((int(device_names.size), _MAX_MEAS_TYPE_CODE + 1), dtype=np.float64)
-        if device_names.size == 0:
-            return scale
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        for name, values in scale_by_name.items():
-            name_id = name_id_by_name.get(name)
-            if name_id is None or not (0 <= int(name_id) < scale.shape[0]):
-                continue
-            value_array = np.asarray(values, dtype=np.float64)
-            width = min(scale.shape[1], int(value_array.size))
-            if width:
-                scale[int(name_id), :width] = value_array[:width]
-        return scale
-
-    def _fill_scalar_scale_by_id(
-        self,
-        scale: np.ndarray,
-        rows: np.ndarray,
-        lookup: np.ndarray,
-        device_name_id: np.ndarray,
-        meas_type_code: np.ndarray,
-        allowed_code: int,
-    ) -> None:
-        if rows.size == 0 or lookup.size == 0:
-            return
-        selected = rows[meas_type_code[rows] == int(allowed_code)]
-        if selected.size == 0:
-            return
-        ids = device_name_id[selected].astype(np.int64, copy=False)
-        valid = (ids >= 0) & (ids < lookup.size)
-        if np.any(valid):
-            scale[selected[valid]] = lookup[ids[valid].astype(np.intp, copy=False)]
-
-    def _fill_tuple_scale_by_id(
-        self,
-        scale: np.ndarray,
-        rows: np.ndarray,
-        lookup: np.ndarray,
-        device_name_id: np.ndarray,
-        meas_type_code: np.ndarray,
-    ) -> None:
-        if rows.size == 0 or lookup.size == 0:
-            return
-        ids = device_name_id[rows].astype(np.int64, copy=False)
-        kinds = meas_type_code[rows].astype(np.int64, copy=False)
-        valid = (ids >= 0) & (ids < lookup.shape[0]) & (kinds >= 0) & (kinds < lookup.shape[1])
-        if np.any(valid):
-            scale[rows[valid]] = lookup[ids[valid].astype(np.intp, copy=False), kinds[valid].astype(np.intp, copy=False)]
-
-    def _fill_code_scale_by_id(
-        self,
-        scale: np.ndarray,
-        rows: np.ndarray,
-        lookup_by_code: Dict[int, object],
-        device_name_id: np.ndarray,
-        meas_type_code: np.ndarray,
-    ) -> None:
-        if rows.size == 0 or not lookup_by_code:
-            return
-        row_codes = meas_type_code[rows]
-        row_ids = device_name_id[rows].astype(np.int64, copy=False)
-        for code_int, lookup in lookup_by_code.items():
-            selected_mask = row_codes == int(code_int)
-            if not np.any(selected_mask):
-                continue
-            selected = rows[selected_mask]
-            if np.isscalar(lookup):
-                scale[selected] = float(lookup)
-                continue
-            lookup_array = np.asarray(lookup, dtype=np.float64)
-            ids = row_ids[selected_mask]
-            valid = (ids >= 0) & (ids < lookup_array.size)
-            if np.any(valid):
-                scale[selected[valid]] = lookup_array[ids[valid].astype(np.intp, copy=False)]
-
-    @staticmethod
-    def _update_best_by_node(
-        best: Dict[int, Tuple[float, float]],
-        node_idx: np.ndarray,
-        weight: np.ndarray,
-        value: np.ndarray,
-    ) -> None:
-        nodes = np.asarray(node_idx, dtype=np.int64)
-        if nodes.size == 0:
-            return
-        weights = np.asarray(weight, dtype=np.float64)
-        values = np.asarray(value, dtype=np.float64)
-        unique_nodes, inverse = np.unique(nodes, return_inverse=True)
-        max_weight = np.full(unique_nodes.size, -np.inf, dtype=np.float64)
-        np.maximum.at(max_weight, inverse, weights)
-        is_best = weights == max_weight[inverse]
-        best_pos = np.full(unique_nodes.size, nodes.size, dtype=np.int64)
-        np.minimum.at(best_pos, inverse[is_best], np.flatnonzero(is_best).astype(np.int64, copy=False))
-        chosen = best_pos[best_pos < nodes.size]
-        for node, row_weight, row_value in zip(nodes[chosen].tolist(), weights[chosen].tolist(), values[chosen].tolist()):
-            node_int = int(node)
-            current = best.get(node_int)
-            if current is None or float(row_weight) > current[0]:
-                best[node_int] = (float(row_weight), float(row_value))
-
-    def _voltage_best_from_name_id_arrays(
-        self,
-        active: np.ndarray,
-        status_code: np.ndarray,
-        device_type_code: np.ndarray,
-        device_name_id: np.ndarray,
-        meas_type_code: np.ndarray,
-        value: np.ndarray,
-        weight: np.ndarray,
-    ) -> Tuple[Dict[int, Tuple[float, float]], Dict[int, Tuple[float, float]]]:
-        node_voltage_best: Dict[int, Tuple[float, float]] = {}
-        real_voltage_best: Dict[int, Tuple[float, float]] = {}
-        lookup_by_type = getattr(self, "_voltage_node_idx_by_code_name_id", None)
-        if not lookup_by_type:
-            return node_voltage_best, real_voltage_best
-        real_rows = np.flatnonzero(active & (status_code != MEAS_STATUS_PSEUDO))
-        if real_rows.size == 0:
-            return node_voltage_best, real_voltage_best
-        for type_code, meas_lookup in lookup_by_type.items():
-            type_rows = real_rows[device_type_code[real_rows] == int(type_code)]
-            if type_rows.size == 0:
-                continue
-            type_meas_code = meas_type_code[type_rows]
-            type_name_id = device_name_id[type_rows].astype(np.int64, copy=False)
-            for meas_code, node_lookup in meas_lookup.items():
-                rows = type_rows[type_meas_code == int(meas_code)]
-                if rows.size == 0:
-                    continue
-                ids = type_name_id[type_meas_code == int(meas_code)]
-                valid = (ids >= 0) & (ids < node_lookup.size)
-                if not np.any(valid):
-                    continue
-                nodes = node_lookup[ids[valid].astype(np.intp, copy=False)]
-                valid_node = nodes >= 0
-                if not np.any(valid_node):
-                    continue
-                selected = rows[valid][valid_node]
-                nodes = nodes[valid_node]
-                self._update_best_by_node(real_voltage_best, nodes, weight[selected], value[selected])
-                if int(type_code) == _DEVICE_TYPE_CODES["DCNode"] and int(meas_code) == MEAS_TYPE_V:
-                    self._update_best_by_node(node_voltage_best, nodes, weight[selected], value[selected])
-        return node_voltage_best, real_voltage_best
-
-    def _measurement_strings_from_codes(
-        self,
-        table: MeasurementTable,
-        rows: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        row_idx = np.asarray(rows, dtype=np.int64)
-        if row_idx.size == 0:
-            empty = np.asarray([], dtype=object)
-            return empty, empty, empty
-        device_type_array = np.asarray(table.device_type, dtype=object)
-        device_name_array = np.asarray(table.device_name, dtype=object)
-        meas_type_array = np.asarray(table.meas_type, dtype=object)
-        if (
-            device_type_array.size == table.idx.size
-            and device_name_array.size == table.idx.size
-            and meas_type_array.size == table.idx.size
-        ):
-            return device_type_array[row_idx], device_name_array[row_idx], meas_type_array[row_idx]
-        device_names = self._meas_ppc_device_names()
-        name_ids = getattr(table, "device_name_id", None)
-        if name_ids is None:
-            name_values = np.asarray([""] * row_idx.size, dtype=object)
-        else:
-            name_ids = np.asarray(name_ids, dtype=np.int64)
-            name_values = np.asarray([""] * row_idx.size, dtype=object)
-            ids = name_ids[row_idx]
-            in_range = (ids >= 0) & (ids < device_names.size)
-            if np.any(in_range):
-                name_values[in_range] = device_names[ids[in_range].astype(np.intp, copy=False)]
-        type_values = np.asarray(
-            [DEVICE_TYPE_NAMES.get(int(code), "") for code in table.device_type_code[row_idx]],
-            dtype=object,
-        )
-        meas_type_code = getattr(table, "meas_type_code", None)
-        if meas_type_code is None:
-            meas_values = np.asarray([""] * row_idx.size, dtype=object)
-        else:
-            meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
-            meas_values = np.asarray(
-                [MEAS_TYPE_NAMES.get(int(code), "") for code in meas_type_code[row_idx]],
-                dtype=object,
-            )
-        return type_values, name_values, meas_values
 
     def _convert_measurements_to_pu(self) -> None:
         """Normalize file measurement values to the internal state-estimation units."""
@@ -2971,192 +2347,6 @@ class DCStateEstimator:
             node_idx: value for node_idx, (_weight, value) in real_voltage_best.items()
         }
 
-    def _record_measurement_summary(self, meas: Measurement) -> None:
-        if not hasattr(self, "_max_measurement_idx"):
-            self._refresh_measurement_summary_cache()
-        if meas.idx > self._max_measurement_idx:
-            self._max_measurement_idx = int(meas.idx)
-        if meas.valid and meas.weight > 0.0:
-            device_key = self._active_device_cache_key(meas.device_type, meas.device_name)
-            measurement_key = self._active_measurement_cache_key(meas.device_type, meas.device_name, meas.meas_type)
-            if device_key is not None:
-                self._active_device_key_cache.add(device_key)
-            if measurement_key is not None:
-                self._active_measurement_key_cache.add(measurement_key)
-
-    def _device_pos_for_measurement_name(self, device_type: str, device_name: str) -> int:
-        self._ensure_measurement_plan_lookup_arrays()
-        code = _DEVICE_TYPE_CODES.get(device_type, 0)
-        pos_map = self._measurement_plan_device_pos_by_type_code.get(int(code))
-        if not pos_map:
-            return -1
-        return int(pos_map.get(device_name, -1))
-
-    def _append_pseudo_measurement_to_table(
-        self,
-        measurement: Measurement,
-        *,
-        device_type_code: int,
-        meas_type_code: int,
-        device_pos: int,
-    ) -> bool:
-        table = getattr(self.measurements, "table", None)
-        if table is None:
-            return False
-        if not isinstance(self.measurements, TableBackedMeasurementList):
-            return False
-        include_strings = np.asarray(table.device_name, dtype=object).size == int(table.idx.size)
-        if include_strings:
-            return False
-        name_id = self._meas_ppc_device_name_ids().get(measurement.device_name, -1)
-        if not hasattr(self, "active_measurements"):
-            pending = getattr(self, "_pending_pseudo_table_rows", None)
-            if pending is None:
-                pending = {
-                    "idx": [],
-                    "weight": [],
-                    "valid": [],
-                    "value": [],
-                    "status": [],
-                    "device_type_code": [],
-                    "device_name_id": [],
-                    "meas_type_code": [],
-                    "device_pos": [],
-                }
-                self._pending_pseudo_table_rows = pending
-            pending["idx"].append(int(measurement.idx))
-            pending["weight"].append(float(measurement.weight))
-            pending["valid"].append(bool(measurement.valid))
-            pending["value"].append(float(measurement.value))
-            pending["status"].append(int(measurement.status))
-            pending["device_type_code"].append(int(device_type_code))
-            pending["device_name_id"].append(int(name_id))
-            pending["meas_type_code"].append(int(meas_type_code))
-            pending["device_pos"].append(int(device_pos))
-            return True
-        row_table = MeasurementTable(
-            idx=np.asarray([measurement.idx], dtype=np.int64),
-            name=np.asarray([measurement.name], dtype=object) if include_strings else np.asarray([], dtype=object),
-            device_type=np.asarray([measurement.device_type], dtype=object) if include_strings else np.asarray([], dtype=object),
-            device_name=np.asarray([measurement.device_name], dtype=object) if include_strings else np.asarray([], dtype=object),
-            meas_type=np.asarray([measurement.meas_type], dtype=object) if include_strings else np.asarray([], dtype=object),
-            weight=np.asarray([measurement.weight], dtype=np.float64),
-            valid=np.asarray([measurement.valid], dtype=bool),
-            value=np.asarray([measurement.value], dtype=np.float64),
-            device_type_code=np.asarray([device_type_code], dtype=np.int16),
-            angle_mask=np.asarray([False], dtype=bool),
-            status_code=np.asarray([measurement.status], dtype=np.int16),
-            rows_by_device_type_code={int(device_type_code): np.asarray([0], dtype=np.int64)},
-            device_name_id=np.asarray([name_id], dtype=np.int64),
-            meas_type_code=np.asarray([meas_type_code], dtype=np.int16),
-            device_pos=np.asarray([device_pos], dtype=np.int64),
-        )
-        table.device_pos = self._measurement_device_pos_array(table)
-        self.measurements.table = concat_measurement_tables(table, row_table)
-        self.measurement_table = self.measurements.table
-        self.measurements._table_prefix_size = int(self.measurements.table.idx.size)
-        return True
-
-    def _flush_pending_pseudo_measurement_table_rows(self) -> None:
-        pending = getattr(self, "_pending_pseudo_table_rows", None)
-        if not pending:
-            return
-        count = len(pending["idx"])
-        if count == 0:
-            self._pending_pseudo_table_rows = None
-            return
-        table = getattr(self.measurements, "table", None)
-        if table is None or not isinstance(self.measurements, TableBackedMeasurementList):
-            self._pending_pseudo_table_rows = None
-            return
-        device_type_code = np.asarray(pending["device_type_code"], dtype=np.int16)
-        row_table = MeasurementTable(
-            idx=np.asarray(pending["idx"], dtype=np.int64),
-            name=np.asarray([], dtype=object),
-            device_type=np.asarray([], dtype=object),
-            device_name=np.asarray([], dtype=object),
-            meas_type=np.asarray([], dtype=object),
-            weight=np.asarray(pending["weight"], dtype=np.float64),
-            valid=np.asarray(pending["valid"], dtype=bool),
-            value=np.asarray(pending["value"], dtype=np.float64),
-            device_type_code=device_type_code,
-            angle_mask=np.zeros(count, dtype=bool),
-            status_code=np.asarray(pending["status"], dtype=np.int16),
-            rows_by_device_type_code={
-                int(code): np.flatnonzero(device_type_code == int(code)).astype(np.int64, copy=False)
-                for code in np.unique(device_type_code)
-            },
-            device_name_id=np.asarray(pending["device_name_id"], dtype=np.int64),
-            meas_type_code=np.asarray(pending["meas_type_code"], dtype=np.int16),
-            device_pos=np.asarray(pending["device_pos"], dtype=np.int64),
-        )
-        table.device_pos = self._measurement_device_pos_array(table)
-        self.measurements.table = concat_measurement_tables(table, row_table)
-        self.measurement_table = self.measurements.table
-        self.measurements._table_prefix_size = int(self.measurements.table.idx.size)
-        self._pending_pseudo_table_rows = None
-
-    def _append_pseudo_measurement(
-        self,
-        next_idx: int,
-        name: str,
-        device_type: str,
-        device_name: str,
-        meas_type: str,
-        value: float,
-        *,
-        weight: Optional[float] = None,
-        record_summary: bool = True,
-    ) -> int:
-        measurement = Measurement.__new__(Measurement)
-        measurement.idx = next_idx
-        measurement.name = name
-        measurement.device_type = device_type
-        measurement.device_name = device_name
-        measurement.meas_type = meas_type
-        measurement.weight = self.pseudo_measurement_weight if weight is None else float(weight)
-        measurement.valid = True
-        measurement.value = float(value)
-        mark_measurement_pseudo(measurement)
-        device_type_code = int(_DEVICE_TYPE_CODES.get(device_type, 0))
-        meas_type_code = int(MEAS_TYPE_CODES.get(meas_type, 0))
-        appended_to_table = self._append_pseudo_measurement_to_table(
-            measurement,
-            device_type_code=device_type_code,
-            meas_type_code=meas_type_code,
-            device_pos=self._device_pos_for_measurement_name(device_type, device_name),
-        )
-        if not appended_to_table:
-            self.measurements.append(measurement)
-        if record_summary:
-            self._record_measurement_summary(measurement)
-        elif next_idx > getattr(self, "_max_measurement_idx", 0):
-            self._max_measurement_idx = int(next_idx)
-        return next_idx + 1
-
-    @staticmethod
-    def _generator_pseudo_power(gen) -> float:
-        # Prefer solved output when available; otherwise infer from the control mode.
-        p = getattr(gen, "p", None)
-        if p is not None:
-            return float(p)
-        control_type = str(getattr(gen, "control_type", "")).upper()
-        if control_type == "I":
-            node = getattr(gen, "node_obj", None)
-            voltage = float(getattr(node, "voltage", 1.0) or 1.0)
-            return float(getattr(gen, "i_set", 0.0) or 0.0) * voltage
-        return float(getattr(gen, "p_set", 0.0) or 0.0)
-
-    @staticmethod
-    def _load_pseudo_power(load) -> float:
-        # Loads may be voltage dependent, so evaluate the ZIP model at the current seed voltage.
-        p = getattr(load, "p", None)
-        if p is not None:
-            return float(p)
-        node = getattr(load, "node_obj", None)
-        voltage = float(getattr(node, "voltage", 1.0) or 1.0)
-        return float(getattr(load, "pbase", 1.0) * (load.pv0 + load.pv1 * voltage + load.pv2 * voltage * voltage))
-
     def _topology_voltage_pseudo_seed(self, i_node: int, j_node: int, i_pos: int) -> float:
         """Pick a voltage seed for DC zero-impedance topology pseudo measurements."""
         for node_idx in (i_node, j_node):
@@ -3516,7 +2706,6 @@ class DCStateEstimator:
         )
         if added_keys:
             measured_keys.update(added_keys)
-        self._flush_pending_pseudo_measurement_table_rows()
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch DC rank deficiencies and optional post-observability redundancy."""
@@ -3545,13 +2734,8 @@ class DCStateEstimator:
                 continue
             next_idx = self._next_measurement_idx()
             existing_keys = self._active_measurement_keys()
-            if bool(getattr(self, "_array_only_runtime", False)):
-                existing_names = set()
-            else:
-                existing_names = {meas.name for meas in self.measurements}
             added = 0
             refreshed = False
-            measurement_count_before = len(self.measurements)
             remaining = batch_limit
             for state_idx, _score in observability.weak_states:
                 if added >= remaining:
@@ -3560,7 +2744,6 @@ class DCStateEstimator:
                     next_idx,
                     state_idx,
                     existing_keys,
-                    existing_names,
                     remaining - added,
                 )
                 added += added_count
@@ -3570,10 +2753,6 @@ class DCStateEstimator:
             if added == 0:
                 break
             total_added += added
-            if not refreshed:
-                refreshed = self._incremental_update_active_measurement_indexes(
-                    self.measurements[measurement_count_before:]
-                )
             if not refreshed:
                 self._refresh_active_measurement_indexes()
         return total_added
@@ -3590,170 +2769,286 @@ class DCStateEstimator:
         candidates = self._observability_pseudo_candidate_measurements()
         if not candidates:
             return 0
-        selected = self._select_weak_direction_pseudo_candidates(observability, candidates, max_add)
-        if not selected:
+        selected_rows = self._select_weak_direction_pseudo_candidates(observability, candidates, max_add)
+        if selected_rows.size == 0:
             return 0
         next_idx = self._next_measurement_idx()
-        measurement_count_before = len(self.measurements)
-        for candidate in selected:
-            candidate.idx = next_idx
-            next_idx += 1
-            self.measurements.append(candidate)
+        candidate_table = getattr(candidates, "table", None)
+        if candidate_table is None:
+            return 0
+        selected_table = measurement_table_take(candidate_table, selected_rows)
+        selected_count = int(selected_table.idx.size)
+        self._append_pseudo_measurement_rows(
+            next_idx,
+            selected_table.name,
+            selected_table.device_type,
+            selected_table.device_name,
+            selected_table.meas_type,
+            selected_table.value,
+            weights=selected_table.weight,
+            device_type_codes=selected_table.device_type_code,
+            device_name_ids=selected_table.device_name_id,
+            meas_type_codes=selected_table.meas_type_code,
+            device_positions=selected_table.device_pos,
+        )
         if refresh:
-            refreshed = self._incremental_update_active_measurement_indexes(
-                self.measurements[measurement_count_before:]
-            )
-            if not refreshed:
-                self._refresh_active_measurement_indexes()
-        return len(selected)
+            self._refresh_active_measurement_indexes()
+        return selected_count
 
     def _add_redundant_observability_pseudo_measurements(self, max_add: int, refresh: bool = True) -> int:
         observability = self.observability_analysis()
         return self._add_weak_direction_observability_pseudo_measurements(observability, max_add, refresh)
 
-    def _observability_pseudo_candidate_measurements(self) -> List[Measurement]:
+    def _observability_pseudo_candidate_measurements(self) -> MeasurementTableView:
         """Build low-weight candidate pseudo rows for weak-direction observability repair."""
         existing_keys = self._active_measurement_keys()
-        existing_names = {meas.name for meas in self.measurements}
-        candidates: List[Measurement] = []
+        candidate_keys = set()
+        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        capacity = (
+            int(self._raw_node_names_alive.size)
+            + 2 * int(self._load_names.size)
+            + 2 * int(self._generator_names.size)
+            + 2 * int(self._branch_names.size)
+            + 2 * int(self._dcdc_names.size)
+        )
+        names = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
+        device_types = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
+        device_names = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
+        meas_types = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
+        device_type_codes = np.empty(capacity, dtype=np.int16)
+        device_name_ids = np.full(capacity, -1, dtype=np.int64)
+        device_positions = np.empty(capacity, dtype=np.int64)
+        meas_type_codes = np.empty(capacity, dtype=np.int16)
+        values = np.empty(capacity, dtype=np.float64)
+        count = 0
 
-        def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
-            key = self._active_measurement_cache_key(device_type, device_name, meas_type)
-            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
-            if self._voltage_pseudo_is_covered(device_type, device_name, meas_type):
+        def add(
+            device_type_code: int,
+            device_type: str,
+            device_name: str,
+            device_pos: int,
+            meas_type_code: int,
+            meas_type: str,
+            value: float,
+        ) -> None:
+            nonlocal count
+            device_type_code = int(device_type_code)
+            device_pos = int(device_pos)
+            meas_type_code = int(meas_type_code)
+            if device_type_code <= 0 or device_pos < 0 or meas_type_code <= 0:
                 return
-            if key is None or key in existing_keys or pseudo_name in existing_names:
+            key = self._active_measurement_pos_key(device_type_code, device_pos, meas_type_code)
+            if (
+                meas_type_code in _VOLTAGE_MEASUREMENT_TYPE_CODES
+                and self._voltage_pseudo_is_covered_by_pos(device_type_code, device_pos, meas_type_code)
+            ):
                 return
-            candidates.append(
-                Measurement(
-                    0,
-                    pseudo_name,
-                    device_type,
-                    device_name,
-                    meas_type,
-                    self.pseudo_measurement_weight,
-                    True,
-                    float(value),
-                    MEAS_STATUS_PSEUDO,
+            if key in existing_keys or key in candidate_keys:
+                return
+            row = count
+            if store_strings:
+                names[row] = f"pseudo_obs_{meas_type.lower()}_{device_name}"
+                device_types[row] = device_type
+                device_names[row] = str(device_name)
+                meas_types[row] = meas_type
+            device_type_codes[row] = device_type_code
+            device_positions[row] = device_pos
+            meas_type_codes[row] = meas_type_code
+            values[row] = float(value)
+            count = row + 1
+            candidate_keys.add(key)
+
+        for device_pos, (name, node_pos) in enumerate(
+            zip(self._raw_node_names_alive.tolist(), self._raw_node_solver_pos_alive.tolist())
+        ):
+            node_pos = int(node_pos)
+            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+            add(DEVICE_TYPE_DCNode, "DCNode", str(name), int(device_pos), MEAS_TYPE_V, "V", voltage)
+
+        load_rows = self._load_rows.astype(np.intp, copy=False)
+        for device_pos in range(int(self._load_names.size)):
+            node_pos = int(self._load_pos[device_pos])
+            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+            row = int(load_rows[device_pos])
+            table_row = self._load_table[row]
+            p_value = float(table_row[DC_LOAD_COLS["p"]])
+            if p_value == 0.0:
+                p_value = float(table_row[DC_LOAD_COLS["pbase"]]) * (
+                    float(table_row[DC_LOAD_COLS["pv0"]])
+                    + float(table_row[DC_LOAD_COLS["pv1"]]) * voltage
+                    + float(table_row[DC_LOAD_COLS["pv2"]]) * voltage * voltage
                 )
-            )
-            existing_keys.add(key)
-            existing_names.add(pseudo_name)
+            name = str(self._load_names[device_pos])
+            add(DEVICE_TYPE_DCLoad, "DCLoad", name, device_pos, MEAS_TYPE_P_LOAD, "P_LOAD", p_value)
+            add(DEVICE_TYPE_DCLoad, "DCLoad", name, device_pos, MEAS_TYPE_V_LOAD, "V_LOAD", voltage)
 
-        for node in sorted(self.node_by_name.values(), key=lambda item: item.idx):
-            add("DCNode", node.name, "V", float(getattr(node, "voltage", 1.0) or 1.0))
+        gen_rows = self._generator_rows.astype(np.intp, copy=False)
+        for device_pos in range(int(self._generator_names.size)):
+            node_pos = int(self._generator_pos[device_pos])
+            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+            row = int(gen_rows[device_pos])
+            table_row = self._gen_table[row]
+            p_value = float(table_row[DC_GEN_COLS["p"]])
+            if p_value == 0.0:
+                ctrl = int(table_row[DC_GEN_COLS["control_type"]])
+                p_value = (
+                    float(table_row[DC_GEN_COLS["i_set"]]) * voltage
+                    if ctrl == DC_CTRL_I
+                    else float(table_row[DC_GEN_COLS["p_set"]])
+                )
+            name = str(self._generator_names[device_pos])
+            add(DEVICE_TYPE_DCGenerator, "DCGenerator", name, device_pos, MEAS_TYPE_P_GEN, "P_GEN", p_value)
+            add(DEVICE_TYPE_DCGenerator, "DCGenerator", name, device_pos, MEAS_TYPE_V_GEN, "V_GEN", voltage)
 
-        for load in sorted(self.load_by_name.values(), key=lambda item: item.idx):
-            voltage = float(getattr(getattr(load, "node_obj", None), "voltage", 1.0) or 1.0)
-            add("DCLoad", load.name, "P_LOAD", self._load_pseudo_power(load))
-            add("DCLoad", load.name, "V_LOAD", voltage)
+        branch_table = np.asarray(self._dc_ppc.get("branch", np.zeros((0, len(DC_BRANCH_COLS)))), dtype=np.float64)
+        branch_rows = self._branch_rows.astype(np.intp, copy=False)
+        for device_pos in range(int(self._branch_names.size)):
+            row = int(branch_rows[device_pos])
+            if 0 <= row < branch_table.shape[0]:
+                name = str(self._branch_names[device_pos])
+                add(DEVICE_TYPE_DCBranch, "DCBranch", name, device_pos, MEAS_TYPE_P_FROM, "P_FROM", float(branch_table[row, DC_BRANCH_COLS["i_p"]]))
+                add(DEVICE_TYPE_DCBranch, "DCBranch", name, device_pos, MEAS_TYPE_P_TO, "P_TO", float(branch_table[row, DC_BRANCH_COLS["j_p"]]))
 
-        for gen in self.generator_order:
-            voltage = float(getattr(getattr(gen, "node_obj", None), "voltage", 1.0) or 1.0)
-            add("DCGenerator", gen.name, "P_GEN", self._generator_pseudo_power(gen))
-            add("DCGenerator", gen.name, "V_GEN", voltage)
+        dcdc_table = np.asarray(self._dc_ppc.get("dcdc", np.zeros((0, len(DC_DCDC_COLS)))), dtype=np.float64)
+        dcdc_rows = self._dcdc_rows.astype(np.intp, copy=False)
+        for device_pos in range(int(self._dcdc_names.size)):
+            row = int(dcdc_rows[device_pos])
+            if 0 <= row < dcdc_table.shape[0]:
+                name = str(self._dcdc_names[device_pos])
+                add(DEVICE_TYPE_DCDCConverter, "DCDCConverter", name, device_pos, MEAS_TYPE_P_FROM, "P_FROM", float(dcdc_table[row, DC_DCDC_COLS["i_p"]]))
+                add(DEVICE_TYPE_DCDCConverter, "DCDCConverter", name, device_pos, MEAS_TYPE_P_TO, "P_TO", float(dcdc_table[row, DC_DCDC_COLS["j_p"]]))
 
-        for branch in sorted(self.branch_by_name.values(), key=lambda item: item.idx):
-            add("DCBranch", branch.name, "P_FROM", float(getattr(branch, "i_p", 0.0) or 0.0))
-            add("DCBranch", branch.name, "P_TO", float(getattr(branch, "j_p", 0.0) or 0.0))
-
-        return candidates
+        candidate_table = self._pseudo_measurement_table(
+            names[:count] if store_strings else np.asarray([], dtype=object),
+            device_types[:count] if store_strings else np.asarray([], dtype=object),
+            device_names[:count] if store_strings else np.asarray([], dtype=object),
+            meas_types[:count] if store_strings else np.asarray([], dtype=object),
+            values[:count],
+            self.pseudo_measurement_weight,
+            device_type_codes=device_type_codes[:count],
+            device_name_ids=device_name_ids[:count],
+            meas_type_codes=meas_type_codes[:count],
+            device_positions=device_positions[:count],
+        )
+        return MeasurementTableView(candidate_table, normalized=True)
 
     def _select_weak_direction_pseudo_candidates(
         self,
         observability: ObservabilityResult,
         candidates: Sequence[Measurement],
         max_add: int,
-    ) -> List[Measurement]:
+    ) -> np.ndarray:
         if max_add <= 0 or not candidates:
-            return []
+            return np.asarray([], dtype=np.int64)
+        candidate_count = int(len(candidates))
         x = self.initial_state()
         cache = self._observability_matrix_cache_for(observability, self.active_measurements, x)
         H = cache.get("H") if cache is not None else self.jacobian_sparse(x, self.active_measurements)
         direction = observability_weak_direction(H, self.n_state, observability.weak_states)
         if direction.size != self.n_state or not np.any(direction):
-            return list(candidates[:max_add])
+            return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
         candidate_h = self.jacobian_sparse(x, candidates)
         scores = np.abs(candidate_h @ direction)
         scores = np.asarray(scores, dtype=np.float64).reshape(-1)
         if scores.size != len(candidates) or not np.any(scores > 0.0):
-            return list(candidates[:max_add])
-        order = np.argsort(-scores, kind="stable")
-        selected = [candidates[int(pos)] for pos in order[:max_add] if scores[int(pos)] > 0.0]
-        return selected or list(candidates[:max_add])
+            return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
+        positive = np.flatnonzero(scores > 0.0)
+        if positive.size > max_add:
+            top = positive[np.argpartition(-scores[positive], max_add - 1)[:max_add]]
+            order = top[np.argsort(-scores[top], kind="stable")]
+        else:
+            order = positive[np.argsort(-scores[positive], kind="stable")]
+        selected = np.asarray(order[:max_add], dtype=np.int64)
+        if selected.size:
+            return selected
+        return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
 
     def _append_targeted_observability_pseudo(
         self,
         next_idx: int,
         state_idx: int,
         existing_keys: set,
-        existing_names: set,
         max_add: int,
     ) -> Tuple[int, int]:
         """Translate a weak compact DC state into the smallest useful pseudo measurement."""
         meta = state_meta_at(self.state_meta, state_idx)
         if meta is None:
             return next_idx, 0
-        name = meta.device_name
+        name = str(meta.device_name)
+        device_type_code = int(meta.device_type_code)
+        device_pos = int(meta.device_pos)
         added_total = 0
 
-        def add(device_type: str, device_name: str, meas_type: str, value: float) -> Tuple[int, int]:
+        def add(
+            target_device_type_code: int,
+            device_type: str,
+            device_name: str,
+            target_device_pos: int,
+            target_meas_type_code: int,
+            meas_type: str,
+            value: float,
+        ) -> Tuple[int, int]:
             nonlocal added_total
             if added_total >= max_add:
                 return next_idx, 0
-            key = self._active_measurement_cache_key(device_type, device_name, meas_type)
-            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
-            if self._voltage_pseudo_is_covered(device_type, device_name, meas_type):
+            target_device_type_code = int(target_device_type_code)
+            target_device_pos = int(target_device_pos)
+            target_meas_type_code = int(target_meas_type_code)
+            if target_device_type_code <= 0 or target_device_pos < 0 or target_meas_type_code <= 0:
                 return next_idx, 0
-            if key is None or key in existing_keys or pseudo_name in existing_names:
+            key = self._active_measurement_pos_key(target_device_type_code, target_device_pos, target_meas_type_code)
+            if (
+                target_meas_type_code in _VOLTAGE_MEASUREMENT_TYPE_CODES
+                and self._voltage_pseudo_is_covered_by_pos(
+                    target_device_type_code,
+                    target_device_pos,
+                    target_meas_type_code,
+                )
+            ):
                 return next_idx, 0
-            device_type_code = int(_DEVICE_TYPE_CODES.get(device_type, 0))
-            meas_type_code = int(MEAS_TYPE_CODES.get(meas_type, 0))
-            device_pos = self._device_pos_for_measurement_name(device_type, device_name)
-            name_id = int(self._meas_ppc_device_name_ids().get(device_name, -1))
+            if key in existing_keys:
+                return next_idx, 0
+            store_strings = not bool(getattr(self, "_array_only_runtime", False))
+            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}" if store_strings else ""
             new_idx = self._append_pseudo_measurement_rows(
                 next_idx,
-                np.asarray([] if bool(getattr(self, "_array_only_runtime", False)) else [pseudo_name], dtype=object),
-                np.asarray([] if bool(getattr(self, "_array_only_runtime", False)) else [device_type], dtype=object),
-                np.asarray([] if bool(getattr(self, "_array_only_runtime", False)) else [device_name], dtype=object),
-                np.asarray([] if bool(getattr(self, "_array_only_runtime", False)) else [meas_type], dtype=object),
+                np.asarray([pseudo_name], dtype=object) if store_strings else np.asarray([], dtype=object),
+                np.asarray([device_type], dtype=object) if store_strings else np.asarray([], dtype=object),
+                np.asarray([device_name], dtype=object) if store_strings else np.asarray([], dtype=object),
+                np.asarray([meas_type], dtype=object) if store_strings else np.asarray([], dtype=object),
                 np.asarray([float(value)], dtype=np.float64),
-                device_type_codes=np.asarray([device_type_code], dtype=np.int16),
-                device_name_ids=np.asarray([name_id], dtype=np.int64),
-                meas_type_codes=np.asarray([meas_type_code], dtype=np.int16),
-                device_positions=np.asarray([device_pos], dtype=np.int64),
+                device_type_codes=np.asarray([target_device_type_code], dtype=np.int16),
+                device_name_ids=np.asarray([-1], dtype=np.int64),
+                meas_type_codes=np.asarray([target_meas_type_code], dtype=np.int16),
+                device_positions=np.asarray([target_device_pos], dtype=np.int64),
             )
             existing_keys.add(key)
-            existing_names.add(pseudo_name)
             added_total += 1
             return new_idx, 1
 
-        if meta.kind == "voltage" and meta.device_type == "DCNode" and name in self.node_by_name:
-            node_idx = self._node_idx_from_lookup_value(self.node_by_name[name])
-            node_pos = self.node_pos.get(node_idx, -1)
-            value = float(self._node_voltage_by_pos[int(node_pos)] if 0 <= int(node_pos) < self._node_voltage_by_pos.size else 1.0)
-            return add("DCNode", name, "V", value)
-        if meta.kind == "zero_current" and meta.device_type == "DCZeroBranch" and name in self.zero_branch_by_name:
-            pos = int(self.zero_branch_by_name[name])
+        if meta.kind == "voltage" and device_type_code == DEVICE_TYPE_DCNode:
+            node_pos = int(self._node_plan_node_pos[device_pos]) if 0 <= device_pos < self._node_plan_node_pos.size else -1
+            value = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+            return add(DEVICE_TYPE_DCNode, "DCNode", name, device_pos, MEAS_TYPE_V, "V", value)
+        if meta.kind == "zero_current" and device_type_code == DEVICE_TYPE_DCZeroBranch:
             value = 0.0
             if self._zero_branch_rows.size and "current" in DC_ZERO_BRANCH_COLS:
-                value = float(self._dc_ppc["zero_branch"][int(self._zero_branch_rows[pos]), DC_ZERO_BRANCH_COLS["current"]])
-            return add("DCZeroBranch", name, "I_FROM", value)
-        if meta.kind == "break_current" and meta.device_type == "DCBreak" and name in self.break_by_name:
-            pos = int(self.break_by_name[name])
+                value = float(self._dc_ppc["zero_branch"][int(self._zero_branch_rows[device_pos]), DC_ZERO_BRANCH_COLS["current"]])
+            return add(DEVICE_TYPE_DCZeroBranch, "DCZeroBranch", name, device_pos, MEAS_TYPE_I_FROM, "I_FROM", value)
+        if meta.kind == "break_current" and device_type_code == DEVICE_TYPE_DCBreak:
             value = 0.0
             if self._break_rows.size and "current" in DC_BREAK_COLS:
-                value = float(self._dc_ppc["break"][int(self._break_rows[pos]), DC_BREAK_COLS["current"]])
-            return add("DCBreak", name, "I_FROM", value)
-        if meta.kind == "dcdc_p_from" and name in self.dcdc_by_name:
-            pos = int(self.dcdc_by_name[name])
-            return add("DCDCConverter", name, "P_FROM", float(self._dc_ppc["dcdc"][int(self._dcdc_rows[pos]), DC_DCDC_COLS["i_p"]]))
-        if meta.kind == "dcdc_p_to" and name in self.dcdc_by_name:
-            pos = int(self.dcdc_by_name[name])
-            return add("DCDCConverter", name, "P_TO", float(self._dc_ppc["dcdc"][int(self._dcdc_rows[pos]), DC_DCDC_COLS["j_p"]]))
-        if meta.kind == "v_generator_p" and name in self.generator_by_name:
-            pos = int(self.generator_by_name[name])
-            return add("DCGenerator", name, "P_GEN", float(self._gen_table[int(self._generator_rows[pos]), DC_GEN_COLS["p_set"]]))
+                value = float(self._dc_ppc["break"][int(self._break_rows[device_pos]), DC_BREAK_COLS["current"]])
+            return add(DEVICE_TYPE_DCBreak, "DCBreak", name, device_pos, MEAS_TYPE_I_FROM, "I_FROM", value)
+        if meta.kind == "dcdc_p_from" and device_type_code == DEVICE_TYPE_DCDCConverter:
+            value = float(self._dc_ppc["dcdc"][int(self._dcdc_rows[device_pos]), DC_DCDC_COLS["i_p"]])
+            return add(DEVICE_TYPE_DCDCConverter, "DCDCConverter", name, device_pos, MEAS_TYPE_P_FROM, "P_FROM", value)
+        if meta.kind == "dcdc_p_to" and device_type_code == DEVICE_TYPE_DCDCConverter:
+            value = float(self._dc_ppc["dcdc"][int(self._dcdc_rows[device_pos]), DC_DCDC_COLS["j_p"]])
+            return add(DEVICE_TYPE_DCDCConverter, "DCDCConverter", name, device_pos, MEAS_TYPE_P_TO, "P_TO", value)
+        if meta.kind == "v_generator_p" and device_type_code == DEVICE_TYPE_DCGenerator:
+            value = float(self._gen_table[int(self._generator_rows[device_pos]), DC_GEN_COLS["p_set"]])
+            return add(DEVICE_TYPE_DCGenerator, "DCGenerator", name, device_pos, MEAS_TYPE_P_GEN, "P_GEN", value)
         return next_idx, 0
 
     def initial_state(self) -> np.ndarray:
