@@ -39,11 +39,14 @@ from model.meas_array_model import (
     build_meas_ppc_from_e_file,
     copy_meas_ppc,
     measurement_list_from_meas_ppc,
+    measurement_table_from_meas_ppc,
     sync_meas_ppc_from_measurement_table,
 )
 from model.meas_type import (
     DEVICE_TYPE_CODES,
+    DEVICE_TYPE_NAMES,
     MEAS_TYPE_CODES,
+    MEAS_TYPE_NAMES,
     MEAS_TYPE_V,
     MEAS_TYPE_P_FROM,
     MEAS_TYPE_V_FROM,
@@ -68,6 +71,7 @@ from model.meas_model import (
     Measurement,
     MeasurementList,
     MeasurementTable,
+    MeasurementTableView,
     ObservabilityResult,
     TableBackedMeasurementList,
     is_pseudo_measurement,
@@ -102,6 +106,7 @@ from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
+    rows_by_device_type_code,
     take_measurement_view,
 )
 from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_result_mode
@@ -137,6 +142,16 @@ _GEN_CONTROL_CODE_BY_NAME = {"V": 0, "P": 1, "I": 2}
 _MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
 _VOLTAGE_MEASUREMENT_TYPES = frozenset(("V", "V_FROM", "V_TO", "V_GEN", "V_LOAD"))
 _VOLTAGE_MEASUREMENT_TYPE_TUPLE = tuple(_VOLTAGE_MEASUREMENT_TYPES)
+_LEGACY_PATCH_HOOKS = (EBook, build_dc_network_from_ppc)
+
+
+def _measurement_type_code_lookup(kind_map: Dict[str, int]) -> np.ndarray:
+    lookup = np.full(_MAX_MEAS_TYPE_CODE + 1, -1, dtype=np.int16)
+    for name, value in kind_map.items():
+        code = MEAS_TYPE_CODES.get(str(name).upper(), -1)
+        if 0 <= int(code) < lookup.size:
+            lookup[int(code)] = int(value)
+    return lookup
 
 
 def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) -> MeasurementTable:
@@ -647,6 +662,7 @@ class DCStateEstimator:
         self._prepare_measurements = measurements
         self._prepare_active_measurements = bool(prepare_active_measurements)
         self._prepare_defer_finalize = bool(defer_prepare_finalize)
+        self._array_only_runtime = False
         self.observability_result = None
         self.estimate_result = None
         self.removed_bad_data: List[BadDataItem] = []
@@ -659,6 +675,25 @@ class DCStateEstimator:
                 measurements=measurements,
                 prepare_active_measurements=prepare_active_measurements,
             )
+
+    def _measurement_sequence_from_table(self, table: MeasurementTable, *, normalized: bool = False):
+        if bool(getattr(self, "_array_only_runtime", False)):
+            return MeasurementTableView(table, normalized=normalized)
+        return TableBackedMeasurementList(table, normalized=normalized)
+
+    @staticmethod
+    def _clear_meas_ppc_runtime_arrays(meas_ppc: Dict) -> None:
+        """Drop estimator-local measurement runtime arrays copied from a shared file cache."""
+        for key in (
+            "device_pos",
+            "scale",
+            "from_pos",
+            "to_pos",
+            "available",
+            "_dc_se_runtime_cache_key",
+            "_mutable_runtime_arrays",
+        ):
+            meas_ppc.pop(key, None)
 
     def prepare(
         self,
@@ -703,11 +738,30 @@ class DCStateEstimator:
         self._record_profile_time("init.load_network", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
         if measurements is None:
-            self.meas_ppc = copy_meas_ppc(build_meas_ppc_from_e_file(self.meas_file))
-            self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
+            if bool(getattr(self, "_array_only_runtime", False)):
+                self.meas_ppc = build_meas_ppc_from_e_file(
+                    self.meas_file,
+                    include_strings=False,
+                    use_cache=False,
+                    include_matrix=False,
+                )
+                self.meas_ppc["_mutable_runtime_arrays"] = True
+                self.measurements = TableBackedMeasurementList(
+                    measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
+                    normalized=bool(self.meas_ppc.get("normalized", False)),
+                )
+            else:
+                self.meas_ppc = copy_meas_ppc(build_meas_ppc_from_e_file(self.meas_file))
+                self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         elif isinstance(measurements, dict) and measurements.get("format") == "meas_ppc_v1":
             self.meas_ppc = copy_meas_ppc(measurements)
-            self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
+            if bool(getattr(self, "_array_only_runtime", False)):
+                self.measurements = TableBackedMeasurementList(
+                    measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
+                    normalized=bool(self.meas_ppc.get("normalized", False)),
+                )
+            else:
+                self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         elif isinstance(measurements, MeasurementList):
             self.measurements = measurements
             self.meas_ppc = None
@@ -976,6 +1030,7 @@ class DCStateEstimator:
         active_view = build_active_measurement_view(
             self.measurements,
             table_builder=_measurement_table_from_measurements,
+            materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
         )
         self.measurement_table = active_view.source_table
         self.active_measurements = active_view.measurements
@@ -1078,10 +1133,15 @@ class DCStateEstimator:
         self.measurement_table = concat_measurement_tables(master_table, appended_list.table)
         self.measurements.table = self.measurement_table
         active_view = append_active_measurement_view(
-            build_active_measurement_view(self.active_measurements, table_builder=_measurement_table_from_measurements),
+            build_active_measurement_view(
+                self.active_measurements,
+                table_builder=_measurement_table_from_measurements,
+                materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
+            ),
             appended_list,
             source_row_start=len(master_table.idx),
             table_builder=_measurement_table_from_measurements,
+            materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
         )
         self._max_measurement_idx = int(self.measurement_table.idx.max()) if self.measurement_table.idx.size else 0
         self.active_measurements = active_view.measurements
@@ -1165,9 +1225,12 @@ class DCStateEstimator:
             self._active_measurement_plan = self._measurement_plan(self.active_measurements)
         return self.active_measurements
 
-    def _normalize_measurements(self, measurements: Optional[Sequence[Measurement]]) -> List[Measurement]:
+    def _normalize_measurements(self, measurements: Optional[Sequence[Measurement]]):
         if measurements is None:
             return self.active_measurements
+        table = getattr(measurements, "table", None)
+        if table is not None and len(table.idx) == len(measurements):
+            return measurements
         if isinstance(measurements, list):
             return measurements
         return list(measurements)
@@ -1235,6 +1298,58 @@ class DCStateEstimator:
         table = getattr(self.measurements, "table", None)
         table_valid = table.valid if table is not None and len(table.valid) == len(self.measurements) else None
         table_status = measurement_table_status_code(table) if table_valid is not None else None
+        if table_valid is not None and np.asarray(table.device_name, dtype=object).size != len(table.idx):
+            device_name_id = getattr(table, "device_name_id", None)
+            meas_ppc = getattr(self, "meas_ppc", None) or {}
+            device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
+            name_id_by_name = meas_ppc.get("device_name_id_by_name", {})
+            if device_name_id is None or device_names.size == 0 or not isinstance(name_id_by_name, dict):
+                warnings.warn(
+                    "DC SE measurement availability check requires device_name_id; string fallback is disabled.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return
+            device_name_id = np.asarray(device_name_id, dtype=np.int64)
+            if device_name_id.size != len(table.idx):
+                warnings.warn(
+                    "DC SE measurement availability check requires aligned device_name_id; string fallback is disabled.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return
+            device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
+            active = table_valid & (np.asarray(table.weight, dtype=np.float64) > 0.0)
+            keep = np.zeros(len(table.idx), dtype=bool)
+            code_maps = {
+                int(_DEVICE_TYPE_CODES["DCNode"]): self.node_by_name,
+                int(_DEVICE_TYPE_CODES["DCBranch"]): self.branch_by_name,
+                int(_DEVICE_TYPE_CODES["DCBreak"]): self.break_by_name,
+                int(_DEVICE_TYPE_CODES["DCZeroBranch"]): self.zero_branch_by_name,
+                int(_DEVICE_TYPE_CODES["DCGenerator"]): self.generator_by_name,
+                int(_DEVICE_TYPE_CODES["DCLoad"]): self.load_by_name,
+                int(_DEVICE_TYPE_CODES["DCDCConverter"]): self.dcdc_by_name,
+            }
+            for code_int, devices in code_maps.items():
+                rows = np.flatnonzero(active & (device_type_code == code_int))
+                if rows.size == 0:
+                    continue
+                valid_ids = np.asarray(
+                    [
+                        int(name_id_by_name[name])
+                        for name in devices.keys()
+                        if name in name_id_by_name
+                    ],
+                    dtype=np.int64,
+                )
+                if valid_ids.size:
+                    keep[rows] = np.isin(device_name_id[rows], valid_ids)
+            invalid_rows = np.flatnonzero(active & ~keep)
+            if invalid_rows.size:
+                table_valid[invalid_rows] = False
+                if table_status is not None:
+                    table_status[invalid_rows] = MEAS_STATUS_INVALID
+            return
         for pos, meas in enumerate(self.measurements):
             if not meas.valid or meas.weight <= 0.0:
                 continue
@@ -1767,10 +1882,116 @@ class DCStateEstimator:
             _DEVICE_TYPE_CODES["DCBreakConstraint"]: _DC_CONSTRAINT_MEAS_TYPE_CODES,
             _DEVICE_TYPE_CODES["DCDCConverter"]: _DC_TERMINAL_MEAS_TYPE_CODES,
         }
+        self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
+        self._measurement_plan_meas_kind_code_by_type_code = {
+            int(code): _measurement_type_code_lookup(kind_map)
+            for code, kind_map in self._measurement_plan_meas_kind_by_type_code.items()
+        }
 
     def _ensure_measurement_plan_lookup_arrays(self) -> None:
         if not hasattr(self, "_measurement_plan_device_pos_by_type_code"):
             self._build_measurement_plan_lookup_arrays()
+
+    def _measurement_plan_device_id_lookup_arrays(self) -> Dict[int, np.ndarray]:
+        device_names = self._meas_ppc_device_names()
+        if device_names.size == 0:
+            return {}
+        name_id_by_name = self._meas_ppc_device_name_ids()
+        if not name_id_by_name:
+            return {}
+        result: Dict[int, np.ndarray] = {}
+        for code_int, pos_by_name in self._measurement_plan_device_pos_by_type_code.items():
+            lookup = np.empty(device_names.size, dtype=np.int64)
+            lookup.fill(-1)
+            for name, pos in pos_by_name.items():
+                name_id = name_id_by_name.get(name)
+                if name_id is not None and 0 <= int(name_id) < lookup.size:
+                    lookup[int(name_id)] = int(pos)
+            result[int(code_int)] = lookup
+        return result
+
+    def _measurement_device_pos_array(self, table: MeasurementTable) -> np.ndarray:
+        n_rows = int(table.idx.size)
+        precomputed = getattr(table, "device_pos", None)
+        if precomputed is not None and np.asarray(precomputed).size == n_rows:
+            device_pos = np.asarray(precomputed, dtype=np.int64).copy()
+        else:
+            device_pos = np.empty(n_rows, dtype=np.int64)
+            device_pos.fill(-1)
+        if n_rows == 0 or np.all(device_pos >= 0):
+            return device_pos
+        self._ensure_measurement_plan_lookup_arrays()
+        device_name_id = getattr(table, "device_name_id", None)
+        if device_name_id is not None:
+            device_name_id = np.asarray(device_name_id, dtype=np.int64)
+            if device_name_id.size != n_rows:
+                device_name_id = None
+        id_maps = getattr(self, "_measurement_plan_device_pos_by_type_code_id", {})
+        if device_name_id is not None and id_maps:
+            for code_int, code_rows in rows_by_device_type_code(table).items():
+                rows = np.asarray(code_rows, dtype=np.int64)
+                rows = rows[device_pos[rows] < 0]
+                if rows.size == 0:
+                    continue
+                lookup = id_maps.get(int(code_int))
+                if lookup is None or lookup.size == 0:
+                    continue
+                ids = device_name_id[rows]
+                valid = (ids >= 0) & (ids < lookup.size)
+                if np.any(valid):
+                    device_pos[rows[valid]] = lookup[ids[valid].astype(np.intp, copy=False)]
+        missing = device_pos < 0
+        device_name_array = np.asarray(table.device_name, dtype=object)
+        if np.any(missing) and device_name_array.size == n_rows:
+            for code_int, code_rows in rows_by_device_type_code(table).items():
+                rows = np.asarray(code_rows, dtype=np.int64)
+                rows = rows[missing[rows]]
+                if rows.size == 0:
+                    continue
+                pos_map = self._measurement_plan_device_pos_by_type_code.get(int(code_int))
+                if not pos_map:
+                    continue
+                pos_get = pos_map.get
+                device_pos[rows] = np.asarray(
+                    [pos_get(name, -1) for name in device_name_array[rows].tolist()],
+                    dtype=np.int64,
+                )
+        return device_pos
+
+    @staticmethod
+    def _ensure_table_meas_type_codes(table: MeasurementTable) -> np.ndarray:
+        n_rows = int(table.idx.size)
+        meas_type_code = getattr(table, "meas_type_code", None)
+        if meas_type_code is not None:
+            meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
+            if meas_type_code.size == n_rows:
+                missing = meas_type_code < 0
+                meas_type = np.asarray(table.meas_type, dtype=object)
+                if np.any(missing) and meas_type.size == n_rows:
+                    rows = np.flatnonzero(missing)
+                    meas_type_code = meas_type_code.copy()
+                    meas_type_code[rows] = np.asarray(
+                        [MEAS_TYPE_CODES.get(str(name).upper(), 0) for name in meas_type[rows].tolist()],
+                        dtype=np.int16,
+                    )
+                table.meas_type_code = meas_type_code
+                return meas_type_code
+        meas_type = np.asarray(table.meas_type, dtype=object)
+        if meas_type.size == n_rows:
+            meas_type_code = np.asarray(
+                [MEAS_TYPE_CODES.get(str(name).upper(), 0) for name in meas_type.tolist()],
+                dtype=np.int16,
+            )
+        else:
+            meas_type_code = np.zeros(n_rows, dtype=np.int16)
+        table.meas_type_code = meas_type_code
+        return meas_type_code
+
+    def _measurement_table_for_indexed_plan(self, measurements: Sequence[Measurement]) -> MeasurementTable:
+        table = _measurement_table_from_measurements(measurements)
+        self._ensure_table_meas_type_codes(table)
+        table.device_pos = self._measurement_device_pos_array(table)
+        return table
 
     @staticmethod
     def _load_network(e_file: Path) -> DCPowerNetwork:
@@ -2370,6 +2591,127 @@ class DCStateEstimator:
             for name, dev in {**self.zero_branch_by_name, **self.switch_by_name, **self.break_by_name}.items()
         }
 
+    def _meas_ppc_device_names(self) -> np.ndarray:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if isinstance(meas_ppc, dict):
+            return np.asarray(meas_ppc.get("device_names", ()), dtype=object)
+        return np.asarray([], dtype=object)
+
+    def _meas_ppc_device_name_ids(self) -> Dict[object, int]:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if isinstance(meas_ppc, dict):
+            lookup = meas_ppc.get("device_name_id_by_name")
+            if isinstance(lookup, dict):
+                return lookup
+        return {}
+
+    def _scalar_scale_lookup_by_name_id(self, scale_by_name: Dict[str, float]) -> np.ndarray:
+        device_names = self._meas_ppc_device_names()
+        scale = np.ones(int(device_names.size), dtype=np.float64)
+        if device_names.size == 0:
+            return scale
+        name_id_by_name = self._meas_ppc_device_name_ids()
+        for name, value in scale_by_name.items():
+            name_id = name_id_by_name.get(name)
+            if name_id is not None and 0 <= int(name_id) < scale.size:
+                scale[int(name_id)] = float(value)
+        return scale
+
+    def _tuple_scale_lookup_by_name_id(self, scale_by_name: Dict[str, Tuple[float, ...]]) -> np.ndarray:
+        device_names = self._meas_ppc_device_names()
+        scale = np.ones((int(device_names.size), _MAX_MEAS_TYPE_CODE + 1), dtype=np.float64)
+        if device_names.size == 0:
+            return scale
+        name_id_by_name = self._meas_ppc_device_name_ids()
+        for name, values in scale_by_name.items():
+            name_id = name_id_by_name.get(name)
+            if name_id is None or not (0 <= int(name_id) < scale.shape[0]):
+                continue
+            value_array = np.asarray(values, dtype=np.float64)
+            width = min(scale.shape[1], int(value_array.size))
+            if width:
+                scale[int(name_id), :width] = value_array[:width]
+        return scale
+
+    def _fill_scalar_scale_by_id(
+        self,
+        scale: np.ndarray,
+        rows: np.ndarray,
+        lookup: np.ndarray,
+        device_name_id: np.ndarray,
+        meas_type_code: np.ndarray,
+        allowed_code: int,
+    ) -> None:
+        if rows.size == 0 or lookup.size == 0:
+            return
+        selected = rows[meas_type_code[rows] == int(allowed_code)]
+        if selected.size == 0:
+            return
+        ids = device_name_id[selected].astype(np.int64, copy=False)
+        valid = (ids >= 0) & (ids < lookup.size)
+        if np.any(valid):
+            scale[selected[valid]] = lookup[ids[valid].astype(np.intp, copy=False)]
+
+    def _fill_tuple_scale_by_id(
+        self,
+        scale: np.ndarray,
+        rows: np.ndarray,
+        lookup: np.ndarray,
+        device_name_id: np.ndarray,
+        meas_type_code: np.ndarray,
+    ) -> None:
+        if rows.size == 0 or lookup.size == 0:
+            return
+        ids = device_name_id[rows].astype(np.int64, copy=False)
+        kinds = meas_type_code[rows].astype(np.int64, copy=False)
+        valid = (ids >= 0) & (ids < lookup.shape[0]) & (kinds >= 0) & (kinds < lookup.shape[1])
+        if np.any(valid):
+            scale[rows[valid]] = lookup[ids[valid].astype(np.intp, copy=False), kinds[valid].astype(np.intp, copy=False)]
+
+    def _measurement_strings_from_codes(
+        self,
+        table: MeasurementTable,
+        rows: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        row_idx = np.asarray(rows, dtype=np.int64)
+        if row_idx.size == 0:
+            empty = np.asarray([], dtype=object)
+            return empty, empty, empty
+        device_type_array = np.asarray(table.device_type, dtype=object)
+        device_name_array = np.asarray(table.device_name, dtype=object)
+        meas_type_array = np.asarray(table.meas_type, dtype=object)
+        if (
+            device_type_array.size == table.idx.size
+            and device_name_array.size == table.idx.size
+            and meas_type_array.size == table.idx.size
+        ):
+            return device_type_array[row_idx], device_name_array[row_idx], meas_type_array[row_idx]
+        device_names = self._meas_ppc_device_names()
+        name_ids = getattr(table, "device_name_id", None)
+        if name_ids is None:
+            name_values = np.asarray([""] * row_idx.size, dtype=object)
+        else:
+            name_ids = np.asarray(name_ids, dtype=np.int64)
+            name_values = np.asarray([""] * row_idx.size, dtype=object)
+            ids = name_ids[row_idx]
+            in_range = (ids >= 0) & (ids < device_names.size)
+            if np.any(in_range):
+                name_values[in_range] = device_names[ids[in_range].astype(np.intp, copy=False)]
+        type_values = np.asarray(
+            [DEVICE_TYPE_NAMES.get(int(code), "") for code in table.device_type_code[row_idx]],
+            dtype=object,
+        )
+        meas_type_code = getattr(table, "meas_type_code", None)
+        if meas_type_code is None:
+            meas_values = np.asarray([""] * row_idx.size, dtype=object)
+        else:
+            meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
+            meas_values = np.asarray(
+                [MEAS_TYPE_NAMES.get(int(code), "") for code in meas_type_code[row_idx]],
+                dtype=object,
+            )
+        return type_values, name_values, meas_values
+
     def _convert_measurements_to_pu(self) -> None:
         """Normalize file measurement values to the internal state-estimation units."""
         if getattr(self.measurements, "normalized", False):
@@ -2419,77 +2761,136 @@ class DCStateEstimator:
         active = valid & (weight > 0.0)
         scale = np.ones(value.size, dtype=np.float64)
         code = np.asarray(table.device_type_code, dtype=np.int16)
-        name = table.device_name
-        mtype = table.meas_type
+        device_name_id = getattr(table, "device_name_id", None)
+        if device_name_id is None or np.asarray(device_name_id).size != value.size:
+            device_name_id = np.full(value.size, -1, dtype=np.int64)
+        else:
+            device_name_id = np.asarray(device_name_id, dtype=np.int64)
+        meas_type_code = self._ensure_table_meas_type_codes(table)
         status_code = measurement_table_status_code(table)
 
-        def fill_scalar(rows: np.ndarray, scale_by_name: Dict[str, float], allowed_type: Optional[str] = None) -> None:
-            if rows.size == 0:
-                return
-            if allowed_type is None:
-                scale[rows] = np.asarray([float(scale_by_name[str(name[int(row)])]) for row in rows], dtype=np.float64)
-                return
-            selected = rows[mtype[rows] == allowed_type]
-            if selected.size:
-                scale[selected] = np.asarray(
-                    [float(scale_by_name[str(name[int(row)])]) for row in selected],
-                    dtype=np.float64,
-                )
-
-        def fill_tuple(rows: np.ndarray, scale_by_name: Dict[str, Tuple[float, ...]], kind_by_type: Dict[str, int]) -> None:
-            if rows.size == 0:
-                return
-            kinds = np.asarray([kind_by_type.get(str(item), -1) for item in mtype[rows]], dtype=np.int16)
-            selected = rows[kinds >= 0]
-            selected_kinds = kinds[kinds >= 0]
-            if selected.size:
-                scale[selected] = np.asarray(
-                    [float(scale_by_name[str(name[int(row)])][int(kind)]) for row, kind in zip(selected, selected_kinds)],
-                    dtype=np.float64,
-                )
-
         node_rows = np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCNode"]))
-        fill_scalar(node_rows, self._node_measurement_scale_by_name, "V")
-        fill_tuple(
+        self._fill_scalar_scale_by_id(
+            scale,
+            node_rows,
+            self._scalar_scale_lookup_by_name_id(self._node_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
+            MEAS_TYPE_V,
+        )
+        self._fill_tuple_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBranch"])),
-            self._branch_measurement_scale_by_name,
-            _DC_TERMINAL_MEAS_TYPE_CODES,
+            self._tuple_scale_lookup_by_name_id(self._branch_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
         )
-        fill_tuple(
+        self._fill_tuple_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreak"])),
-            self._break_measurement_scale_by_name,
-            _DC_TERMINAL_MEAS_TYPE_CODES,
+            self._tuple_scale_lookup_by_name_id(self._break_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
         )
-        fill_tuple(
+        self._fill_tuple_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranch"])),
-            self._zero_branch_measurement_scale_by_name,
-            _DC_TERMINAL_MEAS_TYPE_CODES,
+            self._tuple_scale_lookup_by_name_id(self._zero_branch_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
         )
-        fill_scalar(
+        self._fill_scalar_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranchConstraint"])),
-            self._constraint_measurement_scale_by_name,
-            "V_DIFF",
+            self._scalar_scale_lookup_by_name_id(self._constraint_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
+            MEAS_TYPE_V_DIFF,
         )
-        fill_scalar(
+        self._fill_scalar_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreakConstraint"])),
-            self._constraint_measurement_scale_by_name,
-            "V_DIFF",
+            self._scalar_scale_lookup_by_name_id(self._constraint_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
+            MEAS_TYPE_V_DIFF,
         )
-        fill_tuple(
+        self._fill_tuple_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCDCConverter"])),
-            self._dcdc_measurement_scale_by_name,
-            _DC_TERMINAL_MEAS_TYPE_CODES,
+            self._tuple_scale_lookup_by_name_id(self._dcdc_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
         )
-        fill_tuple(
+        self._fill_tuple_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCGenerator"])),
-            self._generator_measurement_scale_by_name,
-            _DC_GEN_MEAS_TYPE_CODES,
+            self._tuple_scale_lookup_by_name_id(self._generator_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
         )
-        fill_tuple(
+        self._fill_tuple_scale_by_id(
+            scale,
             np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCLoad"])),
-            self._load_measurement_scale_by_name,
-            _DC_LOAD_MEAS_TYPE_CODES,
+            self._tuple_scale_lookup_by_name_id(self._load_measurement_scale_by_name),
+            device_name_id,
+            meas_type_code,
         )
+        name_array = np.asarray(table.device_name, dtype=object)
+        if np.all(device_name_id < 0) and name_array.size == value.size:
+            def fill_scalar_by_name(rows: np.ndarray, scale_by_name: Dict[str, float], allowed_code: int) -> None:
+                selected = rows[meas_type_code[rows] == int(allowed_code)]
+                if selected.size:
+                    scale[selected] = np.asarray(
+                        [float(scale_by_name[str(name_array[int(row)])]) for row in selected],
+                        dtype=np.float64,
+                    )
+
+            def fill_tuple_by_name(rows: np.ndarray, scale_by_name: Dict[str, Tuple[float, ...]]) -> None:
+                if rows.size:
+                    scale[rows] = np.asarray(
+                        [
+                            float(scale_by_name[str(name_array[int(row)])][int(meas_type_code[int(row)])])
+                            for row in rows
+                        ],
+                        dtype=np.float64,
+                    )
+
+            fill_scalar_by_name(node_rows, self._node_measurement_scale_by_name, MEAS_TYPE_V)
+            fill_tuple_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBranch"])),
+                self._branch_measurement_scale_by_name,
+            )
+            fill_tuple_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreak"])),
+                self._break_measurement_scale_by_name,
+            )
+            fill_tuple_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranch"])),
+                self._zero_branch_measurement_scale_by_name,
+            )
+            fill_scalar_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCZeroBranchConstraint"])),
+                self._constraint_measurement_scale_by_name,
+                MEAS_TYPE_V_DIFF,
+            )
+            fill_scalar_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCBreakConstraint"])),
+                self._constraint_measurement_scale_by_name,
+                MEAS_TYPE_V_DIFF,
+            )
+            fill_tuple_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCDCConverter"])),
+                self._dcdc_measurement_scale_by_name,
+            )
+            fill_tuple_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCGenerator"])),
+                self._generator_measurement_scale_by_name,
+            )
+            fill_tuple_by_name(
+                np.flatnonzero(active & (code == _DEVICE_TYPE_CODES["DCLoad"])),
+                self._load_measurement_scale_by_name,
+            )
         value[active] = np.divide(value[active], scale[active], out=value[active].copy(), where=np.abs(scale[active]) > 1e-12)
         object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
         if object_count == value.size and object_count > 0:
@@ -2497,14 +2898,12 @@ class DCStateEstimator:
                 meas.value = float(value[pos])
 
         active_rows = np.flatnonzero(active)
-        device_type_arr = np.asarray(table.device_type, dtype=object)
-        device_name_arr = np.asarray(table.device_name, dtype=object)
-        meas_type_arr = np.asarray(table.meas_type, dtype=object)
-        active_device_keys = set(zip(device_type_arr[active_rows].tolist(), device_name_arr[active_rows].tolist()))
+        device_type_arr, device_name_arr, meas_type_arr = self._measurement_strings_from_codes(table, active_rows)
+        active_device_keys = set(zip(device_type_arr.tolist(), device_name_arr.tolist()))
         active_measurement_keys = set(zip(
-            device_type_arr[active_rows].tolist(),
-            device_name_arr[active_rows].tolist(),
-            meas_type_arr[active_rows].tolist(),
+            device_type_arr.tolist(),
+            device_name_arr.tolist(),
+            meas_type_arr.tolist(),
         ))
         node_voltage_best: Dict[int, Tuple[float, float]] = {}
         real_voltage_best: Dict[int, Tuple[float, float]] = {}
@@ -2513,9 +2912,9 @@ class DCStateEstimator:
         # numpy scalar boxing. The dict-build loop below operates entirely on
         # plain Python objects.
         if active_rows.size:
-            dt_list = device_type_arr[active_rows].tolist()
-            dn_list = device_name_arr[active_rows].tolist()
-            mt_list = meas_type_arr[active_rows].tolist()
+            dt_list = device_type_arr.tolist()
+            dn_list = device_name_arr.tolist()
+            mt_list = meas_type_arr.tolist()
             val_list = value[active_rows].tolist()
             w_list = weight[active_rows].tolist()
             is_pseudo_list = (status_code[active_rows] == MEAS_STATUS_PSEUDO).tolist()
@@ -2594,28 +2993,24 @@ class DCStateEstimator:
         if table is not None and len(table.idx) == len(self.measurements):
             max_idx = int(table.idx.max()) if table.idx.size else 0
             active = table.valid & (table.weight > 0.0)
-            device_type_array = np.asarray(table.device_type, dtype=object)
-            device_name_array = np.asarray(table.device_name, dtype=object)
-            meas_type_array = np.asarray(table.meas_type, dtype=object)
-            active_device_keys = set(zip(device_type_array[active].tolist(), device_name_array[active].tolist()))
+            active_rows = np.flatnonzero(active)
+            device_type_array, device_name_array, meas_type_array = self._measurement_strings_from_codes(table, active_rows)
+            active_device_keys = set(zip(device_type_array.tolist(), device_name_array.tolist()))
             active_measurement_keys = set(
                 zip(
-                    device_type_array[active].tolist(),
-                    device_name_array[active].tolist(),
-                    meas_type_array[active].tolist(),
+                    device_type_array.tolist(),
+                    device_name_array.tolist(),
+                    meas_type_array.tolist(),
                 )
             )
             status_code = measurement_table_status_code(table)
-            voltage_mask = (
-                active
-                & (status_code != MEAS_STATUS_PSEUDO)
-                & np.isin(meas_type_array, _VOLTAGE_MEASUREMENT_TYPE_TUPLE)
-            )
+            real_active = status_code[active_rows] != MEAS_STATUS_PSEUDO
+            voltage_active = real_active & np.isin(meas_type_array, _VOLTAGE_MEASUREMENT_TYPE_TUPLE)
             for row, device_type_value, device_name_value, meas_type_value in zip(
-                np.flatnonzero(voltage_mask),
-                device_type_array[voltage_mask],
-                device_name_array[voltage_mask],
-                meas_type_array[voltage_mask],
+                active_rows[voltage_active],
+                device_type_array[voltage_active],
+                device_name_array[voltage_active],
+                meas_type_array[voltage_active],
             ):
                 device_type = str(device_type_value)
                 device_name = str(device_name_value)
@@ -2675,6 +3070,118 @@ class DCStateEstimator:
             self._active_device_key_cache.add((meas.device_type, meas.device_name))
             self._active_measurement_key_cache.add((meas.device_type, meas.device_name, meas.meas_type))
 
+    def _device_pos_for_measurement_name(self, device_type: str, device_name: str) -> int:
+        self._ensure_measurement_plan_lookup_arrays()
+        code = _DEVICE_TYPE_CODES.get(device_type, 0)
+        pos_map = self._measurement_plan_device_pos_by_type_code.get(int(code))
+        if not pos_map:
+            return -1
+        return int(pos_map.get(device_name, -1))
+
+    def _append_pseudo_measurement_to_table(
+        self,
+        measurement: Measurement,
+        *,
+        device_type_code: int,
+        meas_type_code: int,
+        device_pos: int,
+    ) -> bool:
+        table = getattr(self.measurements, "table", None)
+        if table is None:
+            return False
+        if not isinstance(self.measurements, TableBackedMeasurementList):
+            return False
+        include_strings = np.asarray(table.device_name, dtype=object).size == int(table.idx.size)
+        if include_strings:
+            return False
+        name_id = self._meas_ppc_device_name_ids().get(measurement.device_name, -1)
+        if not hasattr(self, "active_measurements"):
+            pending = getattr(self, "_pending_pseudo_table_rows", None)
+            if pending is None:
+                pending = {
+                    "idx": [],
+                    "weight": [],
+                    "valid": [],
+                    "value": [],
+                    "status": [],
+                    "device_type_code": [],
+                    "device_name_id": [],
+                    "meas_type_code": [],
+                    "device_pos": [],
+                }
+                self._pending_pseudo_table_rows = pending
+            pending["idx"].append(int(measurement.idx))
+            pending["weight"].append(float(measurement.weight))
+            pending["valid"].append(bool(measurement.valid))
+            pending["value"].append(float(measurement.value))
+            pending["status"].append(int(measurement.status))
+            pending["device_type_code"].append(int(device_type_code))
+            pending["device_name_id"].append(int(name_id))
+            pending["meas_type_code"].append(int(meas_type_code))
+            pending["device_pos"].append(int(device_pos))
+            return True
+        row_table = MeasurementTable(
+            idx=np.asarray([measurement.idx], dtype=np.int64),
+            name=np.asarray([measurement.name], dtype=object) if include_strings else np.asarray([], dtype=object),
+            device_type=np.asarray([measurement.device_type], dtype=object) if include_strings else np.asarray([], dtype=object),
+            device_name=np.asarray([measurement.device_name], dtype=object) if include_strings else np.asarray([], dtype=object),
+            meas_type=np.asarray([measurement.meas_type], dtype=object) if include_strings else np.asarray([], dtype=object),
+            weight=np.asarray([measurement.weight], dtype=np.float64),
+            valid=np.asarray([measurement.valid], dtype=bool),
+            value=np.asarray([measurement.value], dtype=np.float64),
+            device_type_code=np.asarray([device_type_code], dtype=np.int16),
+            angle_mask=np.asarray([False], dtype=bool),
+            status_code=np.asarray([measurement.status], dtype=np.int16),
+            rows_by_device_type_code={int(device_type_code): np.asarray([0], dtype=np.int64)},
+            device_name_id=np.asarray([name_id], dtype=np.int64),
+            meas_type_code=np.asarray([meas_type_code], dtype=np.int16),
+            device_pos=np.asarray([device_pos], dtype=np.int64),
+        )
+        table.device_pos = self._measurement_device_pos_array(table)
+        self.measurements.table = concat_measurement_tables(table, row_table)
+        self.measurement_table = self.measurements.table
+        self.measurements._table_prefix_size = int(self.measurements.table.idx.size)
+        return True
+
+    def _flush_pending_pseudo_measurement_table_rows(self) -> None:
+        pending = getattr(self, "_pending_pseudo_table_rows", None)
+        if not pending:
+            return
+        count = len(pending["idx"])
+        if count == 0:
+            self._pending_pseudo_table_rows = None
+            return
+        table = getattr(self.measurements, "table", None)
+        if table is None or not isinstance(self.measurements, TableBackedMeasurementList):
+            self._pending_pseudo_table_rows = None
+            return
+        device_type_code = np.asarray(pending["device_type_code"], dtype=np.int16)
+        row_table = MeasurementTable(
+            idx=np.asarray(pending["idx"], dtype=np.int64),
+            name=np.asarray([], dtype=object),
+            device_type=np.asarray([], dtype=object),
+            device_name=np.asarray([], dtype=object),
+            meas_type=np.asarray([], dtype=object),
+            weight=np.asarray(pending["weight"], dtype=np.float64),
+            valid=np.asarray(pending["valid"], dtype=bool),
+            value=np.asarray(pending["value"], dtype=np.float64),
+            device_type_code=device_type_code,
+            angle_mask=np.zeros(count, dtype=bool),
+            status_code=np.asarray(pending["status"], dtype=np.int16),
+            rows_by_device_type_code={
+                int(code): np.flatnonzero(device_type_code == int(code)).astype(np.int64, copy=False)
+                for code in np.unique(device_type_code)
+            },
+            device_name_id=np.asarray(pending["device_name_id"], dtype=np.int64),
+            meas_type_code=np.asarray(pending["meas_type_code"], dtype=np.int16),
+            device_pos=np.asarray(pending["device_pos"], dtype=np.int64),
+        )
+        table.device_pos = self._measurement_device_pos_array(table)
+        self.measurements.table = concat_measurement_tables(table, row_table)
+        self.measurement_table = self.measurements.table
+        self.measurements._table_prefix_size = int(self.measurements.table.idx.size)
+        self._pending_pseudo_table_rows = None
+
     def _append_pseudo_measurement(
         self,
         next_idx: int,
@@ -2684,6 +3191,7 @@ class DCStateEstimator:
         meas_type: str,
         value: float,
         *,
+        weight: Optional[float] = None,
         record_summary: bool = True,
     ) -> int:
         measurement = Measurement.__new__(Measurement)
@@ -2692,11 +3200,20 @@ class DCStateEstimator:
         measurement.device_type = device_type
         measurement.device_name = device_name
         measurement.meas_type = meas_type
-        measurement.weight = self.pseudo_measurement_weight
+        measurement.weight = self.pseudo_measurement_weight if weight is None else float(weight)
         measurement.valid = True
         measurement.value = float(value)
         mark_measurement_pseudo(measurement)
-        self.measurements.append(measurement)
+        device_type_code = int(_DEVICE_TYPE_CODES.get(device_type, 0))
+        meas_type_code = int(MEAS_TYPE_CODES.get(meas_type, 0))
+        appended_to_table = self._append_pseudo_measurement_to_table(
+            measurement,
+            device_type_code=device_type_code,
+            meas_type_code=meas_type_code,
+            device_pos=self._device_pos_for_measurement_name(device_type, device_name),
+        )
+        if not appended_to_table:
+            self.measurements.append(measurement)
         if record_summary:
             self._record_measurement_summary(measurement)
         elif next_idx > getattr(self, "_max_measurement_idx", 0):
@@ -2763,8 +3280,8 @@ class DCStateEstimator:
                         dev.name,
                         meas_type,
                         value,
+                        weight=topology_weight,
                     )
-                    self.measurements[-1].weight = topology_weight
         return next_idx
 
     def _add_pseudo_power_measurements(self) -> None:
@@ -2867,6 +3384,7 @@ class DCStateEstimator:
                     "V_TO",
                     float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0),
                 )
+        self._flush_pending_pseudo_measurement_table_rows()
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch DC rank deficiencies and optional post-observability redundancy."""
@@ -3309,8 +3827,11 @@ class DCStateEstimator:
         plan_table = build_measurement_plan_table(
             measurements,
             device_pos_by_type_code=self._measurement_plan_device_pos_by_type_code,
+            device_pos_by_type_code_id=getattr(self, "_measurement_plan_device_pos_by_type_code_id", {}),
             meas_kind_by_type_code=self._measurement_plan_meas_kind_by_type_code,
-            table_builder=_measurement_table_from_measurements,
+            meas_kind_code_by_type_code=getattr(self, "_measurement_plan_meas_kind_code_by_type_code", {}),
+            require_index_arrays=True,
+            table_builder=self._measurement_table_for_indexed_plan,
         )
         handled = np.asarray(plan_table.handled, dtype=bool).copy()
         row = plan_table.row
@@ -4526,14 +5047,24 @@ class DCStateEstimator:
         max_remove: Optional[int] = None,
         skip_bad_data: bool = False,
         verbose: bool = False,
+        final_diagnostics: bool = True,
         observability: Optional[ObservabilityResult] = None,
     ) -> Optional[SEResult]:
-        self._require_prepared("run()")
         mode = normalize_seresult_result_mode(result_mode)
-        threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
         array_only = mode == "array"
         if array_only and remove_bad_data:
             raise ValueError("result_mode='array' cannot be combined with remove_bad_data=True")
+        previous_runtime_mode = bool(getattr(self, "_array_only_runtime", False))
+        self._array_only_runtime = array_only
+        if not self._prepared:
+            try:
+                self.prepare()
+            except Exception:
+                self._array_only_runtime = previous_runtime_mode
+                raise
+        elif array_only and not isinstance(getattr(self, "active_measurements", None), MeasurementTableView):
+            self._refresh_active_measurement_indexes()
+        threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
         needs_bad_data = not skip_bad_data
         if observability is None:
             observability = self.observability_analysis()
@@ -4551,11 +5082,12 @@ class DCStateEstimator:
             else:
                 result = self.estimate(
                     verbose=verbose,
-                    final_diagnostics=needs_bad_data,
+                    final_diagnostics=final_diagnostics and needs_bad_data,
                     observability=observability,
                 )
         finally:
             self._array_only_estimate_result = previous_array_only
+            self._array_only_runtime = previous_runtime_mode
         self.estimate_result = result
         self.removed_bad_data = removed
         if skip_bad_data:

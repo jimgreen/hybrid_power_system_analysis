@@ -1872,6 +1872,7 @@ class DCStateEstimationTest(unittest.TestCase):
     def test_run_array_result_mode_keeps_estimate_arrays_only(self):
         import secore.dc_se as dc_se_module
         from secore.dc_se import DCStateEstimator
+        from model.meas_model import MeasurementTableView
         from secore.se_result import SEResult
 
         estimator = DCStateEstimator(
@@ -1923,12 +1924,31 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertGreater(result.x.size, 0)
         self.assertGreater(result.z_est.size, 0)
         self.assertGreater(result.residual.size, 0)
+        self.assertIsInstance(estimator.active_measurements, MeasurementTableView)
         self.assertIsNotNone(result.H)
         self.assertIsNotNone(result.gain)
         self.assertEqual(0, len(result.measurements))
         self.assertEqual(1, bad_data_calls)
         self.assertEqual([], estimator.bad_items)
         self.assertEqual(result.residual.size, estimator.normalized_residual.size)
+
+    def test_run_array_result_mode_uses_stringless_measurement_ppc(self):
+        from secore.dc_se import DCStateEstimator
+        from model.meas_model import MeasurementTableView
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+            auto_prepare=False,
+        )
+
+        estimator.run(result_mode="array", verbose=False, skip_bad_data=True)
+
+        self.assertIsInstance(estimator.active_measurements, MeasurementTableView)
+        self.assertEqual(0, estimator.measurement_table.device_name.size)
+        self.assertEqual(0, estimator.measurement_table.device_type.size)
+        self.assertEqual(0, estimator.measurement_table.meas_type.size)
+        self.assertTrue(estimator.estimate_result.converged)
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator
