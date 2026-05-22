@@ -326,6 +326,13 @@ class _PackedMeasurementKeyCache:
             self._keys = keys
         return keys
 
+    def _update_materialized(self, key_array: np.ndarray) -> None:
+        if self._keys is not None:
+            self._keys.update(np.asarray(key_array, dtype=np.int64).astype(object, copy=False))
+
+    def extend_array(self, keys) -> None:
+        self.estimator._append_active_measurement_key_array_cache(keys)
+
     def __contains__(self, key) -> bool:
         keys = self._keys
         if keys is not None:
@@ -344,11 +351,14 @@ class _PackedMeasurementKeyCache:
     def __iter__(self):
         return iter(self._materialize())
 
+    def __eq__(self, other) -> bool:
+        return self._materialize() == other
+
     def add(self, key) -> None:
-        self._materialize().add(int(key))
+        self.extend_array(np.asarray([int(key)], dtype=np.int64))
 
     def update(self, keys) -> None:
-        self._materialize().update(keys)
+        self.extend_array(keys)
 
 
 class _PseudoMeasurementBuffer:
@@ -2748,6 +2758,8 @@ class ACStateEstimator:
     def _measurement_key_array_from_cache(measurement_keys) -> np.ndarray:
         if isinstance(measurement_keys, np.ndarray):
             keys = np.asarray(measurement_keys, dtype=np.int64).reshape(-1)
+        elif isinstance(measurement_keys, _PackedMeasurementKeyCache):
+            return measurement_keys._key_array()
         elif not measurement_keys:
             return np.empty(0, dtype=np.int64)
         else:
@@ -2773,9 +2785,40 @@ class ACStateEstimator:
             self._active_measurement_code_pos_cache = key_set
         else:
             self._active_measurement_keys = key_set
-            self._active_measurement_code_pos_cache = key_set
+        self._active_measurement_code_pos_cache = key_set
         self._active_measurement_key_array_cache = key_array
         self._active_measurement_key_sorted_array_cache = None
+
+    def _append_active_measurement_key_array_cache(self, measurement_keys) -> None:
+        key_array = np.asarray(measurement_keys, dtype=np.int64).reshape(-1)
+        if key_array.size == 0:
+            return
+        key_array = key_array.astype(np.int64, copy=False)
+        current = getattr(self, "_active_measurement_key_array_cache", None)
+        if current is None or np.asarray(current).size == 0:
+            self._active_measurement_key_array_cache = key_array.copy()
+        else:
+            self._active_measurement_key_array_cache = np.concatenate(
+                (
+                    np.asarray(current, dtype=np.int64),
+                    key_array,
+                )
+            )
+        self._active_measurement_key_sorted_array_cache = None
+        seen_cache_ids = set()
+        for attr in (
+            "_active_measurement_keys",
+            "_active_measurement_code_pos_cache",
+        ):
+            cache = getattr(self, attr, None)
+            cache_id = id(cache)
+            if cache is None or cache_id in seen_cache_ids:
+                continue
+            seen_cache_ids.add(cache_id)
+            if isinstance(cache, _PackedMeasurementKeyCache):
+                cache._update_materialized(key_array)
+            elif isinstance(cache, set):
+                cache.update(key_array.astype(object, copy=False))
 
     @staticmethod
     def _active_measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
@@ -3464,7 +3507,6 @@ class ACStateEstimator:
                 )
         self._set_active_key_caches_from_array(
             active_measurement_key_array,
-            set(active_measurement_key_array.astype(object, copy=False)),
         )
         self._max_measurement_idx = max_idx
         self._node_voltage_measurement_cache = node_voltage_best
@@ -3694,7 +3736,6 @@ class ACStateEstimator:
         if row_count:
             self._max_measurement_idx = int(np.max(appended_table.idx))
         if record_summary:
-            measurement_key_cache = self._active_measurement_keys_ref()
             tail_type = np.asarray(appended_table.device_type_code, dtype=np.int16)
             tail_meas = np.asarray(appended_table.meas_type_code, dtype=np.int16)
             tail_pos = (
@@ -3708,18 +3749,7 @@ class ACStateEstimator:
                 valid_pos = tail_pos[valid_tail].astype(np.int64, copy=False)
                 valid_meas = tail_meas[valid_tail].astype(np.int64, copy=False)
                 measurement_keys = self._active_measurement_key_array(valid_type, valid_pos, valid_meas)
-                measurement_key_cache.update(measurement_keys.astype(object, copy=False))
-                key_array = getattr(self, "_active_measurement_key_array_cache", None)
-                if key_array is None or np.asarray(key_array).size == 0:
-                    self._active_measurement_key_array_cache = measurement_keys.astype(np.int64, copy=False)
-                else:
-                    self._active_measurement_key_array_cache = np.concatenate(
-                        (
-                            np.asarray(key_array, dtype=np.int64),
-                            measurement_keys.astype(np.int64, copy=False),
-                        )
-                    )
-                self._active_measurement_key_sorted_array_cache = None
+                self._append_active_measurement_key_array_cache(measurement_keys)
         return base_table
 
     def _real_voltage_observation_nodes(self) -> Dict[int, float]:
@@ -6453,9 +6483,8 @@ class ACStateEstimator:
                 present_device_codes = {int(code) for code in rows_by_code.keys()}
             else:
                 present_device_codes = set(np.unique(np.asarray(table.device_type_code, dtype=np.int16)).astype(object, copy=False))
-        self._ac_measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays(
-            present_device_codes,
-        )
+        self._ac_measurement_present_device_codes = present_device_codes
+        self._ac_measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
         self._ac_branch_transformer_plan_kind_by_type_code = {
             DEVICE_TYPE_ACBranch: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
             DEVICE_TYPE_ACTransformer: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
@@ -6505,6 +6534,15 @@ class ACStateEstimator:
         device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
         if device_names.size == 0:
             return {}
+        if include_codes is None:
+            include_codes = getattr(self, "_ac_measurement_present_device_codes", None)
+        device_name_id_array = meas_ppc.get("device_name_id_array")
+        if isinstance(device_name_id_array, np.ndarray):
+            device_name_id_array = np.asarray(device_name_id_array, dtype=np.int64)
+        else:
+            device_name_id_array = np.asarray([], dtype=np.int64)
+        rows_by_meas_code = meas_ppc.get("rows_by_device_type_code")
+        rows_by_meas_code = rows_by_meas_code if isinstance(rows_by_meas_code, dict) else {}
         plan_name_rows = getattr(self, "_ac_measurement_plan_name_rows_by_type_code", None)
         if not plan_name_rows:
             warnings.warn(
@@ -6513,20 +6551,55 @@ class ACStateEstimator:
                 stacklevel=2,
             )
             return {}
+
+        def lookup_from_ids(name_ids: np.ndarray) -> np.ndarray:
+            name_ids = np.asarray(name_ids, dtype=np.int64)
+            if name_ids.size == 0:
+                return np.asarray([], dtype=np.int64)
+            lookup = np.empty(int(name_ids.max()) + 1, dtype=np.int64)
+            lookup.fill(-1)
+            lookup[name_ids.astype(np.intp, copy=False)] = np.arange(name_ids.size, dtype=np.int64)
+            return lookup
+
+        def lookup_for(device_type_code: int, row_names: np.ndarray) -> np.ndarray:
+            row_names = np.asarray(row_names, dtype=object)
+            if row_names.size == 0:
+                return np.asarray([], dtype=np.int64)
+            if device_name_id_array.size:
+                rows = rows_by_meas_code.get(int(device_type_code))
+                rows = np.asarray(rows, dtype=np.int64) if rows is not None else np.asarray([], dtype=np.int64)
+                if rows.size:
+                    row_ids = device_name_id_array[rows.astype(np.intp, copy=False)]
+                    row_ids = row_ids[row_ids >= 0]
+                    if row_ids.size:
+                        first_mask = np.empty(row_ids.size, dtype=bool)
+                        first_mask[0] = True
+                        first_mask[1:] = row_ids[1:] != row_ids[:-1]
+                        ordered_ids = row_ids[first_mask]
+                        if ordered_ids.size == row_names.size:
+                            valid_ids = (ordered_ids >= 0) & (ordered_ids < device_names.size)
+                            if np.all(valid_ids) and np.array_equal(
+                                device_names[ordered_ids.astype(np.intp, copy=False)],
+                                row_names,
+                            ):
+                                return lookup_from_ids(ordered_ids)
+            name_ids = self._meas_device_name_ids_for_ppc_names(meas_ppc, row_names)
+            valid = name_ids >= 0
+            if not np.any(valid):
+                return np.asarray([], dtype=np.int64)
+            lookup = np.empty(int(name_ids[valid].max()) + 1, dtype=np.int64)
+            lookup.fill(-1)
+            plan_pos = np.arange(name_ids.size, dtype=np.int64)
+            lookup[name_ids[valid].astype(np.intp, copy=False)] = plan_pos[valid]
+            return lookup
+
         result: Dict[int, np.ndarray] = {}
         for code, name_rows in plan_name_rows.items():
             if include_codes is not None and int(code) not in include_codes:
                 continue
             names, rows = name_rows
             row_names = self._ppc_names_for_rows(names, np.asarray(rows, dtype=np.int64))
-            name_ids = self._meas_device_name_ids_for_ppc_names(meas_ppc, row_names)
-            lookup = np.empty(device_names.size, dtype=np.int64)
-            lookup.fill(-1)
-            valid = name_ids >= 0
-            if np.any(valid):
-                plan_pos = np.arange(name_ids.size, dtype=np.int64)
-                lookup[name_ids[valid].astype(np.intp, copy=False)] = plan_pos[valid]
-            result[int(code)] = lookup
+            result[int(code)] = lookup_for(int(code), row_names)
         return result
 
     def _measurement_device_id_maps_for(
