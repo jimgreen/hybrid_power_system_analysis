@@ -98,7 +98,7 @@ from secore.se_math import (
     observability_weak_direction,
     targeted_redundancy_count,
 )
-from secore.state_metadata import StateMeta, state_labels_from_metadata, state_meta_at
+from secore.state_metadata import StateMeta, state_labels_from_metadata
 from secore.se_array_plan import (
     build_active_measurement_view,
     build_measurement_plan_table,
@@ -217,7 +217,6 @@ class DCStateEstimator:
         self._prepare_active_measurements = bool(prepare_active_measurements)
         self._prepare_defer_finalize = bool(defer_prepare_finalize)
         self._array_only_runtime = False
-        self._active_key_cache_uses_name_id = False
         self.observability_result = None
         self.estimate_result = None
         self.removed_bad_data: List[BadDataItem] = []
@@ -497,7 +496,7 @@ class DCStateEstimator:
                     include_matrix=False,
                 )
                 self.meas_ppc["_mutable_runtime_arrays"] = True
-                self.measurements = TableBackedMeasurementList(
+                self.measurements = self._measurement_sequence_from_table(
                     measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
                     normalized=bool(self.meas_ppc.get("normalized", False)),
                 )
@@ -507,7 +506,7 @@ class DCStateEstimator:
         elif isinstance(measurements, dict) and measurements.get("format") == "meas_ppc_v1":
             self.meas_ppc = copy_meas_ppc(measurements)
             if bool(getattr(self, "_array_only_runtime", False)):
-                self.measurements = TableBackedMeasurementList(
+                self.measurements = self._measurement_sequence_from_table(
                     measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
                     normalized=bool(self.meas_ppc.get("normalized", False)),
                 )
@@ -542,6 +541,181 @@ class DCStateEstimator:
     def _require_prepared(self, action: str) -> None:
         if not self._prepared:
             raise RuntimeError(f"Call prepare() before {action}.")
+
+    def _build_state_meta_arrays(self) -> Dict[str, np.ndarray]:
+        n_state = int(getattr(self, "n_state", 0))
+        side = np.full(n_state, "dc", dtype=object)
+        kind = np.empty(n_state, dtype=object)
+        device_type = np.empty(n_state, dtype=object)
+        device_name = np.empty(n_state, dtype=object)
+        terminal = np.full(n_state, "", dtype=object)
+        component = np.empty(n_state, dtype=object)
+        legacy_label = np.empty(n_state, dtype=object)
+        device_pos = np.full(n_state, -1, dtype=np.int64)
+        device_type_code = np.zeros(n_state, dtype=np.int16)
+        meas_type_code = np.zeros(n_state, dtype=np.int16)
+        cursor = 0
+
+        voltage_state_pos = np.asarray(getattr(self, "voltage_state_pos", ()), dtype=np.int64)
+        count = int(voltage_state_pos.size)
+        if count:
+            rows = slice(cursor, cursor + count)
+            solver_pos = voltage_state_pos.astype(np.intp, copy=False)
+            names = np.asarray(self._node_name_by_pos, dtype=object)[solver_pos]
+            kind[rows] = "voltage"
+            device_type[rows] = "DCNode"
+            device_name[rows] = names
+            component[rows] = "magnitude"
+            legacy_label[rows] = np.char.add("V:", names.astype(str)).astype(object)
+            local_device_pos = np.full(count, -1, dtype=np.int64)
+            valid = voltage_state_pos < self._dc_node_device_pos_by_solver_pos.size
+            if np.any(valid):
+                local_device_pos[valid] = self._dc_node_device_pos_by_solver_pos[voltage_state_pos[valid].astype(np.intp, copy=False)]
+            device_pos[rows] = local_device_pos
+            device_type_code[rows] = DEVICE_TYPE_DCNode
+            meas_type_code[rows] = MEAS_TYPE_V
+            cursor += count
+
+        zero_names = np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object)
+        count = int(zero_names.size)
+        if count:
+            rows = slice(cursor, cursor + count)
+            kind[rows] = "zero_current"
+            device_type[rows] = "DCZeroBranch"
+            device_name[rows] = zero_names
+            component[rows] = "current"
+            legacy_label[rows] = np.char.add("I_ZERO:", zero_names.astype(str)).astype(object)
+            device_pos[rows] = np.arange(count, dtype=np.int64)
+            device_type_code[rows] = DEVICE_TYPE_DCZeroBranch
+            meas_type_code[rows] = MEAS_TYPE_I_FROM
+            cursor += count
+
+        break_names = np.asarray(getattr(self, "_break_names", ()), dtype=object)
+        count = int(break_names.size)
+        if count:
+            rows = slice(cursor, cursor + count)
+            kind[rows] = "break_current"
+            device_type[rows] = "DCBreak"
+            device_name[rows] = break_names
+            component[rows] = "current"
+            legacy_label[rows] = np.char.add("I_BREAK:", break_names.astype(str)).astype(object)
+            device_pos[rows] = np.arange(count, dtype=np.int64)
+            device_type_code[rows] = DEVICE_TYPE_DCBreak
+            meas_type_code[rows] = MEAS_TYPE_I_FROM
+            cursor += count
+
+        dcdc_names = np.asarray(getattr(self, "_dcdc_names", ()), dtype=object)
+        count = int(dcdc_names.size)
+        if count:
+            rows = slice(cursor, cursor + 2 * count)
+            repeated_names = np.repeat(dcdc_names, 2)
+            kind[rows] = np.tile(np.asarray(["dcdc_p_from", "dcdc_p_to"], dtype=object), count)
+            device_type[rows] = "DCDCConverter"
+            device_name[rows] = repeated_names
+            terminal[rows] = np.tile(np.asarray(["from", "to"], dtype=object), count)
+            component[rows] = "p"
+            label_prefix = np.tile(np.asarray(["P_DCDC_FROM:", "P_DCDC_TO:"], dtype=object), count)
+            legacy_label[rows] = np.char.add(label_prefix.astype(str), repeated_names.astype(str)).astype(object)
+            device_pos[rows] = np.repeat(np.arange(count, dtype=np.int64), 2)
+            device_type_code[rows] = DEVICE_TYPE_DCDCConverter
+            meas_type_code[rows] = np.tile(np.asarray([MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO], dtype=np.int16), count)
+            cursor += 2 * count
+
+        vgen_names = np.asarray(getattr(self, "_v_generator_names", ()), dtype=object)
+        vgen_device_pos = np.asarray(getattr(self, "_v_generator_local_pos", ()), dtype=np.int64)
+        count = int(vgen_names.size)
+        if count:
+            rows = slice(cursor, cursor + count)
+            kind[rows] = "v_generator_p"
+            device_type[rows] = "DCGenerator"
+            device_name[rows] = vgen_names
+            component[rows] = "p"
+            legacy_label[rows] = np.char.add("P_VGEN:", vgen_names.astype(str)).astype(object)
+            device_pos[rows] = vgen_device_pos
+            device_type_code[rows] = DEVICE_TYPE_DCGenerator
+            meas_type_code[rows] = MEAS_TYPE_P_GEN
+            cursor += count
+
+        if cursor != n_state:
+            side = side[:cursor]
+            kind = kind[:cursor]
+            device_type = device_type[:cursor]
+            device_name = device_name[:cursor]
+            terminal = terminal[:cursor]
+            component = component[:cursor]
+            legacy_label = legacy_label[:cursor]
+            device_pos = device_pos[:cursor]
+            device_type_code = device_type_code[:cursor]
+            meas_type_code = meas_type_code[:cursor]
+        return {
+            "side": side,
+            "kind": kind,
+            "device_type": device_type,
+            "device_name": device_name,
+            "terminal": terminal,
+            "component": component,
+            "legacy_label": legacy_label,
+            "device_pos": device_pos,
+            "device_type_code": device_type_code,
+            "meas_type_code": meas_type_code,
+        }
+
+    def _state_meta_arrays_ref(self) -> Dict[str, np.ndarray]:
+        arrays = getattr(self, "_state_meta_arrays", None)
+        if arrays is None:
+            arrays = self._build_state_meta_arrays()
+            self._state_meta_arrays = arrays
+        return arrays
+
+    def _build_state_meta(self) -> List[StateMeta]:
+        arrays = self._state_meta_arrays_ref()
+        row_count = int(np.asarray(arrays["kind"], dtype=object).size)
+        state_meta = [None] * row_count
+        for idx in range(row_count):
+            state_meta[idx] = StateMeta(
+                str(arrays["side"][idx]),
+                str(arrays["kind"][idx]),
+                str(arrays["device_type"][idx]),
+                str(arrays["device_name"][idx]),
+                terminal=str(arrays["terminal"][idx]),
+                component=str(arrays["component"][idx]),
+                legacy_label=str(arrays["legacy_label"][idx]),
+                device_pos=int(arrays["device_pos"][idx]),
+                device_type_code=int(arrays["device_type_code"][idx]),
+                meas_type_code=int(arrays["meas_type_code"][idx]),
+            )
+        return state_meta
+
+    @property
+    def state_meta(self) -> List[StateMeta]:
+        cache = getattr(self, "_state_meta_cache", None)
+        if cache is None:
+            cache = self._build_state_meta()
+            self._state_meta_cache = cache
+        return cache
+
+    @state_meta.setter
+    def state_meta(self, value) -> None:
+        self._state_meta_cache = value
+        self._state_labels_cache = None
+
+    @property
+    def state_labels(self) -> List[str]:
+        cache = getattr(self, "_state_labels_cache", None)
+        if cache is None:
+            meta_cache = getattr(self, "_state_meta_cache", None)
+            if meta_cache is None:
+                labels = [str(label) for label in self._state_meta_arrays_ref()["legacy_label"].tolist()]
+                cache = labels if all(labels) else state_labels_from_metadata(self.state_meta)
+            else:
+                labels = [meta.legacy_label for meta in meta_cache]
+                cache = labels if all(labels) else state_labels_from_metadata(meta_cache)
+            self._state_labels_cache = cache
+        return cache
+
+    @state_labels.setter
+    def state_labels(self, value) -> None:
+        self._state_labels_cache = value
 
     def finalize_prepare(
         self,
@@ -588,102 +762,9 @@ class DCStateEstimator:
         self.dcdc_start = self.switch_start + self.n_switch
         self.v_generator_start = self.dcdc_start + self.n_dcdc_power
         self.n_state = self.v_generator_start + self.n_v_generator
-
-        state_meta: List[StateMeta] = []
-        for pos in self.voltage_state_pos.tolist():
-            solver_pos = int(pos)
-            device_pos = (
-                int(self._dc_node_device_pos_by_solver_pos[solver_pos])
-                if 0 <= solver_pos < self._dc_node_device_pos_by_solver_pos.size
-                else -1
-            )
-            state_meta.append(
-                StateMeta(
-                    "dc",
-                    "voltage",
-                    "DCNode",
-                    str(self._node_name_by_pos[solver_pos]),
-                    component="magnitude",
-                    legacy_label=f"V:{self._node_name_by_pos[solver_pos]}",
-                    device_pos=device_pos,
-                    device_type_code=DEVICE_TYPE_DCNode,
-                    meas_type_code=MEAS_TYPE_V,
-                )
-            )
-        state_meta.extend(
-            StateMeta(
-                "dc",
-                "zero_current",
-                "DCZeroBranch",
-                str(name),
-                component="current",
-                legacy_label=f"I_ZERO:{name}",
-                device_pos=int(pos),
-                device_type_code=DEVICE_TYPE_DCZeroBranch,
-                meas_type_code=MEAS_TYPE_I_FROM,
-            )
-            for pos, name in enumerate(self._zero_branch_names.tolist())
-        )
-        state_meta.extend(
-            StateMeta(
-                "dc",
-                "break_current",
-                "DCBreak",
-                str(name),
-                component="current",
-                legacy_label=f"I_BREAK:{name}",
-                device_pos=int(pos),
-                device_type_code=DEVICE_TYPE_DCBreak,
-                meas_type_code=MEAS_TYPE_I_FROM,
-            )
-            for pos, name in enumerate(self._break_names.tolist())
-        )
-        for pos, conv_name in enumerate(self._dcdc_names.tolist()):
-            state_meta.append(
-                StateMeta(
-                    "dc",
-                    "dcdc_p_from",
-                    "DCDCConverter",
-                    str(conv_name),
-                    terminal="from",
-                    component="p",
-                    legacy_label=f"P_DCDC_FROM:{conv_name}",
-                    device_pos=int(pos),
-                    device_type_code=DEVICE_TYPE_DCDCConverter,
-                    meas_type_code=MEAS_TYPE_P_FROM,
-                )
-            )
-            state_meta.append(
-                StateMeta(
-                    "dc",
-                    "dcdc_p_to",
-                    "DCDCConverter",
-                    str(conv_name),
-                    terminal="to",
-                    component="p",
-                    legacy_label=f"P_DCDC_TO:{conv_name}",
-                    device_pos=int(pos),
-                    device_type_code=DEVICE_TYPE_DCDCConverter,
-                    meas_type_code=MEAS_TYPE_P_TO,
-                )
-            )
-        state_meta.extend(
-            StateMeta(
-                "dc",
-                "v_generator_p",
-                "DCGenerator",
-                str(name),
-                component="p",
-                legacy_label=f"P_VGEN:{name}",
-                device_pos=int(device_pos),
-                device_type_code=DEVICE_TYPE_DCGenerator,
-                meas_type_code=MEAS_TYPE_P_GEN,
-            )
-            for device_pos, name in zip(self._v_generator_local_pos.tolist(), self._v_generator_names.tolist())
-        )
-        self.state_meta = state_meta
-        labels = [meta.legacy_label for meta in state_meta]
-        self.state_labels = labels if all(labels) else state_labels_from_metadata(self.state_meta)
+        self._state_meta_arrays = None
+        self._state_meta_cache = None
+        self._state_labels_cache = None
         self._build_apply_state_index()
         self._build_initial_state_seed_arrays()
         self._build_measurement_plan_device_cache()
@@ -701,10 +782,28 @@ class DCStateEstimator:
             self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
             self._record_profile_time("init.targeted_observability_pseudo", time.perf_counter() - stage_start)
         else:
-            self.active_measurements = MeasurementList(
-                [],
+            empty_table = MeasurementTable(
+                idx=np.asarray([], dtype=np.int64),
+                name=np.asarray([], dtype=object),
+                device_type=np.asarray([], dtype=object),
+                device_name=np.asarray([], dtype=object),
+                meas_type=np.asarray([], dtype=object),
+                weight=np.asarray([], dtype=np.float64),
+                valid=np.asarray([], dtype=bool),
+                value=np.asarray([], dtype=np.float64),
+                device_type_code=np.asarray([], dtype=np.int16),
+                angle_mask=np.asarray([], dtype=bool),
+                status_code=np.asarray([], dtype=np.int16),
+                rows_by_device_type_code={},
+                device_name_id=np.asarray([], dtype=np.int64),
+                meas_type_code=np.asarray([], dtype=np.int16),
+                device_pos=np.asarray([], dtype=np.int64),
+            )
+            self.active_measurements = self._measurement_sequence_from_table(
+                empty_table,
                 normalized=getattr(self.measurements, "normalized", False),
             )
+            self.active_measurement_table = empty_table
             self.active_measurement_rows = np.array([], dtype=np.int64)
             self.active_z = np.array([], dtype=np.float64)
             self.active_weight = np.array([], dtype=np.float64)
@@ -729,6 +828,7 @@ class DCStateEstimator:
             materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
         )
         self.measurement_table = active_view.source_table
+        self._max_measurement_idx = int(self.measurement_table.idx.max()) if self.measurement_table.idx.size else 0
         self.active_measurements = active_view.measurements
         self.active_measurement_rows = active_view.source_rows
         self.active_measurement_table = active_view.table
@@ -1605,12 +1705,6 @@ class DCStateEstimator:
         return {}
 
     @staticmethod
-    def _active_device_pos_key(device_type_code: int, device_pos: int) -> int:
-        if int(device_pos) < 0:
-            return -1
-        return (int(device_type_code) << _ACTIVE_NAME_ID_KEY_BITS) | int(device_pos)
-
-    @staticmethod
     def _active_measurement_pos_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
         if int(device_pos) < 0:
             return -1
@@ -1619,12 +1713,6 @@ class DCStateEstimator:
             | (int(device_pos) << _ACTIVE_MEAS_TYPE_KEY_BITS)
             | int(meas_type_code)
         )
-
-    @staticmethod
-    def _active_device_pos_key_array(device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
-        return (
-            np.asarray(device_type_code, dtype=np.int64) << _ACTIVE_NAME_ID_KEY_BITS
-        ) | np.asarray(device_pos, dtype=np.int64)
 
     @staticmethod
     def _active_measurement_pos_key_array(
@@ -1835,14 +1923,7 @@ class DCStateEstimator:
                 meas.value = float(value[pos])
 
         active_rows = np.flatnonzero(active)
-        self._active_key_cache_uses_name_id = False
         valid_key_rows = active_rows[device_pos[active_rows] >= 0]
-        active_device_keys = set(
-            self._active_device_pos_key_array(
-                code[valid_key_rows],
-                device_pos[valid_key_rows],
-            ).tolist()
-        )
         active_measurement_keys = set(
             self._active_measurement_pos_key_array(
                 code[valid_key_rows],
@@ -1911,7 +1992,6 @@ class DCStateEstimator:
                     value[seed_selected].astype(np.float64, copy=False).tolist(),
                 )
             )
-        self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache = {
@@ -1924,12 +2004,6 @@ class DCStateEstimator:
         if getattr(self, "meas_ppc", None) is not None:
             self.meas_ppc["normalized"] = True
             sync_meas_ppc_from_measurement_table(self.meas_ppc, table)
-
-    def _active_device_keys(self) -> set:
-        """Return devices that already have at least one usable real measurement."""
-        if not hasattr(self, "_active_device_key_cache"):
-            self._refresh_measurement_summary_cache()
-        return set(self._active_device_key_cache)
 
     def _active_measurement_keys(self) -> set:
         """Return usable measurement keys at device and measurement-type granularity."""
@@ -2113,8 +2187,6 @@ class DCStateEstimator:
 
     def _refresh_measurement_summary_cache(self) -> None:
         """Cache active measurement key sets and max row id for initialization scans."""
-        self._active_key_cache_uses_name_id = False
-        active_device_keys = set()
         active_measurement_keys = set()
         node_voltage_best: Dict[int, Tuple[float, float]] = {}
         real_voltage_best: Dict[int, Tuple[float, float]] = {}
@@ -2127,12 +2199,6 @@ class DCStateEstimator:
             meas_type_code = self._ensure_table_meas_type_codes(table)
             device_pos = self._measurement_device_pos_array(table)
             valid_key_rows = active_rows[device_pos[active_rows] >= 0]
-            active_device_keys = set(
-                self._active_device_pos_key_array(
-                    device_type_code[valid_key_rows],
-                    device_pos[valid_key_rows],
-                ).tolist()
-            )
             active_measurement_keys = set(
                 self._active_measurement_pos_key_array(
                     device_type_code[valid_key_rows],
@@ -2170,7 +2236,6 @@ class DCStateEstimator:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        self._active_device_key_cache = active_device_keys
         self._active_measurement_key_cache = active_measurement_keys
         self._max_measurement_idx = max_idx
         self._node_voltage_measurement_cache = {
@@ -2325,7 +2390,7 @@ class DCStateEstimator:
 
     def _add_pseudo_power_measurements(self) -> None:
         """Add weak priors for devices whose file measurements are missing or invalid."""
-        if not hasattr(self, "_active_device_key_cache") or not hasattr(self, "_active_measurement_key_cache"):
+        if not hasattr(self, "_active_measurement_key_cache"):
             self._refresh_measurement_summary_cache()
         measured_keys = self._active_measurement_key_cache
         next_idx = self._next_measurement_idx()
@@ -2804,12 +2869,14 @@ class DCStateEstimator:
         max_add: int,
     ) -> Tuple[int, int]:
         """Translate a weak compact DC state into the smallest useful pseudo measurement."""
-        meta = state_meta_at(self.state_meta, state_idx)
-        if meta is None:
+        arrays = self._state_meta_arrays_ref()
+        state_pos = int(state_idx)
+        if state_pos < 0 or state_pos >= int(np.asarray(arrays["kind"], dtype=object).size):
             return next_idx, 0
-        name = str(meta.device_name)
-        device_type_code = int(meta.device_type_code)
-        device_pos = int(meta.device_pos)
+        meta_kind = str(arrays["kind"][state_pos])
+        name = str(arrays["device_name"][state_pos])
+        device_type_code = int(arrays["device_type_code"][state_pos])
+        device_pos = int(arrays["device_pos"][state_pos])
         added_total = 0
 
         def add(
@@ -2859,27 +2926,27 @@ class DCStateEstimator:
             added_total += 1
             return new_idx, 1
 
-        if meta.kind == "voltage" and device_type_code == DEVICE_TYPE_DCNode:
+        if meta_kind == "voltage" and device_type_code == DEVICE_TYPE_DCNode:
             node_pos = int(self._node_plan_node_pos[device_pos]) if 0 <= device_pos < self._node_plan_node_pos.size else -1
             value = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
             return add(DEVICE_TYPE_DCNode, "DCNode", name, device_pos, MEAS_TYPE_V, "V", value)
-        if meta.kind == "zero_current" and device_type_code == DEVICE_TYPE_DCZeroBranch:
+        if meta_kind == "zero_current" and device_type_code == DEVICE_TYPE_DCZeroBranch:
             value = 0.0
             if self._zero_branch_rows.size and "current" in DC_ZERO_BRANCH_COLS:
                 value = float(self._dc_ppc["zero_branch"][int(self._zero_branch_rows[device_pos]), DC_ZERO_BRANCH_COLS["current"]])
             return add(DEVICE_TYPE_DCZeroBranch, "DCZeroBranch", name, device_pos, MEAS_TYPE_I_FROM, "I_FROM", value)
-        if meta.kind == "break_current" and device_type_code == DEVICE_TYPE_DCBreak:
+        if meta_kind == "break_current" and device_type_code == DEVICE_TYPE_DCBreak:
             value = 0.0
             if self._break_rows.size and "current" in DC_BREAK_COLS:
                 value = float(self._dc_ppc["break"][int(self._break_rows[device_pos]), DC_BREAK_COLS["current"]])
             return add(DEVICE_TYPE_DCBreak, "DCBreak", name, device_pos, MEAS_TYPE_I_FROM, "I_FROM", value)
-        if meta.kind == "dcdc_p_from" and device_type_code == DEVICE_TYPE_DCDCConverter:
+        if meta_kind == "dcdc_p_from" and device_type_code == DEVICE_TYPE_DCDCConverter:
             value = float(self._dc_ppc["dcdc"][int(self._dcdc_rows[device_pos]), DC_DCDC_COLS["i_p"]])
             return add(DEVICE_TYPE_DCDCConverter, "DCDCConverter", name, device_pos, MEAS_TYPE_P_FROM, "P_FROM", value)
-        if meta.kind == "dcdc_p_to" and device_type_code == DEVICE_TYPE_DCDCConverter:
+        if meta_kind == "dcdc_p_to" and device_type_code == DEVICE_TYPE_DCDCConverter:
             value = float(self._dc_ppc["dcdc"][int(self._dcdc_rows[device_pos]), DC_DCDC_COLS["j_p"]])
             return add(DEVICE_TYPE_DCDCConverter, "DCDCConverter", name, device_pos, MEAS_TYPE_P_TO, "P_TO", value)
-        if meta.kind == "v_generator_p" and device_type_code == DEVICE_TYPE_DCGenerator:
+        if meta_kind == "v_generator_p" and device_type_code == DEVICE_TYPE_DCGenerator:
             value = float(self._gen_table[int(self._generator_rows[device_pos]), DC_GEN_COLS["p_set"]])
             return add(DEVICE_TYPE_DCGenerator, "DCGenerator", name, device_pos, MEAS_TYPE_P_GEN, "P_GEN", value)
         return next_idx, 0
