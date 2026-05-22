@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.sparse.csgraph import maximum_bipartite_matching as sp_maximum_bipartite_matching
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -32,11 +33,11 @@ from model.dc_array_model import (
 )
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 from model.meas_array_model import (
+    MEAS_COLS,
     build_meas_ppc_from_e_file,
     copy_meas_ppc,
     measurement_list_from_meas_ppc,
     measurement_table_from_meas_ppc,
-    sync_meas_ppc_from_measurement_table,
 )
 from model.meas_type import (
     DEVICE_TYPE_DCBreak,
@@ -86,20 +87,25 @@ from model.meas_model import (
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from paths import measurement_file, model_file
 from secore.se_math import (
+    LowerNormalEquationCscPlan,
+    NormalEquationAssemblyPlan,
     NormalEquationSolver,
     SparseJacobianBuilder,
     _normal_equation_structural_pattern,
     build_normal_equations,
+    full_normal_equation_from_lower,
     is_sparse_matrix,
     inverse_gain_for_bad_data,
     matrix_is_empty,
     measurement_leverage,
     observability_rank_details,
     observability_weak_direction,
+    sparse_structural_rank,
     targeted_redundancy_count,
 )
 from secore.state_metadata import StateMeta, state_labels_from_metadata
 from secore.se_array_plan import (
+    append_active_measurement_view,
     build_active_measurement_view,
     build_measurement_plan_table,
     concat_measurement_tables,
@@ -218,6 +224,7 @@ class DCStateEstimator:
         self._prepare_defer_finalize = bool(defer_prepare_finalize)
         self._array_only_runtime = False
         self.observability_result = None
+        self._initial_observability_cache = None
         self.estimate_result = None
         self.removed_bad_data: List[BadDataItem] = []
         self.bad_items: List[BadDataItem] = []
@@ -726,7 +733,6 @@ class DCStateEstimator:
         self._defer_prepare_finalize_pending = False
         if not measurements_already_normalized:
             stage_start = time.perf_counter()
-            self._disable_unavailable_measurements()
             self._convert_measurements_to_pu()
             self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
         self.power_flow_seed_converged = False
@@ -771,6 +777,9 @@ class DCStateEstimator:
         self._record_profile_time("init.state_layout", time.perf_counter() - stage_start)
         self.targeted_observability_pseudo_count = 0
         self._observability_matrix_cache = None
+        self._active_normal_pattern = None
+        self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         if prepare_active_measurements:
             stage_start = time.perf_counter()
             self._add_pseudo_power_measurements()
@@ -810,6 +819,8 @@ class DCStateEstimator:
             self.active_uniform_weight = None
             self.active_weights_are_uniform = False
             self._active_normal_pattern = None
+            self._active_normal_assembly_plan = None
+            self._active_lower_normal_plan = None
             self._jacobian_builder = SparseJacobianBuilder((0, self.n_state))
             self._jacobian_builder._assume_fixed_pattern = True
             self._measurement_plan_cache = {}
@@ -836,12 +847,163 @@ class DCStateEstimator:
         self.active_weight = active_view.weight
         self.active_uniform_weight = self._uniform_weight(self.active_weight)
         self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_rows_by_device_type_code = active_view.rows_by_device_type_code
         self._active_normal_pattern = None
+        self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
         self._jacobian_builder._assume_fixed_pattern = True
+        self._initial_observability_cache = None
         self._observability_matrix_cache = None
         self._measurement_plan_cache = {}
         self._active_measurement_plan = self._measurement_plan(self.active_measurements)
+        handled_mask = self._active_measurement_plan.get("handled_mask")
+        self.active_measurements_are_vectorized = bool(np.all(handled_mask)) if handled_mask is not None else False
+
+    def _incremental_update_active_measurement_indexes(
+        self,
+        appended_measurements: Sequence[Measurement],
+        *,
+        source_row_start: Optional[int] = None,
+        master_table: Optional[MeasurementTable] = None,
+    ) -> bool:
+        if not appended_measurements:
+            return True
+        if not hasattr(self, "active_measurements"):
+            warnings.warn(
+                "DC SE incremental active update requires active_measurements; full rebuild is required.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        appended_table = _measurement_table_from_measurements(appended_measurements)
+        if np.any(
+            (~np.asarray(appended_table.valid, dtype=bool))
+            | (np.asarray(appended_table.weight, dtype=np.float64) <= 0.0)
+        ):
+            return False
+        appended_device_pos = getattr(appended_table, "device_pos", None)
+        if appended_device_pos is None or np.asarray(appended_device_pos).size != int(appended_table.idx.size):
+            warnings.warn(
+                "DC SE incremental active update requires appended measurement device_pos; "
+                "name-based index rebuild is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        appended_device_pos = np.asarray(appended_device_pos, dtype=np.int64)
+        if np.any(appended_device_pos < 0):
+            warnings.warn(
+                "DC SE incremental active update found appended rows without valid device_pos; "
+                "name-based index rebuild is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        master_table = master_table if master_table is not None else getattr(
+            self,
+            "measurement_table",
+            getattr(self.measurements, "table", None),
+        )
+        active_table = getattr(self, "active_measurement_table", getattr(self.active_measurements, "table", None))
+        if master_table is None or active_table is None:
+            return False
+        source_row_start = int(len(master_table.idx) if source_row_start is None else source_row_start)
+        if len(master_table.idx) != source_row_start:
+            return False
+        if len(active_table.idx) != len(self.active_measurements):
+            return False
+
+        appended_view = MeasurementTableView(
+            appended_table,
+            normalized=getattr(self.measurements, "normalized", False),
+        )
+        self.measurement_table = concat_measurement_tables(master_table, appended_table)
+        try:
+            self.measurements.table = self.measurement_table
+        except AttributeError:
+            pass
+        active_view = append_active_measurement_view(
+            build_active_measurement_view(
+                self.active_measurements,
+                table_builder=_measurement_table_from_measurements,
+                materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
+            ),
+            appended_view,
+            source_row_start=source_row_start,
+            table_builder=_measurement_table_from_measurements,
+            materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
+        )
+        row_offset = len(active_table.idx)
+        previous_plan = getattr(self, "_active_measurement_plan", None)
+        self._initial_observability_cache = None
+        self._max_measurement_idx = int(self.measurement_table.idx.max()) if self.measurement_table.idx.size else 0
+        self.active_measurements = active_view.measurements
+        self.active_measurement_rows = active_view.source_rows
+        self.active_measurement_table = active_view.table
+        self.active_z = active_view.z
+        self.active_weight = active_view.weight
+        self.active_uniform_weight = self._uniform_weight(self.active_weight)
+        self.active_weights_are_uniform = self.active_uniform_weight is not None
+        self._active_rows_by_device_type_code = active_view.rows_by_device_type_code
+        self._measurement_plan_cache = {}
+        if previous_plan is None:
+            self._active_measurement_plan = self._measurement_plan(self.active_measurements)
+        else:
+            tail_plan = self._measurement_plan(appended_view)
+            self._active_measurement_plan = self._merge_active_plan_dict(
+                previous_plan,
+                tail_plan,
+                row_offset=row_offset,
+                row_keys=(
+                    "node_rows",
+                    "branch_rows",
+                    "load_rows",
+                    "gen_rows",
+                    "switch_rows",
+                    "constraint_rows",
+                    "dcdc_rows",
+                ),
+            )
+            self._measurement_plan_cache = {
+                id(self.active_measurements): (self.active_measurements, self._active_measurement_plan)
+            }
+        self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._active_normal_pattern = None
+        self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
+        self._observability_matrix_cache = None
+        self._weak_direction_candidate_jacobian_cache = None
+        handled_mask = self._active_measurement_plan.get("handled_mask")
+        self.active_measurements_are_vectorized = bool(np.all(handled_mask)) if handled_mask is not None else False
+        return True
+
+    @staticmethod
+    def _merge_active_plan_dict(
+        head: Dict[str, object],
+        tail: Dict[str, object],
+        *,
+        row_offset: int,
+        row_keys: Sequence[str],
+    ) -> Dict[str, object]:
+        row_key_tuple = tuple(row_keys)
+        merged: Dict[str, object] = {}
+        for key, head_value in head.items():
+            if key.endswith("_masks"):
+                continue
+            tail_value = tail[key]
+            if key in row_key_tuple:
+                merged[key] = np.concatenate(
+                    (
+                        np.asarray(head_value, dtype=np.int64),
+                        np.asarray(tail_value, dtype=np.int64) + int(row_offset),
+                    )
+                ).astype(np.int64, copy=False)
+                continue
+            merged[key] = np.concatenate((np.asarray(head_value), np.asarray(tail_value)))
+        DCStateEstimator._populate_kind_masks(merged)
+        return merged
 
     @staticmethod
     def _populate_kind_masks(plan: Dict[str, np.ndarray]) -> None:
@@ -910,8 +1072,11 @@ class DCStateEstimator:
         if not hasattr(self, "n_state"):
             return self.active_measurements
         self._active_normal_pattern = None
+        self._active_normal_assembly_plan = None
+        self._active_lower_normal_plan = None
         self._jacobian_builder = SparseJacobianBuilder((len(self.active_measurements), self.n_state))
         self._jacobian_builder._assume_fixed_pattern = True
+        self._initial_observability_cache = None
         self._observability_matrix_cache = None
         if hasattr(self, "_active_measurement_plan"):
             self._active_measurement_plan = self._shrink_active_measurement_plan(self._active_measurement_plan, removed_pos)
@@ -933,6 +1098,19 @@ class DCStateEstimator:
             return measurements
         return list(measurements)
 
+    def _measurement_count(self, measurement_plan_tables=None) -> int:
+        if measurement_plan_tables is None:
+            return len(self.active_measurements)
+        return len(measurement_plan_tables)
+
+    def _measurement_plan_tables_are_active(self, measurement_plan_tables) -> bool:
+        return measurement_plan_tables is getattr(self, "active_measurements", None)
+
+    def _measurement_plan_tables_for(self, measurements_or_plan_tables=None):
+        if measurements_or_plan_tables is None:
+            return self.active_measurements
+        return self._normalize_measurements(measurements_or_plan_tables)
+
     def _node_pos_from_idx(self, node_idx: int) -> int:
         lookup_ids = getattr(self, "_node_idx_lookup_ids", None)
         lookup_pos = getattr(self, "_node_idx_lookup_pos", None)
@@ -947,6 +1125,8 @@ class DCStateEstimator:
         return -1
 
     def _measurement_vectors(self, measurements: Sequence[Measurement]) -> Tuple[np.ndarray, np.ndarray]:
+        if measurements is None:
+            return self.active_z, self.active_weight
         if measurements is self.active_measurements:
             return self.active_z, self.active_weight
         table = getattr(measurements, "table", None)
@@ -964,19 +1144,63 @@ class DCStateEstimator:
         first_weight = float(weight[0])
         return first_weight if bool(np.all(weight == first_weight)) else None
 
+    @staticmethod
+    def _measurement_residual(
+        z: np.ndarray,
+        z_est: np.ndarray,
+        measurements: Sequence[Measurement],
+        *,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        if out is None:
+            return np.subtract(z, z_est, dtype=np.float64)
+        np.subtract(z, z_est, out=out)
+        return out
+
+    @staticmethod
+    def _weighted_objective(weight: np.ndarray, residual: np.ndarray) -> float:
+        return 0.5 * float(np.einsum("i,i,i->", weight, residual, residual, optimize=False))
+
     def _cache_observability_matrix(
         self,
         result: ObservabilityResult,
         x: np.ndarray,
         measurements: Sequence[Measurement],
         H,
+        *,
+        cache_lower_normal_plan: bool = True,
     ) -> None:
+        lower_normal_plan = None
+        if (
+            cache_lower_normal_plan
+            and self._measurement_plan_tables_are_active(measurements)
+            and is_sparse_matrix(H)
+        ):
+            lower_normal_plan = getattr(self, "_active_lower_normal_plan", None)
+            if lower_normal_plan is not None and not lower_normal_plan.matches(H):
+                lower_normal_plan = None
+            if lower_normal_plan is None:
+                start = time.perf_counter() if self.profile_enabled else None
+                lower_normal_plan = LowerNormalEquationCscPlan.from_jacobian(H)
+                if start is not None:
+                    profile_key = (
+                        "solve.lower_normal_plan_build"
+                        if bool(getattr(self, "_prepared", False))
+                        else "init.lower_normal_plan_build"
+                    )
+                    self._record_profile_time(profile_key, time.perf_counter() - start)
+            active_weight = getattr(self, "active_weight", None)
+            if active_weight is not None and np.asarray(active_weight).size == int(H.shape[0]):
+                lower_normal_plan.prepare_fixed_weights(np.asarray(active_weight, dtype=np.float64))
+            self._active_lower_normal_plan = lower_normal_plan
         self._observability_matrix_cache = {
             "result": result,
             "measurements": measurements,
             "x": np.asarray(x, dtype=np.float64).copy(),
             "H": H,
             "normal_pattern": None,
+            "normal_assembly_plan": None,
+            "lower_normal_plan": lower_normal_plan,
         }
 
     def _observability_matrix_cache_for(
@@ -1747,269 +1971,498 @@ class DCStateEstimator:
         assign(DEVICE_TYPE_DCDCConverter, self._dcdc_rows)
         return rows
 
-    def _convert_measurements_to_pu(self) -> None:
-        """Normalize file measurement values to the internal state-estimation units."""
-        if getattr(self.measurements, "normalized", False):
-            self._refresh_measurement_summary_cache()
-            seed_rows = []
-            table = getattr(self.measurements, "table", None)
-            if not bool(getattr(self, "flat_start", False)) and table is not None:
-                code = np.asarray(table.device_type_code, dtype=np.int16)
-                meas_type_code = self._ensure_table_meas_type_codes(table)
-                device_pos = self._measurement_device_pos_array(table)
-                active = np.asarray(table.valid, dtype=bool) & (np.asarray(table.weight, dtype=np.float64) > 0.0)
-                rows = np.flatnonzero(active & (device_pos >= 0))
-                seed_mask = (
-                    ((code[rows] == DEVICE_TYPE_DCNode) & (meas_type_code[rows] == MEAS_TYPE_V))
-                    | (
-                        (code[rows] == DEVICE_TYPE_DCGenerator)
-                        & np.isin(meas_type_code[rows], np.asarray([MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN], dtype=np.int16))
-                    )
-                    | (
-                        (code[rows] == DEVICE_TYPE_DCLoad)
-                        & np.isin(meas_type_code[rows], np.asarray([MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD], dtype=np.int16))
-                    )
-                    | (
-                        (code[rows] == DEVICE_TYPE_DCDCConverter)
-                        & np.isin(
-                            meas_type_code[rows],
-                            np.asarray([MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO], dtype=np.int16),
-                        )
-                    )
-                )
-                selected = rows[seed_mask]
-                seed_ppc_rows = self._seed_ppc_rows_from_device_pos(code[selected], device_pos[selected])
-                valid_seed = seed_ppc_rows >= 0
-                selected = selected[valid_seed]
-                seed_ppc_rows = seed_ppc_rows[valid_seed]
-                seed_rows = list(
-                    zip(
-                        code[selected].astype(np.int16, copy=False).tolist(),
-                        seed_ppc_rows.astype(np.int64, copy=False).tolist(),
-                        meas_type_code[selected].astype(np.int16, copy=False).tolist(),
-                        table.value[selected].astype(np.float64, copy=False).tolist(),
-                    )
-                )
-            self._power_flow_seed_rows = seed_rows
-            if getattr(self, "meas_ppc", None) is not None:
-                self.meas_ppc["normalized"] = True
-                sync_meas_ppc_from_measurement_table(self.meas_ppc, self.measurements.table)
-            return
-        table = _measurement_table_from_measurements(self.measurements)
-        self.measurement_table = table
-        try:
-            self.measurements.table = table
-        except AttributeError:
-            pass
-        value = table.value
-        valid = np.asarray(table.valid, dtype=bool)
-        weight = np.asarray(table.weight, dtype=np.float64)
-        active = valid & (weight > 0.0)
-        scale = np.ones(value.size, dtype=np.float64)
-        code = np.asarray(table.device_type_code, dtype=np.int16)
-        meas_type_code = self._ensure_table_meas_type_codes(table)
-        device_pos = self._measurement_device_pos_array(table)
-        status_code = measurement_table_status_code(table)
+    @staticmethod
+    def _values_for_device_pos(plan_values: np.ndarray, device_pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(plan_values, dtype=np.int64)
+        pos = np.asarray(device_pos, dtype=np.int64)
+        out = np.full(pos.size, -1, dtype=np.int64)
+        valid = (pos >= 0) & (pos < values.size)
+        if np.any(valid):
+            out[valid] = values[pos[valid].astype(np.intp, copy=False)]
+        return valid, out
 
-        def assign_single(rows: np.ndarray, node_pos_array: np.ndarray, p_code: int, v_code: int, i_code: int) -> None:
+    def _measurement_scale_for_codes(
+        self,
+        device_type_code: np.ndarray,
+        device_pos: np.ndarray,
+        meas_type_code: np.ndarray,
+        rows_by_code: Optional[Dict[int, np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        device_type_code = np.asarray(device_type_code, dtype=np.int16)
+        device_pos = np.asarray(device_pos, dtype=np.int64)
+        meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
+        n_rows = int(device_type_code.size)
+        available = np.zeros(n_rows, dtype=bool)
+        scale = np.ones(n_rows, dtype=np.float64)
+        from_pos = np.full(n_rows, -1, dtype=np.int64)
+        to_pos = np.full(n_rows, -1, dtype=np.int64)
+        n_nodes = int(self._node_voltage_file_base_by_pos.size)
+
+        def rows_for(device_code: int) -> np.ndarray:
+            if rows_by_code is not None:
+                rows = rows_by_code.get(int(device_code))
+                if rows is None:
+                    return np.asarray([], dtype=np.int64)
+                return np.asarray(rows, dtype=np.int64)
+            return np.flatnonzero(device_type_code == int(device_code)).astype(np.int64, copy=False)
+
+        def apply_node(rows: np.ndarray, node_pos_array: np.ndarray, voltage_code: int) -> None:
             if rows.size == 0:
                 return
-            pos = device_pos[rows].astype(np.int64, copy=False)
-            valid_pos = (pos >= 0) & (pos < node_pos_array.size)
-            if not np.any(valid_pos):
+            valid_plan, node_pos = self._values_for_device_pos(node_pos_array, device_pos[rows])
+            valid_node = valid_plan & (node_pos >= 0) & (node_pos < n_nodes)
+            rows_valid = rows[valid_node]
+            if rows_valid.size == 0:
                 return
-            selected = rows[valid_pos]
-            node_pos = node_pos_array[pos[valid_pos].astype(np.intp, copy=False)]
-            in_range = (node_pos >= 0) & (node_pos < self._node_voltage_file_base_by_pos.size)
-            if not np.any(in_range):
+            pos_valid = node_pos[valid_node].astype(np.intp, copy=False)
+            kind = meas_type_code[rows_valid]
+            voltage_mask = kind == int(voltage_code)
+            if not np.any(voltage_mask):
                 return
-            selected = selected[in_range]
-            node_pos = node_pos[in_range].astype(np.intp, copy=False)
-            mt = meas_type_code[selected]
-            scale[selected[mt == int(p_code)]] = self.p_base
-            v_rows = selected[mt == int(v_code)]
-            if v_rows.size:
-                scale[v_rows] = self._node_voltage_file_base_by_pos[node_pos[mt == int(v_code)]]
-            i_rows = selected[mt == int(i_code)]
-            if i_rows.size:
-                scale[i_rows] = self._node_current_file_base_by_pos[node_pos[mt == int(i_code)]]
+            selected = rows_valid[voltage_mask]
+            from_pos[selected] = pos_valid[voltage_mask]
+            available[selected] = True
+            scale[selected] = self._node_voltage_file_base_by_pos[pos_valid[voltage_mask]]
 
-        def assign_terminal(
-            rows: np.ndarray,
-            i_pos_array: np.ndarray,
-            j_pos_array: np.ndarray,
-        ) -> None:
+        def apply_single(rows: np.ndarray, node_pos_array: np.ndarray, p_code: int, v_code: int, i_code: int) -> None:
             if rows.size == 0:
                 return
-            pos = device_pos[rows].astype(np.int64, copy=False)
-            valid_pos = (pos >= 0) & (pos < i_pos_array.size) & (pos < j_pos_array.size)
-            if not np.any(valid_pos):
+            valid_plan, node_pos = self._values_for_device_pos(node_pos_array, device_pos[rows])
+            valid_node = valid_plan & (node_pos >= 0) & (node_pos < n_nodes)
+            rows_valid = rows[valid_node]
+            if rows_valid.size == 0:
                 return
-            selected = rows[valid_pos]
-            local_pos = pos[valid_pos].astype(np.intp, copy=False)
-            i_pos = i_pos_array[local_pos]
-            j_pos = j_pos_array[local_pos]
-            mt = meas_type_code[selected]
-            p_mask = (mt == MEAS_TYPE_P_FROM) | (mt == MEAS_TYPE_P_TO)
-            if np.any(p_mask):
-                scale[selected[p_mask]] = self.p_base
-            v_from = mt == MEAS_TYPE_V_FROM
-            if np.any(v_from):
-                scale[selected[v_from]] = self._node_voltage_file_base_by_pos[i_pos[v_from].astype(np.intp, copy=False)]
-            i_from = mt == MEAS_TYPE_I_FROM
-            if np.any(i_from):
-                scale[selected[i_from]] = self._node_current_file_base_by_pos[i_pos[i_from].astype(np.intp, copy=False)]
-            v_to = mt == MEAS_TYPE_V_TO
-            if np.any(v_to):
-                scale[selected[v_to]] = self._node_voltage_file_base_by_pos[j_pos[v_to].astype(np.intp, copy=False)]
-            i_to = mt == MEAS_TYPE_I_TO
-            if np.any(i_to):
-                scale[selected[i_to]] = self._node_current_file_base_by_pos[j_pos[i_to].astype(np.intp, copy=False)]
+            pos_valid = node_pos[valid_node].astype(np.intp, copy=False)
+            kind = meas_type_code[rows_valid]
+            supported = (kind == int(p_code)) | (kind == int(v_code)) | (kind == int(i_code))
+            if not np.any(supported):
+                return
+            selected = rows_valid[supported]
+            selected_pos = pos_valid[supported]
+            selected_kind = kind[supported]
+            from_pos[selected] = selected_pos
+            available[selected] = True
+            scale[selected[selected_kind == int(p_code)]] = self.p_base
+            voltage_mask = selected_kind == int(v_code)
+            if np.any(voltage_mask):
+                scale[selected[voltage_mask]] = self._node_voltage_file_base_by_pos[selected_pos[voltage_mask]]
+            current_mask = selected_kind == int(i_code)
+            if np.any(current_mask):
+                scale[selected[current_mask]] = self._node_current_file_base_by_pos[selected_pos[current_mask]]
 
-        node_rows = np.flatnonzero(active & (code == DEVICE_TYPE_DCNode) & (meas_type_code == MEAS_TYPE_V) & (device_pos >= 0))
-        if node_rows.size:
-            raw_pos = device_pos[node_rows].astype(np.intp, copy=False)
-            solver_pos = self._raw_node_solver_pos_alive[raw_pos]
-            valid_solver = (solver_pos >= 0) & (solver_pos < self._node_voltage_file_base_by_pos.size)
-            if np.any(valid_solver):
-                scale[node_rows[valid_solver]] = self._node_voltage_file_base_by_pos[solver_pos[valid_solver].astype(np.intp, copy=False)]
-
-        assign_terminal(np.flatnonzero(active & (code == DEVICE_TYPE_DCBranch)), self._branch_i_pos, self._branch_j_pos)
-        assign_terminal(np.flatnonzero(active & (code == DEVICE_TYPE_DCBreak)), self._break_i_pos, self._break_j_pos)
-        assign_terminal(np.flatnonzero(active & (code == DEVICE_TYPE_DCZeroBranch)), self._zero_branch_i_pos, self._zero_branch_j_pos)
-        assign_terminal(np.flatnonzero(active & (code == DEVICE_TYPE_DCDCConverter)), self._dcdc_i_pos, self._dcdc_j_pos)
-        assign_single(
-            np.flatnonzero(active & (code == DEVICE_TYPE_DCGenerator)),
-            self._generator_pos,
-            MEAS_TYPE_P_GEN,
-            MEAS_TYPE_V_GEN,
-            MEAS_TYPE_I_GEN,
-        )
-        assign_single(
-            np.flatnonzero(active & (code == DEVICE_TYPE_DCLoad)),
-            self._load_pos,
-            MEAS_TYPE_P_LOAD,
-            MEAS_TYPE_V_LOAD,
-            MEAS_TYPE_I_LOAD,
-        )
-        constraint_rows = np.flatnonzero(
-            active
-            & (
-                (code == DEVICE_TYPE_DCZeroBranchConstraint)
-                | (code == DEVICE_TYPE_DCBreakConstraint)
-                | (code == DEVICE_TYPE_DCSwitchConstraint)
+        def apply_terminal(rows: np.ndarray, i_pos_array: np.ndarray, j_pos_array: np.ndarray) -> None:
+            if rows.size == 0:
+                return
+            i_valid_plan, i_pos = self._values_for_device_pos(i_pos_array, device_pos[rows])
+            j_valid_plan, j_pos = self._values_for_device_pos(j_pos_array, device_pos[rows])
+            valid_node = i_valid_plan & j_valid_plan & (i_pos >= 0) & (j_pos >= 0) & (i_pos < n_nodes) & (j_pos < n_nodes)
+            rows_valid = rows[valid_node]
+            if rows_valid.size == 0:
+                return
+            i_valid = i_pos[valid_node].astype(np.intp, copy=False)
+            j_valid = j_pos[valid_node].astype(np.intp, copy=False)
+            kind = meas_type_code[rows_valid]
+            supported = (
+                (kind == MEAS_TYPE_P_FROM)
+                | (kind == MEAS_TYPE_P_TO)
+                | (kind == MEAS_TYPE_V_FROM)
+                | (kind == MEAS_TYPE_V_TO)
+                | (kind == MEAS_TYPE_I_FROM)
+                | (kind == MEAS_TYPE_I_TO)
             )
-            & (meas_type_code == MEAS_TYPE_V_DIFF)
-            & (device_pos >= 0)
-        )
-        if constraint_rows.size:
+            if not np.any(supported):
+                return
+            selected = rows_valid[supported]
+            selected_i = i_valid[supported]
+            selected_j = j_valid[supported]
+            selected_kind = kind[supported]
+            from_pos[selected] = selected_i
+            to_pos[selected] = selected_j
+            available[selected] = True
+            power_mask = (selected_kind == MEAS_TYPE_P_FROM) | (selected_kind == MEAS_TYPE_P_TO)
+            scale[selected[power_mask]] = self.p_base
+            mask = selected_kind == MEAS_TYPE_V_FROM
+            if np.any(mask):
+                scale[selected[mask]] = self._node_voltage_file_base_by_pos[selected_i[mask]]
+            mask = selected_kind == MEAS_TYPE_I_FROM
+            if np.any(mask):
+                scale[selected[mask]] = self._node_current_file_base_by_pos[selected_i[mask]]
+            mask = selected_kind == MEAS_TYPE_V_TO
+            if np.any(mask):
+                scale[selected[mask]] = self._node_voltage_file_base_by_pos[selected_j[mask]]
+            mask = selected_kind == MEAS_TYPE_I_TO
+            if np.any(mask):
+                scale[selected[mask]] = self._node_current_file_base_by_pos[selected_j[mask]]
+
+        def apply_constraint(rows: np.ndarray) -> None:
+            if rows.size == 0:
+                return
             constraint_i_pos = np.concatenate((self._zero_branch_i_pos, self._switch_i_pos, self._break_i_pos)).astype(
                 np.int64,
                 copy=False,
             )
-            pos = device_pos[constraint_rows].astype(np.intp, copy=False)
-            valid_pos = pos < constraint_i_pos.size
-            if np.any(valid_pos):
-                i_pos = constraint_i_pos[pos[valid_pos]]
-                valid_node = (i_pos >= 0) & (i_pos < self._node_voltage_file_base_by_pos.size)
-                if np.any(valid_node):
-                    scale[constraint_rows[valid_pos][valid_node]] = self._node_voltage_file_base_by_pos[
-                        i_pos[valid_node].astype(np.intp, copy=False)
-                    ]
-        value[active] = np.divide(value[active], scale[active], out=value[active].copy(), where=np.abs(scale[active]) > 1e-12)
-        object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
-        if object_count == value.size and object_count > 0:
-            for pos, meas in enumerate(list.__iter__(self.measurements)):
-                meas.value = float(value[pos])
+            constraint_j_pos = np.concatenate((self._zero_branch_j_pos, self._switch_j_pos, self._break_j_pos)).astype(
+                np.int64,
+                copy=False,
+            )
+            apply_terminal(rows, constraint_i_pos, constraint_j_pos)
+            diff_rows = rows[meas_type_code[rows] == MEAS_TYPE_V_DIFF]
+            if diff_rows.size == 0:
+                return
+            valid_plan, i_pos = self._values_for_device_pos(constraint_i_pos, device_pos[diff_rows])
+            valid_node = valid_plan & (i_pos >= 0) & (i_pos < n_nodes)
+            if np.any(valid_node):
+                selected = diff_rows[valid_node]
+                from_pos[selected] = i_pos[valid_node]
+                available[selected] = True
+                scale[selected] = self._node_voltage_file_base_by_pos[i_pos[valid_node].astype(np.intp, copy=False)]
 
-        active_rows = np.flatnonzero(active)
-        valid_key_rows = active_rows[device_pos[active_rows] >= 0]
-        active_measurement_keys = set(
-            self._active_measurement_pos_key_array(
-                code[valid_key_rows],
-                device_pos[valid_key_rows],
-                meas_type_code[valid_key_rows],
-            ).tolist()
+        apply_node(rows_for(DEVICE_TYPE_DCNode), self._raw_node_solver_pos_alive, MEAS_TYPE_V)
+        apply_terminal(rows_for(DEVICE_TYPE_DCBranch), self._branch_i_pos, self._branch_j_pos)
+        apply_terminal(rows_for(DEVICE_TYPE_DCBreak), self._break_i_pos, self._break_j_pos)
+        apply_terminal(rows_for(DEVICE_TYPE_DCZeroBranch), self._zero_branch_i_pos, self._zero_branch_j_pos)
+        apply_terminal(rows_for(DEVICE_TYPE_DCDCConverter), self._dcdc_i_pos, self._dcdc_j_pos)
+        apply_single(rows_for(DEVICE_TYPE_DCGenerator), self._generator_pos, MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN)
+        apply_single(rows_for(DEVICE_TYPE_DCLoad), self._load_pos, MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD)
+        apply_constraint(
+            np.concatenate(
+                (
+                    rows_for(DEVICE_TYPE_DCZeroBranchConstraint),
+                    rows_for(DEVICE_TYPE_DCBreakConstraint),
+                    rows_for(DEVICE_TYPE_DCSwitchConstraint),
+                )
+            ).astype(np.int64, copy=False)
         )
-        node_voltage_best: Dict[int, Tuple[float, float]] = {}
-        real_voltage_best: Dict[int, Tuple[float, float]] = {}
-        seed_rows = []
-        collect_power_flow_seed_rows = not bool(getattr(self, "flat_start", False))
-        voltage_rows = active_rows[
-            (status_code[active_rows] != MEAS_STATUS_PSEUDO)
-            & np.isin(meas_type_code[active_rows], _VOLTAGE_MEASUREMENT_TYPE_CODES)
-            & (device_pos[active_rows] >= 0)
-        ]
-        for row in voltage_rows.tolist():
-            node_idx = self._voltage_measurement_node_idx_from_pos(
-                int(code[row]),
-                int(device_pos[row]),
-                int(meas_type_code[row]),
+        return available, scale, from_pos, to_pos
+
+    def _measurement_voltage_node_positions_from_codes(
+        self,
+        device_type_code: np.ndarray,
+        device_pos: np.ndarray,
+        meas_type_code: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        _available, _scale, from_pos, to_pos = self._measurement_scale_for_codes(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+        )
+        return from_pos, to_pos
+
+    def _active_key_cache_from_arrays(
+        self,
+        device_type_code: np.ndarray,
+        device_pos: np.ndarray,
+        meas_type_code: np.ndarray,
+        active_mask: np.ndarray,
+    ) -> set:
+        rows = np.flatnonzero(np.asarray(active_mask, dtype=bool)).astype(np.int64, copy=False)
+        if rows.size == 0:
+            return set()
+        pos_values = np.asarray(device_pos, dtype=np.int64)[rows]
+        valid_pos = pos_values >= 0
+        if not np.any(valid_pos):
+            return set()
+        keys = self._active_measurement_pos_key_array(
+            np.asarray(device_type_code, dtype=np.int16)[rows][valid_pos],
+            pos_values[valid_pos],
+            np.asarray(meas_type_code, dtype=np.int16)[rows][valid_pos],
+        )
+        return set(keys.tolist())
+
+    def _voltage_best_from_arrays(
+        self,
+        table: MeasurementTable,
+        real_mask: np.ndarray,
+        device_type_code: np.ndarray,
+        meas_type_code: np.ndarray,
+        from_pos: np.ndarray,
+        to_pos: np.ndarray,
+    ) -> Tuple[Dict[int, float], Dict[int, float]]:
+        n_nodes = int(self._node_idx_by_pos.size)
+        node_best_weight = np.full(n_nodes, -np.inf, dtype=np.float64)
+        node_best_value = np.zeros(n_nodes, dtype=np.float64)
+        real_best_weight = np.full(n_nodes, -np.inf, dtype=np.float64)
+        real_best_value = np.zeros(n_nodes, dtype=np.float64)
+        row_index = np.arange(int(table.idx.size), dtype=np.int64)
+        weight = np.asarray(table.weight, dtype=np.float64)
+        value = np.asarray(table.value, dtype=np.float64)
+
+        def update(rows: np.ndarray, pos_values: np.ndarray, best_weight: np.ndarray, best_value: np.ndarray) -> None:
+            if rows.size == 0:
+                return
+            pos_values = np.asarray(pos_values, dtype=np.int64)
+            in_range = (pos_values >= 0) & (pos_values < n_nodes)
+            if not np.any(in_range):
+                return
+            rows_valid = rows[in_range]
+            pos_valid = pos_values[in_range].astype(np.intp, copy=False)
+            weights = weight[rows_valid]
+            values = value[rows_valid]
+            np.maximum.at(best_weight, pos_valid, weights)
+            keep = weights >= best_weight[pos_valid]
+            if np.any(keep):
+                best_value[pos_valid[keep]] = values[keep]
+
+        def best_dict(best_weight: np.ndarray, best_value: np.ndarray) -> Dict[int, float]:
+            valid = np.flatnonzero(np.isfinite(best_weight)).astype(np.int64, copy=False)
+            return dict(zip(self._node_idx_by_pos[valid].tolist(), best_value[valid].tolist()))
+
+        node_v_rows = row_index[real_mask & (device_type_code == DEVICE_TYPE_DCNode) & (meas_type_code == MEAS_TYPE_V)]
+        update(node_v_rows, from_pos[node_v_rows], node_best_weight, node_best_value)
+        update(node_v_rows, from_pos[node_v_rows], real_best_weight, real_best_value)
+        gen_v_rows = row_index[real_mask & (device_type_code == DEVICE_TYPE_DCGenerator) & (meas_type_code == MEAS_TYPE_V_GEN)]
+        load_v_rows = row_index[real_mask & (device_type_code == DEVICE_TYPE_DCLoad) & (meas_type_code == MEAS_TYPE_V_LOAD)]
+        update(gen_v_rows, from_pos[gen_v_rows], real_best_weight, real_best_value)
+        update(load_v_rows, from_pos[load_v_rows], real_best_weight, real_best_value)
+        terminal_mask = (
+            (device_type_code == DEVICE_TYPE_DCBranch)
+            | (device_type_code == DEVICE_TYPE_DCZeroBranch)
+            | (device_type_code == DEVICE_TYPE_DCBreak)
+            | (device_type_code == DEVICE_TYPE_DCDCConverter)
+        )
+        v_from_rows = row_index[real_mask & terminal_mask & (meas_type_code == MEAS_TYPE_V_FROM)]
+        v_to_rows = row_index[real_mask & terminal_mask & (meas_type_code == MEAS_TYPE_V_TO)]
+        update(v_from_rows, from_pos[v_from_rows], real_best_weight, real_best_value)
+        update(v_to_rows, to_pos[v_to_rows], real_best_weight, real_best_value)
+        return best_dict(node_best_weight, node_best_value), best_dict(real_best_weight, real_best_value)
+
+    def _power_flow_seed_rows_from_arrays(
+        self,
+        table: MeasurementTable,
+        processable_mask: np.ndarray,
+        device_type_code: np.ndarray,
+        meas_type_code: np.ndarray,
+        device_pos: np.ndarray,
+    ) -> list:
+        if getattr(self, "flat_start", True):
+            return []
+        seed_rows_mask = (
+            (device_type_code == DEVICE_TYPE_DCNode)
+            & (meas_type_code == MEAS_TYPE_V)
+        ) | (
+            (device_type_code == DEVICE_TYPE_DCGenerator)
+            & np.isin(meas_type_code, (MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN))
+        ) | (
+            (device_type_code == DEVICE_TYPE_DCLoad)
+            & np.isin(meas_type_code, (MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD))
+        ) | (
+            (device_type_code == DEVICE_TYPE_DCDCConverter)
+            & np.isin(
+                meas_type_code,
+                (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO),
             )
-            if node_idx is None or self._node_pos_from_idx(node_idx) < 0:
-                continue
-            row_weight = float(weight[row])
-            row_value = float(value[row])
-            current = real_voltage_best.get(node_idx)
-            if current is None or row_weight > current[0]:
-                real_voltage_best[node_idx] = (row_weight, row_value)
-            if int(code[row]) == DEVICE_TYPE_DCNode and int(meas_type_code[row]) == MEAS_TYPE_V:
-                current = node_voltage_best.get(node_idx)
-                if current is None or row_weight > current[0]:
-                    node_voltage_best[node_idx] = (row_weight, row_value)
-        if collect_power_flow_seed_rows:
-            seed_mask = (
-                (device_pos[active_rows] >= 0)
-                & (
-                    ((code[active_rows] == DEVICE_TYPE_DCNode) & (meas_type_code[active_rows] == MEAS_TYPE_V))
-                    | (
-                        (code[active_rows] == DEVICE_TYPE_DCGenerator)
-                        & np.isin(meas_type_code[active_rows], np.asarray([MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN], dtype=np.int16))
-                    )
-                    | (
-                        (code[active_rows] == DEVICE_TYPE_DCLoad)
-                        & np.isin(meas_type_code[active_rows], np.asarray([MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD], dtype=np.int16))
-                    )
-                    | (
-                        (code[active_rows] == DEVICE_TYPE_DCDCConverter)
-                        & np.isin(
-                            meas_type_code[active_rows],
-                            np.asarray([MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO], dtype=np.int16),
-                        )
-                    )
-                )
+        )
+        rows = np.flatnonzero(processable_mask & seed_rows_mask & (device_pos >= 0)).astype(np.int64, copy=False)
+        if rows.size == 0:
+            return []
+        ppc_rows = self._seed_ppc_rows_from_device_pos(device_type_code[rows], device_pos[rows])
+        valid = ppc_rows >= 0
+        if not np.any(valid):
+            return []
+        rows = rows[valid]
+        ppc_rows = ppc_rows[valid]
+        return list(
+            zip(
+                device_type_code[rows].astype(np.int16, copy=False).tolist(),
+                ppc_rows.astype(np.int64, copy=False).tolist(),
+                meas_type_code[rows].astype(np.int16, copy=False).tolist(),
+                np.asarray(table.value, dtype=np.float64)[rows].astype(np.float64, copy=False).tolist(),
             )
-            seed_selected = active_rows[seed_mask]
-            seed_ppc_rows = self._seed_ppc_rows_from_device_pos(code[seed_selected], device_pos[seed_selected])
-            valid_seed = seed_ppc_rows >= 0
-            seed_selected = seed_selected[valid_seed]
-            seed_ppc_rows = seed_ppc_rows[valid_seed]
-            seed_rows = list(
-                zip(
-                    code[seed_selected].astype(np.int16, copy=False).tolist(),
-                    seed_ppc_rows.astype(np.int64, copy=False).tolist(),
-                    meas_type_code[seed_selected].astype(np.int16, copy=False).tolist(),
-                    value[seed_selected].astype(np.float64, copy=False).tolist(),
-                )
+        )
+
+    def _measurement_runtime_array_cache_key(self) -> Tuple[object, ...]:
+        return (
+            id(getattr(self, "_measurement_plan_device_pos_by_type_code_id", None)),
+            id(getattr(self, "_raw_node_solver_pos_alive", None)),
+            id(getattr(self, "_branch_i_pos", None)),
+            id(getattr(self, "_branch_j_pos", None)),
+            id(getattr(self, "_zero_branch_i_pos", None)),
+            id(getattr(self, "_zero_branch_j_pos", None)),
+            id(getattr(self, "_break_i_pos", None)),
+            id(getattr(self, "_break_j_pos", None)),
+            id(getattr(self, "_generator_pos", None)),
+            id(getattr(self, "_load_pos", None)),
+            id(getattr(self, "_dcdc_i_pos", None)),
+            id(getattr(self, "_dcdc_j_pos", None)),
+            float(getattr(self, "p_base", 0.0)),
+            float(getattr(self, "u_scale", 0.0)),
+            float(getattr(self, "i_scale", 0.0)),
+        )
+
+    @staticmethod
+    def _cached_measurement_runtime_arrays(meas_ppc: Dict, n_rows: int, cache_key: Tuple[object, ...]):
+        if meas_ppc.get("_dc_se_runtime_cache_key") != cache_key:
+            return None
+        arrays = []
+        for key in ("device_pos", "available", "scale", "from_pos", "to_pos"):
+            value = meas_ppc.get(key)
+            if not isinstance(value, np.ndarray) or int(value.size) != int(n_rows):
+                return None
+            arrays.append(value)
+        return arrays
+
+    def _normalize_measurements_to_pu_from_meas_ppc(self, table: MeasurementTable, meas_ppc: Dict) -> bool:
+        meas = meas_ppc.get("meas")
+        has_meas = isinstance(meas, np.ndarray) and meas.ndim == 2 and meas.shape[0] == table.idx.size
+        cols = meas_ppc.get("meas_cols", MEAS_COLS)
+        value = table.value
+        valid = table.valid
+        weight = table.weight
+        status = measurement_table_status_code(table)
+        n_rows = int(value.size)
+        device_name_id = meas_ppc.get("device_name_id_array")
+        device_type_code = meas_ppc.get("device_type_code_array")
+        meas_type_code = meas_ppc.get("meas_type_code_array")
+        if not isinstance(device_name_id, np.ndarray) and has_meas:
+            device_name_id = meas[:, cols["device_name_id"]].astype(np.int64, copy=False)
+        if not isinstance(device_type_code, np.ndarray) and has_meas:
+            device_type_code = meas[:, cols["device_type_code"]].astype(np.int16, copy=False)
+        if not isinstance(meas_type_code, np.ndarray) and has_meas:
+            meas_type_code = meas[:, cols["meas_type_code"]].astype(np.int16, copy=False)
+        if isinstance(device_name_id, np.ndarray):
+            device_name_id = np.asarray(device_name_id, dtype=np.int64)
+        if isinstance(device_type_code, np.ndarray):
+            device_type_code = np.asarray(device_type_code, dtype=np.int16)
+        if isinstance(meas_type_code, np.ndarray):
+            meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
+        if not isinstance(device_name_id, np.ndarray) or not isinstance(device_type_code, np.ndarray) or not isinstance(meas_type_code, np.ndarray):
+            return False
+        if device_name_id.size != n_rows or device_type_code.size != n_rows or meas_type_code.size != n_rows:
+            return False
+
+        table.device_name_id = device_name_id
+        table.device_type_code = device_type_code
+        table.meas_type_code = meas_type_code
+        self._ensure_measurement_plan_lookup_arrays()
+        runtime_cache_key = self._measurement_runtime_array_cache_key()
+        cached_runtime = self._cached_measurement_runtime_arrays(meas_ppc, n_rows, runtime_cache_key)
+        if cached_runtime is None:
+            device_pos = getattr(table, "device_pos", None)
+            if device_pos is not None:
+                device_pos = np.asarray(device_pos, dtype=np.int64)
+                if int(device_pos.size) != n_rows:
+                    device_pos = None
+            if device_pos is None:
+                device_pos = self._measurement_device_pos_array(table)
+            available, scale, from_pos, to_pos = self._measurement_scale_for_codes(
+                device_type_code,
+                device_pos,
+                meas_type_code,
+                rows_by_code=rows_by_device_type_code(table),
             )
-        self._active_measurement_key_cache = active_measurement_keys
+            runtime_copy = not bool(meas_ppc.get("_mutable_runtime_arrays", False))
+            meas_ppc["device_pos"] = device_pos.astype(np.int64, copy=runtime_copy)
+            meas_ppc["available"] = available.astype(bool, copy=runtime_copy)
+            meas_ppc["scale"] = scale.astype(np.float64, copy=runtime_copy)
+            meas_ppc["from_pos"] = from_pos.astype(np.int64, copy=runtime_copy)
+            meas_ppc["to_pos"] = to_pos.astype(np.int64, copy=runtime_copy)
+            meas_ppc["_dc_se_runtime_cache_key"] = runtime_cache_key
+        else:
+            device_pos, available, scale, from_pos, to_pos = cached_runtime
+            device_pos = np.asarray(device_pos, dtype=np.int64)
+            available = np.asarray(available, dtype=bool)
+            scale = np.asarray(scale, dtype=np.float64)
+            from_pos = np.asarray(from_pos, dtype=np.int64)
+            to_pos = np.asarray(to_pos, dtype=np.int64)
+        table.device_pos = device_pos
+        table.available = available
+        table.scale = scale
+        table.from_pos = from_pos
+        table.to_pos = to_pos
+
+        candidate = valid & (weight > 0.0)
+        unavailable = candidate & (~available)
+        if np.any(unavailable):
+            valid[unavailable] = False
+            status[unavailable] = MEAS_STATUS_INVALID
+        processable = candidate & available
+        if np.any(processable):
+            value[processable] = np.divide(
+                value[processable],
+                scale[processable],
+                out=value[processable].copy(),
+                where=np.abs(scale[processable]) > 1e-12,
+            )
+        real_mask = processable & (status != MEAS_STATUS_PSEUDO)
+        self.measurement_table = table
+        self._active_measurement_key_cache = self._active_key_cache_from_arrays(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+            processable,
+        )
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
-        self._node_voltage_measurement_cache = {
-            node_idx: value for node_idx, (_weight, value) in node_voltage_best.items()
-        }
-        self._real_voltage_observation_node_cache = {
-            node_idx: value for node_idx, (_weight, value) in real_voltage_best.items()
-        }
-        self._power_flow_seed_rows = seed_rows
-        if getattr(self, "meas_ppc", None) is not None:
-            self.meas_ppc["normalized"] = True
-            sync_meas_ppc_from_measurement_table(self.meas_ppc, table)
+        self._node_voltage_measurement_cache, self._real_voltage_observation_node_cache = self._voltage_best_from_arrays(
+            table,
+            real_mask,
+            device_type_code,
+            meas_type_code,
+            from_pos,
+            to_pos,
+        )
+        self._power_flow_seed_rows = self._power_flow_seed_rows_from_arrays(
+            table,
+            processable,
+            device_type_code,
+            meas_type_code,
+            device_pos,
+        )
+        try:
+            self.measurements.normalized = True
+        except AttributeError:
+            pass
+        meas_ppc["value_array"] = value
+        meas_ppc["valid_array"] = valid
+        meas_ppc["status_array"] = status
+        if has_meas:
+            meas[:, cols["value"]] = value.astype(np.float64, copy=False)
+            meas[:, cols["valid"]] = valid.astype(np.float64, copy=False)
+            meas[:, cols["status"]] = status.astype(np.float64, copy=False)
+        meas_ppc["normalized"] = True
+        object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
+        if object_count == n_rows and object_count > 0:
+            for pos, meas_obj in enumerate(list.__iter__(self.measurements)):
+                meas_obj.valid = bool(valid[pos])
+                meas_obj.value = float(value[pos])
+                meas_obj.status = int(status[pos])
+        return True
+
+    def _normalize_measurements_to_pu(self) -> None:
+        table = _measurement_table_from_measurements(self.measurements)
+        if getattr(self.measurements, "normalized", False):
+            self.measurement_table = table
+            self._refresh_measurement_summary_cache()
+            if isinstance(getattr(self, "meas_ppc", None), dict):
+                self.meas_ppc["normalized"] = True
+            return
+        if isinstance(getattr(self, "meas_ppc", None), dict) and self._normalize_measurements_to_pu_from_meas_ppc(table, self.meas_ppc):
+            return
+        self.measurement_table = table
+        self._active_measurement_key_cache = set()
+        self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
+        self._node_voltage_measurement_cache = {}
+        self._real_voltage_observation_node_cache = {}
+        self._power_flow_seed_rows = []
+        warnings.warn(
+            "DC SE measurement normalization requires measurement PPC arrays; object/string fallback is disabled.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    def _convert_measurements_to_pu(self) -> None:
+        self._normalize_measurements_to_pu()
 
     def _active_measurement_keys(self) -> set:
         """Return usable measurement keys at device and measurement-type granularity."""
         if not hasattr(self, "_active_measurement_key_cache"):
             self._refresh_measurement_summary_cache()
         return set(self._active_measurement_key_cache)
+
+    def _active_measurement_keys_ref(self) -> set:
+        """Return mutable active measurement packed-key cache."""
+        if not hasattr(self, "_active_measurement_key_cache"):
+            self._refresh_measurement_summary_cache()
+        return self._active_measurement_key_cache
 
     def _next_measurement_idx(self) -> int:
         if not hasattr(self, "_max_measurement_idx"):
@@ -2165,16 +2618,75 @@ class DCStateEstimator:
             meas_type_codes=meas_type_codes,
             device_positions=device_positions,
         )
-        table = getattr(self.measurements, "table", None)
-        if table is None:
+        self._append_pseudo_measurement_table(appended_table)
+        return int(next_idx) + row_count
+
+    def _append_pseudo_measurement_table(
+        self,
+        appended_table: MeasurementTable,
+        *,
+        record_summary: bool = True,
+    ) -> MeasurementTable:
+        row_count = int(appended_table.idx.size)
+        if row_count == 0:
+            return _measurement_table_from_measurements(self.measurements)
+        base_table = getattr(self.measurements, "table", None)
+        if base_table is None:
             warnings.warn(
                 "DC SE pseudo measurement append requires a PPC-backed measurement table; skipped table append.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return int(next_idx)
-        combined_table = concat_measurement_tables(table, appended_table)
-        combined_table.rows_by_device_type_code = rows_by_device_type_code(combined_table)
+            return _measurement_table_from_measurements(self.measurements)
+        base_table = _measurement_table_from_measurements(self.measurements)
+        base_count = int(base_table.idx.size)
+        total_count = base_count + row_count
+        base_device_pos = getattr(base_table, "device_pos", None)
+        if base_device_pos is not None:
+            base_device_pos = np.asarray(base_device_pos, dtype=np.int64)
+        appended_device_pos = getattr(appended_table, "device_pos", None)
+        if appended_device_pos is not None:
+            appended_device_pos = np.asarray(appended_device_pos, dtype=np.int64)
+        combined_table = concat_measurement_tables(base_table, appended_table)
+        rows_by_code = {
+            int(code): np.asarray(rows, dtype=np.int64).copy()
+            for code, rows in rows_by_device_type_code(base_table).items()
+        }
+        for code, rows in rows_by_device_type_code(appended_table).items():
+            tail_rows = np.asarray(rows, dtype=np.int64) + base_count
+            if int(code) in rows_by_code:
+                rows_by_code[int(code)] = np.concatenate((rows_by_code[int(code)], tail_rows))
+            else:
+                rows_by_code[int(code)] = tail_rows
+        combined_table.rows_by_device_type_code = rows_by_code
+        combined_device_pos = getattr(combined_table, "device_pos", None)
+        if combined_device_pos is None or np.asarray(combined_device_pos).size != total_count:
+            combined_device_pos = np.empty(total_count, dtype=np.int64)
+            combined_device_pos.fill(-1)
+            if base_device_pos is not None and base_device_pos.size == base_count:
+                combined_device_pos[:base_count] = base_device_pos
+            if appended_device_pos is not None and appended_device_pos.size == row_count:
+                combined_device_pos[base_count:total_count] = appended_device_pos
+        else:
+            combined_device_pos = np.asarray(combined_device_pos, dtype=np.int64)
+        combined_table.device_pos = combined_device_pos
+        invalid_device_pos_count = 0
+        if base_count and (base_device_pos is None or base_device_pos.size != base_count):
+            invalid_device_pos_count += base_count
+        if appended_device_pos is None or appended_device_pos.size != row_count:
+            invalid_device_pos_count += row_count
+        else:
+            invalid_device_pos_count += int(np.count_nonzero(appended_device_pos < 0))
+        if invalid_device_pos_count:
+            warnings.warn(
+                (
+                    "DC SE pseudo measurement append found "
+                    f"{invalid_device_pos_count} rows without valid device_pos; "
+                    "name-based device lookup is disabled."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.measurements = self._measurement_sequence_from_table(
             combined_table,
             normalized=getattr(self.measurements, "normalized", False),
@@ -2183,7 +2695,27 @@ class DCStateEstimator:
         if isinstance(self.measurements, TableBackedMeasurementList):
             self.measurements._table_prefix_size = int(combined_table.idx.size)
         self._max_measurement_idx = int(np.max(appended_table.idx))
-        return int(next_idx) + row_count
+        self._initial_observability_cache = None
+        self._observability_matrix_cache = None
+        self._weak_direction_candidate_jacobian_cache = None
+        if record_summary:
+            measured_keys = self._active_measurement_keys_ref()
+            tail_type = np.asarray(appended_table.device_type_code, dtype=np.int16)
+            tail_meas = np.asarray(appended_table.meas_type_code, dtype=np.int16)
+            tail_pos = (
+                appended_device_pos
+                if appended_device_pos is not None and appended_device_pos.size == row_count
+                else np.full(row_count, -1, dtype=np.int64)
+            )
+            valid_tail = tail_pos >= 0
+            if np.any(valid_tail):
+                measurement_keys = self._active_measurement_pos_key_array(
+                    tail_type[valid_tail],
+                    tail_pos[valid_tail],
+                    tail_meas[valid_tail],
+                )
+                measured_keys.update(measurement_keys.tolist())
+        return base_table
 
     def _refresh_measurement_summary_cache(self) -> None:
         """Cache active measurement key sets and max row id for initialization scans."""
@@ -2614,6 +3146,7 @@ class DCStateEstimator:
             getattr(self, "n_state", 0),
             getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
         )
+        observability = None
         while total_added < max_count:
             observability = self.observability_analysis()
             batch_limit = min(max_count - total_added, step)
@@ -2629,11 +3162,14 @@ class DCStateEstimator:
                 if added == 0:
                     break
                 total_added += added
+                observability = None
                 continue
             next_idx = self._next_measurement_idx()
-            existing_keys = self._active_measurement_keys()
+            existing_keys = self._active_measurement_keys_ref()
             added = 0
             refreshed = False
+            measurement_count_before = len(self.measurements)
+            base_table_before = _measurement_table_from_measurements(self.measurements)
             remaining = batch_limit
             for state_idx, _score in observability.weak_states:
                 if added >= remaining:
@@ -2649,10 +3185,29 @@ class DCStateEstimator:
                 added = self._add_weak_direction_observability_pseudo_measurements(observability, remaining)
                 refreshed = added > 0
             if added == 0:
+                added = self._add_structural_rank_restoring_pseudo_measurements(remaining)
+                refreshed = added > 0
+            if added == 0:
                 break
             total_added += added
             if not refreshed:
+                current_table = _measurement_table_from_measurements(self.measurements)
+                current_count = int(current_table.idx.size)
+                if current_count > measurement_count_before:
+                    tail_rows = np.arange(measurement_count_before, current_count, dtype=np.int64)
+                    tail_table = measurement_table_take(current_table, tail_rows)
+                    refreshed = self._incremental_update_active_measurement_indexes(
+                        MeasurementTableView(tail_table, normalized=getattr(self.measurements, "normalized", False)),
+                        source_row_start=measurement_count_before,
+                        master_table=base_table_before,
+                    )
+            if not refreshed:
                 self._refresh_active_measurement_indexes()
+            observability = None
+        if observability is None and total_added < max_count:
+            observability = self.observability_analysis()
+        if observability is not None:
+            self._initial_observability_cache = observability
         return total_added
 
     def _add_weak_direction_observability_pseudo_measurements(
@@ -2671,26 +3226,23 @@ class DCStateEstimator:
         if selected_rows.size == 0:
             return 0
         next_idx = self._next_measurement_idx()
+        base_table_before = _measurement_table_from_measurements(self.measurements)
+        measurement_count_before = int(base_table_before.idx.size)
         candidate_table = getattr(candidates, "table", None)
         if candidate_table is None:
             return 0
         selected_table = measurement_table_take(candidate_table, selected_rows)
         selected_count = int(selected_table.idx.size)
-        self._append_pseudo_measurement_rows(
-            next_idx,
-            selected_table.name,
-            selected_table.device_type,
-            selected_table.device_name,
-            selected_table.meas_type,
-            selected_table.value,
-            weights=selected_table.weight,
-            device_type_codes=selected_table.device_type_code,
-            device_name_ids=selected_table.device_name_id,
-            meas_type_codes=selected_table.meas_type_code,
-            device_positions=selected_table.device_pos,
-        )
+        selected_table.idx = np.arange(next_idx, next_idx + selected_count, dtype=np.int64)
+        self._append_pseudo_measurement_table(selected_table)
         if refresh:
-            self._refresh_active_measurement_indexes()
+            refreshed = self._incremental_update_active_measurement_indexes(
+                MeasurementTableView(selected_table, normalized=True),
+                source_row_start=measurement_count_before,
+                master_table=base_table_before,
+            )
+            if not refreshed:
+                self._refresh_active_measurement_indexes()
         return selected_count
 
     def _add_redundant_observability_pseudo_measurements(self, max_add: int, refresh: bool = True) -> int:
@@ -2699,7 +3251,7 @@ class DCStateEstimator:
 
     def _observability_pseudo_candidate_measurements(self) -> MeasurementTableView:
         """Build low-weight candidate pseudo rows for weak-direction observability repair."""
-        existing_keys = self._active_measurement_keys()
+        existing_keys = self._active_measurement_keys_ref()
         candidate_keys = set()
         store_strings = not bool(getattr(self, "_array_only_runtime", False))
         capacity = (
@@ -2845,9 +3397,26 @@ class DCStateEstimator:
         direction = observability_weak_direction(H, self.n_state, observability.weak_states)
         if direction.size != self.n_state or not np.any(direction):
             return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
-        candidate_h = self.jacobian_sparse(x, candidates)
+        cache = getattr(self, "_weak_direction_candidate_jacobian_cache", None)
+        table = getattr(candidates, "table", None)
+        cache_key = (id(candidates), id(table), len(candidates), self.n_state)
+        if cache is not None and cache.get("key") == cache_key and cache.get("candidates") is candidates:
+            candidate_h = cache["H"]
+        else:
+            start = time.perf_counter() if self.profile_enabled else None
+            candidate_h = self.jacobian_sparse(x, candidates)
+            if start is not None:
+                self._record_profile_time("init.weak_direction_candidate_jacobian", time.perf_counter() - start)
+            self._weak_direction_candidate_jacobian_cache = {
+                "key": cache_key,
+                "candidates": candidates,
+                "H": candidate_h,
+            }
+        start = time.perf_counter() if self.profile_enabled else None
         scores = np.abs(candidate_h @ direction)
         scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        if start is not None:
+            self._record_profile_time("init.weak_direction_candidate_scores", time.perf_counter() - start)
         if scores.size != len(candidates) or not np.any(scores > 0.0):
             return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
         positive = np.flatnonzero(scores > 0.0)
@@ -2861,14 +3430,179 @@ class DCStateEstimator:
             return selected
         return np.arange(min(int(max_add), candidate_count), dtype=np.int64)
 
+    def _rank_restoring_candidate_measurements(self) -> MeasurementTableView:
+        """Build low-weight candidates from invalid real device rows."""
+        table = _measurement_table_from_measurements(self.measurements)
+        device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
+        meas_type_code = self._ensure_table_meas_type_codes(table)
+        device_pos = getattr(table, "device_pos", None)
+        if device_pos is None or np.asarray(device_pos).size != int(table.idx.size):
+            warnings.warn(
+                "DC SE rank-restoring candidates require measurement device_pos; "
+                "name-based index rebuild is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
+        device_pos = np.asarray(device_pos, dtype=np.int64)
+        existing_keys = self._active_measurement_keys_ref()
+        seen_keys = set()
+        next_idx = self._next_measurement_idx()
+        invalid_rows = np.flatnonzero(
+            (~np.asarray(table.valid, dtype=bool))
+            & (np.asarray(table.weight, dtype=np.float64) > 0.0)
+        )
+        if invalid_rows.size == 0:
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
+        available, scale, _from_pos, _to_pos = self._measurement_scale_for_codes(
+            device_type_code[invalid_rows],
+            device_pos[invalid_rows],
+            meas_type_code[invalid_rows],
+        )
+        candidate_rows = []
+        candidate_values = []
+        for local_idx, row in enumerate(invalid_rows.tolist()):
+            row = int(row)
+            if int(device_pos[row]) < 0 or not bool(available[local_idx]):
+                continue
+            if int(device_type_code[row]) == DEVICE_TYPE_DCNode and int(meas_type_code[row]) == MEAS_TYPE_V:
+                continue
+            key = self._active_measurement_pos_key(device_type_code[row], device_pos[row], meas_type_code[row])
+            if key in existing_keys or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            candidate_rows.append(row)
+            candidate_values.append(float(table.value[row]) / float(scale[local_idx]))
+        if not candidate_rows:
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
+        rows = np.asarray(candidate_rows, dtype=np.int64)
+        values = np.asarray(candidate_values, dtype=np.float64)
+        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        if store_strings:
+            names = np.asarray(table.name, dtype=object)
+            names = names[rows] if names.size == int(table.idx.size) else np.asarray([f"rank_{int(table.idx[row])}" for row in rows], dtype=object)
+            names = np.asarray([f"pseudo_rank_{name}" for name in names.tolist()], dtype=object)
+            device_types = np.asarray(table.device_type, dtype=object)
+            device_types = device_types[rows] if device_types.size == int(table.idx.size) else np.asarray([""] * rows.size, dtype=object)
+            device_names = np.asarray(table.device_name, dtype=object)
+            device_names = device_names[rows] if device_names.size == int(table.idx.size) else np.asarray([""] * rows.size, dtype=object)
+            meas_types = np.asarray(table.meas_type, dtype=object)
+            meas_types = meas_types[rows] if meas_types.size == int(table.idx.size) else np.asarray([""] * rows.size, dtype=object)
+        else:
+            names = np.asarray([], dtype=object)
+            device_types = np.asarray([], dtype=object)
+            device_names = np.asarray([], dtype=object)
+            meas_types = np.asarray([], dtype=object)
+        device_name_id = getattr(table, "device_name_id", None)
+        if device_name_id is not None and np.asarray(device_name_id).size == int(table.idx.size):
+            candidate_name_ids = np.asarray(device_name_id, dtype=np.int64)[rows]
+        else:
+            candidate_name_ids = np.full(rows.size, -1, dtype=np.int64)
+        candidate_table = self._pseudo_measurement_table(
+            names,
+            device_types,
+            device_names,
+            meas_types,
+            values,
+            self.pseudo_measurement_weight,
+            idx_start=next_idx,
+            device_type_codes=device_type_code[rows],
+            device_name_ids=candidate_name_ids,
+            meas_type_codes=meas_type_code[rows],
+            device_positions=device_pos[rows],
+        )
+        return MeasurementTableView(candidate_table, normalized=True)
+
+    def _rank_restoring_candidate_indices(self, candidates: Sequence[Measurement], max_add: int) -> List[int]:
+        """Select candidate rows that participate in a higher structural-rank matching."""
+        if max_add <= 0 or not candidates:
+            return []
+        base_measurements = self.active_measurements
+        x = self.initial_state()
+        base_h = self.jacobian_sparse(x, base_measurements)
+        base_rank = sparse_structural_rank(base_h)
+        if base_rank is None or base_rank >= self.n_state:
+            return []
+
+        base_table = _measurement_table_from_measurements(base_measurements)
+        candidate_table = _measurement_table_from_measurements(candidates)
+        combined_measurements = MeasurementTableView(
+            concat_measurement_tables(base_table, candidate_table),
+            normalized=getattr(base_measurements, "normalized", False),
+        )
+        combined_h = self.jacobian_sparse(x, combined_measurements)
+        combined_rank = sparse_structural_rank(combined_h)
+        if combined_rank is None or combined_rank <= base_rank:
+            return []
+
+        matching = sp_maximum_bipartite_matching(combined_h, perm_type="row")
+        base_rows = len(base_measurements)
+        selected = sorted({int(row) - base_rows for row in matching if int(row) >= base_rows})
+        return selected[:max_add]
+
+    def _add_structural_rank_restoring_pseudo_measurements(self, max_add: int) -> int:
+        """Add invalid real-measurement candidates that improve structural observability."""
+        candidates = self._rank_restoring_candidate_measurements()
+        selected_indices = self._rank_restoring_candidate_indices(candidates, max_add)
+        if not selected_indices:
+            return 0
+        next_idx = self._next_measurement_idx()
+        base_table_before = _measurement_table_from_measurements(self.measurements)
+        measurement_count_before = int(base_table_before.idx.size)
+        candidate_table = getattr(candidates, "table", None)
+        if candidate_table is None:
+            return 0
+        selected_rows = np.asarray(selected_indices, dtype=np.int64)
+        selected_table = measurement_table_take(candidate_table, selected_rows)
+        selected_count = int(selected_table.idx.size)
+        selected_table.idx = np.arange(next_idx, next_idx + selected_count, dtype=np.int64)
+        self._append_pseudo_measurement_table(selected_table)
+        refreshed = self._incremental_update_active_measurement_indexes(
+            MeasurementTableView(selected_table, normalized=True),
+            source_row_start=measurement_count_before,
+            master_table=base_table_before,
+        )
+        if not refreshed:
+            self._refresh_active_measurement_indexes()
+        return selected_count
+
     def _append_targeted_observability_pseudo(
         self,
         next_idx: int,
         state_idx: int,
         existing_keys: set,
-        max_add: int,
+        max_add_or_unused,
+        max_add: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Translate a weak compact DC state into the smallest useful pseudo measurement."""
+        if max_add is None:
+            max_add = int(max_add_or_unused)
+        else:
+            max_add = int(max_add)
         arrays = self._state_meta_arrays_ref()
         state_pos = int(state_idx)
         if state_pos < 0 or state_pos >= int(np.asarray(arrays["kind"], dtype=object).size):
@@ -3424,27 +4158,34 @@ class DCStateEstimator:
     def evaluate(
         self,
         x: np.ndarray,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurement_plan_tables=None,
         *,
         out: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Evaluate h(x): estimated values for each active DC measurement."""
-        measurements = self._normalize_measurements(measurements)
+        measurement_plan_tables = self._measurement_plan_tables_for(measurement_plan_tables)
         voltage, switch_current, dcdc_power, v_generator_power = self._unpack_state(x)
-        n_meas = len(measurements)
+        n_meas = self._measurement_count(measurement_plan_tables)
+        active_vectorized = (
+            self._measurement_plan_tables_are_active(measurement_plan_tables)
+            and bool(getattr(self, "active_measurements_are_vectorized", False))
+        )
         if out is None:
-            values = np.zeros(n_meas, dtype=np.float64)
+            values = np.empty(n_meas, dtype=np.float64) if active_vectorized else np.zeros(n_meas, dtype=np.float64)
         else:
             values = out
-            values.fill(0.0)
+            if not active_vectorized:
+                values.fill(0.0)
         vectorized_rows = self._fill_measurement_values_vectorized(
             values,
-            measurements,
+            measurement_plan_tables,
             voltage,
             switch_current,
             dcdc_power,
             v_generator_power,
         )
+        if active_vectorized:
+            return values
         if not np.all(vectorized_rows):
             missing = int(vectorized_rows.size - np.count_nonzero(vectorized_rows))
             warnings.warn(
@@ -3644,45 +4385,53 @@ class DCStateEstimator:
     def _assemble_jacobian(
         self,
         x: np.ndarray,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurement_plan_tables=None,
         sparse: bool = False,
     ):
         """Assemble analytical DC measurement sensitivities for WLS."""
-        measurements = self._normalize_measurements(measurements)
+        measurement_plan_tables = self._measurement_plan_tables_for(measurement_plan_tables)
         voltage, switch_current, dcdc_power, v_generator_power = self._unpack_state(x)
-        if sparse:
-            if measurements is self.active_measurements:
-                H = self._jacobian_builder
+        n_meas = self._measurement_count(measurement_plan_tables)
+        active_plan_run = self._measurement_plan_tables_are_active(measurement_plan_tables)
+        active_vectorized = active_plan_run and bool(getattr(self, "active_measurements_are_vectorized", False))
+        if sparse and active_plan_run:
+            H = self._jacobian_builder
+            H.shape = (n_meas, self.n_state)
+            H.size = H.shape[0] * H.shape[1]
+            H.reset()
+        elif sparse:
+            # Cache a fixed-pattern builder per `id(measurements)` so repeated
+            # calls (e.g. from a hybrid parent) reuse the CSR pattern instead
+            # of rebuilding it each call.
+            cache = getattr(self, "_external_jacobian_builder_cache", None)
+            if cache is None:
+                cache = {}
+                self._external_jacobian_builder_cache = cache
+            key = id(measurement_plan_tables)
+            cached = cache.get(key)
+            if cached is not None and cached[0] is measurement_plan_tables:
+                H = cached[1]
+                H.shape = (n_meas, self.n_state)
+                H.size = H.shape[0] * H.shape[1]
                 H.reset()
             else:
-                # Cache a fixed-pattern builder per `id(measurements)` so repeated
-                # calls (e.g. from a hybrid parent) reuse the CSR pattern instead
-                # of rebuilding it each call.
-                cache = getattr(self, "_external_jacobian_builder_cache", None)
-                if cache is None:
-                    cache = {}
-                    self._external_jacobian_builder_cache = cache
-                key = id(measurements)
-                cached = cache.get(key)
-                if cached is not None and cached[0] is measurements:
-                    H = cached[1]
-                    H.reset()
-                else:
-                    H = SparseJacobianBuilder((len(measurements), self.n_state))
-                    H._assume_fixed_pattern = True
-                    if len(cache) > 4:
-                        cache.clear()
-                    cache[key] = (measurements, H)
+                H = SparseJacobianBuilder((n_meas, self.n_state))
+                H._assume_fixed_pattern = True
+                if len(cache) > 4:
+                    cache.clear()
+                cache[key] = (measurement_plan_tables, H)
         else:
-            H = np.zeros((len(measurements), self.n_state), dtype=np.float64)
+            H = np.zeros((n_meas, self.n_state), dtype=np.float64)
         vectorized_rows = self._fill_jacobian_vectorized(
             H,
-            measurements,
+            measurement_plan_tables,
             voltage,
             switch_current,
             dcdc_power,
             v_generator_power,
         )
+        if active_vectorized:
+            return H.to_csr() if sparse else H
         if not np.all(vectorized_rows):
             missing = int(vectorized_rows.size - np.count_nonzero(vectorized_rows))
             warnings.warn(
@@ -3709,11 +4458,52 @@ class DCStateEstimator:
         normal_factor_diag: Optional[np.ndarray] = None,
     ) -> ObservabilityResult:
         """Use singular values of H to locate unobservable DC state combinations."""
+        if (
+            x is None
+            and measurements is None
+            and H is None
+            and normal_matrix is None
+            and normal_factor_diag is None
+            and self._initial_observability_cache is not None
+        ):
+            cache = getattr(self, "_observability_matrix_cache", None)
+            if cache is not None and cache.get("result") is self._initial_observability_cache:
+                return self._initial_observability_cache
+        use_default_cache = (
+            x is None
+            and measurements is None
+            and H is None
+            and normal_matrix is None
+            and normal_factor_diag is None
+        )
         x = self.initial_state() if x is None else x
         measurements = self._normalize_measurements(measurements)
         H = self.jacobian_sparse(x, measurements) if H is None else H
+        measurement_count = len(measurements)
         if matrix_is_empty(H):
             return ObservabilityResult(False, 0, self.n_state, 0, self.n_state, np.array([]), [])
+
+        if (
+            normal_matrix is None
+            and normal_factor_diag is None
+            and is_sparse_matrix(H)
+            and int(H.shape[0]) >= int(self.n_state)
+        ):
+            structural_rank = sparse_structural_rank(H)
+            if structural_rank == self.n_state:
+                result = ObservabilityResult(
+                    observable=True,
+                    rank=self.n_state,
+                    state_count=self.n_state,
+                    measurement_count=measurement_count,
+                    deficiency=0,
+                    singular_values=np.array([], dtype=np.float64),
+                    weak_states=[],
+                )
+                if use_default_cache:
+                    self._initial_observability_cache = result
+                self._cache_observability_matrix(result, x, measurements, H)
+                return result
 
         rank, deficiency, s, weak_states = observability_rank_details(
             H,
@@ -3721,17 +4511,28 @@ class DCStateEstimator:
             normal_matrix=normal_matrix,
             normal_factor_diag=normal_factor_diag,
         )
+        if deficiency > 0 and self._has_structural_observability_certificate(H):
+            rank = self.n_state
+            deficiency = 0
+            weak_states = []
         result = ObservabilityResult(
             observable=rank == self.n_state,
             rank=rank,
             state_count=self.n_state,
-            measurement_count=len(measurements),
+            measurement_count=measurement_count,
             deficiency=max(0, deficiency),
             singular_values=s,
             weak_states=weak_states,
         )
+        if use_default_cache:
+            self._initial_observability_cache = result
         self._cache_observability_matrix(result, x, measurements, H)
         return result
+
+    def _has_structural_observability_certificate(self, H) -> bool:
+        """Certify DC observability when sparse structure covers every state."""
+        rank = sparse_structural_rank(H)
+        return rank == self.n_state
 
     def estimate(
         self,
@@ -3743,75 +4544,177 @@ class DCStateEstimator:
     ) -> EstimateResult:
         """Solve the weighted least-squares DC state estimate with damped Newton steps."""
         solve_profile_start = time.perf_counter() if self.profile_enabled else None
-        measurements = self._normalize_measurements(measurements)
-        if len(measurements) < self.n_state:
-            raise RuntimeError(f"Not enough valid measurements: {len(measurements)} < {self.n_state}")
+        source_measurements = None if measurements is None else self._normalize_measurements(measurements)
+        measurement_plan_tables = self._measurement_plan_tables_for(source_measurements)
+        n_meas = self._measurement_count(measurement_plan_tables)
+        if n_meas < self.n_state:
+            raise RuntimeError(f"Not enough valid measurements: {n_meas} < {self.n_state}")
 
         x = self.initial_state() if x0 is None else x0.copy()
         if observability is None:
-            if measurements is self.active_measurements and x0 is None:
+            start = time.perf_counter() if self.profile_enabled else None
+            if (
+                self._measurement_plan_tables_are_active(measurement_plan_tables)
+                and x0 is None
+            ):
                 observability = self.observability_analysis()
             else:
-                observability = self.observability_analysis(x, measurements)
-        observability_cache = self._observability_matrix_cache_for(observability, measurements, x)
+                observability = self.observability_analysis(x, measurement_plan_tables)
+            if start is not None:
+                self._record_profile_time("solve.observability", time.perf_counter() - start)
+        observability_cache = self._observability_matrix_cache_for(observability, measurement_plan_tables, x)
         cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
-        z, weight = self._measurement_vectors(measurements)
-        uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
-        weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
-        weighted_residual = None if weights_are_uniform else np.empty_like(weight)
+        z, weight = self._measurement_vectors(measurement_plan_tables)
+        active_measurement_run = self._measurement_plan_tables_are_active(measurement_plan_tables)
+        uniform_weight = self.active_uniform_weight if active_measurement_run else self._uniform_weight(weight)
+        weights_are_uniform = self.active_weights_are_uniform if active_measurement_run else uniform_weight is not None
+        weighted_residual = None if (weights_are_uniform or active_measurement_run) else np.empty_like(weight)
         converged = False
         max_correction = np.inf
         objective = np.inf
         iteration = 0
         H = None
-        gain = np.zeros((self.n_state, self.n_state), dtype=np.float64)
+        gain = None
         final_quantities_current = False
-        normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
-        normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=active_measurement_run)
+        lower_normal_plan = self._active_lower_normal_plan if active_measurement_run else None
+        if (
+            active_measurement_run
+            and observability_cache is not None
+            and observability_cache.get("lower_normal_plan") is not None
+        ):
+            lower_normal_plan = observability_cache["lower_normal_plan"]
+        if (
+            self.profile_enabled
+            and active_measurement_run
+            and lower_normal_plan is not None
+            and "solve.lower_normal_plan_build" not in self.profile_times
+        ):
+            self._record_profile_time("solve.lower_normal_plan_build", 0.0)
+        normal_pattern = self._active_normal_pattern if active_measurement_run else None
         if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
             normal_pattern = observability_cache["normal_pattern"]
+        normal_assembly_plan = None if active_measurement_run else getattr(self, "_active_normal_assembly_plan", None)
+        if (
+            not active_measurement_run
+            and observability_cache is not None
+            and observability_cache.get("normal_assembly_plan") is not None
+        ):
+            normal_assembly_plan = observability_cache["normal_assembly_plan"]
+        normal_assembly_plan_disabled = active_measurement_run
 
         if verbose:
             _print_iteration_header()
 
-        # Pre-allocate evaluation buffers reused across iterations and line-search
-        # candidates. On acceptance we swap pointers so the accepted vectors
-        # become the "main" buffers without copying.
-        n_meas = len(measurements)
+        # Pre-allocated buffers reused across iterations and line-search trials.
+        # ``z_est_dirty`` tracks whether the main buffer already reflects the
+        # current ``x`` after an accepted step swap.
         z_est = np.empty(n_meas, dtype=np.float64)
         residual = np.empty(n_meas, dtype=np.float64)
         cand_z_est = np.empty(n_meas, dtype=np.float64)
         cand_residual = np.empty(n_meas, dtype=np.float64)
+        z_est_dirty = True
 
         for iteration in range(1, self.max_iter + 1):
-            self.evaluate(x, measurements, out=z_est)
-            np.subtract(z, z_est, out=residual)
+            if z_est_dirty:
+                start = time.perf_counter() if self.profile_enabled else None
+                self.evaluate(x, measurement_plan_tables, out=z_est)
+                if start is not None:
+                    self._record_profile_time("solve.evaluate", time.perf_counter() - start)
+                start = time.perf_counter() if self.profile_enabled else None
+                self._measurement_residual(z, z_est, measurement_plan_tables, out=residual)
+                objective = self._weighted_objective(weight, residual)
+                if start is not None:
+                    self._record_profile_time("solve.residual_objective", time.perf_counter() - start)
+                z_est_dirty = False
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            objective = 0.5 * float(np.dot(weight * residual, residual))
             if iteration == 1 and cached_initial_H is not None:
                 H = cached_initial_H
                 cached_initial_H = None
             else:
-                H = self.jacobian_sparse(x, measurements)
-            if normal_pattern is None and is_sparse_matrix(H):
+                start = time.perf_counter() if self.profile_enabled else None
+                H = self.jacobian_sparse(x, measurement_plan_tables)
+                if start is not None:
+                    self._record_profile_time("solve.jacobian", time.perf_counter() - start)
+            if normal_assembly_plan is not None and not normal_assembly_plan.matches(H):
+                normal_assembly_plan = None
+                if active_measurement_run:
+                    self._active_normal_assembly_plan = None
+                if observability_cache is not None:
+                    observability_cache["normal_assembly_plan"] = None
+            if lower_normal_plan is not None and (
+                not is_sparse_matrix(H)
+                or tuple(H.shape) != lower_normal_plan.shape
+                or int(H.nnz) != int(lower_normal_plan.h_indices.size)
+            ):
+                lower_normal_plan = None
+                if active_measurement_run:
+                    self._active_lower_normal_plan = None
+                if observability_cache is not None:
+                    observability_cache["lower_normal_plan"] = None
+            if active_measurement_run and lower_normal_plan is None and is_sparse_matrix(H):
+                start = time.perf_counter() if self.profile_enabled else None
+                lower_normal_plan = LowerNormalEquationCscPlan.from_jacobian(H)
+                if start is not None:
+                    self._record_profile_time("solve.lower_normal_plan_build", time.perf_counter() - start)
+                self._active_lower_normal_plan = lower_normal_plan
+                if observability_cache is not None:
+                    observability_cache["lower_normal_plan"] = lower_normal_plan
+            if normal_assembly_plan is None and is_sparse_matrix(H) and not normal_assembly_plan_disabled:
+                if not NormalEquationAssemblyPlan.direct_assembly_is_reasonable(H):
+                    normal_assembly_plan_disabled = True
+                else:
+                    start = time.perf_counter() if self.profile_enabled else None
+                    normal_assembly_plan = NormalEquationAssemblyPlan.from_jacobian(H)
+                    if start is not None:
+                        self._record_profile_time("solve.normal_assembly_plan_build", time.perf_counter() - start)
+                    if active_measurement_run:
+                        self._active_normal_assembly_plan = normal_assembly_plan
+                    if observability_cache is not None:
+                        observability_cache["normal_assembly_plan"] = normal_assembly_plan
+            if lower_normal_plan is None and normal_pattern is None and is_sparse_matrix(H):
+                start = time.perf_counter() if self.profile_enabled else None
                 normal_pattern = _normal_equation_structural_pattern(H)
-                if measurements is self.active_measurements:
+                if start is not None:
+                    self._record_profile_time("solve.normal_pattern", time.perf_counter() - start)
+                if active_measurement_run:
                     self._active_normal_pattern = normal_pattern
                 if observability_cache is not None:
                     observability_cache["normal_pattern"] = normal_pattern
-            if weighted_residual is not None:
+            normal_plan_can_weight_rhs = lower_normal_plan is not None and active_measurement_run
+            if weighted_residual is not None and not normal_plan_can_weight_rhs:
                 np.multiply(weight, residual, out=weighted_residual)
-            gain, rhs = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=measurements is self.active_measurements,
-            )
+            start = time.perf_counter() if self.profile_enabled else None
+            if lower_normal_plan is not None:
+                gain, rhs = lower_normal_plan.assemble(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=None if normal_plan_can_weight_rhs else weighted_residual,
+                    dense_gain_limit=0,
+                    assume_fixed_weights=active_measurement_run,
+                    copy_rhs=False,
+                )
+            else:
+                gain, rhs = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    assume_normal_pattern_matches=False,
+                    normal_assembly_plan=normal_assembly_plan,
+                )
+            if start is not None:
+                self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
+            start = time.perf_counter() if self.profile_enabled else None
             dx, _ = normal_solver.solve(gain, rhs, return_factor_diag=False)
+            if start is not None:
+                self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
 
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
             if max_correction < self.tol:
@@ -3824,54 +4727,97 @@ class DCStateEstimator:
             accepted = False
             step_scale = 1.0
             accepted_step = None
-            # Try shorter steps when the full Gauss-Newton update raises the objective.
-            for _ in range(8):
+            nonfinite_candidates = 0
+            previous_objective = objective
+            # Backtracking keeps the weighted objective non-increasing on difficult cases.
+            for _ in range(20):
                 candidate = x + step_scale * dx
                 candidate[: self.n_voltage] = np.maximum(candidate[: self.n_voltage], self.voltage_floor)
-                self.evaluate(candidate, measurements, out=cand_z_est)
-                np.subtract(z, cand_z_est, out=cand_residual)
-                candidate_objective = 0.5 * float(np.dot(weight * cand_residual, cand_residual))
-                if candidate_objective <= objective or step_scale < 1e-3:
+                start = time.perf_counter() if self.profile_enabled else None
+                self.evaluate(candidate, measurement_plan_tables, out=cand_z_est)
+                if start is not None:
+                    self._record_profile_time("solve.line_search_evaluate", time.perf_counter() - start)
+                start = time.perf_counter() if self.profile_enabled else None
+                self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                candidate_objective = self._weighted_objective(weight, cand_residual)
+                if start is not None:
+                    self._record_profile_time("solve.line_search_residual_objective", time.perf_counter() - start)
+                finite_candidate = np.isfinite(candidate_objective)
+                if not finite_candidate:
+                    nonfinite_candidates += 1
+                    if nonfinite_candidates >= 8:
+                        break
+                    step_scale *= 0.5
+                    continue
+                nonfinite_candidates = 0
+                objective_tol = max(1e-12, 1e-10 * (abs(objective) + 1.0))
+                if candidate_objective <= objective + objective_tol:
                     x = candidate
-                    objective = candidate_objective
-                    accepted_step = step_scale
-                    accepted = True
                     # Swap so the accepted candidate becomes the "main" buffer.
                     z_est, cand_z_est = cand_z_est, z_est
                     residual, cand_residual = cand_residual, residual
+                    objective = candidate_objective
+                    accepted_step = step_scale
+                    accepted = True
                     break
                 step_scale *= 0.5
             if not accepted:
-                x += dx
-                x[: self.n_voltage] = np.maximum(x[: self.n_voltage], self.voltage_floor)
-                accepted_step = 1.0
+                final_quantities_current = True
+                break
+
+            objective_change = abs(previous_objective - objective)
+            stagnation_tol = max(1e-14, 1e-10 * (abs(previous_objective) + 1.0))
+            practically_converged = (
+                max_correction < 10.0 * self.tol
+                and objective_change <= stagnation_tol
+            )
 
             if verbose:
-                self.evaluate(x, measurements, out=cand_z_est)
-                np.subtract(z, cand_z_est, out=cand_residual)
-                updated_residual_inf = float(np.linalg.norm(cand_residual, np.inf)) if cand_residual.size else 0.0
-                updated_objective = 0.5 * float(np.dot(weight * cand_residual, cand_residual))
+                updated_residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
                 _print_iteration(
                     iteration,
-                    updated_objective,
+                    objective,
                     updated_residual_inf,
                     max_correction,
                     accepted_step,
                     False,
                 )
 
-        if not final_quantities_current:
-            self.evaluate(x, measurements, out=z_est)
-            np.subtract(z, z_est, out=residual)
-            objective = 0.5 * float(np.dot(weight * residual, residual))
-            if final_diagnostics:
-                H = self.jacobian_sparse(x, measurements)
-                if normal_pattern is None and is_sparse_matrix(H):
-                    normal_pattern = _normal_equation_structural_pattern(H)
-                    if measurements is self.active_measurements:
-                        self._active_normal_pattern = normal_pattern
-                if weighted_residual is not None:
-                    np.multiply(weight, residual, out=weighted_residual)
+            if max_correction < self.tol or practically_converged:
+                converged = True
+                break
+
+        if not final_quantities_current and z_est_dirty:
+            start = time.perf_counter() if self.profile_enabled else None
+            self.evaluate(x, measurement_plan_tables, out=z_est)
+            if start is not None:
+                self._record_profile_time("solve.evaluate", time.perf_counter() - start)
+            start = time.perf_counter() if self.profile_enabled else None
+            self._measurement_residual(z, z_est, measurement_plan_tables, out=residual)
+            objective = self._weighted_objective(weight, residual)
+            if start is not None:
+                self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        if final_diagnostics and not final_quantities_current:
+            start = time.perf_counter() if self.profile_enabled else None
+            H = self.jacobian_sparse(x, measurement_plan_tables)
+            if start is not None:
+                self._record_profile_time("solve.jacobian", time.perf_counter() - start)
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            start = time.perf_counter() if self.profile_enabled else None
+            if lower_normal_plan is not None:
+                gain, _ = lower_normal_plan.assemble(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    dense_gain_limit=0,
+                    assume_fixed_weights=active_measurement_run,
+                    copy_rhs=False,
+                )
+            else:
                 gain, _ = build_normal_equations(
                     H,
                     residual,
@@ -3880,16 +4826,24 @@ class DCStateEstimator:
                     weights_are_uniform=weights_are_uniform,
                     weighted_residual=weighted_residual,
                     normal_pattern=normal_pattern,
-                    assume_normal_pattern_matches=measurements is self.active_measurements,
+                    normal_assembly_plan=normal_assembly_plan,
                 )
-        if not final_diagnostics:
+            if start is not None:
+                self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
+        elif not final_diagnostics:
             H = None
             gain = None
+        elif lower_normal_plan is not None and gain is not None:
+            start = time.perf_counter() if self.profile_enabled else None
+            gain = full_normal_equation_from_lower(gain)
+            if start is not None:
+                self._record_profile_time("solve.full_gain_from_lower", time.perf_counter() - start)
         array_only_result = bool(getattr(self, "_array_only_estimate_result", False))
         if not array_only_result:
             self.apply_state(x)
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
+        result_table = getattr(measurement_plan_tables, "table", None)
         return EstimateResult(
             converged=converged,
             iterations=iteration,
@@ -3901,9 +4855,10 @@ class DCStateEstimator:
             residual=residual.copy(),
             H=H,
             gain=gain,
-            measurements=[] if array_only_result else measurements,
+            measurements=[] if array_only_result else measurement_plan_tables,
             observability=observability,
-            measurement_table=getattr(measurements, "table", None),
+            measurement_plan_tables=measurement_plan_tables,
+            measurement_table=result_table,
         )
 
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
