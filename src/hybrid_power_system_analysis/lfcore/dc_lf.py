@@ -723,11 +723,6 @@ class DCPowerFlowCalc:
         self.slack_node_arr = np.fromiter(self.slack_nodes.keys(), dtype=np.int32, count=len(self.slack_nodes))
         self.slack_value_arr = np.fromiter(self.slack_nodes.values(), dtype=np.float64, count=len(self.slack_nodes))
 
-        if self.verbose:
-            print("self.N = ", self.N)
-            print("self.N_phi = ", self.N_phi)
-            print("self.N_dcdc = ", self.N_dcdc)
-
         # ---------- 5. 变量定义 ----------
         # 前 N 个变量是节点电压；随后是零阻抗连通分量的 phi。
         # array/summary/none 模式消去 DCDC j 端功率，j 端由损耗方程闭式回算。
@@ -738,9 +733,6 @@ class DCPowerFlowCalc:
         x[:self.N] = 1.0
         if self.slack_node_arr.size:
             x[self.slack_node_arr] = self.slack_value_arr
-
-        if self.verbose:
-            print(x)
 
         # ---------- 6. 节点分类 ----------
         known_mask = np.zeros(self.N, dtype=bool)
@@ -763,8 +755,7 @@ class DCPowerFlowCalc:
                 print(f"警告：变量数({self.total_vars})与方程数({self.total_eq})不匹配，请检查零阻抗支路设置。")
 
         if self.verbose:
-            print("total_vars", self.total_vars)
-            print("total_eq", self.total_eq)
+            print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
 
         self.eq_unknown_start = 0
         self.eq_known_start = self.eq_unknown_start + self.n_unknown
@@ -1389,8 +1380,9 @@ class DCPowerFlowCalc:
         terms = self._eval_newton_terms(self.G, x)
         return self._get_f_from_terms(x, terms)
 
-    def _write_back_ppc(self, x):
+    def _write_back_ppc(self):
         """Write array-mode DC LF results to self.result without object topology."""
+        x = self.x
         ppc = self.ppc
         V_final = x[:self.N]
         phi_final = x[self.N:self.N + self.N_phi] if self.N_phi > 0 else np.array([])
@@ -1794,14 +1786,9 @@ class DCPowerFlowCalc:
                 "converged": bool(self.converged),
                 "iterations": int(self.iterations),
                 "normF": float(self.normF),
-                "node_count": int(self.N),
-                "total_vars": int(self.total_vars),
-                "total_eq": int(self.total_eq),
-                "v_min": float(np.min(voltage)) if voltage.size else 0.0,
-                "v_max": float(np.max(voltage)) if voltage.size else 0.0,
-                "v_mean": float(np.mean(voltage)) if voltage.size else 0.0,
             },
         }
+        self.lf_result = None
 
     def _write_back(self):
         """结果回填；数值计算批量完成，Python 循环只负责对象属性赋值。"""
@@ -1811,10 +1798,9 @@ class DCPowerFlowCalc:
             return
         if self.result_mode == "summary":
             self._write_summary_result()
-            self.lf_result = None
             return
 
-        self._write_back_ppc(self.x)
+        self._write_back_ppc()
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
         return
@@ -1870,15 +1856,16 @@ class DCPowerFlowCalc:
 
             try:
                 factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
-                delta = factor.solve(-F)
+                delta = factor.solve(F)
             except Exception:
                 _OPTIONAL_SPARSE_SOLVERS.pop(self._linear_solver_resolved, None)
                 _OPTIONAL_SPARSE_MISSING.add(self._linear_solver_resolved)
                 self._linear_solver_resolved = "scipy"
                 self._linear_solver_fn = spsolve
-                delta = spsolve(J, -F)
+                delta = spsolve(J, F)
 
-            x += delta
+            # 与 AC 潮流一致：方程定义为 F(x)=0，使用 x_new = x - J^{-1}F。
+            x -= delta
 
         if self.verbose:
             print(f"达到最大迭代次数 {self.max_iter}，未收敛")
@@ -1886,7 +1873,7 @@ class DCPowerFlowCalc:
         self._write_back()
         return -1
 
-def print_dc_result(calc: DCPowerFlowCalc) -> None:
+def print_dc_result(calc: DCPowerFlowCalc, rc: int) -> None:
     # 9. 输出详细结果
     print("\n===输出直流电网潮流计算结果===")
 
@@ -1975,9 +1962,10 @@ def print_dc_result(calc: DCPowerFlowCalc) -> None:
             print(f"     出力功率: {row[DC_GEN_COLS['p']]:.6f} pu, 电流: {row[DC_GEN_COLS['current']]:.6f} pu")
 
         print("\n8. 计算收敛信息:")
-        print(f"   收敛状态: {'✓ 已收敛' if calc.converged else '✗ 未收敛'}")
-        print(f"   迭代次数: {calc.iterations}")
-        print(f"   最终残差: {calc.normF:.2e}")
+        print(
+            f"   收敛状态: {'✓ 已收敛' if calc.converged else '✗ 未收敛'}, "
+            f"返回码: {rc}, 迭代次数: {calc.iterations}, 最终残差: {calc.normF:.2e}"
+        )
 
         total_gen_power = float(np.sum(gen[:, DC_GEN_COLS["p"]])) if gen.size else 0.0
         total_load_power = float(np.sum(load[:, DC_LOAD_COLS["p"]])) if load.size else 0.0
@@ -1986,61 +1974,6 @@ def print_dc_result(calc: DCPowerFlowCalc) -> None:
         print(f"   总负荷功率: {total_load_power:.6f} pu")
         print(f"   网损: {total_gen_power - total_load_power:.6f} pu")
         return
-
-    net = calc.model
-
-    print("\n1. 节点电压 (pu):")
-    for node in net.nodes:
-        print(f"   节点 {node.idx}: {node.voltage:.6f} {'(松弛节点)' if node.is_slack else ''}")
-
-    print("\n2. 普通电阻支路信息:")
-    for br in net.branches:
-        print(f"   支路 {br.idx} ({br.i_node}->{br.j_node}, r={br.r}pu):")
-        print(f"     电流: {br.current:.6f} pu")
-        print(f"     送端功率: {br.i_p:.6f} pu, 受端功率: {br.j_p:.6f} pu")
-        print(f"     损耗功率: {br.j_p + br.i_p:.6f} pu")
-
-    print("\n3. 零阻抗支路信息:")
-    for zb in net.zero_branches:
-        print(f"   零阻抗支路 {zb.idx} ({zb.i_node}->{zb.j_node}):")
-        print(f"     电流: {zb.current:.6f} pu, 功率: {zb.p:.6f} pu")
-
-    print("\n4. 开关信息:")
-    for sw in net.switches:
-        print(f"   开关 {sw.idx} ({sw.i_node}->{sw.j_node}, 状态:{'闭合' if sw.status == 1 else '断开'}):")
-        print(f"     电流: {sw.current:.6f} pu, 功率: {sw.p:.6f} pu")
-
-    print("\n5. DC-DC变流器信息:")
-    for conv in net.dcdc_converters:
-        print(f"   变流器 {conv.idx} ({conv.i_node}->{conv.j_node}, 控制:{conv.control_type}):")
-        print(f"     设定值: {conv.p_set}, {conv.i_set},{conv.v_set}, 电阻: r1={conv.r1}, r2={conv.r2}")
-        print(f"     送端功率: {conv.i_p:.6f} pu, 送端电流: {conv.i_c:.6f} pu")
-        print(f"     受端功率: {conv.j_p:.6f} pu, 受端电流: {conv.j_c:.6f} pu")
-        print(f"     损耗功率: {conv.j_p + conv.i_p:.6f} pu")
-
-    print("\n6. 负荷信息:")
-    for load in net.loads:
-        print(f"   负荷 {load.idx} (节点{load.node}):")
-        print(f"     消耗功率: {load.p:.6f} pu, 电流: {load.current:.6f} pu")
-
-    print("\n7. 发电机信息:")
-    for gen in net.generators:
-        print(f"   发电机 {gen.idx} (节点{gen.node}, 类型{gen.control_type}):")
-        print(f"     出力功率: {gen.p:.6f} pu, 电流: {gen.current:.6f} pu")
-
-    print("\n8. 计算收敛信息:")
-    print(f"   收敛状态: {'✓ 已收敛' if calc.converged else '✗ 未收敛'}")
-    print(f"   迭代次数: {calc.iterations}")
-    print(f"   最终残差: {calc.normF:.2e}")
-
-    # 功率平衡校验
-    total_gen_power = sum(gen.p for gen in net.generators)
-    total_load_power = sum(load.p for load in net.loads)
-    total_loss = total_gen_power - total_load_power
-    print(f"\n9. 功率平衡校验:")
-    print(f"   总发电功率: {total_gen_power:.6f} pu")
-    print(f"   总负荷功率: {total_load_power:.6f} pu")
-    print(f"   网损: {total_loss:.6f} pu")
 
 
 def main(argv=None) -> int:
@@ -2066,11 +1999,9 @@ def main(argv=None) -> int:
         result_mode=args.result_mode,
         verbose=not args.quiet,
     )
-    if not args.quiet:
-        print("=== 开始直流电网潮流计算===")
     rc = calc.run()
     if not args.quiet and calc.result_mode == "full":
-        print_dc_result(calc)
+        print_dc_result(calc, rc)
     elif not args.quiet:
         print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
     return 0 if rc == 0 else 1

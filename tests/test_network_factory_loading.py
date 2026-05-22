@@ -40,6 +40,8 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
         self.assertFalse(hasattr(dc_array_model, "DCPowerNetwork"))
 
     def test_dc_lf_public_api_matches_ac_lf_flow(self):
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
         from lfcore.ac_lf import ACPowerFlowCalc
         from lfcore.dc_lf import DCPowerFlowCalc
 
@@ -74,13 +76,46 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
             inspect.signature(ACPowerFlowCalc._write_back),
             inspect.signature(DCPowerFlowCalc._write_back),
         )
+        self.assertEqual(
+            inspect.signature(ACPowerFlowCalc._write_back_ppc),
+            inspect.signature(DCPowerFlowCalc._write_back_ppc),
+        )
+        self.assertEqual(
+            list(inspect.signature(ac_lf.print_ac_result).parameters),
+            list(inspect.signature(dc_lf.print_dc_result).parameters),
+        )
 
         dc_source = inspect.getsource(DCPowerFlowCalc._run_newton_raphson)
+        self.assertIn("delta = factor.solve(F)", dc_source)
+        self.assertIn("x -= delta", dc_source)
+        self.assertNotIn("factor.solve(-F)", dc_source)
+        self.assertNotIn("x += delta", dc_source)
         self.assertIn("self._write_back()", dc_source)
         self.assertNotIn("update_lf_info", dc_source)
         self.assertNotIn("runtime_params", dc_source)
         self.assertNotIn("divergence_threshold", dc_source)
         self.assertNotIn("np.linalg.lstsq", dc_source)
+
+        self.assertNotIn("calc.model", inspect.getsource(dc_lf.print_dc_result))
+        dc_main_source = inspect.getsource(dc_lf.main)
+        self.assertIn("print_dc_result(calc, rc)", dc_main_source)
+        self.assertNotIn("开始直流电网潮流计算", dc_main_source)
+
+        dc_prepare_source = inspect.getsource(DCPowerFlowCalc._prepare_from_ppc)
+        self.assertIn("预处理完成：节点数", dc_prepare_source)
+        self.assertNotIn('print("self.N = "', dc_prepare_source)
+        self.assertNotIn('print("self.N_phi = "', dc_prepare_source)
+        self.assertNotIn('print("self.N_dcdc = "', dc_prepare_source)
+        self.assertNotIn("print(x)", dc_prepare_source)
+        self.assertNotIn('print("total_vars"', dc_prepare_source)
+        self.assertNotIn('print("total_eq"', dc_prepare_source)
+
+        ac_summary_source = inspect.getsource(ACPowerFlowCalc._write_summary_result)
+        dc_summary_source = inspect.getsource(DCPowerFlowCalc._write_summary_result)
+        self.assertIn("self.lf_result = None", ac_summary_source)
+        self.assertIn("self.lf_result = None", dc_summary_source)
+        for dc_only_field in ("node_count", "total_vars", "total_eq", "v_min", "v_max", "v_mean"):
+            self.assertNotIn(dc_only_field, dc_summary_source)
 
     def test_lf_refresh_period_and_algorithm_branches_are_removed(self):
         from lfcore.ac_lf import ACPowerFlowCalc
