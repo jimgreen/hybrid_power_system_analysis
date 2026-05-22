@@ -236,6 +236,7 @@ class DCPowerFlowCalc:
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = bool(keep_node_objects) and self.result_mode == "full"
+        self._cache_csr_jacobian_pattern = self.result_mode == "full"
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -1010,11 +1011,17 @@ class DCPowerFlowCalc:
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        (
-            self._dc_jac_csr_indices,
-            self._dc_jac_csr_indptr,
-            self._dc_jac_raw_to_csr_pos,
-        ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        if self._cache_csr_jacobian_pattern:
+            (
+                self._dc_jac_csr_indices,
+                self._dc_jac_csr_indptr,
+                self._dc_jac_raw_to_csr_pos,
+            ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        else:
+            self._dc_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
+            self._dc_jac_csr_indices = np.array([], dtype=np.int32)
+            self._dc_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
+            self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, 0)
         (
             self._dc_jac_csc_indices,
             self._dc_jac_csc_indptr,
@@ -1022,7 +1029,8 @@ class DCPowerFlowCalc:
         ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
         self._dc_jac_csr_data = np.empty(self._dc_jac_csr_indices.size, dtype=np.float64)
         self._dc_jac_csc_data = np.empty(self._dc_jac_csc_indices.size, dtype=np.float64)
-        self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, self._dc_jac_csr_data.size)
+        if self._cache_csr_jacobian_pattern:
+            self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, self._dc_jac_csr_data.size)
         self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, self._dc_jac_csc_data.size)
 
     @staticmethod
@@ -1130,6 +1138,8 @@ class DCPowerFlowCalc:
                 shape=(self.total_eq, self.total_vars),
                 copy=False,
             )
+        if not self._dc_jac_raw_to_csr_pos.size:
+            return None
 
         apply_raw_sum_plan(self._dc_jac_csr_data, self._dc_jac_raw_data, self._dc_jac_csr_sum_plan)
         if not build_matrix:
@@ -1829,6 +1839,7 @@ class DCPowerFlowCalc:
         """执行直流 Newton 迭代并在收敛后回填结果。"""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
+            self._cache_csr_jacobian_pattern = self.result_mode == "full"
             if self.result_mode != "full":
                 self.keep_node_objects = False
                 self.alive_nodes = []

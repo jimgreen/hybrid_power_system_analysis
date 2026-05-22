@@ -260,6 +260,7 @@ class ACPowerFlowCalc:
             raise ValueError("ACPowerFlowCalc requires ac_ppc_v1 or ACPowerNetwork input")
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = bool(keep_node_objects) and self.result_mode == "full"
+        self._cache_csr_jacobian_pattern = self.result_mode == "full"
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
@@ -286,6 +287,8 @@ class ACPowerFlowCalc:
         self.ppc_node_vbase = np.array([], dtype=np.float64)
         self.ppc_node_voltage = np.array([], dtype=np.float64)
         self.ppc_node_angle = np.array([], dtype=np.float64)
+        self._ppc_node_row_lookup = np.array([], dtype=np.int32)
+        self._active_node_solver_lookup = np.array([], dtype=np.int32)
         self.isl = None
         self.Y: Optional[csr_matrix] = None
 
@@ -631,7 +634,21 @@ class ACPowerFlowCalc:
         node_ids = np.asarray(node_ids, dtype=np.int64)
         if self._ppc_sequential_node_ids:
             return node_ids.astype(np.int32)
-        return np.fromiter((self._ppc_node_row_by_id[int(node_id)] for node_id in node_ids), dtype=np.int32, count=node_ids.size)
+        lookup = getattr(self, "_ppc_node_row_lookup", None)
+        if isinstance(lookup, np.ndarray) and lookup.size:
+            rows = np.full(node_ids.shape, -1, dtype=np.int32)
+            valid = (node_ids >= 0) & (node_ids < lookup.size)
+            if np.any(valid):
+                rows[valid] = lookup[node_ids[valid].astype(np.intp, copy=False)]
+            if np.any(rows < 0):
+                missing = int(node_ids[np.flatnonzero(rows < 0)[0]])
+                raise KeyError(missing)
+            return rows
+        return np.fromiter(
+            (self._ppc_node_row_by_id[int(node_id)] for node_id in node_ids),
+            dtype=np.int32,
+            count=node_ids.size,
+        )
 
     def _bind_ppc_nodes_to_network(self) -> None:
         """Use original ACNode objects for network-input array solves."""
@@ -672,7 +689,17 @@ class ACPowerFlowCalc:
         n_bus_all = bus.shape[0]
         bus_ids = bus[:, BUS_COLS["idx"]].astype(np.int64)
         self._ppc_sequential_node_ids = bool(np.array_equal(bus_ids, np.arange(n_bus_all)))
-        self._ppc_node_row_by_id = {} if self._ppc_sequential_node_ids else {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
+        self._ppc_node_row_lookup = np.array([], dtype=np.int32)
+        self._ppc_node_row_by_id = {}
+        if not self._ppc_sequential_node_ids:
+            if bus_ids.size and np.all(bus_ids >= 0):
+                self._ppc_node_row_lookup = np.full(int(np.max(bus_ids)) + 1, -1, dtype=np.int32)
+                self._ppc_node_row_lookup[bus_ids.astype(np.intp, copy=False)] = np.arange(
+                    n_bus_all,
+                    dtype=np.int32,
+                )
+            else:
+                self._ppc_node_row_by_id = {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
         ensure_ac_ppc_topology(ppc)
         topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
@@ -690,6 +717,14 @@ class ACPowerFlowCalc:
         self.ppc_node_vbase = bus[active_rows, BUS_COLS["vbase"]].astype(np.float64, copy=True)
         self.ppc_node_voltage = bus[active_rows, BUS_COLS["voltage"]].astype(np.float64, copy=True)
         self.ppc_node_angle = bus[active_rows, BUS_COLS["angle"]].astype(np.float64, copy=True)
+        if self.ppc_node_idx.size and np.all(self.ppc_node_idx >= 0):
+            self._active_node_solver_lookup = np.full(int(np.max(self.ppc_node_idx)) + 1, -1, dtype=np.int32)
+            self._active_node_solver_lookup[self.ppc_node_idx.astype(np.intp, copy=False)] = np.arange(
+                self.N,
+                dtype=np.int32,
+            )
+        else:
+            self._active_node_solver_lookup = np.array([], dtype=np.int32)
         if self.keep_node_objects:
             bus_names = ppc.get("bus_name", np.asarray([f"bus_{int(idx)}" for idx in bus_ids], dtype=object))
             self.ppc_node_name = np.asarray(bus_names[active_rows], dtype=object)
@@ -1143,26 +1178,31 @@ class ACPowerFlowCalc:
         self.standard_jac_data = np.empty(cursor, dtype=np.float64)
         if cursor:
             n_dim = self.n_theta + self.n_V
-            (
-                self.standard_jac_csr_indices,
-                self.standard_jac_csr_indptr,
-                self.standard_jac_raw_to_csr_pos,
-            ) = build_compressed_pattern_from_raw_coords(self.standard_jac_rows, self.standard_jac_cols, n_dim)
-            (
-                self.standard_jac_csc_indices,
-                self.standard_jac_csc_indptr,
-                self.standard_jac_raw_to_csc_pos,
-            ) = build_compressed_pattern_from_raw_coords(self.standard_jac_cols, self.standard_jac_rows, n_dim)
-            self.standard_jac_csr_data = np.empty(self.standard_jac_csr_indices.size, dtype=np.float64)
-            self.standard_jac_csc_data = np.empty(self.standard_jac_csc_indices.size, dtype=np.float64)
-            self.standard_jac_csr_sum_plan = build_raw_sum_plan(
-                self.standard_jac_raw_to_csr_pos,
-                self.standard_jac_csr_data.size,
-            )
-            self.standard_jac_csc_sum_plan = build_raw_sum_plan(
-                self.standard_jac_raw_to_csc_pos,
-                self.standard_jac_csc_data.size,
-            )
+            cache_standard_csc = self.N_phi == 0
+            if self._cache_csr_jacobian_pattern:
+                (
+                    self.standard_jac_csr_indices,
+                    self.standard_jac_csr_indptr,
+                    self.standard_jac_raw_to_csr_pos,
+                ) = build_compressed_pattern_from_raw_coords(self.standard_jac_rows, self.standard_jac_cols, n_dim)
+                self.standard_jac_csr_data = np.empty(self.standard_jac_csr_indices.size, dtype=np.float64)
+            if cache_standard_csc:
+                (
+                    self.standard_jac_csc_indices,
+                    self.standard_jac_csc_indptr,
+                    self.standard_jac_raw_to_csc_pos,
+                ) = build_compressed_pattern_from_raw_coords(self.standard_jac_cols, self.standard_jac_rows, n_dim)
+                self.standard_jac_csc_data = np.empty(self.standard_jac_csc_indices.size, dtype=np.float64)
+            if self._cache_csr_jacobian_pattern:
+                self.standard_jac_csr_sum_plan = build_raw_sum_plan(
+                    self.standard_jac_raw_to_csr_pos,
+                    self.standard_jac_csr_data.size,
+                )
+            if cache_standard_csc:
+                self.standard_jac_csc_sum_plan = build_raw_sum_plan(
+                    self.standard_jac_raw_to_csc_pos,
+                    self.standard_jac_csc_data.size,
+                )
             y_nnz = self.Y_jac_rows.size
             self._jac_delta = np.empty(y_nnz, dtype=np.float64)
             self._jac_cos_delta = np.empty(y_nnz, dtype=np.float64)
@@ -1471,11 +1511,12 @@ class ACPowerFlowCalc:
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        (
-            self.full_jac_csr_indices,
-            self.full_jac_csr_indptr,
-            self.full_jac_raw_to_csr_pos,
-        ) = _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        if self._cache_csr_jacobian_pattern:
+            (
+                self.full_jac_csr_indices,
+                self.full_jac_csr_indptr,
+                self.full_jac_raw_to_csr_pos,
+            ) = _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
         (
             self.full_jac_csc_indices,
             self.full_jac_csc_indptr,
@@ -1483,7 +1524,8 @@ class ACPowerFlowCalc:
         ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
         self.full_jac_csr_data = np.empty(self.full_jac_csr_indices.size, dtype=np.float64)
         self.full_jac_csc_data = np.empty(self.full_jac_csc_indices.size, dtype=np.float64)
-        self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, self.full_jac_csr_data.size)
+        if self._cache_csr_jacobian_pattern:
+            self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, self.full_jac_csr_data.size)
         self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, self.full_jac_csc_data.size)
 
     # --------------------------------------------------------------------------
@@ -2008,6 +2050,8 @@ class ACPowerFlowCalc:
                 shape=(self.total_eq, self.total_vars),
                 copy=False,
             )
+        if not self.full_jac_raw_to_csr_pos.size:
+            return None
 
         apply_raw_sum_plan(self.full_jac_csr_data, raw, self.full_jac_csr_sum_plan)
         if not build_matrix:
@@ -2115,6 +2159,7 @@ class ACPowerFlowCalc:
         """执行所选潮流算法。"""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
+            self._cache_csr_jacobian_pattern = self.result_mode == "full"
             if self.result_mode != "full":
                 self.keep_node_objects = False
                 self.node_list = []

@@ -794,6 +794,11 @@ class HybridPowerFlowCalc:
 
     def _ac_solver_pos(self, node_id: int) -> int:
         node_id = int(node_id)
+        lookup = getattr(self.ac_calc, "_active_node_solver_lookup", None)
+        if isinstance(lookup, np.ndarray) and lookup.size and 0 <= node_id < lookup.size:
+            pos = int(lookup[node_id])
+            if pos >= 0:
+                return pos
         pos = self.ac_calc.node_pos.get(node_id) if getattr(self.ac_calc, "node_pos", None) else None
         if pos is not None:
             return int(pos)
@@ -1175,9 +1180,28 @@ class HybridPowerFlowCalc:
     def _rows_from_csr_indptr(indptr):
         return np.repeat(np.arange(len(indptr) - 1, dtype=np.int32), np.diff(indptr))
 
+    @staticmethod
+    def _cols_from_csc_indptr(indptr):
+        return np.repeat(np.arange(len(indptr) - 1, dtype=np.int32), np.diff(indptr))
+
     def _sub_jacobian_pattern(self, calc, is_dc=False):
         if calc is None or getattr(calc, "total_eq", 0) == 0 or getattr(calc, "total_vars", 0) == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        if is_dc and hasattr(calc, "_dc_jac_csc_indices") and calc._dc_jac_csc_indices.size:
+            return (
+                calc._dc_jac_csc_indices.astype(np.int32, copy=True),
+                self._cols_from_csc_indptr(calc._dc_jac_csc_indptr),
+            )
+        if hasattr(calc, "full_jac_csc_indices") and calc.full_jac_csc_indices.size:
+            return (
+                calc.full_jac_csc_indices.astype(np.int32, copy=True),
+                self._cols_from_csc_indptr(calc.full_jac_csc_indptr),
+            )
+        if hasattr(calc, "standard_jac_csc_indices") and calc.standard_jac_csc_indices.size:
+            return (
+                calc.standard_jac_csc_indices.astype(np.int32, copy=True),
+                self._cols_from_csc_indptr(calc.standard_jac_csc_indptr),
+            )
         if is_dc and hasattr(calc, "_dc_jac_csr_indices") and calc._dc_jac_csr_indices.size:
             return (
                 self._rows_from_csr_indptr(calc._dc_jac_csr_indptr),
@@ -1665,7 +1689,7 @@ class HybridPowerFlowCalc:
             ac_f, ac_j = self.ac_calc._build_newton_system(
                 ac_x,
                 return_jacobian=False,
-                jacobian_format="csr",
+                jacobian_format="csc",
             )
             if ac_j is None and self._slice_len(self.global_jac_ac_slice):
                 ac_j = self.ac_calc.get_jacobi(ac_x)
@@ -1673,7 +1697,7 @@ class HybridPowerFlowCalc:
             dc_f, dc_j = self.dc_calc._build_newton_system(
                 dc_x,
                 return_jacobian=False,
-                jacobian_format="csr",
+                jacobian_format="csc",
             )
             if dc_j is None and self._slice_len(self.global_jac_dc_slice):
                 dc_j = self.dc_calc.get_jacobi(dc_x)
