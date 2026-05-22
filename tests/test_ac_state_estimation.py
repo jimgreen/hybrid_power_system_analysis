@@ -122,26 +122,21 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._refresh_measurement_summary_cache()
 
         self.assertFalse(hasattr(ACStateEstimator, "_active_device_key"))
-        node0_key = (
-            ACStateEstimator._active_measurement_key(
-                mt.DEVICE_TYPE_ACNode,
-                0,
-                mt.MEAS_TYPE_V,
-            )
-            >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
+        node0_key = ACStateEstimator._active_measurement_key(
+            mt.DEVICE_TYPE_ACNode,
+            0,
+            mt.MEAS_TYPE_V,
         )
-        node1_key = (
-            ACStateEstimator._active_measurement_key(
-                mt.DEVICE_TYPE_ACNode,
-                1,
-                mt.MEAS_TYPE_V,
-            )
-            >> ac_se._ACTIVE_MEASUREMENT_KEY_MEAS_BITS
+        node1_key = ACStateEstimator._active_measurement_key(
+            mt.DEVICE_TYPE_ACNode,
+            1,
+            mt.MEAS_TYPE_V,
         )
-        self.assertIsNone(estimator._active_device_code_pos_cache)
+        self.assertFalse(hasattr(ACStateEstimator, "_active_device_keys_ref"))
+        self.assertFalse(hasattr(estimator, "_active_device_code_pos_cache"))
         self.assertEqual(
             {node0_key, node1_key},
-            estimator._active_device_keys_ref(),
+            estimator._active_measurement_keys_ref(),
         )
         self.assertEqual(2, estimator._max_measurement_idx)
         self.assertEqual({1: 1.02}, estimator._node_voltage_measurement_cache)
@@ -964,7 +959,6 @@ class ACStateEstimationTest(unittest.TestCase):
         )
         estimator._voltage_pseudo_is_covered_by_code = lambda *_args, **_kwargs: False
         estimator._active_measurement_code_pos_cache = set()
-        estimator._active_device_code_pos_cache = set()
         for attr in (
             "node_by_name",
             "branch_by_name",
@@ -1074,7 +1068,6 @@ class ACStateEstimationTest(unittest.TestCase):
             prepare_active_measurements=False,
         )
         estimator._active_measurement_code_pos_cache = set()
-        estimator._active_device_code_pos_cache = set()
 
         original_codes = ac_se._DEVICE_TYPE_CODES
         original_meas_type_array = ac_se._meas_type_code_array
@@ -1110,7 +1103,6 @@ class ACStateEstimationTest(unittest.TestCase):
             prepare_active_measurements=False,
         )
         estimator._active_measurement_code_pos_cache = set()
-        estimator._active_device_code_pos_cache = set()
         before_count = int(estimator.measurements.table.idx.size)
 
         original_measurement = ac_se.Measurement
@@ -1168,7 +1160,6 @@ class ACStateEstimationTest(unittest.TestCase):
             prepare_active_measurements=False,
         )
         estimator._active_measurement_code_pos_cache = set()
-        estimator._active_device_code_pos_cache = set()
         estimator.zero_branches = RejectIterable()
         estimator.breakers = RejectIterable()
         estimator.generator_order = RejectIterable()
@@ -1189,7 +1180,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn(("ACLoad", "load_1", "Q_LOAD"), pseudo_keys)
 
     def test_voltage_measurement_node_lookup_uses_ppc_rows_not_device_maps(self):
-        import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
         class RejectDeviceMap(dict):
@@ -2503,7 +2493,6 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
     def test_pseudo_append_with_device_positions_skips_full_device_index_rebuild(self):
-        import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -2545,7 +2534,6 @@ class ACStateEstimationTest(unittest.TestCase):
     def test_pseudo_append_warns_and_skips_name_lookup_without_device_positions(self):
         import warnings
 
-        import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -2973,7 +2961,6 @@ class ACStateEstimationTest(unittest.TestCase):
         np.testing.assert_allclose(voltage[estimator.voltage_state_pos], 1.12)
 
     def test_power_flow_seed_uses_cached_seed_rows(self):
-        import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
         class FailingMeasurements(list):
@@ -3146,7 +3133,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, shunt_obj.q)
 
     def test_targeted_zero_current_pseudo_uses_to_side_when_from_side_exists(self):
-        from secore import ac_se
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -3181,7 +3167,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertIn(active_key(target_meta.device_type_code, target_meta.device_pos, mt.MEAS_TYPE_Q_TO), existing_keys)
 
     def test_targeted_node_voltage_state_adds_pseudo_measurement(self):
-        from secore import ac_se
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3241,7 +3226,6 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
     def test_targeted_observability_uses_state_meta_arrays_without_object_list(self):
-        from secore import ac_se
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3295,7 +3279,6 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
     def test_ac_state_meta_contains_device_position_and_codes(self):
-        from secore import ac_se
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -3742,7 +3725,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertNotIn(("ACZeroBranch", "zbr_1_2", "I_FROM"), regular_pseudo_keys)
 
     def test_topology_pseudo_measurements_record_device_positions(self):
-        from secore import ac_se
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -4300,17 +4282,16 @@ class ACStateEstimationTest(unittest.TestCase):
             e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
-        expected_device_keys = set(estimator._active_device_keys_ref())
         expected_measurement_keys = set(estimator._active_measurement_keys_ref())
-        expected_next_idx = max(meas.idx for meas in estimator.measurements) + 1
+        expected_next_idx = int(np.max(estimator.measurements.table.idx)) + 1
 
         class RejectIteration(list):
             def __iter__(self):
                 raise AssertionError("active measurement summary should use cached values")
 
-        estimator.measurements = RejectIteration(estimator.measurements)
+        estimator.measurements = RejectIteration()
 
-        self.assertEqual(expected_device_keys, set(estimator._active_device_keys_ref()))
+        self.assertFalse(hasattr(ACStateEstimator, "_active_device_keys_ref"))
         self.assertEqual(expected_measurement_keys, estimator._active_measurement_keys_ref())
         self.assertEqual(expected_next_idx, estimator._next_measurement_idx())
 
@@ -4373,7 +4354,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertGreater(estimator._ac_transformer_plan_i.size, 0)
 
     def test_measurement_scale_uses_cached_indexes_not_device_maps(self):
-        import secore.ac_se as ac_se
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
@@ -4412,7 +4392,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertFalse(hasattr(estimator, "load_by_name"))
 
     def test_power_state_seed_uses_integer_device_positions(self):
-        from secore import ac_se
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator.__new__(ACStateEstimator)
@@ -6180,7 +6159,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(1, calls["active"])
 
     def test_incremental_updater_reuses_existing_active_measurement_plans(self):
-        import secore.ac_se as ac_se
         from model.meas_model import MeasurementTableView
         from secore.ac_se import ACStateEstimator
 

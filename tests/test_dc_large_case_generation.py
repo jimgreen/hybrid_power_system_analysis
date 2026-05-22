@@ -1,8 +1,15 @@
 import contextlib
 import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = ROOT_DIR / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 class DCLargeCaseGenerationTest(unittest.TestCase):

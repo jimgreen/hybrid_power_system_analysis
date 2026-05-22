@@ -50,7 +50,6 @@ from model.meas_array_model import (
 )
 from model.meas_type import (
     DEVICE_TYPE_CODES,
-    DEVICE_TYPE_NAMES,
     DEVICE_TYPE_ACNode,
     DEVICE_TYPE_ACBranch,
     DEVICE_TYPE_ACTransformer,
@@ -62,7 +61,6 @@ from model.meas_type import (
     DEVICE_TYPE_ACBreak,
     DEVICE_TYPE_ACBreakConstraint,
     MEAS_TYPE_CODES,
-    MEAS_TYPE_NAMES,
     MEAS_TYPE_V,
     MEAS_TYPE_ANGLE,
     MEAS_TYPE_THETA,
@@ -206,6 +204,7 @@ _OBSERVABILITY_RESULT_CACHE = {}
 _MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
 _TERMINAL_POWER_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_TERMINAL_POWER_MEASUREMENT_TYPES), dtype=np.int16)
 _VOLTAGE_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_VOLTAGE_MEASUREMENT_TYPES), dtype=np.int16)
+_ANGLE_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_ANGLE_MEASUREMENT_CODE_SET), dtype=np.int16)
 
 
 def _measurement_type_code_lookup_from_codes(codes: Sequence[int]) -> np.ndarray:
@@ -286,11 +285,15 @@ _AC_CONSTRAINT_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
 
 
 def _meas_type_code_array(meas_type_values) -> np.ndarray:
-    values = np.asarray(meas_type_values, dtype=object)
+    values = np.asarray(meas_type_values, dtype=object).reshape(-1)
     if values.size == 0:
         return np.empty(0, dtype=np.int16)
     code_get = MEAS_TYPE_CODES.get
-    return np.asarray([code_get(str(name).upper(), 0) for name in values.tolist()], dtype=np.int16)
+    return np.fromiter(
+        (code_get(str(name).upper(), 0) for name in values),
+        dtype=np.int16,
+        count=int(values.size),
+    )
 
 
 def _measurement_type_code_lookup(kind_map) -> np.ndarray:
@@ -957,7 +960,7 @@ class ACStateEstimator:
         if cache is None:
             meta_cache = getattr(self, "_state_meta_cache", None)
             if meta_cache is None:
-                labels = [str(label) for label in self._state_meta_arrays_ref()["legacy_label"].tolist()]
+                labels = [str(label) for label in np.asarray(self._state_meta_arrays_ref()["legacy_label"], dtype=object)]
                 cache = labels if all(labels) else state_labels_from_metadata(self.state_meta)
             else:
                 labels = [meta.legacy_label for meta in meta_cache]
@@ -2191,7 +2194,7 @@ class ACStateEstimator:
             "device_name": device_name_array,
             "device_names": np.asarray(device_names, dtype=object),
             "device_name_id_by_name": dict(
-                zip(np.asarray(device_names, dtype=object).tolist(), range(int(device_names.size)))
+                zip(np.asarray(device_names, dtype=object), range(int(device_names.size)))
             ),
             "meas_type": np.asarray(table.meas_type, dtype=object),
             "rows_by_device_type_code": rows_by_device_type_code(table),
@@ -2233,10 +2236,10 @@ class ACStateEstimator:
                 id_by_name = meas_ppc.get("device_name_id_by_name")
                 if not isinstance(id_by_name, dict):
                     id_by_name = dict(
-                        zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
+                        zip(device_names.astype(object, copy=False), range(int(device_names.size)))
                     )
                 start_pos = int(device_names.size)
-                for offset, name in enumerate(missing_names.astype(object, copy=False).tolist()):
+                for offset, name in enumerate(missing_names.astype(object, copy=False)):
                     id_by_name[name] = start_pos + int(offset)
                 meas_ppc["device_name_id_by_name"] = id_by_name
                 if hasattr(self, "_meas_device_name_sorted_id_cache"):
@@ -2655,9 +2658,28 @@ class ACStateEstimator:
             out[in_range] = lookup[rows[in_range].astype(np.intp, copy=False)]
         return out
 
+    @staticmethod
+    def _measurement_key_array_from_cache(measurement_keys) -> np.ndarray:
+        if isinstance(measurement_keys, np.ndarray):
+            keys = np.asarray(measurement_keys, dtype=np.int64).reshape(-1)
+        elif not measurement_keys:
+            return np.empty(0, dtype=np.int64)
+        else:
+            keys = np.fromiter(
+                (int(key) for key in measurement_keys),
+                dtype=np.int64,
+                count=len(measurement_keys),
+            )
+        if keys.size == 0:
+            return keys.astype(np.int64, copy=False)
+        return np.unique(keys.astype(np.int64, copy=False))
+
     def _set_active_key_caches(self, measurement_keys: set) -> None:
-        self._active_measurement_keys = measurement_keys
-        self._active_measurement_code_pos_cache = measurement_keys
+        key_array = self._measurement_key_array_from_cache(measurement_keys)
+        key_set = measurement_keys if isinstance(measurement_keys, set) else set(map(int, key_array))
+        self._active_measurement_keys = key_set
+        self._active_measurement_code_pos_cache = key_set
+        self._active_measurement_key_array_cache = key_array
 
     @staticmethod
     def _active_measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
@@ -2703,7 +2725,7 @@ class ACStateEstimator:
         valid_pos_values = pos_values[valid_pos]
         valid_meas = meas_values[valid_pos]
         measurement_keys = ACStateEstimator._active_measurement_key_array(valid_type, valid_pos_values, valid_meas)
-        return set(measurement_keys.tolist())
+        return set(map(int, np.unique(measurement_keys)))
 
     def _voltage_best_from_arrays(
         self,
@@ -2747,7 +2769,10 @@ class ACStateEstimator:
 
         def best_dict(best_weight: np.ndarray, best_value: np.ndarray) -> Dict[int, float]:
             valid = np.flatnonzero(np.isfinite(best_weight) & (node_idx_by_pos >= 0)).astype(np.int64, copy=False)
-            return dict(zip(node_idx_by_pos[valid].tolist(), best_value[valid].tolist()))
+            return {
+                int(node_idx): float(value)
+                for node_idx, value in zip(node_idx_by_pos[valid], best_value[valid])
+            }
 
         node_v_rows = row_index[
             real_mask
@@ -3165,6 +3190,16 @@ class ACStateEstimator:
             self._refresh_measurement_summary_cache()
         return self._active_measurement_keys
 
+    def _active_measurement_key_array_ref(self) -> np.ndarray:
+        """Return active measurement keys as a sorted int64 array for vectorized membership checks."""
+        key_array = getattr(self, "_active_measurement_key_array_cache", None)
+        if key_array is not None:
+            return np.asarray(key_array, dtype=np.int64)
+        keys = self._active_measurement_keys_ref()
+        key_array = self._measurement_key_array_from_cache(keys)
+        self._active_measurement_key_array_cache = key_array
+        return key_array
+
     def _next_measurement_idx(self) -> int:
         if not hasattr(self, "_max_measurement_idx"):
             self._refresh_measurement_summary_cache()
@@ -3314,9 +3349,11 @@ class ACStateEstimator:
         if device_type_codes is None:
             if device_type_array.size != row_count:
                 raise ValueError("pseudo measurement device_type_code is required when device_type strings are omitted")
-            device_type_code = np.asarray(
-                [_DEVICE_TYPE_CODES.get(str(device_type), 0) for device_type in device_type_array.tolist()],
+            code_get = _DEVICE_TYPE_CODES.get
+            device_type_code = np.fromiter(
+                (code_get(str(device_type), 0) for device_type in device_type_array),
                 dtype=np.int16,
+                count=int(device_type_array.size),
             )
         else:
             device_type_code = np.asarray(device_type_codes, dtype=np.int16)
@@ -3484,7 +3521,21 @@ class ACStateEstimator:
                 valid_pos = tail_pos[valid_tail].astype(np.int64, copy=False)
                 valid_meas = tail_meas[valid_tail].astype(np.int64, copy=False)
                 measurement_keys = self._active_measurement_key_array(valid_type, valid_pos, valid_meas)
-                measurement_key_cache.update(measurement_keys.tolist())
+                measurement_key_cache.update(map(int, measurement_keys))
+                key_array = getattr(self, "_active_measurement_key_array_cache", None)
+                if key_array is None or np.asarray(key_array).size == 0:
+                    self._active_measurement_key_array_cache = np.unique(
+                        measurement_keys.astype(np.int64, copy=False)
+                    )
+                else:
+                    self._active_measurement_key_array_cache = np.unique(
+                        np.concatenate(
+                            (
+                                np.asarray(key_array, dtype=np.int64),
+                                measurement_keys.astype(np.int64, copy=False),
+                            )
+                        )
+                    )
         return base_table
 
     def _real_voltage_observation_nodes(self) -> Dict[int, float]:
@@ -4444,8 +4495,7 @@ class ACStateEstimator:
             return MeasurementTableView(empty_table, normalized=True)
         else:
             device_pos = np.asarray(device_pos, dtype=np.int64)
-        existing_keys = self._active_measurement_keys_ref()
-        seen_keys = set()
+        existing_key_array = self._active_measurement_key_array_ref()
         next_idx = self._next_measurement_idx()
         invalid_rows = np.flatnonzero(
             (~np.asarray(table.valid, dtype=bool))
@@ -4466,23 +4516,14 @@ class ACStateEstimator:
             device_pos[invalid_rows],
             meas_type_code[invalid_rows],
         )
-        candidate_rows = []
-        candidate_values = []
-        for local_idx, row in enumerate(invalid_rows.tolist()):
-            row = int(row)
-            if int(device_pos[row]) < 0 or not bool(available[local_idx]):
-                continue
-            if int(meas_type_code[row]) in _ANGLE_MEASUREMENT_CODE_SET:
-                continue
-            if int(device_type_code[row]) == DEVICE_TYPE_ACNode and int(meas_type_code[row]) == MEAS_TYPE_V:
-                continue
-            key = self._active_measurement_key(device_type_code[row], device_pos[row], meas_type_code[row])
-            if key in existing_keys or key in seen_keys:
-                continue
-            seen_keys.add(key)
-            candidate_rows.append(row)
-            candidate_values.append(float(table.value[row]) / float(scale[local_idx]))
-        if not candidate_rows:
+        candidate_mask = (device_pos[invalid_rows] >= 0) & np.asarray(available, dtype=bool)
+        candidate_mask &= ~np.isin(meas_type_code[invalid_rows], _ANGLE_MEASUREMENT_TYPE_CODES)
+        candidate_mask &= ~(
+            (device_type_code[invalid_rows] == DEVICE_TYPE_ACNode)
+            & (meas_type_code[invalid_rows] == MEAS_TYPE_V)
+        )
+        candidate_rows = invalid_rows[candidate_mask]
+        if candidate_rows.size == 0:
             empty_table = self._pseudo_measurement_table(
                 (),
                 (),
@@ -4492,31 +4533,41 @@ class ACStateEstimator:
                 self.pseudo_measurement_weight,
             )
             return MeasurementTableView(empty_table, normalized=True)
-        rows = np.asarray(candidate_rows, dtype=np.int64)
-        values = np.asarray(candidate_values, dtype=np.float64)
-
-        def optional_object_values(values_array: np.ndarray, fallback):
-            if values_array.size == int(table.idx.size):
-                return values_array[rows]
-            return np.asarray([fallback(int(row)) for row in rows], dtype=object)
-
-        names = optional_object_values(
-            np.asarray(table.name, dtype=object),
-            lambda row: f"rank_{int(table.idx[row])}",
+        keys = self._active_measurement_key_array(
+            device_type_code[candidate_rows].astype(np.int64, copy=False),
+            device_pos[candidate_rows].astype(np.int64, copy=False),
+            meas_type_code[candidate_rows].astype(np.int64, copy=False),
         )
-        names = np.asarray([f"pseudo_rank_{name}" for name in names.tolist()], dtype=object)
-        device_types = optional_object_values(
-            np.asarray(table.device_type, dtype=object),
-            lambda row: DEVICE_TYPE_NAMES.get(int(device_type_code[row]), f"DeviceType{int(device_type_code[row])}"),
+        keep = np.ones(candidate_rows.size, dtype=bool)
+        if existing_key_array.size:
+            keep &= ~np.isin(keys, existing_key_array, assume_unique=False)
+        if keys.size:
+            _unique_keys, first_pos = np.unique(keys, return_index=True)
+            first_mask = np.zeros(keys.size, dtype=bool)
+            first_mask[first_pos.astype(np.intp, copy=False)] = True
+            keep &= first_mask
+        rows = candidate_rows[keep].astype(np.int64, copy=False)
+        if rows.size == 0:
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
+        scale_rows = scale[candidate_mask][keep]
+        values = np.divide(
+            np.asarray(table.value, dtype=np.float64)[rows],
+            scale_rows,
+            out=np.zeros(rows.size, dtype=np.float64),
+            where=np.abs(scale_rows) > 1e-12,
         )
-        device_names = optional_object_values(
-            np.asarray(table.device_name, dtype=object),
-            lambda row: f"device_pos_{int(device_pos[row])}",
-        )
-        meas_types = optional_object_values(
-            np.asarray(table.meas_type, dtype=object),
-            lambda row: MEAS_TYPE_NAMES.get(int(meas_type_code[row]), f"MEAS_{int(meas_type_code[row])}"),
-        )
+        names = np.asarray([], dtype=object)
+        device_types = np.asarray([], dtype=object)
+        device_names = np.asarray([], dtype=object)
+        meas_types = np.asarray([], dtype=object)
         candidate_table = self._pseudo_measurement_table(
             names,
             device_types,
@@ -4531,16 +4582,16 @@ class ACStateEstimator:
         )
         return MeasurementTableView(candidate_table, normalized=True)
 
-    def _rank_restoring_candidate_indices(self, candidates: Sequence[Measurement], max_add: int) -> List[int]:
+    def _rank_restoring_candidate_indices(self, candidates: Sequence[Measurement], max_add: int) -> np.ndarray:
         """Select candidate rows that participate in a higher structural-rank matching."""
         if max_add <= 0 or not candidates:
-            return []
+            return np.asarray([], dtype=np.int64)
         base_measurements = self.active_measurements
         x = self.initial_state()
         base_h = self.jacobian_sparse(x, base_measurements)
         base_rank = sparse_structural_rank(base_h)
         if base_rank is None or base_rank >= self.n_state:
-            return []
+            return np.asarray([], dtype=np.int64)
 
         base_table = _measurement_table_from_measurements(base_measurements)
         candidate_table = _measurement_table_from_measurements(candidates)
@@ -4551,17 +4602,19 @@ class ACStateEstimator:
         combined_h = self.jacobian_sparse(x, combined_measurements)
         combined_rank = sparse_structural_rank(combined_h)
         if combined_rank is None or combined_rank <= base_rank:
-            return []
+            return np.asarray([], dtype=np.int64)
 
         matching = sp_maximum_bipartite_matching(combined_h, perm_type="row")
         base_rows = len(base_measurements)
-        selected = sorted({int(row) - base_rows for row in matching if int(row) >= base_rows})
-        selected = selected[:max_add]
-        remaining = max_add - len(selected)
+        selected = np.asarray(matching, dtype=np.int64)
+        selected = selected[selected >= base_rows] - int(base_rows)
+        if selected.size:
+            selected = np.unique(selected)[:max_add].astype(np.int64, copy=False)
+        remaining = max_add - int(selected.size)
         if remaining <= 0:
             return selected
 
-        selected_rows = np.asarray(selected, dtype=np.int64)
+        selected_rows = selected.astype(np.int64, copy=False)
         all_candidate_rows = np.arange(len(candidates), dtype=np.int64)
         remaining_mask = np.ones(all_candidate_rows.size, dtype=bool)
         if selected_rows.size:
@@ -4580,16 +4633,20 @@ class ACStateEstimator:
         remaining_candidates = MeasurementTableView(remaining_table, normalized=True)
         candidate_h = self.jacobian_sparse(x, remaining_candidates)
         anchor_local_indices = self._angle_anchor_candidate_indices(current_h, candidate_h, remaining)
-        if not anchor_local_indices:
+        anchor_local_indices = np.asarray(anchor_local_indices, dtype=np.int64)
+        if anchor_local_indices.size == 0:
             return selected
 
-        selected.extend(int(remaining_rows[int(idx)]) for idx in anchor_local_indices)
-        return sorted(set(selected))
+        valid_anchor = (anchor_local_indices >= 0) & (anchor_local_indices < remaining_rows.size)
+        if not np.any(valid_anchor):
+            return selected
+        anchor_rows = remaining_rows[anchor_local_indices[valid_anchor].astype(np.intp, copy=False)]
+        return np.unique(np.concatenate((selected, anchor_rows.astype(np.int64, copy=False))))[:max_add]
 
-    def _angle_anchor_candidate_indices(self, current_h, candidate_h, max_add: int) -> List[int]:
+    def _angle_anchor_candidate_indices(self, current_h, candidate_h, max_add: int) -> np.ndarray:
         """Select non-angle rows that connect unanchored angle components to an anchored component."""
         if max_add <= 0 or self.n_angle <= 0 or candidate_h.shape[0] == 0:
-            return []
+            return np.asarray([], dtype=np.int64)
         tol = 1e-12
         current_angle = current_h[:, : self.n_angle].tocsr() if issparse(current_h) else csr_matrix(current_h[:, : self.n_angle])
         n_angle = self.n_angle
@@ -4632,7 +4689,7 @@ class ACStateEstimator:
         roots = {find(col) for col in range(n_angle)}
         anchored_roots = {find(col) for col in range(n_angle) if anchored[find(col)]}
         if roots and roots.issubset(anchored_roots):
-            return []
+            return np.asarray([], dtype=np.int64)
 
         candidate_angle = candidate_h[:, : self.n_angle].tocsr() if issparse(candidate_h) else csr_matrix(candidate_h[:, : self.n_angle])
         row_roots: List[Tuple[int, Tuple[int, ...], bool]] = []
@@ -4660,44 +4717,47 @@ class ACStateEstimator:
             for root in row_component_roots:
                 incident.setdefault(root, []).append(row_id)
 
-        selected: List[int] = []
+        selected = np.empty(min(int(max_add), int(candidate_angle.shape[0])), dtype=np.int64)
+        selected_count = 0
         used_rows = set()
         visited = set(anchored_roots)
         queue = list(anchored_roots)
 
         def activate(row_id: int) -> None:
-            if len(selected) >= max_add or row_id in used_rows:
+            nonlocal selected_count
+            if selected_count >= max_add or row_id in used_rows:
                 return
             candidate_row, component_roots, _is_anchor_row = row_roots[row_id]
             new_roots = [root for root in component_roots if root not in visited]
             if not new_roots:
                 return
             used_rows.add(row_id)
-            selected.append(candidate_row)
+            selected[selected_count] = int(candidate_row)
+            selected_count += 1
             for root in new_roots:
                 visited.add(root)
                 queue.append(root)
 
         for row_id in anchor_rows:
             activate(row_id)
-            if len(selected) >= max_add:
+            if selected_count >= max_add:
                 break
 
         cursor = 0
-        while cursor < len(queue) and len(selected) < max_add:
+        while cursor < len(queue) and selected_count < max_add:
             root = queue[cursor]
             cursor += 1
             for row_id in incident.get(root, ()):
                 activate(row_id)
-                if len(selected) >= max_add:
+                if selected_count >= max_add:
                     break
-        return selected
+        return selected[:selected_count].astype(np.int64, copy=False)
 
     def _add_structural_rank_restoring_pseudo_measurements(self, max_add: int) -> int:
         """Add only invalid real-measurement candidates that improve structural observability."""
         candidates = self._rank_restoring_candidate_measurements()
         selected_indices = self._rank_restoring_candidate_indices(candidates, max_add)
-        if not selected_indices:
+        if selected_indices.size == 0:
             return 0
         next_idx = self._next_measurement_idx()
         base_table_before = _measurement_table_from_measurements(self.measurements)

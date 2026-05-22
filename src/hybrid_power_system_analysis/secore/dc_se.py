@@ -43,7 +43,6 @@ from model.meas_type import (
     DEVICE_TYPE_DCBreak,
     DEVICE_TYPE_DCBreakConstraint,
     DEVICE_TYPE_DCBranch,
-    DEVICE_TYPE_CODES,
     DEVICE_TYPE_DCDCConverter,
     DEVICE_TYPE_DCGenerator,
     DEVICE_TYPE_DCLoad,
@@ -72,13 +71,10 @@ from model.meas_model import (
     EstimateResult,
     MEAS_STATUS_INVALID,
     MEAS_STATUS_PSEUDO,
-    Measurement,
-    MeasurementList,
     MeasurementTable,
     MeasurementTableView,
     ObservabilityResult,
     measurement_from_table_row,
-    measurement_table_from_measurements,
     measurement_table_status_code,
     print_iteration as _print_iteration,
     print_iteration_header as _print_iteration_header,
@@ -127,7 +123,6 @@ from unit_system import dc_current_base_ka
 DEFAULT_CASE = model_file("dc", "dc_net_30.e")
 DEFAULT_MEAS = measurement_file("dc", "dc_net_30.meas")
 
-_DEVICE_TYPE_CODES = DEVICE_TYPE_CODES
 _DC_TERMINAL_MEAS_TYPE_CODES = np.asarray(
     [MEAS_TYPE_P_FROM, MEAS_TYPE_V_FROM, MEAS_TYPE_I_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_V_TO, MEAS_TYPE_I_TO],
     dtype=np.int16,
@@ -162,10 +157,16 @@ def _measurement_type_code_lookup(meas_type_codes: Sequence[int]) -> np.ndarray:
     return lookup
 
 
-def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) -> MeasurementTable:
-    return measurement_table_from_measurements(
-        measurements,
-        device_type_codes=_DEVICE_TYPE_CODES,
+def _measurement_table_from_array_view(measurements) -> MeasurementTable:
+    if isinstance(measurements, MeasurementTable):
+        return measurements
+    if isinstance(measurements, dict) and measurements.get("format") == "meas_ppc_v1":
+        return measurement_table_from_meas_ppc(measurements, include_strings=False)
+    table = getattr(measurements, "table", None)
+    if isinstance(table, MeasurementTable):
+        return table
+    raise RuntimeError(
+        "DC SE requires PPC-backed MeasurementTable data; Measurement object parsing is disabled."
     )
 
 def load_dc_ppc_from_e_file(file_name) -> Dict:
@@ -206,7 +207,7 @@ class DCStateEstimator:
         parameters: Optional[StateEstimationParameters] = None,
         profile: bool = False,
         network: Optional[object] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
         auto_prepare: bool = True,
@@ -481,7 +482,7 @@ class DCStateEstimator:
         self,
         *,
         network: Optional[object] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         prepare_active_measurements: Optional[bool] = None,
         defer_prepare_finalize: Optional[bool] = None,
     ) -> "DCStateEstimator":
@@ -539,17 +540,22 @@ class DCStateEstimator:
                 measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
                 normalized=bool(self.meas_ppc.get("normalized", False)),
             )
-        elif isinstance(measurements, MeasurementList):
-            table = _measurement_table_from_measurements(measurements)
-            self.measurements = self._measurement_sequence_from_table(
-                table,
-                normalized=getattr(measurements, "normalized", False),
-            )
+        elif isinstance(measurements, MeasurementTable):
             self.meas_ppc = None
+            self.measurements = self._measurement_sequence_from_table(measurements, normalized=False)
         else:
-            table = _measurement_table_from_measurements(list(measurements))
-            self.measurements = self._measurement_sequence_from_table(table, normalized=False)
-            self.meas_ppc = None
+            table = getattr(measurements, "table", None)
+            if isinstance(table, MeasurementTable):
+                self.meas_ppc = None
+                self.measurements = self._measurement_sequence_from_table(
+                    table,
+                    normalized=getattr(measurements, "normalized", False),
+                )
+            else:
+                raise TypeError(
+                    "DC SE measurements must be a meas PPC dict or MeasurementTable; "
+                    "Measurement object parsing is disabled."
+                )
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self.p_base = float(self.network.p_base)
         self.p_base_kW = float(self.network.p_base_kW)
@@ -737,7 +743,7 @@ class DCStateEstimator:
         if cache is None:
             meta_cache = getattr(self, "_state_meta_cache", None)
             if meta_cache is None:
-                labels = [str(label) for label in self._state_meta_arrays_ref()["legacy_label"].tolist()]
+                labels = [str(label) for label in np.asarray(self._state_meta_arrays_ref()["legacy_label"], dtype=object)]
                 cache = labels if all(labels) else state_labels_from_metadata(self.state_meta)
             else:
                 labels = [meta.legacy_label for meta in meta_cache]
@@ -942,7 +948,7 @@ class DCStateEstimator:
         """Rebuild active measurement arrays and the vectorized measurement plan."""
         active_view = build_active_measurement_view(
             self.measurements,
-            table_builder=_measurement_table_from_measurements,
+            table_builder=_measurement_table_from_array_view,
             materialize_measurements=False,
         )
         self.measurement_table = active_view.source_table
@@ -972,7 +978,7 @@ class DCStateEstimator:
 
     def _incremental_update_active_measurement_indexes(
         self,
-        appended_measurements: Sequence[Measurement],
+        appended_measurements: object,
         *,
         source_row_start: Optional[int] = None,
         master_table: Optional[MeasurementTable] = None,
@@ -986,7 +992,7 @@ class DCStateEstimator:
                 stacklevel=2,
             )
             return False
-        appended_table = _measurement_table_from_measurements(appended_measurements)
+        appended_table = _measurement_table_from_array_view(appended_measurements)
         if np.any(
             (~np.asarray(appended_table.valid, dtype=bool))
             | (np.asarray(appended_table.weight, dtype=np.float64) <= 0.0)
@@ -1036,12 +1042,12 @@ class DCStateEstimator:
         active_view = append_active_measurement_view(
             build_active_measurement_view(
                 self.active_measurements,
-                table_builder=_measurement_table_from_measurements,
+                table_builder=_measurement_table_from_array_view,
                 materialize_measurements=False,
             ),
             appended_view,
             source_row_start=source_row_start,
-            table_builder=_measurement_table_from_measurements,
+            table_builder=_measurement_table_from_array_view,
             materialize_measurements=False,
         )
         self._initial_observability_cache = None
@@ -1117,7 +1123,7 @@ class DCStateEstimator:
             mask_key = key.rsplit("_", 1)[0] + ("_ctrl_masks" if key.endswith("_ctrl") else "_kind_masks")
             plan[mask_key] = tuple((kind == k) for k in range(max_kind + 1))
 
-    def _normalize_measurements(self, measurements: Optional[Sequence[Measurement]]):
+    def _normalize_measurements(self, measurements: Optional[object]):
         if measurements is None:
             return self.active_measurements
         if isinstance(measurements, dict) or isinstance(measurements, MeasurementPlanTable):
@@ -1125,9 +1131,10 @@ class DCStateEstimator:
         table = getattr(measurements, "table", None)
         if table is not None and len(table.idx) == len(measurements):
             return measurements
-        if isinstance(measurements, list):
-            return measurements
-        return list(measurements)
+        raise TypeError(
+            "DC SE measurement runtime requires MeasurementPlanTable or MeasurementTableView; "
+            "Measurement object iteration is disabled."
+        )
 
     def _measurement_count(self, measurements_or_plan_tables=None) -> int:
         if measurements_or_plan_tables is None:
@@ -1160,20 +1167,16 @@ class DCStateEstimator:
             return table
         return next(iter(plan_tables.values()))
 
-    def _measurement_plan_tables_for(self, measurements_or_plan_tables=None):
+    def _measurement_plan_tables_for(self, measurements_or_plan_tables=None) -> Dict[str, MeasurementPlanTable]:
         if isinstance(measurements_or_plan_tables, dict):
             return measurements_or_plan_tables
         if isinstance(measurements_or_plan_tables, MeasurementPlanTable):
             return {"simple": measurements_or_plan_tables}
         if measurements_or_plan_tables is None:
             return self._active_measurement_plan_tables_ref()
-        if measurements_or_plan_tables is getattr(self, "active_measurements", None):
-            return self._active_measurement_plan_tables_ref()
         measurements = self._normalize_measurements(measurements_or_plan_tables)
-        if isinstance(measurements, dict):
-            return measurements
-        if isinstance(measurements, MeasurementPlanTable):
-            return {"simple": measurements}
+        if measurements is None:
+            return self._active_measurement_plan_tables_ref()
         table = self._measurement_table_for_indexed_plan(measurements)
         return self._active_measurement_plan_tables(table)
 
@@ -1211,9 +1214,8 @@ class DCStateEstimator:
         table = getattr(measurements, "table", None)
         if table is not None and len(table.value) == len(measurements):
             return np.asarray(table.value, dtype=np.float64), np.asarray(table.weight, dtype=np.float64)
-        return (
-            np.asarray([meas.value for meas in measurements], dtype=np.float64),
-            np.asarray([meas.weight for meas in measurements], dtype=np.float64),
+        raise TypeError(
+            "DC SE measurement vectors require table-backed arrays; Measurement object iteration is disabled."
         )
 
     @staticmethod
@@ -1227,7 +1229,7 @@ class DCStateEstimator:
         self,
         z: np.ndarray,
         z_est: np.ndarray,
-        measurements: Sequence[Measurement],
+        measurements: object,
         *,
         out: Optional[np.ndarray] = None,
     ) -> np.ndarray:
@@ -1292,7 +1294,7 @@ class DCStateEstimator:
         self,
         result: ObservabilityResult,
         x: np.ndarray,
-        measurements: Sequence[Measurement],
+        measurements: object,
         H,
         *,
         cache_lower_normal_plan: bool = True,
@@ -1334,7 +1336,7 @@ class DCStateEstimator:
     def _observability_matrix_cache_for(
         self,
         result: Optional[ObservabilityResult],
-        measurements: Sequence[Measurement],
+        measurements: object,
         x: np.ndarray,
     ):
         cache = getattr(self, "_observability_matrix_cache", None)
@@ -1494,11 +1496,16 @@ class DCStateEstimator:
             return float(observed[node_idx])
         pos = self._node_pos_from_idx(node_idx)
         component_by_pos = getattr(self, "zero_tie_component_by_pos", None)
-        components = getattr(self, "zero_tie_components", None)
-        if pos < 0 or component_by_pos is None or not components:
+        component_offsets = getattr(self, "zero_tie_component_offsets", None)
+        component_indices = getattr(self, "zero_tie_component_indices", None)
+        if pos < 0 or component_by_pos is None or component_offsets is None or component_indices is None:
             return None
-        component = components[int(component_by_pos[int(pos)])]
-        for member_pos in component:
+        component_idx = int(component_by_pos[int(pos)])
+        if component_idx < 0 or component_idx + 1 >= int(np.asarray(component_offsets).size):
+            return None
+        start = int(component_offsets[component_idx])
+        end = int(component_offsets[component_idx + 1])
+        for member_pos in np.asarray(component_indices, dtype=np.int64)[start:end]:
             member_idx = int(self._node_idx_by_pos[int(member_pos)])
             if member_idx in observed:
                 return float(observed[member_idx])
@@ -1529,15 +1536,33 @@ class DCStateEstimator:
                 if np.any(valid):
                     np.add.at(degrees, right[valid].astype(np.intp, copy=False), 1)
         self._node_degree_by_pos = degrees
-        return dict(zip(self._node_idx_by_pos.tolist(), degrees.tolist()))
+        return {int(node_idx): int(degree) for node_idx, degree in zip(self._node_idx_by_pos, degrees)}
 
     def _select_reference_nodes(self) -> np.ndarray:
         """Choose one measured high-degree DC voltage reference per live DC topology island."""
-        references = []
         voltage_measurements = self.node_voltage_measurements
+        measured_node_idx = (
+            np.fromiter(
+                (int(node_idx) for node_idx in voltage_measurements.keys()),
+                dtype=np.int64,
+                count=len(voltage_measurements),
+            )
+            if voltage_measurements
+            else np.asarray([], dtype=np.int64)
+        )
+        measured_solver_mask = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+        if measured_node_idx.size:
+            measured_solver_mask = np.isin(
+                np.asarray(self._node_idx_by_pos, dtype=np.int64),
+                measured_node_idx,
+                assume_unique=False,
+            )
         degrees = getattr(self, "_node_degree_by_pos", np.zeros(int(getattr(self, "n_nodes", 0)), dtype=np.int64))
         topology_arrays = self._dc_topology_arrays
         bus_solver_pos = self._bus_solver_pos
+        island_alive = np.asarray(topology_arrays.island_alive_mask, dtype=bool)
+        references = np.full(int(np.count_nonzero(island_alive)), -1, dtype=np.int64)
+        ref_count = 0
         for island_pos, alive in enumerate(np.asarray(topology_arrays.island_alive_mask, dtype=bool)):
             if not bool(alive):
                 continue
@@ -1548,18 +1573,23 @@ class DCStateEstimator:
             solver_pos = solver_pos[solver_pos >= 0]
             if solver_pos.size == 0:
                 continue
-            measured = [
-                int(pos)
-                for pos in solver_pos.tolist()
-                if int(self._node_idx_by_pos[int(pos)]) in voltage_measurements
-            ]
-            if measured:
-                references.append(max(measured, key=lambda pos: (int(degrees[int(pos)]), -int(self._node_idx_by_pos[int(pos)]))))
+            if measured_node_idx.size:
+                measured_pos = solver_pos[measured_solver_mask[solver_pos.astype(np.intp, copy=False)]]
+            else:
+                measured_pos = np.asarray([], dtype=np.int64)
+            if measured_pos.size:
+                measured_pos = measured_pos.astype(np.intp, copy=False)
+                measured_degrees = degrees[measured_pos]
+                measured_candidate_node_idx = self._node_idx_by_pos[measured_pos]
+                best_order = np.lexsort((measured_candidate_node_idx, -measured_degrees))
+                references[ref_count] = int(measured_pos[int(best_order[0])])
+                ref_count += 1
                 continue
             ref_bus = int(topology_arrays.island_reference_bus_pos[island_pos])
             ref_solver = int(bus_solver_pos[ref_bus]) if 0 <= ref_bus < bus_solver_pos.size else -1
-            references.append(ref_solver if ref_solver >= 0 else int(solver_pos[0]))
-        return np.asarray(references, dtype=np.int64)
+            references[ref_count] = ref_solver if ref_solver >= 0 else int(solver_pos[0])
+            ref_count += 1
+        return references[:ref_count].astype(np.int64, copy=False)
 
     def _build_zero_tie_voltage_layout(self) -> None:
         """Compress DC voltage states across closed switches and zero branches."""
@@ -1583,63 +1613,127 @@ class DCStateEstimator:
             (self._switch_i_pos, self._switch_j_pos),
             (self._break_i_pos, self._break_j_pos),
         ):
-            for i, j in zip(np.asarray(left, dtype=np.int64).tolist(), np.asarray(right, dtype=np.int64).tolist()):
+            for i, j in zip(np.asarray(left, dtype=np.int64), np.asarray(right, dtype=np.int64)):
                 if 0 <= int(i) < n and 0 <= int(j) < n:
                     union(int(i), int(j))
 
-        groups: Dict[int, List[int]] = {}
+        roots = np.empty(n, dtype=np.int32)
         for pos in range(n):
-            groups.setdefault(find(pos), []).append(pos)
-        components = list(groups.values())
-        components.sort(key=lambda group: group[0])
-        self.zero_tie_components = components
+            roots[pos] = find(pos)
+        node_pos = np.arange(n, dtype=np.int32)
+        root_order = np.lexsort((node_pos, roots))
+        sorted_roots = roots[root_order]
+        component_starts = np.concatenate(
+            (
+                np.asarray([0], dtype=np.int64),
+                np.flatnonzero(sorted_roots[1:] != sorted_roots[:-1]).astype(np.int64, copy=False) + 1,
+            )
+        )
+        component_ends = np.concatenate((component_starts[1:], np.asarray([n], dtype=np.int64)))
+        component_first = root_order[component_starts.astype(np.intp, copy=False)]
+        component_order = np.argsort(component_first, kind="stable")
+        component_count = int(component_order.size)
+        component_offsets = np.empty(component_count + 1, dtype=np.int64)
+        component_indices = np.empty(n, dtype=np.int32)
         zero_tie_component_by_pos = np.empty(n, dtype=np.int32)
-        for component_idx, component in enumerate(components):
-            for pos in component:
-                zero_tie_component_by_pos[pos] = component_idx
+        offset = 0
+        for component_idx, source_idx in enumerate(component_order):
+            start = int(component_starts[int(source_idx)])
+            end = int(component_ends[int(source_idx)])
+            members = root_order[start:end].astype(np.int32, copy=False)
+            component_offsets[component_idx] = offset
+            component_indices[offset : offset + members.size] = members
+            zero_tie_component_by_pos[members.astype(np.intp, copy=False)] = component_idx
+            offset += int(members.size)
+        component_offsets[component_count] = offset
+        self.zero_tie_component_offsets = component_offsets
+        self.zero_tie_component_indices = component_indices[:offset]
+        self.zero_tie_components = tuple(
+            self.zero_tie_component_indices[
+                int(component_offsets[idx]) : int(component_offsets[idx + 1])
+            ]
+            for idx in range(component_count)
+        )
         self.zero_tie_component_by_pos = zero_tie_component_by_pos
 
-        node_voltage_state = np.full(n, -1, dtype=np.int32)
-        voltage_state_pos = []
-        self.voltage_state_nodes: List[Sequence[int]] = []
-        self.ref_voltages: Dict[int, float] = {}
-        reference_voltage_by_pos = {}
-        for pos in np.asarray(getattr(self, "references", ()), dtype=np.int64).tolist():
-            if not (0 <= int(pos) < self._node_idx_by_pos.size):
-                continue
-            node_idx = int(self._node_idx_by_pos[int(pos)])
-            reference_voltage_by_pos[int(pos)] = float(
-                self.node_voltage_measurements.get(node_idx, self._node_voltage_by_pos[int(pos)])
+        reference_voltage_by_pos = np.full(n, np.nan, dtype=np.float64)
+        references = np.asarray(getattr(self, "references", ()), dtype=np.int64)
+        ref_valid = (references >= 0) & (references < self._node_idx_by_pos.size)
+        if np.any(ref_valid):
+            ref_pos = references[ref_valid].astype(np.intp, copy=False)
+            ref_values = np.fromiter(
+                (
+                    float(
+                        self.node_voltage_measurements.get(
+                            int(self._node_idx_by_pos[int(pos)]),
+                            self._node_voltage_by_pos[int(pos)],
+                        )
+                    )
+                    for pos in ref_pos
+                ),
+                dtype=np.float64,
+                count=int(ref_pos.size),
             )
-        state_col = 0
-        voltage_expand_pos = []
-        voltage_expand_col = []
-        for component in components:
-            fixed_pos = next((int(pos) for pos in component if int(pos) in reference_voltage_by_pos), None)
-            if fixed_pos is not None:
-                fixed_voltage = max(float(reference_voltage_by_pos[fixed_pos]), self.voltage_floor)
-                for pos in component:
-                    self.ref_voltages[int(pos)] = fixed_voltage
-                continue
-            voltage_state_pos.append(component[0])
-            self.voltage_state_nodes.append(component)
-            voltage_expand_pos.extend(component)
-            voltage_expand_col.extend([state_col] * len(component))
-            for pos in component:
-                node_voltage_state[pos] = state_col
-            state_col += 1
+            reference_voltage_by_pos[ref_pos] = ref_values
+
+        component_sizes = np.diff(component_offsets).astype(np.int64, copy=False)
+        component_first = component_indices[component_offsets[:-1].astype(np.intp, copy=False)].astype(np.int32, copy=False)
+        component_for_pos = zero_tie_component_by_pos.astype(np.int64, copy=False)
+        fixed_voltage_by_component = np.full(component_count, np.nan, dtype=np.float64)
+        ref_pos = np.flatnonzero(np.isfinite(reference_voltage_by_pos)).astype(np.int64, copy=False)
+        if ref_pos.size:
+            ref_component = component_for_pos[ref_pos.astype(np.intp, copy=False)]
+            order = np.lexsort((ref_pos, ref_component))
+            sorted_component = ref_component[order]
+            unique_component, first = np.unique(sorted_component, return_index=True)
+            fixed_voltage_by_component[unique_component.astype(np.intp, copy=False)] = np.maximum(
+                reference_voltage_by_pos[ref_pos[order][first].astype(np.intp, copy=False)],
+                self.voltage_floor,
+            )
+        fixed_component_mask = np.isfinite(fixed_voltage_by_component)
+        state_components = np.flatnonzero(~fixed_component_mask).astype(np.int64, copy=False)
+        state_index_by_component = np.full(component_count, -1, dtype=np.int32)
+        if state_components.size:
+            state_index_by_component[state_components.astype(np.intp, copy=False)] = np.arange(
+                state_components.size,
+                dtype=np.int32,
+            )
+        node_voltage_state = state_index_by_component[component_for_pos.astype(np.intp, copy=False)].astype(np.int32, copy=False)
 
         self.node_voltage_state = node_voltage_state
-        self.voltage_state_pos = np.asarray(voltage_state_pos, dtype=np.int32)
+        self.voltage_state_pos = component_first[state_components.astype(np.intp, copy=False)].astype(np.int32, copy=False)
+        component_for_ordered_nodes = component_for_pos[component_indices[:offset].astype(np.intp, copy=False)]
+        variable_node_mask = ~fixed_component_mask[component_for_ordered_nodes.astype(np.intp, copy=False)]
+        self.voltage_state_node_indices = component_indices[:offset][variable_node_mask].astype(np.int32, copy=False)
+        variable_counts = component_sizes[state_components.astype(np.intp, copy=False)]
+        self.voltage_state_node_offsets = np.empty(state_components.size + 1, dtype=np.int64)
+        self.voltage_state_node_offsets[0] = 0
+        if variable_counts.size:
+            self.voltage_state_node_offsets[1:] = np.cumsum(variable_counts, dtype=np.int64)
+        else:
+            self.voltage_state_node_offsets = np.asarray([0], dtype=np.int64)
+        self.voltage_state_nodes = tuple(
+            self.voltage_state_node_indices[
+                int(self.voltage_state_node_offsets[idx]) : int(self.voltage_state_node_offsets[idx + 1])
+            ]
+            for idx in range(int(state_components.size))
+        )
         self.voltage_col = node_voltage_state.copy()
         self.n_voltage = int(self.voltage_state_pos.size)
-        self._voltage_expand_pos = np.asarray(voltage_expand_pos, dtype=np.int64)
-        self._voltage_expand_col = np.asarray(voltage_expand_col, dtype=np.int64)
-        if self.ref_voltages:
-            refs = sorted(self.ref_voltages.items())
-            self._ref_voltage_pos = np.asarray([pos for pos, _value in refs], dtype=np.int64)
-            self._ref_voltage_value = np.asarray([value for _pos, value in refs], dtype=np.float64)
+        self._voltage_expand_pos = self.voltage_state_node_indices.astype(np.int64, copy=False)
+        self._voltage_expand_col = node_voltage_state[self._voltage_expand_pos.astype(np.intp, copy=False)].astype(np.int64, copy=False)
+        fixed_node_mask = fixed_component_mask[component_for_pos.astype(np.intp, copy=False)]
+        if np.any(fixed_node_mask):
+            self._ref_voltage_pos = np.flatnonzero(fixed_node_mask).astype(np.int64, copy=False)
+            self._ref_voltage_value = fixed_voltage_by_component[
+                component_for_pos[self._ref_voltage_pos.astype(np.intp, copy=False)].astype(np.intp, copy=False)
+            ].astype(np.float64, copy=False)
+            self.ref_voltages = {
+                int(pos): float(value)
+                for pos, value in zip(self._ref_voltage_pos, self._ref_voltage_value)
+            }
         else:
+            self.ref_voltages = {}
             self._ref_voltage_pos = np.array([], dtype=np.int64)
             self._ref_voltage_value = np.array([], dtype=np.float64)
 
@@ -1749,8 +1843,16 @@ class DCStateEstimator:
         self._build_measurement_plan_lookup_arrays()
 
     def _build_measurement_plan_lookup_arrays(self) -> None:
+        cache_key = self._measurement_plan_lookup_cache_signature()
+        if getattr(self, "_measurement_plan_lookup_cache_key", None) == cache_key:
+            return
         self._measurement_plan_device_pos_by_type_code = {}
         self._measurement_plan_meas_kind_by_type_code = {}
+        table = getattr(getattr(self, "measurements", None), "table", None)
+        if table is not None and getattr(table, "device_type_code", None) is not None:
+            present_device_codes = set(map(int, np.unique(np.asarray(table.device_type_code, dtype=np.int16))))
+        else:
+            present_device_codes = None
         meas_kind_source = {
             DEVICE_TYPE_DCNode: _DC_NODE_MEAS_TYPE_CODES,
             DEVICE_TYPE_DCBranch: _DC_TERMINAL_MEAS_TYPE_CODES,
@@ -1762,45 +1864,88 @@ class DCStateEstimator:
             DEVICE_TYPE_DCBreakConstraint: _DC_CONSTRAINT_MEAS_TYPE_CODES,
             DEVICE_TYPE_DCDCConverter: _DC_TERMINAL_MEAS_TYPE_CODES,
         }
-        self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
+        self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays(
+            present_device_codes,
+        )
         self._measurement_plan_meas_kind_code_by_type_code = {
             int(code): _measurement_type_code_lookup(kind_map)
             for code, kind_map in meas_kind_source.items()
         }
+        self._measurement_plan_lookup_cache_key = cache_key
+
+    def _measurement_plan_lookup_cache_signature(self) -> Tuple[object, ...]:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object) if isinstance(meas_ppc, dict) else np.asarray([], dtype=object)
+        return (
+            id(meas_ppc),
+            id(device_names),
+            int(device_names.size),
+            id(getattr(self, "_raw_node_names_alive", None)),
+            int(getattr(self, "_raw_node_names_alive", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_branch_names", None)),
+            int(getattr(self, "_branch_names", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_load_names", None)),
+            int(getattr(self, "_load_names", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_generator_names", None)),
+            int(getattr(self, "_generator_names", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_zero_branch_names", None)),
+            int(getattr(self, "_zero_branch_names", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_switch_names", None)),
+            int(getattr(self, "_switch_names", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_break_names", None)),
+            int(getattr(self, "_break_names", np.asarray([], dtype=object)).size),
+            id(getattr(self, "_dcdc_names", None)),
+            int(getattr(self, "_dcdc_names", np.asarray([], dtype=object)).size),
+        )
 
     def _ensure_measurement_plan_lookup_arrays(self) -> None:
         if not hasattr(self, "_measurement_plan_device_pos_by_type_code"):
             self._build_measurement_plan_lookup_arrays()
 
-    def _measurement_plan_device_id_lookup_arrays(self) -> Dict[int, np.ndarray]:
+    def _measurement_plan_device_id_lookup_arrays(self, include_codes: Optional[set] = None) -> Dict[int, np.ndarray]:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if not isinstance(meas_ppc, dict):
+            return {}
         device_names = self._meas_ppc_device_names()
         if device_names.size == 0:
             return {}
-        name_id_by_name = self._meas_ppc_device_name_ids()
-        if not name_id_by_name:
-            return {}
 
         def lookup_for(names: np.ndarray) -> np.ndarray:
+            row_names = np.asarray(names, dtype=object)
+            name_ids = self._meas_device_name_ids_for_ppc_names(meas_ppc, row_names)
             lookup = np.empty(device_names.size, dtype=np.int64)
             lookup.fill(-1)
-            for pos, name in enumerate(np.asarray(names, dtype=object).tolist()):
-                name_id = name_id_by_name.get(name)
-                if name_id is not None and 0 <= int(name_id) < lookup.size:
-                    lookup[int(name_id)] = int(pos)
+            valid = name_ids >= 0
+            if np.any(valid):
+                plan_pos = np.arange(row_names.size, dtype=np.int64)
+                lookup[name_ids[valid].astype(np.intp, copy=False)] = plan_pos[valid]
             return lookup
 
+        def need(code: int) -> bool:
+            return include_codes is None or int(code) in include_codes
+
         constraint_names = np.concatenate((self._zero_branch_names, self._switch_names, self._break_names))
-        result: Dict[int, np.ndarray] = {
-            DEVICE_TYPE_DCNode: lookup_for(self._raw_node_names_alive),
-            DEVICE_TYPE_DCBranch: lookup_for(self._branch_names),
-            DEVICE_TYPE_DCLoad: lookup_for(self._load_names),
-            DEVICE_TYPE_DCGenerator: lookup_for(self._generator_names),
-            DEVICE_TYPE_DCZeroBranch: lookup_for(self._zero_branch_names),
-            DEVICE_TYPE_DCBreak: lookup_for(self._break_names),
-            DEVICE_TYPE_DCZeroBranchConstraint: lookup_for(constraint_names),
-            DEVICE_TYPE_DCBreakConstraint: lookup_for(constraint_names),
-            DEVICE_TYPE_DCDCConverter: lookup_for(self._dcdc_names),
-        }
+        result: Dict[int, np.ndarray] = {}
+        if need(DEVICE_TYPE_DCNode):
+            result[DEVICE_TYPE_DCNode] = lookup_for(self._raw_node_names_alive)
+        if need(DEVICE_TYPE_DCBranch):
+            result[DEVICE_TYPE_DCBranch] = lookup_for(self._branch_names)
+        if need(DEVICE_TYPE_DCLoad):
+            result[DEVICE_TYPE_DCLoad] = lookup_for(self._load_names)
+        if need(DEVICE_TYPE_DCGenerator):
+            result[DEVICE_TYPE_DCGenerator] = lookup_for(self._generator_names)
+        if need(DEVICE_TYPE_DCZeroBranch):
+            result[DEVICE_TYPE_DCZeroBranch] = lookup_for(self._zero_branch_names)
+        if need(DEVICE_TYPE_DCBreak):
+            result[DEVICE_TYPE_DCBreak] = lookup_for(self._break_names)
+        if need(DEVICE_TYPE_DCZeroBranchConstraint):
+            result[DEVICE_TYPE_DCZeroBranchConstraint] = lookup_for(constraint_names)
+        if need(DEVICE_TYPE_DCBreakConstraint):
+            result[DEVICE_TYPE_DCBreakConstraint] = lookup_for(constraint_names)
+        if need(DEVICE_TYPE_DCSwitchConstraint):
+            result[DEVICE_TYPE_DCSwitchConstraint] = lookup_for(constraint_names)
+        if need(DEVICE_TYPE_DCDCConverter):
+            result[DEVICE_TYPE_DCDCConverter] = lookup_for(self._dcdc_names)
         return result
 
     def _measurement_device_pos_array(
@@ -1874,8 +2019,8 @@ class DCStateEstimator:
         table.meas_type_code = meas_type_code
         return meas_type_code
 
-    def _measurement_table_for_indexed_plan(self, measurements: Sequence[Measurement]) -> MeasurementTable:
-        table = _measurement_table_from_measurements(measurements)
+    def _measurement_table_for_indexed_plan(self, measurements: object) -> MeasurementTable:
+        table = _measurement_table_from_array_view(measurements)
         self._ensure_table_meas_type_codes(table)
         table.device_pos = self._measurement_device_pos_array(table)
         return table
@@ -2014,70 +2159,134 @@ class DCStateEstimator:
         bus = ppc.get("bus")
         if bus is None:
             return
+        if not isinstance(seed_rows, dict):
+            warnings.warn(
+                "DC SE power-flow seed requires packed key arrays; row tuple fallback is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        measurement_key = np.asarray(seed_rows.get("measurement_key", ()), dtype=np.int64)
+        device_row = np.asarray(seed_rows.get("ppc_row", ()), dtype=np.int64)
+        values = np.asarray(seed_rows.get("value", ()), dtype=np.float64)
+        if measurement_key.size == 0:
+            return
+        if device_row.size != measurement_key.size or values.size != measurement_key.size:
+            warnings.warn(
+                "DC SE power-flow seed requires same-sized measurement_key, ppc_row and value arrays.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        meas_mask = (1 << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS) - 1
+        device_key = measurement_key >> _ACTIVE_MEASUREMENT_KEY_MEAS_BITS
+        meas_type = (measurement_key & meas_mask).astype(np.int16, copy=False)
+        device_type = (device_key >> _ACTIVE_DEVICE_KEY_POS_BITS).astype(np.int16, copy=False)
         gen = ppc.get("gen")
         load = ppc.get("load")
         dcdc = ppc.get("dcdc")
 
-        def set_bus_voltage_by_idx(node_idx, value):
-            node_ids = bus[:, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)
-            matches = np.flatnonzero(node_ids == int(node_idx))
-            if matches.size:
-                bus[int(matches[0]), DC_BUS_COLS["voltage"]] = max(float(value), 0.0)
+        def valid_rows(mask: np.ndarray, row_count: int) -> Tuple[np.ndarray, np.ndarray]:
+            rows = device_row[mask]
+            valid = (rows >= 0) & (rows < row_count)
+            return rows[valid].astype(np.intp, copy=False), values[mask][valid]
 
-        for device_type_code, ppc_row, meas_type_code, value in seed_rows:
-            device_type_code = int(device_type_code)
-            meas_type_code = int(meas_type_code)
-            row = int(ppc_row)
-            value = float(value)
-            if device_type_code == DEVICE_TYPE_DCNode:
-                if meas_type_code == MEAS_TYPE_V and 0 <= row < bus.shape[0]:
-                    bus[row, DC_BUS_COLS["voltage"]] = max(value, 0.0)
-                continue
-            if device_type_code == DEVICE_TYPE_DCGenerator and gen is not None:
-                if not (0 <= row < gen.shape[0]):
-                    continue
-                if meas_type_code == MEAS_TYPE_P_GEN:
-                    gen[row, DC_GEN_COLS["p_set"]] = value
-                    gen[row, DC_GEN_COLS["p"]] = value
-                elif meas_type_code == MEAS_TYPE_V_GEN:
-                    voltage = max(value, 0.0)
-                    gen[row, DC_GEN_COLS["v_set"]] = voltage
-                    set_bus_voltage_by_idx(gen[row, DC_GEN_COLS["node"]], voltage)
-                elif meas_type_code == MEAS_TYPE_I_GEN:
-                    gen[row, DC_GEN_COLS["i_set"]] = value
-                    gen[row, DC_GEN_COLS["current"]] = value
-                continue
-            if device_type_code == DEVICE_TYPE_DCLoad and load is not None:
-                if not (0 <= row < load.shape[0]):
-                    continue
-                if meas_type_code == MEAS_TYPE_P_LOAD:
-                    load[row, DC_LOAD_COLS["pbase"]] = 1.0
-                    load[row, DC_LOAD_COLS["pv0"]] = value
-                    load[row, DC_LOAD_COLS["pv1"]] = 0.0
-                    load[row, DC_LOAD_COLS["pv2"]] = 0.0
-                    load[row, DC_LOAD_COLS["p"]] = value
-                elif meas_type_code == MEAS_TYPE_V_LOAD:
-                    set_bus_voltage_by_idx(load[row, DC_LOAD_COLS["node"]], value)
-                elif meas_type_code == MEAS_TYPE_I_LOAD:
-                    load[row, DC_LOAD_COLS["current"]] = value
-                continue
-            if device_type_code == DEVICE_TYPE_DCDCConverter and dcdc is not None:
-                if not (0 <= row < dcdc.shape[0]):
-                    continue
-                if meas_type_code == MEAS_TYPE_P_FROM:
-                    dcdc[row, DC_DCDC_COLS["p_set"]] = value
-                    dcdc[row, DC_DCDC_COLS["i_p"]] = value
-                elif meas_type_code == MEAS_TYPE_P_TO:
-                    dcdc[row, DC_DCDC_COLS["j_p"]] = value
-                elif meas_type_code == MEAS_TYPE_V_FROM:
-                    set_bus_voltage_by_idx(dcdc[row, DC_DCDC_COLS["i_node"]], value)
-                elif meas_type_code == MEAS_TYPE_V_TO:
-                    set_bus_voltage_by_idx(dcdc[row, DC_DCDC_COLS["j_node"]], value)
-                elif meas_type_code == MEAS_TYPE_I_FROM:
-                    dcdc[row, DC_DCDC_COLS["i_set"]] = value
-                    dcdc[row, DC_DCDC_COLS["i_c"]] = value
-                elif meas_type_code == MEAS_TYPE_I_TO:
-                    dcdc[row, DC_DCDC_COLS["j_c"]] = value
+        bus_idx = None
+        bus_order = None
+        sorted_bus_idx = None
+
+        def set_bus_voltage_by_idx(node_idx_values: np.ndarray, voltage_values: np.ndarray) -> None:
+            nonlocal bus_idx, bus_order, sorted_bus_idx
+            if node_idx_values.size == 0:
+                return
+            if bus_idx is None:
+                bus_idx = bus[:, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)
+                bus_order = np.argsort(bus_idx, kind="stable")
+                sorted_bus_idx = bus_idx[bus_order]
+            node_idx_values = np.asarray(node_idx_values, dtype=np.int64)
+            pos = np.searchsorted(sorted_bus_idx, node_idx_values)
+            in_range = pos < sorted_bus_idx.size
+            if not np.any(in_range):
+                return
+            valid_pos = pos[in_range]
+            valid_nodes = node_idx_values[in_range]
+            hit = sorted_bus_idx[valid_pos] == valid_nodes
+            if not np.any(hit):
+                return
+            bus_rows = bus_order[valid_pos[hit]].astype(np.intp, copy=False)
+            bus[bus_rows, DC_BUS_COLS["voltage"]] = np.maximum(voltage_values[in_range][hit], 0.0)
+
+        mask = (device_type == DEVICE_TYPE_DCNode) & (meas_type == MEAS_TYPE_V)
+        rows, row_values = valid_rows(mask, bus.shape[0])
+        if rows.size:
+            bus[rows, DC_BUS_COLS["voltage"]] = np.maximum(row_values, 0.0)
+
+        if isinstance(gen, np.ndarray) and gen.size:
+            gen_device = device_type == DEVICE_TYPE_DCGenerator
+            mask = gen_device & (meas_type == MEAS_TYPE_P_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                gen[rows, DC_GEN_COLS["p_set"]] = row_values
+                gen[rows, DC_GEN_COLS["p"]] = row_values
+            mask = gen_device & (meas_type == MEAS_TYPE_V_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                voltage = np.maximum(row_values, 0.0)
+                gen[rows, DC_GEN_COLS["v_set"]] = voltage
+                set_bus_voltage_by_idx(gen[rows, DC_GEN_COLS["node"]], voltage)
+            mask = gen_device & (meas_type == MEAS_TYPE_I_GEN)
+            rows, row_values = valid_rows(mask, gen.shape[0])
+            if rows.size:
+                gen[rows, DC_GEN_COLS["i_set"]] = row_values
+                gen[rows, DC_GEN_COLS["current"]] = row_values
+
+        if isinstance(load, np.ndarray) and load.size:
+            load_device = device_type == DEVICE_TYPE_DCLoad
+            mask = load_device & (meas_type == MEAS_TYPE_P_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                load[rows, DC_LOAD_COLS["pbase"]] = 1.0
+                load[rows, DC_LOAD_COLS["pv0"]] = row_values
+                load[rows, DC_LOAD_COLS["pv1"]] = 0.0
+                load[rows, DC_LOAD_COLS["pv2"]] = 0.0
+                load[rows, DC_LOAD_COLS["p"]] = row_values
+            mask = load_device & (meas_type == MEAS_TYPE_V_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                set_bus_voltage_by_idx(load[rows, DC_LOAD_COLS["node"]], row_values)
+            mask = load_device & (meas_type == MEAS_TYPE_I_LOAD)
+            rows, row_values = valid_rows(mask, load.shape[0])
+            if rows.size:
+                load[rows, DC_LOAD_COLS["current"]] = row_values
+
+        if isinstance(dcdc, np.ndarray) and dcdc.size:
+            dcdc_device = device_type == DEVICE_TYPE_DCDCConverter
+            mask = dcdc_device & (meas_type == MEAS_TYPE_P_FROM)
+            rows, row_values = valid_rows(mask, dcdc.shape[0])
+            if rows.size:
+                dcdc[rows, DC_DCDC_COLS["p_set"]] = row_values
+                dcdc[rows, DC_DCDC_COLS["i_p"]] = row_values
+            mask = dcdc_device & (meas_type == MEAS_TYPE_P_TO)
+            rows, row_values = valid_rows(mask, dcdc.shape[0])
+            if rows.size:
+                dcdc[rows, DC_DCDC_COLS["j_p"]] = row_values
+            mask = dcdc_device & (meas_type == MEAS_TYPE_V_FROM)
+            rows, row_values = valid_rows(mask, dcdc.shape[0])
+            if rows.size:
+                set_bus_voltage_by_idx(dcdc[rows, DC_DCDC_COLS["i_node"]], row_values)
+            mask = dcdc_device & (meas_type == MEAS_TYPE_V_TO)
+            rows, row_values = valid_rows(mask, dcdc.shape[0])
+            if rows.size:
+                set_bus_voltage_by_idx(dcdc[rows, DC_DCDC_COLS["j_node"]], row_values)
+            mask = dcdc_device & (meas_type == MEAS_TYPE_I_FROM)
+            rows, row_values = valid_rows(mask, dcdc.shape[0])
+            if rows.size:
+                dcdc[rows, DC_DCDC_COLS["i_set"]] = row_values
+                dcdc[rows, DC_DCDC_COLS["i_c"]] = row_values
+            mask = dcdc_device & (meas_type == MEAS_TYPE_I_TO)
+            rows, row_values = valid_rows(mask, dcdc.shape[0])
+            if rows.size:
+                dcdc[rows, DC_DCDC_COLS["j_c"]] = row_values
 
     @staticmethod
     def _overlay_power_flow_seed_result_ppc(seed_ppc, result):
@@ -2099,30 +2308,50 @@ class DCStateEstimator:
         return seed_ppc
 
     @staticmethod
+    def _apply_power_flow_seed_ppc_to_network(network, ppc) -> None:
+        network.ppc = ppc
+        if hasattr(network, "_array_model"):
+            network._array_model = ppc
+        if hasattr(network, "topology"):
+            network.topology = ppc.get("_topology_arrays", network.topology)
+
+    @staticmethod
     def _apply_power_flow_seed_calc_state_to_network(network, ppc, calc) -> None:
         bus = ppc.get("bus")
         if hasattr(calc, "x") and hasattr(calc, "N"):
             voltage = np.asarray(calc.x[: calc.N], dtype=np.float64)
             if isinstance(bus, np.ndarray) and bus.size:
-                node_pos = getattr(calc, "alive_node_dict", None)
-                if node_pos is not None and hasattr(node_pos, "get"):
-                    bus[:, DC_BUS_COLS["voltage"]] = 0.0
-                    for row, node_idx in enumerate(bus[:, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)):
-                        pos = node_pos.get(int(node_idx), -1)
-                        if 0 <= int(pos) < voltage.size:
-                            bus[row, DC_BUS_COLS["voltage"]] = voltage[int(pos)]
-                elif voltage.size == bus.shape[0]:
-                    bus[:, DC_BUS_COLS["voltage"]] = voltage
-            network.ppc = ppc
-            if hasattr(network, "_array_model"):
-                network._array_model = ppc
+                active_bus_pos = getattr(calc, "_active_bus_pos", None)
+                if isinstance(active_bus_pos, np.ndarray) and active_bus_pos.size == voltage.size:
+                    rows = active_bus_pos.astype(np.intp, copy=False)
+                    valid = (rows >= 0) & (rows < bus.shape[0])
+                    if np.any(valid):
+                        bus[rows[valid], DC_BUS_COLS["voltage"]] = voltage[valid]
+                else:
+                    node_pos = getattr(calc, "alive_node_dict", None)
+                    if node_pos is not None and hasattr(node_pos, "get"):
+                        bus[:, DC_BUS_COLS["voltage"]] = 0.0
+                        for row, node_idx in enumerate(bus[:, DC_BUS_COLS["idx"]].astype(np.int64, copy=False)):
+                            pos = node_pos.get(int(node_idx), -1)
+                            if 0 <= int(pos) < voltage.size:
+                                bus[row, DC_BUS_COLS["voltage"]] = voltage[int(pos)]
+                    elif voltage.size == bus.shape[0]:
+                        bus[:, DC_BUS_COLS["voltage"]] = voltage
+            DCStateEstimator._apply_power_flow_seed_ppc_to_network(network, ppc)
+            return
+        result_ppc = DCStateEstimator._overlay_power_flow_seed_result_ppc(ppc, getattr(calc, "result", None))
+        DCStateEstimator._apply_power_flow_seed_ppc_to_network(network, result_ppc)
 
     def _apply_measurement_seed_to_network(self) -> None:
         """Apply valid normalized measurements to network fields used by the LF seed."""
         seed_rows = getattr(self, "_power_flow_seed_rows", None)
         if seed_rows is None:
-            seed_rows = ()
-        setattr(self.network, "_se_power_flow_seed_rows", tuple(seed_rows))
+            seed_rows = {
+                "measurement_key": np.empty(0, dtype=np.int64),
+                "ppc_row": np.empty(0, dtype=np.int64),
+                "value": np.empty(0, dtype=np.float64),
+            }
+        setattr(self.network, "_se_power_flow_seed_rows", seed_rows)
 
     def _meas_ppc_device_names(self) -> np.ndarray:
         meas_ppc = getattr(self, "meas_ppc", None)
@@ -2130,13 +2359,35 @@ class DCStateEstimator:
             return np.asarray(meas_ppc.get("device_names", ()), dtype=object)
         return np.asarray([], dtype=object)
 
-    def _meas_ppc_device_name_ids(self) -> Dict[object, int]:
-        meas_ppc = getattr(self, "meas_ppc", None)
-        if isinstance(meas_ppc, dict):
-            lookup = meas_ppc.get("device_name_id_by_name")
-            if isinstance(lookup, dict):
-                return lookup
-        return {}
+    def _meas_device_name_ids_for_ppc_names(self, meas_ppc: Dict, names: np.ndarray) -> np.ndarray:
+        names = np.asarray(names, dtype=object)
+        out = np.empty(names.size, dtype=np.int64)
+        out.fill(-1)
+        if names.size == 0:
+            return out
+        id_by_name = meas_ppc.get("device_name_id_by_name")
+        if isinstance(id_by_name, dict) and id_by_name:
+            get_id = id_by_name.get
+            return np.fromiter((int(get_id(name, -1)) for name in names), dtype=np.int64, count=int(names.size))
+        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
+        if device_names.size == 0:
+            return out
+        cache = getattr(self, "_meas_device_name_sorted_id_cache", None)
+        cache_key = (id(device_names), int(device_names.size))
+        if cache is None or cache[0] != cache_key:
+            order = np.argsort(device_names, kind="stable")
+            cache = (cache_key, order.astype(np.int64, copy=False), device_names[order])
+            self._meas_device_name_sorted_id_cache = cache
+        order = cache[1]
+        sorted_names = cache[2]
+        pos = np.searchsorted(sorted_names, names)
+        in_range = pos < sorted_names.size
+        if np.any(in_range):
+            idx = np.flatnonzero(in_range)
+            matched = sorted_names[pos[idx]] == names[idx]
+            if np.any(matched):
+                out[idx[matched]] = order[pos[idx[matched]]]
+        return out
 
     @staticmethod
     def _active_measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
@@ -2163,12 +2414,40 @@ class DCStateEstimator:
             | meas_values
         )
 
-    def _set_active_key_caches(self, measurement_keys: set) -> None:
-        self._active_measurement_keys = measurement_keys
-        self._active_measurement_key_cache = measurement_keys
-        self._active_measurement_code_pos_cache = measurement_keys
+    @staticmethod
+    def _measurement_key_array_from_cache(measurement_keys) -> np.ndarray:
+        if isinstance(measurement_keys, np.ndarray):
+            keys = np.asarray(measurement_keys, dtype=np.int64).reshape(-1)
+        elif not measurement_keys:
+            return np.empty(0, dtype=np.int64)
+        else:
+            keys = np.fromiter(
+                (int(key) for key in measurement_keys),
+                dtype=np.int64,
+                count=len(measurement_keys),
+            )
+        if keys.size == 0:
+            return keys.astype(np.int64, copy=False)
+        return keys.astype(np.int64, copy=False)
 
-    def _seed_ppc_rows_from_device_pos(self, device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
+    def _set_active_key_caches(self, measurement_keys: set) -> None:
+        key_array = self._measurement_key_array_from_cache(measurement_keys)
+        self._set_active_key_caches_from_array(
+            key_array,
+            measurement_keys if isinstance(measurement_keys, set) else None,
+        )
+
+    def _set_active_key_caches_from_array(self, key_array: np.ndarray, key_set: Optional[set] = None) -> None:
+        key_array = np.asarray(key_array, dtype=np.int64).reshape(-1)
+        if key_set is None:
+            key_set = set(key_array.astype(object, copy=False))
+        self._active_measurement_keys = key_set
+        self._active_measurement_key_cache = key_set
+        self._active_measurement_code_pos_cache = key_set
+        self._active_measurement_key_array_cache = key_array
+        self._active_measurement_key_sorted_array_cache = None
+
+    def _measurement_ppc_rows_for_device_positions(self, device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
         rows = np.full(np.asarray(device_pos).size, -1, dtype=np.int64)
         codes = np.asarray(device_type_code, dtype=np.int16)
         pos = np.asarray(device_pos, dtype=np.int64)
@@ -2190,7 +2469,7 @@ class DCStateEstimator:
         return rows
 
     @staticmethod
-    def _values_for_device_pos(plan_values: np.ndarray, device_pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _values_for_plan_pos(plan_values: np.ndarray, device_pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         values = np.asarray(plan_values, dtype=np.int64)
         pos = np.asarray(device_pos, dtype=np.int64)
         out = np.full(pos.size, -1, dtype=np.int64)
@@ -2227,7 +2506,7 @@ class DCStateEstimator:
         def apply_node(rows: np.ndarray, node_pos_array: np.ndarray, voltage_code: int) -> None:
             if rows.size == 0:
                 return
-            valid_plan, node_pos = self._values_for_device_pos(node_pos_array, device_pos[rows])
+            valid_plan, node_pos = self._values_for_plan_pos(node_pos_array, device_pos[rows])
             valid_node = valid_plan & (node_pos >= 0) & (node_pos < n_nodes)
             rows_valid = rows[valid_node]
             if rows_valid.size == 0:
@@ -2245,7 +2524,7 @@ class DCStateEstimator:
         def apply_single(rows: np.ndarray, node_pos_array: np.ndarray, p_code: int, v_code: int, i_code: int) -> None:
             if rows.size == 0:
                 return
-            valid_plan, node_pos = self._values_for_device_pos(node_pos_array, device_pos[rows])
+            valid_plan, node_pos = self._values_for_plan_pos(node_pos_array, device_pos[rows])
             valid_node = valid_plan & (node_pos >= 0) & (node_pos < n_nodes)
             rows_valid = rows[valid_node]
             if rows_valid.size == 0:
@@ -2271,8 +2550,8 @@ class DCStateEstimator:
         def apply_terminal(rows: np.ndarray, i_pos_array: np.ndarray, j_pos_array: np.ndarray) -> None:
             if rows.size == 0:
                 return
-            i_valid_plan, i_pos = self._values_for_device_pos(i_pos_array, device_pos[rows])
-            j_valid_plan, j_pos = self._values_for_device_pos(j_pos_array, device_pos[rows])
+            i_valid_plan, i_pos = self._values_for_plan_pos(i_pos_array, device_pos[rows])
+            j_valid_plan, j_pos = self._values_for_plan_pos(j_pos_array, device_pos[rows])
             valid_node = i_valid_plan & j_valid_plan & (i_pos >= 0) & (j_pos >= 0) & (i_pos < n_nodes) & (j_pos < n_nodes)
             rows_valid = rows[valid_node]
             if rows_valid.size == 0:
@@ -2327,7 +2606,7 @@ class DCStateEstimator:
             diff_rows = rows[meas_type_code[rows] == MEAS_TYPE_V_DIFF]
             if diff_rows.size == 0:
                 return
-            valid_plan, i_pos = self._values_for_device_pos(constraint_i_pos, device_pos[diff_rows])
+            valid_plan, i_pos = self._values_for_plan_pos(constraint_i_pos, device_pos[diff_rows])
             valid_node = valid_plan & (i_pos >= 0) & (i_pos < n_nodes)
             if np.any(valid_node):
                 selected = diff_rows[valid_node]
@@ -2367,25 +2646,39 @@ class DCStateEstimator:
         return from_pos, to_pos
 
     @staticmethod
+    def _active_key_array_from_arrays(
+        device_type_code: np.ndarray,
+        device_pos: np.ndarray,
+        meas_type_code: np.ndarray,
+        active_mask: np.ndarray,
+    ) -> np.ndarray:
+        rows = np.flatnonzero(np.asarray(active_mask, dtype=bool)).astype(np.int64, copy=False)
+        if rows.size == 0:
+            return np.empty(0, dtype=np.int64)
+        pos_values = np.asarray(device_pos, dtype=np.int64)[rows]
+        valid_pos = pos_values >= 0
+        if not np.any(valid_pos):
+            return np.empty(0, dtype=np.int64)
+        return DCStateEstimator._active_measurement_key_array(
+            np.asarray(device_type_code, dtype=np.int16)[rows][valid_pos],
+            pos_values[valid_pos],
+            np.asarray(meas_type_code, dtype=np.int16)[rows][valid_pos],
+        ).astype(np.int64, copy=False)
+
+    @staticmethod
     def _active_key_cache_from_arrays(
         device_type_code: np.ndarray,
         device_pos: np.ndarray,
         meas_type_code: np.ndarray,
         active_mask: np.ndarray,
     ) -> set:
-        rows = np.flatnonzero(np.asarray(active_mask, dtype=bool)).astype(np.int64, copy=False)
-        if rows.size == 0:
-            return set()
-        pos_values = np.asarray(device_pos, dtype=np.int64)[rows]
-        valid_pos = pos_values >= 0
-        if not np.any(valid_pos):
-            return set()
-        keys = DCStateEstimator._active_measurement_key_array(
-            np.asarray(device_type_code, dtype=np.int16)[rows][valid_pos],
-            pos_values[valid_pos],
-            np.asarray(meas_type_code, dtype=np.int16)[rows][valid_pos],
+        keys = DCStateEstimator._active_key_array_from_arrays(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+            active_mask,
         )
-        return set(keys.tolist())
+        return set(keys.astype(object, copy=False))
 
     def _voltage_best_from_arrays(
         self,
@@ -2423,7 +2716,10 @@ class DCStateEstimator:
 
         def best_dict(best_weight: np.ndarray, best_value: np.ndarray) -> Dict[int, float]:
             valid = np.flatnonzero(np.isfinite(best_weight)).astype(np.int64, copy=False)
-            return dict(zip(self._node_idx_by_pos[valid].tolist(), best_value[valid].tolist()))
+            return {
+                int(self._node_idx_by_pos[int(pos)]): float(best_value[int(pos)])
+                for pos in valid
+            }
 
         node_v_rows = row_index[real_mask & (device_type_code == DEVICE_TYPE_DCNode) & (meas_type_code == MEAS_TYPE_V)]
         update(node_v_rows, from_pos[node_v_rows], node_best_weight, node_best_value)
@@ -2451,9 +2747,16 @@ class DCStateEstimator:
         device_type_code: np.ndarray,
         meas_type_code: np.ndarray,
         device_pos: np.ndarray,
-    ) -> list:
+    ) -> Dict[str, np.ndarray]:
+        def empty_seed() -> Dict[str, np.ndarray]:
+            return {
+                "measurement_key": np.empty(0, dtype=np.int64),
+                "ppc_row": np.empty(0, dtype=np.int64),
+                "value": np.empty(0, dtype=np.float64),
+            }
+
         if getattr(self, "flat_start", True):
-            return []
+            return empty_seed()
         seed_rows_mask = (
             (device_type_code == DEVICE_TYPE_DCNode)
             & (meas_type_code == MEAS_TYPE_V)
@@ -2472,21 +2775,22 @@ class DCStateEstimator:
         )
         rows = np.flatnonzero(processable_mask & seed_rows_mask & (device_pos >= 0)).astype(np.int64, copy=False)
         if rows.size == 0:
-            return []
-        ppc_rows = self._seed_ppc_rows_from_device_pos(device_type_code[rows], device_pos[rows])
+            return empty_seed()
+        ppc_rows = self._measurement_ppc_rows_for_device_positions(device_type_code[rows], device_pos[rows])
         valid = ppc_rows >= 0
         if not np.any(valid):
-            return []
+            return empty_seed()
         rows = rows[valid]
         ppc_rows = ppc_rows[valid]
-        return list(
-            zip(
-                device_type_code[rows].astype(np.int16, copy=False).tolist(),
-                ppc_rows.astype(np.int64, copy=False).tolist(),
-                meas_type_code[rows].astype(np.int16, copy=False).tolist(),
-                np.asarray(table.value, dtype=np.float64)[rows].astype(np.float64, copy=False).tolist(),
-            )
-        )
+        return {
+            "measurement_key": self._active_measurement_key_array(
+                device_type_code[rows],
+                device_pos[rows],
+                meas_type_code[rows],
+            ).astype(np.int64, copy=False),
+            "ppc_row": ppc_rows.astype(np.int64, copy=False),
+            "value": np.asarray(table.value, dtype=np.float64)[rows].astype(np.float64, copy=False),
+        }
 
     def _measurement_runtime_array_cache_key(self) -> Tuple[object, ...]:
         return (
@@ -2511,12 +2815,9 @@ class DCStateEstimator:
     def _cached_measurement_runtime_arrays(meas_ppc: Dict, n_rows: int, cache_key: Tuple[object, ...]):
         if meas_ppc.get("_dc_se_runtime_cache_key") != cache_key:
             return None
-        arrays = []
-        for key in ("device_pos", "available", "scale", "from_pos", "to_pos"):
-            value = meas_ppc.get(key)
-            if not isinstance(value, np.ndarray) or int(value.size) != int(n_rows):
-                return None
-            arrays.append(value)
+        arrays = tuple(meas_ppc.get(key) for key in ("device_pos", "available", "scale", "from_pos", "to_pos"))
+        if any((not isinstance(value, np.ndarray)) or int(value.size) != int(n_rows) for value in arrays):
+            return None
         return arrays
 
     def _normalize_measurements_to_pu_from_meas_ppc(self, table: MeasurementTable, meas_ppc: Dict) -> bool:
@@ -2603,13 +2904,13 @@ class DCStateEstimator:
             )
         real_mask = processable & (status != MEAS_STATUS_PSEUDO)
         self.measurement_table = table
-        active_measurement_keys = self._active_key_cache_from_arrays(
+        active_key_array = self._active_key_array_from_arrays(
             device_type_code,
             device_pos,
             meas_type_code,
             processable,
         )
-        self._set_active_key_caches(active_measurement_keys)
+        self._set_active_key_caches_from_array(active_key_array)
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache, self._real_voltage_observation_node_cache = self._voltage_best_from_arrays(
             table,
@@ -2638,16 +2939,10 @@ class DCStateEstimator:
             meas[:, cols["valid"]] = valid.astype(np.float64, copy=False)
             meas[:, cols["status"]] = status.astype(np.float64, copy=False)
         meas_ppc["normalized"] = True
-        object_count = list.__len__(self.measurements) if isinstance(self.measurements, list) else 0
-        if object_count == n_rows and object_count > 0:
-            for pos, meas_obj in enumerate(list.__iter__(self.measurements)):
-                meas_obj.valid = bool(valid[pos])
-                meas_obj.value = float(value[pos])
-                meas_obj.status = int(status[pos])
         return True
 
     def _normalize_measurements_to_pu(self) -> None:
-        table = _measurement_table_from_measurements(self.measurements)
+        table = _measurement_table_from_array_view(self.measurements)
         if getattr(self.measurements, "normalized", False):
             self.measurement_table = table
             self._refresh_measurement_summary_cache()
@@ -2661,7 +2956,11 @@ class DCStateEstimator:
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache = {}
         self._real_voltage_observation_node_cache = {}
-        self._power_flow_seed_rows = []
+        self._power_flow_seed_rows = {
+            "measurement_key": np.empty(0, dtype=np.int64),
+            "ppc_row": np.empty(0, dtype=np.int64),
+            "value": np.empty(0, dtype=np.float64),
+        }
         warnings.warn(
             "DC SE measurement normalization requires measurement PPC arrays; object/string fallback is disabled.",
             RuntimeWarning,
@@ -2681,6 +2980,48 @@ class DCStateEstimator:
             self._refresh_measurement_summary_cache()
         self._active_measurement_key_cache = self._active_measurement_keys
         return self._active_measurement_keys
+
+    def _active_measurement_key_array_ref(self) -> np.ndarray:
+        """Return active measurement keys as an int64 array for vectorized membership checks."""
+        key_array = getattr(self, "_active_measurement_key_array_cache", None)
+        if key_array is not None:
+            return np.asarray(key_array, dtype=np.int64)
+        keys = self._active_measurement_keys_ref()
+        key_array = self._measurement_key_array_from_cache(keys)
+        self._active_measurement_key_array_cache = key_array
+        return key_array
+
+    def _active_measurement_key_sorted_array_ref(self) -> np.ndarray:
+        """Return active measurement keys sorted for repeated vector membership probes."""
+        sorted_key_array = getattr(self, "_active_measurement_key_sorted_array_cache", None)
+        key_array = self._active_measurement_key_array_ref()
+        cache_key = (id(key_array), int(np.asarray(key_array).size))
+        if (
+            isinstance(sorted_key_array, tuple)
+            and len(sorted_key_array) == 2
+            and sorted_key_array[0] == cache_key
+        ):
+            return sorted_key_array[1]
+        keys = np.asarray(key_array, dtype=np.int64).reshape(-1)
+        sorted_keys = np.sort(keys) if keys.size else np.empty(0, dtype=np.int64)
+        self._active_measurement_key_sorted_array_cache = (cache_key, sorted_keys)
+        return sorted_keys
+
+    def _active_measurement_key_membership(self, keys: np.ndarray) -> np.ndarray:
+        """Vectorized membership against active packed measurement keys without np.isin uniquing."""
+        probe = np.asarray(keys, dtype=np.int64).reshape(-1)
+        if probe.size == 0:
+            return np.zeros(0, dtype=bool)
+        sorted_keys = self._active_measurement_key_sorted_array_ref()
+        if sorted_keys.size == 0:
+            return np.zeros(probe.size, dtype=bool)
+        pos = np.searchsorted(sorted_keys, probe)
+        in_range = pos < sorted_keys.size
+        out = np.zeros(probe.size, dtype=bool)
+        if np.any(in_range):
+            idx = np.flatnonzero(in_range)
+            out[idx] = sorted_keys[pos[idx].astype(np.intp, copy=False)] == probe[idx]
+        return out
 
     def _next_measurement_idx(self) -> int:
         if not hasattr(self, "_max_measurement_idx"):
@@ -2837,7 +3178,7 @@ class DCStateEstimator:
     ) -> MeasurementTable:
         row_count = int(appended_table.idx.size)
         if row_count == 0:
-            return _measurement_table_from_measurements(self.measurements)
+            return _measurement_table_from_array_view(self.measurements)
         base_table = getattr(self.measurements, "table", None)
         if base_table is None:
             warnings.warn(
@@ -2845,8 +3186,8 @@ class DCStateEstimator:
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return _measurement_table_from_measurements(self.measurements)
-        base_table = _measurement_table_from_measurements(self.measurements)
+            return _measurement_table_from_array_view(self.measurements)
+        base_table = _measurement_table_from_array_view(self.measurements)
         base_count = int(base_table.idx.size)
         total_count = base_count + row_count
         base_device_pos = getattr(base_table, "device_pos", None)
@@ -2922,7 +3263,18 @@ class DCStateEstimator:
                     tail_pos[valid_tail],
                     tail_meas[valid_tail],
                 )
-                measurement_key_cache.update(measurement_keys.tolist())
+                measurement_key_cache.update(measurement_keys.astype(object, copy=False))
+                key_array = getattr(self, "_active_measurement_key_array_cache", None)
+                if key_array is None or np.asarray(key_array).size == 0:
+                    self._active_measurement_key_array_cache = measurement_keys.astype(np.int64, copy=False)
+                else:
+                    self._active_measurement_key_array_cache = np.concatenate(
+                        (
+                            np.asarray(key_array, dtype=np.int64),
+                            measurement_keys.astype(np.int64, copy=False),
+                        )
+                    )
+                self._active_measurement_key_sorted_array_cache = None
         return base_table
 
     def _refresh_measurement_summary_cache(self) -> None:
@@ -2938,12 +3290,13 @@ class DCStateEstimator:
             meas_type_code = self._ensure_table_meas_type_codes(table)
             device_pos = self._measurement_device_pos_array(table)
             status_code = measurement_table_status_code(table)
-            active_measurement_keys = self._active_key_cache_from_arrays(
+            active_key_array = self._active_key_array_from_arrays(
                 device_type_code,
                 device_pos,
                 meas_type_code,
                 active,
             )
+            active_measurement_keys = set(active_key_array.astype(object, copy=False))
             from_pos, to_pos = self._measurement_voltage_node_positions_from_codes(
                 device_type_code,
                 device_pos,
@@ -2964,7 +3317,10 @@ class DCStateEstimator:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        self._set_active_key_caches(active_measurement_keys)
+        if table is not None and len(table.idx) == len(self.measurements):
+            self._set_active_key_caches_from_array(active_key_array, active_measurement_keys)
+        else:
+            self._set_active_key_caches(active_measurement_keys)
         self._max_measurement_idx = max_idx
         self._node_voltage_measurement_cache = node_voltage_best
         self._real_voltage_observation_node_cache = real_voltage_best
@@ -2979,10 +3335,56 @@ class DCStateEstimator:
             return max(float(self._node_voltage_by_pos[int(i_pos)]), self.voltage_floor)
         return 1.0
 
+    def _real_voltage_observed_solver_pos_mask(self) -> np.ndarray:
+        """Return solver-node positions covered by real voltage measurements."""
+        observed_voltage = self._real_voltage_observation_nodes()
+        cache_key = (
+            id(observed_voltage),
+            int(self.n_nodes),
+            id(getattr(self, "zero_tie_component_by_pos", None)),
+            id(getattr(self, "zero_tie_component_offsets", None)),
+        )
+        cache = getattr(self, "_real_voltage_observed_solver_pos_mask_cache", None)
+        if isinstance(cache, tuple) and len(cache) == 2 and cache[0] == cache_key:
+            return cache[1]
+        covered_voltage_pos = np.zeros(int(self.n_nodes), dtype=bool)
+        if not observed_voltage:
+            self._real_voltage_observed_solver_pos_mask_cache = (cache_key, covered_voltage_pos)
+            return covered_voltage_pos
+        observed_node_idx = np.fromiter(
+            (int(node_idx) for node_idx in observed_voltage.keys()),
+            dtype=np.int64,
+            count=len(observed_voltage),
+        )
+        lookup_ids = np.asarray(getattr(self, "_node_idx_lookup_ids", ()), dtype=np.int64)
+        lookup_pos = np.asarray(getattr(self, "_node_idx_lookup_pos", ()), dtype=np.int64)
+        if lookup_ids.size and lookup_pos.size:
+            pos = np.searchsorted(lookup_ids, observed_node_idx)
+            in_range = pos < lookup_ids.size
+            if np.any(in_range):
+                idx = np.flatnonzero(in_range)
+                matched = lookup_ids[pos[idx].astype(np.intp, copy=False)] == observed_node_idx[idx]
+                if np.any(matched):
+                    solver_pos = lookup_pos[pos[idx[matched]].astype(np.intp, copy=False)]
+                    valid_solver = (solver_pos >= 0) & (solver_pos < covered_voltage_pos.size)
+                    if np.any(valid_solver):
+                        covered_voltage_pos[solver_pos[valid_solver].astype(np.intp, copy=False)] = True
+        component_by_pos = getattr(self, "zero_tie_component_by_pos", None)
+        component_offsets = getattr(self, "zero_tie_component_offsets", None)
+        if component_by_pos is not None and component_offsets is not None and covered_voltage_pos.size:
+            component_by_pos = np.asarray(component_by_pos, dtype=np.int64)
+            component_count = max(0, int(np.asarray(component_offsets, dtype=np.int64).size) - 1)
+            if component_count:
+                component_observed = np.zeros(component_count, dtype=bool)
+                observed_pos = np.flatnonzero(covered_voltage_pos).astype(np.int64, copy=False)
+                if observed_pos.size:
+                    component_observed[component_by_pos[observed_pos.astype(np.intp, copy=False)].astype(np.intp, copy=False)] = True
+                    covered_voltage_pos = component_observed[component_by_pos.astype(np.intp, copy=False)]
+        self._real_voltage_observed_solver_pos_mask_cache = (cache_key, covered_voltage_pos)
+        return covered_voltage_pos
+
     def _add_pseudo_topology_measurements(self, next_idx: int) -> Tuple[int, set]:
         """Add weak P/V priors for unmeasured DC topology-device states."""
-        measured_keys = self._active_measurement_keys_ref()
-        added_keys = set()
         topology_weight = float(self.pseudo_measurement_weight) * 1e-4
         store_strings = False
         capacity = 2 * (self._zero_branch_names.size + self._break_names.size)
@@ -2996,45 +3398,33 @@ class DCStateEstimator:
         pseudo_values = np.empty(capacity, dtype=np.float64)
         pseudo_weights = np.empty(capacity, dtype=np.float64)
         pseudo_count = 0
+        added_key_chunks = []
+        covered_voltage_pos = self._real_voltage_observed_solver_pos_mask()
 
-        def active_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
-            return self._active_measurement_key(device_type_code, device_pos, meas_type_code)
-
-        def queue_topology_pseudo(
-            device_type_code: int,
-            device_type: str,
-            device_name: str,
-            device_pos: int,
-            meas_type: str,
-            meas_type_code: int,
-            value: float,
-        ) -> None:
+        def append_rows(device_type_code: int, device_pos: np.ndarray, meas_type_code: int, values: np.ndarray) -> None:
             nonlocal pseudo_count
-            if int(device_pos) < 0:
-                warnings.warn(
-                    f"DC SE skipped topology pseudo measurement for {device_type}:{device_name}; device_pos is missing.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            count = int(device_pos.size)
+            if count == 0:
                 return
-            key = active_key(device_type_code, device_pos, meas_type_code)
-            if key >= 0 and (key in measured_keys or key in added_keys):
-                return
-            device_name = str(device_name) if store_strings else ""
-            row = pseudo_count
+            end = pseudo_count + count
+            pseudo_device_type_codes[pseudo_count:end] = int(device_type_code)
+            pseudo_device_positions[pseudo_count:end] = device_pos.astype(np.int64, copy=False)
+            pseudo_meas_type_codes[pseudo_count:end] = int(meas_type_code)
+            pseudo_values[pseudo_count:end] = values.astype(np.float64, copy=False)
+            pseudo_weights[pseudo_count:end] = topology_weight
             if store_strings:
-                pseudo_names[row] = f"pseudo_{meas_type.lower()}_{device_name}"
-                pseudo_device_types[row] = device_type
-                pseudo_device_names[row] = device_name
-                pseudo_meas_types[row] = meas_type
-            pseudo_device_type_codes[row] = int(device_type_code)
-            pseudo_device_positions[row] = int(device_pos)
-            pseudo_meas_type_codes[row] = int(meas_type_code)
-            pseudo_values[row] = float(value)
-            pseudo_weights[row] = topology_weight
-            pseudo_count = row + 1
-            if key >= 0:
-                added_keys.add(key)
+                pseudo_names[pseudo_count:end] = ""
+                pseudo_device_types[pseudo_count:end] = ""
+                pseudo_device_names[pseudo_count:end] = ""
+                pseudo_meas_types[pseudo_count:end] = ""
+            added_key_chunks.append(
+                self._active_measurement_key_array(
+                    np.full(count, int(device_type_code), dtype=np.int64),
+                    device_pos.astype(np.int64, copy=False),
+                    np.full(count, int(meas_type_code), dtype=np.int64),
+                )
+            )
+            pseudo_count = end
 
         for device_type_code, device_type, names, i_node, j_node, i_pos, p_values in (
             (
@@ -3060,41 +3450,34 @@ class DCStateEstimator:
                 else np.zeros(self._break_names.size, dtype=np.float64),
             ),
         ):
-            for device_pos, name, i_node_value, j_node_value, i_pos_value, p_value in zip(
-                np.arange(names.size, dtype=np.int64).tolist(),
-                names.tolist(),
-                i_node.tolist(),
-                j_node.tolist(),
-                i_pos.tolist(),
-                np.asarray(p_values, dtype=np.float64).tolist(),
-            ):
-                name = str(name)
-                has_terminal_measurement = False
-                for meas_type_code in (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO):
-                    key = active_key(device_type_code, int(device_pos), meas_type_code)
-                    if key >= 0 and key in measured_keys:
-                        has_terminal_measurement = True
-                        break
-                if not has_terminal_measurement:
-                    queue_topology_pseudo(
-                        device_type_code,
-                        device_type,
-                        name,
-                        int(device_pos),
-                        "P_FROM",
-                        MEAS_TYPE_P_FROM,
-                        float(p_value),
-                    )
-                if self._real_voltage_observation_value_for_node(int(i_node_value)) is None:
-                    queue_topology_pseudo(
-                        device_type_code,
-                        device_type,
-                        name,
-                        int(device_pos),
-                        "V_FROM",
-                        MEAS_TYPE_V_FROM,
-                        self._topology_voltage_pseudo_seed(int(i_node_value), int(j_node_value), int(i_pos_value)),
-                    )
+            p_values = np.asarray(p_values, dtype=np.float64)
+            device_count = int(names.size)
+            if device_count == 0:
+                continue
+            device_pos = np.arange(device_count, dtype=np.int64)
+            type_values = np.full(device_count, int(device_type_code), dtype=np.int64)
+            terminal_measured = np.zeros(device_count, dtype=bool)
+            for meas_code in (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO):
+                keys = self._active_measurement_key_array(
+                    type_values,
+                    device_pos,
+                    np.full(device_count, int(meas_code), dtype=np.int64),
+                )
+                terminal_measured |= self._active_measurement_key_membership(keys)
+            p_rows = device_pos[~terminal_measured]
+            if p_rows.size:
+                append_rows(int(device_type_code), p_rows, MEAS_TYPE_P_FROM, p_values[p_rows.astype(np.intp, copy=False)])
+
+            i_pos_values = np.asarray(i_pos, dtype=np.int64)
+            valid_i = (i_pos_values >= 0) & (i_pos_values < covered_voltage_pos.size)
+            voltage_missing = np.ones(device_count, dtype=bool)
+            if np.any(valid_i):
+                voltage_missing[valid_i] = ~covered_voltage_pos[i_pos_values[valid_i].astype(np.intp, copy=False)]
+            v_rows = device_pos[valid_i & voltage_missing]
+            if v_rows.size:
+                seed_pos = i_pos_values[v_rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)
+                seed_values = np.maximum(self._node_voltage_by_pos[seed_pos], self.voltage_floor)
+                append_rows(int(device_type_code), v_rows, MEAS_TYPE_V_FROM, seed_values)
         next_idx = self._append_pseudo_measurement_rows(
             next_idx,
             pseudo_names[:pseudo_count] if store_strings else np.asarray([], dtype=object),
@@ -3107,14 +3490,18 @@ class DCStateEstimator:
             meas_type_codes=pseudo_meas_type_codes[:pseudo_count],
             device_positions=pseudo_device_positions[:pseudo_count],
         )
+        added_keys = (
+            set(map(int, np.concatenate(added_key_chunks)))
+            if added_key_chunks
+            else set()
+        )
         return next_idx, added_keys
 
     def _add_pseudo_power_measurements(self) -> None:
         """Add weak priors for devices whose file measurements are missing or invalid."""
-        measured_keys = self._active_measurement_keys_ref()
         next_idx = self._next_measurement_idx()
         next_idx, topology_added_keys = self._add_pseudo_topology_measurements(next_idx)
-        added_keys = set(topology_added_keys)
+        del topology_added_keys
         store_strings = False
         capacity = 2 * int(self._generator_names.size) + 2 * int(self._load_names.size) + 4 * int(self._dcdc_names.size)
         pseudo_names = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
@@ -3127,185 +3514,116 @@ class DCStateEstimator:
         pseudo_values = np.empty(capacity, dtype=np.float64)
         pseudo_count = 0
 
-        def measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
-            return self._active_measurement_key(device_type_code, device_pos, meas_type_code)
+        def missing_rows(device_type_code: int, device_pos: np.ndarray, meas_type_code: int) -> np.ndarray:
+            device_pos = np.asarray(device_pos, dtype=np.int64)
+            if device_pos.size == 0:
+                return np.empty(0, dtype=np.int64)
+            keys = self._active_measurement_key_array(
+                np.full(device_pos.size, int(device_type_code), dtype=np.int64),
+                device_pos,
+                np.full(device_pos.size, int(meas_type_code), dtype=np.int64),
+            )
+            return device_pos[~self._active_measurement_key_membership(keys)]
 
-        def has_measurement(device_type_code: int, device_pos: int, meas_type_code: int) -> bool:
-            if int(device_pos) < 0:
-                return False
-            key = measurement_key(device_type_code, device_pos, meas_type_code)
-            return key in measured_keys or key in added_keys
-
-        def queue_pseudo(
-            device_type: str,
-            device_type_code: int,
-            device_name: str,
-            device_pos: int,
-            meas_type: str,
-            meas_type_code: int,
-            value: float,
-        ) -> None:
+        def append_rows(device_type_code: int, device_pos: np.ndarray, meas_type_code: int, values: np.ndarray) -> None:
             nonlocal pseudo_count
-            if int(device_pos) < 0:
-                warnings.warn(
-                    f"DC SE skipped pseudo measurement for {device_type}:{device_name}; device_pos is missing.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            count = int(device_pos.size)
+            if count == 0:
                 return
-            key = measurement_key(device_type_code, device_pos, meas_type_code)
-            if key in measured_keys or key in added_keys:
-                return
-            row_device_name = str(device_name) if store_strings else ""
-            row = pseudo_count
+            end = pseudo_count + count
+            pseudo_device_type_codes[pseudo_count:end] = int(device_type_code)
+            pseudo_device_positions[pseudo_count:end] = device_pos.astype(np.int64, copy=False)
+            pseudo_meas_type_codes[pseudo_count:end] = int(meas_type_code)
+            pseudo_values[pseudo_count:end] = values.astype(np.float64, copy=False)
             if store_strings:
-                pseudo_names[row] = f"pseudo_{meas_type.lower()}_{row_device_name}"
-                pseudo_device_types[row] = device_type
-                pseudo_device_names[row] = row_device_name
-                pseudo_meas_types[row] = meas_type
-            pseudo_device_type_codes[row] = int(device_type_code)
-            pseudo_device_positions[row] = int(device_pos)
-            pseudo_meas_type_codes[row] = int(meas_type_code)
-            pseudo_values[row] = float(value)
-            pseudo_count = row + 1
-            added_keys.add(key)
+                pseudo_names[pseudo_count:end] = ""
+                pseudo_device_types[pseudo_count:end] = ""
+                pseudo_device_names[pseudo_count:end] = ""
+                pseudo_meas_types[pseudo_count:end] = ""
+            pseudo_count = end
+
+        covered_voltage_pos = self._real_voltage_observed_solver_pos_mask()
 
         gen_rows = self._generator_rows.astype(np.intp, copy=False)
         gen_table = self._gen_table
-        for device_pos in range(int(self._generator_names.size)):
-            name = str(self._generator_names[device_pos])
-            node_idx = int(self._generator_node[device_pos])
-            node_pos = int(self._generator_pos[device_pos])
-            row = int(gen_rows[device_pos])
-            p_value = float(gen_table[row, DC_GEN_COLS["p"]])
-            if p_value == 0.0:
-                ctrl = int(gen_table[row, DC_GEN_COLS["control_type"]])
-                if ctrl == DC_CTRL_I and 0 <= int(node_pos) < self._node_voltage_by_pos.size:
-                    p_value = float(gen_table[row, DC_GEN_COLS["i_set"]] * self._node_voltage_by_pos[node_pos])
-                else:
-                    p_value = float(gen_table[row, DC_GEN_COLS["p_set"]])
-            queue_pseudo(
-                "DCGenerator",
-                DEVICE_TYPE_DCGenerator,
-                name,
-                device_pos,
-                "P_GEN",
-                MEAS_TYPE_P_GEN,
-                p_value,
-            )
-            if (
-                not has_measurement(DEVICE_TYPE_DCGenerator, device_pos, MEAS_TYPE_V_GEN)
-                and self._real_voltage_observation_value_for_node(int(node_idx)) is None
-            ):
-                queue_pseudo(
-                    "DCGenerator",
-                    DEVICE_TYPE_DCGenerator,
-                    name,
-                    device_pos,
-                    "V_GEN",
-                    MEAS_TYPE_V_GEN,
-                    float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0),
-                )
+        gen_pos = np.arange(int(self._generator_names.size), dtype=np.int64)
+        if gen_pos.size:
+            gen_node_pos = self._generator_pos.astype(np.int64, copy=False)
+            gen_p_values = gen_table[gen_rows, DC_GEN_COLS["p"]].astype(np.float64, copy=True)
+            zero_p = gen_p_values == 0.0
+            if np.any(zero_p):
+                ctrl = gen_table[gen_rows, DC_GEN_COLS["control_type"]].astype(np.int64, copy=False)
+                valid_v = (gen_node_pos >= 0) & (gen_node_pos < self._node_voltage_by_pos.size)
+                current_ctrl = zero_p & (ctrl == DC_CTRL_I) & valid_v
+                if np.any(current_ctrl):
+                    gen_p_values[current_ctrl] = (
+                        gen_table[gen_rows[current_ctrl], DC_GEN_COLS["i_set"]]
+                        * self._node_voltage_by_pos[gen_node_pos[current_ctrl].astype(np.intp, copy=False)]
+                    )
+                set_ctrl = zero_p & ~current_ctrl
+                if np.any(set_ctrl):
+                    gen_p_values[set_ctrl] = gen_table[gen_rows[set_ctrl], DC_GEN_COLS["p_set"]]
+            rows = missing_rows(DEVICE_TYPE_DCGenerator, gen_pos, MEAS_TYPE_P_GEN)
+            append_rows(DEVICE_TYPE_DCGenerator, rows, MEAS_TYPE_P_GEN, gen_p_values[rows.astype(np.intp, copy=False)])
+            valid_v = (gen_node_pos >= 0) & (gen_node_pos < covered_voltage_pos.size)
+            rows = missing_rows(DEVICE_TYPE_DCGenerator, gen_pos, MEAS_TYPE_V_GEN)
+            rows = rows[valid_v[rows.astype(np.intp, copy=False)] & ~covered_voltage_pos[gen_node_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)]]
+            if rows.size:
+                row_pos = gen_node_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)
+                append_rows(DEVICE_TYPE_DCGenerator, rows, MEAS_TYPE_V_GEN, self._node_voltage_by_pos[row_pos])
 
         load_rows = self._load_rows.astype(np.intp, copy=False)
         load_table = self._load_table
-        for device_pos in range(int(self._load_names.size)):
-            name = str(self._load_names[device_pos])
-            node_idx = int(self._load_node[device_pos])
-            node_pos = int(self._load_pos[device_pos])
-            row = int(load_rows[device_pos])
-            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
-            p_value = float(load_table[row, DC_LOAD_COLS["p"]])
-            if p_value == 0.0:
-                pbase = float(load_table[row, DC_LOAD_COLS["pbase"]])
-                p_value = pbase * (
-                    float(load_table[row, DC_LOAD_COLS["pv0"]])
-                    + float(load_table[row, DC_LOAD_COLS["pv1"]]) * voltage
-                    + float(load_table[row, DC_LOAD_COLS["pv2"]]) * voltage * voltage
+        load_pos = np.arange(int(self._load_names.size), dtype=np.int64)
+        if load_pos.size:
+            load_node_pos = self._load_pos.astype(np.int64, copy=False)
+            valid_v = (load_node_pos >= 0) & (load_node_pos < self._node_voltage_by_pos.size)
+            load_voltage = np.ones(load_pos.size, dtype=np.float64)
+            if np.any(valid_v):
+                load_voltage[valid_v] = self._node_voltage_by_pos[load_node_pos[valid_v].astype(np.intp, copy=False)]
+            load_p_values = load_table[load_rows, DC_LOAD_COLS["p"]].astype(np.float64, copy=True)
+            zero_p = load_p_values == 0.0
+            if np.any(zero_p):
+                load_p_values[zero_p] = load_table[load_rows[zero_p], DC_LOAD_COLS["pbase"]] * (
+                    load_table[load_rows[zero_p], DC_LOAD_COLS["pv0"]]
+                    + load_table[load_rows[zero_p], DC_LOAD_COLS["pv1"]] * load_voltage[zero_p]
+                    + load_table[load_rows[zero_p], DC_LOAD_COLS["pv2"]] * load_voltage[zero_p] * load_voltage[zero_p]
                 )
-            queue_pseudo(
-                "DCLoad",
-                DEVICE_TYPE_DCLoad,
-                name,
-                device_pos,
-                "P_LOAD",
-                MEAS_TYPE_P_LOAD,
-                p_value,
-            )
-            if (
-                not has_measurement(DEVICE_TYPE_DCLoad, device_pos, MEAS_TYPE_V_LOAD)
-                and self._real_voltage_observation_value_for_node(int(node_idx)) is None
-            ):
-                queue_pseudo(
-                    "DCLoad",
-                    DEVICE_TYPE_DCLoad,
-                    name,
-                    device_pos,
-                    "V_LOAD",
-                    MEAS_TYPE_V_LOAD,
-                    voltage,
-                )
+            rows = missing_rows(DEVICE_TYPE_DCLoad, load_pos, MEAS_TYPE_P_LOAD)
+            append_rows(DEVICE_TYPE_DCLoad, rows, MEAS_TYPE_P_LOAD, load_p_values[rows.astype(np.intp, copy=False)])
+            rows = missing_rows(DEVICE_TYPE_DCLoad, load_pos, MEAS_TYPE_V_LOAD)
+            rows = rows[valid_v[rows.astype(np.intp, copy=False)] & ~covered_voltage_pos[load_node_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)]]
+            append_rows(DEVICE_TYPE_DCLoad, rows, MEAS_TYPE_V_LOAD, load_voltage[rows.astype(np.intp, copy=False)])
 
         dcdc_table = self._dc_ppc["dcdc"]
         dcdc_rows = self._dcdc_rows.astype(np.intp, copy=False)
-        for device_pos in range(int(self._dcdc_names.size)):
-            name = str(self._dcdc_names[device_pos])
-            i_node = int(self._dcdc_i_node[device_pos])
-            j_node = int(self._dcdc_j_node[device_pos])
-            i_pos = int(self._dcdc_i_pos[device_pos])
-            j_pos = int(self._dcdc_j_pos[device_pos])
-            row = int(dcdc_rows[device_pos])
-            queue_pseudo(
-                "DCDCConverter",
-                DEVICE_TYPE_DCDCConverter,
-                name,
-                device_pos,
-                "P_FROM",
-                MEAS_TYPE_P_FROM,
-                float(dcdc_table[row, DC_DCDC_COLS["i_p"]]),
-            )
-            queue_pseudo(
-                "DCDCConverter",
-                DEVICE_TYPE_DCDCConverter,
-                name,
-                device_pos,
-                "P_TO",
-                MEAS_TYPE_P_TO,
-                float(dcdc_table[row, DC_DCDC_COLS["j_p"]]),
-            )
-            if (
-                not has_measurement(
+        dcdc_pos = np.arange(int(self._dcdc_names.size), dtype=np.int64)
+        if dcdc_pos.size:
+            rows = missing_rows(DEVICE_TYPE_DCDCConverter, dcdc_pos, MEAS_TYPE_P_FROM)
+            append_rows(DEVICE_TYPE_DCDCConverter, rows, MEAS_TYPE_P_FROM, dcdc_table[dcdc_rows[rows.astype(np.intp, copy=False)], DC_DCDC_COLS["i_p"]])
+            rows = missing_rows(DEVICE_TYPE_DCDCConverter, dcdc_pos, MEAS_TYPE_P_TO)
+            append_rows(DEVICE_TYPE_DCDCConverter, rows, MEAS_TYPE_P_TO, dcdc_table[dcdc_rows[rows.astype(np.intp, copy=False)], DC_DCDC_COLS["j_p"]])
+            dcdc_i_pos = self._dcdc_i_pos.astype(np.int64, copy=False)
+            dcdc_j_pos = self._dcdc_j_pos.astype(np.int64, copy=False)
+            valid_i = (dcdc_i_pos >= 0) & (dcdc_i_pos < covered_voltage_pos.size)
+            valid_j = (dcdc_j_pos >= 0) & (dcdc_j_pos < covered_voltage_pos.size)
+            rows = missing_rows(DEVICE_TYPE_DCDCConverter, dcdc_pos, MEAS_TYPE_V_FROM)
+            rows = rows[valid_i[rows.astype(np.intp, copy=False)] & ~covered_voltage_pos[dcdc_i_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)]]
+            if rows.size:
+                append_rows(
                     DEVICE_TYPE_DCDCConverter,
-                    device_pos,
+                    rows,
                     MEAS_TYPE_V_FROM,
+                    self._node_voltage_by_pos[dcdc_i_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)],
                 )
-                and self._real_voltage_observation_value_for_node(int(i_node)) is None
-            ):
-                queue_pseudo(
-                    "DCDCConverter",
+            rows = missing_rows(DEVICE_TYPE_DCDCConverter, dcdc_pos, MEAS_TYPE_V_TO)
+            rows = rows[valid_j[rows.astype(np.intp, copy=False)] & ~covered_voltage_pos[dcdc_j_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)]]
+            if rows.size:
+                append_rows(
                     DEVICE_TYPE_DCDCConverter,
-                    name,
-                    device_pos,
-                    "V_FROM",
-                    MEAS_TYPE_V_FROM,
-                    float(self._node_voltage_by_pos[i_pos] if 0 <= i_pos < self._node_voltage_by_pos.size else 1.0),
-                )
-            if (
-                not has_measurement(
-                    DEVICE_TYPE_DCDCConverter,
-                    device_pos,
+                    rows,
                     MEAS_TYPE_V_TO,
-                )
-                and self._real_voltage_observation_value_for_node(int(j_node)) is None
-            ):
-                queue_pseudo(
-                    "DCDCConverter",
-                    DEVICE_TYPE_DCDCConverter,
-                    name,
-                    device_pos,
-                    "V_TO",
-                    MEAS_TYPE_V_TO,
-                    float(self._node_voltage_by_pos[j_pos] if 0 <= j_pos < self._node_voltage_by_pos.size else 1.0),
+                    self._node_voltage_by_pos[dcdc_j_pos[rows.astype(np.intp, copy=False)].astype(np.intp, copy=False)],
                 )
         next_idx = self._append_pseudo_measurement_rows(
             next_idx,
@@ -3318,8 +3636,6 @@ class DCStateEstimator:
             meas_type_codes=pseudo_meas_type_codes[:pseudo_count],
             device_positions=pseudo_device_positions[:pseudo_count],
         )
-        if added_keys:
-            measured_keys.update(added_keys)
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch DC rank deficiencies and optional post-observability redundancy."""
@@ -3353,7 +3669,7 @@ class DCStateEstimator:
             added = 0
             refreshed = False
             measurement_count_before = len(self.measurements)
-            base_table_before = _measurement_table_from_measurements(self.measurements)
+            base_table_before = _measurement_table_from_array_view(self.measurements)
             remaining = batch_limit
             for state_idx, _score in observability.weak_states:
                 if added >= remaining:
@@ -3375,7 +3691,7 @@ class DCStateEstimator:
                 break
             total_added += added
             if not refreshed:
-                current_table = _measurement_table_from_measurements(self.measurements)
+                current_table = _measurement_table_from_array_view(self.measurements)
                 current_count = int(current_table.idx.size)
                 if current_count > measurement_count_before:
                     tail_rows = np.arange(measurement_count_before, current_count, dtype=np.int64)
@@ -3410,7 +3726,7 @@ class DCStateEstimator:
         if selected_rows.size == 0:
             return 0
         next_idx = self._next_measurement_idx()
-        base_table_before = _measurement_table_from_measurements(self.measurements)
+        base_table_before = _measurement_table_from_array_view(self.measurements)
         measurement_count_before = int(base_table_before.idx.size)
         candidate_table = getattr(candidates, "table", None)
         if candidate_table is None:
@@ -3491,9 +3807,9 @@ class DCStateEstimator:
             count = row + 1
             candidate_keys.add(key)
 
-        for device_pos, (name, node_pos) in enumerate(
-            zip(self._raw_node_names_alive.tolist(), self._raw_node_solver_pos_alive.tolist())
-        ):
+        for device_pos in range(int(self._raw_node_names_alive.size)):
+            name = self._raw_node_names_alive[device_pos]
+            node_pos = self._raw_node_solver_pos_alive[device_pos]
             node_pos = int(node_pos)
             voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
             add(DEVICE_TYPE_DCNode, "DCNode", str(name), int(device_pos), MEAS_TYPE_V, "V", voltage)
@@ -3567,7 +3883,7 @@ class DCStateEstimator:
     def _select_weak_direction_pseudo_candidates(
         self,
         observability: ObservabilityResult,
-        candidates: Sequence[Measurement],
+        candidates: object,
         max_add: int,
     ) -> np.ndarray:
         if max_add <= 0 or not candidates:
@@ -3615,7 +3931,7 @@ class DCStateEstimator:
 
     def _rank_restoring_candidate_measurements(self) -> MeasurementTableView:
         """Build low-weight candidates from invalid real device rows."""
-        table = _measurement_table_from_measurements(self.measurements)
+        table = _measurement_table_from_array_view(self.measurements)
         device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
         meas_type_code = self._ensure_table_meas_type_codes(table)
         device_pos = getattr(table, "device_pos", None)
@@ -3636,8 +3952,7 @@ class DCStateEstimator:
             )
             return MeasurementTableView(empty_table, normalized=True)
         device_pos = np.asarray(device_pos, dtype=np.int64)
-        existing_keys = self._active_measurement_keys_ref()
-        seen_keys = set()
+        existing_key_array = self._active_measurement_key_array_ref()
         next_idx = self._next_measurement_idx()
         invalid_rows = np.flatnonzero(
             (~np.asarray(table.valid, dtype=bool))
@@ -3658,21 +3973,13 @@ class DCStateEstimator:
             device_pos[invalid_rows],
             meas_type_code[invalid_rows],
         )
-        candidate_rows = []
-        candidate_values = []
-        for local_idx, row in enumerate(invalid_rows.tolist()):
-            row = int(row)
-            if int(device_pos[row]) < 0 or not bool(available[local_idx]):
-                continue
-            if int(device_type_code[row]) == DEVICE_TYPE_DCNode and int(meas_type_code[row]) == MEAS_TYPE_V:
-                continue
-            key = self._active_measurement_key(device_type_code[row], device_pos[row], meas_type_code[row])
-            if key in existing_keys or key in seen_keys:
-                continue
-            seen_keys.add(key)
-            candidate_rows.append(row)
-            candidate_values.append(float(table.value[row]) / float(scale[local_idx]))
-        if not candidate_rows:
+        candidate_mask = (device_pos[invalid_rows] >= 0) & np.asarray(available, dtype=bool)
+        candidate_mask &= ~(
+            (device_type_code[invalid_rows] == DEVICE_TYPE_DCNode)
+            & (meas_type_code[invalid_rows] == MEAS_TYPE_V)
+        )
+        candidate_rows = invalid_rows[candidate_mask]
+        if candidate_rows.size == 0:
             empty_table = self._pseudo_measurement_table(
                 (),
                 (),
@@ -3682,13 +3989,42 @@ class DCStateEstimator:
                 self.pseudo_measurement_weight,
             )
             return MeasurementTableView(empty_table, normalized=True)
-        rows = np.asarray(candidate_rows, dtype=np.int64)
-        values = np.asarray(candidate_values, dtype=np.float64)
+        keys = self._active_measurement_key_array(
+            device_type_code[candidate_rows].astype(np.int64, copy=False),
+            device_pos[candidate_rows].astype(np.int64, copy=False),
+            meas_type_code[candidate_rows].astype(np.int64, copy=False),
+        )
+        keep = np.ones(candidate_rows.size, dtype=bool)
+        if existing_key_array.size:
+            keep &= ~self._active_measurement_key_membership(keys)
+        if keys.size:
+            _unique_keys, first_pos = np.unique(keys, return_index=True)
+            first_mask = np.zeros(keys.size, dtype=bool)
+            first_mask[first_pos.astype(np.intp, copy=False)] = True
+            keep &= first_mask
+        rows = candidate_rows[keep].astype(np.int64, copy=False)
+        if rows.size == 0:
+            empty_table = self._pseudo_measurement_table(
+                (),
+                (),
+                (),
+                (),
+                (),
+                self.pseudo_measurement_weight,
+            )
+            return MeasurementTableView(empty_table, normalized=True)
+        scale_rows = scale[candidate_mask][keep]
+        values = np.divide(
+            np.asarray(table.value, dtype=np.float64)[rows],
+            scale_rows,
+            out=np.zeros(rows.size, dtype=np.float64),
+            where=np.abs(scale_rows) > 1e-12,
+        )
         store_strings = False
         if store_strings:
             names = np.asarray(table.name, dtype=object)
             names = names[rows] if names.size == int(table.idx.size) else np.asarray([f"rank_{int(table.idx[row])}" for row in rows], dtype=object)
-            names = np.asarray([f"pseudo_rank_{name}" for name in names.tolist()], dtype=object)
+            names = np.asarray([f"pseudo_rank_{name}" for name in names], dtype=object)
             device_types = np.asarray(table.device_type, dtype=object)
             device_types = device_types[rows] if device_types.size == int(table.idx.size) else np.asarray([""] * rows.size, dtype=object)
             device_names = np.asarray(table.device_name, dtype=object)
@@ -3714,19 +4050,19 @@ class DCStateEstimator:
         )
         return MeasurementTableView(candidate_table, normalized=True)
 
-    def _rank_restoring_candidate_indices(self, candidates: Sequence[Measurement], max_add: int) -> List[int]:
+    def _rank_restoring_candidate_indices(self, candidates: object, max_add: int) -> np.ndarray:
         """Select candidate rows that participate in a higher structural-rank matching."""
         if max_add <= 0 or not candidates:
-            return []
+            return np.asarray([], dtype=np.int64)
         base_measurements = self.active_measurements
         x = self.initial_state()
         base_h = self.jacobian_sparse(x, base_measurements)
         base_rank = sparse_structural_rank(base_h)
         if base_rank is None or base_rank >= self.n_state:
-            return []
+            return np.asarray([], dtype=np.int64)
 
-        base_table = _measurement_table_from_measurements(base_measurements)
-        candidate_table = _measurement_table_from_measurements(candidates)
+        base_table = _measurement_table_from_array_view(base_measurements)
+        candidate_table = _measurement_table_from_array_view(candidates)
         combined_measurements = MeasurementTableView(
             concat_measurement_tables(base_table, candidate_table),
             normalized=getattr(base_measurements, "normalized", False),
@@ -3734,26 +4070,30 @@ class DCStateEstimator:
         combined_h = self.jacobian_sparse(x, combined_measurements)
         combined_rank = sparse_structural_rank(combined_h)
         if combined_rank is None or combined_rank <= base_rank:
-            return []
+            return np.asarray([], dtype=np.int64)
 
         matching = sp_maximum_bipartite_matching(combined_h, perm_type="row")
         base_rows = len(base_measurements)
-        selected = sorted({int(row) - base_rows for row in matching if int(row) >= base_rows})
-        return selected[:max_add]
+        selected = np.asarray(matching, dtype=np.int64)
+        selected = selected[selected >= base_rows] - int(base_rows)
+        if selected.size == 0:
+            return np.asarray([], dtype=np.int64)
+        selected = np.unique(selected)
+        return selected[:max_add].astype(np.int64, copy=False)
 
     def _add_structural_rank_restoring_pseudo_measurements(self, max_add: int) -> int:
         """Add invalid real-measurement candidates that improve structural observability."""
         candidates = self._rank_restoring_candidate_measurements()
         selected_indices = self._rank_restoring_candidate_indices(candidates, max_add)
-        if not selected_indices:
+        if selected_indices.size == 0:
             return 0
         next_idx = self._next_measurement_idx()
-        base_table_before = _measurement_table_from_measurements(self.measurements)
+        base_table_before = _measurement_table_from_array_view(self.measurements)
         measurement_count_before = int(base_table_before.idx.size)
         candidate_table = getattr(candidates, "table", None)
         if candidate_table is None:
             return 0
-        selected_rows = np.asarray(selected_indices, dtype=np.int64)
+        selected_rows = selected_indices.astype(np.int64, copy=False)
         selected_table = measurement_table_take(candidate_table, selected_rows)
         selected_count = int(selected_table.idx.size)
         selected_table.idx = np.arange(next_idx, next_idx + selected_count, dtype=np.int64)
@@ -3875,6 +4215,8 @@ class DCStateEstimator:
             "references": self.references,
             "voltage_state_pos": self.voltage_state_pos,
             "zero_tie_component_by_pos": self.zero_tie_component_by_pos,
+            "zero_tie_component_offsets": self.zero_tie_component_offsets,
+            "zero_tie_component_indices": self.zero_tie_component_indices,
             "zero_tie_components": self.zero_tie_components,
         }
 
@@ -4173,7 +4515,7 @@ class DCStateEstimator:
     def _fill_measurement_values_vectorized(
         self,
         values: np.ndarray,
-        measurements: Sequence[Measurement],
+        measurements: object,
         voltage: np.ndarray,
         switch_current: np.ndarray,
         dcdc_power: np.ndarray,
@@ -4425,7 +4767,7 @@ class DCStateEstimator:
     def _fill_jacobian_vectorized(
         self,
         H,
-        measurements: Sequence[Measurement],
+        measurements: object,
         voltage: np.ndarray,
         switch_current: np.ndarray,
         dcdc_power: np.ndarray,
@@ -4633,14 +4975,14 @@ class DCStateEstimator:
             )
         return H.to_csr() if sparse else H
 
-    def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None):
+    def jacobian_sparse(self, x: np.ndarray, measurements: Optional[object] = None):
         """Assemble analytical DC measurement sensitivities directly as sparse CSR."""
         return self._assemble_jacobian(x, measurements, sparse=True)
 
     def observability_analysis(
         self,
         x: Optional[np.ndarray] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         H: Optional[np.ndarray] = None,
         normal_matrix: Optional[np.ndarray] = None,
         normal_factor_diag: Optional[np.ndarray] = None,
@@ -4739,7 +5081,7 @@ class DCStateEstimator:
 
     def estimate(
         self,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
         final_diagnostics: bool = True,
@@ -5105,7 +5447,6 @@ class DCStateEstimator:
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         result_table = self._common_measurement_plan_table(measurement_plan_tables).table
-        result_measurements = []
         return EstimateResult(
             converged=converged,
             iterations=iteration,
@@ -5117,7 +5458,7 @@ class DCStateEstimator:
             residual=residual.copy(),
             H=H,
             gain=gain,
-            measurements=result_measurements,
+            measurements=(),
             observability=observability,
             measurement_plan_tables=measurement_plan_tables,
             measurement_table=result_table,
