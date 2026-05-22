@@ -2049,6 +2049,29 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual(10.0, scale[MEAS_TYPE_V_TO])
         self.assertEqual(1.0, scale[0])
 
+    def test_array_result_mode_builds_numeric_scale_cache_without_terminal_tuples(self):
+        from secore.dc_se import DCStateEstimator
+
+        original_terminal_scale = DCStateEstimator._terminal_scale_tuple
+
+        def reject_terminal_tuple(*_args, **_kwargs):
+            raise AssertionError("array result_mode should build numeric scale arrays without terminal tuples")
+
+        DCStateEstimator._terminal_scale_tuple = reject_terminal_tuple
+        try:
+            estimator = DCStateEstimator(
+                e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+                meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+                flat_start=True,
+                auto_prepare=False,
+            )
+            estimator.run(result_mode="array", verbose=False, skip_bad_data=True)
+        finally:
+            DCStateEstimator._terminal_scale_tuple = original_terminal_scale
+
+        self.assertTrue(hasattr(estimator, "_branch_measurement_scale_by_code_name_id"))
+        self.assertTrue(estimator.estimate_result.converged)
+
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator
 
