@@ -590,21 +590,21 @@ class DCPowerFlowCalc:
         append_zero_edges("switch", self.ppc["switch"], DC_SWITCH_COLS, "S")
         append_zero_edges("break", self.ppc.get("break"), DC_BREAK_COLS, "B")
 
-        zero_adj = [[] for _ in range(self.N)]
+        zero_adj = {}
         for edge_idx, (_, _, i_node, j_node) in enumerate(self.zero_edges):
-            zero_adj[i_node].append((edge_idx, j_node))
-            zero_adj[j_node].append((edge_idx, i_node))
+            zero_adj.setdefault(i_node, []).append((edge_idx, j_node))
+            zero_adj.setdefault(j_node, []).append((edge_idx, i_node))
 
-        visited = np.zeros(self.N, dtype=bool)
+        visited_nodes = set()
         edge_used = np.zeros(len(self.zero_edges), dtype=bool)
         comp_nodes = []
         comp_edge_indices = []
 
-        for start in range(self.N):
-            if visited[start] or not zero_adj[start]:
+        for start in zero_adj:
+            if start in visited_nodes:
                 continue
             q = deque([start])
-            visited[start] = True
+            visited_nodes.add(start)
             nodes = []
             edges_idx = []
             while q:
@@ -614,8 +614,8 @@ class DCPowerFlowCalc:
                     if not edge_used[edge_idx]:
                         edge_used[edge_idx] = True
                         edges_idx.append(edge_idx)
-                    if not visited[v]:
-                        visited[v] = True
+                    if v not in visited_nodes:
+                        visited_nodes.add(v)
                         q.append(v)
             if len(nodes) > 1:
                 comp_nodes.append(nodes)

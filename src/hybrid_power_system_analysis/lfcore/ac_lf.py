@@ -320,8 +320,8 @@ class ACPowerFlowCalc:
         # 雅可比时只使用这些预计算索引，避免在迭代中重复查表。
         self.theta_unknown: np.ndarray = np.array([])
         self.V_unknown: np.ndarray = np.array([])
-        self.theta_idx: Dict[int, int] = {}
-        self.V_idx: Dict[int, int] = {}
+        self.theta_idx = np.array([], dtype=np.int32)
+        self.V_idx = np.array([], dtype=np.int32)
         self.base_phi_re: int = 0
         self.base_phi_im: int = 0
         self.n_theta: int = 0
@@ -978,10 +978,12 @@ class ACPowerFlowCalc:
         """Finalize variable/equation indices after node specs, Y and zero edges are ready."""
         self.theta_unknown = np.where(self.node_type != 'SLACK')[0].astype(np.int32)
         self.V_unknown = np.where(self.node_type == 'PQ')[0].astype(np.int32)
-        self.theta_idx = {int(pos): i for i, pos in enumerate(self.theta_unknown)}
-        self.V_idx = {int(pos): i for i, pos in enumerate(self.V_unknown)}
         self.n_theta = len(self.theta_unknown)
         self.n_V = len(self.V_unknown)
+        self.theta_idx = np.full(self.N, -1, dtype=np.int32)
+        self.V_idx = np.full(self.N, -1, dtype=np.int32)
+        self.theta_idx[self.theta_unknown] = np.arange(self.n_theta, dtype=np.int32)
+        self.V_idx[self.V_unknown] = np.arange(self.n_V, dtype=np.int32)
         self.base_phi_re = self.n_theta + self.n_V
         self.base_phi_im = self.base_phi_re + self.N_phi
         self.total_vars = self.base_phi_im + self.N_phi
@@ -1056,11 +1058,7 @@ class ACPowerFlowCalc:
         else:
             self.zero_idx = self.zero_type = self.zero_a = self.zero_b = np.array([], dtype=np.int32)
             self.zero_phi_a = self.zero_phi_b = np.array([], dtype=np.int32)
-        self.pq_theta_rows = np.fromiter(
-            (self.theta_idx[int(pos)] for pos in self.V_unknown),
-            dtype=np.int32,
-            count=self.V_unknown.size,
-        )
+        self.pq_theta_rows = self.theta_idx[self.V_unknown].astype(np.int32, copy=True)
         self.pq_v_cols = np.arange(self.V_unknown.size, dtype=np.int32)
         self.theta_col_by_node = np.full(self.N, -1, dtype=np.int32)
         self.v_col_by_node = np.full(self.N, -1, dtype=np.int32)
@@ -2516,17 +2514,28 @@ class ACPowerFlowCalc:
 
         shunt = self.ppc["shunt"].copy()
         if self.ppc_shunt_rows.size:
-            for row_idx, pos in zip(self.ppc_shunt_rows, self.ppc_shunt_pos):
-                control = int(shunt[row_idx, SHUNT_COLS["control_type"]])
-                if control in (SHUNT_B, SHUNT_Z) or shunt[row_idx, SHUNT_COLS["g_set"]] != 0.0:
-                    p = V[pos] ** 2 * shunt[row_idx, SHUNT_COLS["g_set"]]
-                    q = -V[pos] ** 2 * shunt[row_idx, SHUNT_COLS["b_set"]]
-                else:
-                    p = 0.0
-                    q = shunt[row_idx, SHUNT_COLS["q_set"]] if control == SHUNT_Q else 0.0
-                shunt[row_idx, SHUNT_COLS["p"]] = p
-                shunt[row_idx, SHUNT_COLS["q"]] = q
-                shunt[row_idx, SHUNT_COLS["current"]] = self.get_current(Vc[pos], p, q)
+            rows = self.ppc_shunt_rows
+            vm = V[self.ppc_shunt_pos]
+            vm2 = vm * vm
+            control = shunt[rows, SHUNT_COLS["control_type"]].astype(np.int32, copy=False)
+            g_set = shunt[rows, SHUNT_COLS["g_set"]]
+            b_set = shunt[rows, SHUNT_COLS["b_set"]]
+            y_mask = (control == SHUNT_B) | (control == SHUNT_Z) | (g_set != 0.0)
+            p = np.zeros(rows.size, dtype=np.float64)
+            q = np.zeros(rows.size, dtype=np.float64)
+            p[y_mask] = vm2[y_mask] * g_set[y_mask]
+            q[y_mask] = -vm2[y_mask] * b_set[y_mask]
+            q_mask = (~y_mask) & (control == SHUNT_Q)
+            q[q_mask] = shunt[rows[q_mask], SHUNT_COLS["q_set"]]
+            current = np.divide(
+                np.hypot(p, q),
+                vm,
+                out=np.zeros_like(p),
+                where=vm > self.min_voltage,
+            )
+            shunt[rows, SHUNT_COLS["p"]] = p
+            shunt[rows, SHUNT_COLS["q"]] = q
+            shunt[rows, SHUNT_COLS["current"]] = current
 
         branch = self.ppc["branch"].copy()
         if self.ppc_branch_rows.size:
