@@ -141,7 +141,7 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(calc.Y.toarray(), expected_calc.Y.toarray(), atol=1e-12)
 
     def test_ppc_flow_matches_object_flow_for_ieee300(self):
-        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_array_model import BUS_COLS, build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
@@ -167,8 +167,10 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual(0, ppc_rc)
         self.assertTrue(ppc_calc.converged)
 
-        object_voltage = np.asarray([node.voltage for node in object_calc.node_list])
-        object_angle = np.asarray([node.angle for node in object_calc.node_list])
+        self.assertFalse(object_calc.keep_node_objects)
+        self.assertEqual([], object_calc.node_list)
+        object_voltage = object_calc.result["bus"][:, BUS_COLS["voltage"]]
+        object_angle = object_calc.result["bus"][:, BUS_COLS["angle"]]
 
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["voltage"]], object_voltage, atol=1e-10)
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["angle"]], object_angle, atol=1e-10)
@@ -585,15 +587,20 @@ class ACPPCFlowTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
 
-        def reject_full_backfill():
-            raise AssertionError("result_mode='none' should skip full AC result backfill")
+        none_calls = []
+        original_none_write_back_ppc = calc._write_back_ppc
 
-        calc._write_back_ppc = reject_full_backfill
+        def counted_none_write_back_ppc():
+            none_calls.append(calc.result_mode)
+            return original_none_write_back_ppc()
+
+        calc._write_back_ppc = counted_none_write_back_ppc
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(calc.converged)
+        self.assertEqual(["none"], none_calls)
         self.assertEqual({}, calc.result)
         self.assertIsNone(getattr(calc, "lf_result", None))
         self.assertTrue(hasattr(calc, "x"))
@@ -601,12 +608,20 @@ class ACPPCFlowTest(unittest.TestCase):
         summary_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="summary")
         with contextlib.redirect_stdout(io.StringIO()):
             summary_calc.prepare()
-        summary_calc._write_back_ppc = reject_full_backfill
+        summary_calls = []
+        original_summary_write_back_ppc = summary_calc._write_back_ppc
+
+        def counted_summary_write_back_ppc():
+            summary_calls.append(summary_calc.result_mode)
+            return original_summary_write_back_ppc()
+
+        summary_calc._write_back_ppc = counted_summary_write_back_ppc
         with contextlib.redirect_stdout(io.StringIO()):
             rc = summary_calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(summary_calc.converged)
+        self.assertEqual(["summary"], summary_calls)
         self.assertEqual({"node_id", "voltage", "angle", "summary"}, set(summary_calc.result))
         self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["angle"].size)

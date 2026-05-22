@@ -235,7 +235,7 @@ class DCPowerFlowCalc:
         self.linear_solver = str(linear_solver or "pyklu").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.result_mode = self._normalize_result_mode(result_mode)
-        self.keep_node_objects = bool(keep_node_objects) and self.result_mode == "full"
+        self.keep_node_objects = False
         self._cache_csr_jacobian_pattern = self.result_mode == "full"
         self.converged = False
         self.iterations = 0
@@ -1545,8 +1545,6 @@ class DCPowerFlowCalc:
             "break": breaker,
             "dcdc": dcdc,
         }
-        self._write_ppc_result_to_network()
-
     def _write_ppc_result_to_network(self) -> None:
         """Copy ppc results back to an optional DCPowerNetwork object."""
         network = getattr(self, "_network_writeback", None)
@@ -1792,6 +1790,7 @@ class DCPowerFlowCalc:
 
     def _write_back(self):
         """结果回填；数值计算批量完成，Python 循环只负责对象属性赋值。"""
+        self._write_back_ppc()
         if self.result_mode == "none":
             self.result = {}
             self.lf_result = None
@@ -1800,7 +1799,7 @@ class DCPowerFlowCalc:
             self._write_summary_result()
             return
 
-        self._write_back_ppc()
+        self._write_ppc_result_to_network()
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
         return
@@ -1826,9 +1825,8 @@ class DCPowerFlowCalc:
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
             self._cache_csr_jacobian_pattern = self.result_mode == "full"
-            if self.result_mode != "full":
-                self.keep_node_objects = False
-                self.alive_nodes = []
+            self.keep_node_objects = False
+            self.alive_nodes = []
         if self.x.size == 0 or self.G is None:
             self.prepare()
         return self._run_newton_raphson()

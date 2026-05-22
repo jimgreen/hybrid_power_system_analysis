@@ -259,7 +259,7 @@ class ACPowerFlowCalc:
         else:
             raise ValueError("ACPowerFlowCalc requires ac_ppc_v1 or ACPowerNetwork input")
         self.result_mode = self._normalize_result_mode(result_mode)
-        self.keep_node_objects = bool(keep_node_objects) and self.result_mode == "full"
+        self.keep_node_objects = False
         self._cache_csr_jacobian_pattern = self.result_mode == "full"
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
@@ -2158,10 +2158,9 @@ class ACPowerFlowCalc:
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
             self._cache_csr_jacobian_pattern = self.result_mode == "full"
-            if self.result_mode != "full":
-                self.keep_node_objects = False
-                self.node_list = []
-                self.node_pos = {}
+            self.keep_node_objects = False
+            self.node_list = []
+            self.node_pos = {}
         if self.x.size == 0:
             self.prepare()
         return self._run_newton_raphson()
@@ -2232,6 +2231,7 @@ class ACPowerFlowCalc:
 
     def _write_back(self):
         """结果回填；数值计算批量完成，Python 循环只负责对象属性赋值。"""
+        self._write_back_ppc()
         if self.result_mode == "none":
             self.result = {}
             self.lf_result = None
@@ -2239,8 +2239,9 @@ class ACPowerFlowCalc:
         if self.result_mode == "summary":
             self._write_summary_result()
             return
-
-        self._write_back_ppc()
+        self._write_ppc_result_to_network()
+        if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
+            self.lf_result = self._build_lf_result()
         return
 
     def _build_lf_result(self) -> ACLFResult:
@@ -2598,9 +2599,6 @@ class ACPowerFlowCalc:
             "switch": switch,
             "break": breaker,
         }
-        self._write_ppc_result_to_network()
-        if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
-            self.lf_result = self._build_lf_result()
 
 def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     for isl in calc.skipped_islands:

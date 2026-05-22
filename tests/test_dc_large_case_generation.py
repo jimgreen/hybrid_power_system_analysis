@@ -70,10 +70,11 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         self.assertIsNone(prepared)
         self.assertFalse(hasattr(calc, "array_mode"))
-        self.assertEqual((30, 30), calc.G.shape)
-        self.assertEqual(70, calc.x.size)
+        self.assertFalse(calc.keep_node_objects)
+        self.assertEqual((26, 26), calc.G.shape)
+        self.assertEqual(53, calc.x.size)
         np.testing.assert_array_equal(calc.branch_i[:3], np.asarray([0, 1, 2], dtype=np.int32))
-        np.testing.assert_array_equal(calc.branch_j[:3], np.asarray([1, 2, 3], dtype=np.int32))
+        np.testing.assert_array_equal(calc.branch_j[:3], np.asarray([1, 2, 2], dtype=np.int32))
         self.assertEqual(9, calc.N_dcdc)
 
     def test_dc_solver_run_prepares_and_exposes_ac_style_state_access(self):
@@ -213,29 +214,42 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         calc = DCPowerFlowCalc(ppc, result_mode="none")
 
-        def reject_full_backfill(_x):
-            raise AssertionError("result_mode='none' should skip full DC result backfill")
-
         stale_result = object()
         calc.lf_result = stale_result
-        calc._write_back_ppc = reject_full_backfill
+        none_calls = []
+        original_none_write_back_ppc = calc._write_back_ppc
+
+        def counted_none_write_back_ppc():
+            none_calls.append(calc.result_mode)
+            return original_none_write_back_ppc()
+
+        calc._write_back_ppc = counted_none_write_back_ppc
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(calc.converged)
+        self.assertEqual(["none"], none_calls)
         self.assertEqual({}, calc.result)
         self.assertIsNone(calc.lf_result)
         self.assertTrue(hasattr(calc, "x"))
 
         summary_calc = DCPowerFlowCalc(ppc, result_mode="summary")
         summary_calc.lf_result = stale_result
-        summary_calc._write_back_ppc = reject_full_backfill
+        summary_calls = []
+        original_summary_write_back_ppc = summary_calc._write_back_ppc
+
+        def counted_summary_write_back_ppc():
+            summary_calls.append(summary_calc.result_mode)
+            return original_summary_write_back_ppc()
+
+        summary_calc._write_back_ppc = counted_summary_write_back_ppc
         with contextlib.redirect_stdout(io.StringIO()):
             rc = summary_calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(summary_calc.converged)
+        self.assertEqual(["summary"], summary_calls)
         self.assertEqual({"node_id", "voltage", "summary"}, set(summary_calc.result))
         self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)

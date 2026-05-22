@@ -392,22 +392,36 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
         hybrid_init = [name for name in inspect.signature(HybridPowerFlowCalc.__init__).parameters if name != "self"]
         self.assertEqual(ac_init, hybrid_init)
         self.assertEqual(inspect.signature(ACPowerFlowCalc._build_newton_system), inspect.signature(HybridPowerFlowCalc._build_newton_system))
+        self.assertEqual(inspect.signature(ACPowerFlowCalc._run_newton_raphson), inspect.signature(HybridPowerFlowCalc._run_newton_raphson))
+        self.assertEqual(inspect.signature(ACPowerFlowCalc.get_f), inspect.signature(HybridPowerFlowCalc.get_f))
+        self.assertEqual(inspect.signature(ACPowerFlowCalc.get_jacobi), inspect.signature(HybridPowerFlowCalc.get_jacobi))
         self.assertEqual(inspect.signature(ACPowerFlowCalc._write_summary_result), inspect.signature(HybridPowerFlowCalc._write_summary_result))
         self.assertEqual(inspect.signature(ACPowerFlowCalc._write_back), inspect.signature(HybridPowerFlowCalc._write_back))
         self.assertEqual(
             list(inspect.signature(ac_lf.print_ac_result).parameters),
             list(inspect.signature(hybrid_lf.print_hybrid_result).parameters),
         )
+        self.assertEqual(
+            inspect.signature(ac_lf.print_ac_result).return_annotation,
+            inspect.signature(hybrid_lf.print_hybrid_result).return_annotation,
+        )
 
         hybrid_source = inspect.getsource(HybridPowerFlowCalc._run_newton_raphson)
         self.assertIn("delta = factor.solve(F)", hybrid_source)
         self.assertIn("x -= delta", hybrid_source)
+        self.assertIn("self._write_back()", hybrid_source)
         self.assertNotIn("factor.solve(-F)", hybrid_source)
         self.assertNotIn("x += delta", hybrid_source)
-        self.assertNotIn("self._finish_result(x)", hybrid_source)
+        self.assertNotIn("_finish_result", hybrid_source)
+        self.assertFalse(hasattr(HybridPowerFlowCalc, "_finish_result"))
+        self.assertFalse(hasattr(HybridPowerFlowCalc, "_write_none_result"))
+        self.assertFalse(hasattr(HybridPowerFlowCalc, "_write_array_result"))
 
         self.assertIn("self.result =", inspect.getsource(HybridPowerFlowCalc._write_summary_result))
         self.assertIn("self.lf_result = None", inspect.getsource(HybridPowerFlowCalc._write_summary_result))
+        hybrid_summary_source = inspect.getsource(HybridPowerFlowCalc._hybrid_summary)
+        self.assertNotIn('"total_vars"', hybrid_summary_source)
+        self.assertNotIn('"total_eq"', hybrid_summary_source)
         self.assertNotIn(
             'self.lf_result = {"ac":',
             inspect.getsource(HybridPowerFlowCalc._sync_single_subsolver_result),

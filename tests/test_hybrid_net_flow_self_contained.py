@@ -495,20 +495,55 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIs(result.lf_result, result)
         self.assertTrue(result.converged)
         self.assertIs(result.network, result.calc.network)
-        self.assertIsNotNone(result.ac)
-        self.assertIsNotNone(result.dc)
+        self.assertIsNone(result.ac)
+        self.assertIsNone(result.dc)
+        self.assertIsNone(getattr(result.calc.ac_calc, "lf_result", None))
+        self.assertIsNone(getattr(result.calc.dc_calc, "lf_result", None))
+        self.assertEqual("array", result.calc.ac_calc.result_mode)
+        self.assertEqual("array", result.calc.dc_calc.result_mode)
+        self.assertIn("bus", result.calc.ac_calc.result)
+        self.assertIn("bus", result.calc.dc_calc.result)
         self.assertTrue(result.dcac.dcac_converters)
         self.assertTrue(result.acac.acac_converters)
 
+    def test_hybrid_subcalculations_always_use_array_results(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
+
+        for mode in ("none", "summary", "array", "full"):
+            network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
+            calc = HybridPowerFlowCalc(network, verbose=False, result_mode=mode)
+            with contextlib.redirect_stdout(io.StringIO()):
+                calc.prepare()
+
+            self.assertEqual("array", calc.ac_calc.result_mode)
+            self.assertEqual("array", calc.dc_calc.result_mode)
+            self.assertFalse(calc.ac_calc.keep_node_objects)
+            self.assertFalse(calc.dc_calc.keep_node_objects)
+
+            def reject_sub_lf_result(*_args, **_kwargs):
+                raise AssertionError("Hybrid sub-solvers must not build object LF results")
+
+            calc.ac_calc._build_lf_result = reject_sub_lf_result
+            calc.dc_calc._build_lf_result = reject_sub_lf_result
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = calc.run()
+
+            self.assertEqual(0, rc, mode)
+            self.assertEqual("array", calc.ac_calc.result_mode)
+            self.assertEqual("array", calc.dc_calc.result_mode)
+            self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
+            self.assertIsNone(getattr(calc.dc_calc, "lf_result", None))
+            self.assertIn("bus", calc.ac_calc.result)
+            self.assertIn("bus", calc.dc_calc.result)
+
     def test_converter_initial_values_and_writeback_use_cached_arrays(self):
-        from lfcore.hybrid_lf import HybridPowerFlowCalc, HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
 
         class NonIterableConverters:
             def __iter__(self):
                 raise AssertionError("hybrid converter helpers should use cached converter arrays")
 
-        network = HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
-        network.prepare(verbose=False)
+        network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -549,10 +584,10 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         network = HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
 
-        def reject_full_backfill():
-            raise AssertionError("result_mode='none' should skip full hybrid result backfill")
+        def reject_full_result_build(*_args, **_kwargs):
+            raise AssertionError("result_mode should skip full hybrid LF result construction")
 
-        calc._write_back = reject_full_backfill
+        calc._build_lf_result = reject_full_result_build
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run()
 
@@ -562,7 +597,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(hasattr(calc, "x"))
 
         summary_calc = HybridPowerFlowCalc(network, verbose=False, result_mode="summary")
-        summary_calc._write_back = reject_full_backfill
+        summary_calc._build_lf_result = reject_full_result_build
         with contextlib.redirect_stdout(io.StringIO()):
             rc = summary_calc.run()
 
@@ -582,10 +617,10 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = HybridPowerFlowCalc(network, verbose=False, result_mode="none")
 
-        def reject_full_backfill():
-            raise AssertionError("result_mode='array' should skip hybrid object backfill")
+        def reject_full_result_build(*_args, **_kwargs):
+            raise AssertionError("result_mode='array' should skip full hybrid LF result construction")
 
-        calc._write_back = reject_full_backfill
+        calc._build_lf_result = reject_full_result_build
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run(result_mode="array")
 
