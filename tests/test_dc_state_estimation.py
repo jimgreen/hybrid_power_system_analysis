@@ -855,6 +855,49 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertGreaterEqual(len(bad_items), 1)
         self.assertEqual(bad_measurements[voltage_idx].idx, bad_items[0].measurement.idx)
 
+    def test_identify_bad_data_skips_gain_inverse_when_residual_bound_is_below_threshold(self):
+        import secore.dc_se as dc_se_module
+        from model.meas_model import EstimateResult, Measurement, ObservabilityResult, measurement_table_from_measurements
+        from secore.dc_se import DCStateEstimator
+
+        measurements = [
+            Measurement(1, "m1", "DCNode", "n1", "V", 1.0, True, 1.0),
+            Measurement(2, "m2", "DCNode", "n2", "V", 1.0, True, 1.0),
+        ]
+        result = EstimateResult(
+            converged=True,
+            iterations=1,
+            objective=0.0,
+            max_correction=0.0,
+            residual_inf=2e-9,
+            x=np.zeros(2, dtype=np.float64),
+            z_est=np.ones(2, dtype=np.float64),
+            residual=np.array([1e-9, -2e-9], dtype=np.float64),
+            H=None,
+            gain=None,
+            measurements=measurements,
+            observability=ObservabilityResult(True, 2, 2, 2, 0, np.array([]), []),
+            measurement_table=measurement_table_from_measurements(measurements),
+        )
+        estimator = DCStateEstimator.__new__(DCStateEstimator)
+        estimator.params = SimpleNamespace(bad_threshold=3.0)
+        estimator.profile_enabled = False
+
+        original_inverse = dc_se_module.inverse_gain_for_bad_data
+
+        def reject_inverse(*_args, **_kwargs):
+            raise AssertionError("tiny residuals should skip gain inverse for bad-data detection")
+
+        dc_se_module.inverse_gain_for_bad_data = reject_inverse
+        try:
+            bad_items, normalized = estimator.identify_bad_data(result, threshold=3.0)
+        finally:
+            dc_se_module.inverse_gain_for_bad_data = original_inverse
+
+        self.assertEqual([], bad_items)
+        self.assertEqual(result.residual.size, normalized.size)
+        self.assertLess(float(normalized.max()), 3.0)
+
     def test_jacobian_uses_direct_derivatives_without_repeated_evaluation(self):
         from secore.dc_se import DCStateEstimator
 
@@ -1949,6 +1992,62 @@ class DCStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, estimator.measurement_table.device_type.size)
         self.assertEqual(0, estimator.measurement_table.meas_type.size)
         self.assertTrue(estimator.estimate_result.converged)
+
+    def test_run_array_result_mode_uses_integer_active_key_caches(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+
+        estimator.run(result_mode="array", verbose=False, skip_bad_data=True)
+
+        self.assertTrue(estimator._active_key_cache_uses_name_id)
+        self.assertTrue(estimator._active_measurement_key_cache)
+        self.assertTrue(all(isinstance(key, int) for key in estimator._active_measurement_key_cache))
+
+    def test_flat_start_array_result_mode_skips_power_flow_seed_rows(self):
+        from secore.dc_se import DCStateEstimator
+
+        estimator = DCStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+
+        estimator.run(result_mode="array", verbose=False, skip_bad_data=True)
+
+        self.assertEqual([], estimator._power_flow_seed_rows)
+        self.assertTrue(estimator.estimate_result.converged)
+
+    def test_measurement_scale_tuple_avoids_numpy_allocation_per_device(self):
+        import secore.dc_se as dc_se
+        from secore.dc_se import DCStateEstimator
+        from model.meas_type import MEAS_TYPE_P_FROM, MEAS_TYPE_V_TO
+
+        original_ones = dc_se.np.ones
+
+        def reject_numpy_ones(*_args, **_kwargs):
+            raise AssertionError("measurement scale tuple should not allocate a numpy vector per device")
+
+        dc_se.np.ones = reject_numpy_ones
+        try:
+            scale = DCStateEstimator._measurement_scale_tuple(
+                {
+                    MEAS_TYPE_P_FROM: 100.0,
+                    MEAS_TYPE_V_TO: 10.0,
+                }
+            )
+        finally:
+            dc_se.np.ones = original_ones
+
+        self.assertEqual(100.0, scale[MEAS_TYPE_P_FROM])
+        self.assertEqual(10.0, scale[MEAS_TYPE_V_TO])
+        self.assertEqual(1.0, scale[0])
 
     def test_observability_uses_cholesky_fast_path_when_observable(self):
         from secore.dc_se import DCStateEstimator
