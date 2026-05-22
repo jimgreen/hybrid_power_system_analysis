@@ -307,6 +307,50 @@ def _measurement_type_code_lookup(kind_map) -> np.ndarray:
     return _measurement_type_code_lookup_from_codes(())
 
 
+class _PackedMeasurementKeyCache:
+    """Set-like packed-key cache that avoids materializing Python ints until required."""
+
+    __slots__ = ("estimator", "_keys")
+
+    def __init__(self, estimator: "ACStateEstimator") -> None:
+        self.estimator = estimator
+        self._keys = None
+
+    def _key_array(self) -> np.ndarray:
+        return np.asarray(getattr(self.estimator, "_active_measurement_key_array_cache", ()), dtype=np.int64).reshape(-1)
+
+    def _materialize(self) -> set:
+        keys = self._keys
+        if keys is None:
+            keys = set(self._key_array().astype(object, copy=False))
+            self._keys = keys
+        return keys
+
+    def __contains__(self, key) -> bool:
+        keys = self._keys
+        if keys is not None:
+            return int(key) in keys
+        probe = np.asarray([int(key)], dtype=np.int64)
+        return bool(self.estimator._active_measurement_key_membership(probe)[0])
+
+    def __bool__(self) -> bool:
+        keys = self._keys
+        return bool(keys) if keys is not None else bool(self._key_array().size)
+
+    def __len__(self) -> int:
+        keys = self._keys
+        return len(keys) if keys is not None else int(self._key_array().size)
+
+    def __iter__(self):
+        return iter(self._materialize())
+
+    def add(self, key) -> None:
+        self._materialize().add(int(key))
+
+    def update(self, keys) -> None:
+        self._materialize().update(keys)
+
+
 class _PseudoMeasurementBuffer:
     """Preallocated row buffer for pseudo-measurement table construction."""
 
@@ -394,6 +438,38 @@ class _PseudoMeasurementBuffer:
         if self.weight is not None:
             self.weight[pos] = float(weight)
         self.count = pos + 1
+
+    def add_many(
+        self,
+        device_type_code: int,
+        device_pos: np.ndarray,
+        meas_type_code: int,
+        value: np.ndarray,
+        *,
+        weight: Optional[float] = None,
+    ) -> None:
+        device_pos = np.asarray(device_pos, dtype=np.int64)
+        value = np.asarray(value, dtype=np.float64)
+        count = int(device_pos.size)
+        if count == 0:
+            return
+        if value.size != count:
+            raise ValueError("pseudo measurement value array size does not match device_pos")
+        start = int(self.count)
+        end = start + count
+        self._ensure_capacity(end)
+        if self.store_strings:
+            self.name[start:end] = ""
+            self.device_type[start:end] = ""
+            self.device_name[start:end] = ""
+            self.meas_type[start:end] = ""
+        self.device_type_code[start:end] = int(device_type_code)
+        self.device_pos[start:end] = device_pos
+        self.meas_type_code[start:end] = int(meas_type_code)
+        self.value[start:end] = value
+        if self.weight is not None:
+            self.weight[start:end] = float(weight)
+        self.count = end
 
     @property
     def names(self) -> np.ndarray:
@@ -2692,9 +2768,12 @@ class ACStateEstimator:
     def _set_active_key_caches_from_array(self, key_array: np.ndarray, key_set: Optional[set] = None) -> None:
         key_array = np.asarray(key_array, dtype=np.int64).reshape(-1)
         if key_set is None:
-            key_set = set(key_array.astype(object, copy=False))
-        self._active_measurement_keys = key_set
-        self._active_measurement_code_pos_cache = key_set
+            key_set = _PackedMeasurementKeyCache(self)
+            self._active_measurement_keys = key_set
+            self._active_measurement_code_pos_cache = key_set
+        else:
+            self._active_measurement_keys = key_set
+            self._active_measurement_code_pos_cache = key_set
         self._active_measurement_key_array_cache = key_array
         self._active_measurement_key_sorted_array_cache = None
 
@@ -2722,27 +2801,32 @@ class ACStateEstimator:
         )
 
     @staticmethod
+    def _active_measurement_key_array_for_type(
+        device_type_code: int,
+        device_pos: np.ndarray,
+        meas_type_code: int,
+    ) -> np.ndarray:
+        pos_values = np.asarray(device_pos, dtype=np.int64)
+        return (
+            (np.int64(int(device_type_code)) << (_ACTIVE_DEVICE_KEY_POS_BITS + _ACTIVE_MEASUREMENT_KEY_MEAS_BITS))
+            | (pos_values << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS)
+            | np.int64(int(meas_type_code))
+        )
+
+    @staticmethod
     def _active_key_cache_from_arrays(
         device_type_code: np.ndarray,
         device_pos: np.ndarray,
         meas_type_code: np.ndarray,
         active_mask: np.ndarray,
     ) -> set:
-        valid = np.asarray(active_mask, dtype=bool)
-        rows = np.flatnonzero(valid).astype(np.int64, copy=False)
-        if rows.size == 0:
-            return set()
-        type_values = np.asarray(device_type_code, dtype=np.int16)[rows].astype(np.int64, copy=False)
-        pos_values = np.asarray(device_pos, dtype=np.int64)[rows]
-        meas_values = np.asarray(meas_type_code, dtype=np.int16)[rows].astype(np.int64, copy=False)
-        valid_pos = pos_values >= 0
-        if not np.any(valid_pos):
-            return set()
-        valid_type = type_values[valid_pos]
-        valid_pos_values = pos_values[valid_pos]
-        valid_meas = meas_values[valid_pos]
-        measurement_keys = ACStateEstimator._active_measurement_key_array(valid_type, valid_pos_values, valid_meas)
-        return set(measurement_keys.astype(object, copy=False))
+        keys = ACStateEstimator._active_key_array_from_arrays(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+            active_mask,
+        )
+        return set(keys.astype(object, copy=False))
 
     @staticmethod
     def _active_key_array_from_arrays(
@@ -2751,10 +2835,20 @@ class ACStateEstimator:
         meas_type_code: np.ndarray,
         active_mask: np.ndarray,
     ) -> np.ndarray:
-        rows = np.flatnonzero(np.asarray(active_mask, dtype=bool)).astype(np.int64, copy=False)
+        active_values = np.asarray(active_mask, dtype=bool)
+        pos_all = np.asarray(device_pos, dtype=np.int64)
+        if active_values.size == pos_all.size and active_values.size and bool(np.all(active_values)):
+            valid_pos = pos_all >= 0
+            if bool(np.all(valid_pos)):
+                return ACStateEstimator._active_measurement_key_array(
+                    device_type_code,
+                    pos_all,
+                    meas_type_code,
+                ).astype(np.int64, copy=False)
+        rows = np.flatnonzero(active_values).astype(np.int64, copy=False)
         if rows.size == 0:
             return np.empty(0, dtype=np.int64)
-        pos_values = np.asarray(device_pos, dtype=np.int64)[rows]
+        pos_values = pos_all[rows]
         valid_pos = pos_values >= 0
         if not np.any(valid_pos):
             return np.empty(0, dtype=np.int64)
@@ -2842,6 +2936,10 @@ class ACStateEstimator:
         terminal_v_to_rows = row_index[real_mask & terminal_device_mask & (meas_type_code == MEAS_TYPE_V_TO)]
         update_best_arrays(terminal_v_from_rows, from_pos[terminal_v_from_rows], real_best_weight, real_best_value)
         update_best_arrays(terminal_v_to_rows, to_pos[terminal_v_to_rows], real_best_weight, real_best_value)
+        node_valid_pos = node_idx_by_pos >= 0
+        self._node_voltage_measurement_pos_mask_cache = np.isfinite(node_best_weight) & node_valid_pos
+        self._real_voltage_observation_pos_mask_cache = np.isfinite(real_best_weight) & node_valid_pos
+        self._real_voltage_observed_solver_pos_mask_cache = None
         return best_dict(node_best_weight, node_best_value), best_dict(real_best_weight, real_best_value)
 
     def _power_seed_best_from_arrays(
@@ -3198,6 +3296,9 @@ class ACStateEstimator:
         self._max_measurement_idx = int(table.idx.max()) if table.idx.size else 0
         self._node_voltage_measurement_cache = {}
         self._real_voltage_observation_node_cache = {}
+        self._node_voltage_measurement_pos_mask_cache = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+        self._real_voltage_observation_pos_mask_cache = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+        self._real_voltage_observed_solver_pos_mask_cache = None
         self._real_power_measurement_seed_cache = {
             "measurement_key": np.empty(0, dtype=np.int64),
             "weight": np.empty(0, dtype=np.float64),
@@ -3223,12 +3324,26 @@ class ACStateEstimator:
         if hasattr(self, "_active_measurement_code_pos_cache"):
             self._active_measurement_keys = self._active_measurement_code_pos_cache
             return self._active_measurement_code_pos_cache
-        if not hasattr(self, "_active_measurement_keys"):
+        keys = getattr(self, "_active_measurement_keys", None)
+        if keys is not None:
+            return keys
+        key_array = getattr(self, "_active_measurement_key_array_cache", None)
+        if key_array is None:
             self._refresh_measurement_summary_cache()
-        return self._active_measurement_keys
+            key_array = getattr(self, "_active_measurement_key_array_cache", None)
+        key_array = np.asarray(key_array, dtype=np.int64).reshape(-1)
+        keys = set(key_array.astype(object, copy=False))
+        self._active_measurement_keys = keys
+        self._active_measurement_code_pos_cache = keys
+        return keys
 
     def _active_measurement_key_array_ref(self) -> np.ndarray:
         """Return active measurement keys as an int64 array for vectorized membership checks."""
+        code_cache = getattr(self, "_active_measurement_code_pos_cache", None)
+        if code_cache is not None and code_cache is not getattr(self, "_active_measurement_keys", None):
+            key_array = self._measurement_key_array_from_cache(code_cache)
+            self._active_measurement_key_array_cache = key_array
+            return key_array
         key_array = getattr(self, "_active_measurement_key_array_cache", None)
         if key_array is not None:
             return np.asarray(key_array, dtype=np.int64)
@@ -3347,12 +3462,19 @@ class ACStateEstimator:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-        self._set_active_key_caches_from_array(active_measurement_key_array)
+        self._set_active_key_caches_from_array(
+            active_measurement_key_array,
+            set(active_measurement_key_array.astype(object, copy=False)),
+        )
         self._max_measurement_idx = max_idx
         self._node_voltage_measurement_cache = node_voltage_best
         self._real_voltage_observation_node_cache = real_voltage_best
         self._real_power_measurement_seed_cache = power_seed_best
         self._power_flow_seed_rows = power_flow_seed_rows
+        if table is None or len(table.idx) != len(self.measurements):
+            self._node_voltage_measurement_pos_mask_cache = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+            self._real_voltage_observation_pos_mask_cache = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+            self._real_voltage_observed_solver_pos_mask_cache = None
 
     @staticmethod
     def _pseudo_measurement_table(
@@ -3586,7 +3708,7 @@ class ACStateEstimator:
                 valid_pos = tail_pos[valid_tail].astype(np.int64, copy=False)
                 valid_meas = tail_meas[valid_tail].astype(np.int64, copy=False)
                 measurement_keys = self._active_measurement_key_array(valid_type, valid_pos, valid_meas)
-                measurement_key_cache.update(map(int, measurement_keys))
+                measurement_key_cache.update(measurement_keys.astype(object, copy=False))
                 key_array = getattr(self, "_active_measurement_key_array_cache", None)
                 if key_array is None or np.asarray(key_array).size == 0:
                     self._active_measurement_key_array_cache = measurement_keys.astype(np.int64, copy=False)
@@ -3633,35 +3755,141 @@ class ACStateEstimator:
                 return float(observed[member_idx])
         return None
 
+    def _real_voltage_observed_solver_pos_mask(self) -> np.ndarray:
+        """Return solver-node positions covered by real voltage measurements, including zero-tie peers."""
+        observed_pos_mask = getattr(self, "_real_voltage_observation_pos_mask_cache", None)
+        cache_key = (
+            id(observed_pos_mask),
+            int(getattr(self, "n_nodes", 0)),
+            id(getattr(self, "zero_tie_component_by_pos", None)),
+            id(getattr(self, "zero_tie_component_offsets", None)),
+        )
+        cache = getattr(self, "_real_voltage_observed_solver_pos_mask_cache", None)
+        if isinstance(cache, tuple) and len(cache) == 2 and cache[0] == cache_key:
+            return cache[1]
+        n_nodes = int(getattr(self, "n_nodes", 0))
+        if isinstance(observed_pos_mask, np.ndarray) and int(observed_pos_mask.size) == n_nodes:
+            covered_voltage_pos = np.asarray(observed_pos_mask, dtype=bool).copy()
+        else:
+            observed_voltage = self._real_voltage_observation_nodes()
+            covered_voltage_pos = np.zeros(n_nodes, dtype=bool)
+            if observed_voltage:
+                observed_node_idx = np.fromiter(
+                    (int(node_idx) for node_idx in observed_voltage.keys()),
+                    dtype=np.int64,
+                    count=len(observed_voltage),
+                )
+                lookup_ids = np.asarray(getattr(self, "_ac_node_id_lookup_ids", ()), dtype=np.int64)
+                lookup_pos = np.asarray(getattr(self, "_ac_node_id_lookup_pos", ()), dtype=np.int64)
+                if lookup_ids.size and lookup_pos.size:
+                    pos = np.searchsorted(lookup_ids, observed_node_idx)
+                    in_range = pos < lookup_ids.size
+                    if np.any(in_range):
+                        idx = np.flatnonzero(in_range)
+                        matched = lookup_ids[pos[idx].astype(np.intp, copy=False)] == observed_node_idx[idx]
+                        if np.any(matched):
+                            solver_pos = lookup_pos[pos[idx[matched]].astype(np.intp, copy=False)]
+                            valid_solver = (solver_pos >= 0) & (solver_pos < covered_voltage_pos.size)
+                            if np.any(valid_solver):
+                                covered_voltage_pos[solver_pos[valid_solver].astype(np.intp, copy=False)] = True
+        if not np.any(covered_voltage_pos):
+            self._real_voltage_observed_solver_pos_mask_cache = (cache_key, covered_voltage_pos)
+            return covered_voltage_pos
+        component_by_pos = getattr(self, "zero_tie_component_by_pos", None)
+        component_offsets = getattr(self, "zero_tie_component_offsets", None)
+        if component_by_pos is not None and component_offsets is not None and covered_voltage_pos.size:
+            component_by_pos = np.asarray(component_by_pos, dtype=np.int64)
+            component_count = max(0, int(np.asarray(component_offsets, dtype=np.int64).size) - 1)
+            valid_component = (
+                component_count > 0
+                and component_by_pos.size == covered_voltage_pos.size
+                and np.all((component_by_pos >= 0) & (component_by_pos < component_count))
+            )
+            if valid_component:
+                component_observed = np.zeros(component_count, dtype=bool)
+                observed_pos = np.flatnonzero(covered_voltage_pos).astype(np.int64, copy=False)
+                if observed_pos.size:
+                    component_observed[component_by_pos[observed_pos.astype(np.intp, copy=False)].astype(np.intp, copy=False)] = True
+                    covered_voltage_pos = component_observed[component_by_pos.astype(np.intp, copy=False)]
+        self._real_voltage_observed_solver_pos_mask_cache = (cache_key, covered_voltage_pos)
+        return covered_voltage_pos
+
+    def _voltage_measurement_node_pos_from_code(
+        self,
+        device_type_code: int,
+        device_pos: int,
+        meas_type_code: int,
+    ) -> int:
+        pos = int(device_pos)
+        if pos < 0:
+            return -1
+        code = int(device_type_code)
+        meas_code = int(meas_type_code)
+        if code == DEVICE_TYPE_ACNode:
+            values = getattr(self, "_ac_node_plan_pos", np.asarray([], dtype=np.int64))
+            valid_meas = meas_code == MEAS_TYPE_V
+        elif code == DEVICE_TYPE_ACGenerator:
+            values = getattr(self, "_ac_generator_plan_node_pos", np.asarray([], dtype=np.int64))
+            valid_meas = meas_code == MEAS_TYPE_V_GEN
+        elif code == DEVICE_TYPE_ACLoad:
+            values = getattr(self, "_ac_load_plan_node_pos", np.asarray([], dtype=np.int64))
+            valid_meas = meas_code == MEAS_TYPE_V_LOAD
+        elif code == DEVICE_TYPE_ACBranch:
+            values = (
+                getattr(self, "_ac_branch_plan_i", np.asarray([], dtype=np.int64))
+                if meas_code == MEAS_TYPE_V_FROM
+                else getattr(self, "_ac_branch_plan_j", np.asarray([], dtype=np.int64))
+            )
+            valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
+        elif code == DEVICE_TYPE_ACTransformer:
+            values = (
+                getattr(self, "_ac_transformer_plan_i", np.asarray([], dtype=np.int64))
+                if meas_code == MEAS_TYPE_V_FROM
+                else getattr(self, "_ac_transformer_plan_j", np.asarray([], dtype=np.int64))
+            )
+            valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
+        elif code == DEVICE_TYPE_ACZeroBranch:
+            values = (
+                getattr(self, "_ac_zero_branch_plan_i", np.asarray([], dtype=np.int64))
+                if meas_code == MEAS_TYPE_V_FROM
+                else getattr(self, "_ac_zero_branch_plan_j", np.asarray([], dtype=np.int64))
+            )
+            valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
+        elif code == DEVICE_TYPE_ACBreak:
+            values = (
+                getattr(self, "_ac_break_plan_i", np.asarray([], dtype=np.int64))
+                if meas_code == MEAS_TYPE_V_FROM
+                else getattr(self, "_ac_break_plan_j", np.asarray([], dtype=np.int64))
+            )
+            valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
+        else:
+            return -1
+        if not valid_meas:
+            return -1
+        values = np.asarray(values, dtype=np.int64)
+        if pos >= values.size:
+            return -1
+        return int(values[pos])
+
     def _voltage_pseudo_is_covered_by_code(
         self,
         device_type_code: int,
         device_pos: int,
         meas_type_code: int,
     ) -> bool:
-        from_pos, to_pos = self._measurement_voltage_node_positions_from_codes(
-            np.asarray([int(device_type_code)], dtype=np.int16),
-            np.asarray([int(device_pos)], dtype=np.int64),
-            np.asarray([int(meas_type_code)], dtype=np.int16),
-        )
-        node_pos = int(to_pos[0]) if int(meas_type_code) == MEAS_TYPE_V_TO else int(from_pos[0])
+        node_pos = self._voltage_measurement_node_pos_from_code(device_type_code, device_pos, meas_type_code)
         if node_pos < 0:
             return False
-        _node_valid, _node_voltage_scale, _node_current_scale, node_idx_by_pos = self._node_scale_arrays_by_pos()
-        if node_pos >= int(node_idx_by_pos.size):
-            return False
-        node_idx = int(node_idx_by_pos[node_pos])
-        if node_idx < 0:
-            return False
-        return self._real_voltage_observation_value_for_node(node_idx) is not None
+        covered = self._real_voltage_observed_solver_pos_mask()
+        return bool(node_pos < covered.size and covered[int(node_pos)])
 
     def _add_pseudo_topology_measurements(self, next_idx: int) -> Tuple[int, set]:
         """Add weak P/Q/V priors for unmeasured AC topology-device states."""
-        measured_keys = self._active_measurement_keys_ref()
         added_keys = set()
         topology_weight = float(self.pseudo_measurement_weight) * 1e-4
         ppc = self._ac_ppc_dict()
         store_strings = False
+        key_probe = np.empty(1, dtype=np.int64)
         pseudo_rows = _PseudoMeasurementBuffer(
             3
             * (
@@ -3671,6 +3899,10 @@ class ACStateEstimator:
             with_weights=True,
             store_strings=store_strings,
         )
+
+        def key_is_active(key: int) -> bool:
+            key_probe[0] = int(key)
+            return bool(self._active_measurement_key_membership(key_probe)[0])
 
         def queue_topology_pseudo(
             device_type_code: int,
@@ -3682,7 +3914,7 @@ class ACStateEstimator:
             value: float,
         ) -> None:
             key = self._active_measurement_key(device_type_code, int(device_pos), meas_type_code)
-            if key in measured_keys or key in added_keys:
+            if key in added_keys or key_is_active(key):
                 return
             pseudo_name = f"pseudo_{meas_type.lower()}_{device_name}" if store_strings else ""
             pseudo_rows.add(
@@ -3717,11 +3949,11 @@ class ACStateEstimator:
                     continue
                 device_name = str(name) if store_strings else ""
                 has_terminal_current = any(
-                    self._active_measurement_key(device_type_code, int(pos), meas_type_code) in measured_keys
+                    key_is_active(self._active_measurement_key(device_type_code, int(pos), meas_type_code))
                     for meas_type_code in (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO)
                 )
                 if not has_terminal_current and not any(
-                    self._active_measurement_key(device_type_code, int(pos), meas_type_code) in measured_keys
+                    key_is_active(self._active_measurement_key(device_type_code, int(pos), meas_type_code))
                     for meas_type_code in (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO)
                 ):
                     queue_topology_pseudo(
@@ -3734,7 +3966,7 @@ class ACStateEstimator:
                         float(device_values[cols["p"]] or 0.0),
                     )
                 if not has_terminal_current and not any(
-                    self._active_measurement_key(device_type_code, int(pos), meas_type_code) in measured_keys
+                    key_is_active(self._active_measurement_key(device_type_code, int(pos), meas_type_code))
                     for meas_type_code in (MEAS_TYPE_Q_FROM, MEAS_TYPE_Q_TO)
                 ):
                     queue_topology_pseudo(
@@ -3774,13 +4006,8 @@ class ACStateEstimator:
 
     def _add_pseudo_power_measurements(self) -> None:
         """Add weak priors for devices whose file measurements are missing or invalid."""
-        if not hasattr(self, "_active_measurement_keys"):
-            self._refresh_measurement_summary_cache()
-        measured_keys = self._active_measurement_keys_ref()
-        added_keys = set()
         next_idx = self._next_measurement_idx()
-        next_idx, topology_added_keys = self._add_pseudo_topology_measurements(next_idx)
-        added_keys.update(topology_added_keys)
+        next_idx, _topology_added_keys = self._add_pseudo_topology_measurements(next_idx)
         ppc = self._ac_ppc_dict()
         store_strings = False
         pseudo_rows = _PseudoMeasurementBuffer(
@@ -3792,166 +4019,80 @@ class ACStateEstimator:
             store_strings=store_strings,
         )
 
-        def queue_pseudo(
-            name: str,
-            device_type: str,
+        covered_voltage_pos = self._real_voltage_observed_solver_pos_mask()
+
+        def append_missing(
             device_type_code: int,
-            device_name: str,
-            device_pos: int,
-            meas_type: str,
+            device_pos: np.ndarray,
             meas_type_code: int,
-            value: float,
+            values: np.ndarray,
+            extra_mask: Optional[np.ndarray] = None,
         ) -> None:
-            pseudo_rows.add(
-                name,
-                device_type,
+            pos = np.asarray(device_pos, dtype=np.int64)
+            if pos.size == 0:
+                return
+            missing = pos >= 0
+            if not np.any(missing):
+                return
+            keys = self._active_measurement_key_array_for_type(int(device_type_code), pos, int(meas_type_code))
+            missing &= ~self._active_measurement_key_membership(keys)
+            if extra_mask is not None:
+                missing &= np.asarray(extra_mask, dtype=bool)
+            if not np.any(missing):
+                return
+            rows = np.flatnonzero(missing).astype(np.intp, copy=False)
+            pseudo_rows.add_many(
                 int(device_type_code),
-                device_name,
-                int(device_pos),
-                meas_type,
+                pos[rows],
                 int(meas_type_code),
-                float(value),
+                np.asarray(values, dtype=np.float64)[rows],
             )
 
-        def device_measurement_keys(device_type_code: int, device_pos: np.ndarray, meas_type_code: int) -> np.ndarray:
-            pos = np.asarray(device_pos, dtype=np.int64)
-            return self._active_measurement_key_array(
-                np.full(pos.size, int(device_type_code), dtype=np.int64),
-                pos,
-                np.full(pos.size, int(meas_type_code), dtype=np.int64),
-            )
+        def voltage_missing_mask(node_pos: np.ndarray) -> np.ndarray:
+            node_pos = np.asarray(node_pos, dtype=np.int64)
+            out = np.zeros(node_pos.size, dtype=bool)
+            valid = (node_pos >= 0) & (node_pos < covered_voltage_pos.size)
+            if np.any(valid):
+                out[valid] = ~covered_voltage_pos[node_pos[valid].astype(np.intp, copy=False)]
+            return out
 
         gen, gen_topology, gen_rows = self._ppc_sorted_alive_rows_for(ppc, "gen", "gen", GEN_COLS["idx"])
         gen_voltage = self._ppc_device_node_voltage_values(ppc, gen_topology, gen_rows)
         gen_p, gen_q = self._ppc_generator_pseudo_power_arrays(ppc, gen_rows)
-        gen_nodes = gen[gen_rows.astype(np.intp, copy=False), GEN_COLS["node"]].astype(np.int64, copy=False)
         gen_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_ACGenerator, gen_rows, gen.shape[0])
-        gen_p_keys = device_measurement_keys(DEVICE_TYPE_ACGenerator, gen_plan_pos, MEAS_TYPE_P_GEN)
-        gen_q_keys = device_measurement_keys(DEVICE_TYPE_ACGenerator, gen_plan_pos, MEAS_TYPE_Q_GEN)
-        gen_v_keys = device_measurement_keys(DEVICE_TYPE_ACGenerator, gen_plan_pos, MEAS_TYPE_V_GEN)
-        gen_names = (
-            self._ppc_names_for_rows(ppc["gen_name"], gen_rows)
-            if store_strings
-            else repeat("", int(gen_plan_pos.size))
+        gen_node_pos = (
+            np.asarray(gen_topology.node_pos, dtype=np.int32)[gen_rows.astype(np.intp, copy=False)]
+            if gen_topology is not None and gen_rows.size
+            else np.asarray([], dtype=np.int32)
         )
-        for row_pos, (name, pos, p, q, voltage, node_idx) in enumerate(
-            zip(gen_names, gen_plan_pos, gen_p, gen_q, gen_voltage, gen_nodes)
-        ):
-            if int(pos) < 0:
-                continue
-            device_name = str(name) if store_strings else ""
-            key = int(gen_p_keys[row_pos])
-            if key not in measured_keys and key not in added_keys:
-                pseudo_name = f"pseudo_p_{device_name}" if store_strings else ""
-                queue_pseudo(
-                    pseudo_name,
-                    "ACGenerator",
-                    DEVICE_TYPE_ACGenerator,
-                    device_name,
-                    int(pos),
-                    "P_GEN",
-                    MEAS_TYPE_P_GEN,
-                    p,
-                )
-                added_keys.add(key)
-            key = int(gen_q_keys[row_pos])
-            if key not in measured_keys and key not in added_keys:
-                pseudo_name = f"pseudo_q_{device_name}" if store_strings else ""
-                queue_pseudo(
-                    pseudo_name,
-                    "ACGenerator",
-                    DEVICE_TYPE_ACGenerator,
-                    device_name,
-                    int(pos),
-                    "Q_GEN",
-                    MEAS_TYPE_Q_GEN,
-                    q,
-                )
-                added_keys.add(key)
-            key = int(gen_v_keys[row_pos])
-            if (
-                key not in measured_keys
-                and key not in added_keys
-                and self._real_voltage_observation_value_for_node(int(node_idx)) is None
-            ):
-                pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
-                queue_pseudo(
-                    pseudo_name,
-                    "ACGenerator",
-                    DEVICE_TYPE_ACGenerator,
-                    device_name,
-                    int(pos),
-                    "V_GEN",
-                    MEAS_TYPE_V_GEN,
-                    float(voltage or 1.0),
-                )
-                added_keys.add(key)
+        append_missing(DEVICE_TYPE_ACGenerator, gen_plan_pos, MEAS_TYPE_P_GEN, gen_p)
+        append_missing(DEVICE_TYPE_ACGenerator, gen_plan_pos, MEAS_TYPE_Q_GEN, gen_q)
+        append_missing(
+            DEVICE_TYPE_ACGenerator,
+            gen_plan_pos,
+            MEAS_TYPE_V_GEN,
+            np.maximum(gen_voltage, self.voltage_floor),
+            voltage_missing_mask(gen_node_pos),
+        )
 
         load, load_topology, load_rows = self._ppc_sorted_alive_rows_for(ppc, "load", "load", LOAD_COLS["idx"])
         load_voltage = self._ppc_device_node_voltage_values(ppc, load_topology, load_rows)
         load_p, load_q = self._ppc_load_pseudo_power_arrays(ppc, load_rows, load_voltage)
-        load_nodes = load[load_rows.astype(np.intp, copy=False), LOAD_COLS["node"]].astype(np.int64, copy=False)
         load_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_ACLoad, load_rows, load.shape[0])
-        load_p_keys = device_measurement_keys(DEVICE_TYPE_ACLoad, load_plan_pos, MEAS_TYPE_P_LOAD)
-        load_q_keys = device_measurement_keys(DEVICE_TYPE_ACLoad, load_plan_pos, MEAS_TYPE_Q_LOAD)
-        load_v_keys = device_measurement_keys(DEVICE_TYPE_ACLoad, load_plan_pos, MEAS_TYPE_V_LOAD)
-        load_names = (
-            self._ppc_names_for_rows(ppc["load_name"], load_rows)
-            if store_strings
-            else repeat("", int(load_plan_pos.size))
+        load_node_pos = (
+            np.asarray(load_topology.node_pos, dtype=np.int32)[load_rows.astype(np.intp, copy=False)]
+            if load_topology is not None and load_rows.size
+            else np.asarray([], dtype=np.int32)
         )
-        for row_pos, (name, pos, p, q, voltage, node_idx) in enumerate(
-            zip(load_names, load_plan_pos, load_p, load_q, load_voltage, load_nodes)
-        ):
-            if int(pos) < 0:
-                continue
-            device_name = str(name) if store_strings else ""
-            key = int(load_p_keys[row_pos])
-            if key not in measured_keys and key not in added_keys:
-                pseudo_name = f"pseudo_p_{device_name}" if store_strings else ""
-                queue_pseudo(
-                    pseudo_name,
-                    "ACLoad",
-                    DEVICE_TYPE_ACLoad,
-                    device_name,
-                    int(pos),
-                    "P_LOAD",
-                    MEAS_TYPE_P_LOAD,
-                    p,
-                )
-                added_keys.add(key)
-            key = int(load_q_keys[row_pos])
-            if key not in measured_keys and key not in added_keys:
-                pseudo_name = f"pseudo_q_{device_name}" if store_strings else ""
-                queue_pseudo(
-                    pseudo_name,
-                    "ACLoad",
-                    DEVICE_TYPE_ACLoad,
-                    device_name,
-                    int(pos),
-                    "Q_LOAD",
-                    MEAS_TYPE_Q_LOAD,
-                    q,
-                )
-                added_keys.add(key)
-            key = int(load_v_keys[row_pos])
-            if (
-                key not in measured_keys
-                and key not in added_keys
-                and self._real_voltage_observation_value_for_node(int(node_idx)) is None
-            ):
-                pseudo_name = f"pseudo_v_{device_name}" if store_strings else ""
-                queue_pseudo(
-                    pseudo_name,
-                    "ACLoad",
-                    DEVICE_TYPE_ACLoad,
-                    device_name,
-                    int(pos),
-                    "V_LOAD",
-                    MEAS_TYPE_V_LOAD,
-                    float(voltage or 1.0),
-                )
-                added_keys.add(key)
+        append_missing(DEVICE_TYPE_ACLoad, load_plan_pos, MEAS_TYPE_P_LOAD, load_p)
+        append_missing(DEVICE_TYPE_ACLoad, load_plan_pos, MEAS_TYPE_Q_LOAD, load_q)
+        append_missing(
+            DEVICE_TYPE_ACLoad,
+            load_plan_pos,
+            MEAS_TYPE_V_LOAD,
+            np.maximum(load_voltage, self.voltage_floor),
+            voltage_missing_mask(load_node_pos),
+        )
         next_idx = self._append_pseudo_measurement_rows(
             next_idx,
             pseudo_rows.names,
@@ -3964,8 +4105,6 @@ class ACStateEstimator:
             meas_type_codes=pseudo_rows.meas_type_codes,
             device_positions=pseudo_rows.device_positions,
         )
-        if added_keys:
-            measured_keys.update(added_keys)
 
     def _seed_power_state_arrays_from_measurements(self) -> None:
         """Use the best available P/Q rows as initial values for explicit power states."""
@@ -5079,9 +5218,9 @@ class ACStateEstimator:
         """Return valid real ACNode voltage measurements keyed by node index."""
         cached = getattr(self, "_node_voltage_measurement_cache", None)
         if cached is not None:
-            return dict(cached)
+            return cached
         self._refresh_measurement_summary_cache()
-        return dict(getattr(self, "_node_voltage_measurement_cache", {}))
+        return getattr(self, "_node_voltage_measurement_cache", {})
 
     def _node_incident_degrees(self) -> Dict[int, int]:
         """Count live incident AC branches, transformers, switches and zero branches."""
@@ -5128,12 +5267,16 @@ class ACStateEstimator:
         island_ref_pos = np.asarray(getattr(self, "_ac_island_reference_solver_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
         if node_ids.size == 0:
             return np.asarray([], dtype=np.int32)
-        voltage_measurements = getattr(self, "node_voltage_measurements", {})
-        measured_by_pos = np.zeros(node_ids.size, dtype=bool)
-        if voltage_measurements:
-            measured_ids = np.fromiter((int(key) for key in voltage_measurements.keys()), dtype=np.int64)
-            if measured_ids.size:
-                measured_by_pos = np.isin(node_ids, measured_ids, assume_unique=False)
+        cached_measured_by_pos = getattr(self, "_node_voltage_measurement_pos_mask_cache", None)
+        if isinstance(cached_measured_by_pos, np.ndarray) and int(cached_measured_by_pos.size) == int(node_ids.size):
+            measured_by_pos = np.asarray(cached_measured_by_pos, dtype=bool)
+        else:
+            voltage_measurements = getattr(self, "node_voltage_measurements", {})
+            measured_by_pos = np.zeros(node_ids.size, dtype=bool)
+            if voltage_measurements:
+                measured_ids = np.fromiter((int(key) for key in voltage_measurements.keys()), dtype=np.int64)
+                if measured_ids.size:
+                    measured_by_pos = np.isin(node_ids, measured_ids, assume_unique=False)
         degree_array = np.asarray(getattr(self, "node_degree_array", np.asarray([], dtype=np.int32)), dtype=np.int32)
         if degree_array.size != node_ids.size:
             degree_array = np.asarray(
@@ -5385,8 +5528,11 @@ class ACStateEstimator:
         left, right = self._zero_tie_solver_edges_from_ppc()
         if n <= 0:
             empty_i32 = np.asarray([], dtype=np.int32)
+            empty_i64 = np.asarray([], dtype=np.int64)
             self.zero_tie_components = {}
             self.zero_tie_component_by_pos = empty_i32
+            self.zero_tie_component_offsets = empty_i64
+            self.zero_tie_component_indices = empty_i32
             self.angle_col = empty_i32.copy()
             self.voltage_col = empty_i32.copy()
             self.angle_state_pos = empty_i32.copy()
@@ -5460,9 +5606,15 @@ class ACStateEstimator:
         self.zero_tie_component_by_pos = component_by_pos.astype(np.int32, copy=False)
 
         component_counts = np.bincount(component_by_pos, minlength=n_components)
+        sorted_nodes = np.argsort(component_by_pos, kind="stable").astype(np.int32, copy=False)
+        component_offsets = np.empty(n_components + 1, dtype=np.int64)
+        component_offsets[0] = 0
+        if n_components:
+            component_offsets[1:] = np.cumsum(component_counts, dtype=np.int64)
+        self.zero_tie_component_offsets = component_offsets
+        self.zero_tie_component_indices = sorted_nodes
         multi_components = np.flatnonzero(component_counts > 1).astype(np.int32, copy=False)
         if multi_components.size:
-            sorted_nodes = np.argsort(component_by_pos, kind="stable").astype(np.int32, copy=False)
             sorted_components = component_by_pos[sorted_nodes.astype(np.intp, copy=False)]
             split_points = np.flatnonzero(sorted_components[1:] != sorted_components[:-1]) + 1
             starts = np.concatenate((np.asarray([0], dtype=np.int64), split_points.astype(np.int64, copy=False)))
