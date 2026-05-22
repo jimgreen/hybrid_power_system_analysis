@@ -2327,7 +2327,6 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(estimator.estimate(final_diagnostics=False).converged)
 
     def test_array_result_mode_does_not_build_measurement_object_views(self):
-        import secore.ac_se as ac_se
         import secore.se_array_plan as se_array_plan
         from model import meas_model
         from secore.ac_se import ACStateEstimator
@@ -2339,14 +2338,9 @@ class ACStateEstimationTest(unittest.TestCase):
             auto_prepare=False,
         )
 
-        original_measurement_list_from_meas_ppc = ac_se.measurement_list_from_meas_ppc
-        original_ac_table_backed = ac_se.TableBackedMeasurementList
         original_plan_table_backed = se_array_plan.TableBackedMeasurementList
         original_plan_measurement_view = se_array_plan.MeasurementView
         original_model_measurement_view = meas_model.MeasurementView
-
-        def reject_measurement_list_from_meas_ppc(*_args, **_kwargs):
-            raise AssertionError("array-only AC SE should not build a MeasurementList from meas_ppc")
 
         class RejectTableBackedMeasurementList:
             def __init__(self, *_args, **_kwargs):
@@ -2356,8 +2350,6 @@ class ACStateEstimationTest(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 raise AssertionError("array-only AC SE should not build a MeasurementView")
 
-        ac_se.measurement_list_from_meas_ppc = reject_measurement_list_from_meas_ppc
-        ac_se.TableBackedMeasurementList = RejectTableBackedMeasurementList
         se_array_plan.TableBackedMeasurementList = RejectTableBackedMeasurementList
         se_array_plan.MeasurementView = RejectMeasurementView
         meas_model.MeasurementView = RejectMeasurementView
@@ -2369,8 +2361,6 @@ class ACStateEstimationTest(unittest.TestCase):
                 verbose=False,
             )
         finally:
-            ac_se.measurement_list_from_meas_ppc = original_measurement_list_from_meas_ppc
-            ac_se.TableBackedMeasurementList = original_ac_table_backed
             se_array_plan.TableBackedMeasurementList = original_plan_table_backed
             se_array_plan.MeasurementView = original_plan_measurement_view
             meas_model.MeasurementView = original_model_measurement_view
@@ -5170,7 +5160,8 @@ class ACStateEstimationTest(unittest.TestCase):
         )
         estimator.prepare()
         original_build = ACStateEstimator.build_se_result
-        original_summary = ac_se_module.build_seresult_summary
+        original_summary = ac_se_module.build_seresult_summary_from_table
+        original_full = ac_se_module.build_seresult_full_from_table
         original_identify = ACStateEstimator.identify_bad_data
         original_from_estimate = SEResult.from_estimate_result
         original_apply_state = ACStateEstimator.apply_state
@@ -5192,7 +5183,8 @@ class ACStateEstimationTest(unittest.TestCase):
             raise AssertionError("array result_mode should not build full SEResult measurement tables")
 
         ACStateEstimator.build_se_result = reject_seresult_path
-        ac_se_module.build_seresult_summary = reject_seresult_path
+        ac_se_module.build_seresult_summary_from_table = reject_seresult_path
+        ac_se_module.build_seresult_full_from_table = reject_seresult_path
         ACStateEstimator.identify_bad_data = counted_bad_data
         ACStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
@@ -5203,7 +5195,8 @@ class ACStateEstimationTest(unittest.TestCase):
             )
         finally:
             ACStateEstimator.build_se_result = original_build
-            ac_se_module.build_seresult_summary = original_summary
+            ac_se_module.build_seresult_summary_from_table = original_summary
+            ac_se_module.build_seresult_full_from_table = original_full
             ACStateEstimator.identify_bad_data = original_identify
             ACStateEstimator.apply_state = original_apply_state
             SEResult.from_estimate_result = original_from_estimate

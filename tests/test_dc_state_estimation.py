@@ -282,7 +282,6 @@ class DCStateEstimationTest(unittest.TestCase):
             case_path = Path(tmp_dir) / "dc_break.e"
             text = source.read_text(encoding="utf-8")
             switch_start = text.index("<DCSwitch>")
-            switch_end = text.index("</DCSwitch>", switch_start) + len("</DCSwitch>")
             break_start = text.index("<DCBreak>")
             break_end = text.index("</DCBreak>", break_start) + len("</DCBreak>")
             text = (
@@ -915,7 +914,7 @@ class DCStateEstimationTest(unittest.TestCase):
             return original_evaluate(*args, **kwargs)
 
         estimator.evaluate = counted_evaluate
-        H = estimator.jacobian(estimator.initial_state())
+        H = estimator.jacobian_sparse(estimator.initial_state())
 
         self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
         self.assertLessEqual(call_count, 1)
@@ -930,7 +929,7 @@ class DCStateEstimationTest(unittest.TestCase):
         )
 
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator._assemble_jacobian(x, sparse=False)
         sparse = estimator.jacobian_sparse(x)
 
         self.assertTrue(issparse(sparse))
@@ -988,12 +987,9 @@ class DCStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
         )
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator._assemble_jacobian(x, sparse=False)
 
-        def fail_scalar_derivative_path(*args, **kwargs):
-            raise AssertionError("DC sparse Jacobian must be assembled in vectorized batches")
-
-        estimator._add_derivative = fail_scalar_derivative_path
+        self.assertFalse(hasattr(estimator, "_add_derivative"))
         sparse = estimator.jacobian_sparse(x)
 
         self.assertTrue(issparse(sparse))
@@ -1024,7 +1020,7 @@ class DCStateEstimationTest(unittest.TestCase):
         )
 
     def test_active_measurement_plan_uses_table_without_iterating_measurements(self):
-        from model.meas_model import Measurement, MeasurementTable
+        from model.meas_model import MeasurementTable
         from secore.dc_se import DCStateEstimator
 
         class TableBackedSequence:
@@ -1925,7 +1921,8 @@ class DCStateEstimationTest(unittest.TestCase):
         )
         estimator.prepare()
         original_build = DCStateEstimator.build_se_result
-        original_summary = dc_se_module.build_seresult_summary
+        original_summary = dc_se_module.build_seresult_summary_from_table
+        original_full = dc_se_module.build_seresult_full_from_table
         original_identify = DCStateEstimator.identify_bad_data
         original_from_estimate = SEResult.from_estimate_result
         original_apply_state = DCStateEstimator.apply_state
@@ -1947,7 +1944,8 @@ class DCStateEstimationTest(unittest.TestCase):
             raise AssertionError("array result_mode should not build full SEResult measurement tables")
 
         DCStateEstimator.build_se_result = reject_seresult_path
-        dc_se_module.build_seresult_summary = reject_seresult_path
+        dc_se_module.build_seresult_summary_from_table = reject_seresult_path
+        dc_se_module.build_seresult_full_from_table = reject_seresult_path
         DCStateEstimator.identify_bad_data = counted_bad_data
         DCStateEstimator.apply_state = reject_apply_state
         SEResult.from_estimate_result = reject_full_tables
@@ -1955,7 +1953,8 @@ class DCStateEstimationTest(unittest.TestCase):
             se_result = estimator.run(result_mode="array", verbose=False)
         finally:
             DCStateEstimator.build_se_result = original_build
-            dc_se_module.build_seresult_summary = original_summary
+            dc_se_module.build_seresult_summary_from_table = original_summary
+            dc_se_module.build_seresult_full_from_table = original_full
             DCStateEstimator.identify_bad_data = original_identify
             DCStateEstimator.apply_state = original_apply_state
             SEResult.from_estimate_result = original_from_estimate
@@ -2005,7 +2004,6 @@ class DCStateEstimationTest(unittest.TestCase):
 
         estimator.run(result_mode="array", verbose=False, skip_bad_data=True)
 
-        self.assertTrue(estimator._active_key_cache_uses_name_id)
         self.assertTrue(estimator._active_measurement_key_cache)
         self.assertTrue(all(isinstance(key, int) for key in estimator._active_measurement_key_cache))
 
@@ -2115,7 +2113,7 @@ class DCStateEstimationTest(unittest.TestCase):
         )
 
         x = estimator.initial_state()
-        H = estimator.jacobian(x)
+        H = estimator.jacobian_sparse(x).toarray()
         H_num = np.zeros_like(H)
         for col in range(estimator.n_state):
             step = 1e-6 * max(1.0, abs(x[col]))

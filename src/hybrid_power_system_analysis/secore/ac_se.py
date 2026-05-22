@@ -46,7 +46,6 @@ from model.meas_array_model import (
     MEAS_COLS,
     build_meas_ppc_from_e_file,
     copy_meas_ppc,
-    measurement_list_from_meas_ppc,
     measurement_table_from_meas_ppc,
 )
 from model.meas_type import (
@@ -102,7 +101,6 @@ from model.meas_model import (
     MeasurementTable,
     MeasurementTableView,
     ObservabilityResult,
-    TableBackedMeasurementList,
     measurement_from_table_row,
     measurement_table_from_measurements,
     measurement_table_status_code,
@@ -143,7 +141,12 @@ from secore.se_array_plan import (
     rows_by_device_type_code,
     take_measurement_view,
 )
-from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_result_mode
+from secore.se_result import (
+    SEResult,
+    build_seresult_full_from_table,
+    build_seresult_summary_from_table,
+    normalize_seresult_result_mode,
+)
 
 
 DEFAULT_CASE = model_file("ac", "ieee39.e")
@@ -507,7 +510,8 @@ class ACStateEstimator:
         self._prepare_measurements = measurements
         self._prepare_active_measurements = bool(prepare_active_measurements)
         self._prepare_defer_finalize = bool(defer_prepare_finalize)
-        self._array_only_runtime = False
+        self._array_only_runtime = True
+        self._array_only_estimate_result = True
         self.matrix_dump_dir = Path(matrix_dump_dir) if matrix_dump_dir is not None else None
         self.observability_result = None
         self.estimate_result = None
@@ -523,9 +527,7 @@ class ACStateEstimator:
             )
 
     def _measurement_sequence_from_table(self, table: MeasurementTable, *, normalized: bool = False):
-        if bool(getattr(self, "_array_only_runtime", False)):
-            return MeasurementTableView(table, normalized=normalized)
-        return TableBackedMeasurementList(table, normalized=normalized)
+        return MeasurementTableView(table, normalized=normalized)
 
     @staticmethod
     def _clear_meas_ppc_runtime_arrays(meas_ppc: Dict) -> None:
@@ -649,48 +651,42 @@ class ACStateEstimator:
             self._prepare_defer_finalize = bool(defer_prepare_finalize)
         prepare_active_measurements = bool(prepare_active_measurements)
         defer_prepare_finalize = bool(defer_prepare_finalize)
+        self._array_only_runtime = True
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
         self.network = network if network is not None else self._load_network(self.e_file)
         self._record_profile_time("init.load_network", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
         if measurements is None:
-            if bool(getattr(self, "_array_only_runtime", False)):
-                self.meas_ppc = build_meas_ppc_from_e_file(
-                    self.meas_file,
-                    include_strings=False,
-                    use_cache=False,
-                    include_matrix=False,
-                )
-                self.meas_ppc["_mutable_runtime_arrays"] = True
-                self.measurements = self._measurement_sequence_from_table(
-                    measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
-                    normalized=bool(self.meas_ppc.get("normalized", False)),
-                )
-            else:
-                self.meas_ppc = copy_meas_ppc(
-                    build_meas_ppc_from_e_file(
-                        self.meas_file,
-                        include_strings=True,
-                    )
-                )
-                self._clear_meas_ppc_runtime_arrays(self.meas_ppc)
-                self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
+            self.meas_ppc = build_meas_ppc_from_e_file(
+                self.meas_file,
+                include_strings=False,
+                use_cache=False,
+                include_matrix=False,
+            )
+            self.meas_ppc["_mutable_runtime_arrays"] = True
+            self.measurements = self._measurement_sequence_from_table(
+                measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
+                normalized=bool(self.meas_ppc.get("normalized", False)),
+            )
         elif isinstance(measurements, dict):
             self.meas_ppc = copy_meas_ppc(measurements)
-            if bool(getattr(self, "_array_only_runtime", False)):
-                self.measurements = self._measurement_sequence_from_table(
-                    measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
-                    normalized=bool(self.meas_ppc.get("normalized", False)),
-                )
-            else:
-                self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
+            self.meas_ppc["_mutable_runtime_arrays"] = True
+            self.measurements = self._measurement_sequence_from_table(
+                measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
+                normalized=bool(self.meas_ppc.get("normalized", False)),
+            )
         elif isinstance(measurements, MeasurementList):
-            self.measurements = measurements
-            self.meas_ppc = self._measurement_table_to_meas_ppc(_measurement_table_from_measurements(measurements))
+            table = _measurement_table_from_measurements(measurements)
+            self.meas_ppc = self._measurement_table_to_meas_ppc(table)
+            self.measurements = self._measurement_sequence_from_table(
+                table,
+                normalized=getattr(measurements, "normalized", False),
+            )
         else:
-            self.measurements = list(measurements)
-            self.meas_ppc = self._measurement_table_to_meas_ppc(_measurement_table_from_measurements(self.measurements))
+            table = _measurement_table_from_measurements(list(measurements))
+            self.meas_ppc = self._measurement_table_to_meas_ppc(table)
+            self.measurements = self._measurement_sequence_from_table(table, normalized=False)
         elapsed = time.perf_counter() - stage_start
         self._record_profile_time("init.load_measurement_parse", elapsed)
         self._record_profile_time("init.load_measurements", elapsed)
@@ -1168,10 +1164,14 @@ class ACStateEstimator:
             if fast_cache_args is not None:
                 self._cache_observability_matrix(*fast_cache_args)
         else:
-            self.active_measurements = MeasurementList(
-                [],
+            base_table = _measurement_table_from_measurements(self.measurements)
+            empty_rows = np.asarray([], dtype=np.int64)
+            empty_table = measurement_table_take(base_table, empty_rows, rows_by_device_type_code={})
+            self.active_measurements = self._measurement_sequence_from_table(
+                empty_table,
                 normalized=getattr(self.measurements, "normalized", False),
             )
+            self.active_measurement_table = empty_table
             self.active_measurement_rows = np.array([], dtype=np.int64)
             self.active_z = np.array([], dtype=np.float64)
             self.active_weight = np.array([], dtype=np.float64)
@@ -1502,7 +1502,7 @@ class ACStateEstimator:
         active_view = build_active_measurement_view(
             self.measurements,
             table_builder=_measurement_table_from_measurements,
-            materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
+            materialize_measurements=False,
         )
         table = active_view.source_table
         active_table = active_view.table
@@ -1630,12 +1630,12 @@ class ACStateEstimator:
             build_active_measurement_view(
                 self.active_measurements,
                 table_builder=_measurement_table_from_measurements,
-                materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
+                materialize_measurements=False,
             ),
             appended_view,
             source_row_start=source_row_start,
             table_builder=_measurement_table_from_measurements,
-            materialize_measurements=not bool(getattr(self, "_array_only_runtime", False)),
+            materialize_measurements=False,
         )
         self._initial_observability_cache = None
         self._max_measurement_idx = int(self.measurement_table.idx.max()) if self.measurement_table.idx.size else 0
@@ -3296,7 +3296,7 @@ class ACStateEstimator:
         device_type_codes: Optional[Sequence[int]] = None,
         meas_type_codes: Optional[Sequence[int]] = None,
         device_positions: Optional[Sequence[int]] = None,
-    ) -> TableBackedMeasurementList:
+    ) -> MeasurementTable:
         row_count = max(
             len(values),
             len(names),
@@ -3392,36 +3392,6 @@ class ACStateEstimator:
             device_pos=device_pos,
         )
         return table
-
-    @staticmethod
-    def _table_backed_pseudo_measurements(
-        names: Sequence[str],
-        device_types: Sequence[str],
-        device_names: Sequence[str],
-        meas_types: Sequence[str],
-        values: Sequence[float],
-        weight: float,
-        *,
-        idx_start: int = 0,
-        device_type_codes: Optional[Sequence[int]] = None,
-        meas_type_codes: Optional[Sequence[int]] = None,
-        device_positions: Optional[Sequence[int]] = None,
-    ) -> TableBackedMeasurementList:
-        return TableBackedMeasurementList(
-            ACStateEstimator._pseudo_measurement_table(
-                names,
-                device_types,
-                device_names,
-                meas_types,
-                values,
-                weight,
-                idx_start=idx_start,
-                device_type_codes=device_type_codes,
-                meas_type_codes=meas_type_codes,
-                device_positions=device_positions,
-            ),
-            normalized=True,
-        )
 
     def _append_pseudo_measurement_rows(
         self,
@@ -3609,7 +3579,7 @@ class ACStateEstimator:
         added_keys = set()
         topology_weight = float(self.pseudo_measurement_weight) * 1e-4
         ppc = self._ac_ppc_dict()
-        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        store_strings = False
         pseudo_rows = _PseudoMeasurementBuffer(
             3
             * (
@@ -3730,7 +3700,7 @@ class ACStateEstimator:
         next_idx, topology_added_keys = self._add_pseudo_topology_measurements(next_idx)
         added_keys.update(topology_added_keys)
         ppc = self._ac_ppc_dict()
-        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        store_strings = False
         pseudo_rows = _PseudoMeasurementBuffer(
             3
             * (
@@ -4224,7 +4194,7 @@ class ACStateEstimator:
         topology = ppc.get("_topology_arrays")
         if topology is None:
             self._warn_required_runtime_missing("PPC topology arrays", "observability pseudo candidate build")
-        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        store_strings = False
         candidate_rows = _PseudoMeasurementBuffer(
             int(np.asarray(ppc.get("bus", np.zeros((0, len(BUS_COLS)))), dtype=np.float64).shape[0])
             + 3 * int(np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64).shape[0])
@@ -4941,7 +4911,7 @@ class ACStateEstimator:
             return
         row_count = 2 * node_count
         weight = 10.0
-        store_strings = not bool(getattr(self, "_array_only_runtime", False))
+        store_strings = False
         if store_strings:
             node_names = np.asarray(getattr(self, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
             names = np.empty(row_count, dtype=object)
@@ -8198,10 +8168,6 @@ class ACStateEstimator:
         )
         return H.to_csr() if sparse else H
 
-    def jacobian(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
-        """Assemble the WLS measurement Jacobian as a dense array for diagnostics/tests."""
-        return self._assemble_jacobian(x, measurements, sparse=False)
-
     def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None):
         """Assemble the WLS measurement Jacobian directly as sparse CSR triplets."""
         return self._assemble_jacobian(x, measurements, sparse=True)
@@ -8703,23 +8669,10 @@ class ACStateEstimator:
             gain = full_normal_equation_from_lower(gain)
             if start is not None:
                 self._record_profile_time("solve.full_gain_from_lower", time.perf_counter() - start)
-        array_only_result = bool(getattr(self, "_array_only_estimate_result", False))
-        if not array_only_result:
-            self.apply_state(x)
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         result_table = self._common_measurement_plan_table(measurement_plan_tables).table
-        if array_only_result:
-            result_measurements = []
-        elif source_measurements is not None:
-            result_measurements = source_measurements
-        elif active_measurement_run:
-            result_measurements = self.active_measurements
-        else:
-            result_measurements = TableBackedMeasurementList(
-                result_table,
-                normalized=getattr(self.measurements, "normalized", True),
-            )
+        result_measurements = []
         return EstimateResult(
             converged=converged,
             iterations=iteration,
@@ -8808,17 +8761,19 @@ class ACStateEstimator:
             if normalized_residual is None:
                 normalized_residual = computed_normalized
         if mode == "summary":
-            self.se_result = build_seresult_summary(
+            self.se_result = build_seresult_summary_from_table(
                 result,
                 bad_items=bad_items,
-                all_measurements=self.measurements,
+                all_measurement_table=getattr(self.measurements, "table", None),
+                active_source_rows=getattr(self, "active_measurement_rows", None),
             )
             return self.se_result
-        self.se_result = SEResult.from_estimate_result(
+        self.se_result = build_seresult_full_from_table(
             result,
             bad_items=bad_items,
             normalized_residual=normalized_residual,
-            all_measurements=self.measurements,
+            all_measurement_table=getattr(self.measurements, "table", None),
+            active_source_rows=getattr(self, "active_measurement_rows", None),
         )
         return self.se_result
 
@@ -8838,14 +8793,9 @@ class ACStateEstimator:
         array_only = mode == "array"
         if array_only and remove_bad_data:
             raise ValueError("result_mode='array' cannot be combined with remove_bad_data=True")
-        previous_runtime_mode = bool(getattr(self, "_array_only_runtime", False))
-        self._array_only_runtime = array_only
+        self._array_only_runtime = True
         if not self._prepared:
-            try:
-                self.prepare()
-            except Exception:
-                self._array_only_runtime = previous_runtime_mode
-                raise
+            self.prepare()
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
         needs_bad_data = not skip_bad_data
         if observability is None:
@@ -8853,7 +8803,7 @@ class ACStateEstimator:
         self.observability_result = observability
         removed: List[BadDataItem] = []
         previous_array_only = bool(getattr(self, "_array_only_estimate_result", False))
-        self._array_only_estimate_result = array_only
+        self._array_only_estimate_result = True
         try:
             if remove_bad_data:
                 result, removed = self.estimate_with_bad_data_removal(
@@ -8869,7 +8819,7 @@ class ACStateEstimator:
                 )
         finally:
             self._array_only_estimate_result = previous_array_only
-            self._array_only_runtime = previous_runtime_mode
+            self._array_only_runtime = True
         self.estimate_result = result
         self.removed_bad_data = removed
         if skip_bad_data:
