@@ -2338,7 +2338,7 @@ class ACStateEstimator:
                 if hasattr(self, "_meas_device_name_sorted_id_cache"):
                     del self._meas_device_name_sorted_id_cache
                 if hasattr(self, "_ac_measurement_plan_device_pos_by_type_code"):
-                    self._ac_measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
+                    self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
         table.device_name_id = self._meas_device_name_ids_for_ppc_names(meas_ppc, device_name_array)
         return True
 
@@ -2385,7 +2385,7 @@ class ACStateEstimator:
 
         device_maps = device_pos_by_type_code or self._ac_measurement_plan_device_pos_by_type_code
         if device_pos_by_type_code is None:
-            device_pos_by_id = getattr(self, "_ac_measurement_plan_device_pos_by_type_code_id", {})
+            device_pos_by_id = getattr(self, "_measurement_plan_device_pos_by_type_code_id", {})
         else:
             device_pos_by_id = self._measurement_device_id_maps_for(device_maps)
         if not device_pos_by_id:
@@ -3129,7 +3129,7 @@ class ACStateEstimator:
 
     def _measurement_runtime_array_cache_key(self) -> Tuple[object, ...]:
         return (
-            id(getattr(self, "_ac_measurement_plan_device_pos_by_type_code_id", None)),
+            id(getattr(self, "_measurement_plan_device_pos_by_type_code_id", None)),
             id(getattr(self, "_ac_node_plan_pos", None)),
             id(getattr(self, "_ac_branch_plan_i", None)),
             id(getattr(self, "_ac_branch_plan_j", None)),
@@ -6484,7 +6484,7 @@ class ACStateEstimator:
             else:
                 present_device_codes = set(np.unique(np.asarray(table.device_type_code, dtype=np.int16)).astype(object, copy=False))
         self._ac_measurement_present_device_codes = present_device_codes
-        self._ac_measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
+        self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
         self._ac_branch_transformer_plan_kind_by_type_code = {
             DEVICE_TYPE_ACBranch: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
             DEVICE_TYPE_ACTransformer: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
@@ -6678,7 +6678,7 @@ class ACStateEstimator:
         self._ensure_measurement_plan_lookup_arrays()
         device_maps = device_pos_by_type_code or self._ac_measurement_plan_device_pos_by_type_code
         device_id_maps = (
-            getattr(self, "_ac_measurement_plan_device_pos_by_type_code_id", {})
+            getattr(self, "_measurement_plan_device_pos_by_type_code_id", {})
             if device_pos_by_type_code is None
             else self._measurement_device_id_maps_for(device_maps)
         )

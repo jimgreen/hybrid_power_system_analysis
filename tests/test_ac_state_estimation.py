@@ -45,7 +45,7 @@ class ACStateEstimationTest(unittest.TestCase):
             id_maps[int(type_code)] = lookup
 
         estimator._ac_measurement_plan_device_pos_by_type_code = name_maps
-        estimator._ac_measurement_plan_device_pos_by_type_code_id = id_maps
+        estimator._measurement_plan_device_pos_by_type_code_id = id_maps
         estimator._ac_branch_transformer_plan_kind_by_type_code = {
             mt.DEVICE_TYPE_ACBranch: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
             mt.DEVICE_TYPE_ACTransformer: ac_se._AC_TERMINAL_MEAS_TYPE_LOOKUP,
@@ -1400,7 +1400,7 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._meas_device_name_id_by_name = reject_name_lookup
         estimator._build_measurement_plan_lookup_arrays()
 
-        lookup = estimator._ac_measurement_plan_device_pos_by_type_code_id
+        lookup = estimator._measurement_plan_device_pos_by_type_code_id
         self.assertTrue(lookup)
         self.assertTrue(any(np.any(values >= 0) for values in lookup.values()))
 
