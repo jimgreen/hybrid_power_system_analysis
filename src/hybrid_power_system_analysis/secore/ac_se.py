@@ -2252,9 +2252,16 @@ class ACStateEstimator:
         """Create measurement PPC arrays for explicit measurement sequences."""
         row_count = int(table.idx.size)
         device_name_array = np.asarray(table.device_name, dtype=object)
-        if row_count:
+        if row_count and int(device_name_array.size) == row_count:
             device_names, device_name_id = np.unique(device_name_array, return_inverse=True)
             device_name_id = device_name_id.astype(np.int64, copy=False)
+        elif row_count:
+            device_name_id = getattr(table, "device_name_id", None)
+            if device_name_id is None or np.asarray(device_name_id).size != row_count:
+                device_name_id = np.full(row_count, -1, dtype=np.int64)
+            else:
+                device_name_id = np.asarray(device_name_id, dtype=np.int64)
+            device_names = np.asarray([], dtype=object)
         else:
             device_names = np.asarray([], dtype=object)
             device_name_id = np.asarray([], dtype=np.int64)
@@ -2282,6 +2289,15 @@ class ACStateEstimator:
             "meas": meas,
             "meas_cols": MEAS_COLS,
             "meas_type_codes": MEAS_TYPE_CODES,
+            "idx_array": np.asarray(table.idx, dtype=np.int64),
+            "weight_array": np.asarray(table.weight, dtype=np.float64),
+            "valid_array": np.asarray(table.valid, dtype=bool),
+            "value_array": np.asarray(table.value, dtype=np.float64),
+            "status_array": np.asarray(status_code, dtype=np.int16),
+            "device_type_code_array": np.asarray(table.device_type_code, dtype=np.int16),
+            "device_name_id_array": device_name_id,
+            "meas_type_code_array": np.asarray(meas_type_code, dtype=np.int16),
+            "angle_mask_array": np.asarray(table.angle_mask, dtype=bool),
             "name": np.asarray(table.name, dtype=object),
             "device_type": np.asarray(table.device_type, dtype=object),
             "device_name": device_name_array,
@@ -6532,8 +6548,6 @@ class ACStateEstimator:
     def _measurement_plan_device_id_lookup_arrays(self, include_codes: Optional[set] = None) -> Dict[int, np.ndarray]:
         meas_ppc = self.meas_ppc
         device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
-        if device_names.size == 0:
-            return {}
         if include_codes is None:
             include_codes = getattr(self, "_ac_measurement_present_device_codes", None)
         device_name_id_array = meas_ppc.get("device_name_id_array")
@@ -6577,6 +6591,8 @@ class ACStateEstimator:
                         first_mask[1:] = row_ids[1:] != row_ids[:-1]
                         ordered_ids = row_ids[first_mask]
                         if ordered_ids.size == row_names.size:
+                            if device_names.size == 0:
+                                return lookup_from_ids(ordered_ids)
                             valid_ids = (ordered_ids >= 0) & (ordered_ids < device_names.size)
                             if np.all(valid_ids) and np.array_equal(
                                 device_names[ordered_ids.astype(np.intp, copy=False)],

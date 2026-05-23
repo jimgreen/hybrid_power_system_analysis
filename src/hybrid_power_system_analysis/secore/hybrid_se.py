@@ -617,6 +617,7 @@ class HybridStateEstimator:
         stage_start = time.perf_counter()
         self.meas_ppc = build_meas_ppc_from_e_file(
             self.meas_file,
+            include_strings=False,
             use_cache=False,
             include_matrix=False,
         )
@@ -640,6 +641,7 @@ class HybridStateEstimator:
         stage_start = time.perf_counter()
         self._build_device_maps()
         self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
+        self._populate_measurement_device_pos_from_sub_estimators()
 
         if self._try_delegate_uncoupled_single_side():
             self._prepared = True
@@ -1221,14 +1223,21 @@ class HybridStateEstimator:
                 active = valid & (weight > 0.0)
                 known = np.zeros(table_size, dtype=bool)
                 rows_by_code = getattr(table, "rows_by_device_type_code", None) or {}
-                device_type = np.asarray(table.device_type, dtype=object)
-                device_name = np.asarray(table.device_name, dtype=object)
+                has_strings = self._measurement_table_has_string_columns(table)
+                device_type = np.asarray(table.device_type, dtype=object) if has_strings else np.asarray([], dtype=object)
+                device_name = np.asarray(table.device_name, dtype=object) if has_strings else np.asarray([], dtype=object)
+                device_pos = getattr(table, "device_pos", None)
+                has_device_pos = device_pos is not None and np.asarray(device_pos).size == table_size
+                if has_device_pos:
+                    device_pos = np.asarray(device_pos, dtype=np.int64)
 
                 def rows_for_device_type(device_type_name: str) -> np.ndarray:
                     code = DEVICE_TYPE_CODES.get(device_type_name)
                     rows = rows_by_code.get(code) if code is not None else None
-                    if rows is None:
+                    if rows is None and has_strings:
                         rows = np.flatnonzero(device_type == device_type_name)
+                    if rows is None:
+                        rows = np.asarray([], dtype=np.int64)
                     return np.asarray(rows, dtype=np.int64)
 
                 for device_type_name in unsupported_switch_rows:
@@ -1250,12 +1259,17 @@ class HybridStateEstimator:
                     if not devices:
                         disabled_rows.append(rows)
                         continue
-                    # `tolist()` + list comp avoids per-element numpy unboxing.
-                    name_list = device_name[rows].tolist()
-                    available = np.array(
-                        [name in devices for name in name_list],
-                        dtype=bool,
-                    )
+                    if has_device_pos:
+                        available = device_pos[rows] >= 0
+                    elif has_strings:
+                        # `tolist()` + list comp avoids per-element numpy unboxing.
+                        name_list = device_name[rows].tolist()
+                        available = np.array(
+                            [name in devices for name in name_list],
+                            dtype=bool,
+                        )
+                    else:
+                        available = np.zeros(rows.size, dtype=bool)
                     if not np.all(available):
                         disabled_rows.append(rows[~available])
 
@@ -1850,6 +1864,32 @@ class HybridStateEstimator:
         lookup[ids[valid].astype(np.intp, copy=False)] = np.flatnonzero(valid).astype(np.int64, copy=False)
         return lookup
 
+    def _device_id_lookup_from_master_rows(self, device_type_code: int, plan_size: int) -> np.ndarray:
+        meas_ppc = getattr(self, "meas_ppc", {})
+        if not isinstance(meas_ppc, dict) or int(plan_size) <= 0:
+            return np.asarray([], dtype=np.int64)
+        rows_by_code = meas_ppc.get("rows_by_device_type_code")
+        rows = rows_by_code.get(int(device_type_code)) if isinstance(rows_by_code, dict) else None
+        if rows is None:
+            return np.asarray([], dtype=np.int64)
+        rows = np.asarray(rows, dtype=np.int64)
+        device_name_id = meas_ppc.get("device_name_id_array")
+        if not isinstance(device_name_id, np.ndarray) or rows.size == 0:
+            return np.asarray([], dtype=np.int64)
+        ids = np.asarray(device_name_id, dtype=np.int64)[rows.astype(np.intp, copy=False)]
+        ids = ids[ids >= 0]
+        if ids.size == 0:
+            return np.asarray([], dtype=np.int64)
+        unique_ids, first_pos = np.unique(ids, return_index=True)
+        order = np.argsort(first_pos, kind="stable")
+        ordered_ids = unique_ids[order]
+        if int(ordered_ids.size) != int(plan_size):
+            return np.asarray([], dtype=np.int64)
+        lookup = np.empty(int(ordered_ids.max()) + 1, dtype=np.int64)
+        lookup.fill(-1)
+        lookup[ordered_ids.astype(np.intp, copy=False)] = np.arange(ordered_ids.size, dtype=np.int64)
+        return lookup
+
     def _measurement_plan_device_lookup_by_master_ids(self) -> Dict[int, np.ndarray]:
         cached = getattr(self, "_measurement_plan_device_lookup_by_master_ids_cache", None)
         if cached is not None:
@@ -1862,6 +1902,10 @@ class HybridStateEstimator:
                 rows = np.asarray(rows, dtype=np.int64)
                 if rows.size == 0:
                     lookup_by_code[int(code)] = np.asarray([], dtype=np.int64)
+                    continue
+                fast_lookup = self._device_id_lookup_from_master_rows(int(code), int(rows.size))
+                if fast_lookup.size:
+                    lookup_by_code[int(code)] = fast_lookup
                     continue
                 row_names = np.asarray(names, dtype=object)[rows.astype(np.intp, copy=False)]
                 lookup_by_code[int(code)] = self._device_id_lookup_from_names(row_names)
@@ -1889,14 +1933,20 @@ class HybridStateEstimator:
             for name, values in dc_name_arrays.items():
                 code = DEVICE_TYPE_CODES.get(name)
                 if code is not None:
-                    lookup_by_code[int(code)] = self._device_id_lookup_from_names(
-                        np.asarray(values, dtype=object)
+                    values = np.asarray(values, dtype=object)
+                    fast_lookup = self._device_id_lookup_from_master_rows(int(code), int(values.size))
+                    lookup_by_code[int(code)] = (
+                        fast_lookup if fast_lookup.size else self._device_id_lookup_from_names(values)
                     )
-        lookup_by_code[int(DEVICE_TYPE_CODES["DCACConverter"])] = self._device_id_lookup_from_names(
-            [conv.name for conv in self.dcac_converters]
+        dcac_code = int(DEVICE_TYPE_CODES["DCACConverter"])
+        acac_code = int(DEVICE_TYPE_CODES["ACACConverter"])
+        fast_lookup = self._device_id_lookup_from_master_rows(dcac_code, len(self.dcac_converters))
+        lookup_by_code[dcac_code] = (
+            fast_lookup if fast_lookup.size else self._device_id_lookup_from_names([conv.name for conv in self.dcac_converters])
         )
-        lookup_by_code[int(DEVICE_TYPE_CODES["ACACConverter"])] = self._device_id_lookup_from_names(
-            [conv.name for conv in self.acac_converters]
+        fast_lookup = self._device_id_lookup_from_master_rows(acac_code, len(self.acac_converters))
+        lookup_by_code[acac_code] = (
+            fast_lookup if fast_lookup.size else self._device_id_lookup_from_names([conv.name for conv in self.acac_converters])
         )
         self._measurement_plan_device_lookup_by_master_ids_cache = lookup_by_code
         return lookup_by_code
@@ -2028,39 +2078,28 @@ class HybridStateEstimator:
         if meas_code.size != table.value.size:
             meas_code = np.zeros(table.value.size, dtype=np.int16)
         device_pos = self._hybrid_measurement_device_pos_array(table)
+        self._ensure_hybrid_converter_scale_cache()
 
         dcac_rows = np.flatnonzero(active & (code == DEVICE_TYPE_DCACConverter) & (device_pos >= 0))
         if dcac_rows.size:
             dcac_pos = device_pos[dcac_rows].astype(np.intp, copy=False)
-            dc_nodes = np.asarray([int(conv.dc_node) for conv in self.dcac_converters], dtype=np.int64)
-            ac_nodes = np.asarray([int(conv.ac_node) for conv in self.dcac_converters], dtype=np.int64)
-            dcac_dc_v_scale = np.asarray([self._dc_voltage_file_base(int(node)) for node in dc_nodes], dtype=np.float64)
-            dcac_dc_i_scale = np.asarray([self._dc_current_base(int(node)) for node in dc_nodes], dtype=np.float64)
-            dcac_ac_v_scale = np.asarray([self._ac_voltage_file_base(int(node)) for node in ac_nodes], dtype=np.float64)
-            dcac_ac_i_scale = np.asarray([self._ac_current_base(int(node)) for node in ac_nodes], dtype=np.float64)
             scale_vals = np.ones(dcac_rows.size, dtype=np.float64)
             dcac_meas = meas_code[dcac_rows]
             power_mask = (dcac_meas == MEAS_TYPE_P_DC) | (dcac_meas == MEAS_TYPE_P_AC) | (dcac_meas == MEAS_TYPE_Q_AC)
             scale_vals[power_mask] = self._power_file_base()
             mask = dcac_meas == MEAS_TYPE_V_DC
-            scale_vals[mask] = dcac_dc_v_scale[dcac_pos[mask]]
+            scale_vals[mask] = self._dcac_dc_v_file_scale_by_pos[dcac_pos[mask]]
             mask = dcac_meas == MEAS_TYPE_I_DC
-            scale_vals[mask] = dcac_dc_i_scale[dcac_pos[mask]]
+            scale_vals[mask] = self._dcac_dc_i_file_scale_by_pos[dcac_pos[mask]]
             mask = dcac_meas == MEAS_TYPE_V_AC
-            scale_vals[mask] = dcac_ac_v_scale[dcac_pos[mask]]
+            scale_vals[mask] = self._dcac_ac_v_file_scale_by_pos[dcac_pos[mask]]
             mask = dcac_meas == MEAS_TYPE_I_AC
-            scale_vals[mask] = dcac_ac_i_scale[dcac_pos[mask]]
+            scale_vals[mask] = self._dcac_ac_i_file_scale_by_pos[dcac_pos[mask]]
             scale[dcac_rows] = scale_vals
 
         acac_rows = np.flatnonzero(active & (code == DEVICE_TYPE_ACACConverter) & (device_pos >= 0))
         if acac_rows.size:
             acac_pos = device_pos[acac_rows].astype(np.intp, copy=False)
-            from_nodes = np.asarray([int(conv.i_node) for conv in self.acac_converters], dtype=np.int64)
-            to_nodes = np.asarray([int(conv.j_node) for conv in self.acac_converters], dtype=np.int64)
-            from_v_scale = np.asarray([self._ac_voltage_file_base(int(node)) for node in from_nodes], dtype=np.float64)
-            from_i_scale = np.asarray([self._ac_current_base(int(node)) for node in from_nodes], dtype=np.float64)
-            to_v_scale = np.asarray([self._ac_voltage_file_base(int(node)) for node in to_nodes], dtype=np.float64)
-            to_i_scale = np.asarray([self._ac_current_base(int(node)) for node in to_nodes], dtype=np.float64)
             scale_vals = np.ones(acac_rows.size, dtype=np.float64)
             acac_meas = meas_code[acac_rows]
             power_mask = (
@@ -2071,13 +2110,13 @@ class HybridStateEstimator:
             )
             scale_vals[power_mask] = self._power_file_base()
             mask = acac_meas == MEAS_TYPE_V_FROM
-            scale_vals[mask] = from_v_scale[acac_pos[mask]]
+            scale_vals[mask] = self._acac_from_v_file_scale_by_pos[acac_pos[mask]]
             mask = acac_meas == MEAS_TYPE_I_FROM
-            scale_vals[mask] = from_i_scale[acac_pos[mask]]
+            scale_vals[mask] = self._acac_from_i_file_scale_by_pos[acac_pos[mask]]
             mask = acac_meas == MEAS_TYPE_V_TO
-            scale_vals[mask] = to_v_scale[acac_pos[mask]]
+            scale_vals[mask] = self._acac_to_v_file_scale_by_pos[acac_pos[mask]]
             mask = acac_meas == MEAS_TYPE_I_TO
-            scale_vals[mask] = to_i_scale[acac_pos[mask]]
+            scale_vals[mask] = self._acac_to_i_file_scale_by_pos[acac_pos[mask]]
             scale[acac_rows] = scale_vals
 
         table.value[active] = np.divide(
@@ -2181,6 +2220,141 @@ class HybridStateEstimator:
         if int(node_idx) in node_dict:
             return float(node_dict[int(node_idx)].vbase)
         return 1.0
+
+    @staticmethod
+    def _lookup_node_values_by_idx(
+        node_idx: np.ndarray,
+        ids: np.ndarray,
+        pos: np.ndarray,
+        values: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.ones(nodes.size, dtype=np.float64)
+        matched_rows = np.zeros(nodes.size, dtype=bool)
+        ids = np.asarray(ids, dtype=np.int64)
+        pos = np.asarray(pos, dtype=np.int64)
+        values = np.asarray(values, dtype=np.float64)
+        if nodes.size == 0 or ids.size == 0 or pos.size == 0 or values.size == 0:
+            return out, matched_rows
+        loc = np.searchsorted(ids, nodes)
+        in_range = loc < ids.size
+        if not np.any(in_range):
+            return out, matched_rows
+        rows = np.flatnonzero(in_range)
+        loc_rows = loc[rows].astype(np.intp, copy=False)
+        matched = ids[loc_rows] == nodes[rows]
+        if not np.any(matched):
+            return out, matched_rows
+        matched_row_idx = rows[matched]
+        value_pos = pos[loc[matched_row_idx].astype(np.intp, copy=False)]
+        valid = (value_pos >= 0) & (value_pos < values.size)
+        if np.any(valid):
+            final_rows = matched_row_idx[valid]
+            out[final_rows] = values[value_pos[valid].astype(np.intp, copy=False)]
+            matched_rows[final_rows] = True
+        return out, matched_rows
+
+    def _ac_voltage_base_array(self, node_idx: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.ones(nodes.size, dtype=np.float64)
+        matched = np.zeros(nodes.size, dtype=bool)
+        estimator = getattr(self, "_ac_sub_estimator", None)
+        if estimator is not None and nodes.size:
+            out, matched = self._lookup_node_values_by_idx(
+                nodes,
+                getattr(estimator, "_ac_node_id_lookup_ids", np.asarray([], dtype=np.int64)),
+                getattr(estimator, "_ac_node_id_lookup_pos", np.asarray([], dtype=np.int64)),
+                getattr(estimator, "_ac_node_vbase_by_pos", np.asarray([], dtype=np.float64)),
+            )
+        if nodes.size and not np.all(matched):
+            node_dict = getattr(getattr(self.network, "ac", None), "node_dict", {})
+            for row in np.flatnonzero(~matched):
+                node = node_dict.get(int(nodes[int(row)]))
+                if node is not None:
+                    out[int(row)] = float(getattr(node, "vbase", 1.0) or 1.0)
+        return out
+
+    def _dc_voltage_base_array(self, node_idx: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.ones(nodes.size, dtype=np.float64)
+        matched = np.zeros(nodes.size, dtype=bool)
+        estimator = getattr(self, "_dc_sub_estimator", None)
+        if estimator is not None and nodes.size:
+            out, matched = self._lookup_node_values_by_idx(
+                nodes,
+                getattr(estimator, "_node_idx_lookup_ids", np.asarray([], dtype=np.int64)),
+                getattr(estimator, "_node_idx_lookup_pos", np.asarray([], dtype=np.int64)),
+                getattr(estimator, "_node_vbase_by_pos", np.asarray([], dtype=np.float64)),
+            )
+        if nodes.size and not np.all(matched):
+            node_dict = getattr(getattr(self.network, "dc", None), "node_dict", {})
+            for row in np.flatnonzero(~matched):
+                node = node_dict.get(int(nodes[int(row)]))
+                if node is not None:
+                    out[int(row)] = float(getattr(node, "vbase", 1.0) or 1.0)
+        return out
+
+    def _ac_current_base_array(self, node_idx: np.ndarray) -> np.ndarray:
+        voltage_base = self._ac_voltage_base_array(node_idx)
+        current = np.ones(voltage_base.size, dtype=np.float64)
+        valid = np.abs(voltage_base) > 1e-12
+        if np.any(valid):
+            current[valid] = self.p_base_kW / (1000.0 * np.sqrt(3.0) * np.abs(voltage_base[valid]))
+        return self.i_scale * current
+
+    def _dc_current_base_array(self, node_idx: np.ndarray) -> np.ndarray:
+        voltage_base = self._dc_voltage_base_array(node_idx)
+        current = np.ones(voltage_base.size, dtype=np.float64)
+        valid = np.abs(voltage_base) > 1e-12
+        if np.any(valid):
+            current[valid] = self.p_base_kW / (1000.0 * np.abs(voltage_base[valid]))
+        return self.i_scale * current
+
+    def _ensure_hybrid_converter_node_cache(self) -> None:
+        dcac_count = len(self.dcac_converters)
+        acac_count = len(self.acac_converters)
+        if (
+            getattr(self, "_dcac_count", None) == dcac_count
+            and getattr(self, "_acac_count", None) == acac_count
+            and hasattr(self, "_dcac_dc_node")
+            and hasattr(self, "_dcac_ac_node")
+            and hasattr(self, "_acac_i_node")
+            and hasattr(self, "_acac_j_node")
+        ):
+            return
+        self._dcac_count = dcac_count
+        self._acac_count = acac_count
+        self._dcac_dc_node = np.asarray([int(conv.dc_node) for conv in self.dcac_converters], dtype=np.int64)
+        self._dcac_ac_node = np.asarray([int(conv.ac_node) for conv in self.dcac_converters], dtype=np.int64)
+        self._acac_i_node = np.asarray([int(conv.i_node) for conv in self.acac_converters], dtype=np.int64)
+        self._acac_j_node = np.asarray([int(conv.j_node) for conv in self.acac_converters], dtype=np.int64)
+        if hasattr(self, "_hybrid_converter_scale_cache_key"):
+            delattr(self, "_hybrid_converter_scale_cache_key")
+
+    def _ensure_hybrid_converter_scale_cache(self) -> None:
+        self._ensure_hybrid_converter_node_cache()
+        cache_key = (
+            int(self._dcac_count),
+            int(self._acac_count),
+            float(getattr(self, "p_base_kW", 1.0)),
+            float(getattr(self, "u_scale", 1.0)),
+            float(getattr(self, "i_scale", 1.0)),
+        )
+        if getattr(self, "_hybrid_converter_scale_cache_key", None) == cache_key:
+            return
+        dcac_dc_v = self._dc_voltage_base_array(self._dcac_dc_node)
+        dcac_ac_v = self._ac_voltage_base_array(self._dcac_ac_node)
+        acac_i_v = self._ac_voltage_base_array(self._acac_i_node)
+        acac_j_v = self._ac_voltage_base_array(self._acac_j_node)
+        self._dcac_dc_v_file_scale_by_pos = self.u_scale * dcac_dc_v
+        self._dcac_ac_v_file_scale_by_pos = self.u_scale * dcac_ac_v
+        self._acac_from_v_file_scale_by_pos = self.u_scale * acac_i_v
+        self._acac_to_v_file_scale_by_pos = self.u_scale * acac_j_v
+        self._dcac_dc_i_file_scale_by_pos = self._dc_current_base_array(self._dcac_dc_node)
+        self._dcac_ac_i_file_scale_by_pos = self._ac_current_base_array(self._dcac_ac_node)
+        self._acac_from_i_file_scale_by_pos = self._ac_current_base_array(self._acac_i_node)
+        self._acac_to_i_file_scale_by_pos = self._ac_current_base_array(self._acac_j_node)
+        self._hybrid_converter_scale_cache_key = cache_key
 
     def _ac_current_base(self, node_idx: int) -> float:
         return self.i_scale * ac_current_base_ka(self.p_base_kW, self._ac_voltage_base(node_idx))
@@ -2634,12 +2808,7 @@ class HybridStateEstimator:
         self._partition_state_variables()
 
     def _build_hybrid_converter_array_cache(self) -> None:
-        self._dcac_count = len(self.dcac_converters)
-        self._acac_count = len(self.acac_converters)
-        self._dcac_dc_node = np.asarray([int(conv.dc_node) for conv in self.dcac_converters], dtype=np.int64)
-        self._dcac_ac_node = np.asarray([int(conv.ac_node) for conv in self.dcac_converters], dtype=np.int64)
-        self._acac_i_node = np.asarray([int(conv.i_node) for conv in self.acac_converters], dtype=np.int64)
-        self._acac_j_node = np.asarray([int(conv.j_node) for conv in self.acac_converters], dtype=np.int64)
+        self._ensure_hybrid_converter_node_cache()
         self._dcac_dc_v_col_by_pos = self._dc_voltage_cols_for_nodes(self._dcac_dc_node)
         self._dcac_ac_v_col_by_pos = self._ac_voltage_cols_for_nodes(self._dcac_ac_node)
         self._dcac_dc_v_default_by_pos = self._dc_voltage_defaults_for_nodes(self._dcac_dc_node)
