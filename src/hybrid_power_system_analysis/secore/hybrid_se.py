@@ -97,7 +97,9 @@ from secore.se_math import (
     measurement_leverage,
     observability_rank_details,
     observability_weak_direction,
+    sparse_structural_rank,
     targeted_redundancy_count,
+    unanchored_angle_state_indices,
 )
 from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_result_mode
 from secore.state_metadata import StateMeta, state_labels_from_metadata, state_meta_at
@@ -1832,7 +1834,14 @@ class HybridStateEstimator:
         name_to_id = meas_ppc.get("device_name_id_by_name", {}) if isinstance(meas_ppc, dict) else {}
         if not name_to_id:
             return np.asarray([], dtype=np.int64)
-        ids = np.asarray([int(name_to_id.get(str(name), -1)) for name in names], dtype=np.int64)
+        names_array = np.asarray(names, dtype=object)
+        ids = np.empty(int(names_array.size), dtype=np.int64)
+        get_id = name_to_id.get
+        for idx, name in enumerate(names_array):
+            value = get_id(name)
+            if value is None:
+                value = get_id(str(name), -1)
+            ids[idx] = int(value)
         valid = ids >= 0
         if not np.any(valid):
             return np.asarray([], dtype=np.int64)
@@ -2631,46 +2640,14 @@ class HybridStateEstimator:
         self._dcac_ac_node = np.asarray([int(conv.ac_node) for conv in self.dcac_converters], dtype=np.int64)
         self._acac_i_node = np.asarray([int(conv.i_node) for conv in self.acac_converters], dtype=np.int64)
         self._acac_j_node = np.asarray([int(conv.j_node) for conv in self.acac_converters], dtype=np.int64)
-        self._dcac_dc_v_col_by_pos = np.fromiter(
-            (self._dc_voltage_col_for_node(int(node)) for node in self._dcac_dc_node),
-            dtype=np.int32,
-            count=self._dcac_count,
-        )
-        self._dcac_ac_v_col_by_pos = np.fromiter(
-            (self._ac_voltage_col_for_node(int(node)) for node in self._dcac_ac_node),
-            dtype=np.int32,
-            count=self._dcac_count,
-        )
-        self._dcac_dc_v_default_by_pos = np.fromiter(
-            (self._dc_voltage_default_for_node(int(node)) for node in self._dcac_dc_node),
-            dtype=np.float64,
-            count=self._dcac_count,
-        )
-        self._dcac_ac_v_default_by_pos = np.fromiter(
-            (self._ac_voltage_default_for_node(int(node)) for node in self._dcac_ac_node),
-            dtype=np.float64,
-            count=self._dcac_count,
-        )
-        self._acac_from_v_col_by_pos = np.fromiter(
-            (self._ac_voltage_col_for_node(int(node)) for node in self._acac_i_node),
-            dtype=np.int32,
-            count=self._acac_count,
-        )
-        self._acac_to_v_col_by_pos = np.fromiter(
-            (self._ac_voltage_col_for_node(int(node)) for node in self._acac_j_node),
-            dtype=np.int32,
-            count=self._acac_count,
-        )
-        self._acac_from_v_default_by_pos = np.fromiter(
-            (self._ac_voltage_default_for_node(int(node)) for node in self._acac_i_node),
-            dtype=np.float64,
-            count=self._acac_count,
-        )
-        self._acac_to_v_default_by_pos = np.fromiter(
-            (self._ac_voltage_default_for_node(int(node)) for node in self._acac_j_node),
-            dtype=np.float64,
-            count=self._acac_count,
-        )
+        self._dcac_dc_v_col_by_pos = self._dc_voltage_cols_for_nodes(self._dcac_dc_node)
+        self._dcac_ac_v_col_by_pos = self._ac_voltage_cols_for_nodes(self._dcac_ac_node)
+        self._dcac_dc_v_default_by_pos = self._dc_voltage_defaults_for_nodes(self._dcac_dc_node)
+        self._dcac_ac_v_default_by_pos = self._ac_voltage_defaults_for_nodes(self._dcac_ac_node)
+        self._acac_from_v_col_by_pos = self._ac_voltage_cols_for_nodes(self._acac_i_node)
+        self._acac_to_v_col_by_pos = self._ac_voltage_cols_for_nodes(self._acac_j_node)
+        self._acac_from_v_default_by_pos = self._ac_voltage_defaults_for_nodes(self._acac_i_node)
+        self._acac_to_v_default_by_pos = self._ac_voltage_defaults_for_nodes(self._acac_j_node)
         flat_parts = []
         nonflat_parts = []
         if self._dcac_count:
@@ -4659,12 +4636,42 @@ class HybridStateEstimator:
         value = int(pos[loc])
         return value if value >= 0 else -1
 
+    @staticmethod
+    def _lookup_node_pos_array_by_idx(node_idx: np.ndarray, ids: np.ndarray, pos: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.full(nodes.size, -1, dtype=np.int64)
+        ids = np.asarray(ids, dtype=np.int64)
+        pos = np.asarray(pos, dtype=np.int64)
+        if nodes.size == 0 or ids.size == 0 or pos.size == 0:
+            return out
+        loc = np.searchsorted(ids, nodes)
+        in_range = loc < ids.size
+        if np.any(in_range):
+            rows = np.flatnonzero(in_range)
+            matched = ids[loc[rows].astype(np.intp, copy=False)] == nodes[rows]
+            if np.any(matched):
+                matched_rows = rows[matched]
+                values = pos[loc[matched_rows].astype(np.intp, copy=False)]
+                valid = values >= 0
+                out[matched_rows[valid]] = values[valid]
+        return out
+
     def _ac_node_pos_for_idx(self, node_idx: int) -> int:
         ac = self._ac_sub_estimator
         if ac is None:
             return -1
         return self._lookup_node_pos_by_idx(
             int(node_idx),
+            getattr(ac, "_ac_node_id_lookup_ids", np.asarray([], dtype=np.int64)),
+            getattr(ac, "_ac_node_id_lookup_pos", np.asarray([], dtype=np.int64)),
+        )
+
+    def _ac_node_pos_for_idx_array(self, node_idx: np.ndarray) -> np.ndarray:
+        ac = self._ac_sub_estimator
+        if ac is None:
+            return np.full(np.asarray(node_idx, dtype=np.int64).size, -1, dtype=np.int64)
+        return self._lookup_node_pos_array_by_idx(
+            node_idx,
             getattr(ac, "_ac_node_id_lookup_ids", np.asarray([], dtype=np.int64)),
             getattr(ac, "_ac_node_id_lookup_pos", np.asarray([], dtype=np.int64)),
         )
@@ -4695,6 +4702,16 @@ class HybridStateEstimator:
             getattr(dc, "_node_idx_lookup_pos", np.asarray([], dtype=np.int64)),
         )
 
+    def _dc_node_pos_for_idx_array(self, node_idx: np.ndarray) -> np.ndarray:
+        dc = self._dc_sub_estimator
+        if dc is None:
+            return np.full(np.asarray(node_idx, dtype=np.int64).size, -1, dtype=np.int64)
+        return self._lookup_node_pos_array_by_idx(
+            node_idx,
+            getattr(dc, "_node_idx_lookup_ids", np.asarray([], dtype=np.int64)),
+            getattr(dc, "_node_idx_lookup_pos", np.asarray([], dtype=np.int64)),
+        )
+
     def _ac_voltage_col_for_node(self, node_idx: int) -> int:
         ac = self._ac_sub_estimator
         pos = self._ac_node_pos_for_idx(int(node_idx))
@@ -4702,6 +4719,21 @@ class HybridStateEstimator:
             return -1
         col = int(ac.voltage_col[pos])
         return col if col >= 0 else -1
+
+    def _ac_voltage_cols_for_nodes(self, node_idx: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.full(nodes.size, -1, dtype=np.int32)
+        ac = self._ac_sub_estimator
+        if ac is None or nodes.size == 0:
+            return out
+        pos = self._ac_node_pos_for_idx_array(nodes)
+        voltage_col = np.asarray(getattr(ac, "voltage_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        rows = np.flatnonzero((pos >= 0) & (pos < voltage_col.size))
+        if rows.size:
+            cols = voltage_col[pos[rows].astype(np.intp, copy=False)]
+            valid = cols >= 0
+            out[rows[valid]] = cols[valid]
+        return out
 
     def _ac_voltage_default_for_node(self, node_idx: int) -> float:
         ac = self._ac_sub_estimator
@@ -4716,6 +4748,31 @@ class HybridStateEstimator:
         node = self.ac_node_by_idx.get(int(node_idx))
         return float(getattr(node, "voltage", 1.0) or 1.0)
 
+    def _ac_voltage_defaults_for_nodes(self, node_idx: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.ones(nodes.size, dtype=np.float64)
+        ac = self._ac_sub_estimator
+        if ac is None or nodes.size == 0:
+            return out
+        pos = self._ac_node_pos_for_idx_array(nodes)
+        valid_pos = pos >= 0
+        file_voltage = getattr(ac, "file_voltage", None)
+        if file_voltage is not None:
+            voltage = np.asarray(file_voltage, dtype=np.float64)
+            rows = np.flatnonzero(valid_pos & (pos < voltage.size))
+            if rows.size:
+                values = voltage[pos[rows].astype(np.intp, copy=False)]
+                out[rows] = np.where(values != 0.0, values, 1.0)
+        for ref_pos, value in (getattr(ac, "ref_voltages", {}) or {}).items():
+            rows = np.flatnonzero(valid_pos & (pos == int(ref_pos)))
+            if rows.size:
+                out[rows] = float(value)
+        invalid_rows = np.flatnonzero(~valid_pos)
+        for row in invalid_rows:
+            node = self.ac_node_by_idx.get(int(nodes[row]))
+            out[row] = float(getattr(node, "voltage", 1.0) or 1.0)
+        return out
+
     def _dc_voltage_default_for_node(self, node_idx: int) -> float:
         dc = self._dc_sub_estimator
         pos = self._dc_node_pos_for_idx(int(node_idx))
@@ -4729,6 +4786,31 @@ class HybridStateEstimator:
         node = self.dc_node_by_idx.get(int(node_idx))
         return float(getattr(node, "voltage", 1.0) or 1.0)
 
+    def _dc_voltage_defaults_for_nodes(self, node_idx: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.ones(nodes.size, dtype=np.float64)
+        dc = self._dc_sub_estimator
+        if dc is None or nodes.size == 0:
+            return out
+        pos = self._dc_node_pos_for_idx_array(nodes)
+        valid_pos = pos >= 0
+        node_voltage = getattr(dc, "_node_voltage_by_pos", None)
+        if node_voltage is not None:
+            voltage = np.asarray(node_voltage, dtype=np.float64)
+            rows = np.flatnonzero(valid_pos & (pos < voltage.size))
+            if rows.size:
+                values = voltage[pos[rows].astype(np.intp, copy=False)]
+                out[rows] = np.where(values != 0.0, values, 1.0)
+        for ref_pos, value in (getattr(dc, "ref_voltages", {}) or {}).items():
+            rows = np.flatnonzero(valid_pos & (pos == int(ref_pos)))
+            if rows.size:
+                out[rows] = float(value)
+        invalid_rows = np.flatnonzero(~valid_pos)
+        for row in invalid_rows:
+            node = self.dc_node_by_idx.get(int(nodes[row]))
+            out[row] = float(getattr(node, "voltage", 1.0) or 1.0)
+        return out
+
     def _dc_voltage_col_for_node(self, node_idx: int) -> int:
         dc = self._dc_sub_estimator
         pos = self._dc_node_pos_for_idx(int(node_idx))
@@ -4736,6 +4818,21 @@ class HybridStateEstimator:
             return -1
         col = int(dc.voltage_col[pos])
         return self.dc_state_start + col if col >= 0 else -1
+
+    def _dc_voltage_cols_for_nodes(self, node_idx: np.ndarray) -> np.ndarray:
+        nodes = np.asarray(node_idx, dtype=np.int64)
+        out = np.full(nodes.size, -1, dtype=np.int32)
+        dc = self._dc_sub_estimator
+        if dc is None or nodes.size == 0:
+            return out
+        pos = self._dc_node_pos_for_idx_array(nodes)
+        voltage_col = np.asarray(getattr(dc, "voltage_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        rows = np.flatnonzero((pos >= 0) & (pos < voltage_col.size))
+        if rows.size:
+            cols = voltage_col[pos[rows].astype(np.intp, copy=False)]
+            valid = cols >= 0
+            out[rows[valid]] = (self.dc_state_start + cols[valid]).astype(np.int32, copy=False)
+        return out
 
     def _evaluate_active_hybrid_measurements(
         self,
@@ -5111,6 +5208,30 @@ class HybridStateEstimator:
             if default_active_request:
                 self._initial_observability_cache = result
             return result
+        if (
+            normal_matrix is None
+            and normal_factor_diag is None
+            and is_sparse_matrix(H)
+            and int(H.shape[0]) >= int(self.n_state)
+        ):
+            structural_rank = sparse_structural_rank(H)
+            if structural_rank == self.n_state:
+                ac_angle_cols = np.asarray(getattr(self, "ac_theta_state_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
+                unanchored_angles = unanchored_angle_state_indices(H, ac_angle_cols[ac_angle_cols >= 0])
+                if not unanchored_angles:
+                    result = ObservabilityResult(
+                        observable=True,
+                        rank=self.n_state,
+                        state_count=self.n_state,
+                        measurement_count=len(measurements),
+                        deficiency=0,
+                        singular_values=np.array([], dtype=np.float64),
+                        weak_states=[],
+                    )
+                    self._cache_observability_matrix(result, x, measurements, H)
+                    if default_active_request:
+                        self._initial_observability_cache = result
+                    return result
         rank, deficiency, s, weak_states = observability_rank_details(
             H,
             self.n_state,
@@ -5332,10 +5453,18 @@ class HybridStateEstimator:
         result: EstimateResult,
         threshold: Optional[float] = None,
     ) -> Tuple[List[BadDataItem], np.ndarray]:
+        profile_start = time.perf_counter() if self.profile_enabled else None
         delegate = self._delegate()
         if delegate is not None:
             return delegate.identify_bad_data(result, threshold)
         threshold = self.params.bad_threshold if threshold is None else threshold
+        if result.residual.size and threshold > 0.0:
+            normalized_upper_bound = np.abs(result.residual) / np.sqrt(1e-12)
+            if float(normalized_upper_bound.max()) <= float(threshold):
+                self._record_profile_time("bad_data.fast_residual_bound", 0.0)
+                if profile_start is not None:
+                    self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
+                return [], normalized_upper_bound
         measurement_table = getattr(result, "measurement_table", None)
         table_weight = getattr(measurement_table, "weight", None)
         if table_weight is not None and np.asarray(table_weight).size == result.residual.size:
@@ -5382,6 +5511,8 @@ class HybridStateEstimator:
                 )
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
+        if profile_start is not None:
+            self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
         return bad_items, normalized
 
     def build_se_result(
