@@ -27,7 +27,6 @@ from model.hybrid_array_model import (
 from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
 from model.meas_array_model import (
     build_meas_ppc_from_e_file,
-    copy_meas_ppc,
     measurement_list_from_meas_ppc,
     sync_meas_ppc_from_measurement_table,
 )
@@ -111,7 +110,9 @@ DEFAULT_MEAS = measurement_file("hybrid", "qinling.meas")
 
 def _read_measurements_direct(meas_file: Path):
     """Read Measurement rows through the shared PPC parser."""
-    return measurement_list_from_meas_ppc(copy_meas_ppc(build_meas_ppc_from_e_file(meas_file)))
+    return measurement_list_from_meas_ppc(
+        build_meas_ppc_from_e_file(meas_file, use_cache=False, include_matrix=False)
+    )
 
 
 def _measurement_table_from_measurements(measurements: Sequence[Measurement]):
@@ -607,7 +608,7 @@ class HybridStateEstimator:
         self.p_scale = float(getattr(self.network, "p_scale", 1.0))
         self.i_scale = float(getattr(self.network, "i_scale", 1.0))
         stage_start = time.perf_counter()
-        self.meas_ppc = copy_meas_ppc(build_meas_ppc_from_e_file(self.meas_file))
+        self.meas_ppc = build_meas_ppc_from_e_file(self.meas_file, use_cache=False, include_matrix=False)
         self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self._sub_measurement_sources_by_side = None
@@ -798,6 +799,8 @@ class HybridStateEstimator:
     def _build_device_maps(self) -> None:
         if hasattr(self, "_measurement_plan_device_lookup_by_master_ids_cache"):
             delattr(self, "_measurement_plan_device_lookup_by_master_ids_cache")
+        if hasattr(self, "_hybrid_converter_device_key_array_cache"):
+            delattr(self, "_hybrid_converter_device_key_array_cache")
         ac = self._ac_sub_estimator
         dc = self._dc_sub_estimator
         self.ac_nodes = list(getattr(ac, "nodes", [])) if ac is not None else []
@@ -1377,7 +1380,6 @@ class HybridStateEstimator:
         table = getattr(measurements, "table", None)
         if table is not None and len(table.idx) == len(measurements):
             active = table.valid & (table.weight > 0.0)
-            active_device_keys, active_measurement_keys = self._activity_key_sets_from_table(table, active)
             has_strings = self._measurement_table_has_string_columns(table)
             if has_strings:
                 device_type = np.asarray(table.device_type, dtype=object)
@@ -1434,7 +1436,9 @@ class HybridStateEstimator:
     def _copy_summary_attrs(attrs: Dict[str, object]) -> Dict[str, object]:
         copied = {}
         for name, value in attrs.items():
-            if isinstance(value, set):
+            if name == "_real_voltage_observation_node_cache":
+                copied[name] = value
+            elif isinstance(value, set):
                 copied[name] = set(value)
             elif isinstance(value, dict):
                 copied[name] = dict(value)
@@ -1474,16 +1478,13 @@ class HybridStateEstimator:
             return None
         summary_attrs = getattr(self, "_sub_measurement_global_summary_attrs", None)
         if summary_attrs is None:
-            summary = self._measurement_activity_summary()
             summary_attrs = {
                 "source_count": len(self.measurements),
-                "active_device_keys": summary.measured_devices,
-                "active_measurement_keys": summary.active_keys,
             }
             self._sub_measurement_global_summary_attrs = summary_attrs
         attrs = {
-            "_active_device_key_cache": summary_attrs["active_device_keys"],
-            "_active_measurement_key_cache": summary_attrs["active_measurement_keys"],
+            "_active_device_key_cache": set(),
+            "_active_measurement_key_cache": set(),
             "_max_measurement_idx": (
                 int(max_idx)
                 if max_idx is not None
@@ -1491,7 +1492,7 @@ class HybridStateEstimator:
             ),
         }
         if "_real_voltage_observation_node_cache" in side_attrs:
-            attrs["_real_voltage_observation_node_cache"] = dict(side_attrs["_real_voltage_observation_node_cache"])
+            attrs["_real_voltage_observation_node_cache"] = side_attrs["_real_voltage_observation_node_cache"]
         return attrs
 
     def _sub_measurement_context(
@@ -2314,6 +2315,9 @@ class HybridStateEstimator:
     def _add_hybrid_pseudo_measurements(self) -> None:
         next_idx = self._max_measurement_idx_fast(self.measurements) + 1
         measured_devices = self._active_hybrid_converter_measurement_devices()
+        converter_keys = self._hybrid_converter_device_key_array()
+        if converter_keys.size and all(int(key) in measured_devices for key in converter_keys):
+            return
         specs_to_add = []
         for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
             device_key = self._hybrid_converter_spec_device_key(spec)
@@ -2331,6 +2335,30 @@ class HybridStateEstimator:
                 spec.meas_type,
                 spec.value,
             )
+
+    def _hybrid_converter_device_key_array(self) -> np.ndarray:
+        cached = getattr(self, "_hybrid_converter_device_key_array_cache", None)
+        expected_size = len(self.dcac_converters) + len(self.acac_converters)
+        if cached is not None and int(np.asarray(cached).size) == expected_size:
+            return cached
+        parts = []
+        if self.dcac_converters:
+            parts.append(
+                self._packed_device_key_array(
+                    np.full(len(self.dcac_converters), DEVICE_TYPE_DCACConverter, dtype=np.int64),
+                    np.arange(len(self.dcac_converters), dtype=np.int64),
+                )
+            )
+        if self.acac_converters:
+            parts.append(
+                self._packed_device_key_array(
+                    np.full(len(self.acac_converters), DEVICE_TYPE_ACACConverter, dtype=np.int64),
+                    np.arange(len(self.acac_converters), dtype=np.int64),
+                )
+            )
+        keys = np.concatenate(parts).astype(np.int64, copy=False) if parts else np.empty(0, dtype=np.int64)
+        self._hybrid_converter_device_key_array_cache = keys
+        return keys
 
     def _active_hybrid_converter_measurement_devices(self) -> set:
         table = getattr(self.measurements, "table", None)
