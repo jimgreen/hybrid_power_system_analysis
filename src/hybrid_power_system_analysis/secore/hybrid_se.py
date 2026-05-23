@@ -111,7 +111,11 @@ DEFAULT_MEAS = measurement_file("hybrid", "qinling.meas")
 def _read_measurements_direct(meas_file: Path):
     """Read Measurement rows through the shared PPC parser."""
     return measurement_list_from_meas_ppc(
-        build_meas_ppc_from_e_file(meas_file, use_cache=False, include_matrix=False)
+        build_meas_ppc_from_e_file(
+            meas_file,
+            use_cache=False,
+            include_matrix=False,
+        )
     )
 
 
@@ -420,6 +424,7 @@ class HybridStateEstimator:
     class _MeasurementSideBlock:
         rows: np.ndarray
         measurements: Sequence[Measurement]
+        plan_tables: Optional[object] = None
 
     @dataclass(frozen=True)
     class _SubEstimatorMeasurementContext:
@@ -608,7 +613,11 @@ class HybridStateEstimator:
         self.p_scale = float(getattr(self.network, "p_scale", 1.0))
         self.i_scale = float(getattr(self.network, "i_scale", 1.0))
         stage_start = time.perf_counter()
-        self.meas_ppc = build_meas_ppc_from_e_file(self.meas_file, use_cache=False, include_matrix=False)
+        self.meas_ppc = build_meas_ppc_from_e_file(
+            self.meas_file,
+            use_cache=False,
+            include_matrix=False,
+        )
         self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
         self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self._sub_measurement_sources_by_side = None
@@ -1016,8 +1025,16 @@ class HybridStateEstimator:
         self.dc_meas = [meas for _row, meas in dc]
         self.hybrid_meas = [meas for _row, meas in hybrid]
         self._active_measurement_blocks = {
-            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
-            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "ac": self._MeasurementSideBlock(
+                self.ac_meas_rows,
+                self.ac_meas,
+                self._sub_measurement_plan_tables(self._ac_sub_estimator, self.ac_meas),
+            ),
+            "dc": self._MeasurementSideBlock(
+                self.dc_meas_rows,
+                self.dc_meas,
+                self._sub_measurement_plan_tables(self._dc_sub_estimator, self.dc_meas),
+            ),
             "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
         }
         self._active_ac_hybrid_rows = self.ac_meas_rows.copy()
@@ -1059,6 +1076,34 @@ class HybridStateEstimator:
                 [meas for _row, meas in hybrid],
             ),
         }
+
+    @staticmethod
+    def _sub_measurement_plan_tables(estimator, measurements: Sequence[Measurement]):
+        if estimator is None or len(measurements) == 0:
+            return None
+        builder = getattr(estimator, "_measurement_plan_tables_for", None)
+        if not callable(builder):
+            return None
+        plan_tables = builder(measurements)
+        if not hasattr(estimator, "_jacobian_builder"):
+            estimator._jacobian_builder = SparseJacobianBuilder((len(measurements), int(getattr(estimator, "n_state", 0))))
+            estimator._jacobian_builder._assume_fixed_pattern = True
+        setattr(estimator, "_active_measurement_plan_tables_cache", plan_tables)
+        for attr in (
+            "_active_branch_transformer_vector_plan",
+            "_active_zero_current_vector_plan",
+            "_active_simple_jacobian_plan",
+            "_active_balance_measurement_plan",
+            "_active_generator_measurement_plan",
+            "_active_measurement_plan",
+        ):
+            if hasattr(estimator, attr):
+                setattr(estimator, attr, None)
+        return plan_tables
+
+    @staticmethod
+    def _sub_measurement_runtime_input(block: "HybridStateEstimator._MeasurementSideBlock"):
+        return block.plan_tables if block.plan_tables is not None else block.measurements
 
     def _partition_state_variables(self) -> None:
         if (
@@ -1307,6 +1352,8 @@ class HybridStateEstimator:
                 result = set(names.tolist())
             else:
                 result = set()
+            if table_size >= len(measurements):
+                return result
             for meas in HybridStateEstimator._iter_measurements_from(measurements, table_size):
                 result.add(meas.name)
             return result
@@ -2737,8 +2784,16 @@ class HybridStateEstimator:
             self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
         self._jacobian_static_skip = np.zeros(len(self.active_measurements), dtype=bool)
         self._active_measurement_blocks = {
-            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
-            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "ac": self._MeasurementSideBlock(
+                self.ac_meas_rows,
+                self.ac_meas,
+                self._sub_measurement_plan_tables(self._ac_sub_estimator, self.ac_meas),
+            ),
+            "dc": self._MeasurementSideBlock(
+                self.dc_meas_rows,
+                self.dc_meas,
+                self._sub_measurement_plan_tables(self._dc_sub_estimator, self.dc_meas),
+            ),
             "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
         }
         self._active_hybrid_measurement_plan = self._build_hybrid_measurement_plan(
@@ -2824,8 +2879,16 @@ class HybridStateEstimator:
             self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
         self._jacobian_static_skip = np.zeros(len(self.active_measurements), dtype=bool)
         self._active_measurement_blocks = {
-            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
-            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "ac": self._MeasurementSideBlock(
+                self.ac_meas_rows,
+                self.ac_meas,
+                self._sub_measurement_plan_tables(self._ac_sub_estimator, self.ac_meas),
+            ),
+            "dc": self._MeasurementSideBlock(
+                self.dc_meas_rows,
+                self.dc_meas,
+                self._sub_measurement_plan_tables(self._dc_sub_estimator, self.dc_meas),
+            ),
             "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
         }
         self._active_hybrid_measurement_plan = self._build_hybrid_measurement_plan(
@@ -2907,8 +2970,16 @@ class HybridStateEstimator:
             self._active_dc_delegated_row_mask[self._active_dc_hybrid_rows] = True
         self._jacobian_static_skip = np.zeros(len(self.active_measurements), dtype=bool)
         self._active_measurement_blocks = {
-            "ac": self._MeasurementSideBlock(self.ac_meas_rows, self.ac_meas),
-            "dc": self._MeasurementSideBlock(self.dc_meas_rows, self.dc_meas),
+            "ac": self._MeasurementSideBlock(
+                self.ac_meas_rows,
+                self.ac_meas,
+                self._sub_measurement_plan_tables(self._ac_sub_estimator, self.ac_meas),
+            ),
+            "dc": self._MeasurementSideBlock(
+                self.dc_meas_rows,
+                self.dc_meas,
+                self._sub_measurement_plan_tables(self._dc_sub_estimator, self.dc_meas),
+            ),
             "hybrid": self._MeasurementSideBlock(self.hybrid_meas_rows, self.hybrid_meas),
         }
         self._active_hybrid_measurement_plan = self._build_hybrid_measurement_plan(
@@ -4765,9 +4836,15 @@ class HybridStateEstimator:
         ac_block = blocks["ac"]
         dc_block = blocks["dc"]
         if ac_block.measurements and self._ac_sub_estimator is not None:
-            values[ac_block.rows] = self._ac_sub_estimator.evaluate(ac_x, ac_block.measurements)
+            values[ac_block.rows] = self._ac_sub_estimator.evaluate(
+                ac_x,
+                self._sub_measurement_runtime_input(ac_block),
+            )
         if dc_block.measurements and self._dc_sub_estimator is not None:
-            values[dc_block.rows] = self._dc_sub_estimator.evaluate(dc_x, dc_block.measurements)
+            values[dc_block.rows] = self._dc_sub_estimator.evaluate(
+                dc_x,
+                self._sub_measurement_runtime_input(dc_block),
+            )
         self._evaluate_hybrid_measurements(
             values,
             ac_x,
@@ -4826,7 +4903,7 @@ class HybridStateEstimator:
         """
         if estimator is None or len(block.measurements) == 0:
             return
-        sub_csr = estimator.jacobian_sparse(sub_x, block.measurements)
+        sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
         if sub_csr.nnz == 0:
             return
         cache_store = self._sub_jacobian_stamp_cache if cache_key is not None else None
