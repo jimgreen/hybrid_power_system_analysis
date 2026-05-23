@@ -415,6 +415,10 @@ def _build_meas_ppc_from_measurement_file_array_only(
     status_col = -1
     required_max_col = -1
     split_limit = -1
+    raw_split_limit = -1
+    raw_idx_col = raw_device_type_col = raw_device_name_col = raw_meas_type_col = -1
+    raw_weight_col = raw_valid_col = raw_value_col = raw_status_col = -1
+    standard_raw_no_status = False
     has_status = False
     capacity = _initial_measurement_capacity(source)
     idx_values = np.empty(capacity, dtype=np.int64)
@@ -450,7 +454,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
             for line_no, raw_line in enumerate(fp, start=1):
                 first = raw_line[:1]
                 if first == b"#" and in_measurement:
-                    text = raw_line[1:]
+                    text = None
                 else:
                     line = raw_line.strip()
                     if not line:
@@ -491,15 +495,128 @@ def _build_meas_ppc_from_measurement_file_array_only(
                             value_col,
                         )
                         split_limit = status_col + 1 if has_status else required_max_col
+                        raw_split_limit = split_limit + 1
+                        raw_idx_col = idx_col + 1
+                        raw_device_type_col = device_type_col + 1
+                        raw_device_name_col = device_name_col + 1
+                        raw_meas_type_col = meas_type_col + 1
+                        raw_weight_col = weight_col + 1
+                        raw_valid_col = valid_col + 1
+                        raw_value_col = value_col + 1
+                        raw_status_col = status_col + 1
+                        standard_raw_no_status = (
+                            not has_status
+                            and idx_col == 0
+                            and device_type_col == 2
+                            and device_name_col == 3
+                            and meas_type_col == 4
+                            and weight_col == 5
+                            and valid_col == 6
+                            and value_col == 7
+                        )
                         continue
                     if first != b"#" or not in_measurement:
                         continue
                     text = line[1:]
 
-                fields = text.split(None, split_limit)
                 if not header:
                     raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
-                if len(fields) <= required_max_col:
+                if standard_raw_no_status and first == b"#" and raw_line[:1] == b"#":
+                    fields = raw_line.split(None, 8)
+                    if len(fields) <= 8:
+                        raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
+                    if row_count >= capacity:
+                        capacity *= 2
+                        grow_arrays = (
+                            idx_values,
+                            weight_values,
+                            valid_values,
+                            value_values,
+                            status_values,
+                            device_type_code_values,
+                            meas_type_code_values,
+                            device_name_id,
+                        )
+                        grown = _grow_measurement_arrays(grow_arrays, capacity)
+                        (
+                            idx_values,
+                            weight_values,
+                            valid_values,
+                            value_values,
+                            status_values,
+                            device_type_code_values,
+                            meas_type_code_values,
+                            device_name_id,
+                        ) = grown[:8]
+
+                    idx_values[row_count] = to_int(fields[1])
+                    device_type = fields[3]
+                    if device_type == last_device_type:
+                        device_code = last_device_type_code
+                    else:
+                        device_code = device_code_get(device_type, 0)
+                        last_device_type = device_type
+                        last_device_type_code = device_code
+                    device_type_code_values[row_count] = device_code
+
+                    device_name = fields[4]
+                    if device_name == last_device_name:
+                        name_id = last_device_name_id
+                    else:
+                        name_id = device_name_lookup_get(device_name)
+                        if name_id is None:
+                            device_name_text = intern(device_name.decode("utf8"))
+                            name_id = len(device_names_list)
+                            device_name_lookup[device_name] = name_id
+                            device_names_list_append(device_name_text)
+                        last_device_name = device_name
+                        last_device_name_id = name_id
+                    device_name_id[row_count] = name_id
+
+                    meas_type = fields[5]
+                    if meas_type == last_meas_type:
+                        meas_code = last_meas_type_code
+                    else:
+                        meas_code = meas_code_get(meas_type, 0)
+                        if meas_code == 0:
+                            meas_code = meas_code_get(meas_type.upper(), 0)
+                        last_meas_type = meas_type
+                        last_meas_type_code = meas_code
+                    meas_type_code_values[row_count] = meas_code
+
+                    weight_field = fields[6]
+                    weight_values[row_count] = 1.0 if weight_field == b"1.0" or weight_field == b"1" else to_float(weight_field)
+                    valid = fields[7] == b"1"
+                    value_values[row_count] = to_float(fields[8])
+                    valid_values[row_count] = valid
+                    status_values[row_count] = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+                    row_count += 1
+                    continue
+                if first == b"#" and raw_line[:1] == b"#":
+                    fields = raw_line.split(None, raw_split_limit)
+                    idx_pos = raw_idx_col
+                    device_type_pos = raw_device_type_col
+                    device_name_pos = raw_device_name_col
+                    meas_type_pos = raw_meas_type_col
+                    weight_pos = raw_weight_col
+                    valid_pos = raw_valid_col
+                    value_pos = raw_value_col
+                    status_pos = raw_status_col
+                    required_len = required_max_col + 1
+                else:
+                    if text is None:
+                        text = raw_line[1:]
+                    fields = text.split(None, split_limit)
+                    idx_pos = idx_col
+                    device_type_pos = device_type_col
+                    device_name_pos = device_name_col
+                    meas_type_pos = meas_type_col
+                    weight_pos = weight_col
+                    valid_pos = valid_col
+                    value_pos = value_col
+                    status_pos = status_col
+                    required_len = required_max_col
+                if len(fields) <= required_len:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
                 if row_count >= capacity:
                     capacity *= 2
@@ -525,8 +642,8 @@ def _build_meas_ppc_from_measurement_file_array_only(
                         device_name_id,
                     ) = grown[:8]
 
-                idx_values[row_count] = to_int(fields[idx_col])
-                device_type = fields[device_type_col]
+                idx_values[row_count] = to_int(fields[idx_pos])
+                device_type = fields[device_type_pos]
                 if device_type == last_device_type:
                     device_code = last_device_type_code
                 else:
@@ -534,7 +651,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     last_device_type = device_type
                     last_device_type_code = device_code
                 device_type_code_values[row_count] = device_code
-                device_name = fields[device_name_col]
+                device_name = fields[device_name_pos]
                 if device_name == last_device_name:
                     name_id = last_device_name_id
                 else:
@@ -547,7 +664,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     last_device_name = device_name
                     last_device_name_id = name_id
                 device_name_id[row_count] = name_id
-                meas_type = fields[meas_type_col]
+                meas_type = fields[meas_type_pos]
                 if meas_type == last_meas_type:
                     meas_code = last_meas_type_code
                 else:
@@ -557,11 +674,12 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     last_meas_type = meas_type
                     last_meas_type_code = meas_code
                 meas_type_code_values[row_count] = meas_code
-                weight_values[row_count] = to_float(fields[weight_col])
-                valid = fields[valid_col] == b"1"
-                value_values[row_count] = to_float(fields[value_col])
-                if has_status and len(fields) > status_col:
-                    status = _normalize_status_bytes(fields[status_col], valid)
+                weight_field = fields[weight_pos]
+                weight_values[row_count] = 1.0 if weight_field == b"1.0" or weight_field == b"1" else to_float(weight_field)
+                valid = fields[valid_pos] == b"1"
+                value_values[row_count] = to_float(fields[value_pos])
+                if has_status and len(fields) > status_pos:
+                    status = _normalize_status_bytes(fields[status_pos], valid)
                     if not status_is_active(status):
                         valid = False
                 else:

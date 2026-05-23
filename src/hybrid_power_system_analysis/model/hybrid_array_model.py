@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -15,16 +15,14 @@ from ac_array_model import (
     _build_ac_ppc_from_model,
     build_ac_network_from_ppc as _build_ac_network_from_ppc,
     build_ac_ppc_from_efile_rows,
-    build_ac_ppc_from_model,
 )
 from dc_array_model import (
     BUS_COLS as DC_BUS_COLS,
     _build_dc_ppc_from_model,
     build_dc_network_from_ppc as _build_dc_network_from_ppc,
     build_dc_ppc_from_efile_rows,
-    build_dc_ppc_from_model,
 )
-from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
+from efile_read import _read_efile_rows
 from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
@@ -460,12 +458,15 @@ def _build_dcac_from_rows(
     dc_ppc: Dict,
     *,
     build_objects: bool = True,
+    vbase_maps: Optional[Tuple[Dict[int, float], Dict[int, float], Dict[int, float], Dict[int, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, list]:
     columns, table_rows = _rows_for(rows, "DCACConverter")
     if not table_rows:
         return _empty(len(DCAC_COLS)), np.asarray([], dtype=object), []
     p_base = float(ac_ppc["base"]["p_base"])
-    ac_raw_vbase, dc_raw_vbase, ac_current, dc_current = _raw_vbase_maps(ac_ppc, dc_ppc)
+    ac_raw_vbase, dc_raw_vbase, ac_current, dc_current = (
+        _raw_vbase_maps(ac_ppc, dc_ppc) if vbase_maps is None else vbase_maps
+    )
     out = np.zeros((len(table_rows), len(DCAC_COLS)), dtype=np.float64)
     out[:, DCAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
     out[:, DCAC_COLS["ac_node"]] = _int_column(table_rows, columns, "ac_node")
@@ -540,12 +541,15 @@ def _build_acac_from_rows(
     dc_ppc: Dict,
     *,
     build_objects: bool = True,
+    vbase_maps: Optional[Tuple[Dict[int, float], Dict[int, float], Dict[int, float], Dict[int, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, list]:
     columns, table_rows = _rows_for(rows, "ACACConverter")
     if not table_rows:
         return _empty(len(ACAC_COLS)), np.asarray([], dtype=object), []
     p_base = float(ac_ppc["base"]["p_base"])
-    ac_raw_vbase, _dc_raw_vbase, ac_current, _dc_current = _raw_vbase_maps(ac_ppc, dc_ppc)
+    ac_raw_vbase, _dc_raw_vbase, ac_current, _dc_current = (
+        _raw_vbase_maps(ac_ppc, dc_ppc) if vbase_maps is None else vbase_maps
+    )
     out = np.zeros((len(table_rows), len(ACAC_COLS)), dtype=np.float64)
     out[:, ACAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
     out[:, ACAC_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
@@ -629,8 +633,13 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
     dc_ppc = build_dc_ppc_from_efile_rows(file_path, rows)
     ac_ppc["source"] = str(file_path)
     dc_ppc["source"] = str(file_path)
-    dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(rows, ac_ppc, dc_ppc, build_objects=False)
-    acac, acac_name, _acac_objects = _build_acac_from_rows(rows, ac_ppc, dc_ppc, build_objects=False)
+    vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
+    dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(
+        rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
+    )
+    acac, acac_name, _acac_objects = _build_acac_from_rows(
+        rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
+    )
     return {
         "format": "hybrid_ppc_v1",
         "source": str(file_path),
@@ -655,8 +664,9 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
     dc_ppc["source"] = str(file_path)
     ac_network.ppc = ac_ppc
     dc_network.ppc = dc_ppc
-    dcac, dcac_name, dcac_objects = _build_dcac_from_rows(rows, ac_ppc, dc_ppc)
-    acac, acac_name, acac_objects = _build_acac_from_rows(rows, ac_ppc, dc_ppc)
+    vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
+    dcac, dcac_name, dcac_objects = _build_dcac_from_rows(rows, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
+    acac, acac_name, acac_objects = _build_acac_from_rows(rows, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
     ppc = {
         "format": "hybrid_ppc_v1",
         "source": str(file_path),
