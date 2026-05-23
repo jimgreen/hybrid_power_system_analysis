@@ -31,6 +31,26 @@ from model.meas_array_model import (
     measurement_list_from_meas_ppc,
     sync_meas_ppc_from_measurement_table,
 )
+from model.meas_type import (
+    DEVICE_TYPE_ACACConverter,
+    DEVICE_TYPE_DCACConverter,
+    MEAS_TYPE_CODES,
+    MEAS_TYPE_I_AC,
+    MEAS_TYPE_I_DC,
+    MEAS_TYPE_I_FROM,
+    MEAS_TYPE_I_TO,
+    MEAS_TYPE_P_AC,
+    MEAS_TYPE_P_DC,
+    MEAS_TYPE_P_FROM,
+    MEAS_TYPE_P_TO,
+    MEAS_TYPE_Q_AC,
+    MEAS_TYPE_Q_FROM,
+    MEAS_TYPE_Q_TO,
+    MEAS_TYPE_V_AC,
+    MEAS_TYPE_V_DC,
+    MEAS_TYPE_V_FROM,
+    MEAS_TYPE_V_TO,
+)
 from model.meas_model import (
     BadDataItem,
     DEVICE_TYPE_CODES,
@@ -471,12 +491,55 @@ class HybridStateEstimator:
         device_name: str
         meas_type: str
         value: float
+        device_type_code: int = 0
+        device_pos: int = -1
+        meas_type_code: int = 0
 
     @dataclass(frozen=True)
     class _MeasurementActivitySummary:
         max_idx: int
         measured_devices: set
         active_keys: set
+
+    _ACTIVE_KEY_MEAS_BITS = 16
+    _ACTIVE_KEY_POS_BITS = 32
+
+    @staticmethod
+    def _packed_device_key(device_type_code: int, device_pos: int) -> int:
+        if int(device_type_code) <= 0 or int(device_pos) < 0:
+            return -1
+        return (int(device_type_code) << HybridStateEstimator._ACTIVE_KEY_POS_BITS) | int(device_pos)
+
+    @staticmethod
+    def _packed_measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
+        if int(device_type_code) <= 0 or int(device_pos) < 0 or int(meas_type_code) <= 0:
+            return -1
+        return (
+            (int(device_type_code) << (HybridStateEstimator._ACTIVE_KEY_POS_BITS + HybridStateEstimator._ACTIVE_KEY_MEAS_BITS))
+            | (int(device_pos) << HybridStateEstimator._ACTIVE_KEY_MEAS_BITS)
+            | int(meas_type_code)
+        )
+
+    @staticmethod
+    def _packed_device_key_array(device_type_code: np.ndarray, device_pos: np.ndarray) -> np.ndarray:
+        type_values = np.asarray(device_type_code, dtype=np.int64)
+        pos_values = np.asarray(device_pos, dtype=np.int64)
+        return (type_values << HybridStateEstimator._ACTIVE_KEY_POS_BITS) | pos_values
+
+    @staticmethod
+    def _packed_measurement_key_array(
+        device_type_code: np.ndarray,
+        device_pos: np.ndarray,
+        meas_type_code: np.ndarray,
+    ) -> np.ndarray:
+        type_values = np.asarray(device_type_code, dtype=np.int64)
+        pos_values = np.asarray(device_pos, dtype=np.int64)
+        meas_values = np.asarray(meas_type_code, dtype=np.int64)
+        return (
+            (type_values << (HybridStateEstimator._ACTIVE_KEY_POS_BITS + HybridStateEstimator._ACTIVE_KEY_MEAS_BITS))
+            | (pos_values << HybridStateEstimator._ACTIVE_KEY_MEAS_BITS)
+            | meas_values
+        )
 
     def __init__(
         self,
@@ -733,6 +796,8 @@ class HybridStateEstimator:
             raise
 
     def _build_device_maps(self) -> None:
+        if hasattr(self, "_measurement_plan_device_lookup_by_master_ids_cache"):
+            delattr(self, "_measurement_plan_device_lookup_by_master_ids_cache")
         ac = self._ac_sub_estimator
         dc = self._dc_sub_estimator
         self.ac_nodes = list(getattr(ac, "nodes", [])) if ac is not None else []
@@ -791,7 +856,11 @@ class HybridStateEstimator:
         self.active_measurements = delegate.active_measurements
         self.active_z = delegate.active_z
         self.active_weight = delegate.active_weight
-        self.active_angle_residual_mask = angle_residual_mask(self.active_measurements)
+        active_table = getattr(self.active_measurements, "table", None)
+        if active_table is not None and len(active_table.idx) == len(self.active_measurements):
+            self.active_angle_residual_mask = np.asarray(active_table.angle_mask, dtype=bool)
+        else:
+            self.active_angle_residual_mask = angle_residual_mask(self.active_measurements)
         self.state_meta = list(getattr(delegate, "state_meta", []))
         self.state_labels = list(delegate.state_labels)
         self.ac_state_labels = list(delegate.state_labels) if side == "ac" else []
@@ -836,7 +905,7 @@ class HybridStateEstimator:
             self.ac_meas_rows = rows
             self.dc_meas_rows = empty_rows
             self.hybrid_meas_rows = empty_rows
-            self.ac_meas = list(self.active_measurements)
+            self.ac_meas = self.active_measurements
             self.dc_meas = []
             self.hybrid_meas = []
             self._active_ac_hybrid_rows = rows.copy()
@@ -846,15 +915,15 @@ class HybridStateEstimator:
             self.dc_meas_rows = rows
             self.hybrid_meas_rows = empty_rows
             self.ac_meas = []
-            self.dc_meas = list(self.active_measurements)
+            self.dc_meas = self.active_measurements
             self.hybrid_meas = []
             self._active_ac_hybrid_rows = empty_rows
             self._active_dc_hybrid_rows = rows.copy()
         else:
             self._partition_active_measurements()
             return
-        self._active_ac_sub_measurements = list(self.ac_meas)
-        self._active_dc_sub_measurements = list(self.dc_meas)
+        self._active_ac_sub_measurements = self.ac_meas
+        self._active_dc_sub_measurements = self.dc_meas
         self._active_ac_sub_rows = np.arange(len(self.ac_meas), dtype=np.int32)
         self._active_dc_sub_rows = np.arange(len(self.dc_meas), dtype=np.int32)
         self._active_ac_delegated_row_mask = np.zeros(count, dtype=bool)
@@ -1225,6 +1294,70 @@ class HybridStateEstimator:
                 max_idx = int(meas.idx)
         return max_idx
 
+    @staticmethod
+    def _measurement_name_set_fast(measurements: Sequence[Measurement]) -> set:
+        table = getattr(measurements, "table", None)
+        if table is not None:
+            table_size = int(table.idx.size)
+            names = np.asarray(getattr(table, "name", np.asarray([], dtype=object)), dtype=object)
+            if names.size == table_size:
+                result = set(names.tolist())
+            else:
+                result = set()
+            for meas in HybridStateEstimator._iter_measurements_from(measurements, table_size):
+                result.add(meas.name)
+            return result
+        return {meas.name for meas in measurements}
+
+    @staticmethod
+    def _measurement_table_has_string_columns(table) -> bool:
+        if table is None:
+            return False
+        row_count = int(np.asarray(getattr(table, "idx", np.asarray([]))).size)
+        return (
+            np.asarray(getattr(table, "device_type", np.asarray([], dtype=object)), dtype=object).size == row_count
+            and np.asarray(getattr(table, "device_name", np.asarray([], dtype=object)), dtype=object).size == row_count
+            and np.asarray(getattr(table, "meas_type", np.asarray([], dtype=object)), dtype=object).size == row_count
+        )
+
+    @staticmethod
+    def _activity_key_sets_from_table(table, active_mask: np.ndarray) -> Tuple[set, set]:
+        row_count = int(np.asarray(getattr(table, "idx", np.asarray([]))).size)
+        device_pos = getattr(table, "device_pos", None)
+        meas_type_code = getattr(table, "meas_type_code", None)
+        if device_pos is not None and meas_type_code is not None:
+            device_type_code = np.asarray(table.device_type_code, dtype=np.int64)
+            device_pos = np.asarray(device_pos, dtype=np.int64)
+            meas_type_code = np.asarray(meas_type_code, dtype=np.int64)
+            if device_type_code.size == row_count and device_pos.size == row_count and meas_type_code.size == row_count:
+                active = np.asarray(active_mask, dtype=bool)
+                valid_device = active & (device_type_code > 0) & (device_pos >= 0)
+                measured_devices = set(
+                    HybridStateEstimator._packed_device_key_array(
+                        device_type_code[valid_device],
+                        device_pos[valid_device],
+                    ).tolist()
+                )
+                valid_measurement = valid_device & (meas_type_code > 0)
+                active_keys = set(
+                    HybridStateEstimator._packed_measurement_key_array(
+                        device_type_code[valid_measurement],
+                        device_pos[valid_measurement],
+                        meas_type_code[valid_measurement],
+                    ).tolist()
+                )
+                return measured_devices, active_keys
+        if HybridStateEstimator._measurement_table_has_string_columns(table):
+            device_type = np.asarray(table.device_type, dtype=object)
+            device_name = np.asarray(table.device_name, dtype=object)
+            meas_type = np.asarray(table.meas_type, dtype=object)
+            active = np.asarray(active_mask, dtype=bool)
+            return (
+                set(zip(device_type[active].tolist(), device_name[active].tolist())),
+                set(zip(device_type[active].tolist(), device_name[active].tolist(), meas_type[active].tolist())),
+            )
+        return set(), set()
+
     def _sub_measurement_summary_attrs(
         self,
         measurements: Sequence[Measurement],
@@ -1244,14 +1377,13 @@ class HybridStateEstimator:
         table = getattr(measurements, "table", None)
         if table is not None and len(table.idx) == len(measurements):
             active = table.valid & (table.weight > 0.0)
-            device_type = np.asarray(table.device_type, dtype=object)
-            device_name = np.asarray(table.device_name, dtype=object)
-            meas_type = np.asarray(table.meas_type, dtype=object)
-            active_device_keys = set(zip(device_type[active].tolist(), device_name[active].tolist()))
-            active_measurement_keys = set(
-                zip(device_type[active].tolist(), device_name[active].tolist(), meas_type[active].tolist())
-            )
-            if voltage_node_mapper is not None and np.any(active):
+            active_device_keys, active_measurement_keys = self._activity_key_sets_from_table(table, active)
+            has_strings = self._measurement_table_has_string_columns(table)
+            if has_strings:
+                device_type = np.asarray(table.device_type, dtype=object)
+                device_name = np.asarray(table.device_name, dtype=object)
+                meas_type = np.asarray(table.meas_type, dtype=object)
+            if voltage_node_mapper is not None and np.any(active) and has_strings:
                 status_code = measurement_table_status_code(table)
                 voltage_mask = (
                     active
@@ -1496,6 +1628,70 @@ class HybridStateEstimator:
             captured_attrs=captured_attrs,
         )
 
+    def _adopt_sub_measurement_update(self, captured_attrs: Dict[str, object]) -> bool:
+        """Adopt a sub-estimator MeasurementList when it replaced the shared view."""
+        updated = captured_attrs.get("measurements")
+        if updated is None or updated is self.measurements:
+            return False
+        table = captured_attrs.get("measurement_table")
+        if table is None:
+            table = getattr(updated, "table", None)
+        self.measurements = updated
+        if table is not None:
+            self.measurement_table = table
+            try:
+                self.measurements.table = table
+            except AttributeError:
+                pass
+        self._invalidate_measurement_activity_summary()
+        return True
+
+    def _meas_ppc_for_source_rows(self, source_rows: np.ndarray) -> Dict:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if not isinstance(meas_ppc, dict):
+            return {}
+        rows = np.asarray(source_rows, dtype=np.int64)
+        row_count = int(rows.size)
+        out = dict(meas_ppc)
+        full_count = int(np.asarray(meas_ppc.get("idx_array", np.asarray([]))).size)
+        for key in (
+            "idx_array",
+            "weight_array",
+            "valid_array",
+            "value_array",
+            "status_array",
+            "device_type_code_array",
+            "device_name_id_array",
+            "meas_type_code_array",
+            "angle_mask_array",
+            "device_pos",
+            "scale",
+            "from_pos",
+            "to_pos",
+            "available",
+            "name",
+            "device_type",
+            "device_name",
+            "meas_type",
+        ):
+            value = meas_ppc.get(key)
+            if isinstance(value, np.ndarray) and int(value.shape[0]) == full_count:
+                out[key] = value[rows.astype(np.intp, copy=False)].copy()
+        meas = meas_ppc.get("meas")
+        if isinstance(meas, np.ndarray) and meas.ndim == 2 and int(meas.shape[0]) == full_count:
+            out["meas"] = meas[rows.astype(np.intp, copy=False), :].copy()
+        device_type_code = out.get("device_type_code_array")
+        if isinstance(device_type_code, np.ndarray) and int(device_type_code.size) == row_count:
+            out["rows_by_device_type_code"] = {
+                int(code): np.flatnonzero(device_type_code == code).astype(np.int64, copy=False)
+                for code in np.unique(device_type_code)
+            }
+        else:
+            out["rows_by_device_type_code"] = {}
+        out["_mutable_runtime_arrays"] = True
+        out["normalized"] = bool(meas_ppc.get("normalized", False))
+        return out
+
     @staticmethod
     def _sub_voltage_node_mapper(estimator):
         mapper = getattr(estimator, "_voltage_measurement_node_idx", None)
@@ -1538,14 +1734,34 @@ class HybridStateEstimator:
                 self._ac_sub_estimator.measurements.normalized = True
         if not converted_by_sub.get("dc", False):
             captured_summary = {}
-            self._call_sub_with_measurements(
-                self._dc_sub_estimator,
-                sources["dc"],
-                "_convert_measurements_to_pu",
-                refresh_summary=False,
-                capture_attrs=self._SUB_MEASUREMENT_SUMMARY_ATTRS,
-                captured_attrs=captured_summary,
+            dc_rows = (
+                np.asarray(self._sub_measurement_source_rows_by_side.get("dc", np.asarray([], dtype=np.int64)), dtype=np.int64)
+                if isinstance(getattr(self, "_sub_measurement_source_rows_by_side", None), dict)
+                else np.asarray([], dtype=np.int64)
             )
+            dc_table = getattr(sources["dc"], "table", None)
+            normalized_by_ppc = False
+            if self._dc_sub_estimator is not None and dc_table is not None and dc_rows.size == int(dc_table.idx.size):
+                dc_meas_ppc = self._meas_ppc_for_source_rows(dc_rows)
+                normalize_from_ppc = getattr(self._dc_sub_estimator, "_normalize_measurements_to_pu_from_meas_ppc", None)
+                if callable(normalize_from_ppc) and dc_meas_ppc:
+                    self._dc_sub_estimator.meas_ppc = dc_meas_ppc
+                    self._dc_sub_estimator.measurements = sources["dc"]
+                    normalized_by_ppc = bool(normalize_from_ppc(dc_table, dc_meas_ppc))
+                    captured_summary = {
+                        name: getattr(self._dc_sub_estimator, name)
+                        for name in self._SUB_MEASUREMENT_SUMMARY_ATTRS
+                        if hasattr(self._dc_sub_estimator, name)
+                    }
+            if not normalized_by_ppc:
+                self._call_sub_with_measurements(
+                    self._dc_sub_estimator,
+                    sources["dc"],
+                    "_convert_measurements_to_pu",
+                    refresh_summary=False,
+                    capture_attrs=self._SUB_MEASUREMENT_SUMMARY_ATTRS,
+                    captured_attrs=captured_summary,
+                )
             self._cache_sub_measurement_summary_attrs("dc", captured_summary)
             if not self._sub_estimator_updates_measurement_table(self._dc_sub_estimator):
                 self._sync_partition_table_from_objects(sources["dc"])
@@ -1578,6 +1794,9 @@ class HybridStateEstimator:
         return lookup
 
     def _measurement_plan_device_lookup_by_master_ids(self) -> Dict[int, np.ndarray]:
+        cached = getattr(self, "_measurement_plan_device_lookup_by_master_ids_cache", None)
+        if cached is not None:
+            return cached
         lookup_by_code: Dict[int, np.ndarray] = {}
         ac = getattr(self, "_ac_sub_estimator", None)
         if ac is not None:
@@ -1622,6 +1841,7 @@ class HybridStateEstimator:
         lookup_by_code[int(DEVICE_TYPE_CODES["ACACConverter"])] = self._device_id_lookup_from_names(
             [conv.name for conv in self.acac_converters]
         )
+        self._measurement_plan_device_lookup_by_master_ids_cache = lookup_by_code
         return lookup_by_code
 
     def _populate_measurement_device_pos_from_sub_estimators(self) -> None:
@@ -1701,6 +1921,36 @@ class HybridStateEstimator:
             table.value[pos] = float(meas.value)
         return True
 
+    def _hybrid_measurement_device_pos_array(self, table) -> np.ndarray:
+        row_count = int(np.asarray(getattr(table, "idx", np.asarray([]))).size)
+        device_pos = getattr(table, "device_pos", None)
+        if device_pos is not None and np.asarray(device_pos).size == row_count:
+            return np.asarray(device_pos, dtype=np.int64)
+        device_pos = np.empty(row_count, dtype=np.int64)
+        device_pos.fill(-1)
+        device_name_id = getattr(table, "device_name_id", None)
+        if device_name_id is None or np.asarray(device_name_id).size != row_count:
+            table.device_pos = device_pos
+            return device_pos
+        device_name_id = np.asarray(device_name_id, dtype=np.int64)
+        code = np.asarray(table.device_type_code, dtype=np.int16)
+        for device_type_code, converters in (
+            (DEVICE_TYPE_DCACConverter, self.dcac_converters),
+            (DEVICE_TYPE_ACACConverter, self.acac_converters),
+        ):
+            rows = np.flatnonzero(code == int(device_type_code))
+            if rows.size == 0:
+                continue
+            lookup = self._device_id_lookup_from_names([conv.name for conv in converters])
+            if lookup.size == 0:
+                continue
+            ids = device_name_id[rows.astype(np.intp, copy=False)]
+            in_range = (ids >= 0) & (ids < lookup.size)
+            if np.any(in_range):
+                device_pos[rows[in_range].astype(np.intp, copy=False)] = lookup[ids[in_range].astype(np.intp, copy=False)]
+        table.device_pos = device_pos
+        return device_pos
+
     def _convert_hybrid_measurements_to_pu(self, measurements: Sequence[Measurement]) -> None:
         table = getattr(measurements, "table", None)
         has_table = table is not None and len(table.idx) == len(measurements)
@@ -1717,77 +1967,60 @@ class HybridStateEstimator:
             return
         scale = np.ones(table.value.size, dtype=np.float64)
         code = np.asarray(table.device_type_code, dtype=np.int16)
-        dcac_code = DEVICE_TYPE_CODES["DCACConverter"]
-        acac_code = DEVICE_TYPE_CODES["ACACConverter"]
+        meas_code = np.asarray(getattr(table, "meas_type_code", np.asarray([], dtype=np.int16)), dtype=np.int16)
+        if meas_code.size != table.value.size:
+            meas_code = np.zeros(table.value.size, dtype=np.int16)
+        device_pos = self._hybrid_measurement_device_pos_array(table)
 
-        dcac_rows = np.flatnonzero(active & (code == dcac_code))
+        dcac_rows = np.flatnonzero(active & (code == DEVICE_TYPE_DCACConverter) & (device_pos >= 0))
         if dcac_rows.size:
-            dcac_scales = {
-                name: (
-                    self._power_file_base(),
-                    self._dc_voltage_file_base(conv.dc_node),
-                    self._dc_current_base(conv.dc_node),
-                    self._ac_voltage_file_base(conv.ac_node),
-                    self._ac_current_base(conv.ac_node),
-                )
-                for name, conv in self.dcac_by_name.items()
-            }
-            mt_list = table.meas_type[dcac_rows].tolist()
-            dn_list = table.device_name[dcac_rows].tolist()
-            scale_vals = np.empty(dcac_rows.size, dtype=np.float64)
-            for k in range(dcac_rows.size):
-                mtype = mt_list[k]
-                values = dcac_scales[dn_list[k]]
-                if mtype == "P_DC" or mtype == "P_AC" or mtype == "Q_AC":
-                    scale_vals[k] = values[0]
-                elif mtype == "V_DC":
-                    scale_vals[k] = values[1]
-                elif mtype == "I_DC":
-                    scale_vals[k] = values[2]
-                elif mtype == "V_AC":
-                    scale_vals[k] = values[3]
-                elif mtype == "I_AC":
-                    scale_vals[k] = values[4]
-                else:
-                    scale_vals[k] = 1.0
+            dcac_pos = device_pos[dcac_rows].astype(np.intp, copy=False)
+            dc_nodes = np.asarray([int(conv.dc_node) for conv in self.dcac_converters], dtype=np.int64)
+            ac_nodes = np.asarray([int(conv.ac_node) for conv in self.dcac_converters], dtype=np.int64)
+            dcac_dc_v_scale = np.asarray([self._dc_voltage_file_base(int(node)) for node in dc_nodes], dtype=np.float64)
+            dcac_dc_i_scale = np.asarray([self._dc_current_base(int(node)) for node in dc_nodes], dtype=np.float64)
+            dcac_ac_v_scale = np.asarray([self._ac_voltage_file_base(int(node)) for node in ac_nodes], dtype=np.float64)
+            dcac_ac_i_scale = np.asarray([self._ac_current_base(int(node)) for node in ac_nodes], dtype=np.float64)
+            scale_vals = np.ones(dcac_rows.size, dtype=np.float64)
+            dcac_meas = meas_code[dcac_rows]
+            power_mask = (dcac_meas == MEAS_TYPE_P_DC) | (dcac_meas == MEAS_TYPE_P_AC) | (dcac_meas == MEAS_TYPE_Q_AC)
+            scale_vals[power_mask] = self._power_file_base()
+            mask = dcac_meas == MEAS_TYPE_V_DC
+            scale_vals[mask] = dcac_dc_v_scale[dcac_pos[mask]]
+            mask = dcac_meas == MEAS_TYPE_I_DC
+            scale_vals[mask] = dcac_dc_i_scale[dcac_pos[mask]]
+            mask = dcac_meas == MEAS_TYPE_V_AC
+            scale_vals[mask] = dcac_ac_v_scale[dcac_pos[mask]]
+            mask = dcac_meas == MEAS_TYPE_I_AC
+            scale_vals[mask] = dcac_ac_i_scale[dcac_pos[mask]]
             scale[dcac_rows] = scale_vals
 
-        acac_rows = np.flatnonzero(active & (code == acac_code))
+        acac_rows = np.flatnonzero(active & (code == DEVICE_TYPE_ACACConverter) & (device_pos >= 0))
         if acac_rows.size:
-            acac_scales = {
-                name: (
-                    self._power_file_base(),
-                    self._ac_voltage_file_base(conv.i_node),
-                    self._ac_current_base(conv.i_node),
-                    self._ac_voltage_file_base(conv.j_node),
-                    self._ac_current_base(conv.j_node),
-                )
-                for name, conv in self.acac_by_name.items()
-            }
-            mt_list = table.meas_type[acac_rows].tolist()
-            dn_list = table.device_name[acac_rows].tolist()
-            scale_vals = np.empty(acac_rows.size, dtype=np.float64)
-            for k in range(acac_rows.size):
-                mtype = mt_list[k]
-                values = acac_scales[dn_list[k]]
-                if mtype.startswith(("P_", "Q_")):
-                    scale_vals[k] = values[0]
-                elif mtype.endswith("_FROM"):
-                    if mtype.startswith("V_"):
-                        scale_vals[k] = values[1]
-                    elif mtype.startswith("I_"):
-                        scale_vals[k] = values[2]
-                    else:
-                        scale_vals[k] = 1.0
-                elif mtype.endswith("_TO"):
-                    if mtype.startswith("V_"):
-                        scale_vals[k] = values[3]
-                    elif mtype.startswith("I_"):
-                        scale_vals[k] = values[4]
-                    else:
-                        scale_vals[k] = 1.0
-                else:
-                    scale_vals[k] = 1.0
+            acac_pos = device_pos[acac_rows].astype(np.intp, copy=False)
+            from_nodes = np.asarray([int(conv.i_node) for conv in self.acac_converters], dtype=np.int64)
+            to_nodes = np.asarray([int(conv.j_node) for conv in self.acac_converters], dtype=np.int64)
+            from_v_scale = np.asarray([self._ac_voltage_file_base(int(node)) for node in from_nodes], dtype=np.float64)
+            from_i_scale = np.asarray([self._ac_current_base(int(node)) for node in from_nodes], dtype=np.float64)
+            to_v_scale = np.asarray([self._ac_voltage_file_base(int(node)) for node in to_nodes], dtype=np.float64)
+            to_i_scale = np.asarray([self._ac_current_base(int(node)) for node in to_nodes], dtype=np.float64)
+            scale_vals = np.ones(acac_rows.size, dtype=np.float64)
+            acac_meas = meas_code[acac_rows]
+            power_mask = (
+                (acac_meas == MEAS_TYPE_P_FROM)
+                | (acac_meas == MEAS_TYPE_Q_FROM)
+                | (acac_meas == MEAS_TYPE_P_TO)
+                | (acac_meas == MEAS_TYPE_Q_TO)
+            )
+            scale_vals[power_mask] = self._power_file_base()
+            mask = acac_meas == MEAS_TYPE_V_FROM
+            scale_vals[mask] = from_v_scale[acac_pos[mask]]
+            mask = acac_meas == MEAS_TYPE_I_FROM
+            scale_vals[mask] = from_i_scale[acac_pos[mask]]
+            mask = acac_meas == MEAS_TYPE_V_TO
+            scale_vals[mask] = to_v_scale[acac_pos[mask]]
+            mask = acac_meas == MEAS_TYPE_I_TO
+            scale_vals[mask] = to_i_scale[acac_pos[mask]]
             scale[acac_rows] = scale_vals
 
         table.value[active] = np.divide(
@@ -1960,6 +2193,16 @@ class HybridStateEstimator:
         self._invalidate_measurement_activity_summary()
         return next_idx + 1
 
+    def _hybrid_converter_spec_device_key(self, spec: "_HybridConverterMeasurementSpec") -> int:
+        device_type_code = int(spec.device_type_code or DEVICE_TYPE_CODES.get(spec.device_type, 0))
+        device_pos = int(spec.device_pos)
+        if device_pos < 0:
+            if device_type_code == DEVICE_TYPE_DCACConverter:
+                device_pos = int(self.dcac_pos_by_name.get(spec.device_name, -1))
+            elif device_type_code == DEVICE_TYPE_ACACConverter:
+                device_pos = int(self.acac_pos_by_name.get(spec.device_name, -1))
+        return self._packed_device_key(device_type_code, device_pos)
+
     def _add_pseudo_power_measurements(self) -> None:
         """Delegate AC/DC pseudo rows, then add missing converter-device pseudo rows."""
         if self._ac_sub_estimator is not None:
@@ -1976,7 +2219,10 @@ class HybridStateEstimator:
                 summary_measurements=self._initial_measurement_sources_by_side()["ac"],
                 summary_max_idx=max_idx,
                 summary_voltage_node_mapper=self._sub_voltage_node_mapper(self._ac_sub_estimator),
+                capture_attrs=("measurements", "measurement_table", "_max_measurement_idx"),
+                captured_attrs=(captured_attrs := {}),
             )
+            self._adopt_sub_measurement_update(captured_attrs)
             if callable(add_balance):
                 self._disable_coupled_ac_power_balance_rows()
         if self._dc_sub_estimator is not None:
@@ -1992,13 +2238,17 @@ class HybridStateEstimator:
                 summary_measurements=self._initial_measurement_sources_by_side()["dc"],
                 summary_max_idx=max_idx,
                 summary_voltage_node_mapper=self._sub_voltage_node_mapper(self._dc_sub_estimator),
+                capture_attrs=("measurements", "measurement_table", "_max_measurement_idx"),
+                captured_attrs=(captured_attrs := {}),
             )
+            self._adopt_sub_measurement_update(captured_attrs)
         self._populate_side_device_pseudo_values()
         self._add_hybrid_pseudo_measurements()
 
     def _disable_coupled_ac_power_balance_rows(self) -> None:
         coupled = self._converter_coupled_ac_node_names()
-        if not coupled:
+        coupled_pos = self._converter_coupled_ac_device_positions()
+        if not coupled and coupled_pos.size == 0:
             return
         table = getattr(self.measurements, "table", None)
         if table is not None:
@@ -2012,25 +2262,36 @@ class HybridStateEstimator:
                 else:
                     balance_rows = np.asarray(balance_rows, dtype=np.int64)
                 if balance_rows.size:
-                    names = table.device_name
-                    matched = np.fromiter(
-                        (str(names[int(row)]) in coupled for row in balance_rows),
-                        dtype=bool,
-                        count=int(balance_rows.size),
-                    )
+                    matched = np.zeros(balance_rows.size, dtype=bool)
+                    if coupled_pos.size:
+                        device_pos = getattr(table, "device_pos", None)
+                        if device_pos is not None and np.asarray(device_pos).size == table_size:
+                            matched |= np.isin(
+                                np.asarray(device_pos, dtype=np.int64)[balance_rows.astype(np.intp, copy=False)],
+                                coupled_pos,
+                            )
+                    if coupled and self._measurement_table_has_string_columns(table):
+                        names = table.device_name
+                        matched |= np.fromiter(
+                            (str(names[int(row)]) in coupled for row in balance_rows),
+                            dtype=bool,
+                            count=int(balance_rows.size),
+                        )
                     if np.any(matched):
                         disable_rows = balance_rows[matched]
                         table.valid[disable_rows] = False
                         measurement_table_status_code(table)[disable_rows] = MEAS_STATUS_INVALID
+                        self._invalidate_measurement_activity_summary()
             incorporated = (
                 self.measurements._incorporated_tail_size()
                 if hasattr(self.measurements, "_incorporated_tail_size")
                 else 0
             )
-            for pos in range(incorporated, list.__len__(self.measurements)):
-                meas = list.__getitem__(self.measurements, pos)
-                if meas.device_type == "ACPowerBalance" and meas.device_name in coupled:
-                    mark_measurement_invalid(meas)
+            if isinstance(self.measurements, list):
+                for pos in range(incorporated, list.__len__(self.measurements)):
+                    meas = list.__getitem__(self.measurements, pos)
+                    if meas.device_type == "ACPowerBalance" and meas.device_name in coupled:
+                        mark_measurement_invalid(meas)
             return
         for meas in self.measurements:
             if meas.device_type == "ACPowerBalance" and meas.device_name in coupled:
@@ -2055,7 +2316,8 @@ class HybridStateEstimator:
         measured_devices = self._active_hybrid_converter_measurement_devices()
         specs_to_add = []
         for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
-            if (spec.device_type, spec.device_name) in measured_devices:
+            device_key = self._hybrid_converter_spec_device_key(spec)
+            if device_key in measured_devices or (spec.device_type, spec.device_name) in measured_devices:
                 continue
             if self._voltage_pseudo_is_covered(spec.device_type, spec.device_name, spec.meas_type):
                 continue
@@ -2071,36 +2333,50 @@ class HybridStateEstimator:
             )
 
     def _active_hybrid_converter_measurement_devices(self) -> set:
+        table = getattr(self.measurements, "table", None)
+        if table is not None and len(table.idx) == len(self.measurements):
+            source_count = int(getattr(self, "_sub_measurement_source_count", len(self.measurements)))
+            return self._active_hybrid_converter_measurement_devices_from_table(table, row_limit=source_count)
         sources_by_side = getattr(self, "_sub_measurement_sources_by_side", None)
         if sources_by_side is None:
             return self._active_hybrid_converter_measurement_devices_from(self.measurements)
-        measured_devices = self._active_hybrid_converter_measurement_devices_from(
-            sources_by_side.get("hybrid", ())
+        return self._active_hybrid_converter_measurement_devices_from(sources_by_side.get("hybrid", ()))
+
+    def _active_hybrid_converter_measurement_devices_from_table(self, table, row_limit: Optional[int] = None) -> set:
+        row_count = int(table.idx.size)
+        limit = row_count if row_limit is None else max(0, min(int(row_limit), row_count))
+        if limit <= 0:
+            return set()
+        active = (
+            np.asarray(table.valid[:limit], dtype=bool)
+            & (np.asarray(table.weight[:limit], dtype=np.float64) > 0.0)
         )
-        source_count = int(getattr(self, "_sub_measurement_source_count", len(self.measurements)))
-        if source_count < len(self.measurements):
-            measured_devices.update(
-                self._active_hybrid_converter_measurement_devices_from(
-                    self._iter_measurements_from(self.measurements, source_count)
+        if not np.any(active):
+            return set()
+        code = np.asarray(table.device_type_code[:limit], dtype=np.int64)
+        device_pos = self._hybrid_measurement_device_pos_array(table)[:limit]
+        converter_mask = (
+            active
+            & (device_pos >= 0)
+            & ((code == DEVICE_TYPE_DCACConverter) | (code == DEVICE_TYPE_ACACConverter))
+        )
+        if np.any(converter_mask):
+            return set(self._packed_device_key_array(code[converter_mask], device_pos[converter_mask]).tolist())
+        if self._measurement_table_has_string_columns(table):
+            device_type = np.asarray(table.device_type[:limit], dtype=object)
+            string_mask = active & np.isin(device_type, tuple(self._HYBRID_MEASUREMENT_DEVICE_TYPES))
+            return set(
+                zip(
+                    device_type[string_mask].tolist(),
+                    np.asarray(table.device_name[:limit], dtype=object)[string_mask].tolist(),
                 )
             )
-        return measured_devices
+        return set()
 
     def _active_hybrid_converter_measurement_devices_from(self, measurements: Sequence[Measurement]) -> set:
         table = getattr(measurements, "table", None)
         if table is not None and len(table.idx) == len(measurements):
-            device_type = np.asarray(table.device_type, dtype=object)
-            active = (
-                np.asarray(table.valid, dtype=bool)
-                & (np.asarray(table.weight, dtype=np.float64) > 0.0)
-                & np.isin(device_type, tuple(self._HYBRID_MEASUREMENT_DEVICE_TYPES))
-            )
-            return set(
-                zip(
-                    device_type[active].tolist(),
-                    np.asarray(table.device_name, dtype=object)[active].tolist(),
-                )
-            )
+            return self._active_hybrid_converter_measurement_devices_from_table(table)
         measured_devices = set()
         for meas in measurements:
             if (
@@ -2256,17 +2532,20 @@ class HybridStateEstimator:
             if self._ac_sub_estimator is not None
             else np.array([], dtype=np.int32)
         )
-        self.dc_voltage_state_col = (
-            np.asarray(getattr(self._dc_sub_estimator, "voltage_col", []), dtype=np.int32) + self.dc_state_start
-            if self._dc_sub_estimator is not None
-            else np.array([], dtype=np.int32)
-        )
-        self.voltage_cols = np.concatenate(
-            (
-                self.ac_voltage_state_col.astype(np.int32, copy=False),
-                self.dc_voltage_state_col.astype(np.int32, copy=False),
+        if self._dc_sub_estimator is not None:
+            dc_voltage_col = np.asarray(getattr(self._dc_sub_estimator, "voltage_col", []), dtype=np.int32)
+            self.dc_voltage_state_col = np.where(dc_voltage_col >= 0, dc_voltage_col + self.dc_state_start, -1).astype(
+                np.int32,
+                copy=False,
             )
-        ) if (self.ac_voltage_state_col.size or self.dc_voltage_state_col.size) else np.array([], dtype=np.int32)
+        else:
+            self.dc_voltage_state_col = np.array([], dtype=np.int32)
+        voltage_col_parts = []
+        if self.ac_voltage_state_col.size:
+            voltage_col_parts.append(self.ac_voltage_state_col[self.ac_voltage_state_col >= 0].astype(np.int32, copy=False))
+        if self.dc_voltage_state_col.size:
+            voltage_col_parts.append(self.dc_voltage_state_col[self.dc_voltage_state_col >= 0].astype(np.int32, copy=False))
+        self.voltage_cols = np.concatenate(voltage_col_parts) if voltage_col_parts else np.array([], dtype=np.int32)
         self._build_hybrid_converter_array_cache()
         self._partition_state_variables()
 
@@ -2634,6 +2913,10 @@ class HybridStateEstimator:
     ) -> "HybridStateEstimator._HybridMeasurementPlan":
         dcac_code = int(DEVICE_TYPE_CODES["DCACConverter"])
         acac_code = int(DEVICE_TYPE_CODES["ACACConverter"])
+        meas_kind_code_by_type_code = {
+            dcac_code: self._measurement_kind_code_lookup(self._DCAC_MEASUREMENT_CODE),
+            acac_code: self._measurement_kind_code_lookup(self._ACAC_MEASUREMENT_CODE),
+        }
         plan_table = build_measurement_plan_table(
             block.measurements,
             device_pos_by_type_code={
@@ -2644,6 +2927,9 @@ class HybridStateEstimator:
                 dcac_code: self._DCAC_MEASUREMENT_CODE,
                 acac_code: self._ACAC_MEASUREMENT_CODE,
             },
+            device_pos_by_type_code_id=self._measurement_plan_device_lookup_by_master_ids(),
+            meas_kind_code_by_type_code=meas_kind_code_by_type_code,
+            require_index_arrays=True,
             table_builder=_measurement_table_from_measurements,
         )
 
@@ -2995,47 +3281,62 @@ class HybridStateEstimator:
         source: str = "flow",
     ) -> List["_HybridConverterMeasurementSpec"]:
         specs: List[HybridStateEstimator._HybridConverterMeasurementSpec] = []
-        for conv in sorted(self.dcac_by_name.values(), key=lambda item: item.idx):
+        def spec(device_type: str, device_name: str, meas_type: str, value: float, device_pos: int) -> "HybridStateEstimator._HybridConverterMeasurementSpec":
+            return self._HybridConverterMeasurementSpec(
+                device_type,
+                device_name,
+                meas_type,
+                value,
+                int(DEVICE_TYPE_CODES.get(device_type, 0)),
+                int(device_pos),
+                int(MEAS_TYPE_CODES.get(meas_type, 0)),
+            )
+
+        for pos, conv in enumerate(self.dcac_converters):
             p_dc = float(getattr(conv, "dc_p", 0.0) or 0.0) if source == "pseudo" else float(getattr(conv, "i_p", 0.0) or 0.0)
             p_ac = float(getattr(conv, "ac_p", 0.0) or 0.0) if source == "pseudo" else float(getattr(conv, "j_p", 0.0) or 0.0)
             q_ac = float(getattr(conv, "ac_q", 0.0) or 0.0) if source == "pseudo" else float(getattr(conv, "j_q", 0.0) or 0.0)
             specs.extend(
                 (
-                    self._HybridConverterMeasurementSpec("DCACConverter", conv.name, "P_DC", p_dc),
-                    self._HybridConverterMeasurementSpec("DCACConverter", conv.name, "P_AC", p_ac),
-                    self._HybridConverterMeasurementSpec("DCACConverter", conv.name, "Q_AC", q_ac),
-                    self._HybridConverterMeasurementSpec(
+                    spec("DCACConverter", conv.name, "P_DC", p_dc, pos),
+                    spec("DCACConverter", conv.name, "P_AC", p_ac, pos),
+                    spec("DCACConverter", conv.name, "Q_AC", q_ac, pos),
+                    spec(
                         "DCACConverter",
                         conv.name,
                         "V_DC",
                         float(getattr(getattr(conv, "dc_node_obj", None), "voltage", 1.0) or 1.0),
+                        pos,
                     ),
-                    self._HybridConverterMeasurementSpec(
+                    spec(
                         "DCACConverter",
                         conv.name,
                         "V_AC",
                         float(getattr(getattr(conv, "ac_node_obj", None), "voltage", 1.0) or 1.0),
+                        pos,
                     ),
                 )
             )
-        for conv in sorted(self.acac_by_name.values(), key=lambda item: item.idx):
+        for pos, conv in enumerate(self.acac_converters):
             specs.extend(
                 (
-                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "P_FROM", float(getattr(conv, "i_p", 0.0) or 0.0)),
-                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "Q_FROM", float(getattr(conv, "i_q", 0.0) or 0.0)),
-                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "P_TO", float(getattr(conv, "j_p", 0.0) or 0.0)),
-                    self._HybridConverterMeasurementSpec("ACACConverter", conv.name, "Q_TO", float(getattr(conv, "j_q", 0.0) or 0.0)),
-                    self._HybridConverterMeasurementSpec(
+                    spec("ACACConverter", conv.name, "P_FROM", float(getattr(conv, "i_p", 0.0) or 0.0), pos),
+                    spec("ACACConverter", conv.name, "Q_FROM", float(getattr(conv, "i_q", 0.0) or 0.0), pos),
+                    spec("ACACConverter", conv.name, "P_TO", float(getattr(conv, "j_p", 0.0) or 0.0), pos),
+                    spec("ACACConverter", conv.name, "Q_TO", float(getattr(conv, "j_q", 0.0) or 0.0), pos),
+                    spec(
                         "ACACConverter",
                         conv.name,
                         "V_FROM",
                         float(getattr(getattr(conv, "i_node_obj", None), "voltage", 1.0) or 1.0),
+                        pos,
                     ),
-                    self._HybridConverterMeasurementSpec(
+                    spec(
                         "ACACConverter",
                         conv.name,
                         "V_TO",
                         float(getattr(getattr(conv, "j_node_obj", None), "voltage", 1.0) or 1.0),
+                        pos,
                     ),
                 )
             )
@@ -3363,6 +3664,39 @@ class HybridStateEstimator:
                     names.add(node.name)
         return names
 
+    def _converter_coupled_ac_device_positions(self) -> np.ndarray:
+        node_ids = []
+        dcac_ac_node = np.asarray(getattr(self, "_dcac_ac_node", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        if dcac_ac_node.size:
+            node_ids.extend(dcac_ac_node.tolist())
+        else:
+            node_ids.extend(int(conv.ac_node) for conv in self.dcac_converters)
+        acac_i_node = np.asarray(getattr(self, "_acac_i_node", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        acac_j_node = np.asarray(getattr(self, "_acac_j_node", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        if acac_i_node.size or acac_j_node.size:
+            node_ids.extend(acac_i_node.tolist())
+            node_ids.extend(acac_j_node.tolist())
+        else:
+            for conv in self.acac_converters:
+                node_ids.append(int(conv.i_node))
+                node_ids.append(int(conv.j_node))
+        if not node_ids or self._ac_sub_estimator is None:
+            return np.asarray([], dtype=np.int64)
+        ac = self._ac_sub_estimator
+        ids = np.asarray(getattr(ac, "_ac_node_id_lookup_ids", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        pos = np.asarray(getattr(ac, "_ac_node_id_lookup_pos", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        if ids.size == 0 or pos.size != ids.size:
+            return np.asarray([], dtype=np.int64)
+        query = np.unique(np.asarray(node_ids, dtype=np.int64))
+        loc = np.searchsorted(ids, query)
+        valid = (loc >= 0) & (loc < ids.size)
+        if np.any(valid):
+            valid_locs = loc[valid].astype(np.intp, copy=False)
+            valid[valid] = ids[valid_locs] == query[valid]
+        if not np.any(valid):
+            return np.asarray([], dtype=np.int64)
+        return np.unique(pos[loc[valid].astype(np.intp, copy=False)].astype(np.int64, copy=False))
+
     def _ac_voltage_measurement_node_idx(
         self,
         device_type: str,
@@ -3460,36 +3794,44 @@ class HybridStateEstimator:
         if side == "ac":
             mapper = self._ac_voltage_measurement_node_idx
             node_pos = getattr(self._ac_sub_estimator, "node_pos", {})
+            sub_cache = getattr(self._ac_sub_estimator, "_real_voltage_observation_node_cache", None)
         else:
             mapper = self._dc_voltage_measurement_node_idx
             node_pos = getattr(self._dc_sub_estimator, "node_pos", {})
+            sub_cache = getattr(self._dc_sub_estimator, "_real_voltage_observation_node_cache", None)
         best: Dict[int, Tuple[float, float]] = {}
+        if isinstance(sub_cache, dict):
+            for node_idx, value in sub_cache.items():
+                best[int(node_idx)] = (float("inf"), float(value))
         table = getattr(self.measurements, "table", None)
         if table is not None and len(table.idx) == len(self.measurements):
-            meas_type = np.asarray(table.meas_type, dtype=object)
             status_code = measurement_table_status_code(table)
-            voltage_mask = (
+            active_real = (
                 np.asarray(table.valid, dtype=bool)
                 & (np.asarray(table.weight, dtype=np.float64) > 0.0)
                 & (status_code != MEAS_STATUS_PSEUDO)
-                & np.isin(meas_type, self._VOLTAGE_MEASUREMENT_TYPE_TUPLE)
             )
-            voltage_rows = np.flatnonzero(voltage_mask)
-            device_type = np.asarray(table.device_type, dtype=object)
-            device_name = np.asarray(table.device_name, dtype=object)
-            for row, dev_type, dev_name, meas_type_value in zip(
-                voltage_rows,
-                device_type[voltage_mask],
-                device_name[voltage_mask],
-                meas_type[voltage_mask],
-            ):
-                node_idx = mapper(str(dev_type), str(dev_name), str(meas_type_value))
-                if node_idx is None or node_idx not in node_pos:
-                    continue
-                weight = float(table.weight[row])
-                current = best.get(int(node_idx))
-                if current is None or weight > current[0]:
-                    best[int(node_idx)] = (weight, float(table.value[row]))
+            if self._measurement_table_has_string_columns(table):
+                meas_type = np.asarray(table.meas_type, dtype=object)
+                voltage_mask = active_real & np.isin(meas_type, self._VOLTAGE_MEASUREMENT_TYPE_TUPLE)
+                voltage_rows = np.flatnonzero(voltage_mask)
+                device_type = np.asarray(table.device_type, dtype=object)
+                device_name = np.asarray(table.device_name, dtype=object)
+                for row, dev_type, dev_name, meas_type_value in zip(
+                    voltage_rows,
+                    device_type[voltage_mask],
+                    device_name[voltage_mask],
+                    meas_type[voltage_mask],
+                ):
+                    node_idx = mapper(str(dev_type), str(dev_name), str(meas_type_value))
+                    if node_idx is None or node_idx not in node_pos:
+                        continue
+                    weight = float(table.weight[row])
+                    current = best.get(int(node_idx))
+                    if current is None or weight > current[0]:
+                        best[int(node_idx)] = (weight, float(table.value[row]))
+            else:
+                self._add_hybrid_converter_real_voltage_observations(side, table, active_real, best)
         else:
             for meas in self.measurements:
                 if (
@@ -3508,6 +3850,91 @@ class HybridStateEstimator:
         cache = {node_idx: value for node_idx, (_weight, value) in best.items()}
         setattr(self, cache_name, cache)
         return cache
+
+    def _add_hybrid_converter_real_voltage_observations(
+        self,
+        side: str,
+        table,
+        active_real: np.ndarray,
+        best: Dict[int, Tuple[float, float]],
+    ) -> None:
+        meas_type_code = getattr(table, "meas_type_code", None)
+        if meas_type_code is None or np.asarray(meas_type_code).size != int(table.idx.size):
+            return
+        device_pos = self._hybrid_measurement_device_pos_array(table)
+        device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
+        meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
+        table_weight = np.asarray(table.weight, dtype=np.float64)
+        table_value = np.asarray(table.value, dtype=np.float64)
+
+        def update(rows: np.ndarray, node_by_pos: np.ndarray) -> None:
+            if rows.size == 0 or node_by_pos.size == 0:
+                return
+            pos = device_pos[rows.astype(np.intp, copy=False)]
+            in_range = (pos >= 0) & (pos < node_by_pos.size)
+            if not np.any(in_range):
+                return
+            rows_valid = rows[in_range]
+            pos_valid = pos[in_range].astype(np.intp, copy=False)
+            for row, node_idx in zip(rows_valid, node_by_pos[pos_valid]):
+                weight = float(table_weight[int(row)])
+                current = best.get(int(node_idx))
+                if current is None or weight > current[0]:
+                    best[int(node_idx)] = (weight, float(table_value[int(row)]))
+
+        if side == "dc":
+            dcac_dc_node = np.asarray(
+                getattr(self, "_dcac_dc_node", [int(conv.dc_node) for conv in self.dcac_converters]),
+                dtype=np.int64,
+            )
+            rows = np.flatnonzero(
+                active_real
+                & (device_type_code == DEVICE_TYPE_DCACConverter)
+                & (meas_type_code == MEAS_TYPE_V_DC)
+                & (device_pos >= 0)
+            )
+            update(rows, dcac_dc_node)
+            return
+
+        dcac_ac_node = np.asarray(
+            getattr(self, "_dcac_ac_node", [int(conv.ac_node) for conv in self.dcac_converters]),
+            dtype=np.int64,
+        )
+        acac_i_node = np.asarray(
+            getattr(self, "_acac_i_node", [int(conv.i_node) for conv in self.acac_converters]),
+            dtype=np.int64,
+        )
+        acac_j_node = np.asarray(
+            getattr(self, "_acac_j_node", [int(conv.j_node) for conv in self.acac_converters]),
+            dtype=np.int64,
+        )
+        update(
+            np.flatnonzero(
+                active_real
+                & (device_type_code == DEVICE_TYPE_DCACConverter)
+                & (meas_type_code == MEAS_TYPE_V_AC)
+                & (device_pos >= 0)
+            ),
+            dcac_ac_node,
+        )
+        update(
+            np.flatnonzero(
+                active_real
+                & (device_type_code == DEVICE_TYPE_ACACConverter)
+                & (meas_type_code == MEAS_TYPE_V_FROM)
+                & (device_pos >= 0)
+            ),
+            acac_i_node,
+        )
+        update(
+            np.flatnonzero(
+                active_real
+                & (device_type_code == DEVICE_TYPE_ACACConverter)
+                & (meas_type_code == MEAS_TYPE_V_TO)
+                & (device_pos >= 0)
+            ),
+            acac_j_node,
+        )
 
     def _real_voltage_observation_value_for_side_node(
         self,
@@ -3577,13 +4004,7 @@ class HybridStateEstimator:
             active_mask = np.asarray(active_table.valid, dtype=bool) & (
                 np.asarray(active_table.weight, dtype=np.float64) > 0.0
             )
-            active_device_type = np.asarray(active_table.device_type, dtype=object)[active_mask]
-            active_device_name = np.asarray(active_table.device_name, dtype=object)[active_mask]
-            active_meas_type = np.asarray(active_table.meas_type, dtype=object)[active_mask]
-            measured_devices = set(zip(active_device_type.tolist(), active_device_name.tolist()))
-            active_keys = set(
-                zip(active_device_type.tolist(), active_device_name.tolist(), active_meas_type.tolist())
-            )
+            measured_devices, active_keys = self._activity_key_sets_from_table(active_table, active_mask)
             cache = self._MeasurementActivitySummary(
                 max_idx=max_idx,
                 measured_devices=measured_devices,
@@ -3596,19 +4017,7 @@ class HybridStateEstimator:
         weight = np.asarray(table.weight, dtype=np.float64)
         active_mask = valid & (weight > 0.0)
         max_idx = int(idx.max()) if idx.size else 0
-        measured_devices = set(
-            zip(
-                np.asarray(table.device_type, dtype=object)[active_mask].tolist(),
-                np.asarray(table.device_name, dtype=object)[active_mask].tolist(),
-            )
-        )
-        active_keys = set(
-            zip(
-                np.asarray(table.device_type, dtype=object)[active_mask].tolist(),
-                np.asarray(table.device_name, dtype=object)[active_mask].tolist(),
-                np.asarray(table.meas_type, dtype=object)[active_mask].tolist(),
-            )
-        )
+        measured_devices, active_keys = self._activity_key_sets_from_table(table, active_mask)
         cache = self._MeasurementActivitySummary(max_idx=max_idx, measured_devices=measured_devices, active_keys=active_keys)
         self._measurement_activity_summary_cache = cache
         return cache
@@ -3650,10 +4059,15 @@ class HybridStateEstimator:
         meas_type = self._converter_meas_type_for_state_meta(meta)
         if meas_type is None:
             return []
+        device_type_code = int(meta.device_type_code or DEVICE_TYPE_CODES.get(meta.device_type, 0))
+        device_pos = int(meta.device_pos)
+        meas_type_code = int(MEAS_TYPE_CODES.get(meas_type, 0))
         return [
             spec
             for spec in self._hybrid_converter_measurement_specs(source=source)
-            if spec.device_type == meta.device_type and spec.device_name == meta.device_name and spec.meas_type == meas_type
+            if int(spec.device_type_code) == device_type_code
+            and int(spec.device_pos) == device_pos
+            and int(spec.meas_type_code) == meas_type_code
         ]
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
@@ -3688,7 +4102,7 @@ class HybridStateEstimator:
                 continue
             next_idx = self._next_measurement_idx()
             existing_keys = self._active_measurement_keys()
-            existing_names = {meas.name for meas in self.measurements}
+            existing_names = self._measurement_name_set_fast(self.measurements)
             added = 0
             refreshed = False
             measurement_count_before = len(self.measurements)
@@ -3761,15 +4175,26 @@ class HybridStateEstimator:
         if cache is not None:
             return cache
         existing_keys = self._active_measurement_keys()
-        existing_names = {meas.name for meas in self.measurements}
+        existing_names = self._measurement_name_set_fast(self.measurements)
         candidates: List[Measurement] = []
 
-        def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
-            key = (device_type, device_name, meas_type)
+        def add(
+            device_type: str,
+            device_name: str,
+            meas_type: str,
+            value: float,
+            device_type_code: int = 0,
+            device_pos: int = -1,
+            meas_type_code: int = 0,
+        ) -> None:
+            device_type_code = int(device_type_code or DEVICE_TYPE_CODES.get(device_type, 0))
+            meas_type_code = int(meas_type_code or MEAS_TYPE_CODES.get(meas_type, 0))
+            key = self._packed_measurement_key(device_type_code, int(device_pos), meas_type_code)
+            legacy_key = (device_type, device_name, meas_type)
             pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}"
             if self._voltage_pseudo_is_covered(device_type, device_name, meas_type):
                 return
-            if key in existing_keys or pseudo_name in existing_names:
+            if key in existing_keys or legacy_key in existing_keys or pseudo_name in existing_names:
                 return
             candidates.append(
                 Measurement(
@@ -3784,7 +4209,7 @@ class HybridStateEstimator:
                     MEAS_STATUS_PSEUDO,
                 )
             )
-            existing_keys.add(key)
+            existing_keys.add(key if key >= 0 else legacy_key)
             existing_names.add(pseudo_name)
 
         for spec in self._side_observability_pseudo_specs("ac"):
@@ -3793,7 +4218,15 @@ class HybridStateEstimator:
             add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
 
         for spec in self._hybrid_converter_measurement_specs(source="flow"):
-            add(spec.device_type, spec.device_name, spec.meas_type, spec.value)
+            add(
+                spec.device_type,
+                spec.device_name,
+                spec.meas_type,
+                spec.value,
+                spec.device_type_code,
+                spec.device_pos,
+                spec.meas_type_code,
+            )
 
         self._observability_pseudo_candidate_cache = candidates
         return candidates
@@ -3956,14 +4389,17 @@ class HybridStateEstimator:
             nonlocal next_idx, added
             if added >= max_add:
                 return
-            key = (device_type, name, meas_type)
+            device_type_code = int(DEVICE_TYPE_CODES.get(device_type, 0))
+            meas_type_code = int(MEAS_TYPE_CODES.get(meas_type, 0))
+            key = self._packed_measurement_key(device_type_code, int(meta.device_pos), meas_type_code)
+            legacy_key = (device_type, name, meas_type)
             pseudo_name = f"pseudo_obs_{meas_type.lower()}_{name}"
             if self._voltage_pseudo_is_covered(device_type, name, meas_type):
                 return
-            if key in existing_keys or pseudo_name in existing_names:
+            if key in existing_keys or legacy_key in existing_keys or pseudo_name in existing_names:
                 return
             next_idx = self._append_pseudo_measurement(next_idx, pseudo_name, device_type, name, meas_type, value)
-            existing_keys.add(key)
+            existing_keys.add(key if key >= 0 else legacy_key)
             existing_names.add(pseudo_name)
             added += 1
 
@@ -4133,6 +4569,22 @@ class HybridStateEstimator:
             getattr(ac, "_ac_node_id_lookup_ids", np.asarray([], dtype=np.int64)),
             getattr(ac, "_ac_node_id_lookup_pos", np.asarray([], dtype=np.int64)),
         )
+
+    @staticmethod
+    def _measurement_kind_code_lookup(kind_by_name: Dict[str, int]) -> np.ndarray:
+        if not kind_by_name:
+            return np.asarray([], dtype=np.int16)
+        codes = [int(MEAS_TYPE_CODES.get(str(name), -1)) for name in kind_by_name]
+        valid_codes = [code for code in codes if code >= 0]
+        if not valid_codes:
+            return np.asarray([], dtype=np.int16)
+        lookup = np.empty(max(valid_codes) + 1, dtype=np.int16)
+        lookup.fill(-1)
+        for name, kind in kind_by_name.items():
+            code = int(MEAS_TYPE_CODES.get(str(name), -1))
+            if code >= 0:
+                lookup[code] = int(kind)
+        return lookup
 
     def _dc_node_pos_for_idx(self, node_idx: int) -> int:
         dc = self._dc_sub_estimator

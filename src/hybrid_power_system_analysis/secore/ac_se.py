@@ -7379,8 +7379,14 @@ class ACStateEstimator:
             return
         if hasattr(H, "add_many"):
             for rows, cols, values in blocks:
-                if np.asarray(rows).size:
+                rows_array = np.asarray(rows)
+                if not rows_array.size:
+                    continue
+                row_mask = rows_array >= 0
+                if np.all(row_mask):
                     H.add_many(rows, cols, values)
+                else:
+                    H.add_many(rows, cols, values, row_mask)
             return
         row_parts = []
         col_parts = []
