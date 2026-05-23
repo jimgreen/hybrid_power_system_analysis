@@ -614,6 +614,12 @@ def partition_measurements_by_code(
             row_array = np.array([], dtype=np.int64)
         row_arrays[side] = row_array
         local_rows_by_code: Dict[int, np.ndarray] = {}
+        row_to_pos = None
+        if row_array.size:
+            max_row = int(row_array[-1])
+            if max_row <= 10_000_000:
+                row_to_pos = np.full(max_row + 1, -1, dtype=np.int64)
+                row_to_pos[row_array.astype(np.intp, copy=False)] = np.arange(row_array.size, dtype=np.int64)
         if row_array.size:
             for code, chunks in code_row_chunks[side].items():
                 if not chunks:
@@ -625,12 +631,19 @@ def partition_measurements_by_code(
                 )
                 if source_rows.size == 0:
                     continue
-                local_pos = np.searchsorted(row_array, source_rows)
-                in_range = local_pos < row_array.size
-                valid = np.zeros(local_pos.shape, dtype=bool)
-                if np.any(in_range):
-                    valid[in_range] = row_array[local_pos[in_range]] == source_rows[in_range]
-                local_pos = local_pos[valid].astype(np.int64, copy=False)
+                if row_to_pos is not None:
+                    source_rows = source_rows[(source_rows >= 0) & (source_rows < row_to_pos.size)]
+                    if source_rows.size == 0:
+                        continue
+                    local_pos = row_to_pos[source_rows.astype(np.intp, copy=False)]
+                    local_pos = local_pos[local_pos >= 0].astype(np.int64, copy=False)
+                else:
+                    local_pos = np.searchsorted(row_array, source_rows)
+                    in_range = local_pos < row_array.size
+                    valid = np.zeros(local_pos.shape, dtype=bool)
+                    if np.any(in_range):
+                        valid[in_range] = row_array[local_pos[in_range]] == source_rows[in_range]
+                    local_pos = local_pos[valid].astype(np.int64, copy=False)
                 if local_pos.size:
                     local_pos.sort()
                     local_rows_by_code[int(code)] = local_pos

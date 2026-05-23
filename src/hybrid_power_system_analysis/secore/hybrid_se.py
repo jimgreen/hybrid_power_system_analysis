@@ -329,6 +329,195 @@ def _build_hybrid_se_network_from_ppc(ppc: Dict) -> _SELightweightHybridNetwork:
     return network
 
 
+class _HybridStateLabelSlice:
+    __slots__ = ("_parent", "_start", "_stop", "_step")
+
+    def __init__(self, parent, start: int, stop: int, step: int):
+        self._parent = parent
+        self._start = int(start)
+        self._stop = int(stop)
+        self._step = int(step)
+
+    def __len__(self) -> int:
+        return len(range(self._start, self._stop, self._step))
+
+    def __iter__(self):
+        for pos in range(self._start, self._stop, self._step):
+            yield self._parent[pos]
+
+    def __getitem__(self, key):
+        values = range(self._start, self._stop, self._step)
+        if isinstance(key, slice):
+            sub = values[key]
+            return _HybridStateLabelSlice(self._parent, sub.start, sub.stop, sub.step)
+        return self._parent[values[int(key)]]
+
+    def __contains__(self, value) -> bool:
+        return any(label == value for label in self)
+
+    def __eq__(self, other) -> bool:
+        return list(self) == list(other)
+
+    def index(self, value) -> int:
+        for pos, label in enumerate(self):
+            if label == value:
+                return pos
+        raise ValueError(f"{value!r} is not in state labels")
+
+
+class _HybridStateLabelView:
+    __slots__ = ("ac_n", "dc_n", "dcac_names", "acac_names", "dcac_start", "acac_start", "n_state")
+
+    def __init__(self, ac_n: int, dc_n: int, dcac_names: Sequence[str], acac_names: Sequence[str]):
+        self.ac_n = int(ac_n)
+        self.dc_n = int(dc_n)
+        self.dcac_names = tuple(str(name) for name in dcac_names)
+        self.acac_names = tuple(str(name) for name in acac_names)
+        self.dcac_start = self.ac_n + self.dc_n
+        self.acac_start = self.dcac_start + 3 * len(self.dcac_names)
+        self.n_state = self.acac_start + 4 * len(self.acac_names)
+
+    def __len__(self) -> int:
+        return self.n_state
+
+    def _label_at(self, pos: int) -> str:
+        if pos < self.ac_n:
+            return f"AC_STATE:{pos}"
+        if pos < self.dcac_start:
+            return f"DC_STATE:{pos - self.ac_n}"
+        if pos < self.acac_start:
+            local = pos - self.dcac_start
+            name = self.dcac_names[local // 3]
+            kind = local % 3
+            if kind == 0:
+                return f"DCAC_P_DC:{name}"
+            if kind == 1:
+                return f"DCAC_P_AC:{name}"
+            return f"DCAC_Q_AC:{name}"
+        local = pos - self.acac_start
+        name = self.acac_names[local // 4]
+        kind = local % 4
+        if kind == 0:
+            return f"ACAC_P_FROM:{name}"
+        if kind == 1:
+            return f"ACAC_Q_FROM:{name}"
+        if kind == 2:
+            return f"ACAC_P_TO:{name}"
+        return f"ACAC_Q_TO:{name}"
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            indices = range(self.n_state)[key]
+            return _HybridStateLabelSlice(self, indices.start, indices.stop, indices.step)
+        pos = int(key)
+        if pos < 0:
+            pos += self.n_state
+        if pos < 0 or pos >= self.n_state:
+            raise IndexError("state label index out of range")
+        return self._label_at(pos)
+
+    def __iter__(self):
+        for pos in range(self.n_state):
+            yield self._label_at(pos)
+
+    def __contains__(self, value) -> bool:
+        return any(label == value for label in self)
+
+    def __eq__(self, other) -> bool:
+        return list(self) == list(other)
+
+    def index(self, value) -> int:
+        for pos, label in enumerate(self):
+            if label == value:
+                return pos
+        raise ValueError(f"{value!r} is not in state labels")
+
+
+class _HybridStateSideView:
+    __slots__ = ("ac_n", "dc_n", "hybrid_n", "n_state")
+
+    def __init__(self, ac_n: int, dc_n: int, hybrid_n: int):
+        self.ac_n = int(ac_n)
+        self.dc_n = int(dc_n)
+        self.hybrid_n = int(hybrid_n)
+        self.n_state = self.ac_n + self.dc_n + self.hybrid_n
+
+    def __len__(self) -> int:
+        return self.n_state
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [self[pos] for pos in range(self.n_state)[key]]
+        pos = int(key)
+        if pos < 0:
+            pos += self.n_state
+        if pos < self.ac_n:
+            return "ac"
+        if pos < self.ac_n + self.dc_n:
+            return "dc"
+        if pos < self.n_state:
+            return "hybrid"
+        raise IndexError("state side index out of range")
+
+    def __iter__(self):
+        for _ in range(self.ac_n):
+            yield "ac"
+        for _ in range(self.dc_n):
+            yield "dc"
+        for _ in range(self.hybrid_n):
+            yield "hybrid"
+
+
+class _HybridStateMetaView:
+    __slots__ = ("_labels",)
+
+    def __init__(self, labels: _HybridStateLabelView):
+        self._labels = labels
+
+    def __len__(self) -> int:
+        return len(self._labels)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [self[pos] for pos in range(len(self))[key]]
+        pos = int(key)
+        labels = self._labels
+        if pos < 0:
+            pos += len(labels)
+        if pos < labels.ac_n:
+            return StateMeta("ac", "sub_state", "ACSubsystem", str(pos), legacy_label=labels[pos])
+        if pos < labels.dcac_start:
+            local = pos - labels.ac_n
+            return StateMeta("dc", "sub_state", "DCSubsystem", str(local), legacy_label=labels[pos])
+        if pos < labels.acac_start:
+            local = pos - labels.dcac_start
+            conv_pos = local // 3
+            name = labels.dcac_names[conv_pos]
+            kind = local % 3
+            if kind == 0:
+                return StateMeta("hybrid", "dcac_p_dc", "DCACConverter", name, terminal="dc", component="p", legacy_label=labels[pos], device_pos=conv_pos)
+            if kind == 1:
+                return StateMeta("hybrid", "dcac_p_ac", "DCACConverter", name, terminal="ac", component="p", legacy_label=labels[pos], device_pos=conv_pos)
+            return StateMeta("hybrid", "dcac_q_ac", "DCACConverter", name, terminal="ac", component="q", legacy_label=labels[pos], device_pos=conv_pos)
+        if pos < len(labels):
+            local = pos - labels.acac_start
+            conv_pos = local // 4
+            name = labels.acac_names[conv_pos]
+            kind = local % 4
+            if kind == 0:
+                return StateMeta("hybrid", "acac_p_from", "ACACConverter", name, terminal="from", component="p", legacy_label=labels[pos], device_pos=conv_pos)
+            if kind == 1:
+                return StateMeta("hybrid", "acac_q_from", "ACACConverter", name, terminal="from", component="q", legacy_label=labels[pos], device_pos=conv_pos)
+            if kind == 2:
+                return StateMeta("hybrid", "acac_p_to", "ACACConverter", name, terminal="to", component="p", legacy_label=labels[pos], device_pos=conv_pos)
+            return StateMeta("hybrid", "acac_q_to", "ACACConverter", name, terminal="to", component="q", legacy_label=labels[pos], device_pos=conv_pos)
+        raise IndexError("state metadata index out of range")
+
+    def __iter__(self):
+        for pos in range(len(self)):
+            yield self[pos]
+
+
 class HybridStateEstimator:
     """AC/DC state-estimation orchestrator.
 
@@ -1123,9 +1312,14 @@ class HybridStateEstimator:
             self.ac_state_cols = np.arange(ac_n, dtype=np.int32)
             self.dc_state_cols = dc_start + np.arange(dc_n, dtype=np.int32)
             self.hybrid_state_cols = hybrid_start + np.arange(hybrid_n, dtype=np.int32)
-            self.ac_vars = list(self.state_labels[:ac_n])
-            self.dc_vars = list(self.state_labels[dc_start : dc_start + dc_n])
-            self.hybrid_vars = list(self.state_labels[hybrid_start : hybrid_start + hybrid_n])
+            if getattr(self, "_lazy_state_layout", False):
+                self.ac_vars = self.state_labels[:ac_n]
+                self.dc_vars = self.state_labels[dc_start : dc_start + dc_n]
+                self.hybrid_vars = self.state_labels[hybrid_start : hybrid_start + hybrid_n]
+            else:
+                self.ac_vars = list(self.state_labels[:ac_n])
+                self.dc_vars = list(self.state_labels[dc_start : dc_start + dc_n])
+                self.hybrid_vars = list(self.state_labels[hybrid_start : hybrid_start + hybrid_n])
             self.ac_state_slice = slice(0, ac_n)
             self.dc_state_slice = slice(dc_start, dc_start + dc_n)
             self.hybrid_state_slice = slice(hybrid_start, hybrid_start + hybrid_n)
@@ -1959,13 +2153,20 @@ class HybridStateEstimator:
         if n_rows == 0:
             table.device_pos = np.asarray([], dtype=np.int64)
             return
+        existing_device_pos = getattr(table, "device_pos", None)
+        if existing_device_pos is not None:
+            existing_device_pos = np.asarray(existing_device_pos, dtype=np.int64)
+            if existing_device_pos.size == n_rows and not np.any(existing_device_pos < 0):
+                table.device_pos = existing_device_pos
+                if isinstance(getattr(self, "meas_ppc", None), dict):
+                    self.meas_ppc["device_pos"] = existing_device_pos
+                return
         device_name_id = getattr(table, "device_name_id", None)
         if device_name_id is None or np.asarray(device_name_id).size != n_rows:
             return
         device_name_id = np.asarray(device_name_id, dtype=np.int64)
-        device_pos = getattr(table, "device_pos", None)
-        if device_pos is not None and np.asarray(device_pos).size == n_rows:
-            device_pos = np.asarray(device_pos, dtype=np.int64).copy()
+        if existing_device_pos is not None and existing_device_pos.size == n_rows:
+            device_pos = existing_device_pos.copy()
         else:
             device_pos = np.empty(n_rows, dtype=np.int64)
             device_pos.fill(-1)
@@ -2714,6 +2915,42 @@ class HybridStateEstimator:
     def _build_state_layout(self) -> None:
         ac_n = int(getattr(self._ac_sub_estimator, "n_state", 0) or 0)
         dc_n = int(getattr(self._dc_sub_estimator, "n_state", 0) or 0)
+        dcac_count = len(self.dcac_converters)
+        acac_count = len(self.acac_converters)
+        hybrid_n = 3 * dcac_count + 4 * acac_count
+        self.ac_n_state = ac_n
+        self.dc_n_state = dc_n
+        self.hybrid_n_state = hybrid_n
+        self.dc_state_start = ac_n
+        self.hybrid_state_start = ac_n + dc_n
+        self.dcac_state_start = ac_n + dc_n
+        self.acac_state_start = self.dcac_state_start + 3 * dcac_count
+        self.n_state = ac_n + dc_n + hybrid_n
+        lazy_state_layout = self.n_state > 20000
+        self._lazy_state_layout = bool(lazy_state_layout)
+        if lazy_state_layout:
+            labels = _HybridStateLabelView(
+                ac_n,
+                dc_n,
+                (conv.name for conv in self.dcac_converters),
+                (conv.name for conv in self.acac_converters),
+            )
+            self.state_labels = labels
+            self.state_meta = _HybridStateMetaView(labels)
+            self.state_sides = _HybridStateSideView(ac_n, dc_n, hybrid_n)
+            self.ac_state_labels = labels[:ac_n]
+            self.dc_state_labels = labels[ac_n : ac_n + dc_n]
+            self.ac_state_layout = {"state_labels": self.ac_state_labels, "n_state": ac_n}
+            self.dc_state_layout = {"state_labels": self.dc_state_labels, "n_state": dc_n}
+            self.dcac_p_dc_state_col = self.dcac_state_start + 3 * np.arange(dcac_count, dtype=np.int32)
+            self.dcac_p_ac_state_col = self.dcac_p_dc_state_col + 1
+            self.dcac_q_ac_state_col = self.dcac_p_dc_state_col + 2
+            self.acac_p_from_state_col = self.acac_state_start + 4 * np.arange(acac_count, dtype=np.int32)
+            self.acac_q_from_state_col = self.acac_p_from_state_col + 1
+            self.acac_p_to_state_col = self.acac_p_from_state_col + 2
+            self.acac_q_to_state_col = self.acac_p_from_state_col + 3
+            self._finish_state_layout_arrays()
+            return
         state_meta: List[StateMeta] = [
             StateMeta("ac", "sub_state", "ACSubsystem", str(idx), legacy_label=f"AC_STATE:{idx}")
             for idx in range(ac_n)
@@ -2722,7 +2959,6 @@ class HybridStateEstimator:
             StateMeta("dc", "sub_state", "DCSubsystem", str(idx), legacy_label=f"DC_STATE:{idx}")
             for idx in range(dc_n)
         )
-        self.dcac_state_start = ac_n + dc_n
         for pos, conv in enumerate(self.dcac_converters):
             state_meta.extend(
                 (
@@ -2741,11 +2977,6 @@ class HybridStateEstimator:
                     StateMeta("hybrid", "acac_q_to", "ACACConverter", conv.name, terminal="to", component="q", legacy_label=f"ACAC_Q_TO:{conv.name}", device_pos=pos),
                 )
             )
-        self.ac_n_state = ac_n
-        self.dc_n_state = dc_n
-        self.hybrid_n_state = 3 * len(self.dcac_converters) + 4 * len(self.acac_converters)
-        self.dc_state_start = ac_n
-        self.hybrid_state_start = ac_n + dc_n
         self.n_state = len(state_meta)
         self.state_meta = state_meta
         labels = [meta.legacy_label for meta in state_meta]
@@ -2768,6 +2999,9 @@ class HybridStateEstimator:
         self.acac_q_from_state_col = self.acac_p_from_state_col + 1
         self.acac_p_to_state_col = self.acac_p_from_state_col + 2
         self.acac_q_to_state_col = self.acac_p_from_state_col + 3
+        self._finish_state_layout_arrays()
+
+    def _finish_state_layout_arrays(self) -> None:
         self.ac_reference_nodes = getattr(self._ac_sub_estimator, "references", []) if self._ac_sub_estimator is not None else []
         self.dc_reference_nodes = getattr(self._dc_sub_estimator, "references", []) if self._dc_sub_estimator is not None else []
         self.ac_node_voltage_measurements = (
