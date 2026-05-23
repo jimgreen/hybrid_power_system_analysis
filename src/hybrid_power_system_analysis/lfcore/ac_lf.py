@@ -88,8 +88,23 @@ except ImportError:  # pragma: no cover - direct script import path
     )
 
 
+AC_NODE_TYPE_PQ = np.int8(1)
+AC_NODE_TYPE_PV = np.int8(2)
+AC_NODE_TYPE_SLACK = np.int8(3)
+AC_NODE_TYPE_LABELS = {
+    int(AC_NODE_TYPE_PQ): "PQ",
+    int(AC_NODE_TYPE_PV): "PV",
+    int(AC_NODE_TYPE_SLACK): "SLACK",
+}
+
+
+def ac_node_type_label(node_type) -> str:
+    return AC_NODE_TYPE_LABELS.get(int(node_type), str(int(node_type)))
+
+
 @dataclass
 class ACLFResult:
+    arrays: Dict[str, np.ndarray] = field(default_factory=dict)
     branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
     transformers: Dict[str, SimpleNamespace] = field(default_factory=dict)
     nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
@@ -497,8 +512,8 @@ class ACPowerFlowCalc:
         return _normalize_lf_result_mode(result_mode, "AC")
 
     def _cache_node_type_masks(self):
-        self._slack_mask = self.node_type == 'SLACK'
-        self._fixed_voltage_mask = self._slack_mask | (self.node_type == 'PV')
+        self._slack_mask = self.node_type == AC_NODE_TYPE_SLACK
+        self._fixed_voltage_mask = self._slack_mask | (self.node_type == AC_NODE_TYPE_PV)
 
     # --------------------------------------------------------------------------
     # 私有辅助函数（精简版）
@@ -751,7 +766,7 @@ class ACPowerFlowCalc:
             self.node_pos = {}
         self._bind_ppc_nodes_to_network()
 
-        self.node_type = np.full(self.N, 'PQ', dtype='U5')
+        self.node_type = np.full(self.N, AC_NODE_TYPE_PQ, dtype=np.int8)
         self.V_spec = np.full(self.N, np.nan, dtype=np.float64)
         self.theta_spec = np.zeros(self.N, dtype=np.float64)
         self.P_spec = np.zeros(self.N, dtype=np.float64)
@@ -780,19 +795,19 @@ class ACPowerFlowCalc:
             slack_mask = controls == CTRL_SLACK
             if np.any(slack_mask):
                 slack_pos = self.ppc_gen_pos[slack_mask]
-                self.node_type[slack_pos] = 'SLACK'
+                self.node_type[slack_pos] = AC_NODE_TYPE_SLACK
                 self.V_spec[slack_pos] = live_gen[slack_mask, GEN_COLS["v_set"]]
                 self.theta_spec[slack_pos] = self.ppc["bus"][self.active_bus_rows[slack_pos], BUS_COLS["angle"]]
                 self.slack_node = int(slack_pos[-1])
 
-            pv_mask = (controls == CTRL_PV) & (self.node_type[self.ppc_gen_pos] != 'SLACK')
+            pv_mask = (controls == CTRL_PV) & (self.node_type[self.ppc_gen_pos] != AC_NODE_TYPE_SLACK)
             if np.any(pv_mask):
                 pv_pos = self.ppc_gen_pos[pv_mask]
                 pv_v = live_gen[pv_mask, GEN_COLS["v_set"]]
                 for pos, v_set in zip(pv_pos, pv_v):
                     if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - v_set) > 1e-6:
                         raise ValueError(f"节点{pos}多个PV发电机电压设定冲突")
-                self.node_type[pv_pos] = 'PV'
+                self.node_type[pv_pos] = AC_NODE_TYPE_PV
                 self.V_spec[pv_pos] = pv_v
                 np.add.at(self.P_spec, pv_pos, live_gen[pv_mask, GEN_COLS["p_set"]])
 
@@ -821,14 +836,14 @@ class ACPowerFlowCalc:
             q_mask = controls == SHUNT_Q
             if np.any(q_mask):
                 np.add.at(self.Q_spec, self.ppc_shunt_pos[q_mask], live_shunt[q_mask, SHUNT_COLS["q_set"]])
-            v_mask = (controls == SHUNT_V) & (self.node_type[self.ppc_shunt_pos] != 'SLACK')
+            v_mask = (controls == SHUNT_V) & (self.node_type[self.ppc_shunt_pos] != AC_NODE_TYPE_SLACK)
             if np.any(v_mask):
                 v_pos = self.ppc_shunt_pos[v_mask]
                 v_set_values = live_shunt[v_mask, SHUNT_COLS["v_set"]]
                 for pos, v_set in zip(v_pos, v_set_values):
                     if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - v_set) > 1e-6:
                         raise ValueError(f"节点{pos}电压设定冲突")
-                self.node_type[v_pos] = 'PV'
+                self.node_type[v_pos] = AC_NODE_TYPE_PV
                 self.V_spec[v_pos] = v_set_values
 
         if load.size:
@@ -849,10 +864,10 @@ class ACPowerFlowCalc:
             )
 
         if self.slack_node == -1:
-            pv_indices = np.where(self.node_type == 'PV')[0]
+            pv_indices = np.where(self.node_type == AC_NODE_TYPE_PV)[0]
             if pv_indices.size:
                 self.slack_node = int(pv_indices[0])
-                self.node_type[self.slack_node] = 'SLACK'
+                self.node_type[self.slack_node] = AC_NODE_TYPE_SLACK
                 self.theta_spec[self.slack_node] = self.ppc["bus"][self.active_bus_rows[self.slack_node], BUS_COLS["angle"]]
         if self.slack_node == -1:
             raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
@@ -976,8 +991,8 @@ class ACPowerFlowCalc:
 
     def _finalize_prepared_arrays(self):
         """Finalize variable/equation indices after node specs, Y and zero edges are ready."""
-        self.theta_unknown = np.where(self.node_type != 'SLACK')[0].astype(np.int32)
-        self.V_unknown = np.where(self.node_type == 'PQ')[0].astype(np.int32)
+        self.theta_unknown = np.where(self.node_type != AC_NODE_TYPE_SLACK)[0].astype(np.int32)
+        self.V_unknown = np.where(self.node_type == AC_NODE_TYPE_PQ)[0].astype(np.int32)
         self.n_theta = len(self.theta_unknown)
         self.n_V = len(self.V_unknown)
         self.theta_idx = np.full(self.N, -1, dtype=np.int32)
@@ -1320,13 +1335,13 @@ class ACPowerFlowCalc:
             phi_b = int(phi_b_raw)
             phi_cols = (phi_a, self.N_phi + phi_a, phi_b, self.N_phi + phi_b)
 
-            if self.node_type[a] != 'SLACK':
+            if self.node_type[a] != AC_NODE_TYPE_SLACK:
                 eq_a = self.theta_idx[a]
                 top_left_rows.append(eq_a)
                 top_left_cols.append(eq_a)
                 top_left_edge.append(edge_pos)
                 top_left_kind.append(0)
-                if self.node_type[a] == 'PQ':
+                if self.node_type[a] == AC_NODE_TYPE_PQ:
                     top_left_rows.append(eq_a)
                     top_left_cols.append(self.n_theta + self.V_idx[a])
                     top_left_edge.append(edge_pos)
@@ -1336,7 +1351,7 @@ class ACPowerFlowCalc:
                 top_right_edge.extend([edge_pos] * 4)
                 top_right_kind.extend([0, 1, 2, 3])
 
-            if self.node_type[a] == 'PQ':
+            if self.node_type[a] == AC_NODE_TYPE_PQ:
                 eq_a = self.n_theta + self.V_idx[a]
                 top_left_rows.extend([eq_a, eq_a])
                 top_left_cols.extend([self.theta_idx[a], self.n_theta + self.V_idx[a]])
@@ -1347,13 +1362,13 @@ class ACPowerFlowCalc:
                 top_right_edge.extend([edge_pos] * 4)
                 top_right_kind.extend([4, 5, 6, 7])
 
-            if self.node_type[b] != 'SLACK':
+            if self.node_type[b] != AC_NODE_TYPE_SLACK:
                 eq_b = self.theta_idx[b]
                 top_left_rows.append(eq_b)
                 top_left_cols.append(eq_b)
                 top_left_edge.append(edge_pos)
                 top_left_kind.append(4)
-                if self.node_type[b] == 'PQ':
+                if self.node_type[b] == AC_NODE_TYPE_PQ:
                     top_left_rows.append(eq_b)
                     top_left_cols.append(self.n_theta + self.V_idx[b])
                     top_left_edge.append(edge_pos)
@@ -1363,7 +1378,7 @@ class ACPowerFlowCalc:
                 top_right_edge.extend([edge_pos] * 4)
                 top_right_kind.extend([8, 9, 10, 11])
 
-            if self.node_type[b] == 'PQ':
+            if self.node_type[b] == AC_NODE_TYPE_PQ:
                 eq_b = self.n_theta + self.V_idx[b]
                 top_left_rows.extend([eq_b, eq_b])
                 top_left_cols.extend([self.theta_idx[b], self.n_theta + self.V_idx[b]])
@@ -1392,44 +1407,44 @@ class ACPowerFlowCalc:
                 _, _, a, b = self.zero_edges[edge_idx]
                 a = int(a)
                 b = int(b)
-                if self.node_type[a] != 'SLACK':
+                if self.node_type[a] != AC_NODE_TYPE_SLACK:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.theta_idx[a])
                     bottom_left_node.append(a)
                     bottom_left_kind.append(0)
-                if self.node_type[a] == 'PQ':
+                if self.node_type[a] == AC_NODE_TYPE_PQ:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.n_theta + self.V_idx[a])
                     bottom_left_node.append(a)
                     bottom_left_kind.append(1)
-                if self.node_type[b] != 'SLACK':
+                if self.node_type[b] != AC_NODE_TYPE_SLACK:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.theta_idx[b])
                     bottom_left_node.append(b)
                     bottom_left_kind.append(2)
-                if self.node_type[b] == 'PQ':
+                if self.node_type[b] == AC_NODE_TYPE_PQ:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.n_theta + self.V_idx[b])
                     bottom_left_node.append(b)
                     bottom_left_kind.append(3)
                 eq_idx += 1
 
-                if self.node_type[a] != 'SLACK':
+                if self.node_type[a] != AC_NODE_TYPE_SLACK:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.theta_idx[a])
                     bottom_left_node.append(a)
                     bottom_left_kind.append(4)
-                if self.node_type[a] == 'PQ':
+                if self.node_type[a] == AC_NODE_TYPE_PQ:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.n_theta + self.V_idx[a])
                     bottom_left_node.append(a)
                     bottom_left_kind.append(5)
-                if self.node_type[b] != 'SLACK':
+                if self.node_type[b] != AC_NODE_TYPE_SLACK:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.theta_idx[b])
                     bottom_left_node.append(b)
                     bottom_left_kind.append(6)
-                if self.node_type[b] == 'PQ':
+                if self.node_type[b] == AC_NODE_TYPE_PQ:
                     bottom_left_rows.append(eq_idx)
                     bottom_left_cols.append(self.n_theta + self.V_idx[b])
                     bottom_left_node.append(b)
@@ -1626,7 +1641,7 @@ class ACPowerFlowCalc:
         """
         if self.node_type.size == 0:
             return False
-        if self.node_type[a] != 'SLACK' or self.node_type[b] != 'SLACK':
+        if self.node_type[a] != AC_NODE_TYPE_SLACK or self.node_type[b] != AC_NODE_TYPE_SLACK:
             return False
         if abs(self.V_spec[a] - self.V_spec[b]) > 1e-10:
             return False
@@ -2252,6 +2267,7 @@ class ACPowerFlowCalc:
         # 之前是逐行 Python 循环（30k 节点时占总耗时 ~33%），改成
         # 按列向量化抽取 + 单次 searchsorted 做节点电压查表。
         result = ACLFResult()
+        result.arrays = dict(self.result)
         bus = self.result.get("bus")
         if bus is None or len(bus) == 0:
             return result
@@ -2617,7 +2633,7 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     print("\n1. 节点电压 (pu):")
     bus = calc.result["bus"]
     bus_names = _names("bus_name", bus.shape[0])
-    slack_node_ids = set(calc.ppc_node_idx[calc.node_type == "SLACK"].tolist())
+    slack_node_ids = set(calc.ppc_node_idx[calc.node_type == AC_NODE_TYPE_SLACK].tolist())
     active_node_ids = set(calc.ppc_node_idx.tolist())
     for row, name in zip(bus, bus_names):
         node_idx = int(row[BUS_COLS["idx"]])

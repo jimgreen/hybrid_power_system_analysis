@@ -272,6 +272,22 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertIn("branch", array_calc.result)
         self.assertIsNone(getattr(array_calc, "lf_result", None))
 
+    def test_full_dc_result_exposes_array_result_tables(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import build_dc_ppc_from_e_file
+
+        ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
+        calc = DCPowerFlowCalc(ppc, result_mode="full")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertIsNotNone(calc.lf_result)
+        self.assertIn("bus", calc.lf_result.arrays)
+        self.assertIn("branch", calc.lf_result.arrays)
+        self.assertIs(calc.lf_result.arrays["bus"], calc.result["bus"])
+        self.assertIs(calc.lf_result.arrays["branch"], calc.result["branch"])
+
     def test_dc_power_flow_can_load_e_file_through_efile_reader_path(self):
         import lfcore.dc_lf as dc_lf
         from lfcore.dc_lf import DCPowerFlowCalc

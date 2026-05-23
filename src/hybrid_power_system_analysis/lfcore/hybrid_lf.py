@@ -16,7 +16,9 @@ for path in (ROOT_DIR, LFCORE_DIR, MODEL_DIR):
 
 from ac_lf import (
     ACLFResult,
+    AC_NODE_TYPE_PQ,
     ACPowerFlowCalc,
+    ac_node_type_label,
     coo_matrix,
     csc_matrix,
     csr_matrix,
@@ -492,6 +494,7 @@ class ACACLFResult:
 
 @dataclass
 class HybridLFResult:
+    arrays: dict = field(default_factory=dict)
     network: Optional[HybridPowerNetwork] = None
     ac_network: Any = None
     dc_network: Any = None
@@ -782,8 +785,9 @@ class HybridPowerFlowCalc:
             conv.ac_node_obj = self._ac_node_obj_by_idx.get(int(conv.ac_node))
             conv.dc_node_obj = self._dc_node_obj_by_idx.get(int(conv.dc_node))
             ac_pos = self.ac_calc.node_pos[conv.ac_node]
-            if self.ac_calc.node_type[ac_pos] != "PQ":
-                raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[ac_pos]}")
+            if self.ac_calc.node_type[ac_pos] != AC_NODE_TYPE_PQ:
+                current_type = ac_node_type_label(self.ac_calc.node_type[ac_pos])
+                raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}")
             dc_pos = self.dc_calc.alive_node_dict[conv.dc_node]
             ctrl = str(conv.control_type).upper()
             if ctrl not in {"DCV", "ACV", "ACP"}:
@@ -832,10 +836,11 @@ class HybridPowerFlowCalc:
             dc_solver_pos = self._dc_solver_pos(dc_node)
             if dc_solver_pos < 0:
                 continue
-            if self.ac_calc.node_type[ac_solver_pos] != "PQ":
+            if self.ac_calc.node_type[ac_solver_pos] != AC_NODE_TYPE_PQ:
                 idx = int(row[DCAC_COLS["idx"]])
+                current_type = ac_node_type_label(self.ac_calc.node_type[ac_solver_pos])
                 raise ValueError(
-                    f"DCACConverter[{idx}] 的 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[ac_solver_pos]}"
+                    f"DCACConverter[{idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}"
                 )
             ctrl = int(row[DCAC_COLS["control_type"]])
             if ctrl not in DCAC_CONTROL_LABEL:
@@ -948,10 +953,12 @@ class HybridPowerFlowCalc:
             j_pos = self.ac_calc.node_pos[conv.j_node]
             if i_pos == j_pos:
                 raise ValueError(f"ACACConverter[{conv.idx}] 两端不能连接同一个 AC 节点")
-            if self.ac_calc.node_type[i_pos] != "PQ":
-                raise ValueError(f"ACACConverter[{conv.idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[i_pos]}")
-            if self.ac_calc.node_type[j_pos] != "PQ":
-                raise ValueError(f"ACACConverter[{conv.idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[j_pos]}")
+            if self.ac_calc.node_type[i_pos] != AC_NODE_TYPE_PQ:
+                current_type = ac_node_type_label(self.ac_calc.node_type[i_pos])
+                raise ValueError(f"ACACConverter[{conv.idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {current_type}")
+            if self.ac_calc.node_type[j_pos] != AC_NODE_TYPE_PQ:
+                current_type = ac_node_type_label(self.ac_calc.node_type[j_pos])
+                raise ValueError(f"ACACConverter[{conv.idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}")
             ctrl = str(conv.control_type).upper()
             if ctrl not in ACAC_CONTROL_TYPES:
                 raise ValueError(f"未知 ACACConverter 控制模式: {conv.control_type}")
@@ -980,13 +987,15 @@ class HybridPowerFlowCalc:
             idx = int(row[ACAC_COLS["idx"]])
             if i_solver_pos == j_solver_pos:
                 raise ValueError(f"ACACConverter[{idx}] 两端不能连接同一个 AC 节点")
-            if self.ac_calc.node_type[i_solver_pos] != "PQ":
+            if self.ac_calc.node_type[i_solver_pos] != AC_NODE_TYPE_PQ:
+                current_type = ac_node_type_label(self.ac_calc.node_type[i_solver_pos])
                 raise ValueError(
-                    f"ACACConverter[{idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[i_solver_pos]}"
+                    f"ACACConverter[{idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {current_type}"
                 )
-            if self.ac_calc.node_type[j_solver_pos] != "PQ":
+            if self.ac_calc.node_type[j_solver_pos] != AC_NODE_TYPE_PQ:
+                current_type = ac_node_type_label(self.ac_calc.node_type[j_solver_pos])
                 raise ValueError(
-                    f"ACACConverter[{idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {self.ac_calc.node_type[j_solver_pos]}"
+                    f"ACACConverter[{idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}"
                 )
             ctrl = int(row[ACAC_COLS["control_type"]])
             if ctrl not in ACAC_CONTROL_LABEL:
@@ -2366,6 +2375,7 @@ class HybridPowerFlowCalc:
 
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
         result = HybridLFResult(
+            arrays=dict(self.result),
             network=self.network,
             ac_network=self.network.ac,
             dc_network=self.network.dc,

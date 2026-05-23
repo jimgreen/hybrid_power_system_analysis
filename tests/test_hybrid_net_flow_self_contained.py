@@ -456,6 +456,14 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertGreater(first_dcac.j_v, 0.0)
         self.assertGreater(first_acac.i_v, 0.0)
         self.assertGreater(first_acac.j_v, 0.0)
+        self.assertIn("ac", result.arrays)
+        self.assertIn("dc", result.arrays)
+        self.assertIn("dcac", result.arrays)
+        self.assertIn("acac", result.arrays)
+        self.assertIs(result.arrays["ac"], result.calc.result["ac"])
+        self.assertIs(result.arrays["dc"], result.calc.result["dc"])
+        self.assertIs(result.arrays["dcac"], result.calc.result["dcac"])
+        self.assertIs(result.arrays["acac"], result.calc.result["acac"])
 
     def test_hybrid_ppc_model_build_delegates_to_ac_dc_array_helpers(self):
         import model.hybrid_array_model as hybrid_array_model

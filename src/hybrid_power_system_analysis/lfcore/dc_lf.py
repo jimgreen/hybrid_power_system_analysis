@@ -122,6 +122,7 @@ except ImportError:  # pragma: no cover - direct script import path
 
 @dataclass
 class DCLFResult:
+    arrays: Dict[str, np.ndarray] = field(default_factory=dict)
     branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
     nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
     zero_branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
@@ -1647,6 +1648,7 @@ class DCPowerFlowCalc:
         # 与 ac_lf 同构：按列向量化抽取 + 单次 searchsorted 做节点电压查表，
         # 避免每行 Python float/int 转换与 dict 查询。
         result = DCLFResult()
+        result.arrays = dict(self.result)
         bus_rows = self.result.get("bus")
         if bus_rows is None or len(bus_rows) == 0:
             return result

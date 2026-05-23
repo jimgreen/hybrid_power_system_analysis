@@ -355,6 +355,50 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertGreater(calc.x.size, 0)
         self.assertIn("bus", calc.result)
 
+    def test_ac_node_type_uses_numeric_codes_in_solver_path(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        self.assertTrue(np.issubdtype(calc.node_type.dtype, np.integer))
+        self.assertEqual((calc.N,), calc.node_type.shape)
+        self.assertGreater(np.unique(calc.node_type).size, 1)
+
+        checked_sources = [
+            ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py",
+            ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "hybrid_lf.py",
+        ]
+        offenders = []
+        for source_path in checked_sources:
+            for line_no, line in enumerate(source_path.read_text(encoding="utf-8").splitlines(), start=1):
+                if "node_type" not in line:
+                    continue
+                if "label" in line.lower() or "LABEL" in line:
+                    continue
+                if any(token in line for token in ("'PQ'", '"PQ"', "'PV'", '"PV"', "'SLACK'", '"SLACK"')):
+                    offenders.append(f"{source_path.name}:{line_no}:{line.strip()}")
+        self.assertEqual([], offenders)
+
+    def test_full_ac_result_exposes_array_result_tables(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="full")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertIsNotNone(calc.lf_result)
+        self.assertIn("bus", calc.lf_result.arrays)
+        self.assertIn("branch", calc.lf_result.arrays)
+        self.assertIs(calc.lf_result.arrays["bus"], calc.result["bus"])
+        self.assertIs(calc.lf_result.arrays["branch"], calc.result["branch"])
+
     def test_ac_lf_benchmark_uses_nr_only(self):
         from lfcore import ac_lf_benchmark
 
