@@ -3,6 +3,14 @@
 # 100 V kW A
 </PowerBase>
 
+<ACRealBs>
+@ idx name  node run_stat
+<ACRealBs>
+
+<DCRealBs>
+@ idx name  node run_stat
+<DCRealBs>
+
 <ACNode>
 @ idx name        vbase voltage angle isl run_stat
 #   1 wt01_src      300     300     0   0        1

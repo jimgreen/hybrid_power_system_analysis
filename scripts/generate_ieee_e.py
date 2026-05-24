@@ -58,6 +58,14 @@ def _row_status(row, col, default=1):
     return int(row[col]) if row.shape[0] > col else default
 
 
+def _unique_name(base: str, used: dict[str, int]) -> str:
+    count = used.get(base, 0) + 1
+    used[base] = count
+    if count == 1:
+        return base
+    return f"{base}_{count}"
+
+
 def convert_case(case_name, out_path):
     mpc = _load_case(case_name)
     base_mva = float(mpc["baseMVA"])
@@ -65,7 +73,7 @@ def convert_case(case_name, out_path):
     gen = np.asarray(mpc["gen"], dtype=float)
     branch = np.asarray(mpc["branch"], dtype=float)
 
-    bus_index = {int(row[BUS_I]): idx for idx, row in enumerate(bus)}
+    bus_index = {int(row[BUS_I]): idx + 1 for idx, row in enumerate(bus)}
     bus_type = {int(row[BUS_I]): int(row[BUS_TYPE]) for row in bus}
     bus_vm = {int(row[BUS_I]): row[VM] for row in bus}
     fallback_kv = base_mva / math.sqrt(3.0)
@@ -106,8 +114,10 @@ def convert_case(case_name, out_path):
 
     branch_rows = []
     transformer_rows = []
-    branch_idx = 0
-    transformer_idx = 0
+    branch_idx = 1
+    transformer_idx = 1
+    used_branch_names: dict[str, int] = {}
+    used_transformer_names: dict[str, int] = {}
     for row in branch:
         run_stat = _row_status(row, BR_STATUS)
         f_bus = int(row[F_BUS])
@@ -125,7 +135,7 @@ def convert_case(case_name, out_path):
             transformer_rows.append(
                 [
                     str(transformer_idx),
-                    f"tr_{f_bus}_{t_bus}",
+                    _unique_name(f"tr_{f_bus}_{t_bus}", used_transformer_names),
                     str(i_node),
                     str(j_node),
                     _fmt(row[BR_R]),
@@ -142,7 +152,7 @@ def convert_case(case_name, out_path):
             branch_rows.append(
                 [
                     str(branch_idx),
-                    f"line_{f_bus}_{t_bus}",
+                    _unique_name(f"line_{f_bus}_{t_bus}", used_branch_names),
                     str(i_node),
                     str(j_node),
                     _fmt(row[BR_R]),
@@ -160,7 +170,7 @@ def convert_case(case_name, out_path):
     )
 
     load_rows = []
-    load_idx = 0
+    load_idx = 1
     for row in bus:
         bus_id = int(row[BUS_I])
         pd = row[PD]
@@ -193,11 +203,12 @@ def convert_case(case_name, out_path):
     )
 
     gen_rows = []
-    for gen_idx, row in enumerate(gen):
+    for gen_pos, row in enumerate(gen):
         bus_id = int(row[GEN_BUS])
         run_stat = _row_status(row, GEN_STATUS)
         btype = bus_type.get(bus_id, 1)
         control_type = "V" if btype == 3 else "PV"
+        gen_idx = gen_pos + 1
         gen_rows.append(
             [
                 str(gen_idx),
@@ -219,7 +230,7 @@ def convert_case(case_name, out_path):
     )
 
     shunt_rows = []
-    shunt_idx = 0
+    shunt_idx = 1
     for row in bus:
         bus_id = int(row[BUS_I])
         gs = row[GS] / base_mva

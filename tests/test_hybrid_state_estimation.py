@@ -3706,6 +3706,32 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertGreater(estimator.n_state, 0)
         self.assertGreater(len(estimator.active_measurements), estimator.n_state)
 
+    def test_pure_ac_delegate_preserves_branch_measurement_device_positions(self):
+        from model.meas_type import DEVICE_TYPE_ACBranch
+        from secore.ac_se import ACStateEstimator
+        from secore.hybrid_se import HybridStateEstimator
+
+        e_file = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
+        meas_file = ROOT_DIR / "data" / "meas" / "ac" / "ieee300.meas"
+        direct = ACStateEstimator(e_file=e_file, meas_file=meas_file, flat_start=True)
+        hybrid = HybridStateEstimator(e_file=e_file, meas_file=meas_file, flat_start=True)
+        delegate = hybrid._delegate_estimator
+
+        direct_table = direct.measurements.table
+        delegate_table = delegate.measurements.table
+        direct_branch = direct_table.device_type_code == DEVICE_TYPE_ACBranch
+        delegate_branch = delegate_table.device_type_code == DEVICE_TYPE_ACBranch
+
+        self.assertGreater(int(np.count_nonzero(direct_branch)), 0)
+        self.assertEqual(
+            int(np.count_nonzero(direct_table.valid[direct_branch])),
+            int(np.count_nonzero(delegate_table.valid[delegate_branch])),
+        )
+        self.assertEqual(
+            int(np.count_nonzero(direct_table.device_pos[direct_branch] >= 0)),
+            int(np.count_nonzero(delegate_table.device_pos[delegate_branch] >= 0)),
+        )
+
     def test_pure_dc_dc_net_3000_adds_pseudo_measurements_for_unmetered_zero_branch_current_states(self):
         from secore.dc_se import DCStateEstimator
         from secore.hybrid_se import HybridStateEstimator

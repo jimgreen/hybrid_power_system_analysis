@@ -902,8 +902,11 @@ class HybridStateEstimator:
             self._sub_measurement_source_count = len(self.measurements)
         return sources_by_side
 
-    def _measurements_for_sub_estimator(self, side: str, share_measurements: bool) -> List[Measurement]:
+    def _measurements_for_sub_estimator(self, side: str, share_measurements: bool):
         if share_measurements and self._is_uncoupled_single_side(side):
+            meas_ppc = getattr(self, "meas_ppc", None)
+            if isinstance(meas_ppc, dict):
+                return meas_ppc
             return self.measurements
         sources = self._initial_measurement_sources_by_side().get(side, ())
         defer_finalize = getattr(self, "network", None) is not None and self._defer_sub_prepare_finalize()
