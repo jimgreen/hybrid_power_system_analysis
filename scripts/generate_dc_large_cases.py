@@ -12,9 +12,9 @@ from unit_system import dc_current_base_ka
 
 
 POWER_BASE = 100.0
-U_SCALE = 1.0
-P_SCALE = 1.0
-I_SCALE = 1.0
+U_UNIT = "kV"
+P_UNIT = "kW"
+I_UNIT = "kA"
 VBASE = 100.0
 NODES_PER_BLOCK = 10
 
@@ -120,7 +120,7 @@ def _build_case_tables(n_nodes: int) -> List[tuple]:
         dcdc_idx += 1
 
     return [
-        ("PowerBase", ("p_base", "u_scale", "p_scale", "i_scale"), [(POWER_BASE, U_SCALE, P_SCALE, I_SCALE)]),
+        ("PowerBase", ("p_base", "u_unit", "p_unit", "i_unit"), [(POWER_BASE, U_UNIT, P_UNIT, I_UNIT)]),
         ("DCNode", ("idx", "name", "vbase", "voltage", "isl", "run_stat"), nodes),
         ("DCBranch", ("idx", "name", "i_node", "j_node", "r", "run_stat"), branches),
         ("DCLoad", ("idx", "name", "node", "pbase", "pv0", "pv1", "pv2", "run_stat"), loads),

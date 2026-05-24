@@ -741,8 +741,8 @@ class ACPPCFlowTest(unittest.TestCase):
         content = "\n".join(
             [
                 "<PowerBase>",
-                "@ p_base u_scale p_scale i_scale",
-                "# 100 1.0 0.001 1.0",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100 kV MW kA",
                 "</PowerBase>",
                 "",
             ]

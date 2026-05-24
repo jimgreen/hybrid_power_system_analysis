@@ -29,9 +29,9 @@ class NamedUnitFileTest(unittest.TestCase):
         self.assertIn("PowerBase", raw)
         power_base = raw["PowerBase"]["data"][0]
         self.assertAlmostEqual(float(power_base["p_base"]), 100.0)
-        self.assertAlmostEqual(float(power_base["u_scale"]), 1000.0)
-        self.assertAlmostEqual(float(power_base["p_scale"]), 1.0)
-        self.assertAlmostEqual(float(power_base["i_scale"]), 1000.0)
+        self.assertEqual(power_base["u_unit"], "V")
+        self.assertEqual(power_base["p_unit"], "kW")
+        self.assertEqual(power_base["i_unit"], "A")
 
         ac_node = next(row for row in raw["ACNode"]["data"] if row["name"] == "wt01_src")
         dcac = next(row for row in raw["DCACConverter"]["data"] if row["name"] == "wt01_rect")
@@ -206,7 +206,7 @@ class NamedUnitFileTest(unittest.TestCase):
         from unit_system import normalize_model_named_units
 
         model = SimpleNamespace(
-            PowerBase=[SimpleNamespace(p_base=100000.0, u_scale=1000.0, p_scale=1000.0, i_scale=1000.0)],
+            PowerBase=[SimpleNamespace(p_base=100000.0, u_unit="V", p_unit="W", i_unit="A")],
             ACNode=[
                 SimpleNamespace(idx=1, vbase=300.0, voltage=300.0),
                 SimpleNamespace(idx=2, vbase=300.0, voltage=297.0),

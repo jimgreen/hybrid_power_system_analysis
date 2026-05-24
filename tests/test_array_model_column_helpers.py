@@ -90,8 +90,8 @@ class ArrayModelColumnHelperTest(unittest.TestCase):
         import model.dc_array_model as dc_array_model
 
         base_table = {
-            "header_list": ["p_base", "u_scale", "p_scale", "i_scale"],
-            "rows": [["100000", "1000", "1000", "1"]],
+            "header_list": ["p_base", "u_unit", "p_unit", "i_unit"],
+            "rows": [["100000", "V", "W", "kA"]],
         }
         ac_ppc = ac_array_model.build_ac_ppc_from_efile_rows(
             "inline_ac.e",

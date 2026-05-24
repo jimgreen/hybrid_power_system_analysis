@@ -2159,8 +2159,8 @@ class ACStateEstimationTest(unittest.TestCase):
 
         data = {
             "PowerBase": {
-                "header_list": ["p_base", "u_scale", "p_scale", "i_scale"],
-                "data": [{"p_base": "100000", "u_scale": "1000", "p_scale": "1000", "i_scale": "1"}],
+                "header_list": ["p_base", "u_unit", "p_unit", "i_unit"],
+                "data": [{"p_base": "100000", "u_unit": "V", "p_unit": "W", "i_unit": "kA"}],
             },
             "ACNode": {
                 "header_list": ["idx", "name", "vbase", "voltage", "angle", "run_stat"],

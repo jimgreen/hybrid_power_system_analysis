@@ -78,8 +78,8 @@ def convert_case(case_name, out_path):
     _write_block(
         lines,
         "PowerBase",
-        ["p_base", "u_scale", "p_scale", "i_scale"],
-        [[_fmt(base_mva), "1.0", "0.001", "1.0"]],
+        ["p_base", "u_unit", "p_unit", "i_unit"],
+        [[_fmt(base_mva), "kV", "MW", "kA"]],
     )
 
     node_rows = []

@@ -287,8 +287,8 @@ class DCStateEstimationTest(unittest.TestCase):
         from model.ppc_topology import build_dc_ppc_with_topology_from_e_file
 
         case_text = """<PowerBase>
-@ p_base u_scale p_scale i_scale
-# 100 1 1 1
+@ p_base u_unit p_unit i_unit
+# 100 kV kW kA
 </PowerBase>
 
 <DCNode>

@@ -11,6 +11,9 @@ class UnitSettings:
     u_scale: float
     p_scale: float
     i_scale: float
+    p_unit: str = "kW"
+    u_unit: str = "kV"
+    i_unit: str = "kA"
 
     @property
     def p_base_kW(self) -> float:
@@ -20,7 +23,7 @@ class UnitSettings:
 def _positive_float(obj, attr: str) -> float:
     if not hasattr(obj, attr):
         raise RuntimeError(
-            "E file <PowerBase> must define p_base, u_scale, p_scale, and i_scale"
+            "E file <PowerBase> must define p_base, u_unit, p_unit, and i_unit"
         )
     value = float(getattr(obj, attr))
     if value <= 0.0:
@@ -28,18 +31,58 @@ def _positive_float(obj, attr: str) -> float:
     return value
 
 
+_P_UNIT_TO_SCALE = {
+    "W": 1000.0,
+    "kW": 1.0,
+    "MW": 0.001,
+}
+_U_UNIT_TO_SCALE = {
+    "mV": 1_000_000.0,
+    "V": 1000.0,
+    "kV": 1.0,
+}
+_I_UNIT_TO_SCALE = {
+    "mA": 1_000_000.0,
+    "A": 1000.0,
+    "kA": 1.0,
+}
+
+
+def _unit_scale(obj, unit_attr: str, scale_attr: str, mapping, default_unit: str) -> tuple[float, str]:
+    """Return the numeric scale implied by the named E-file unit.
+
+    New E files define p/u/i units by name.  Legacy in-memory test objects may
+    still carry *_scale; keep accepting those objects while normalizing all
+    runtime models to the same numeric scale fields.
+    """
+    unit_value = getattr(obj, unit_attr, None)
+    if unit_value not in (None, ""):
+        unit = str(unit_value).strip()
+        if unit not in mapping:
+            allowed = "/".join(mapping.keys())
+            raise RuntimeError(f"Invalid {unit_attr} in <PowerBase>: {unit!r}; expected one of {allowed}")
+        return float(mapping[unit]), unit
+    return _positive_float(obj, scale_attr), default_unit
+
+
 def get_unit_settings(model) -> UnitSettings:
     rows = getattr(model, POWER_BASE_BLOCK, None)
     if not rows:
         raise RuntimeError(
-            "E file must define <PowerBase> with p_base, u_scale, p_scale, and i_scale"
+            "E file must define <PowerBase> with p_base, u_unit, p_unit, and i_unit"
         )
     row = rows[0]
+    u_scale, u_unit = _unit_scale(row, "u_unit", "u_scale", _U_UNIT_TO_SCALE, "kV")
+    p_scale, p_unit = _unit_scale(row, "p_unit", "p_scale", _P_UNIT_TO_SCALE, "kW")
+    i_scale, i_unit = _unit_scale(row, "i_unit", "i_scale", _I_UNIT_TO_SCALE, "kA")
     return UnitSettings(
         p_base=_positive_float(row, "p_base"),
-        u_scale=_positive_float(row, "u_scale"),
-        p_scale=_positive_float(row, "p_scale"),
-        i_scale=_positive_float(row, "i_scale"),
+        u_scale=u_scale,
+        p_scale=p_scale,
+        i_scale=i_scale,
+        p_unit=p_unit,
+        u_unit=u_unit,
+        i_unit=i_unit,
     )
 
 
@@ -108,6 +151,9 @@ def normalize_model_named_units(model) -> float:
     setattr(model, "u_scale", settings.u_scale)
     setattr(model, "p_scale", settings.p_scale)
     setattr(model, "i_scale", settings.i_scale)
+    setattr(model, "p_unit", settings.p_unit)
+    setattr(model, "u_unit", settings.u_unit)
+    setattr(model, "i_unit", settings.i_unit)
 
     ac_nodes = {node.idx: node for node in getattr(model, "ACNode", [])}
     dc_nodes = {node.idx: node for node in getattr(model, "DCNode", [])}

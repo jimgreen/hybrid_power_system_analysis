@@ -1,6 +1,6 @@
 <PowerBase>
-@ p_base u_scale p_scale i_scale
-# 100    1000.0  1.0     1000.0
+@ p_base u_unit p_unit i_unit
+# 100 V kW A
 </PowerBase>
 
 <ACNode>
