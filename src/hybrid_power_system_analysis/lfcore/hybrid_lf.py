@@ -97,6 +97,18 @@ from model.ppc_topology import (
 
 
 DEFAULT_HYBRID_EFILE = model_file("hybrid", "hybrid_net_40.e")
+
+
+def _node_count(network_part) -> int:
+    try:
+        return len(getattr(network_part, "nodes", []))
+    except TypeError:
+        return 0
+
+
+def _default_hybrid_linear_solver(has_dc: bool) -> str:
+    return "umfpack" if has_dc else "pyklu"
+
 def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
 
@@ -568,7 +580,7 @@ class HybridPowerFlowCalc:
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
         keep_node_objects=True,
-        linear_solver: str = "pyklu",
+        linear_solver: Optional[str] = None,
         result_mode: str = "full",
         verbose=False,
     ):
@@ -582,14 +594,15 @@ class HybridPowerFlowCalc:
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.verbose = verbose
-        # 与 ac_lf/dc_lf 同步：linear_solver 留用户输入，实际 callable 与解析后名
-        # 分别保存到 _linear_solver_fn / _linear_solver_resolved。
-        self.linear_solver = str(linear_solver or "pyklu").strip().lower()
-        self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
-        self.has_ac = len(network.ac.nodes) > 0
-        self.has_dc = len(network.dc.nodes) > 0
+        self.has_ac = _node_count(network.ac) > 0
+        self.has_dc = _node_count(network.dc) > 0
+        # Hybrid 含 DC 网络时，PyKLU 在部分非对称/耦合矩阵上会失败；未显式指定时
+        # 默认走 UMFPACK，若本机未安装则由 solver_common 回退到 SciPy/SuperLU。
+        solver_name = str(linear_solver).strip().lower() if linear_solver is not None else ""
+        self.linear_solver = solver_name or _default_hybrid_linear_solver(self.has_dc)
+        self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
         self.ac_calc = self._build_ac_subcalc()
         self.dc_calc = self._build_dc_subcalc()
         self.converged = False
@@ -2530,7 +2543,11 @@ def main(argv=None) -> int:
     parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--min-voltage", type=float, default=None)
-    parser.add_argument("--linear-solver", default="pyklu")
+    parser.add_argument(
+        "--linear-solver",
+        default=None,
+        help="Sparse linear solver. Default: umfpack for hybrid cases with DC network, pyklu for AC-only cases.",
+    )
     parser.add_argument("--result-mode", choices=("full", "array", "summary", "none"), default="full")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)

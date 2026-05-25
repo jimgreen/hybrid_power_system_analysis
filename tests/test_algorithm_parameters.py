@@ -230,7 +230,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             calls,
         )
 
-    def test_lf_cli_defaults_to_pyklu_linear_solver(self):
+    def test_lf_cli_defaults_to_automatic_linear_solver(self):
         import lfcore.ac_lf as ac_lf
         import lfcore.dc_lf as dc_lf
         import lfcore.hybrid_lf as hybrid_lf
@@ -256,10 +256,16 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 "HybridPowerFlowCalc",
                 ["data/model/hybrid/hybrid_net_40.e", "--quiet"],
                 lambda _file_name: "hybrid-network",
+                None,
             ),
         )
 
-        for module, loader_name, calc_name, argv, loader in cases:
+        for case in cases:
+            if len(case) == 5:
+                module, loader_name, calc_name, argv, loader = case
+                expected_solver = "pyklu"
+            else:
+                module, loader_name, calc_name, argv, loader, expected_solver = case
             calls = []
 
             class FakeCalc:
@@ -285,9 +291,9 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 setattr(module, loader_name, original_loader)
                 setattr(module, calc_name, original_calc)
 
-            self.assertEqual(["pyklu"], calls, calc_name)
+            self.assertEqual([expected_solver], calls, calc_name)
 
-    def test_lf_calc_classes_default_to_pyklu_linear_solver(self):
+    def test_lf_calc_classes_default_to_automatic_linear_solver(self):
         from lfcore.ac_lf import ACPowerFlowCalc
         from lfcore.dc_lf import DCPowerFlowCalc
         from lfcore.hybrid_lf import HybridPowerFlowCalc
@@ -301,10 +307,20 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             acac_converters=[],
         )
         hybrid_calc = HybridPowerFlowCalc(hybrid_network, verbose=False)
+        hybrid_dc_network = SimpleNamespace(
+            ac=SimpleNamespace(nodes=[]),
+            dc=SimpleNamespace(nodes=[SimpleNamespace(idx=1)]),
+            dcac_converters=[],
+            acac_converters=[],
+        )
+        hybrid_dc_calc = HybridPowerFlowCalc(hybrid_dc_network, verbose=False)
+        explicit_hybrid_dc_calc = HybridPowerFlowCalc(hybrid_dc_network, verbose=False, linear_solver="pyklu")
 
         self.assertEqual("pyklu", ac_calc.linear_solver)
         self.assertEqual("pyklu", dc_calc.linear_solver)
         self.assertEqual("pyklu", hybrid_calc.linear_solver)
+        self.assertEqual("umfpack", hybrid_dc_calc.linear_solver)
+        self.assertEqual("pyklu", explicit_hybrid_dc_calc.linear_solver)
 
     def test_ac_dc_sparse_solver_registry_supports_sksparse_klu_solve(self):
         import types

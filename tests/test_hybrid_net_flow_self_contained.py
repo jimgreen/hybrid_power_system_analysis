@@ -269,6 +269,22 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(all(shape == (calc.total_eq, calc.total_vars) for shape, _solver, _fn in calls))
         self.assertTrue(all(solver == "scipy" for _shape, solver, _fn in calls))
 
+    def test_hybrid_with_dc_defaults_to_umfpack_linear_solver(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
+        calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="none")
+        explicit_calc = hybrid_lf.HybridPowerFlowCalc(
+            network,
+            verbose=False,
+            linear_solver="pyklu",
+            result_mode="none",
+        )
+
+        self.assertEqual("umfpack", calc.linear_solver)
+        self.assertIn(calc._linear_solver_resolved, {"umfpack", "scipy"})
+        self.assertEqual("pyklu", explicit_calc.linear_solver)
+
     def test_converter_terms_reuse_ac_state_cache(self):
         import hybrid_net_flow
 
