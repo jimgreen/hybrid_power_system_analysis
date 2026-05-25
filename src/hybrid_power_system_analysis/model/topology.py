@@ -1020,6 +1020,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from .dc_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
+            CTRL_SLACK,
             CTRL_V,
             DCDC_COLS,
             GEN_COLS,
@@ -1032,6 +1033,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from dc_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
+            CTRL_SLACK,
             CTRL_V,
             DCDC_COLS,
             GEN_COLS,
@@ -1145,19 +1147,41 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             dcdc_j_nodes = _map_node_positions(dcdc[:, DCDC_COLS["j_node"]], node_lookup)
             dcdc_run_mask = dcdc[:, DCDC_COLS["run_stat"]].astype(np.int64, copy=False) == 1
         valid_dcdc = (dcdc_nodes >= 0) & (dcdc_j_nodes >= 0)
-        dcdc_islands = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
-        dcdc_buses = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
+        dcdc_i_islands = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
+        dcdc_j_islands = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
+        dcdc_i_buses = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
+        dcdc_j_buses = np.full(dcdc_nodes.shape, -1, dtype=np.int32)
         if np.any(valid_dcdc):
-            dcdc_islands[valid_dcdc] = topology.node_to_island_pos[dcdc_nodes[valid_dcdc]]
-            dcdc_buses[valid_dcdc] = topology.node_to_bus_pos[dcdc_nodes[valid_dcdc]]
-        v_mask = (
+            dcdc_i_islands[valid_dcdc] = topology.node_to_island_pos[dcdc_nodes[valid_dcdc]]
+            dcdc_j_islands[valid_dcdc] = topology.node_to_island_pos[dcdc_j_nodes[valid_dcdc]]
+            dcdc_i_buses[valid_dcdc] = topology.node_to_bus_pos[dcdc_nodes[valid_dcdc]]
+            dcdc_j_buses[valid_dcdc] = topology.node_to_bus_pos[dcdc_j_nodes[valid_dcdc]]
+        i_control = dcdc[:, DCDC_COLS["i_control_type"]].astype(np.int64, copy=False)
+        j_control = dcdc[:, DCDC_COLS["j_control_type"]].astype(np.int64, copy=False)
+        valid_i_island = dcdc_i_islands >= 0
+        valid_j_island = dcdc_j_islands >= 0
+        i_v_mask = (
             dcdc_run_mask
             & valid_dcdc
-            & (dcdc_islands >= 0)
-            & (dcdc[:, DCDC_COLS["control_type"]].astype(np.int64, copy=False) == CTRL_V)
+            & valid_i_island
+            & (i_control == CTRL_V)
+            & (j_control == CTRL_SLACK)
         )
-        topology.island_alive_mask[dcdc_islands[v_mask]] = True
-        for island_pos, bus_pos in zip(dcdc_islands[v_mask], dcdc_buses[v_mask]):
+        j_v_mask = (
+            dcdc_run_mask
+            & valid_dcdc
+            & valid_j_island
+            & (j_control == CTRL_V)
+            & (i_control == CTRL_SLACK)
+        )
+        linked_v_mask = i_v_mask | j_v_mask
+        linked_i_alive = linked_v_mask & valid_i_island
+        linked_j_alive = linked_v_mask & valid_j_island
+        topology.island_alive_mask[dcdc_i_islands[linked_i_alive]] = True
+        topology.island_alive_mask[dcdc_j_islands[linked_j_alive]] = True
+        for island_pos, bus_pos in zip(dcdc_i_islands[i_v_mask], dcdc_i_buses[i_v_mask]):
+            _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
+        for island_pos, bus_pos in zip(dcdc_j_islands[j_v_mask], dcdc_j_buses[j_v_mask]):
             _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
 
     external_ref_nodes = np.asarray(ppc.get("_external_voltage_reference_node_ids", _EMPTY_INT), dtype=np.int64)
@@ -1806,22 +1830,28 @@ def apply_dc_topology_arrays(
             i_node.isl_obj.dcdc_converters.append(conv)
         if not compact and j_node.isl_obj is not None:
             j_node.isl_obj.dcdc_converters.append(conv)
-        if conv.control_type == "V" and i_node.isl_obj is not None:
-            i_node.v_set = float(getattr(conv, "v_set", i_node.v_set))
-            if i_node.bus_obj is not None:
-                i_node.bus_obj.v_set = float(getattr(conv, "v_set", i_node.bus_obj.v_set))
-            slack_bus = i_node.bus_obj or i_node
-            if slack_bus not in i_node.isl_obj.slack_nodes:
-                i_node.isl_obj.slack_nodes.append(slack_bus)
+        if getattr(conv, "i_control_type", getattr(conv, "control_type", "")) in ("V", "CTRL_V"):
+            v_node = i_node
+        elif getattr(conv, "j_control_type", "") in ("V", "CTRL_V"):
+            v_node = j_node
+        else:
+            v_node = None
+        if v_node is not None and v_node.isl_obj is not None:
+            v_node.v_set = float(getattr(conv, "v_set", v_node.v_set))
+            if v_node.bus_obj is not None:
+                v_node.bus_obj.v_set = float(getattr(conv, "v_set", v_node.bus_obj.v_set))
+            slack_bus = v_node.bus_obj or v_node
+            if slack_bus not in v_node.isl_obj.slack_nodes:
+                v_node.isl_obj.slack_nodes.append(slack_bus)
             if compact:
-                i_node.is_slack = True
-                if i_node.bus_obj is not None:
-                    i_node.bus_obj.is_slack = True
+                v_node.is_slack = True
+                if v_node.bus_obj is not None:
+                    v_node.bus_obj.is_slack = True
             if not compact:
-                i_node.v_dcdcs.append(conv)
-                if i_node.bus_obj is not None:
-                    i_node.bus_obj.v_dcdcs.append(conv)
-                i_node.isl_obj.v_dcdcs.append(conv)
+                v_node.v_dcdcs.append(conv)
+                if v_node.bus_obj is not None:
+                    v_node.bus_obj.v_dcdcs.append(conv)
+                v_node.isl_obj.v_dcdcs.append(conv)
 
     load_alive = _topology_device_mask(topology, "load", len(loads))
     load_node_pos = _topology_single_node_pos(topology, "load", len(loads))
@@ -2293,10 +2323,15 @@ def prepare_dc_topology(network) -> None:
             continue
         if i_node.isl_obj is None or j_node.isl_obj is None:
             continue
-        node = i_node
         i_node.isl_obj.dcdc_converters.append(conv)
         j_node.isl_obj.dcdc_converters.append(conv)
-        if conv.control_type == "V":
+        if getattr(conv, "i_control_type", getattr(conv, "control_type", "")) in ("V", "CTRL_V"):
+            node = i_node
+        elif getattr(conv, "j_control_type", "") in ("V", "CTRL_V"):
+            node = j_node
+        else:
+            node = None
+        if node is not None:
             node.v_dcdcs.append(conv)
             if node.bus_obj is not None:
                 node.bus_obj.v_dcdcs.append(conv)

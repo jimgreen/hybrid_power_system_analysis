@@ -5406,6 +5406,15 @@ class HybridStateEstimator:
         """
         if estimator is None or len(block.measurements) == 0:
             return
+        sub_builder = getattr(estimator, "_jacobian_builder", None)
+        if sub_builder is not None:
+            # Hybrid SE only needs the sub-estimator CSR as a block to stamp
+            # into the parent Jacobian. The sub-estimator active fixed-pattern
+            # data-refresh shortcut can cache chunk layouts that do not match
+            # this parent/block call path, so keep the sub-block build on the
+            # ordinary sparse path.
+            sub_builder._assume_fixed_pattern = False
+            sub_builder._data_only_refresh_enabled = False
         sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
         if sub_csr.nnz == 0:
             return

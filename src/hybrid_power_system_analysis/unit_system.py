@@ -274,7 +274,10 @@ def normalize_model_named_units(model) -> float:
         i_node = dc_nodes.get(conv.i_node)
         j_node = dc_nodes.get(conv.j_node)
         _scale_power_attrs_in_dict(conv, ("p_set", "i_p", "j_p"), p_base)
-        _scale_voltage_attr(conv, "v_set", i_node, settings)
+        i_ctrl = str(getattr(conv, "i_control_type", getattr(conv, "control_type", ""))).upper()
+        j_ctrl = str(getattr(conv, "j_control_type", "")).upper()
+        v_node = j_node if j_ctrl in ("V", "CTRL_V") and i_ctrl in ("SLACK", "CTRL_SLACK") else i_node
+        _scale_voltage_attr(conv, "v_set", v_node, settings)
         i_scale_base = dc_current_scales.get(conv.i_node)
         if i_scale_base is not None:
             _scale_attr_in_dict(conv, "i_set", i_scale_base)

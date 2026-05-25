@@ -131,12 +131,12 @@
 </DCBreak>
 
 <DCDCConverter>
-@ idx name i_node j_node r1 r2 control_type p_set i_set v_set run_stat
-#   1 conv_1         5     25   0.05   0.05            P   200      0     0        1
-#   2 conv_2         8      9   0.01   0.01            P   100      0     0        1
-#   3 conv_3        12     13  0.075  0.075            I     0 0.0015     0        1
-#   4 conv_4        16     17   0.06   0.06            P   150      0     0        1
-#   5 conv_5        18     19  0.009  0.009            I     0  0.001     0        1
-#   6 conv_6         1     15 0.0125 0.0125            P   100      0     0        1
-#   7 conv_link     20     10  0.075  0.075            V     0      0   100        1
+@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
+# 1 conv_1 5 25 0.05 0.05 CTRL_P SLACK 200 0 0 1
+# 2 conv_2 8 9 0.01 0.01 CTRL_P SLACK 100 0 0 1
+# 3 conv_3 12 13 0.075 0.075 CTRL_I SLACK 0 0.0015 0 1
+# 4 conv_4 16 17 0.06 0.06 CTRL_P SLACK 150 0 0 1
+# 5 conv_5 18 19 0.009 0.009 CTRL_I SLACK 0 0.001 0 1
+# 6 conv_6 1 15 0.0125 0.0125 CTRL_P SLACK 100 0 0 1
+# 7 conv_link 20 10 0.075 0.075 CTRL_V SLACK 0 0 100 1
 </DCDCConverter>

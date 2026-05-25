@@ -483,6 +483,8 @@ class ACPowerFlowCalc:
         self.ppc_gen_rows = np.array([], dtype=np.int32)
         self.ppc_gen_pos = np.array([], dtype=np.int32)
         self.ppc_gen_share = np.array([], dtype=np.float64)
+        self._external_ac_p_injection = None
+        self._external_ac_q_injection = None
         self.ppc_load_rows = np.array([], dtype=np.int32)
         self.ppc_load_pos = np.array([], dtype=np.int32)
         self.ppc_shunt_rows = np.array([], dtype=np.int32)
@@ -2493,6 +2495,16 @@ class ACPowerFlowCalc:
 
         P_gen = S_y.real + P_zero + P_load
         Q_gen = S_y.imag + Q_zero + Q_load
+        external_p = self._external_ac_p_injection
+        external_q = self._external_ac_q_injection
+        if external_p is not None:
+            external_p = np.asarray(external_p, dtype=np.float64)
+            if external_p.shape == P_gen.shape:
+                P_gen = P_gen + external_p
+        if external_q is not None:
+            external_q = np.asarray(external_q, dtype=np.float64)
+            if external_q.shape == Q_gen.shape:
+                Q_gen = Q_gen + external_q
 
         bus = self.ppc["bus"].copy()
         bus[self.active_bus_rows, BUS_COLS["voltage"]] = V

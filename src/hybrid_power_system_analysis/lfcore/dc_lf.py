@@ -79,6 +79,7 @@ from model.dc_array_model import (
     BUS_COLS as DC_BUS_COLS,
     CTRL_I as DC_CTRL_I,
     CTRL_P as DC_CTRL_P,
+    CTRL_SLACK as DC_CTRL_SLACK,
     CTRL_V as DC_CTRL_V,
     DCDC_COLS as DC_DCDC_COLS,
     GEN_COLS as DC_GEN_COLS,
@@ -698,7 +699,8 @@ class DCPowerFlowCalc:
                 self.dcdc_i = dcdc_i_all[dcdc_mask].astype(np.int32, copy=False)
                 self.dcdc_j = dcdc_j_all[dcdc_mask].astype(np.int32, copy=False)
             dcdc_active = dcdc[dcdc_mask]
-            self.dcdc_ctrl_code = dcdc_active[:, DC_DCDC_COLS["control_type"]].astype(np.int8, copy=False)
+            self.dcdc_i_ctrl_code = dcdc_active[:, DC_DCDC_COLS["i_control_type"]].astype(np.int8, copy=False)
+            self.dcdc_j_ctrl_code = dcdc_active[:, DC_DCDC_COLS["j_control_type"]].astype(np.int8, copy=False)
             self.dcdc_p_set = dcdc_active[:, DC_DCDC_COLS["p_set"]].astype(np.float64, copy=False)
             self.dcdc_i_set = dcdc_active[:, DC_DCDC_COLS["i_set"]].astype(np.float64, copy=False)
             self.dcdc_v_set = dcdc_active[:, DC_DCDC_COLS["v_set"]].astype(np.float64, copy=False)
@@ -706,14 +708,28 @@ class DCPowerFlowCalc:
             self.dcdc_r2 = dcdc_active[:, DC_DCDC_COLS["r2"]].astype(np.float64, copy=False)
         else:
             self.dcdc_idx = self.dcdc_i = self.dcdc_j = np.array([], dtype=np.int32)
-            self.dcdc_ctrl_code = np.array([], dtype=np.int8)
+            self.dcdc_i_ctrl_code = np.array([], dtype=np.int8)
+            self.dcdc_j_ctrl_code = np.array([], dtype=np.int8)
             self.dcdc_p_set = self.dcdc_i_set = self.dcdc_v_set = np.array([], dtype=np.float64)
             self.dcdc_r1 = self.dcdc_r2 = np.array([], dtype=np.float64)
         self.N_dcdc = self.dcdc_idx.size
-        self.dcdc_ctrl = self.dcdc_ctrl_code
-        bad_ctrl = ~np.isin(self.dcdc_ctrl_code, np.asarray([DC_CTRL_P, DC_CTRL_V, DC_CTRL_I], dtype=np.int8))
+        self.dcdc_ctrl = self.dcdc_i_ctrl_code
+        valid_dcdc_ctrl = np.asarray([DC_CTRL_P, DC_CTRL_V, DC_CTRL_I, DC_CTRL_SLACK], dtype=np.int8)
+        i_active_ctrl = self.dcdc_i_ctrl_code != DC_CTRL_SLACK
+        j_active_ctrl = self.dcdc_j_ctrl_code != DC_CTRL_SLACK
+        bad_ctrl = (
+            ~np.isin(self.dcdc_i_ctrl_code, valid_dcdc_ctrl)
+            | ~np.isin(self.dcdc_j_ctrl_code, valid_dcdc_ctrl)
+            | (i_active_ctrl == j_active_ctrl)
+        )
         if np.any(bad_ctrl):
-            raise ValueError(f"未知DC-DC控制模式: {self.dcdc_ctrl_code[int(np.where(bad_ctrl)[0][0])]}")
+            bad_pos = int(np.flatnonzero(bad_ctrl)[0])
+            raise ValueError(
+                "DCDCConverter 控制类型必须且只能一端为 CTRL_P/CTRL_V/CTRL_I，另一端为 SLACK；"
+                f"第 {bad_pos + 1} 个活动 DCDC 为 "
+                f"i_control_type={int(self.dcdc_i_ctrl_code[bad_pos])}, "
+                f"j_control_type={int(self.dcdc_j_ctrl_code[bad_pos])}"
+            )
 
         # ---------- 4. 确定松弛节点 ----------
         gen = self.ppc["gen"]
@@ -781,9 +797,34 @@ class DCPowerFlowCalc:
             self.dcdc_q_col = self.dcdc_p_col + 1
             self.dcdc_eq_ctrl = self.eq_dcdc_start + 2 * self.dcdc_seq
             self.dcdc_eq_loss = self.dcdc_eq_ctrl + 1
-        self.dcdc_ctrl_p_mask = self.dcdc_ctrl_code == 0
-        self.dcdc_ctrl_v_mask = self.dcdc_ctrl_code == 1
-        self.dcdc_ctrl_i_mask = self.dcdc_ctrl_code == 2
+        self.dcdc_i_ctrl_p_mask = self.dcdc_i_ctrl_code == DC_CTRL_P
+        self.dcdc_i_ctrl_v_mask = self.dcdc_i_ctrl_code == DC_CTRL_V
+        self.dcdc_i_ctrl_i_mask = self.dcdc_i_ctrl_code == DC_CTRL_I
+        self.dcdc_j_ctrl_p_mask = self.dcdc_j_ctrl_code == DC_CTRL_P
+        self.dcdc_j_ctrl_v_mask = self.dcdc_j_ctrl_code == DC_CTRL_V
+        self.dcdc_j_ctrl_i_mask = self.dcdc_j_ctrl_code == DC_CTRL_I
+        if self.N_dcdc:
+            if np.any(self.dcdc_i_ctrl_v_mask):
+                x[self.dcdc_i[self.dcdc_i_ctrl_v_mask]] = self.dcdc_v_set[self.dcdc_i_ctrl_v_mask]
+            if np.any(self.dcdc_j_ctrl_v_mask):
+                x[self.dcdc_j[self.dcdc_j_ctrl_v_mask]] = self.dcdc_v_set[self.dcdc_j_ctrl_v_mask]
+            pi_seed = self.P_const[self.dcdc_i].astype(np.float64, copy=True)
+            if np.any(self.dcdc_i_ctrl_p_mask):
+                pi_seed[self.dcdc_i_ctrl_p_mask] = self.dcdc_p_set[self.dcdc_i_ctrl_p_mask]
+            if np.any(self.dcdc_i_ctrl_i_mask):
+                pi_seed[self.dcdc_i_ctrl_i_mask] = (
+                    self.dcdc_i_set[self.dcdc_i_ctrl_i_mask] * x[self.dcdc_i[self.dcdc_i_ctrl_i_mask]]
+                )
+            x[self.dcdc_p_col] = pi_seed
+            if not self.dcdc_eliminate_pj:
+                q_seed = -pi_seed
+                if np.any(self.dcdc_j_ctrl_p_mask):
+                    q_seed[self.dcdc_j_ctrl_p_mask] = self.dcdc_p_set[self.dcdc_j_ctrl_p_mask]
+                if np.any(self.dcdc_j_ctrl_i_mask):
+                    q_seed[self.dcdc_j_ctrl_i_mask] = (
+                        self.dcdc_i_set[self.dcdc_j_ctrl_i_mask] * x[self.dcdc_j[self.dcdc_j_ctrl_i_mask]]
+                    )
+                x[self.dcdc_q_col] = q_seed
         self.dcdc_ones = np.ones(self.N_dcdc, dtype=np.float64)
         self._prepare_static_jacobian_indices()
         self.G = G
@@ -865,22 +906,82 @@ class DCPowerFlowCalc:
                 self.dcdc_j_eq_cols_jac = self.dcdc_q_col[self.dcdc_j_unknown_idx]
                 self.dcdc_j_eq_data_jac = np.ones(self.dcdc_j_unknown_idx.size, dtype=np.float64)
 
-            self.dcdc_ctrl_p_count = int(np.count_nonzero(self.dcdc_ctrl_p_mask))
-            self.dcdc_ctrl_v_count = int(np.count_nonzero(self.dcdc_ctrl_v_mask))
-            self.dcdc_ctrl_i_count = int(np.count_nonzero(self.dcdc_ctrl_i_mask))
-            self.dcdc_ctrl_p_data_jac = np.ones(self.dcdc_ctrl_p_count, dtype=np.float64)
-            self.dcdc_ctrl_v_data_jac = np.ones(self.dcdc_ctrl_v_count, dtype=np.float64)
-            self.dcdc_ctrl_i_rows_jac = np.repeat(self.dcdc_eq_ctrl[self.dcdc_ctrl_i_mask], 2)
-            if self.dcdc_ctrl_i_count:
-                self.dcdc_ctrl_i_cols_jac = np.empty(2 * self.dcdc_ctrl_i_count, dtype=np.int32)
-                self.dcdc_ctrl_i_data_jac = np.empty(2 * self.dcdc_ctrl_i_count, dtype=np.float64)
-                self.dcdc_ctrl_i_cols_jac[0::2] = self.dcdc_p_col[self.dcdc_ctrl_i_mask]
-                self.dcdc_ctrl_i_cols_jac[1::2] = self.dcdc_i[self.dcdc_ctrl_i_mask]
-                self.dcdc_ctrl_i_data_jac[0::2] = 1.0
-                self.dcdc_ctrl_i_data_jac[1::2] = -self.dcdc_i_set[self.dcdc_ctrl_i_mask]
+            ctrl_static_rows = []
+            ctrl_static_cols = []
+            ctrl_static_data = []
+
+            i_p_idx = np.flatnonzero(self.dcdc_i_ctrl_p_mask).astype(np.int32, copy=False)
+            if i_p_idx.size:
+                ctrl_static_rows.append(self.dcdc_eq_ctrl[i_p_idx])
+                ctrl_static_cols.append(self.dcdc_p_col[i_p_idx])
+                ctrl_static_data.append(np.ones(i_p_idx.size, dtype=np.float64))
+            i_v_idx = np.flatnonzero(self.dcdc_i_ctrl_v_mask).astype(np.int32, copy=False)
+            if i_v_idx.size:
+                ctrl_static_rows.append(self.dcdc_eq_ctrl[i_v_idx])
+                ctrl_static_cols.append(self.dcdc_i[i_v_idx])
+                ctrl_static_data.append(np.ones(i_v_idx.size, dtype=np.float64))
+            i_i_idx = np.flatnonzero(self.dcdc_i_ctrl_i_mask).astype(np.int32, copy=False)
+            if i_i_idx.size:
+                ctrl_static_rows.append(np.repeat(self.dcdc_eq_ctrl[i_i_idx], 2))
+                cols = np.empty(2 * i_i_idx.size, dtype=np.int32)
+                cols[0::2] = self.dcdc_p_col[i_i_idx]
+                cols[1::2] = self.dcdc_i[i_i_idx]
+                data = np.empty(2 * i_i_idx.size, dtype=np.float64)
+                data[0::2] = 1.0
+                data[1::2] = -self.dcdc_i_set[i_i_idx]
+                ctrl_static_cols.append(cols)
+                ctrl_static_data.append(data)
+            j_v_idx = np.flatnonzero(self.dcdc_j_ctrl_v_mask).astype(np.int32, copy=False)
+            if j_v_idx.size:
+                ctrl_static_rows.append(self.dcdc_eq_ctrl[j_v_idx])
+                ctrl_static_cols.append(self.dcdc_j[j_v_idx])
+                ctrl_static_data.append(np.ones(j_v_idx.size, dtype=np.float64))
+            if not self.dcdc_eliminate_pj:
+                j_p_idx = np.flatnonzero(self.dcdc_j_ctrl_p_mask).astype(np.int32, copy=False)
+                if j_p_idx.size:
+                    ctrl_static_rows.append(self.dcdc_eq_ctrl[j_p_idx])
+                    ctrl_static_cols.append(self.dcdc_q_col[j_p_idx])
+                    ctrl_static_data.append(np.ones(j_p_idx.size, dtype=np.float64))
+                j_i_idx = np.flatnonzero(self.dcdc_j_ctrl_i_mask).astype(np.int32, copy=False)
+                if j_i_idx.size:
+                    ctrl_static_rows.append(np.repeat(self.dcdc_eq_ctrl[j_i_idx], 2))
+                    cols = np.empty(2 * j_i_idx.size, dtype=np.int32)
+                    cols[0::2] = self.dcdc_q_col[j_i_idx]
+                    cols[1::2] = self.dcdc_j[j_i_idx]
+                    data = np.empty(2 * j_i_idx.size, dtype=np.float64)
+                    data[0::2] = 1.0
+                    data[1::2] = -self.dcdc_i_set[j_i_idx]
+                    ctrl_static_cols.append(cols)
+                    ctrl_static_data.append(data)
+            if ctrl_static_rows:
+                self.dcdc_ctrl_static_rows_jac = np.concatenate(ctrl_static_rows).astype(np.int32, copy=False)
+                self.dcdc_ctrl_static_cols_jac = np.concatenate(ctrl_static_cols).astype(np.int32, copy=False)
+                self.dcdc_ctrl_static_data_jac = np.concatenate(ctrl_static_data).astype(np.float64, copy=False)
             else:
-                self.dcdc_ctrl_i_cols_jac = np.array([], dtype=np.int32)
-                self.dcdc_ctrl_i_data_jac = np.array([], dtype=np.float64)
+                self.dcdc_ctrl_static_rows_jac = self.dcdc_ctrl_static_cols_jac = np.array([], dtype=np.int32)
+                self.dcdc_ctrl_static_data_jac = np.array([], dtype=np.float64)
+            if self.dcdc_eliminate_pj:
+                self.dcdc_ctrl_j_dynamic_idx = np.flatnonzero(
+                    self.dcdc_j_ctrl_p_mask | self.dcdc_j_ctrl_i_mask
+                ).astype(np.int32, copy=False)
+                if self.dcdc_ctrl_j_dynamic_idx.size:
+                    idx = self.dcdc_ctrl_j_dynamic_idx
+                    self.dcdc_ctrl_j_dynamic_i_mask = self.dcdc_j_ctrl_i_mask[idx]
+                    self.dcdc_ctrl_j_dynamic_rows_jac = np.repeat(self.dcdc_eq_ctrl[idx], 3)
+                    self.dcdc_ctrl_j_dynamic_cols_jac = np.empty(3 * idx.size, dtype=np.int32)
+                    self.dcdc_ctrl_j_dynamic_cols_jac[0::3] = self.dcdc_p_col[idx]
+                    self.dcdc_ctrl_j_dynamic_cols_jac[1::3] = self.dcdc_i[idx]
+                    self.dcdc_ctrl_j_dynamic_cols_jac[2::3] = self.dcdc_j[idx]
+                    self.dcdc_ctrl_j_dynamic_data_jac = np.empty(3 * idx.size, dtype=np.float64)
+                else:
+                    self.dcdc_ctrl_j_dynamic_i_mask = np.array([], dtype=bool)
+                    self.dcdc_ctrl_j_dynamic_rows_jac = self.dcdc_ctrl_j_dynamic_cols_jac = np.array([], dtype=np.int32)
+                    self.dcdc_ctrl_j_dynamic_data_jac = np.array([], dtype=np.float64)
+            else:
+                self.dcdc_ctrl_j_dynamic_idx = np.array([], dtype=np.int32)
+                self.dcdc_ctrl_j_dynamic_i_mask = np.array([], dtype=bool)
+                self.dcdc_ctrl_j_dynamic_rows_jac = self.dcdc_ctrl_j_dynamic_cols_jac = np.array([], dtype=np.int32)
+                self.dcdc_ctrl_j_dynamic_data_jac = np.array([], dtype=np.float64)
             if self.dcdc_eliminate_pj:
                 self.dcdc_loss_rows_jac = np.array([], dtype=np.int32)
                 self.dcdc_loss_cols_jac = np.array([], dtype=np.int32)
@@ -893,6 +994,12 @@ class DCPowerFlowCalc:
                 self.dcdc_loss_cols_jac[3::4] = self.dcdc_j
         else:
             self.dcdc_i_unknown_idx = self.dcdc_j_unknown_idx = np.array([], dtype=np.int32)
+            self.dcdc_ctrl_static_rows_jac = self.dcdc_ctrl_static_cols_jac = np.array([], dtype=np.int32)
+            self.dcdc_ctrl_static_data_jac = np.array([], dtype=np.float64)
+            self.dcdc_ctrl_j_dynamic_idx = np.array([], dtype=np.int32)
+            self.dcdc_ctrl_j_dynamic_i_mask = np.array([], dtype=bool)
+            self.dcdc_ctrl_j_dynamic_rows_jac = self.dcdc_ctrl_j_dynamic_cols_jac = np.array([], dtype=np.int32)
+            self.dcdc_ctrl_j_dynamic_data_jac = np.array([], dtype=np.float64)
         self._prepare_jacobian_csr_pattern()
 
     def _prepare_jacobian_csr_pattern(self):
@@ -975,16 +1082,15 @@ class DCPowerFlowCalc:
         add_part("zero_con", self.zero_con_rows_jac, self.zero_con_cols_jac)
         add_part("phi_fix", self.phi_fix_rows, self.phi_fix_cols_jac)
         add_part(
-            "dcdc_ctrl_p",
-            self.dcdc_eq_ctrl[self.dcdc_ctrl_p_mask] if self.N_dcdc else [],
-            self.dcdc_p_col[self.dcdc_ctrl_p_mask] if self.N_dcdc else [],
+            "dcdc_ctrl_static",
+            self.dcdc_ctrl_static_rows_jac if self.N_dcdc else [],
+            self.dcdc_ctrl_static_cols_jac if self.N_dcdc else [],
         )
         add_part(
-            "dcdc_ctrl_v",
-            self.dcdc_eq_ctrl[self.dcdc_ctrl_v_mask] if self.N_dcdc else [],
-            self.dcdc_i[self.dcdc_ctrl_v_mask] if self.N_dcdc else [],
+            "dcdc_ctrl_j_dynamic",
+            self.dcdc_ctrl_j_dynamic_rows_jac if self.N_dcdc else [],
+            self.dcdc_ctrl_j_dynamic_cols_jac if self.N_dcdc else [],
         )
-        add_part("dcdc_ctrl_i", self.dcdc_ctrl_i_rows_jac if self.N_dcdc else [], self.dcdc_ctrl_i_cols_jac if self.N_dcdc else [])
         add_part("dcdc_loss", self.dcdc_loss_rows_jac if self.N_dcdc else [], self.dcdc_loss_cols_jac if self.N_dcdc else [])
 
         self._dc_jac_raw_data = np.empty(raw_count, dtype=np.float64)
@@ -1086,15 +1192,19 @@ class DCPowerFlowCalc:
             raw[part_slice] = self.phi_fix_data_jac
 
         if self.N_dcdc:
-            part_slice = self._dc_jac_dcdc_ctrl_p_slice
+            part_slice = self._dc_jac_dcdc_ctrl_static_slice
             if self._slice_len(part_slice):
-                raw[part_slice] = self.dcdc_ctrl_p_data_jac
-            part_slice = self._dc_jac_dcdc_ctrl_v_slice
+                raw[part_slice] = self.dcdc_ctrl_static_data_jac
+            part_slice = self._dc_jac_dcdc_ctrl_j_dynamic_slice
             if self._slice_len(part_slice):
-                raw[part_slice] = self.dcdc_ctrl_v_data_jac
-            part_slice = self._dc_jac_dcdc_ctrl_i_slice
-            if self._slice_len(part_slice):
-                raw[part_slice] = self.dcdc_ctrl_i_data_jac
+                idx = self.dcdc_ctrl_j_dynamic_idx
+                data = raw[part_slice]
+                data[0::3] = terms["dcdc_dpj_dpi"][idx]
+                data[1::3] = terms["dcdc_dpj_dvi"][idx]
+                data[2::3] = terms["dcdc_dpj_dvj"][idx]
+                if np.any(self.dcdc_ctrl_j_dynamic_i_mask):
+                    third = data[2::3]
+                    third[self.dcdc_ctrl_j_dynamic_i_mask] -= self.dcdc_i_set[idx[self.dcdc_ctrl_j_dynamic_i_mask]]
 
             if not getattr(self, "dcdc_eliminate_pj", False):
                 vi = terms["dcdc_vi"]
@@ -1273,18 +1383,22 @@ class DCPowerFlowCalc:
 
         # 8.7 DC-DC方程行
         if self.N_dcdc:
-            if self.dcdc_ctrl_p_count:
-                rows_parts.append(self.dcdc_eq_ctrl[self.dcdc_ctrl_p_mask])
-                cols_parts.append(self.dcdc_p_col[self.dcdc_ctrl_p_mask])
-                data_parts.append(self.dcdc_ctrl_p_data_jac)
-            if self.dcdc_ctrl_v_count:
-                rows_parts.append(self.dcdc_eq_ctrl[self.dcdc_ctrl_v_mask])
-                cols_parts.append(self.dcdc_i[self.dcdc_ctrl_v_mask])
-                data_parts.append(self.dcdc_ctrl_v_data_jac)
-            if self.dcdc_ctrl_i_count:
-                rows_parts.append(self.dcdc_ctrl_i_rows_jac)
-                cols_parts.append(self.dcdc_ctrl_i_cols_jac)
-                data_parts.append(self.dcdc_ctrl_i_data_jac)
+            if self.dcdc_ctrl_static_rows_jac.size:
+                rows_parts.append(self.dcdc_ctrl_static_rows_jac)
+                cols_parts.append(self.dcdc_ctrl_static_cols_jac)
+                data_parts.append(self.dcdc_ctrl_static_data_jac)
+            if self.dcdc_ctrl_j_dynamic_idx.size:
+                idx = self.dcdc_ctrl_j_dynamic_idx
+                data = np.empty(3 * idx.size, dtype=np.float64)
+                data[0::3] = terms["dcdc_dpj_dpi"][idx]
+                data[1::3] = terms["dcdc_dpj_dvi"][idx]
+                data[2::3] = terms["dcdc_dpj_dvj"][idx]
+                if np.any(self.dcdc_ctrl_j_dynamic_i_mask):
+                    third = data[2::3]
+                    third[self.dcdc_ctrl_j_dynamic_i_mask] -= self.dcdc_i_set[idx[self.dcdc_ctrl_j_dynamic_i_mask]]
+                rows_parts.append(self.dcdc_ctrl_j_dynamic_rows_jac)
+                cols_parts.append(self.dcdc_ctrl_j_dynamic_cols_jac)
+                data_parts.append(data)
 
             if not getattr(self, "dcdc_eliminate_pj", False):
                 vi = terms["dcdc_vi"]
@@ -1355,12 +1469,19 @@ class DCPowerFlowCalc:
             p_from = terms["dcdc_pi"]
             p_to = terms["dcdc_pj"]
             vi = terms["dcdc_vi"]
+            vj = terms["dcdc_vj"]
             ctrl_values = np.empty(self.N_dcdc, dtype=np.float64)
-            ctrl_values[self.dcdc_ctrl_p_mask] = p_from[self.dcdc_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_ctrl_p_mask]
-            ctrl_values[self.dcdc_ctrl_v_mask] = vi[self.dcdc_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_ctrl_v_mask]
-            ctrl_values[self.dcdc_ctrl_i_mask] = (
-                p_from[self.dcdc_ctrl_i_mask]
-                - self.dcdc_i_set[self.dcdc_ctrl_i_mask] * vi[self.dcdc_ctrl_i_mask]
+            ctrl_values[self.dcdc_i_ctrl_p_mask] = p_from[self.dcdc_i_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_i_ctrl_p_mask]
+            ctrl_values[self.dcdc_i_ctrl_v_mask] = vi[self.dcdc_i_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_i_ctrl_v_mask]
+            ctrl_values[self.dcdc_i_ctrl_i_mask] = (
+                p_from[self.dcdc_i_ctrl_i_mask]
+                - self.dcdc_i_set[self.dcdc_i_ctrl_i_mask] * vi[self.dcdc_i_ctrl_i_mask]
+            )
+            ctrl_values[self.dcdc_j_ctrl_p_mask] = p_to[self.dcdc_j_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_j_ctrl_p_mask]
+            ctrl_values[self.dcdc_j_ctrl_v_mask] = vj[self.dcdc_j_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_j_ctrl_v_mask]
+            ctrl_values[self.dcdc_j_ctrl_i_mask] = (
+                p_to[self.dcdc_j_ctrl_i_mask]
+                - self.dcdc_i_set[self.dcdc_j_ctrl_i_mask] * vj[self.dcdc_j_ctrl_i_mask]
             )
             F[self.dcdc_eq_ctrl] = ctrl_values
 

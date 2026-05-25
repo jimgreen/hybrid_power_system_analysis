@@ -126,13 +126,30 @@ class DCBreak(DCSwitch):
     pass
 
 class DCDCConverter:
-    def __init__(self, idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat=1):
+    def __init__(
+        self,
+        idx,
+        i_node,
+        j_node,
+        r1,
+        r2,
+        control_type="CTRL_P",
+        p_set=0.0,
+        i_set=0.0,
+        v_set=1.0,
+        run_stat=1,
+        *,
+        i_control_type=None,
+        j_control_type=None,
+    ):
         self.idx = idx
         self.i_node = i_node
         self.j_node = j_node
         self.r1 = r1
         self.r2 = r2
-        self.control_type = control_type
+        self.i_control_type = str(i_control_type if i_control_type is not None else control_type).upper()
+        self.j_control_type = str(j_control_type if j_control_type is not None else "SLACK").upper()
+        self.control_type = self.i_control_type if self.i_control_type != "SLACK" else self.j_control_type
         self.p_set = p_set
         self.i_set = i_set
         self.v_set = v_set
@@ -260,6 +277,8 @@ _DC_ROW_DEFAULT_ATTRS = {
         "r1": 0.0,
         "r2": 0.0,
         "control_type": "",
+        "i_control_type": "",
+        "j_control_type": "SLACK",
         "p_set": 0.0,
         "i_set": 0.0,
         "v_set": 1.0,
@@ -283,14 +302,30 @@ def _coerce_dc_rows(rows, table_name):
             for attr, value in defaults.items():
                 if not hasattr(row, attr):
                     setattr(row, attr, value.copy() if isinstance(value, list) else value)
+            if table_name == "DCDCConverter":
+                _normalize_dcdc_converter_controls(row)
             output.append(row)
             continue
         row_values = getattr(row, "__dict__", {})
         obj = row_cls.__new__(row_cls)
         obj.__dict__.update({key: value.copy() if isinstance(value, list) else value for key, value in defaults.items()})
         obj.__dict__.update(row_values)
+        if table_name == "DCDCConverter":
+            _normalize_dcdc_converter_controls(obj)
         output.append(obj)
     return output
+
+
+def _normalize_dcdc_converter_controls(obj):
+    i_ctrl = getattr(obj, "i_control_type", "")
+    j_ctrl = getattr(obj, "j_control_type", "")
+    if not i_ctrl:
+        i_ctrl = getattr(obj, "control_type", "CTRL_P") or "CTRL_P"
+    if not j_ctrl:
+        j_ctrl = "SLACK"
+    obj.i_control_type = str(i_ctrl).upper()
+    obj.j_control_type = str(j_ctrl).upper()
+    obj.control_type = obj.i_control_type if obj.i_control_type != "SLACK" else obj.j_control_type
 
 
 class DCPowerNetwork:
@@ -355,8 +390,36 @@ class DCPowerNetwork:
         self.breakers.append(brk)
         return brk
 
-    def add_dcdc_converter(self, idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat=1):
-        dc = DCDCConverter(idx, i_node, j_node, r1, r2, control_type, p_set, i_set, v_set, run_stat)
+    def add_dcdc_converter(
+        self,
+        idx,
+        i_node,
+        j_node,
+        r1,
+        r2,
+        control_type="CTRL_P",
+        p_set=0.0,
+        i_set=0.0,
+        v_set=1.0,
+        run_stat=1,
+        *,
+        i_control_type=None,
+        j_control_type=None,
+    ):
+        dc = DCDCConverter(
+            idx,
+            i_node,
+            j_node,
+            r1,
+            r2,
+            control_type,
+            p_set,
+            i_set,
+            v_set,
+            run_stat,
+            i_control_type=i_control_type,
+            j_control_type=j_control_type,
+        )
         self.dcdc_converters.append(dc)
         return dc
 
@@ -559,10 +622,15 @@ class DCPowerNetwork:
                 continue
             if dcdc.i_node_obj.isl_obj is None or dcdc.j_node_obj.isl_obj is None:
                 continue
-            node = dcdc.i_node_obj
             dcdc.i_node_obj.isl_obj.dcdc_converters.append(dcdc)
             dcdc.j_node_obj.isl_obj.dcdc_converters.append(dcdc)
-            if dcdc.control_type == 'V':
+            if dcdc.i_control_type in ("V", "CTRL_V"):
+                node = dcdc.i_node_obj
+            elif dcdc.j_control_type in ("V", "CTRL_V"):
+                node = dcdc.j_node_obj
+            else:
+                node = None
+            if node is not None:
                 node.v_dcdcs.append(dcdc)
                 if node.bus_obj is not None:
                     node.bus_obj.v_dcdcs.append(dcdc)
@@ -706,7 +774,11 @@ class DCPowerNetwork:
 
             print(f"    dcdc_converters = {len(isl.dcdc_converters)}:")
             for dcc in isl.dcdc_converters:
-                print(f"        {dcc.idx} {dcc.name} i_node = {dcc.i_node} j_node = {dcc.j_node} r1 = {dcc.r1} r2 = {dcc.r2} control_type = {dcc.control_type}")
+                print(
+                    f"        {dcc.idx} {dcc.name} i_node = {dcc.i_node} j_node = {dcc.j_node} "
+                    f"r1 = {dcc.r1} r2 = {dcc.r2} "
+                    f"i_control_type = {dcc.i_control_type} j_control_type = {dcc.j_control_type}"
+                )
 
     def check_topo(self):
         """

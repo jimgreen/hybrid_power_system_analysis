@@ -220,15 +220,15 @@
 </DCBreak>
 
 <DCDCConverter>
-@ idx name i_node j_node r1 r2 control_type p_set i_set v_set run_stat
-#   1 pv01_dcdc      12     15 0.005 0.005            P    50     0     0        1
-#   2 pv02_dcdc      13     16 0.005 0.005            P    50     0     0        1
-#   3 pv03_dcdc      14     17 0.005 0.005            P    30     0     0        1
-#   4 ess01_dcdc     18     23 0.005 0.005            P    60     0     0        1
-#   5 ess02_dcdc     19     24 0.005 0.005            P    60     0     0        1
-#   6 ess03_dcdc     20     25 0.005 0.005            P    60     0     0        1
-#   7 ess04_dcdc     21     26 0.005 0.005            P    60     0     0        1
-#   8 ess05_dcdc     22     27 0.005 0.005            P    60     0     0        1
+@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
+# 1 pv01_dcdc 12 15 0.005 0.005 CTRL_P SLACK 50 0 0 1
+# 2 pv02_dcdc 13 16 0.005 0.005 CTRL_P SLACK 50 0 0 1
+# 3 pv03_dcdc 14 17 0.005 0.005 CTRL_P SLACK 30 0 0 1
+# 4 ess01_dcdc 18 23 0.005 0.005 CTRL_P SLACK 60 0 0 1
+# 5 ess02_dcdc 19 24 0.005 0.005 CTRL_P SLACK 60 0 0 1
+# 6 ess03_dcdc 20 25 0.005 0.005 CTRL_P SLACK 60 0 0 1
+# 7 ess04_dcdc 21 26 0.005 0.005 CTRL_P SLACK 60 0 0 1
+# 8 ess05_dcdc 22 27 0.005 0.005 CTRL_P SLACK 60 0 0 1
 </DCDCConverter>
 
 <DCACConverter>

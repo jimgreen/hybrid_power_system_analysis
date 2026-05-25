@@ -8459,7 +8459,11 @@ class ACStateEstimator:
                 H.reset()
             else:
                 H = SparseJacobianBuilder((n_meas, self.n_state))
-                H._assume_fixed_pattern = True
+                # Hybrid SE calls AC SE with sub-block measurement tables whose
+                # vectorized chunk layout can differ from AC's active main path.
+                # Keep this external path sparse-only instead of reusing the
+                # fixed CSR data-refresh shortcut.
+                H._assume_fixed_pattern = False
                 if len(cache) > 4:
                     cache.clear()
                 cache[key] = (measurement_plan_tables, H)

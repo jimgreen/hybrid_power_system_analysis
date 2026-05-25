@@ -109,6 +109,7 @@ def _node_count(network_part) -> int:
 def _default_hybrid_linear_solver(has_dc: bool) -> str:
     return "umfpack" if has_dc else "pyklu"
 
+
 def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
 
@@ -199,7 +200,7 @@ class _PpcDeviceList:
 
 
 def _ppc_device(static_row, row, name, cols, node_by_idx):
-    int_fields = {"idx", "node", "i_node", "j_node", "status", "run_stat", "control_type"}
+    int_fields = {"idx", "node", "i_node", "j_node", "status", "run_stat", "control_type", "i_control_type", "j_control_type"}
     values = {}
     for attr, col in cols.items():
         source = static_row if attr in {"node", "i_node", "j_node", "r", "x", "b", "gt", "bt", "tap", "shift"} else row
@@ -2064,6 +2065,7 @@ class HybridPowerFlowCalc:
         ac_result = None
         dc_result = None
         if self.ac_calc is not None:
+            self._set_ac_converter_power_injections(_dcac_x, _acac_x)
             self.ac_calc.x = ac_x
             self.ac_calc.converged = self.converged
             self.ac_calc.iterations = self.iterations
@@ -2193,6 +2195,7 @@ class HybridPowerFlowCalc:
         ac_result = None
         dc_result = None
         if self.ac_calc is not None:
+            self._set_ac_converter_power_injections(dcac_x, acac_x)
             self.ac_calc.x = ac_x
             self.ac_calc.converged = self.converged
             self.ac_calc.iterations = self.iterations
@@ -2355,6 +2358,31 @@ class HybridPowerFlowCalc:
             self.lf_result = None
         else:
             self.lf_result = self._build_lf_result(ac_V, dc_V)
+
+    def _set_ac_converter_power_injections(self, dcac_x, acac_x) -> None:
+        """Expose final AC-side converter injections to AC result writeback."""
+        if self.ac_calc is None:
+            return
+        if self.N_dcac == 0 and self.N_acac == 0:
+            self.ac_calc._external_ac_p_injection = None
+            self.ac_calc._external_ac_q_injection = None
+            return
+
+        p = np.zeros(self.ac_calc.N, dtype=np.float64)
+        q = np.zeros(self.ac_calc.N, dtype=np.float64)
+        if self.N_dcac:
+            dcac = dcac_x.reshape(self.N_dcac, 3)
+            p += np.bincount(self.dcac_ac_pos, weights=dcac[:, 1], minlength=self.ac_calc.N)
+            q += np.bincount(self.dcac_ac_pos, weights=dcac[:, 2], minlength=self.ac_calc.N)
+        if self.N_acac:
+            acac = acac_x.reshape(self.N_acac, 4)
+            p += np.bincount(self.acac_i_pos, weights=acac[:, 0], minlength=self.ac_calc.N)
+            q += np.bincount(self.acac_i_pos, weights=acac[:, 1], minlength=self.ac_calc.N)
+            p += np.bincount(self.acac_j_pos, weights=acac[:, 2], minlength=self.ac_calc.N)
+            q += np.bincount(self.acac_j_pos, weights=acac[:, 3], minlength=self.ac_calc.N)
+
+        self.ac_calc._external_ac_p_injection = p
+        self.ac_calc._external_ac_q_injection = q
 
     @staticmethod
     def _ppc_converter_key(names, row_pos, idx) -> str:

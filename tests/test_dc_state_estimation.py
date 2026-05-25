@@ -327,7 +327,7 @@ class DCStateEstimationTest(unittest.TestCase):
 </DCBreak>
 
 <DCDCConverter>
-@ idx name i_node j_node r1 r2 control_type p_set i_set v_set run_stat
+@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
 </DCDCConverter>
 """
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -45,10 +45,16 @@ from model.array_common import (
 CTRL_P = 0
 CTRL_V = 1
 CTRL_I = 2
+CTRL_SLACK = 3
 CTRL_CODE = {
     "P": CTRL_P,
+    "CTRL_P": CTRL_P,
     "V": CTRL_V,
+    "CTRL_V": CTRL_V,
     "I": CTRL_I,
+    "CTRL_I": CTRL_I,
+    "SLACK": CTRL_SLACK,
+    "CTRL_SLACK": CTRL_SLACK,
 }
 
 BUS_COLS = {
@@ -114,15 +120,16 @@ DCDC_COLS = {
     "j_node": 2,
     "r1": 3,
     "r2": 4,
-    "control_type": 5,
-    "p_set": 6,
-    "i_set": 7,
-    "v_set": 8,
-    "run_stat": 9,
-    "i_p": 10,
-    "j_p": 11,
-    "i_c": 12,
-    "j_c": 13,
+    "i_control_type": 5,
+    "j_control_type": 6,
+    "p_set": 7,
+    "i_set": 8,
+    "v_set": 9,
+    "run_stat": 10,
+    "i_p": 11,
+    "j_p": 12,
+    "i_c": 13,
+    "j_c": 14,
 }
 
 _DC_PPC_CACHE = {}
@@ -171,6 +178,31 @@ def _build_switch_like_from_rows(
         if "current" in columns:
             out[:, SWITCH_COLS["current"]] = _float_column(table_rows, columns, "current")
     return out, _names_from_rows(table_rows, columns, prefix, out[:, SWITCH_COLS["idx"]])
+
+
+def _validate_dcdc_dual_control(i_control: np.ndarray, j_control: np.ndarray) -> None:
+    valid_codes = np.asarray([CTRL_P, CTRL_V, CTRL_I, CTRL_SLACK], dtype=np.int64)
+    bad = ~np.isin(i_control, valid_codes) | ~np.isin(j_control, valid_codes)
+    i_active = i_control != CTRL_SLACK
+    j_active = j_control != CTRL_SLACK
+    bad |= i_active == j_active
+    if np.any(bad):
+        pos = int(np.flatnonzero(bad)[0])
+        raise ValueError(
+            "DCDCConverter 控制类型必须且只能一端为 CTRL_P/CTRL_V/CTRL_I，另一端为 SLACK；"
+            f"第 {pos + 1} 行为 i_control_type={int(i_control[pos])}, j_control_type={int(j_control[pos])}"
+        )
+
+
+def _dcdc_control_columns_from_rows(table_rows, columns) -> Tuple[np.ndarray, np.ndarray]:
+    if "i_control_type" in columns or "j_control_type" in columns:
+        i_control = _code_column(table_rows, columns, "i_control_type", CTRL_CODE, "P").astype(np.int64, copy=False)
+        j_control = _code_column(table_rows, columns, "j_control_type", CTRL_CODE, "SLACK").astype(np.int64, copy=False)
+    else:
+        i_control = _code_column(table_rows, columns, "control_type", CTRL_CODE, "P").astype(np.int64, copy=False)
+        j_control = np.full(len(table_rows), CTRL_SLACK, dtype=np.int64)
+    _validate_dcdc_dual_control(i_control, j_control)
+    return i_control.astype(np.float64, copy=False), j_control.astype(np.float64, copy=False)
 
 
 def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
@@ -279,10 +311,17 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         dcdc[:, DCDC_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
         dcdc[:, DCDC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
         dcdc[:, DCDC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-        dcdc[:, DCDC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", CTRL_CODE, "P")
+        i_control, j_control = _dcdc_control_columns_from_rows(table_rows, columns)
+        dcdc[:, DCDC_COLS["i_control_type"]] = i_control
+        dcdc[:, DCDC_COLS["j_control_type"]] = j_control
         dcdc[:, DCDC_COLS["p_set"]] = _float_column(table_rows, columns, "p_set") / p_base
         _assign_current_if_present(dcdc, DCDC_COLS["i_set"], table_rows, columns, "i_set", dcdc[:, DCDC_COLS["i_node"]], get_current_scale_by_node)
-        dcdc[:, DCDC_COLS["v_set"]] = _voltage_set_column(table_rows, columns, "v_set", dcdc[:, DCDC_COLS["i_node"]], raw_vbase_by_idx)
+        v_control_nodes = np.where(
+            j_control.astype(np.int64, copy=False) == CTRL_V,
+            dcdc[:, DCDC_COLS["j_node"]],
+            dcdc[:, DCDC_COLS["i_node"]],
+        )
+        dcdc[:, DCDC_COLS["v_set"]] = _voltage_set_column(table_rows, columns, "v_set", v_control_nodes, raw_vbase_by_idx)
         dcdc[:, DCDC_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
         _assign_power_if_present(dcdc, DCDC_COLS["i_p"], table_rows, columns, "i_p", p_base)
         _assign_power_if_present(dcdc, DCDC_COLS["j_p"], table_rows, columns, "j_p", p_base)
@@ -316,7 +355,7 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "switch_cols": SWITCH_COLS,
         "break_cols": BREAK_COLS,
         "dcdc_cols": DCDC_COLS,
-        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I},
+        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I, "SLACK": CTRL_SLACK},
         "bus_name": bus_names,
         "branch_name": branch_names,
         "load_name": load_names,
@@ -397,6 +436,11 @@ def build_dc_ppc_from_network(network) -> Dict:
     switches = list(getattr(network, "switches", []))
     breakers = list(getattr(network, "breakers", []))
     dcdcs = list(getattr(network, "dcdc_converters", []))
+    for conv in dcdcs:
+        if not hasattr(conv, "i_control_type"):
+            setattr(conv, "i_control_type", getattr(conv, "control_type", "P"))
+        if not hasattr(conv, "j_control_type"):
+            setattr(conv, "j_control_type", "SLACK")
 
     p_base = float(getattr(network, "p_base", 1.0))
     u_scale = float(getattr(network, "u_scale", 1.0))
@@ -510,7 +554,8 @@ def build_dc_ppc_from_network(network) -> Dict:
             (DCDC_COLS["j_node"], "j_node", 0, _VALUE_INT),
             (DCDC_COLS["r1"], "r1", 0.0, _VALUE_FLOAT),
             (DCDC_COLS["r2"], "r2", 0.0, _VALUE_FLOAT),
-            (DCDC_COLS["control_type"], "control_type", "P", _VALUE_CTRL),
+            (DCDC_COLS["i_control_type"], "i_control_type", "P", _VALUE_CTRL),
+            (DCDC_COLS["j_control_type"], "j_control_type", "SLACK", _VALUE_CTRL),
             (DCDC_COLS["p_set"], "p_set", 0.0, _VALUE_FLOAT),
             (DCDC_COLS["i_set"], "i_set", 0.0, _VALUE_FLOAT),
             (DCDC_COLS["v_set"], "v_set", 1.0, _VALUE_FLOAT),
@@ -523,6 +568,11 @@ def build_dc_ppc_from_network(network) -> Dict:
             (DCDC_COLS["j_c"], "j_c", 0.0, _VALUE_FLOAT),
         ),
     )
+    if dcdc.size:
+        _validate_dcdc_dual_control(
+            dcdc[:, DCDC_COLS["i_control_type"]].astype(np.int64, copy=False),
+            dcdc[:, DCDC_COLS["j_control_type"]].astype(np.int64, copy=False),
+        )
 
     ppc = {
         "format": "dc_ppc_v1",
@@ -550,7 +600,7 @@ def build_dc_ppc_from_network(network) -> Dict:
         "switch_cols": SWITCH_COLS,
         "break_cols": BREAK_COLS,
         "dcdc_cols": DCDC_COLS,
-        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I},
+        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I, "SLACK": CTRL_SLACK},
     }
     ppc.update(
         bus_name=_name_array(nodes, "bus"),
@@ -600,7 +650,8 @@ def build_dc_network_from_ppc(ppc: Dict):
             return [f"{prefix}_{idx}" for idx in range(count)]
         return [str(value) for value in values]
 
-    ctrl_name = {CTRL_P: "P", CTRL_V: "V", CTRL_I: "I"}
+    ctrl_name = {CTRL_P: "P", CTRL_V: "V", CTRL_I: "I", CTRL_SLACK: "SLACK"}
+    dcdc_ctrl_name = {CTRL_P: "CTRL_P", CTRL_V: "CTRL_V", CTRL_I: "CTRL_I", CTRL_SLACK: "SLACK"}
     bus_names = names("bus_name", "bus", ppc["bus"].shape[0])
     branch_names = names("branch_name", "branch", ppc["branch"].shape[0])
     load_names = names("load_name", "load", ppc["load"].shape[0])
@@ -720,11 +771,13 @@ def build_dc_network_from_ppc(ppc: Dict):
             int(row[DCDC_COLS["j_node"]]),
             float(row[DCDC_COLS["r1"]]),
             float(row[DCDC_COLS["r2"]]),
-            ctrl_name.get(int(row[DCDC_COLS["control_type"]]), "P"),
+            dcdc_ctrl_name.get(int(row[DCDC_COLS["i_control_type"]]), "CTRL_P"),
             float(row[DCDC_COLS["p_set"]]),
             float(row[DCDC_COLS["i_set"]]),
             float(row[DCDC_COLS["v_set"]]),
             int(row[DCDC_COLS["run_stat"]]),
+            i_control_type=dcdc_ctrl_name.get(int(row[DCDC_COLS["i_control_type"]]), "CTRL_P"),
+            j_control_type=dcdc_ctrl_name.get(int(row[DCDC_COLS["j_control_type"]]), "SLACK"),
         )
         for row in ppc["dcdc"]
     ]

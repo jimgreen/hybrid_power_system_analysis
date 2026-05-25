@@ -13,6 +13,121 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 
 class DCLargeCaseGenerationTest(unittest.TestCase):
+    def test_dcdc_dual_control_columns_parse_new_and_legacy_headers(self):
+        from model.dc_array_model import CTRL_P, CTRL_SLACK, CTRL_V, DCDC_COLS, build_dc_ppc_from_e_file
+
+        new_case = """<PowerBase>
+@ p_base u_unit p_unit i_unit
+# 100 kV MW kA
+</PowerBase>
+
+<DCNode>
+@ idx name vbase voltage isl run_stat
+# 1 n1 100 100 0 1
+# 2 n2 100 100 0 1
+</DCNode>
+
+<DCBranch>
+@ idx name i_node j_node r run_stat
+</DCBranch>
+<DCLoad>
+@ idx name node pbase pv0 pv1 pv2 run_stat
+</DCLoad>
+<DCGenerator>
+@ idx name node control_type v_set p_set i_set run_stat
+</DCGenerator>
+<DCZeroBranch>
+@ idx name i_node j_node run_stat
+</DCZeroBranch>
+<DCSwitch>
+@ idx name i_node j_node status run_stat
+</DCSwitch>
+<DCBreak>
+@ idx name i_node j_node status run_stat
+</DCBreak>
+<DCDCConverter>
+@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
+# 1 conv 1 2 0.01 0.01 SLACK V 0 0 100 1
+</DCDCConverter>
+"""
+        legacy_case = new_case.replace(
+            "@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat\n"
+            "# 1 conv 1 2 0.01 0.01 SLACK V 0 0 100 1",
+            "@ idx name i_node j_node r1 r2 control_type p_set i_set v_set run_stat\n"
+            "# 1 conv 1 2 0.01 0.01 P 5 0 0 1",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            new_path = Path(tmp_dir) / "new.e"
+            old_path = Path(tmp_dir) / "old.e"
+            new_path.write_text(new_case, encoding="utf-8")
+            old_path.write_text(legacy_case, encoding="utf-8")
+
+            new_ppc = build_dc_ppc_from_e_file(new_path)
+            old_ppc = build_dc_ppc_from_e_file(old_path)
+
+        new_row = new_ppc["dcdc"][0]
+        self.assertEqual(CTRL_SLACK, int(new_row[DCDC_COLS["i_control_type"]]))
+        self.assertEqual(CTRL_V, int(new_row[DCDC_COLS["j_control_type"]]))
+        old_row = old_ppc["dcdc"][0]
+        self.assertEqual(CTRL_P, int(old_row[DCDC_COLS["i_control_type"]]))
+        self.assertEqual(CTRL_SLACK, int(old_row[DCDC_COLS["j_control_type"]]))
+
+    def test_dcdc_j_side_voltage_control_enters_lf_equation(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from model.dc_array_model import DCDC_COLS, build_dc_ppc_from_e_file
+        from model.ppc_topology import ensure_dc_ppc_topology
+
+        case = """<PowerBase>
+@ p_base u_unit p_unit i_unit
+# 100 kV MW kA
+</PowerBase>
+
+<DCNode>
+@ idx name vbase voltage isl run_stat
+# 1 source 100 100 0 1
+# 2 controlled 100 100 0 1
+</DCNode>
+
+<DCBranch>
+@ idx name i_node j_node r run_stat
+# 1 br 1 2 0.1 1
+</DCBranch>
+<DCLoad>
+@ idx name node pbase pv0 pv1 pv2 run_stat
+</DCLoad>
+<DCGenerator>
+@ idx name node control_type v_set p_set i_set run_stat
+# 1 g1 1 P 0 10 0 1
+</DCGenerator>
+<DCZeroBranch>
+@ idx name i_node j_node run_stat
+</DCZeroBranch>
+<DCSwitch>
+@ idx name i_node j_node status run_stat
+</DCSwitch>
+<DCBreak>
+@ idx name i_node j_node status run_stat
+</DCBreak>
+<DCDCConverter>
+@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
+# 1 conv 1 2 0.01 0.01 SLACK V 0 0 100 1
+</DCDCConverter>
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_path = Path(tmp_dir) / "j_v_control.e"
+            case_path.write_text(case, encoding="utf-8")
+            ppc = ensure_dc_ppc_topology(build_dc_ppc_from_e_file(case_path))
+
+        calc = DCPowerFlowCalc(ppc, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, calc.run())
+
+        row = calc.result["dcdc"][0]
+        from model.dc_array_model import CTRL_SLACK
+
+        self.assertEqual(CTRL_SLACK, int(row[DCDC_COLS["i_control_type"]]))
+        self.assertAlmostEqual(1.0, calc.result["bus"][1, 2], places=9)
+
     def test_dc_array_network_replaces_object_model_loader(self):
         from model.dc_array_model import build_dc_network_from_ppc, build_dc_ppc_from_e_file
         from dc_model import DCPowerNetwork
@@ -87,7 +202,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_solver_run_prepares_and_exposes_ac_style_state_access(self):
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import build_dc_ppc_from_e_file
+        from model.dc_array_model import DCDC_COLS, build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         calc = DCPowerFlowCalc(ppc, result_mode="array")
@@ -105,7 +220,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_dc_solver_accepts_ppc_without_network_topology(self):
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import build_dc_ppc_from_e_file
+        from model.dc_array_model import DCDC_COLS, build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
         calc = DCPowerFlowCalc(ppc)
@@ -592,7 +707,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         import io
         import numpy as np
         from lfcore.dc_lf import DCPowerFlowCalc
-        from model.dc_array_model import build_dc_ppc_from_e_file
+        from model.dc_array_model import DCDC_COLS, build_dc_ppc_from_e_file
 
         ppc = build_dc_ppc_from_e_file(Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e")
 
@@ -616,8 +731,8 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
             atol=1e-9,
         )
         np.testing.assert_allclose(
-            array_calc.result["dcdc"][:, [10, 11]],
-            full_calc.result["dcdc"][:, [10, 11]],
+            array_calc.result["dcdc"][:, [DCDC_COLS["i_p"], DCDC_COLS["j_p"]]],
+            full_calc.result["dcdc"][:, [DCDC_COLS["i_p"], DCDC_COLS["j_p"]]],
             atol=1e-8,
         )
 

@@ -6,6 +6,10 @@ import io
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src" / "hybrid_power_system_analysis"))
+sys.path.insert(0, str(ROOT / "src" / "hybrid_power_system_analysis" / "model"))
+sys.path.insert(0, str(ROOT / "src" / "hybrid_power_system_analysis" / "lfcore"))
+sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "code"))
 sys.path.insert(0, str(ROOT))
 
@@ -97,6 +101,22 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertTrue(issparse(ac_j))
         self.assertTrue(issparse(dc_j))
         self.assertTrue(issparse(hybrid_j))
+
+    def test_ac_generator_writeback_includes_converter_bus_injection(self):
+        from ac_array_model import GEN_COLS
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
+
+        network = _read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.run()
+
+        names = calc.ac_calc.ppc["gen_name"]
+        row = list(names).index("gen_pq9")
+        gen_result = calc.ac_calc.result["gen"][row]
+        gen_source = calc.ac_calc.ppc["gen"][row]
+        self.assertAlmostEqual(float(gen_source[GEN_COLS["p_set"]]), float(gen_result[GEN_COLS["p"]]), places=9)
+        self.assertAlmostEqual(float(gen_source[GEN_COLS["q_set"]]), float(gen_result[GEN_COLS["q"]]), places=9)
 
     def test_hybrid_jacobian_builds_converter_terms_in_one_sparse_pass(self):
         from scipy.sparse import issparse
