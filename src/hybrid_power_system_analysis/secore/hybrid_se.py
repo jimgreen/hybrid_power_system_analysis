@@ -750,6 +750,7 @@ class HybridStateEstimator:
         parameters: Optional[StateEstimationParameters] = None,
         profile: bool = False,
         auto_prepare: bool = True,
+        power_flow_linear_solver: Optional[str] = None,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -773,6 +774,8 @@ class HybridStateEstimator:
         self.targeted_pseudo_measurement_step = self.params.targeted_pseudo_measurement_step
         self.voltage_floor = self.params.voltage_floor
         self.min_current_voltage = self.params.min_current_voltage
+        solver_name = str(power_flow_linear_solver).strip().lower() if power_flow_linear_solver is not None else ""
+        self.power_flow_linear_solver = solver_name or None
 
         self._prepared = False
         self.observability_result = None
@@ -941,6 +944,16 @@ class HybridStateEstimator:
         )
         return bool(self.flat_start and (has_coupling or (has_ac and has_dc)))
 
+    def _sub_power_flow_linear_solver(self) -> Optional[str]:
+        if self.power_flow_linear_solver:
+            return self.power_flow_linear_solver
+        has_dc = _side_has_alive_nodes(getattr(self.network, "dc", None))
+        has_coupling = bool(
+            getattr(self.network, "dcac_converters", None)
+            or getattr(self.network, "acac_converters", None)
+        )
+        return "umfpack" if has_dc or has_coupling else None
+
     def _build_ac_sub_estimator(self) -> Optional[ACStateEstimator]:
         if not _side_has_alive_nodes(getattr(self.network, "ac", None)):
             return None
@@ -963,6 +976,7 @@ class HybridStateEstimator:
                 defer_prepare_finalize=defer_finalize,
                 profile=self.profile_enabled,
                 auto_prepare=False,
+                power_flow_linear_solver=self._sub_power_flow_linear_solver(),
             )
             estimator.prepare()
             return estimator
@@ -993,6 +1007,7 @@ class HybridStateEstimator:
                 defer_prepare_finalize=defer_finalize,
                 profile=self.profile_enabled,
                 auto_prepare=False,
+                power_flow_linear_solver=self._sub_power_flow_linear_solver(),
             )
             estimator.prepare()
             return estimator
@@ -6156,6 +6171,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
     parser.add_argument("--result-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
+    parser.add_argument(
+        "--power-flow-linear-solver",
+        default=None,
+        help="Sparse solver used by AC/DC load-flow seeds. Default: umfpack for hybrid cases with DC/coupling.",
+    )
     parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
@@ -6169,6 +6189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parameter_file=Path(args.para),
         profile=args.profile,
         auto_prepare=False,
+        power_flow_linear_solver=args.power_flow_linear_solver,
     )
     estimator.prepare()
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold

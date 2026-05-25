@@ -339,6 +339,7 @@ class DCStateEstimator:
         defer_prepare_finalize: bool = False,
         auto_prepare: bool = True,
         matrix_dump_dir: Optional[Path] = None,
+        power_flow_linear_solver: Optional[str] = None,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -371,6 +372,8 @@ class DCStateEstimator:
         self._prepare_defer_finalize = bool(defer_prepare_finalize)
         self._array_only_runtime = True
         self._array_only_estimate_result = True
+        solver_name = str(power_flow_linear_solver).strip().lower() if power_flow_linear_solver is not None else ""
+        self.power_flow_linear_solver = solver_name or None
         self.observability_result = None
         self._initial_observability_cache = None
         self.estimate_result = None
@@ -942,6 +945,8 @@ class DCStateEstimator:
             self._apply_measurement_seed_to_network()
             self._record_profile_time("seed.apply_measurements", time.perf_counter() - stage_start)
             stage_start = time.perf_counter()
+            if self.power_flow_linear_solver:
+                setattr(self.network, "_se_power_flow_linear_solver", self.power_flow_linear_solver)
             self.power_flow_seed_converged = bool(self._run_power_flow_seed(self.network, self.params, self.e_file))
             self._record_profile_time("seed.lf", time.perf_counter() - stage_start)
             self._record_profile_time("seed.total", time.perf_counter() - seed_start)
@@ -2326,6 +2331,7 @@ class DCStateEstimator:
             max_iter=params.power_flow_max_iter,
             min_voltage=params.power_flow_min_voltage,
             result_mode="none",
+            linear_solver=getattr(network, "_se_power_flow_linear_solver", None),
         )
         calc.skip_lf_result = True
         try:

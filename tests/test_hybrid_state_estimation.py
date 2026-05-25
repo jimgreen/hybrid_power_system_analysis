@@ -1169,6 +1169,18 @@ class HybridStateEstimationTest(unittest.TestCase):
         _theta, voltage = estimator._delegate()._unpack_state(estimator.initial_state())
         np.testing.assert_allclose(voltage[estimator._delegate().voltage_state_pos], 1.13)
 
+    def test_nonflat_hybrid_sub_estimators_default_to_umfpack_seed_solver(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+            flat_start=False,
+        )
+
+        self.assertEqual("umfpack", estimator._ac_sub_estimator.power_flow_linear_solver)
+        self.assertEqual("umfpack", estimator._dc_sub_estimator.power_flow_linear_solver)
+
     def test_nonflat_hybrid_seed_reuses_ppc_topology_without_object_topology(self):
         from model import topology as network_topology
         from secore.hybrid_se import HybridStateEstimator
