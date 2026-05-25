@@ -28,6 +28,12 @@ from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
 DCAC_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2}
+# DCAC 的正式控制码只保留 DCV/ACV/ACP；PH/PQ 是旧 E 文件里的输入别名。
+DCAC_CONTROL_PARSE_CODE = {
+    **DCAC_CONTROL_CODE,
+    "PH": DCAC_CONTROL_CODE["ACV"],
+    "PQ": DCAC_CONTROL_CODE["ACP"],
+}
 DCAC_CONTROL_LABEL = {value: key for key, value in DCAC_CONTROL_CODE.items()}
 ACAC_CONTROL_CODE = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
 ACAC_CONTROL_LABEL = {value: key for key, value in ACAC_CONTROL_CODE.items()}
@@ -203,6 +209,16 @@ def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, floa
     return np.asarray([raw_vbase_by_idx.get(int(node), 0.0) for node in node_values], dtype=np.float64)
 
 
+def _ppc_bus_value_by_node(ppc: Dict, node_values: np.ndarray, col: int, default: float = 0.0) -> np.ndarray:
+    bus = np.asarray(ppc.get("bus", np.zeros((0, 0))), dtype=np.float64)
+    if bus.size == 0:
+        return np.full(node_values.shape, default, dtype=np.float64)
+    idx = bus[:, 0].astype(np.int64, copy=False)
+    values = bus[:, col].astype(np.float64, copy=False)
+    value_by_idx = {int(node_id): float(value) for node_id, value in zip(idx, values)}
+    return np.asarray([value_by_idx.get(int(node), default) for node in node_values], dtype=np.float64)
+
+
 def _voltage_set_column(
     table_rows,
     columns,
@@ -257,7 +273,7 @@ def _build_dcac(model) -> Tuple[np.ndarray, np.ndarray]:
         out[pos, DCAC_COLS["dc_node"]] = _int_attr(conv, "dc_node")
         out[pos, DCAC_COLS["r1"]] = _float_attr(conv, "r1")
         out[pos, DCAC_COLS["r2"]] = _float_attr(conv, "r2")
-        out[pos, DCAC_COLS["control_type"]] = DCAC_CONTROL_CODE.get(
+        out[pos, DCAC_COLS["control_type"]] = DCAC_CONTROL_PARSE_CODE.get(
             str(_attr(conv, "control_type", "DCV")).upper(),
             0,
         )
@@ -329,7 +345,7 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         r1 = _float_attr(conv, "r1")
         r2 = _float_attr(conv, "r2")
         control_type = str(_attr(conv, "control_type", "DCV")).upper()
-        control_code = DCAC_CONTROL_CODE.get(control_type, 0)
+        control_code = DCAC_CONTROL_PARSE_CODE.get(control_type, 0)
         p_ac_set = _float_attr(conv, "p_ac_set")
         q_ac_set = _float_attr(conv, "q_ac_set")
         v_ac_set = _float_attr(conv, "v_ac_set")
@@ -473,7 +489,7 @@ def _build_dcac_from_rows(
     out[:, DCAC_COLS["dc_node"]] = _int_column(table_rows, columns, "dc_node")
     out[:, DCAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
     out[:, DCAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-    out[:, DCAC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", DCAC_CONTROL_CODE, "DCV")
+    out[:, DCAC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", DCAC_CONTROL_PARSE_CODE, "DCV")
     out[:, DCAC_COLS["p_ac_set"]] = _power_column(table_rows, columns, "p_ac_set", p_base)
     out[:, DCAC_COLS["q_ac_set"]] = _power_column(table_rows, columns, "q_ac_set", p_base)
     out[:, DCAC_COLS["v_ac_set"]] = _voltage_set_column(
@@ -492,6 +508,17 @@ def _build_dcac_from_rows(
         dc_raw_vbase,
         default=0.0,
     )
+    ctrl = out[:, DCAC_COLS["control_type"]].astype(np.int64, copy=False)
+    ac_voltage_ctrl = ctrl == DCAC_CONTROL_CODE["ACV"]
+    if np.any(ac_voltage_ctrl):
+        fallback = _ppc_bus_value_by_node(ac_ppc, out[:, DCAC_COLS["ac_node"]], 2, default=1.0)
+        missing = ac_voltage_ctrl & (np.abs(out[:, DCAC_COLS["v_ac_set"]]) <= 1e-12)
+        out[missing, DCAC_COLS["v_ac_set"]] = fallback[missing]
+    dc_voltage_ctrl = ctrl == DCAC_CONTROL_CODE["DCV"]
+    if np.any(dc_voltage_ctrl):
+        fallback = _ppc_bus_value_by_node(dc_ppc, out[:, DCAC_COLS["dc_node"]], 2, default=1.0)
+        missing = dc_voltage_ctrl & (np.abs(out[:, DCAC_COLS["v_dc_set"]]) <= 1e-12)
+        out[missing, DCAC_COLS["v_dc_set"]] = fallback[missing]
     out[:, DCAC_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
     if "dc_p" in columns:
         out[:, DCAC_COLS["dc_p"]] = _power_column(table_rows, columns, "dc_p", p_base)

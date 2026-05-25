@@ -10,7 +10,7 @@ for path in (MODEL_DIR,):
 
 from ac_model import ACPowerNetwork
 from dc_model import DCPowerNetwork
-from hybrid_array_model import build_hybrid_ppc_from_e_file
+from hybrid_array_model import DCAC_CONTROL_PARSE_CODE, build_hybrid_ppc_from_e_file
 
 
 ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
@@ -449,7 +449,7 @@ class HybridPowerNetwork:
                 errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 DC 节点 {conv.dc_node} 不存在")
             if conv.ac_node not in self.ac.node_dict or conv.dc_node not in self.dc.node_dict:
                 continue
-            if str(conv.control_type).upper() not in {"DCV", "ACV", "ACP"}:
+            if str(conv.control_type).upper() not in DCAC_CONTROL_PARSE_CODE:
                 errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制模式 {conv.control_type} 不支持")
         return errors
 

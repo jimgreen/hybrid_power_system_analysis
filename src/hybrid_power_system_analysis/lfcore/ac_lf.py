@@ -870,7 +870,9 @@ class ACPowerFlowCalc:
                 self.node_type[self.slack_node] = AC_NODE_TYPE_SLACK
                 self.theta_spec[self.slack_node] = self.ppc["bus"][self.active_bus_rows[self.slack_node], BUS_COLS["angle"]]
         if self.slack_node == -1:
-            raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
+            external_refs = np.asarray(self.ppc.get("_external_angle_reference_node_ids", []), dtype=np.int64)
+            if external_refs.size == 0:
+                raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
 
     def _prepare_ppc_y_matrix(self, branch, transformer, shunt):
         row_parts, col_parts, data_parts = [], [], []

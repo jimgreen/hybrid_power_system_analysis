@@ -828,6 +828,23 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         for island_pos, bus_pos in zip(gen_islands[slack_mask], gen_buses[slack_mask]):
             _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
 
+    external_ref_nodes = np.asarray(ppc.get("_external_angle_reference_node_ids", _EMPTY_INT), dtype=np.int64)
+    if external_ref_nodes.size:
+        external_ref_pos = _map_node_positions(external_ref_nodes, node_lookup)
+        valid_ref = external_ref_pos >= 0
+        if np.any(valid_ref):
+            ref_node_pos = external_ref_pos[valid_ref]
+            valid_ref_indices = np.flatnonzero(valid_ref)
+            valid_ref[valid_ref_indices] &= topology.node_run_mask[ref_node_pos]
+        if np.any(valid_ref):
+            ref_node_pos = external_ref_pos[valid_ref]
+            ref_islands = topology.node_to_island_pos[ref_node_pos]
+            ref_buses = topology.node_to_bus_pos[ref_node_pos]
+            valid_island = ref_islands >= 0
+            topology.island_alive_mask[ref_islands[valid_island]] = True
+            for island_pos, bus_pos in zip(ref_islands[valid_island], ref_buses[valid_island]):
+                _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
+
     valid_bus = topology.bus_to_island_pos >= 0
     if np.any(valid_bus):
         topology.bus_alive_mask[valid_bus] = topology.island_alive_mask[topology.bus_to_island_pos[valid_bus]]
@@ -1142,6 +1159,23 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         topology.island_alive_mask[dcdc_islands[v_mask]] = True
         for island_pos, bus_pos in zip(dcdc_islands[v_mask], dcdc_buses[v_mask]):
             _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
+
+    external_ref_nodes = np.asarray(ppc.get("_external_voltage_reference_node_ids", _EMPTY_INT), dtype=np.int64)
+    if external_ref_nodes.size:
+        external_ref_pos = _map_node_positions(external_ref_nodes, node_lookup)
+        valid_ref = external_ref_pos >= 0
+        if np.any(valid_ref):
+            ref_node_pos = external_ref_pos[valid_ref]
+            valid_ref_indices = np.flatnonzero(valid_ref)
+            valid_ref[valid_ref_indices] &= topology.node_run_mask[ref_node_pos]
+        if np.any(valid_ref):
+            ref_node_pos = external_ref_pos[valid_ref]
+            ref_islands = topology.node_to_island_pos[ref_node_pos]
+            ref_buses = topology.node_to_bus_pos[ref_node_pos]
+            valid_island = ref_islands >= 0
+            topology.island_alive_mask[ref_islands[valid_island]] = True
+            for island_pos, bus_pos in zip(ref_islands[valid_island], ref_buses[valid_island]):
+                _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
 
     valid_bus = topology.bus_to_island_pos >= 0
     if np.any(valid_bus):

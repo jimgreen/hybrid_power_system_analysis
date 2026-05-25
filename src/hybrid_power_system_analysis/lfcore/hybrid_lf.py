@@ -85,6 +85,7 @@ from hybrid_array_model import (
     ACAC_CONTROL_LABEL,
     DCAC_COLS,
     DCAC_CONTROL_LABEL,
+    DCAC_CONTROL_PARSE_CODE,
 )
 from model.ppc_topology import (
     build_ac_ppc_with_topology_from_e_file,
@@ -789,9 +790,10 @@ class HybridPowerFlowCalc:
                 current_type = ac_node_type_label(self.ac_calc.node_type[ac_pos])
                 raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}")
             dc_pos = self.dc_calc.alive_node_dict[conv.dc_node]
-            ctrl = str(conv.control_type).upper()
-            if ctrl not in {"DCV", "ACV", "ACP"}:
+            ctrl_text = str(conv.control_type).upper()
+            if ctrl_text not in DCAC_CONTROL_PARSE_CODE:
                 raise ValueError(f"未知 DCACConverter 控制模式: {conv.control_type}")
+            ctrl = DCAC_CONTROL_LABEL[int(DCAC_CONTROL_PARSE_CODE[ctrl_text])]
             conv.is_alive = True
             self.dcac_converters.append((conv, ac_pos, dc_pos, ctrl))
         self.N_dcac = len(self.dcac_converters)
@@ -876,6 +878,8 @@ class HybridPowerFlowCalc:
         )
         self.dcac_dc_eq = np.asarray([self.dc_calc.node_eq[int(pos)] for pos in self.dcac_dc_pos], dtype=np.int32)
         self.dcac_dc_eq_mask = self.dcac_dc_eq >= 0
+        self.dcac_ac_theta_set = self.ac_calc.ppc_node_angle[self.dcac_ac_pos].astype(np.float64, copy=True)
+        self.dcac_ac_theta_col = self.dcac_ac_p_row.copy()
         self.dcac_ac_v_col = self.dcac_ac_q_row.copy()
         self.dcac_dc_v_col = self.ac_size + self.dcac_dc_pos
 
@@ -897,6 +901,8 @@ class HybridPowerFlowCalc:
         self.dcac_ac_q_row = np.array([], dtype=np.int32)
         self.dcac_dc_eq = np.array([], dtype=np.int32)
         self.dcac_dc_eq_mask = np.array([], dtype=bool)
+        self.dcac_ac_theta_set = np.array([], dtype=np.float64)
+        self.dcac_ac_theta_col = np.array([], dtype=np.int32)
         self.dcac_ac_v_col = np.array([], dtype=np.int32)
         self.dcac_dc_v_col = np.array([], dtype=np.int32)
 
@@ -927,6 +933,8 @@ class HybridPowerFlowCalc:
         )
         self.dcac_dc_eq = np.asarray([self.dc_calc.node_eq[int(pos)] for pos in self.dcac_dc_pos], dtype=np.int32)
         self.dcac_dc_eq_mask = self.dcac_dc_eq >= 0
+        self.dcac_ac_theta_set = self.ac_calc.ppc_node_angle[self.dcac_ac_pos].astype(np.float64, copy=True)
+        self.dcac_ac_theta_col = self.dcac_ac_p_row.copy()
         self.dcac_ac_v_col = self.dcac_ac_q_row.copy()
         self.dcac_dc_v_col = self.ac_size + self.dcac_dc_pos
 
@@ -1075,6 +1083,8 @@ class HybridPowerFlowCalc:
         self.dcac_ctrl_dc_v_mask = np.array([], dtype=bool)
         self.dcac_ctrl_ac_v_mask = np.array([], dtype=bool)
         self.dcac_ctrl_ac_p_mask = np.array([], dtype=bool)
+        self.dcac_ctrl_q_mask = np.array([], dtype=bool)
+        self.dcac_ctrl_ac_theta_mask = np.array([], dtype=bool)
         self.dcac_ones = np.array([], dtype=np.float64)
         self.dcac_dc_eq_ones = np.array([], dtype=np.float64)
 
@@ -1113,6 +1123,7 @@ class HybridPowerFlowCalc:
         self.global_jac_dcac_dc_eq_slice = slice(0, 0)
         self.global_jac_dcac_loss_slice = slice(0, 0)
         self.global_jac_dcac_ctrl_q_slice = slice(0, 0)
+        self.global_jac_dcac_ctrl_theta_slice = slice(0, 0)
         self.global_jac_dcac_ctrl_dcv_slice = slice(0, 0)
         self.global_jac_dcac_ctrl_acv_slice = slice(0, 0)
         self.global_jac_dcac_ctrl_acp_slice = slice(0, 0)
@@ -1139,8 +1150,8 @@ class HybridPowerFlowCalc:
             self.dcac_eq_ctrl_1 = self.dcac_eq_loss + 1
             self.dcac_eq_ctrl_2 = self.dcac_eq_loss + 2
 
-            # DCAC 损耗方程依赖 Pdc、Pac、Qac 以及两侧电压；控制方程根据
-            # DCV/ACV/ACP 模式切换为定 DC 电压、定 AC 电压或定 AC 有功。
+            # ACV 表示 AC 侧成网定压：第一控制方程固定电压幅值，
+            # 第二控制方程固定相角；DCV/ACP 保持原有定 Q 方程。
             self.dcac_loss_rows = np.repeat(self.dcac_eq_loss, 5)
             self.dcac_loss_cols = np.empty(self.N_dcac * 5, dtype=np.int32)
             self.dcac_loss_cols[0::5] = self.dcac_dc_p_col
@@ -1156,6 +1167,8 @@ class HybridPowerFlowCalc:
             self.dcac_ctrl_dc_v_mask = self.dcac_ctrl_code == 0
             self.dcac_ctrl_ac_v_mask = self.dcac_ctrl_code == 1
             self.dcac_ctrl_ac_p_mask = self.dcac_ctrl_code == 2
+            self.dcac_ctrl_ac_theta_mask = self.dcac_ctrl_ac_v_mask.copy()
+            self.dcac_ctrl_q_mask = ~self.dcac_ctrl_ac_theta_mask
             self.dcac_ones = np.ones(self.N_dcac, dtype=np.float64)
 
         if self.N_acac:
@@ -1266,7 +1279,12 @@ class HybridPowerFlowCalc:
             add_part("dcac_ac_q", self.dcac_ac_q_row, self.dcac_ac_q_col)
             add_part("dcac_dc_eq", self.dcac_dc_eq_rows, self.dcac_dc_eq_cols)
             add_part("dcac_loss", self.dcac_loss_rows, self.dcac_loss_cols)
-            add_part("dcac_ctrl_q", self.dcac_eq_ctrl_2, self.dcac_ac_q_col)
+            add_part("dcac_ctrl_q", self.dcac_eq_ctrl_2[self.dcac_ctrl_q_mask], self.dcac_ac_q_col[self.dcac_ctrl_q_mask])
+            add_part(
+                "dcac_ctrl_theta",
+                self.dcac_eq_ctrl_2[self.dcac_ctrl_ac_theta_mask],
+                self.dcac_ac_theta_col[self.dcac_ctrl_ac_theta_mask],
+            )
             add_part("dcac_ctrl_dcv", self.dcac_eq_ctrl_1[self.dcac_ctrl_dc_v_mask], self.dcac_dc_v_col[self.dcac_ctrl_dc_v_mask])
             add_part("dcac_ctrl_acv", self.dcac_eq_ctrl_1[self.dcac_ctrl_ac_v_mask], self.dcac_ac_v_col[self.dcac_ctrl_ac_v_mask])
             add_part("dcac_ctrl_acp", self.dcac_eq_ctrl_1[self.dcac_ctrl_ac_p_mask], self.dcac_ac_p_col[self.dcac_ctrl_ac_p_mask])
@@ -1371,7 +1389,7 @@ class HybridPowerFlowCalc:
             dc_V = dc_x[:self.dc_calc.N]
         return ac_theta, ac_V, dc_V
 
-    def _append_dcac_residuals(self, ac_f, dc_f, dcac_x, ac_V, dc_V, out=None):
+    def _append_dcac_residuals(self, ac_f, dc_f, dcac_x, ac_theta, ac_V, dc_V, out=None):
         """Mutate AC/DC nodal residuals and return DC/AC converter residual rows."""
         dcac = dcac_x.reshape(self.N_dcac, 3)
         dc_p = dcac[:, 0]
@@ -1409,7 +1427,13 @@ class HybridPowerFlowCalc:
             ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
         )
         dcac_f[1::3] = f_ctrl
-        dcac_f[2::3] = ac_q - self.dcac_q_ac_set
+        f_second = dcac_f[2::3]
+        f_second[self.dcac_ctrl_q_mask] = ac_q[self.dcac_ctrl_q_mask] - self.dcac_q_ac_set[self.dcac_ctrl_q_mask]
+        f_second[self.dcac_ctrl_ac_theta_mask] = (
+            ac_theta[self.dcac_ac_pos[self.dcac_ctrl_ac_theta_mask]]
+            - self.dcac_ac_theta_set[self.dcac_ctrl_ac_theta_mask]
+        )
+        dcac_f[2::3] = f_second
         return dcac_f
 
     def _append_acac_residuals(self, ac_f, acac_x, ac_V, out=None):
@@ -1446,7 +1470,7 @@ class HybridPowerFlowCalc:
         acac_f[3::4] = f3
         return acac_f
 
-    def _fill_residual_work(self, ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V):
+    def _fill_residual_work(self, ac_f, dc_f, dcac_x, acac_x, ac_theta, ac_V, dc_V):
         """Fill the preallocated global residual vector and return it."""
         if self._residual_work.size != self.total_eq:
             self._residual_work = np.empty(self.total_eq, dtype=np.float64)
@@ -1461,7 +1485,7 @@ class HybridPowerFlowCalc:
             dc_view[:] = dc_f
         if self.N_dcac:
             dcac_view = F[self.dcac_eq_start:self.acac_eq_start]
-            self._append_dcac_residuals(ac_view, dc_view, dcac_x, ac_V, dc_V, out=dcac_view)
+            self._append_dcac_residuals(ac_view, dc_view, dcac_x, ac_theta, ac_V, dc_V, out=dcac_view)
         if self.N_acac:
             acac_view = F[self.acac_eq_start:self.total_eq]
             self._append_acac_residuals(ac_view, acac_x, ac_V, out=acac_view)
@@ -1481,10 +1505,10 @@ class HybridPowerFlowCalc:
             ac_f = self.ac_calc.get_f(ac_x)
         if self.dc_calc is not None:
             dc_f = self.dc_calc.get_f(dc_x)
-        ac_V = dc_V = None
+        ac_theta = ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
-            _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
-        return self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
+            ac_theta, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+        return self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_theta, ac_V, dc_V)
 
     def get_jacobi(self, x: np.ndarray) -> csr_matrix:
         """Build the global sparse Jacobian from sub-solver blocks plus converter couplings."""
@@ -1527,6 +1551,7 @@ class HybridPowerFlowCalc:
             self.global_jac_dcac_ac_q_slice,
             self.global_jac_dcac_dc_eq_slice,
             self.global_jac_dcac_ctrl_q_slice,
+            self.global_jac_dcac_ctrl_theta_slice,
             self.global_jac_dcac_ctrl_dcv_slice,
             self.global_jac_dcac_ctrl_acv_slice,
             self.global_jac_dcac_ctrl_acp_slice,
@@ -1722,11 +1747,11 @@ class HybridPowerFlowCalc:
             if return_jacobian and dc_j is None and self._slice_len(self.global_jac_dc_slice):
                 dc_j = self.dc_calc.get_jacobi(dc_x)
 
-        ac_V = dc_V = None
+        ac_theta = ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
-            _, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+            ac_theta, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
 
-        F = self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_V, dc_V)
+        F = self._fill_residual_work(ac_f, dc_f, dcac_x, acac_x, ac_theta, ac_V, dc_V)
         if not return_jacobian:
             return F, None
         J = self._assemble_jacobian(
@@ -1777,9 +1802,14 @@ class HybridPowerFlowCalc:
         col_parts.append(self.dcac_loss_cols)
         data_parts.append(loss_data)
 
-        row_parts.append(self.dcac_eq_ctrl_2)
-        col_parts.append(self.dcac_ac_q_col)
-        data_parts.append(self.dcac_ones)
+        if np.any(self.dcac_ctrl_q_mask):
+            row_parts.append(self.dcac_eq_ctrl_2[self.dcac_ctrl_q_mask])
+            col_parts.append(self.dcac_ac_q_col[self.dcac_ctrl_q_mask])
+            data_parts.append(self.dcac_ones[self.dcac_ctrl_q_mask])
+        if np.any(self.dcac_ctrl_ac_theta_mask):
+            row_parts.append(self.dcac_eq_ctrl_2[self.dcac_ctrl_ac_theta_mask])
+            col_parts.append(self.dcac_ac_theta_col[self.dcac_ctrl_ac_theta_mask])
+            data_parts.append(self.dcac_ones[self.dcac_ctrl_ac_theta_mask])
         for mask, ctrl_col in (
             (self.dcac_ctrl_dc_v_mask, self.dcac_dc_v_col),
             (self.dcac_ctrl_ac_v_mask, self.dcac_ac_v_col),
