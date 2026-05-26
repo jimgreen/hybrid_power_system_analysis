@@ -28,6 +28,7 @@ from model.hybrid_array_model import (
     DCAC_CONTROL_LABEL,
 )
 from model.dc_array_model import (
+    CTRL_V as DC_CTRL_V,
     GEN_COLS as DC_GEN_COLS,
     LOAD_COLS as DC_LOAD_COLS,
 )
@@ -926,7 +927,7 @@ class HybridStateEstimator:
         stage_start = time.perf_counter()
         self._build_device_maps()
         self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
-        self._populate_measurement_device_pos_from_sub_estimators()
+        self._populate_measurement_device_pos_from_sub_estimators(force=True)
 
         if self._try_delegate_uncoupled_single_side():
             self._prepared = True
@@ -941,7 +942,7 @@ class HybridStateEstimator:
         stage_start = time.perf_counter()
         self._finalize_sub_estimators_after_measurement_prepare()
         self._build_device_maps()
-        self._populate_measurement_device_pos_from_sub_estimators()
+        self._populate_measurement_device_pos_from_sub_estimators(force=True)
         self._record_profile_time("init.finalize_sub_estimators", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
         self._add_pseudo_power_measurements()
@@ -1339,6 +1340,13 @@ class HybridStateEstimator:
         estimator._jacobian_builder = SparseJacobianBuilder((len(measurements), int(getattr(estimator, "n_state", 0))))
         estimator._jacobian_builder._assume_fixed_pattern = True
         setattr(estimator, "_active_measurement_plan_tables_cache", plan_tables)
+        common_table = estimator._common_measurement_plan_table(plan_tables).table
+        setattr(estimator, "active_measurements", measurements)
+        setattr(estimator, "active_measurement_table", common_table)
+        setattr(estimator, "active_z", np.asarray(common_table.value, dtype=np.float64))
+        setattr(estimator, "active_weight", np.asarray(common_table.weight, dtype=np.float64))
+        setattr(estimator, "active_angle_residual_mask", np.asarray(common_table.angle_mask, dtype=bool))
+        setattr(estimator, "_allow_nonflat_fast_observability_certificate", True)
         for attr in (
             "_active_branch_transformer_vector_plan",
             "_active_zero_current_vector_plan",
@@ -1350,6 +1358,21 @@ class HybridStateEstimator:
         ):
             if hasattr(estimator, attr):
                 setattr(estimator, attr, None)
+        vector_plan_builder = getattr(estimator, "_vector_plans_for_measurement_plan_tables", None)
+        if callable(vector_plan_builder):
+            try:
+                vector_plans = vector_plan_builder(plan_tables)
+                handled = np.zeros(len(measurements), dtype=bool)
+                handled_valid = True
+                for plan in vector_plans.values():
+                    plan_handled = np.asarray(plan.get("handled_mask", ()), dtype=bool)
+                    if plan_handled.size != handled.size:
+                        handled_valid = False
+                        break
+                    handled |= plan_handled
+                setattr(estimator, "active_measurements_are_vectorized", bool(handled_valid and np.all(handled)))
+            except Exception:
+                setattr(estimator, "active_measurements_are_vectorized", False)
         return plan_tables
 
     @staticmethod
@@ -2006,7 +2029,12 @@ class HybridStateEstimator:
             self.meas_ppc["normalized"] = True
             sync_meas_ppc_from_measurement_table(self.meas_ppc, self.measurements.table)
 
-    def _measurement_name_arrays_by_type_code(self) -> Dict[int, np.ndarray]:
+    def _measurement_name_arrays_by_type_code(self, requested_codes=None) -> Dict[int, np.ndarray]:
+        requested = None if requested_codes is None else {int(code) for code in requested_codes}
+
+        def include(code: int) -> bool:
+            return requested is None or int(code) in requested
+
         out: Dict[int, np.ndarray] = {}
         ac = getattr(self, "_ac_sub_estimator", None)
         if ac is not None:
@@ -2025,6 +2053,8 @@ class HybridStateEstimator:
                 DEVICE_TYPE_ACPowerBalance: "bus_name",
             }
             for code, rows in (getattr(ac, "_ac_measurement_plan_rows_by_type_code", {}) or {}).items():
+                if not include(int(code)):
+                    continue
                 name_key = name_key_by_code.get(int(code))
                 if name_key is None:
                     continue
@@ -2041,26 +2071,34 @@ class HybridStateEstimator:
                     np.asarray(getattr(dc, "_break_names", ()), dtype=object),
                 )
             )
-            out.update(
-                {
-                    DEVICE_TYPE_DCNode: np.asarray(getattr(dc, "_raw_node_names_alive", ()), dtype=object),
-                    DEVICE_TYPE_DCBranch: np.asarray(getattr(dc, "_branch_names", ()), dtype=object),
-                    DEVICE_TYPE_DCSwitch: np.asarray(getattr(dc, "_switch_names", ()), dtype=object),
-                    DEVICE_TYPE_DCBreak: np.asarray(getattr(dc, "_break_names", ()), dtype=object),
-                    DEVICE_TYPE_DCZeroBranch: np.asarray(getattr(dc, "_zero_branch_names", ()), dtype=object),
-                    DEVICE_TYPE_DCGenerator: np.asarray(getattr(dc, "_generator_names", ()), dtype=object),
-                    DEVICE_TYPE_DCLoad: np.asarray(getattr(dc, "_load_names", ()), dtype=object),
-                    DEVICE_TYPE_DCDCConverter: np.asarray(getattr(dc, "_dcdc_names", ()), dtype=object),
-                    DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
-                    DEVICE_TYPE_DCBreakConstraint: constraint_names,
-                    DEVICE_TYPE_DCSwitchConstraint: constraint_names,
-                }
-            )
-        out[DEVICE_TYPE_DCACConverter] = np.asarray([conv.name for conv in self.dcac_converters], dtype=object)
-        out[DEVICE_TYPE_ACACConverter] = np.asarray([conv.name for conv in self.acac_converters], dtype=object)
+            dc_names = {
+                DEVICE_TYPE_DCNode: np.asarray(getattr(dc, "_raw_node_names_alive", ()), dtype=object),
+                DEVICE_TYPE_DCBranch: np.asarray(getattr(dc, "_branch_names", ()), dtype=object),
+                DEVICE_TYPE_DCSwitch: np.asarray(getattr(dc, "_switch_names", ()), dtype=object),
+                DEVICE_TYPE_DCBreak: np.asarray(getattr(dc, "_break_names", ()), dtype=object),
+                DEVICE_TYPE_DCZeroBranch: np.asarray(getattr(dc, "_zero_branch_names", ()), dtype=object),
+                DEVICE_TYPE_DCGenerator: np.asarray(getattr(dc, "_generator_names", ()), dtype=object),
+                DEVICE_TYPE_DCLoad: np.asarray(getattr(dc, "_load_names", ()), dtype=object),
+                DEVICE_TYPE_DCDCConverter: np.asarray(getattr(dc, "_dcdc_names", ()), dtype=object),
+                DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
+                DEVICE_TYPE_DCBreakConstraint: constraint_names,
+                DEVICE_TYPE_DCSwitchConstraint: constraint_names,
+            }
+            for code, names in dc_names.items():
+                if include(code):
+                    out[int(code)] = names
+        if include(DEVICE_TYPE_DCACConverter):
+            out[DEVICE_TYPE_DCACConverter] = np.asarray([conv.name for conv in self.dcac_converters], dtype=object)
+        if include(DEVICE_TYPE_ACACConverter):
+            out[DEVICE_TYPE_ACACConverter] = np.asarray([conv.name for conv in self.acac_converters], dtype=object)
         return out
 
-    def _populate_measurement_device_pos_from_sub_estimators(self) -> None:
+    def _populate_measurement_device_pos_from_sub_estimators(
+        self,
+        *,
+        force: bool = False,
+        name_attach_codes=None,
+    ) -> None:
         table = getattr(self.measurements, "table", None)
         if table is None or len(table.idx) != len(self.measurements):
             return
@@ -2068,31 +2106,77 @@ class HybridStateEstimator:
         if n_rows == 0:
             table.device_pos = np.asarray([], dtype=np.int64)
             return
-        existing_device_pos = getattr(table, "device_pos", None)
-        if existing_device_pos is not None:
-            existing_device_pos = np.asarray(existing_device_pos, dtype=np.int64)
-            if existing_device_pos.size == n_rows and not np.any(existing_device_pos < 0):
-                table.device_pos = existing_device_pos
-                if isinstance(getattr(self, "meas_ppc", None), dict):
-                    self.meas_ppc["device_pos"] = existing_device_pos
-                return
         meas_ppc = getattr(self, "meas_ppc", None)
-        if isinstance(meas_ppc, dict):
-            if existing_device_pos is not None and existing_device_pos.size == n_rows:
-                meas_ppc["device_pos"] = existing_device_pos.copy()
-            device_pos = attach_device_pos_from_name_arrays(meas_ppc, self._measurement_name_arrays_by_type_code())
-        elif existing_device_pos is not None and existing_device_pos.size == n_rows:
-            device_pos = existing_device_pos.copy()
+        existing_device_pos = getattr(table, "device_pos", None)
+        if existing_device_pos is not None and np.asarray(existing_device_pos).size == n_rows:
+            device_pos = np.asarray(existing_device_pos, dtype=np.int64).copy()
         else:
-            device_pos = np.full(n_rows, -1, dtype=np.int64)
+            ppc_device_pos = meas_ppc.get("device_pos") if isinstance(meas_ppc, dict) else None
+            if isinstance(ppc_device_pos, np.ndarray) and int(ppc_device_pos.size) == n_rows:
+                device_pos = np.asarray(ppc_device_pos, dtype=np.int64).copy()
+            else:
+                device_pos = np.full(n_rows, -1, dtype=np.int64)
+
+        sources_by_side = getattr(self, "_sub_measurement_sources_by_side", None)
+        rows_by_side = getattr(self, "_sub_measurement_source_rows_by_side", None)
+        source_count = int(getattr(self, "_sub_measurement_source_count", -1))
+        can_reuse_partitions = (
+            isinstance(sources_by_side, dict)
+            and isinstance(rows_by_side, dict)
+            and source_count == n_rows
+        )
+        if can_reuse_partitions:
+            estimators = {"ac": self._ac_sub_estimator, "dc": self._dc_sub_estimator}
+            for side, source in sources_by_side.items():
+                estimator = estimators.get(side)
+                estimator_measurements = getattr(estimator, "measurements", None) if estimator is not None else None
+                source_table = getattr(estimator_measurements, "table", None)
+                if source_table is None:
+                    source_table = getattr(source, "table", None)
+                rows = rows_by_side.get(side)
+                source_pos = getattr(source_table, "device_pos", None) if source_table is not None else None
+                if source_table is None or rows is None or source_pos is None:
+                    continue
+                rows = np.asarray(rows, dtype=np.int64)
+                source_pos = np.asarray(source_pos, dtype=np.int64)
+                if rows.size != source_pos.size or rows.size != int(getattr(source_table, "idx", np.asarray([])).size):
+                    continue
+                valid_rows = (rows >= 0) & (rows < n_rows) & (source_pos >= 0)
+                if np.any(valid_rows):
+                    device_pos[rows[valid_rows].astype(np.intp, copy=False)] = source_pos[
+                        valid_rows
+                    ].astype(np.int64, copy=False)
+
+        previous_count = int(getattr(self, "_measurement_device_pos_populated_count", -1))
+        unresolved = device_pos < 0
+        name_attach_done_count = int(getattr(self, "_measurement_device_pos_name_attach_count", -1))
+        should_attach = bool(force and np.any(unresolved) and name_attach_done_count != n_rows)
+        if not should_attach and previous_count < 0:
+            should_attach = bool(np.any(unresolved))
+
+        if should_attach and isinstance(meas_ppc, dict):
+            meas_ppc["device_pos"] = device_pos.copy()
+            codes = np.asarray(getattr(table, "device_type_code", np.asarray([], dtype=np.int16)), dtype=np.int16)
+            unresolved_codes = (
+                np.unique(codes[unresolved])
+                if codes.size == n_rows and np.any(unresolved)
+                else np.asarray([], dtype=np.int16)
+            )
+            if name_attach_codes is not None:
+                allowed_codes = np.asarray(tuple(int(code) for code in name_attach_codes), dtype=np.int16)
+                unresolved_codes = unresolved_codes[np.isin(unresolved_codes, allowed_codes)]
+            device_pos = attach_device_pos_from_name_arrays(
+                meas_ppc,
+                self._measurement_name_arrays_by_type_code(unresolved_codes),
+            )
+            if name_attach_codes is None:
+                self._measurement_device_pos_name_attach_count = n_rows
 
         table.device_pos = device_pos
         cache = getattr(table, "_device_pos_plan_cache", None)
         if cache is not None:
             cache.clear()
-        sources_by_side = getattr(self, "_sub_measurement_sources_by_side", None)
-        rows_by_side = getattr(self, "_sub_measurement_source_rows_by_side", None)
-        if isinstance(sources_by_side, dict) and isinstance(rows_by_side, dict):
+        if can_reuse_partitions:
             for side, source in sources_by_side.items():
                 source_table = getattr(source, "table", None)
                 rows = rows_by_side.get(side)
@@ -2106,9 +2190,11 @@ class HybridStateEstimator:
                         source_cache.clear()
         if isinstance(getattr(self, "meas_ppc", None), dict):
             self.meas_ppc["device_pos"] = device_pos
-        self._sub_measurement_sources_by_side = None
-        self._sub_measurement_source_rows_by_side = None
+        if not can_reuse_partitions:
+            self._sub_measurement_sources_by_side = None
+            self._sub_measurement_source_rows_by_side = None
         self._sub_measurement_source_count = n_rows
+        self._measurement_device_pos_populated_count = n_rows
 
     def _finalize_sub_estimators_after_measurement_prepare(self) -> None:
         if self._ac_sub_estimator is not None and (
@@ -4625,6 +4711,169 @@ class HybridStateEstimator:
             and int(spec.meas_type_code) == meas_type_code
         ]
 
+    def _hybrid_direct_state_coverage_ok(self) -> bool:
+        hybrid_n = int(getattr(self, "hybrid_n_state", 0))
+        if hybrid_n <= 0:
+            return True
+        plan = getattr(self, "_active_hybrid_measurement_plan", None)
+        if plan is None:
+            return False
+        start = int(getattr(self, "hybrid_state_start", 0))
+        stop = start + hybrid_n
+        covered = np.zeros(hybrid_n, dtype=bool)
+        for bucket in (
+            plan.dcac_p_dc,
+            plan.dcac_p_ac,
+            plan.dcac_q_ac,
+            plan.acac_p_from,
+            plan.acac_q_from,
+            plan.acac_p_to,
+            plan.acac_q_to,
+        ):
+            cols = np.asarray(bucket.jcol_p, dtype=np.int64)
+            valid = (cols >= start) & (cols < stop)
+            if np.any(valid):
+                covered[(cols[valid] - start).astype(np.intp, copy=False)] = True
+        return bool(np.all(covered))
+
+    def _sub_block_observable_fast_certificate(
+        self,
+        estimator,
+        block: "HybridStateEstimator._MeasurementSideBlock",
+    ) -> bool:
+        sub_n_state = int(getattr(estimator, "n_state", 0) or 0) if estimator is not None else 0
+        if sub_n_state <= 0:
+            return True
+        if block is None or block.plan_tables is None or len(block.measurements) < sub_n_state:
+            return False
+        cached = getattr(estimator, "_initial_observability_cache", None)
+        if (
+            cached is not None
+            and bool(getattr(cached, "observable", False))
+            and int(getattr(cached, "state_count", -1)) == sub_n_state
+        ):
+            return True
+        fast_builder = getattr(estimator, "_fast_active_observability_certificate", None)
+        if callable(fast_builder):
+            fast_result = fast_builder()
+            if (
+                fast_result is not None
+                and bool(getattr(fast_result, "observable", False))
+                and int(getattr(fast_result, "state_count", -1)) == sub_n_state
+            ):
+                return True
+        if isinstance(estimator, DCStateEstimator) and self._dc_sub_direct_observability_certificate(estimator, block):
+            return True
+        try:
+            result = estimator.observability_analysis(
+                estimator.initial_state(),
+                self._sub_measurement_runtime_input(block),
+            )
+        except Exception:
+            return False
+        return bool(getattr(result, "observable", False)) and int(getattr(result, "rank", -1)) == sub_n_state
+
+    @staticmethod
+    def _dc_sub_direct_observability_certificate(
+        estimator: DCStateEstimator,
+        block: "HybridStateEstimator._MeasurementSideBlock",
+    ) -> bool:
+        n_state = int(getattr(estimator, "n_state", 0) or 0)
+        if n_state <= 0:
+            return True
+        if block is None or block.plan_tables is None or len(block.measurements) < n_state:
+            return False
+        try:
+            plan = estimator._vector_plans_for_measurement_plan_tables(block.plan_tables)["simple"]
+        except Exception:
+            return False
+        handled = np.asarray(plan.get("handled_mask", ()), dtype=bool)
+        if handled.size != len(block.measurements) or not np.all(handled):
+            return False
+        covered = np.zeros(n_state, dtype=bool)
+
+        def mark(cols, mask=None) -> None:
+            values = np.asarray(cols, dtype=np.int64)
+            valid = (values >= 0) & (values < n_state)
+            if mask is not None:
+                mask_values = np.asarray(mask, dtype=bool)
+                if mask_values.size != values.size:
+                    return
+                valid &= mask_values
+            if np.any(valid):
+                covered[values[valid].astype(np.intp, copy=False)] = True
+
+        def mask_at(masks, code: int, size: int) -> np.ndarray:
+            if isinstance(masks, (tuple, list)) and 0 <= int(code) < len(masks):
+                values = np.asarray(masks[int(code)], dtype=bool)
+                if values.size == int(size):
+                    return values
+            return np.zeros(int(size), dtype=bool)
+
+        mark(plan.get("node_col", ()))
+        branch_size = np.asarray(plan.get("branch_i_col", ())).size
+        branch_kind_masks = plan.get("branch_kind_masks", ())
+        mark(plan.get("branch_i_col", ()), mask_at(branch_kind_masks, MEAS_TYPE_V_FROM, branch_size))
+        mark(plan.get("branch_j_col", ()), mask_at(branch_kind_masks, MEAS_TYPE_V_TO, branch_size))
+        load_size = np.asarray(plan.get("load_col", ())).size
+        mark(plan.get("load_col", ()), mask_at(plan.get("load_kind_masks", ()), MEAS_TYPE_V_LOAD, load_size))
+        gen_size = np.asarray(plan.get("gen_col", ())).size
+        gen_kind_masks = plan.get("gen_kind_masks", ())
+        gen_ctrl_masks = plan.get("gen_ctrl_masks", ())
+        mark(plan.get("gen_col", ()), mask_at(gen_kind_masks, MEAS_TYPE_V_GEN, gen_size))
+        mark(
+            plan.get("gen_p_col", ()),
+            mask_at(gen_kind_masks, MEAS_TYPE_P_GEN, gen_size) & mask_at(gen_ctrl_masks, DC_CTRL_V, gen_size),
+        )
+        switch_size = np.asarray(plan.get("switch_col", ())).size
+        switch_kind_masks = plan.get("switch_kind_masks", ())
+        switch_i_mask = mask_at(switch_kind_masks, MEAS_TYPE_I_FROM, switch_size) | mask_at(
+            switch_kind_masks,
+            MEAS_TYPE_I_TO,
+            switch_size,
+        )
+        mark(plan.get("switch_col", ()), switch_i_mask)
+        mark(plan.get("switch_i_col", ()), mask_at(switch_kind_masks, MEAS_TYPE_V_FROM, switch_size))
+        mark(plan.get("switch_j_col", ()), mask_at(switch_kind_masks, MEAS_TYPE_V_TO, switch_size))
+        dcdc_size = np.asarray(plan.get("dcdc_p_col", ())).size
+        dcdc_kind_masks = plan.get("dcdc_kind_masks", ())
+        mark(plan.get("dcdc_p_col", ()), mask_at(dcdc_kind_masks, MEAS_TYPE_P_FROM, dcdc_size))
+        mark(plan.get("dcdc_q_col", ()), mask_at(dcdc_kind_masks, MEAS_TYPE_P_TO, dcdc_size))
+        mark(plan.get("dcdc_i_col", ()), mask_at(dcdc_kind_masks, MEAS_TYPE_V_FROM, dcdc_size))
+        mark(plan.get("dcdc_j_col", ()), mask_at(dcdc_kind_masks, MEAS_TYPE_V_TO, dcdc_size))
+        return bool(np.all(covered))
+
+    def _fast_active_observability_certificate(self) -> Optional[ObservabilityResult]:
+        if not hasattr(self, "active_measurements") or not hasattr(self, "_active_measurement_blocks"):
+            return None
+        n_state = int(getattr(self, "n_state", 0) or 0)
+        if n_state <= 0:
+            return None
+        measurement_count = len(self.active_measurements)
+        if measurement_count < n_state:
+            return None
+        if targeted_redundancy_count(
+            n_state,
+            getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
+        ) > 0:
+            return None
+        if not self._hybrid_direct_state_coverage_ok():
+            return None
+        blocks = self._active_measurement_blocks
+        if not self._sub_block_observable_fast_certificate(self._ac_sub_estimator, blocks.get("ac")):
+            return None
+        if not self._sub_block_observable_fast_certificate(self._dc_sub_estimator, blocks.get("dc")):
+            return None
+        return ObservabilityResult(
+            observable=True,
+            rank=n_state,
+            state_count=n_state,
+            measurement_count=measurement_count,
+            deficiency=0,
+            singular_values=np.array([], dtype=np.float64),
+            weak_states=[],
+        )
+
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch hybrid rank deficiencies and optional post-observability redundancy."""
         delegate = self._delegate()
@@ -4632,11 +4881,17 @@ class HybridStateEstimator:
             return int(getattr(delegate, "targeted_observability_pseudo_count", 0))
         total_added = 0
         max_count = max(0, int(self.targeted_pseudo_measurement_max))
+        if max_count <= 0:
+            return 0
         step = max(1, int(getattr(self, "targeted_pseudo_measurement_step", 10)))
         redundancy_target = targeted_redundancy_count(
             getattr(self, "n_state", 0),
             getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
         )
+        fast_observability = self._fast_active_observability_certificate()
+        if fast_observability is not None:
+            self._initial_observability_cache = fast_observability
+            return 0
         observability = None
         while total_added < max_count:
             observability = self.observability_analysis()
@@ -5766,15 +6021,6 @@ class HybridStateEstimator:
         """
         if estimator is None or len(block.measurements) == 0:
             return
-        sub_builder = getattr(estimator, "_jacobian_builder", None)
-        if sub_builder is not None:
-            # Hybrid SE only needs the sub-estimator CSR as a block to stamp
-            # into the parent Jacobian. The sub-estimator active fixed-pattern
-            # data-refresh shortcut can cache chunk layouts that do not match
-            # this parent/block call path, so keep the sub-block build on the
-            # ordinary sparse path.
-            sub_builder._assume_fixed_pattern = False
-            sub_builder._data_only_refresh_enabled = False
         sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
         if sub_csr.nnz == 0:
             return
@@ -6515,13 +6761,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-state", action="store_true", help="Print estimated states.")
     parser.add_argument("--quiet", action="store_true", help="Suppress WLS iteration process output.")
     parser.add_argument("--profile", action="store_true", help="Print initialization profile timings.")
-    parser.add_argument("--result-mode", default="full", help="SEResult payload mode: full, summary, array, or none.")
+    parser.add_argument(
+        "--result-mode",
+        default=None,
+        choices=("full", "summary", "array", "none"),
+        help="SEResult payload mode: full, summary, array, or none.",
+    )
     parser.add_argument(
         "--power-flow-linear-solver",
         default=None,
         help="Sparse solver used by AC/DC load-flow seeds. Default: umfpack for hybrid cases with DC/coupling.",
     )
-    parser.add_argument("--se-result", default=None, help="Write SEResult blocks to a new E file.")
     args = parser.parse_args(argv)
 
     estimator = HybridStateEstimator(
@@ -6538,8 +6788,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     estimator.prepare()
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
-    se_result = estimator.run(
-        result_mode=args.result_mode if args.se_result else "none",
+    estimator.run(
+        result_mode=args.result_mode if args.result_mode is not None else "none",
         remove_bad_data=args.remove_bad_data,
         bad_threshold=bad_threshold,
         max_remove=args.max_remove,
@@ -6561,8 +6811,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"residual_inf={result.residual_inf:.3e}"
     )
     _print_bad_data(bad_items, normalized, bad_threshold)
-    if args.se_result and se_result is not None:
-        se_result.write_e_file(Path(args.se_result))
     if args.print_state:
         estimator.print_state(result.x)
     if args.profile:

@@ -4263,7 +4263,9 @@ class ACStateEstimator:
 
     def _fast_active_observability_certificate(self) -> Optional[ObservabilityResult]:
         """Certify the generated flat-start AC vectorized active-measurement path."""
-        if not bool(getattr(self, "flat_start", False)):
+        if not bool(getattr(self, "flat_start", False)) and not bool(
+            getattr(self, "_allow_nonflat_fast_observability_certificate", False)
+        ):
             return None
         if not bool(getattr(self, "active_measurements_are_vectorized", False)):
             return None
@@ -8700,11 +8702,7 @@ class ACStateEstimator:
                 H.reset()
             else:
                 H = SparseJacobianBuilder((n_meas, self.n_state))
-                # Hybrid SE calls AC SE with sub-block measurement tables whose
-                # vectorized chunk layout can differ from AC's active main path.
-                # Keep this external path sparse-only instead of reusing the
-                # fixed CSR data-refresh shortcut.
-                H._assume_fixed_pattern = False
+                H._assume_fixed_pattern = True
                 if len(cache) > 4:
                     cache.clear()
                 cache[key] = (measurement_plan_tables, H)

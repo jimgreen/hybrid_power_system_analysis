@@ -265,6 +265,7 @@ def attach_device_pos_from_name_arrays(
 
     device_name_id = np.asarray(device_name_id, dtype=np.int64)
     device_names = np.asarray(device_names, dtype=object)
+    device_name_id_by_name = ppc.get("device_name_id_by_name")
     for code, plan_names in name_arrays_by_type_code.items():
         rows = rows_by_code.get(int(code))
         if rows is None:
@@ -283,6 +284,24 @@ def attach_device_pos_from_name_arrays(
         ids = device_name_id[rows.astype(np.intp, copy=False)]
         valid_ids = (ids >= 0) & (ids < device_names.size)
         if not np.any(valid_ids):
+            continue
+        if isinstance(device_name_id_by_name, dict):
+            lookup = np.full(device_names.size, -1, dtype=np.int64)
+            for pos, name in enumerate(names):
+                name_id = device_name_id_by_name.get(name)
+                if name_id is None and not isinstance(name, str):
+                    name_id = device_name_id_by_name.get(str(name))
+                if name_id is None:
+                    continue
+                name_id = int(name_id)
+                if 0 <= name_id < lookup.size:
+                    lookup[name_id] = int(pos)
+            valid_row_pos = np.flatnonzero(valid_ids)
+            target_pos = lookup[ids[valid_ids].astype(np.intp, copy=False)]
+            matched = target_pos >= 0
+            if np.any(matched):
+                target_rows = rows[valid_row_pos[matched]].astype(np.intp, copy=False)
+                device_pos[target_rows] = target_pos[matched].astype(np.int64, copy=False)
             continue
         rows_valid = rows[valid_ids]
         query = device_names[ids[valid_ids].astype(np.intp, copy=False)]
