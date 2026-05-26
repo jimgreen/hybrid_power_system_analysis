@@ -3474,6 +3474,47 @@ class HybridStateEstimationTest(unittest.TestCase):
         )
         self.assertTrue(bool(plan_tables["simple"].handled[0]))
 
+    def test_hybrid_observability_adds_ac_angle_reference_anchors(self):
+        from algorithm_parameters import load_se_parameters
+        from secore.hybrid_se import HybridStateEstimator
+        from secore.se_math import sparse_structural_rank, unanchored_angle_state_indices
+
+        params = load_se_parameters()
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_4k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_4k.meas",
+            parameters=params,
+            flat_start=True,
+        )
+
+        H = estimator.jacobian_sparse(estimator.initial_state(), estimator.active_measurements)
+        ac_angle_cols = estimator.ac_theta_state_col[estimator.ac_theta_state_col >= 0]
+
+        self.assertEqual(estimator.n_state, sparse_structural_rank(H))
+        self.assertEqual([], unanchored_angle_state_indices(H, ac_angle_cols))
+
+    def test_hybrid_real_acac_measurements_remain_active_without_targeted_pseudo(self):
+        from algorithm_parameters import load_se_parameters
+        from model.meas_type import DEVICE_TYPE_ACACConverter
+        from secore.hybrid_se import HybridStateEstimator
+        from secore.se_math import sparse_structural_rank
+
+        params = load_se_parameters().with_overrides(targeted_pseudo_measurement_max=0)
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_4k.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_4k.meas",
+            parameters=params,
+            flat_start=True,
+        )
+
+        table = estimator.active_measurements.table
+        acac_rows = table.device_type_code == DEVICE_TYPE_ACACConverter
+        H = estimator.jacobian_sparse(estimator.initial_state(), estimator.active_measurements)
+
+        self.assertEqual(199 * 8, int(np.count_nonzero(acac_rows)))
+        self.assertEqual(0, estimator.targeted_observability_pseudo_count)
+        self.assertEqual(estimator.n_state, sparse_structural_rank(H))
+
     def test_pseudo_measurements_are_device_level_for_hybrid_converters(self):
         from secore.hybrid_se import HybridStateEstimator
 

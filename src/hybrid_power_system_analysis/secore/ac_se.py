@@ -2729,6 +2729,11 @@ class ACStateEstimator:
             self._ac_break_plan_i,
             self._ac_break_plan_j,
         )
+        apply_terminal(
+            rows_for(DEVICE_TYPE_ACACConverter),
+            self._ac_acac_plan_i,
+            self._ac_acac_plan_j,
+        )
         apply_single(
             rows_for(DEVICE_TYPE_ACGenerator),
             self._ac_generator_plan_node_pos,
@@ -2819,6 +2824,11 @@ class ACStateEstimator:
             DEVICE_TYPE_ACBreak,
             getattr(self, "_ac_break_plan_i", np.asarray([], dtype=np.int64)),
             getattr(self, "_ac_break_plan_j", np.asarray([], dtype=np.int64)),
+        )
+        assign_terminal(
+            DEVICE_TYPE_ACACConverter,
+            getattr(self, "_ac_acac_plan_i", np.asarray([], dtype=np.int64)),
+            getattr(self, "_ac_acac_plan_j", np.asarray([], dtype=np.int64)),
         )
         return from_pos, to_pos
 

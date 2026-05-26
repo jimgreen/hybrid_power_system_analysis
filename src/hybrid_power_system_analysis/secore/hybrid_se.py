@@ -33,10 +33,12 @@ from model.meas_array_model import (
     sync_meas_ppc_from_measurement_table,
 )
 from model.meas_type import (
+    DEVICE_TYPE_ACNode,
     DEVICE_TYPE_ACACConverter,
     DEVICE_TYPE_DCACConverter,
     DEVICE_TYPE_NAMES,
     MEAS_TYPE_CODES,
+    MEAS_TYPE_ANGLE,
     MEAS_TYPE_I_AC,
     MEAS_TYPE_I_DC,
     MEAS_TYPE_I_FROM,
@@ -906,6 +908,9 @@ class HybridStateEstimator:
         stage_start = time.perf_counter()
         self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
         self._record_profile_time("init.targeted_observability_pseudo", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
+        self.ac_angle_reference_anchor_count = self._add_ac_angle_reference_anchor_measurements()
+        self._record_profile_time("init.add_ac_angle_reference_anchors", time.perf_counter() - stage_start)
         self._prepared = True
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
         return self
@@ -5278,6 +5283,99 @@ class HybridStateEstimator:
     def _add_redundant_observability_pseudo_measurements(self, max_add: int) -> int:
         observability = self.observability_analysis()
         return self._add_weak_direction_observability_pseudo_measurements(observability, max_add)
+
+    def _add_ac_angle_reference_anchor_measurements(self) -> int:
+        """Add one internal AC angle anchor for each structurally free angle component."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return 0
+        ac = getattr(self, "_ac_sub_estimator", None)
+        if ac is None or not hasattr(self, "active_measurements") or int(getattr(self, "n_state", 0)) <= 0:
+            return 0
+        angle_col = np.asarray(getattr(self, "ac_theta_state_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        active_angle_cols = angle_col[angle_col >= 0]
+        if active_angle_cols.size == 0:
+            return 0
+        x = self.initial_state()
+        H = self.jacobian_sparse(x, self.active_measurements)
+        unanchored = unanchored_angle_state_indices(H, active_angle_cols)
+        if not unanchored:
+            return 0
+
+        node_plan_pos = np.asarray(getattr(ac, "_ac_node_plan_pos", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        node_names = np.asarray(getattr(ac, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
+        if node_plan_pos.size == 0 or node_names.size == 0:
+            return 0
+        max_solver_pos = int(node_plan_pos.max()) if node_plan_pos.size else -1
+        if max_solver_pos < 0:
+            return 0
+        solver_to_plan = np.full(max_solver_pos + 1, -1, dtype=np.int64)
+        valid_plan = (node_plan_pos >= 0) & (node_plan_pos <= max_solver_pos)
+        if np.any(valid_plan):
+            solver_to_plan[node_plan_pos[valid_plan].astype(np.intp, copy=False)] = np.flatnonzero(valid_plan).astype(
+                np.int64,
+                copy=False,
+            )
+
+        existing_keys = self._active_measurement_keys()
+        existing_names = self._measurement_name_set_fast(self.measurements)
+        measurements: List[Measurement] = []
+        next_idx = self._next_measurement_idx()
+        seen_state_cols = set()
+        for state_col_raw in unanchored:
+            state_col = int(state_col_raw)
+            if state_col in seen_state_cols:
+                continue
+            seen_state_cols.add(state_col)
+            solver_pos = -1
+            meta = state_meta_at(self.state_meta, state_col)
+            meta_pos = int(getattr(meta, "device_pos", -1)) if meta is not None else -1
+            if 0 <= meta_pos < angle_col.size and int(angle_col[meta_pos]) == state_col:
+                solver_pos = meta_pos
+            if solver_pos < 0:
+                matched = np.flatnonzero(angle_col == state_col)
+                if matched.size == 0:
+                    continue
+                solver_pos = int(matched[0])
+            if solver_pos < 0 or solver_pos >= solver_to_plan.size:
+                continue
+            device_pos = int(solver_to_plan[solver_pos])
+            if device_pos < 0:
+                continue
+            device_name = str(node_names[solver_pos]) if solver_pos < node_names.size else f"ac_node_{solver_pos}"
+            key = self._packed_measurement_key(DEVICE_TYPE_ACNode, device_pos, MEAS_TYPE_ANGLE)
+            pseudo_name = f"pseudo_ref_angle_{device_name}"
+            if key in existing_keys or pseudo_name in existing_names:
+                continue
+            value = float(x[state_col]) if 0 <= state_col < x.size else 0.0
+            measurements.append(
+                Measurement(
+                    next_idx,
+                    pseudo_name,
+                    "ACNode",
+                    device_name,
+                    "ANGLE",
+                    self.pseudo_measurement_weight,
+                    True,
+                    value,
+                    MEAS_STATUS_PSEUDO,
+                    device_type_code=DEVICE_TYPE_ACNode,
+                    meas_type_code=MEAS_TYPE_ANGLE,
+                    device_pos=device_pos,
+                )
+            )
+            next_idx += 1
+            existing_keys.add(key)
+            existing_names.add(pseudo_name)
+
+        if not measurements:
+            return 0
+        measurement_count_before = len(self.measurements)
+        self._append_pseudo_measurement_objects(measurements)
+        appended = self.measurements[measurement_count_before:]
+        if not self._incremental_update_active_measurement_state_layout(appended):
+            self._refresh_active_measurement_state_layout()
+        return len(measurements)
 
     def _observability_pseudo_candidate_measurements(self) -> List[Measurement]:
         """Build low-weight candidate pseudo rows for weak-direction observability repair."""
