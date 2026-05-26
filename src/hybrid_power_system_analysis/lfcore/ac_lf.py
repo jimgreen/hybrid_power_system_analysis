@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - package import path
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
 from ac_array_model import (
+    ACAC_COLS,
     BRANCH_COLS,
     BUS_COLS,
     CTRL_P,
@@ -105,6 +106,7 @@ def ac_node_type_label(node_type) -> str:
 @dataclass
 class ACLFResult:
     arrays: Dict[str, np.ndarray] = field(default_factory=dict)
+    acac_converters: Dict[str, SimpleNamespace] = field(default_factory=dict)
     branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
     transformers: Dict[str, SimpleNamespace] = field(default_factory=dict)
     nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
@@ -2169,6 +2171,96 @@ class ACPowerFlowCalc:
         )
         return F, J
 
+    def _should_delegate_acac_to_hybrid(self) -> bool:
+        acac = self.ppc.get("acac")
+        return acac is not None and getattr(acac, "size", 0) > 0 and int(acac.shape[0]) > 0
+
+    def _run_acac_converter_power_flow(self) -> int:
+        from hybrid_lf import (
+            DCAC_COLS,
+            HybridPowerFlowCalc,
+            _LightweightHybridNetwork,
+            _lightweight_ac_network,
+            _lightweight_dc_network,
+        )
+
+        base = self.ppc["base"]
+        ac_network = _lightweight_ac_network(self.ppc)
+        dc_network = _lightweight_dc_network()
+        network = _LightweightHybridNetwork(
+            _lf_lightweight=True,
+            ac=ac_network,
+            dc=dc_network,
+            dcac_converters=[],
+            acac_converters=ac_network.acac_converters,
+            hybrid_islands=[],
+        )
+        network.ppc = {
+            "format": "hybrid_ppc_v1",
+            "source": self.ppc.get("source", "<ac_ppc>"),
+            "base": base,
+            "ac": self.ppc,
+            "dc": None,
+            "dcac": np.zeros((0, len(DCAC_COLS)), dtype=np.float64),
+            "dcac_name": np.asarray([], dtype=object),
+            "acac": self.ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)),
+            "acac_name": self.ppc.get("acac_name", np.asarray([], dtype=object)),
+        }
+        network._ac_ppc = self.ppc
+        network.p_base = float(base["p_base"])
+        network.u_scale = float(base["u_scale"])
+        network.p_scale = float(base["p_scale"])
+        network.i_scale = float(base["i_scale"])
+        network.p_base_kW = float(base["p_base_kW"])
+
+        calc = HybridPowerFlowCalc(
+            network,
+            parameters=self.params,
+            keep_node_objects=False,
+            linear_solver=self.linear_solver,
+            result_mode=self.result_mode,
+            verbose=self.verbose,
+        )
+        rc = calc.run()
+        self._delegated_hybrid_calc = calc
+        self.converged = bool(calc.converged)
+        self.iterations = int(calc.iterations)
+        self.normF = float(calc.normF)
+        if calc.ac_calc is not None:
+            for attr in (
+                "N",
+                "node_type",
+                "ppc_node_idx",
+                "ppc_node_name",
+                "theta_unknown",
+                "V_unknown",
+                "slack_node",
+                "skipped_islands",
+            ):
+                if hasattr(calc.ac_calc, attr):
+                    setattr(self, attr, getattr(calc.ac_calc, attr))
+        ac_result = calc.result.get("ac", {}) if isinstance(calc.result, dict) else {}
+        self.result = dict(ac_result)
+        acac_table = self.ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)).copy()
+        acac_result = calc.result.get("acac") if isinstance(calc.result, dict) else None
+        if acac_result is not None and getattr(calc, "acac_row_pos", np.array([], dtype=np.int32)).size:
+            rows = calc.acac_row_pos
+            acac_table[rows, ACAC_COLS["i_p"]] = acac_result[:, 0]
+            acac_table[rows, ACAC_COLS["i_q"]] = acac_result[:, 1]
+            acac_table[rows, ACAC_COLS["j_p"]] = acac_result[:, 2]
+            acac_table[rows, ACAC_COLS["j_q"]] = acac_result[:, 3]
+            acac_table[rows, ACAC_COLS["i_i"]] = acac_result[:, 4]
+            acac_table[rows, ACAC_COLS["j_i"]] = acac_result[:, 5]
+        if self.result_mode != "none":
+            self.result["acac"] = acac_table
+        if self._network_writeback is not None and self.result_mode not in ("none", "summary"):
+            self._write_ppc_result_to_network()
+        if self.result_mode not in ("none", "summary", "array") and not getattr(self, "skip_lf_result", False):
+            self.lf_result = self._build_lf_result_from_ppc()
+        else:
+            self.lf_result = None
+        return rc
+
     # --------------------------------------------------------------------------
     # 迭代求解
     # --------------------------------------------------------------------------
@@ -2180,6 +2272,8 @@ class ACPowerFlowCalc:
             self.keep_node_objects = False
             self.node_list = []
             self.node_pos = {}
+        if self._should_delegate_acac_to_hybrid():
+            return self._run_acac_converter_power_flow()
         if self.x.size == 0:
             self.prepare()
         return self._run_newton_raphson()
@@ -2333,6 +2427,22 @@ class ACPowerFlowCalc:
 
         _build_two_port(self.result.get("branch"), "branch_name", BRANCH_COLS, result.branches)
         _build_two_port(self.result.get("transformer"), "transformer_name", TRANSFORMER_COLS, result.transformers)
+        acac_rows = self.result.get("acac")
+        if acac_rows is not None and len(acac_rows):
+            names = _name_list("acac_name", len(acac_rows))
+            i_v = _lookup_voltage(acac_rows[:, ACAC_COLS["i_node"]]).tolist()
+            j_v = _lookup_voltage(acac_rows[:, ACAC_COLS["j_node"]]).tolist()
+            for name, row, iv, jv in zip(names, acac_rows, i_v, j_v):
+                result.acac_converters[name] = SimpleNamespace(
+                    i_p=float(row[ACAC_COLS["i_p"]]),
+                    i_q=float(row[ACAC_COLS["i_q"]]),
+                    i_c=float(row[ACAC_COLS["i_i"]]),
+                    i_v=iv,
+                    j_p=float(row[ACAC_COLS["j_p"]]),
+                    j_q=float(row[ACAC_COLS["j_q"]]),
+                    j_c=float(row[ACAC_COLS["j_i"]]),
+                    j_v=jv,
+                )
 
         def _build_single_port(rows, name_key, p_col, q_col, c_col, node_col, target):
             if rows is None or len(rows) == 0:
@@ -2466,6 +2576,18 @@ class ACPowerFlowCalc:
             getattr(network, "breakers", []),
             rows_by_idx("break", SWITCH_COLS["idx"]),
             (("p", SWITCH_COLS["p"]), ("q", SWITCH_COLS["q"]), ("current", SWITCH_COLS["current"])),
+        )
+        copy_fields(
+            getattr(network, "acac_converters", []),
+            rows_by_idx("acac", ACAC_COLS["idx"]),
+            (
+                ("i_p", ACAC_COLS["i_p"]),
+                ("i_q", ACAC_COLS["i_q"]),
+                ("i_i", ACAC_COLS["i_i"]),
+                ("j_p", ACAC_COLS["j_p"]),
+                ("j_q", ACAC_COLS["j_q"]),
+                ("j_i", ACAC_COLS["j_i"]),
+            ),
         )
 
     def _write_back_ppc(self):
@@ -2628,6 +2750,7 @@ class ACPowerFlowCalc:
             "zero_branch": zero_branch,
             "switch": switch,
             "break": breaker,
+            "acac": self.ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)).copy(),
         }
 
 def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:

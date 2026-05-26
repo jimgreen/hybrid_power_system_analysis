@@ -297,6 +297,7 @@ def _make_compact_bus(bus_cls, idx: int, grouped_nodes):
         bus.angle = getattr(ref, "angle", 0.0)
         bus.transformers = ()
         bus.shunt_compensators = ()
+        bus.acac_converters = ()
         bus.v_gens = ()
     else:
         bus.v_set = 1.0
@@ -619,6 +620,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
     try:
         from .ac_array_model import (
             BREAK_COLS,
+            ACAC_COLS,
             BRANCH_COLS,
             BUS_COLS,
             GEN_COLS,
@@ -632,6 +634,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
     except ImportError:  # pragma: no cover - top-level module import path
         from ac_array_model import (
             BREAK_COLS,
+            ACAC_COLS,
             BRANCH_COLS,
             BUS_COLS,
             GEN_COLS,
@@ -652,6 +655,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
     zero_branch = np.asarray(ppc["zero_branch"], dtype=np.float64)
     switch = np.asarray(ppc["switch"], dtype=np.float64)
     breaker = np.asarray(ppc.get("break", _empty(len(BREAK_COLS))), dtype=np.float64)
+    acac = np.asarray(ppc.get("acac", _empty(len(ACAC_COLS))), dtype=np.float64)
     node_ids = bus[:, BUS_COLS["idx"]].astype(np.int32, copy=False)
     node_run_mask = bus[:, BUS_COLS["run_stat"]].astype(np.int64, copy=False) == 1
     node_lookup = _make_node_pos_lookup(node_ids)
@@ -693,6 +697,13 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             node_lookup,
             status_col=BREAK_COLS["status"],
         ),
+        "acac": _terminal_topology_input(
+            acac,
+            ACAC_COLS["i_node"],
+            ACAC_COLS["j_node"],
+            ACAC_COLS["run_stat"],
+            node_lookup,
+        ),
     }
     singles = {
         "gen": _single_topology_input(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup),
@@ -707,6 +718,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
     try:
         from .ac_array_model import (
             BREAK_COLS,
+            ACAC_COLS,
             BRANCH_COLS,
             CTRL_SLACK,
             GEN_COLS,
@@ -720,6 +732,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
     except ImportError:  # pragma: no cover - top-level module import path
         from ac_array_model import (
             BREAK_COLS,
+            ACAC_COLS,
             BRANCH_COLS,
             CTRL_SLACK,
             GEN_COLS,
@@ -740,6 +753,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
     zero_branch = np.asarray(ppc["zero_branch"], dtype=np.float64)
     switch = np.asarray(ppc["switch"], dtype=np.float64)
     breaker = np.asarray(ppc.get("break", _empty(len(BREAK_COLS))), dtype=np.float64)
+    acac = np.asarray(ppc.get("acac", _empty(len(ACAC_COLS))), dtype=np.float64)
     topology_input = ppc.get("_topology_input")
     if not _compatible_grid_topology_input(topology_input, bus.shape[0] if bus.size else 0):
         topology_input = build_ac_topology_input_ppc(ppc)
@@ -901,6 +915,15 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             topology,
             status_col=BREAK_COLS["status"],
             precomputed=terminals.get("break"),
+        ),
+        "acac": _terminal_device_arrays(
+            acac,
+            ACAC_COLS["i_node"],
+            ACAC_COLS["j_node"],
+            ACAC_COLS["run_stat"],
+            node_lookup,
+            topology,
+            precomputed=terminals.get("acac"),
         ),
         "gen": _single_device_arrays(
             gen,
@@ -1918,6 +1941,8 @@ def _make_ac_island(idx, island_cls):
         island.transformers = []
     if not hasattr(island, "shunt_compensators"):
         island.shunt_compensators = []
+    if not hasattr(island, "acac_converters"):
+        island.acac_converters = []
     return island
 
 
@@ -1939,6 +1964,7 @@ def prepare_ac_topology(network) -> None:
     zero_branches = _device_seq(network, "zero_branches")
     switches = _device_seq(network, "switches")
     breakers = _device_seq(network, "breakers")
+    acac_converters = _device_seq(network, "acac_converters")
 
     node_dict = {node.idx: node for node in nodes}
     network.node_dict = node_dict
@@ -1951,6 +1977,7 @@ def prepare_ac_topology(network) -> None:
     network.zero_branche_dict = network.zero_branch_dict
     network.switch_dict = {dev.idx: dev for dev in switches}
     network.break_dict = {dev.idx: dev for dev in breakers}
+    network.acac_converter_dict = {dev.idx: dev for dev in acac_converters}
     network.branche_dict = network.branch_dict
 
     for node in nodes:
@@ -1967,6 +1994,7 @@ def prepare_ac_topology(network) -> None:
         node.zero_branches = []
         node.transformers = []
         node.shunt_compensators = []
+        node.acac_converters = []
         node.v_gens = []
 
     running_nodes = [node for node in nodes if node.run_stat == 1]
@@ -2136,6 +2164,8 @@ def prepare_ac_topology(network) -> None:
         finalize_branch_like(dev, "breakers", require_closed=True)
     for dev in switches:
         finalize_branch_like(dev, "switches", require_closed=True)
+    for dev in acac_converters:
+        finalize_branch_like(dev, "acac_converters")
 
     network.alive_nodes = [bus for bus in buses if bus.is_alive]
     network.alive_buses = network.alive_nodes
@@ -2146,9 +2176,11 @@ def prepare_ac_topology(network) -> None:
     network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}
     network.alive_switch_by_name = {sw.name: sw for sw in switches if sw.is_alive}
     network.alive_break_by_name = {brk.name: brk for brk in breakers if brk.is_alive}
+    network.alive_acac_converter_by_name = {conv.name: conv for conv in acac_converters if conv.is_alive}
     network.alive_zero_branches = _sorted_by_idx(network.alive_zero_branch_by_name.values())
     network.alive_switches = _sorted_by_idx(network.alive_switch_by_name.values())
     network.alive_breakers = _sorted_by_idx(network.alive_break_by_name.values())
+    network.alive_acac_converters = _sorted_by_idx(network.alive_acac_converter_by_name.values())
     network.alive_generator_order = _sorted_by_idx(network.alive_generator_by_name.values())
     network.alive_load_order = _sorted_by_idx(network.alive_load_by_name.values())
 

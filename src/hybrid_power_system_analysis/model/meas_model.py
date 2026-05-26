@@ -68,6 +68,9 @@ class Measurement:
     valid: bool
     value: float
     status: int
+    device_type_code: int
+    meas_type_code: int
+    device_pos: int
 
     def __init__(
         self,
@@ -80,6 +83,10 @@ class Measurement:
         valid: bool,
         value: float,
         status=None,
+        *,
+        device_type_code: int = 0,
+        meas_type_code: int = 0,
+        device_pos: int = -1,
     ) -> None:
         self.idx = idx
         self.name = name
@@ -90,6 +97,9 @@ class Measurement:
         self.valid = valid
         self.value = value
         self.status = normalize_measurement_status(status, valid=valid)
+        self.device_type_code = int(device_type_code)
+        self.meas_type_code = int(meas_type_code)
+        self.device_pos = int(device_pos)
         if not measurement_status_is_active(self.status):
             self.valid = False
 
@@ -196,6 +206,19 @@ def measurement_from_table_row(table: MeasurementTable, row: int) -> Measurement
     measurement.valid = bool(table.valid[pos])
     measurement.value = float(table.value[pos])
     measurement.status = int(status_code[pos])
+    measurement.device_type_code = int(table.device_type_code[pos])
+    meas_type_code = getattr(table, "meas_type_code", None)
+    measurement.meas_type_code = (
+        int(meas_type_code[pos])
+        if meas_type_code is not None and int(np.asarray(meas_type_code).size) > pos
+        else 0
+    )
+    device_pos = getattr(table, "device_pos", None)
+    measurement.device_pos = (
+        int(device_pos[pos])
+        if device_pos is not None and int(np.asarray(device_pos).size) > pos
+        else -1
+    )
     return measurement
 
 
@@ -383,6 +406,10 @@ def measurement_table_from_measurements(
     device_type_code_list = [0] * count
     angle_mask_list = [False] * count
     status_list = [0] * count
+    meas_type_code_values = [0] * count
+    device_pos_values = [-1] * count
+    has_meas_type_code = False
+    has_device_pos = False
     device_type_codes_get = device_type_codes.get
     for pos, meas in enumerate(measurements):
         idx_list[pos] = int(meas.idx)
@@ -396,6 +423,12 @@ def measurement_table_from_measurements(
         device_type_code_list[pos] = device_type_codes_get(meas.device_type, 0)
         angle_mask_list[pos] = meas.meas_type in angle_measurement_types
         status_list[pos] = measurement_status_from_measurement(meas)
+        meas_code = int(getattr(meas, "meas_type_code", 0) or 0)
+        dev_pos = int(getattr(meas, "device_pos", -1))
+        meas_type_code_values[pos] = meas_code
+        device_pos_values[pos] = dev_pos
+        has_meas_type_code = has_meas_type_code or meas_code > 0
+        has_device_pos = has_device_pos or dev_pos >= 0
     return MeasurementTable(
         idx=np.asarray(idx_list, dtype=np.int64),
         name=np.asarray(name_list, dtype=object),
@@ -408,6 +441,8 @@ def measurement_table_from_measurements(
         device_type_code=np.asarray(device_type_code_list, dtype=np.int16),
         angle_mask=np.asarray(angle_mask_list, dtype=bool),
         status_code=np.asarray(status_list, dtype=np.int16),
+        meas_type_code=np.asarray(meas_type_code_values, dtype=np.int16) if has_meas_type_code else None,
+        device_pos=np.asarray(device_pos_values, dtype=np.int64) if has_device_pos else None,
     )
 
 

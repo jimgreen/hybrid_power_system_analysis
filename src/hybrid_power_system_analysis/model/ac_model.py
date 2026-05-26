@@ -9,6 +9,7 @@ class ACIsl:
         self.zero_branches = []
         self.switches = []
         self.breakers = []
+        self.acac_converters = []
         self.slack_nodes = []
         self.v_gens = []
 
@@ -51,6 +52,7 @@ class ACBus:
         self.zero_branches = []
         self.transformers = []
         self.shunt_compensators = []
+        self.acac_converters = []
         self.v_gens = []
 
 class ACBranch:
@@ -181,6 +183,47 @@ class ACTransformer:
         self.j_q = None
         self.j_c = None
 
+
+ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
+
+
+class ACACConverter:
+    def __init__(
+        self,
+        idx,
+        i_node,
+        j_node,
+        r1,
+        r2,
+        control_type,
+        p_set,
+        i_q_set,
+        j_q_set,
+        i_v_set,
+        j_v_set,
+        run_stat=1,
+    ):
+        self.idx = idx
+        self.i_node = i_node
+        self.j_node = j_node
+        self.r1 = r1
+        self.r2 = r2
+        self.control_type = control_type
+        self.p_set = p_set
+        self.i_q_set = i_q_set
+        self.j_q_set = j_q_set
+        self.i_v_set = i_v_set
+        self.j_v_set = j_v_set
+        self.run_stat = run_stat
+        self.i_p = None
+        self.i_q = None
+        self.j_p = None
+        self.j_q = None
+        self.i_i = None
+        self.j_i = None
+        self.i_node_obj = None
+        self.j_node_obj = None
+
 from efile_read import efile_factory_from_file, efile_factory_from_rows
 from unit_system import normalize_model_named_units
 
@@ -195,6 +238,7 @@ _AC_ROW_CLASS_BY_TABLE = {
     "ACSwitch": ACSwitch,
     "ACBreak": ACBreak,
     "ACTransformer": ACTransformer,
+    "ACACConverter": ACACConverter,
 }
 
 
@@ -337,6 +381,29 @@ _AC_ROW_DEFAULT_ATTRS = {
         "i_node_obj": None,
         "j_node_obj": None,
     },
+    "ACACConverter": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "r1": 0.0,
+        "r2": 0.0,
+        "control_type": "PQQ",
+        "p_set": 0.0,
+        "i_q_set": 0.0,
+        "j_q_set": 0.0,
+        "i_v_set": 1.0,
+        "j_v_set": 1.0,
+        "run_stat": 1,
+        "i_p": None,
+        "i_q": None,
+        "j_p": None,
+        "j_q": None,
+        "i_i": None,
+        "j_i": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+    },
 }
 
 
@@ -382,6 +449,7 @@ class ACPowerNetwork:
         self.breakers = []
         self.transformers = []
         self.shunt_compensators = []
+        self.acac_converters = []
         self.islands = []
         self.buses = []
 
@@ -398,6 +466,7 @@ class ACPowerNetwork:
         self.branche_dict = self.branch_dict
         self.transformer_dict = {}
         self.shunt_compensator_dict = {}
+        self.acac_converter_dict = {}
 
     def add_node(self, idx, vbase, voltage=1.0, angle=0.0, run_stat=1):
         node = ACNode(idx, vbase, voltage, angle, run_stat)
@@ -439,6 +508,38 @@ class ACPowerNetwork:
         self.transformers.append(trfm)
         return trfm
 
+    def add_acac_converter(
+        self,
+        idx,
+        i_node,
+        j_node,
+        r1,
+        r2,
+        control_type,
+        p_set,
+        i_q_set,
+        j_q_set,
+        i_v_set,
+        j_v_set,
+        run_stat=1,
+    ):
+        conv = ACACConverter(
+            idx,
+            i_node,
+            j_node,
+            r1,
+            r2,
+            control_type,
+            p_set,
+            i_q_set,
+            j_q_set,
+            i_v_set,
+            j_v_set,
+            run_stat,
+        )
+        self.acac_converters.append(conv)
+        return conv
+
     def _load_from_model(self, *, units_already_normalized: bool = False):
         if units_already_normalized:
             self.p_base = float(self.model.p_base)
@@ -461,6 +562,7 @@ class ACPowerNetwork:
         self.zero_branches = _coerce_ac_rows(getattr(self.model, 'ACZeroBranch', []), "ACZeroBranch")
         self.transformers = _coerce_ac_rows(getattr(self.model, 'ACTransformer', []), "ACTransformer")
         self.shunt_compensators = _coerce_ac_rows(getattr(self.model, 'ACShuntCompensator', []), "ACShuntCompensator")
+        self.acac_converters = _coerce_ac_rows(getattr(self.model, 'ACACConverter', []), "ACACConverter")
         self.node_dict = {}
         self.bus_dict = {}
         self.node_to_bus = {}
@@ -474,6 +576,7 @@ class ACPowerNetwork:
         self.branche_dict = self.branch_dict
         self.transformer_dict = {}
         self.shunt_compensator_dict = {}
+        self.acac_converter_dict = {}
         self.islands = []
         self.buses = []
 
@@ -502,6 +605,7 @@ class ACPowerNetwork:
         self.branche_dict = self.branch_dict
         self.transformer_dict = {trfm.idx: trfm for trfm in self.transformers}
         self.shunt_compensator_dict = {scp.idx: scp for scp in self.shunt_compensators}
+        self.acac_converter_dict = {conv.idx: conv for conv in self.acac_converters}
 
         for node in self.nodes:
             node.generators = []
@@ -512,6 +616,7 @@ class ACPowerNetwork:
             node.zero_branches = []
             node.transformers = []
             node.shunt_compensators = []
+            node.acac_converters = []
             node.bus = None
             node.bus_obj = None
 
@@ -571,6 +676,14 @@ class ACPowerNetwork:
             if zbr.j_node_obj:
                 zbr.j_node_obj.zero_branches.append(zbr)
 
+        for conv in self.acac_converters:
+            conv.i_node_obj = self.node_dict.get(conv.i_node, None)
+            conv.j_node_obj = self.node_dict.get(conv.j_node, None)
+            if conv.i_node_obj:
+                conv.i_node_obj.acac_converters.append(conv)
+            if conv.j_node_obj:
+                conv.j_node_obj.acac_converters.append(conv)
+
     def topo(self):
         from model import topology as network_topology
 
@@ -591,6 +704,7 @@ class ACPowerNetwork:
             isl.breakers = []
             isl.transformers = []
             isl.shunt_compensators = []
+            isl.acac_converters = []
 
         # 检查节点
         for node in self.nodes:
@@ -606,6 +720,7 @@ class ACPowerNetwork:
             bus.zero_branches = []
             bus.transformers = []
             bus.shunt_compensators = []
+            bus.acac_converters = []
             if bus.isl_obj is not None:
                 bus.isl_obj.buses.append(bus)
 
@@ -688,6 +803,14 @@ class ACPowerNetwork:
             if brk.i_node_obj.isl_obj and brk.j_node_obj.isl_obj and brk.i_node_obj.isl_obj == brk.j_node_obj.isl_obj:
                 brk.i_node_obj.isl_obj.breakers.append(brk)
 
+        for conv in self.acac_converters:
+            if conv.run_stat == 0:
+                continue
+            if conv.i_node_obj is None or conv.j_node_obj is None:
+                continue
+            if conv.i_node_obj.isl_obj and conv.j_node_obj.isl_obj and conv.i_node_obj.isl_obj == conv.j_node_obj.isl_obj:
+                conv.i_node_obj.isl_obj.acac_converters.append(conv)
+
         for isl in self.islands:
             if len(isl.slack_nodes)  >= 1:
                 isl.is_alive = True
@@ -758,6 +881,12 @@ class ACPowerNetwork:
                 continue
             sw.is_alive = sw.i_node_obj.is_alive and sw.j_node_obj.is_alive
 
+        for conv in self.acac_converters:
+            if conv.i_node_obj is None or conv.j_node_obj is None or conv.run_stat == 0:
+                conv.is_alive = False
+                continue
+            conv.is_alive = conv.i_node_obj.is_alive and conv.j_node_obj.is_alive
+
     def print_isl_info(self):
         for isl in self.islands:
             print(f"isl {isl.idx} is_alive = {isl.is_alive}")
@@ -791,6 +920,13 @@ class ACPowerNetwork:
             print(f"    shunt_compensators = {len(isl.shunt_compensators)}:")
             for scp in isl.shunt_compensators:
                 print(f"        {scp.idx} {scp.name} node = {scp.node} g = {scp.g_set} b = {scp.b_set}")
+
+            print(f"    acac_converters = {len(isl.acac_converters)}:")
+            for conv in isl.acac_converters:
+                print(
+                    f"        {conv.idx} {conv.name} i_node = {conv.i_node} "
+                    f"j_node = {conv.j_node} control_type = {conv.control_type}"
+                )
 
     def check_topo(self):
         """
@@ -859,6 +995,16 @@ class ACPowerNetwork:
                 continue
             check_node(scp.node, 'ShuntCompensator', scp)
 
+        for conv in self.acac_converters:
+            if conv.run_stat == 0:
+                continue
+            check_node(conv.i_node, 'ACACConverter', conv)
+            check_node(conv.j_node, 'ACACConverter', conv)
+            if conv.i_node == conv.j_node:
+                errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 两端不能连接同一个 AC 节点")
+            if str(conv.control_type).upper() not in ACAC_CONTROL_TYPES:
+                errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制模式 {conv.control_type} 不支持")
+
         # 检查节点悬空
         for node in self.nodes:
             if node.run_stat != 1:
@@ -911,6 +1057,20 @@ class ACPowerNetwork:
                 continue
             if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
                 str_info = f" 断路器 {dev.idx} {dev.name} 两端节点的电压碁值不同:{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
+                errors.append(str_info)
+
+        for dev in self.acac_converters:
+            if dev.run_stat != 1:
+                continue
+            if dev.i_node_obj is None or dev.j_node_obj is None:
+                continue
+            if dev.i_node_obj.run_stat != 1 or dev.j_node_obj.run_stat != 1:
+                continue
+            if abs(dev.i_node_obj.vbase - dev.j_node_obj.vbase) > 0.1:
+                str_info = (
+                    f" ACACConverter {dev.idx} {dev.name} 两端节点的电压碁值不同:"
+                    f"{dev.i_node_obj.vbase} {dev.j_node_obj.vbase}"
+                )
                 errors.append(str_info)
 
         # 检查每个岛屿

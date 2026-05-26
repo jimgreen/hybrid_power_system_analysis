@@ -3445,6 +3445,35 @@ class HybridStateEstimationTest(unittest.TestCase):
                     meas_file=meas_file,
                 )
 
+    def test_hybrid_observability_pseudo_candidates_carry_index_codes_for_sub_plans(self):
+        from algorithm_parameters import load_se_parameters
+        from model.meas_type import DEVICE_TYPE_ACNode, MEAS_TYPE_V
+        from secore.hybrid_se import HybridStateEstimator
+
+        params = load_se_parameters().with_overrides(targeted_pseudo_measurement_max=0)
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
+            parameters=params,
+            flat_start=True,
+        )
+
+        candidates = estimator._observability_pseudo_candidate_measurements()
+        candidate = next(
+            meas
+            for meas in candidates
+            if meas.device_type == "ACNode" and meas.meas_type == "V"
+        )
+
+        self.assertEqual(DEVICE_TYPE_ACNode, candidate.device_type_code)
+        self.assertEqual(MEAS_TYPE_V, candidate.meas_type_code)
+        self.assertGreaterEqual(candidate.device_pos, 0)
+        plan_tables = estimator._sub_measurement_plan_tables(
+            estimator._ac_sub_estimator,
+            [candidate],
+        )
+        self.assertTrue(bool(plan_tables["simple"].handled[0]))
+
     def test_pseudo_measurements_are_device_level_for_hybrid_converters(self):
         from secore.hybrid_se import HybridStateEstimator
 

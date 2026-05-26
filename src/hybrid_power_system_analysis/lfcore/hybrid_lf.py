@@ -57,8 +57,11 @@ except ImportError:  # pragma: no cover - package import path
     )
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
-from hybrid_model import ACAC_CONTROL_TYPES, HybridPowerNetwork
+from ac_model import ACAC_CONTROL_TYPES
+from hybrid_model import HybridPowerNetwork
 from ac_array_model import (
+    ACAC_COLS,
+    ACAC_CONTROL_LABEL,
     BRANCH_COLS as AC_BRANCH_COLS,
     BREAK_COLS as AC_BREAK_COLS,
     BUS_COLS as AC_BUS_COLS,
@@ -81,8 +84,6 @@ from dc_array_model import (
 )
 from efile_read import _read_efile_rows
 from hybrid_array_model import (
-    ACAC_COLS,
-    ACAC_CONTROL_LABEL,
     DCAC_COLS,
     DCAC_CONTROL_LABEL,
     DCAC_CONTROL_PARSE_CODE,
@@ -288,6 +289,34 @@ def _lightweight_ac_network(ac_ppc):
     network.zero_branches = _PpcDeviceList(network, ac_ppc, "zero_branch", "zero_branch_name", AC_ZERO_BRANCH_COLS)
     network.switches = _PpcDeviceList(network, ac_ppc, "switch", "switch_name", AC_SWITCH_COLS)
     network.breakers = _PpcDeviceList(network, ac_ppc, "break", "break_name", AC_BREAK_COLS)
+    network.acac_converters = _PpcConverterList(
+        ac_ppc,
+        "acac",
+        "acac_name",
+        ACAC_COLS,
+        ACAC_CONTROL_LABEL,
+        (
+            ("i_node", "i_node", "int"),
+            ("j_node", "j_node", "int"),
+            ("r1", "r1", "float"),
+            ("r2", "r2", "float"),
+            ("control_type", "control_type", "control"),
+            ("p_set", "p_set", "float"),
+            ("i_q_set", "i_q_set", "float"),
+            ("j_q_set", "j_q_set", "float"),
+            ("i_v_set", "i_v_set", "float"),
+            ("j_v_set", "j_v_set", "float"),
+            ("run_stat", "run_stat", "int"),
+            ("i_p", "i_p", "float"),
+            ("i_q", "i_q", "float"),
+            ("j_p", "j_p", "float"),
+            ("j_q", "j_q", "float"),
+            ("i_i", "i_i", "float"),
+            ("j_i", "j_i", "float"),
+            ("i_node_obj", "idx", "none"),
+            ("j_node_obj", "idx", "none"),
+        ),
+    )
     return network
 
 
@@ -358,10 +387,18 @@ def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightH
         ac=ac_network,
         dc=dc_network,
         dcac_converters=[],
-        acac_converters=[],
+        acac_converters=ac_network.acac_converters,
         hybrid_islands=[],
     )
-    network.ppc = {"format": "hybrid_ppc_v1", "source": str(file_name), "base": base, "ac": ac_ppc, "dc": None}
+    network.ppc = {
+        "format": "hybrid_ppc_v1",
+        "source": str(file_name),
+        "base": base,
+        "ac": ac_ppc,
+        "dc": None,
+        "acac": ac_ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)),
+        "acac_name": ac_ppc.get("acac_name", np.asarray([], dtype=object)),
+    }
     network._ac_ppc = ac_ppc
     network.p_base = float(base["p_base"])
     network.u_scale = float(base["u_scale"])

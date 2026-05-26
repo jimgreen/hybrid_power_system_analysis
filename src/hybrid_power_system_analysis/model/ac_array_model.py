@@ -170,6 +170,28 @@ SWITCH_COLS = {
     "current": 7,
 }
 BREAK_COLS = SWITCH_COLS
+ACAC_CONTROL_CODE = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
+ACAC_CONTROL_LABEL = {value: key for key, value in ACAC_CONTROL_CODE.items()}
+ACAC_COLS = {
+    "idx": 0,
+    "i_node": 1,
+    "j_node": 2,
+    "r1": 3,
+    "r2": 4,
+    "control_type": 5,
+    "p_set": 6,
+    "i_q_set": 7,
+    "j_q_set": 8,
+    "i_v_set": 9,
+    "j_v_set": 10,
+    "run_stat": 11,
+    "i_p": 12,
+    "i_q": 13,
+    "j_p": 14,
+    "j_q": 15,
+    "i_i": 16,
+    "j_i": 17,
+}
 
 _AC_PPC_CACHE = {}
 _AC_PPC_CACHE_LOCK = threading.Lock()
@@ -221,6 +243,63 @@ def _build_switch_like_from_rows(
         if "current" in columns:
             out[:, SWITCH_COLS["current"]] = _float_column(table_rows, columns, "current")
     return out, _names_from_rows(table_rows, columns, prefix, out[:, SWITCH_COLS["idx"]])
+
+
+def _build_acac_from_rows(
+    table_rows,
+    columns,
+    raw_vbase_by_idx: Dict[int, float],
+    current_scale_by_node,
+    p_base: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    out = np.zeros((len(table_rows), len(ACAC_COLS)), dtype=np.float64)
+    if not table_rows:
+        return out, np.asarray([], dtype=object)
+    out[:, ACAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
+    out[:, ACAC_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
+    out[:, ACAC_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
+    out[:, ACAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
+    out[:, ACAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
+    out[:, ACAC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", ACAC_CONTROL_CODE, "PQQ")
+    out[:, ACAC_COLS["p_set"]] = _float_column(table_rows, columns, "p_set") / p_base
+    out[:, ACAC_COLS["i_q_set"]] = _float_column(table_rows, columns, "i_q_set") / p_base
+    out[:, ACAC_COLS["j_q_set"]] = _float_column(table_rows, columns, "j_q_set") / p_base
+    out[:, ACAC_COLS["i_v_set"]] = _voltage_set_column(
+        table_rows,
+        columns,
+        "i_v_set",
+        out[:, ACAC_COLS["i_node"]],
+        raw_vbase_by_idx,
+    )
+    out[:, ACAC_COLS["j_v_set"]] = _voltage_set_column(
+        table_rows,
+        columns,
+        "j_v_set",
+        out[:, ACAC_COLS["j_node"]],
+        raw_vbase_by_idx,
+    )
+    out[:, ACAC_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+    for attr in ("i_p", "i_q", "j_p", "j_q"):
+        _assign_power_if_present(out, ACAC_COLS[attr], table_rows, columns, attr, p_base)
+    _assign_current_if_present(
+        out,
+        ACAC_COLS["i_i"],
+        table_rows,
+        columns,
+        "i_i",
+        out[:, ACAC_COLS["i_node"]],
+        current_scale_by_node,
+    )
+    _assign_current_if_present(
+        out,
+        ACAC_COLS["j_i"],
+        table_rows,
+        columns,
+        "j_i",
+        out[:, ACAC_COLS["j_node"]],
+        current_scale_by_node,
+    )
+    return out, _names_from_rows(table_rows, columns, "acac", out[:, ACAC_COLS["idx"]])
 
 
 def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
@@ -441,6 +520,15 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         p_base=p_base,
     )
 
+    acac_columns, acac_rows = _rows_for(rows, "ACACConverter")
+    acac, acac_names = _build_acac_from_rows(
+        acac_rows,
+        acac_columns,
+        raw_vbase_by_idx,
+        get_current_scale_by_node,
+        p_base,
+    )
+
     ppc = {
         "format": "ac_ppc_v1",
         "source": str(source),
@@ -460,6 +548,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "zero_branch": zero_branch,
         "switch": switch,
         "break": breaker,
+        "acac": acac,
         "bus_name": bus_names,
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
@@ -470,6 +559,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "zero_branch_cols": ZERO_BRANCH_COLS,
         "switch_cols": SWITCH_COLS,
         "break_cols": BREAK_COLS,
+        "acac_cols": ACAC_COLS,
         "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
         "branch_name": branch_names,
@@ -480,6 +570,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "zero_branch_name": zero_branch_names,
         "switch_name": switch_names,
         "break_name": breaker_names,
+        "acac_name": acac_names,
     }
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
@@ -524,6 +615,7 @@ def build_ac_ppc_from_network(network) -> Dict:
     zero_branches = list(getattr(network, "zero_branches", []))
     switches = list(getattr(network, "switches", []))
     breakers = list(getattr(network, "breakers", []))
+    acac_converters = list(getattr(network, "acac_converters", []))
 
     p_base = float(getattr(network, "p_base", 1.0))
     u_scale = float(getattr(network, "u_scale", 1.0))
@@ -630,6 +722,23 @@ def build_ac_ppc_from_network(network) -> Dict:
             _fill_float_column_if_present(out, devices, SWITCH_COLS[attr], attr)
         return out
 
+    acac = np.zeros((len(acac_converters), len(ACAC_COLS)), dtype=np.float64)
+    for row, dev in enumerate(acac_converters):
+        acac[row, ACAC_COLS["idx"]] = _int_value(dev, "idx")
+        acac[row, ACAC_COLS["i_node"]] = _int_value(dev, "i_node")
+        acac[row, ACAC_COLS["j_node"]] = _int_value(dev, "j_node")
+        acac[row, ACAC_COLS["r1"]] = _float_value(dev, "r1")
+        acac[row, ACAC_COLS["r2"]] = _float_value(dev, "r2")
+        acac[row, ACAC_COLS["control_type"]] = _code_value(_value(dev, "control_type", "PQQ"), ACAC_CONTROL_CODE, "PQQ")
+        acac[row, ACAC_COLS["p_set"]] = _float_value(dev, "p_set")
+        acac[row, ACAC_COLS["i_q_set"]] = _float_value(dev, "i_q_set")
+        acac[row, ACAC_COLS["j_q_set"]] = _float_value(dev, "j_q_set")
+        acac[row, ACAC_COLS["i_v_set"]] = _float_value(dev, "i_v_set")
+        acac[row, ACAC_COLS["j_v_set"]] = _float_value(dev, "j_v_set")
+        acac[row, ACAC_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+    for attr in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i"):
+        _fill_float_column_if_present(acac, acac_converters, ACAC_COLS[attr], attr)
+
     ppc = {
         "format": "ac_ppc_v1",
         "source": str(getattr(network, "source", getattr(network, "file_name", "<network>"))),
@@ -649,6 +758,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         "zero_branch": zero_branch,
         "switch": build_switch_like(switches),
         "break": build_switch_like(breakers),
+        "acac": acac,
         "bus_name": bus_names,
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
@@ -659,6 +769,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         "zero_branch_cols": ZERO_BRANCH_COLS,
         "switch_cols": SWITCH_COLS,
         "break_cols": BREAK_COLS,
+        "acac_cols": ACAC_COLS,
         "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
     }
@@ -671,6 +782,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         zero_branch_name=_name_array(zero_branches, "zero_branch"),
         switch_name=_name_array(switches, "switch"),
         break_name=_name_array(breakers, "break"),
+        acac_name=_name_array(acac_converters, "acac"),
     )
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
@@ -702,6 +814,7 @@ def build_ac_network_from_ppc(ppc: Dict):
     from ac_model import (
         ACBreak,
         ACBranch,
+        ACACConverter,
         ACGenerator,
         ACLoad,
         ACNode,
@@ -723,6 +836,8 @@ def build_ac_network_from_ppc(ppc: Dict):
     zero_branch_names = _list_ppc_names(ppc, "zero_branch_name", "zero_branch", ppc["zero_branch"].shape[0])
     switch_names = _list_ppc_names(ppc, "switch_name", "switch", ppc["switch"].shape[0])
     break_names = _list_ppc_names(ppc, "break_name", "break", ppc.get("break", _empty(len(BREAK_COLS))).shape[0])
+    acac_table = ppc.get("acac", _empty(len(ACAC_COLS)))
+    acac_names = _list_ppc_names(ppc, "acac_name", "acac", acac_table.shape[0])
 
     network = ACPowerNetwork()
     base = ppc["base"]
@@ -755,6 +870,7 @@ def build_ac_network_from_ppc(ppc: Dict):
         node.zero_branches = []
         node.transformers = []
         node.shunt_compensators = []
+        node.acac_converters = []
 
     network.branches = [
         ACBranch(
@@ -856,6 +972,23 @@ def build_ac_network_from_ppc(ppc: Dict):
         )
         for row in ppc.get("break", _empty(len(BREAK_COLS)))
     ]
+    network.acac_converters = [
+        ACACConverter(
+            int(row[ACAC_COLS["idx"]]),
+            int(row[ACAC_COLS["i_node"]]),
+            int(row[ACAC_COLS["j_node"]]),
+            float(row[ACAC_COLS["r1"]]),
+            float(row[ACAC_COLS["r2"]]),
+            ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
+            float(row[ACAC_COLS["p_set"]]),
+            float(row[ACAC_COLS["i_q_set"]]),
+            float(row[ACAC_COLS["j_q_set"]]),
+            float(row[ACAC_COLS["i_v_set"]]),
+            float(row[ACAC_COLS["j_v_set"]]),
+            int(row[ACAC_COLS["run_stat"]]),
+        )
+        for row in acac_table
+    ]
     network.node_dict = {}
     network.switch_dict = {}
     network.break_dict = {}
@@ -865,6 +998,7 @@ def build_ac_network_from_ppc(ppc: Dict):
     network.branch_dict = {}
     network.transformer_dict = {}
     network.shunt_compensator_dict = {}
+    network.acac_converter_dict = {}
     network.islands = []
     for obj, name in zip(network.nodes, bus_names):
         obj.name = name
@@ -922,6 +1056,15 @@ def build_ac_network_from_ppc(ppc: Dict):
         obj.p = float(row[BREAK_COLS["p"]])
         obj.q = float(row[BREAK_COLS["q"]])
         obj.current = float(row[BREAK_COLS["current"]])
+        obj.is_alive = False
+    for obj, row, name in zip(network.acac_converters, acac_table, acac_names):
+        obj.name = name
+        obj.i_p = float(row[ACAC_COLS["i_p"]])
+        obj.i_q = float(row[ACAC_COLS["i_q"]])
+        obj.j_p = float(row[ACAC_COLS["j_p"]])
+        obj.j_q = float(row[ACAC_COLS["j_q"]])
+        obj.i_i = float(row[ACAC_COLS["i_i"]])
+        obj.j_i = float(row[ACAC_COLS["j_i"]])
         obj.is_alive = False
     return network
 

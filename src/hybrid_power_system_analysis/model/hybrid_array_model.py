@@ -11,6 +11,8 @@ for path in (MODEL_DIR, ROOT_DIR):
         sys.path.insert(0, str(path))
 
 from ac_array_model import (
+    ACAC_COLS,
+    ACAC_CONTROL_LABEL,
     BUS_COLS as AC_BUS_COLS,
     _build_ac_ppc_from_model,
     build_ac_network_from_ppc as _build_ac_network_from_ppc,
@@ -22,7 +24,7 @@ from dc_array_model import (
     build_dc_network_from_ppc as _build_dc_network_from_ppc,
     build_dc_ppc_from_efile_rows,
 )
-from efile_read import _read_efile_rows
+from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
 from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
@@ -35,8 +37,6 @@ DCAC_CONTROL_PARSE_CODE = {
     "PQ": DCAC_CONTROL_CODE["ACP"],
 }
 DCAC_CONTROL_LABEL = {value: key for key, value in DCAC_CONTROL_CODE.items()}
-ACAC_CONTROL_CODE = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
-ACAC_CONTROL_LABEL = {value: key for key, value in ACAC_CONTROL_CODE.items()}
 
 DCAC_COLS = {
     "idx": 0,
@@ -56,27 +56,6 @@ DCAC_COLS = {
     "dc_i": 14,
     "ac_i": 15,
 }
-ACAC_COLS = {
-    "idx": 0,
-    "i_node": 1,
-    "j_node": 2,
-    "r1": 3,
-    "r2": 4,
-    "control_type": 5,
-    "p_set": 6,
-    "i_q_set": 7,
-    "j_q_set": 8,
-    "i_v_set": 9,
-    "j_v_set": 10,
-    "run_stat": 11,
-    "i_p": 12,
-    "i_q": 13,
-    "j_p": 14,
-    "j_q": 15,
-    "i_i": 16,
-    "j_i": 17,
-}
-
 def _attr(obj, attr: str, default=""):
     value = getattr(obj, attr, default)
     return default if value in (None, "") else value
@@ -290,42 +269,13 @@ def _build_dcac(model) -> Tuple[np.ndarray, np.ndarray]:
     return out, names
 
 
-def _build_acac(model) -> Tuple[np.ndarray, np.ndarray]:
-    converters = list(getattr(model, "ACACConverter", []))
-    if not converters:
-        return _empty(len(ACAC_COLS)), np.asarray([], dtype=object)
-    out = np.zeros((len(converters), len(ACAC_COLS)), dtype=np.float64)
-    names = _names(converters, len(converters), "acac")
-    for pos, conv in enumerate(converters):
-        out[pos, ACAC_COLS["idx"]] = _int_attr(conv, "idx", pos)
-        out[pos, ACAC_COLS["i_node"]] = _int_attr(conv, "i_node")
-        out[pos, ACAC_COLS["j_node"]] = _int_attr(conv, "j_node")
-        out[pos, ACAC_COLS["r1"]] = _float_attr(conv, "r1")
-        out[pos, ACAC_COLS["r2"]] = _float_attr(conv, "r2")
-        out[pos, ACAC_COLS["control_type"]] = ACAC_CONTROL_CODE.get(
-            str(_attr(conv, "control_type", "PQQ")).upper(),
-            0,
-        )
-        out[pos, ACAC_COLS["p_set"]] = _float_attr(conv, "p_set")
-        out[pos, ACAC_COLS["i_q_set"]] = _float_attr(conv, "i_q_set")
-        out[pos, ACAC_COLS["j_q_set"]] = _float_attr(conv, "j_q_set")
-        out[pos, ACAC_COLS["i_v_set"]] = _float_attr(conv, "i_v_set")
-        out[pos, ACAC_COLS["j_v_set"]] = _float_attr(conv, "j_v_set")
-        out[pos, ACAC_COLS["run_stat"]] = _float_attr(conv, "run_stat", 1.0)
-        out[pos, ACAC_COLS["i_p"]] = _float_attr(conv, "i_p")
-        out[pos, ACAC_COLS["i_q"]] = _float_attr(conv, "i_q")
-        out[pos, ACAC_COLS["j_p"]] = _float_attr(conv, "j_p")
-        out[pos, ACAC_COLS["j_q"]] = _float_attr(conv, "j_q")
-        out[pos, ACAC_COLS["i_i"]] = _float_attr(conv, "i_i")
-        out[pos, ACAC_COLS["j_i"]] = _float_attr(conv, "j_i")
-    return out, names
-
-
 def _converter_classes():
     if __package__ == "model":
-        from model.hybrid_model import ACACConverter, DCACConverter
+        from model.ac_model import ACACConverter
+        from model.hybrid_model import DCACConverter
     else:
-        from hybrid_model import ACACConverter, DCACConverter
+        from ac_model import ACACConverter
+        from hybrid_model import DCACConverter
 
     return DCACConverter, ACACConverter
 
@@ -391,78 +341,6 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         obj.ac_q = ac_q
         obj.dc_i = dc_i
         obj.ac_i = ac_i
-        obj.is_alive = False
-        objects.append(obj)
-    return out, names, objects
-
-
-def _build_acac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
-    converters = list(getattr(model, "ACACConverter", []))
-    if not converters:
-        return _empty(len(ACAC_COLS)), np.asarray([], dtype=object), []
-    _DCACConverter, ACACConverter = _converter_classes()
-    out = np.zeros((len(converters), len(ACAC_COLS)), dtype=np.float64)
-    names = _names(converters, len(converters), "acac")
-    objects = []
-    for pos, conv in enumerate(converters):
-        idx = _int_attr(conv, "idx", pos)
-        i_node = _int_attr(conv, "i_node")
-        j_node = _int_attr(conv, "j_node")
-        r1 = _float_attr(conv, "r1")
-        r2 = _float_attr(conv, "r2")
-        control_type = str(_attr(conv, "control_type", "PQQ")).upper()
-        control_code = ACAC_CONTROL_CODE.get(control_type, 0)
-        p_set = _float_attr(conv, "p_set")
-        i_q_set = _float_attr(conv, "i_q_set")
-        j_q_set = _float_attr(conv, "j_q_set")
-        i_v_set = _float_attr(conv, "i_v_set")
-        j_v_set = _float_attr(conv, "j_v_set")
-        run_stat = _int_attr(conv, "run_stat", 1)
-        i_p = _float_attr(conv, "i_p")
-        i_q = _float_attr(conv, "i_q")
-        j_p = _float_attr(conv, "j_p")
-        j_q = _float_attr(conv, "j_q")
-        i_i = _float_attr(conv, "i_i")
-        j_i = _float_attr(conv, "j_i")
-        out[pos, ACAC_COLS["idx"]] = idx
-        out[pos, ACAC_COLS["i_node"]] = i_node
-        out[pos, ACAC_COLS["j_node"]] = j_node
-        out[pos, ACAC_COLS["r1"]] = r1
-        out[pos, ACAC_COLS["r2"]] = r2
-        out[pos, ACAC_COLS["control_type"]] = control_code
-        out[pos, ACAC_COLS["p_set"]] = p_set
-        out[pos, ACAC_COLS["i_q_set"]] = i_q_set
-        out[pos, ACAC_COLS["j_q_set"]] = j_q_set
-        out[pos, ACAC_COLS["i_v_set"]] = i_v_set
-        out[pos, ACAC_COLS["j_v_set"]] = j_v_set
-        out[pos, ACAC_COLS["run_stat"]] = run_stat
-        out[pos, ACAC_COLS["i_p"]] = i_p
-        out[pos, ACAC_COLS["i_q"]] = i_q
-        out[pos, ACAC_COLS["j_p"]] = j_p
-        out[pos, ACAC_COLS["j_q"]] = j_q
-        out[pos, ACAC_COLS["i_i"]] = i_i
-        out[pos, ACAC_COLS["j_i"]] = j_i
-        obj = ACACConverter(
-            idx,
-            i_node,
-            j_node,
-            r1,
-            r2,
-            ACAC_CONTROL_LABEL.get(control_code, "PQQ"),
-            p_set,
-            i_q_set,
-            j_q_set,
-            i_v_set,
-            j_v_set,
-            run_stat,
-        )
-        obj.name = str(names[pos])
-        obj.i_p = i_p
-        obj.i_q = i_q
-        obj.j_p = j_p
-        obj.j_q = j_q
-        obj.i_i = i_i
-        obj.j_i = j_i
         obj.is_alive = False
         objects.append(obj)
     return out, names, objects
@@ -562,94 +440,6 @@ def _build_dcac_from_rows(
     return out, names, objects
 
 
-def _build_acac_from_rows(
-    rows: Dict,
-    ac_ppc: Dict,
-    dc_ppc: Dict,
-    *,
-    build_objects: bool = True,
-    vbase_maps: Optional[Tuple[Dict[int, float], Dict[int, float], Dict[int, float], Dict[int, float]]] = None,
-) -> Tuple[np.ndarray, np.ndarray, list]:
-    columns, table_rows = _rows_for(rows, "ACACConverter")
-    if not table_rows:
-        return _empty(len(ACAC_COLS)), np.asarray([], dtype=object), []
-    p_base = float(ac_ppc["base"]["p_base"])
-    ac_raw_vbase, _dc_raw_vbase, ac_current, _dc_current = (
-        _raw_vbase_maps(ac_ppc, dc_ppc) if vbase_maps is None else vbase_maps
-    )
-    out = np.zeros((len(table_rows), len(ACAC_COLS)), dtype=np.float64)
-    out[:, ACAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
-    out[:, ACAC_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
-    out[:, ACAC_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
-    out[:, ACAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
-    out[:, ACAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-    out[:, ACAC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", ACAC_CONTROL_CODE, "PQQ")
-    out[:, ACAC_COLS["p_set"]] = _power_column(table_rows, columns, "p_set", p_base)
-    out[:, ACAC_COLS["i_q_set"]] = _power_column(table_rows, columns, "i_q_set", p_base)
-    out[:, ACAC_COLS["j_q_set"]] = _power_column(table_rows, columns, "j_q_set", p_base)
-    out[:, ACAC_COLS["i_v_set"]] = _voltage_set_column(
-        table_rows,
-        columns,
-        "i_v_set",
-        out[:, ACAC_COLS["i_node"]],
-        ac_raw_vbase,
-        default=0.0,
-    )
-    out[:, ACAC_COLS["j_v_set"]] = _voltage_set_column(
-        table_rows,
-        columns,
-        "j_v_set",
-        out[:, ACAC_COLS["j_node"]],
-        ac_raw_vbase,
-        default=0.0,
-    )
-    out[:, ACAC_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
-    if "i_p" in columns:
-        out[:, ACAC_COLS["i_p"]] = _power_column(table_rows, columns, "i_p", p_base)
-    if "i_q" in columns:
-        out[:, ACAC_COLS["i_q"]] = _power_column(table_rows, columns, "i_q", p_base)
-    if "j_p" in columns:
-        out[:, ACAC_COLS["j_p"]] = _power_column(table_rows, columns, "j_p", p_base)
-    if "j_q" in columns:
-        out[:, ACAC_COLS["j_q"]] = _power_column(table_rows, columns, "j_q", p_base)
-    if "i_i" in columns:
-        out[:, ACAC_COLS["i_i"]] = _current_column(table_rows, columns, "i_i", out[:, ACAC_COLS["i_node"]], ac_current)
-    if "j_i" in columns:
-        out[:, ACAC_COLS["j_i"]] = _current_column(table_rows, columns, "j_i", out[:, ACAC_COLS["j_node"]], ac_current)
-
-    names = _names_from_rows(table_rows, columns, "acac", out[:, ACAC_COLS["idx"]])
-    if not build_objects:
-        return out, names, []
-    _DCACConverter, ACACConverter = _converter_classes()
-    objects = []
-    for pos, row in enumerate(out):
-        control_code = int(row[ACAC_COLS["control_type"]])
-        obj = ACACConverter(
-            int(row[ACAC_COLS["idx"]]),
-            int(row[ACAC_COLS["i_node"]]),
-            int(row[ACAC_COLS["j_node"]]),
-            float(row[ACAC_COLS["r1"]]),
-            float(row[ACAC_COLS["r2"]]),
-            ACAC_CONTROL_LABEL.get(control_code, "PQQ"),
-            float(row[ACAC_COLS["p_set"]]),
-            float(row[ACAC_COLS["i_q_set"]]),
-            float(row[ACAC_COLS["j_q_set"]]),
-            float(row[ACAC_COLS["i_v_set"]]),
-            float(row[ACAC_COLS["j_v_set"]]),
-            int(row[ACAC_COLS["run_stat"]]),
-        )
-        obj.name = str(names[pos])
-        obj.i_p = float(row[ACAC_COLS["i_p"]])
-        obj.i_q = float(row[ACAC_COLS["i_q"]])
-        obj.j_p = float(row[ACAC_COLS["j_p"]])
-        obj.j_q = float(row[ACAC_COLS["j_q"]])
-        obj.i_i = float(row[ACAC_COLS["i_i"]])
-        obj.j_i = float(row[ACAC_COLS["j_i"]])
-        obj.is_alive = False
-        objects.append(obj)
-    return out, names, objects
-
-
 def build_hybrid_ppc_from_e_file(file_path):
     rows = _read_efile_rows(file_path)
     return build_hybrid_ppc_from_efile_rows(file_path, rows)
@@ -664,9 +454,8 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
     dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(
         rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
     )
-    acac, acac_name, _acac_objects = _build_acac_from_rows(
-        rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
-    )
+    acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
+    acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
     return {
         "format": "hybrid_ppc_v1",
         "source": str(file_path),
@@ -693,7 +482,9 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
     dc_network.ppc = dc_ppc
     vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
     dcac, dcac_name, dcac_objects = _build_dcac_from_rows(rows, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
-    acac, acac_name, acac_objects = _build_acac_from_rows(rows, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
+    acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
+    acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
+    acac_objects = list(getattr(ac_network, "acac_converters", []))
     ppc = {
         "format": "hybrid_ppc_v1",
         "source": str(file_path),
@@ -723,7 +514,9 @@ def build_hybrid_ppc_from_model(file_path, model):
     dc_network, dc_ppc = _build_dc_ppc_from_model(model, units_already_normalized=True)
     dc_network.ppc = dc_ppc
     dcac, dcac_name, dcac_objects = _build_dcac_with_objects(model)
-    acac, acac_name, acac_objects = _build_acac_with_objects(model)
+    acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
+    acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
+    acac_objects = list(getattr(ac_network, "acac_converters", []))
     ppc = {
         "format": "hybrid_ppc_v1",
         "source": str(file_path),
@@ -748,9 +541,11 @@ def build_hybrid_ppc_from_model(file_path, model):
 
 def build_hybrid_model_from_ppc(ppc: Dict):
     if __package__ == "model":
-        from model.hybrid_model import ACACConverter, DCACConverter, HybridPowerNetwork
+        from model.ac_model import ACACConverter
+        from model.hybrid_model import DCACConverter, HybridPowerNetwork
     else:
-        from hybrid_model import ACACConverter, DCACConverter, HybridPowerNetwork
+        from ac_model import ACACConverter
+        from hybrid_model import DCACConverter, HybridPowerNetwork
 
     ac_network = ppc["ac_network"]
     dc_network = ppc["dc_network"]
@@ -811,6 +606,7 @@ def build_hybrid_model_from_ppc(ppc: Dict):
             conv.j_i = float(row[ACAC_COLS["j_i"]])
             conv.is_alive = False
 
+    ac_network.acac_converters = acac
     model = HybridPowerNetwork(ac=ac_network, dc=dc_network, dcac_converters=dcac, acac_converters=acac)
     base = ppc["base"]
     model.p_base = float(base["p_base"])

@@ -8,13 +8,9 @@ for path in (MODEL_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_model import ACPowerNetwork
+from ac_model import ACACConverter, ACAC_CONTROL_TYPES, ACPowerNetwork
 from dc_model import DCPowerNetwork
 from hybrid_array_model import DCAC_CONTROL_PARSE_CODE, build_hybrid_ppc_from_e_file
-
-
-ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
-
 
 class DCACConverter:
     def __init__(
@@ -49,45 +45,6 @@ class DCACConverter:
         self.ac_i = None
         self.ac_node_obj = None
         self.dc_node_obj = None
-
-
-class ACACConverter:
-    def __init__(
-        self,
-        idx,
-        i_node,
-        j_node,
-        r1,
-        r2,
-        control_type,
-        p_set,
-        i_q_set,
-        j_q_set,
-        i_v_set,
-        j_v_set,
-        run_stat=1,
-    ):
-        self.idx = idx
-        self.i_node = i_node
-        self.j_node = j_node
-        self.r1 = r1
-        self.r2 = r2
-        self.control_type = control_type
-        self.p_set = p_set
-        self.i_q_set = i_q_set
-        self.j_q_set = j_q_set
-        self.i_v_set = i_v_set
-        self.j_v_set = j_v_set
-        self.run_stat = run_stat
-        self.i_p = None
-        self.i_q = None
-        self.j_p = None
-        self.j_q = None
-        self.i_i = None
-        self.j_i = None
-        self.i_node_obj = None
-        self.j_node_obj = None
-
 
 class HybridIsland:
     def __init__(self, idx: int):
@@ -138,6 +95,9 @@ class HybridPowerNetwork:
     dcac_converters: List
     acac_converters: List
     hybrid_islands: List[HybridIsland] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.ac.acac_converters = self.acac_converters
 
     @classmethod
     def read_from_file(cls, file_name) -> "HybridPowerNetwork":
