@@ -1,5 +1,6 @@
 import importlib
 
+import numpy as np
 from scipy.sparse.linalg import splu, spsolve
 
 
@@ -83,6 +84,44 @@ class CallableFactor:
 
     def solve(self, rhs):
         return self._fn(self._matrix, rhs)
+
+
+class ReusableUmfpackFactor:
+    """Reuse UMFPACK symbolic analysis when repeated matrices share a pattern."""
+
+    __slots__ = ("_ctx", "_matrix", "_umfpack")
+
+    def __init__(self, matrix):
+        self._umfpack = importlib.import_module("scikits.umfpack")
+        matrix = as_solver_csc(matrix)
+        family = self._family_for_matrix(matrix)
+        self._ctx = self._umfpack.UmfpackContext(family)
+        self._matrix = None
+        self._ctx.symbolic(matrix)
+
+    @staticmethod
+    def _family_for_matrix(matrix):
+        real = not np.iscomplexobj(matrix.data)
+        int32_index = matrix.indices.dtype == np.int32 and matrix.indptr.dtype == np.int32
+        if real:
+            return "di" if int32_index else "dl"
+        return "zi" if int32_index else "zl"
+
+    def factor(self, matrix):
+        matrix = as_solver_csc(matrix)
+        self._ctx.numeric(matrix)
+        self._matrix = matrix
+        return self
+
+    def solve(self, rhs):
+        return self._ctx.solve(self._umfpack.UMFPACK_A, self._matrix, rhs, autoTranspose=True)
+
+
+def make_reusable_factorizer(matrix, resolved_name):
+    """Return a reusable factorizer for solvers that support fixed-pattern reuse."""
+    if resolved_name != "umfpack":
+        return None
+    return ReusableUmfpackFactor(matrix)
 
 
 def get_pyklu_cls():

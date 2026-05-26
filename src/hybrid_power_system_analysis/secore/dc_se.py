@@ -37,6 +37,7 @@ from model.dc_array_model import (
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 from model.meas_array_model import (
     MEAS_COLS,
+    attach_device_pos_from_name_arrays,
     build_meas_ppc_from_e_file,
     copy_meas_ppc,
     measurement_table_from_meas_ppc,
@@ -49,6 +50,7 @@ from model.meas_type import (
     DEVICE_TYPE_DCGenerator,
     DEVICE_TYPE_DCLoad,
     DEVICE_TYPE_DCNode,
+    DEVICE_TYPE_DCSwitch,
     DEVICE_TYPE_DCSwitchConstraint,
     DEVICE_TYPE_DCZeroBranch,
     DEVICE_TYPE_DCZeroBranchConstraint,
@@ -697,6 +699,9 @@ class DCStateEstimator:
         stage_start = time.perf_counter()
         self._build_array_device_context()
         self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
+        self._attach_meas_ppc_device_pos()
+        self._record_profile_time("init.measurement_device_pos", time.perf_counter() - stage_start)
         self._defer_prepare_finalize_pending = bool(defer_prepare_finalize)
         if defer_prepare_finalize:
             self.power_flow_seed_converged = False
@@ -2030,17 +2035,6 @@ class DCStateEstimator:
         cache_key = self._measurement_plan_lookup_cache_signature()
         if getattr(self, "_measurement_plan_lookup_cache_key", None) == cache_key:
             return
-        self._measurement_plan_device_pos_by_type_code = {}
-        self._measurement_plan_meas_kind_by_type_code = {}
-        table = getattr(getattr(self, "measurements", None), "table", None)
-        if table is not None and getattr(table, "device_type_code", None) is not None:
-            rows_by_code = getattr(table, "rows_by_device_type_code", None)
-            if isinstance(rows_by_code, dict) and rows_by_code:
-                present_device_codes = {int(code) for code in rows_by_code.keys()}
-            else:
-                present_device_codes = set(np.unique(np.asarray(table.device_type_code, dtype=np.int16)).astype(object, copy=False))
-        else:
-            present_device_codes = None
         meas_kind_source = {
             DEVICE_TYPE_DCNode: _DC_NODE_MEAS_TYPE_CODES,
             DEVICE_TYPE_DCBranch: _DC_TERMINAL_MEAS_TYPE_CODES,
@@ -2052,9 +2046,6 @@ class DCStateEstimator:
             DEVICE_TYPE_DCBreakConstraint: _DC_CONSTRAINT_MEAS_TYPE_CODES,
             DEVICE_TYPE_DCDCConverter: _DC_TERMINAL_MEAS_TYPE_CODES,
         }
-        self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays(
-            present_device_codes,
-        )
         self._measurement_plan_meas_kind_code_by_type_code = {
             int(code): _measurement_type_code_lookup(kind_map)
             for code, kind_map in meas_kind_source.items()
@@ -2062,116 +2053,40 @@ class DCStateEstimator:
         self._measurement_plan_lookup_cache_key = cache_key
 
     def _measurement_plan_lookup_cache_signature(self) -> Tuple[object, ...]:
-        meas_ppc = getattr(self, "meas_ppc", None)
-        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object) if isinstance(meas_ppc, dict) else np.asarray([], dtype=object)
-        return (
-            id(meas_ppc),
-            id(device_names),
-            int(device_names.size),
-            id(getattr(self, "_raw_node_names_alive", None)),
-            int(getattr(self, "_raw_node_names_alive", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_branch_names", None)),
-            int(getattr(self, "_branch_names", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_load_names", None)),
-            int(getattr(self, "_load_names", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_generator_names", None)),
-            int(getattr(self, "_generator_names", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_zero_branch_names", None)),
-            int(getattr(self, "_zero_branch_names", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_switch_names", None)),
-            int(getattr(self, "_switch_names", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_break_names", None)),
-            int(getattr(self, "_break_names", np.asarray([], dtype=object)).size),
-            id(getattr(self, "_dcdc_names", None)),
-            int(getattr(self, "_dcdc_names", np.asarray([], dtype=object)).size),
-        )
+        return ("dc_numeric_measurement_plan",)
 
     def _ensure_measurement_plan_lookup_arrays(self) -> None:
-        if not hasattr(self, "_measurement_plan_device_pos_by_type_code"):
+        if not hasattr(self, "_measurement_plan_meas_kind_code_by_type_code"):
             self._build_measurement_plan_lookup_arrays()
 
-    def _measurement_plan_device_id_lookup_arrays(self, include_codes: Optional[set] = None) -> Dict[int, np.ndarray]:
+    def _attach_meas_ppc_device_pos(self) -> None:
         meas_ppc = getattr(self, "meas_ppc", None)
         if not isinstance(meas_ppc, dict):
-            return {}
-        device_names = self._meas_ppc_device_names()
-        if device_names.size == 0:
-            return {}
-        device_name_id_array = meas_ppc.get("device_name_id_array")
-        if isinstance(device_name_id_array, np.ndarray):
-            device_name_id_array = np.asarray(device_name_id_array, dtype=np.int64)
-        else:
-            device_name_id_array = np.asarray([], dtype=np.int64)
-        rows_by_code = meas_ppc.get("rows_by_device_type_code")
-        rows_by_code = rows_by_code if isinstance(rows_by_code, dict) else {}
-
-        def lookup_from_ids(name_ids: np.ndarray) -> np.ndarray:
-            name_ids = np.asarray(name_ids, dtype=np.int64)
-            if name_ids.size == 0:
-                return np.asarray([], dtype=np.int64)
-            lookup = np.empty(int(name_ids.max()) + 1, dtype=np.int64)
-            lookup.fill(-1)
-            lookup[name_ids.astype(np.intp, copy=False)] = np.arange(name_ids.size, dtype=np.int64)
-            return lookup
-
-        def lookup_for(device_type_code: int, names: np.ndarray) -> np.ndarray:
-            row_names = np.asarray(names, dtype=object)
-            if row_names.size == 0:
-                return np.asarray([], dtype=np.int64)
-            if device_name_id_array.size:
-                rows = rows_by_code.get(int(device_type_code))
-                rows = np.asarray(rows, dtype=np.int64) if rows is not None else np.asarray([], dtype=np.int64)
-                if rows.size:
-                    row_ids = device_name_id_array[rows.astype(np.intp, copy=False)]
-                    row_ids = row_ids[row_ids >= 0]
-                    if row_ids.size:
-                        first_mask = np.empty(row_ids.size, dtype=bool)
-                        first_mask[0] = True
-                        first_mask[1:] = row_ids[1:] != row_ids[:-1]
-                        ordered_ids = row_ids[first_mask]
-                        if ordered_ids.size == row_names.size:
-                            valid_ids = (ordered_ids >= 0) & (ordered_ids < device_names.size)
-                            if np.all(valid_ids) and np.array_equal(
-                                device_names[ordered_ids.astype(np.intp, copy=False)],
-                                row_names,
-                            ):
-                                return lookup_from_ids(ordered_ids)
-            name_ids = self._meas_device_name_ids_for_ppc_names(meas_ppc, row_names)
-            valid = name_ids >= 0
-            if not np.any(valid):
-                return np.asarray([], dtype=np.int64)
-            plan_pos = np.arange(row_names.size, dtype=np.int64)
-            lookup = np.empty(int(name_ids[valid].max()) + 1, dtype=np.int64)
-            lookup.fill(-1)
-            lookup[name_ids[valid].astype(np.intp, copy=False)] = plan_pos[valid]
-            return lookup
-
-        def need(code: int) -> bool:
-            return include_codes is None or int(code) in include_codes
-
-        constraint_names = np.concatenate((self._zero_branch_names, self._switch_names, self._break_names))
-        result: Dict[int, np.ndarray] = {}
-        if need(DEVICE_TYPE_DCNode):
-            result[DEVICE_TYPE_DCNode] = lookup_for(DEVICE_TYPE_DCNode, self._raw_node_names_alive)
-        if need(DEVICE_TYPE_DCBranch):
-            result[DEVICE_TYPE_DCBranch] = lookup_for(DEVICE_TYPE_DCBranch, self._branch_names)
-        if need(DEVICE_TYPE_DCLoad):
-            result[DEVICE_TYPE_DCLoad] = lookup_for(DEVICE_TYPE_DCLoad, self._load_names)
-        if need(DEVICE_TYPE_DCGenerator):
-            result[DEVICE_TYPE_DCGenerator] = lookup_for(DEVICE_TYPE_DCGenerator, self._generator_names)
-        if need(DEVICE_TYPE_DCZeroBranch):
-            result[DEVICE_TYPE_DCZeroBranch] = lookup_for(DEVICE_TYPE_DCZeroBranch, self._zero_branch_names)
-        if need(DEVICE_TYPE_DCBreak):
-            result[DEVICE_TYPE_DCBreak] = lookup_for(DEVICE_TYPE_DCBreak, self._break_names)
-        if need(DEVICE_TYPE_DCZeroBranchConstraint):
-            result[DEVICE_TYPE_DCZeroBranchConstraint] = lookup_for(DEVICE_TYPE_DCZeroBranchConstraint, constraint_names)
-        if need(DEVICE_TYPE_DCBreakConstraint):
-            result[DEVICE_TYPE_DCBreakConstraint] = lookup_for(DEVICE_TYPE_DCBreakConstraint, constraint_names)
-        if need(DEVICE_TYPE_DCSwitchConstraint):
-            result[DEVICE_TYPE_DCSwitchConstraint] = lookup_for(DEVICE_TYPE_DCSwitchConstraint, constraint_names)
-        if need(DEVICE_TYPE_DCDCConverter):
-            result[DEVICE_TYPE_DCDCConverter] = lookup_for(DEVICE_TYPE_DCDCConverter, self._dcdc_names)
-        return result
+            return
+        constraint_names = np.concatenate(
+            (
+                np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
+                np.asarray(getattr(self, "_switch_names", ()), dtype=object),
+                np.asarray(getattr(self, "_break_names", ()), dtype=object),
+            )
+        )
+        name_arrays_by_code = {
+            DEVICE_TYPE_DCNode: np.asarray(getattr(self, "_raw_node_names_alive", ()), dtype=object),
+            DEVICE_TYPE_DCBranch: np.asarray(getattr(self, "_branch_names", ()), dtype=object),
+            DEVICE_TYPE_DCSwitch: np.asarray(getattr(self, "_switch_names", ()), dtype=object),
+            DEVICE_TYPE_DCBreak: np.asarray(getattr(self, "_break_names", ()), dtype=object),
+            DEVICE_TYPE_DCZeroBranch: np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
+            DEVICE_TYPE_DCGenerator: np.asarray(getattr(self, "_generator_names", ()), dtype=object),
+            DEVICE_TYPE_DCLoad: np.asarray(getattr(self, "_load_names", ()), dtype=object),
+            DEVICE_TYPE_DCDCConverter: np.asarray(getattr(self, "_dcdc_names", ()), dtype=object),
+            DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
+            DEVICE_TYPE_DCBreakConstraint: constraint_names,
+            DEVICE_TYPE_DCSwitchConstraint: constraint_names,
+        }
+        device_pos = attach_device_pos_from_name_arrays(meas_ppc, name_arrays_by_code)
+        table = getattr(getattr(self, "measurements", None), "table", None)
+        if table is not None and int(getattr(table, "idx", np.asarray([])).size) == int(device_pos.size):
+            table.device_pos = device_pos
 
     def _measurement_device_pos_array(
         self,
@@ -2183,37 +2098,18 @@ class DCStateEstimator:
         if precomputed is not None and np.asarray(precomputed).size == n_rows:
             device_pos = np.asarray(precomputed, dtype=np.int64).copy()
         else:
-            device_pos = np.empty(n_rows, dtype=np.int64)
-            device_pos.fill(-1)
+            meas_ppc = getattr(self, "meas_ppc", None)
+            ppc_device_pos = meas_ppc.get("device_pos") if isinstance(meas_ppc, dict) else None
+            if isinstance(ppc_device_pos, np.ndarray) and int(ppc_device_pos.size) == n_rows:
+                device_pos = np.asarray(ppc_device_pos, dtype=np.int64).copy()
+            else:
+                device_pos = np.empty(n_rows, dtype=np.int64)
+                device_pos.fill(-1)
         if n_rows == 0 or np.all(device_pos >= 0):
             return device_pos
-        self._ensure_measurement_plan_lookup_arrays()
-        device_name_id = getattr(table, "device_name_id", None)
-        if device_name_id is not None:
-            device_name_id = np.asarray(device_name_id, dtype=np.int64)
-            if device_name_id.size != n_rows:
-                device_name_id = None
-        id_maps = (
-            device_pos_by_type_code
-            if device_pos_by_type_code is not None
-            else getattr(self, "_measurement_plan_device_pos_by_type_code_id", {})
-        )
-        if device_name_id is not None and id_maps:
-            for code_int, code_rows in rows_by_device_type_code(table).items():
-                rows = np.asarray(code_rows, dtype=np.int64)
-                rows = rows[device_pos[rows] < 0]
-                if rows.size == 0:
-                    continue
-                lookup = id_maps.get(int(code_int))
-                if lookup is None or lookup.size == 0:
-                    continue
-                ids = device_name_id[rows]
-                valid = (ids >= 0) & (ids < lookup.size)
-                if np.any(valid):
-                    device_pos[rows[valid]] = lookup[ids[valid].astype(np.intp, copy=False)]
         if np.any(device_pos < 0):
             warnings.warn(
-                "DC SE measurement device_pos contains unresolved rows; string fallback is disabled.",
+                "DC SE measurement device_pos contains unresolved rows; name-id/string fallback is disabled.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -2578,42 +2474,6 @@ class DCStateEstimator:
                 "value": np.empty(0, dtype=np.float64),
             }
         setattr(self.network, "_se_power_flow_seed_rows", seed_rows)
-
-    def _meas_ppc_device_names(self) -> np.ndarray:
-        meas_ppc = getattr(self, "meas_ppc", None)
-        if isinstance(meas_ppc, dict):
-            return np.asarray(meas_ppc.get("device_names", ()), dtype=object)
-        return np.asarray([], dtype=object)
-
-    def _meas_device_name_ids_for_ppc_names(self, meas_ppc: Dict, names: np.ndarray) -> np.ndarray:
-        names = np.asarray(names, dtype=object)
-        out = np.empty(names.size, dtype=np.int64)
-        out.fill(-1)
-        if names.size == 0:
-            return out
-        id_by_name = meas_ppc.get("device_name_id_by_name")
-        if isinstance(id_by_name, dict) and id_by_name:
-            get_id = id_by_name.get
-            return np.fromiter((int(get_id(name, -1)) for name in names), dtype=np.int64, count=int(names.size))
-        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
-        if device_names.size == 0:
-            return out
-        cache = getattr(self, "_meas_device_name_sorted_id_cache", None)
-        cache_key = (id(device_names), int(device_names.size))
-        if cache is None or cache[0] != cache_key:
-            order = np.argsort(device_names, kind="stable")
-            cache = (cache_key, order.astype(np.int64, copy=False), device_names[order])
-            self._meas_device_name_sorted_id_cache = cache
-        order = cache[1]
-        sorted_names = cache[2]
-        pos = np.searchsorted(sorted_names, names)
-        in_range = pos < sorted_names.size
-        if np.any(in_range):
-            idx = np.flatnonzero(in_range)
-            matched = sorted_names[pos[idx]] == names[idx]
-            if np.any(matched):
-                out[idx[matched]] = order[pos[idx[matched]]]
-        return out
 
     @staticmethod
     def _active_measurement_key(device_type_code: int, device_pos: int, meas_type_code: int) -> int:
@@ -3078,7 +2938,6 @@ class DCStateEstimator:
 
     def _measurement_runtime_array_cache_key(self) -> Tuple[object, ...]:
         return (
-            id(getattr(self, "_measurement_plan_device_pos_by_type_code_id", None)),
             id(getattr(self, "_raw_node_solver_pos_alive", None)),
             id(getattr(self, "_branch_i_pos", None)),
             id(getattr(self, "_branch_j_pos", None)),
@@ -3113,40 +2972,37 @@ class DCStateEstimator:
         weight = table.weight
         status = measurement_table_status_code(table)
         n_rows = int(value.size)
-        device_name_id = meas_ppc.get("device_name_id_array")
+        device_pos = getattr(table, "device_pos", None)
+        if device_pos is not None:
+            device_pos = np.asarray(device_pos, dtype=np.int64)
+            if int(device_pos.size) != n_rows:
+                device_pos = None
+        if device_pos is None:
+            ppc_device_pos = meas_ppc.get("device_pos")
+            if isinstance(ppc_device_pos, np.ndarray) and int(ppc_device_pos.size) == n_rows:
+                device_pos = np.asarray(ppc_device_pos, dtype=np.int64)
         device_type_code = meas_ppc.get("device_type_code_array")
         meas_type_code = meas_ppc.get("meas_type_code_array")
-        if not isinstance(device_name_id, np.ndarray) and has_meas:
-            device_name_id = meas[:, cols["device_name_id"]].astype(np.int64, copy=False)
         if not isinstance(device_type_code, np.ndarray) and has_meas:
             device_type_code = meas[:, cols["device_type_code"]].astype(np.int16, copy=False)
         if not isinstance(meas_type_code, np.ndarray) and has_meas:
             meas_type_code = meas[:, cols["meas_type_code"]].astype(np.int16, copy=False)
-        if isinstance(device_name_id, np.ndarray):
-            device_name_id = np.asarray(device_name_id, dtype=np.int64)
         if isinstance(device_type_code, np.ndarray):
             device_type_code = np.asarray(device_type_code, dtype=np.int16)
         if isinstance(meas_type_code, np.ndarray):
             meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
-        if not isinstance(device_name_id, np.ndarray) or not isinstance(device_type_code, np.ndarray) or not isinstance(meas_type_code, np.ndarray):
+        if device_pos is None or not isinstance(device_type_code, np.ndarray) or not isinstance(meas_type_code, np.ndarray):
             return False
-        if device_name_id.size != n_rows or device_type_code.size != n_rows or meas_type_code.size != n_rows:
+        if device_pos.size != n_rows or device_type_code.size != n_rows or meas_type_code.size != n_rows:
             return False
 
-        table.device_name_id = device_name_id
+        table.device_pos = device_pos
         table.device_type_code = device_type_code
         table.meas_type_code = meas_type_code
         self._ensure_measurement_plan_lookup_arrays()
         runtime_cache_key = self._measurement_runtime_array_cache_key()
         cached_runtime = self._cached_measurement_runtime_arrays(meas_ppc, n_rows, runtime_cache_key)
         if cached_runtime is None:
-            device_pos = getattr(table, "device_pos", None)
-            if device_pos is not None:
-                device_pos = np.asarray(device_pos, dtype=np.int64)
-                if int(device_pos.size) != n_rows:
-                    device_pos = None
-            if device_pos is None:
-                device_pos = self._measurement_device_pos_array(table)
             available, scale, from_pos, to_pos = self._measurement_scale_for_codes(
                 device_type_code,
                 device_pos,

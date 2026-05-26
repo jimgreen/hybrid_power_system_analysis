@@ -32,6 +32,7 @@ try:
         OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
+        make_reusable_factorizer as _make_reusable_factorizer,
         resolve_linear_solver as _resolve_linear_solver,
     )
 except ImportError:  # pragma: no cover - direct script import path
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover - direct script import path
         OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
+        make_reusable_factorizer as _make_reusable_factorizer,
         resolve_linear_solver as _resolve_linear_solver,
     )
 from scipy.sparse.linalg import spsolve as _scipy_spsolve
@@ -2047,6 +2049,7 @@ class HybridPowerFlowCalc:
         x = self.x.copy()
         resolved_name = self._linear_solver_resolved
         solver_fn = self._linear_solver_fn
+        reusable_factorizer = None
 
         for it in range(self.max_iter):
             F, J = self._build_newton_system(x)
@@ -2079,9 +2082,16 @@ class HybridPowerFlowCalc:
                 return 0
 
             try:
-                factor = _factor_jacobian(J, resolved_name, solver_fn)
+                if reusable_factorizer is None:
+                    reusable_factorizer = _make_reusable_factorizer(J, resolved_name)
+                factor = (
+                    reusable_factorizer.factor(J)
+                    if reusable_factorizer is not None
+                    else _factor_jacobian(J, resolved_name, solver_fn)
+                )
                 delta = factor.solve(F)
             except Exception:
+                reusable_factorizer = None
                 _AC_OPTIONAL_SPARSE_SOLVERS.pop(resolved_name, None)
                 _AC_OPTIONAL_SPARSE_MISSING.add(resolved_name)
                 resolved_name = "scipy"

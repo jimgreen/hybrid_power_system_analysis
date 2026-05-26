@@ -61,13 +61,11 @@ from ac_array_model import (
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
 try:
     from lfcore.common import (
-        device_key as _device_key,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
-        device_key as _device_key,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
     )
@@ -76,7 +74,6 @@ try:
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
-        load_named_sparse_solver as _load_named_sparse_solver,
         resolve_linear_solver as _resolve_linear_solver,
     )
 except ImportError:  # pragma: no cover - direct script import path
@@ -84,7 +81,6 @@ except ImportError:  # pragma: no cover - direct script import path
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
-        load_named_sparse_solver as _load_named_sparse_solver,
         resolve_linear_solver as _resolve_linear_solver,
     )
 

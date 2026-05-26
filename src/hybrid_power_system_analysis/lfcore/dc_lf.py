@@ -93,13 +93,11 @@ from model.dc_array_model import (
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 try:
     from lfcore.common import (
-        device_key as _device_key,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
-        device_key as _device_key,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
     )
@@ -108,7 +106,6 @@ try:
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
-        load_named_sparse_solver as _load_named_sparse_solver,
         resolve_linear_solver as _resolve_linear_solver,
     )
 except ImportError:  # pragma: no cover - direct script import path
@@ -116,7 +113,6 @@ except ImportError:  # pragma: no cover - direct script import path
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
-        load_named_sparse_solver as _load_named_sparse_solver,
         resolve_linear_solver as _resolve_linear_solver,
     )
 
@@ -1438,7 +1434,6 @@ class DCPowerFlowCalc:
         """计算 DC 残差：节点功率平衡、参考电压、零阻抗约束和 DCDC 约束。"""
         V = terms["V"]
         phi = terms["phi"]
-        Pdc = terms["Pdc"]
 
         P_inj = V * terms["GV"] + self.I_shunt * V - self.P_const
 

@@ -45,6 +45,7 @@ from ac_array_model import (
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
 from model.meas_array_model import (
     MEAS_COLS,
+    attach_device_pos_from_name_arrays,
     build_meas_ppc_from_e_file,
     copy_meas_ppc,
     measurement_table_from_meas_ppc,
@@ -290,12 +291,12 @@ def _meas_type_code_array(meas_type_values) -> np.ndarray:
     values = np.asarray(meas_type_values, dtype=object).reshape(-1)
     if values.size == 0:
         return np.empty(0, dtype=np.int16)
-    code_get = MEAS_TYPE_CODES.get
-    return np.fromiter(
-        (code_get(str(name).upper(), 0) for name in values),
-        dtype=np.int16,
-        count=int(values.size),
+    warnings.warn(
+        "AC SE requires meas_type_code arrays; string meas_type conversion is disabled.",
+        RuntimeWarning,
+        stacklevel=2,
     )
+    return np.zeros(int(values.size), dtype=np.int16)
 
 
 def _measurement_type_code_lookup(kind_map) -> np.ndarray:
@@ -542,6 +543,11 @@ def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) 
     )
     meas_type_code = getattr(table, "meas_type_code", None)
     if meas_type_code is None or np.asarray(meas_type_code).size != table.idx.size:
+        warnings.warn(
+            "AC SE MeasurementTable is missing meas_type_code; string fallback is disabled.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         table.meas_type_code = _meas_type_code_array(table.meas_type)
     return table
 
@@ -806,6 +812,9 @@ class ACStateEstimator:
         stage_start = time.perf_counter()
         self._ppc_runtime_node_and_device_context(ppc, topology_arrays)
         self._record_profile_time("init.ppc_runtime_context", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
+        self._attach_meas_ppc_device_pos()
+        self._record_profile_time("init.measurement_device_pos", time.perf_counter() - stage_start)
         if int(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)).size) == 0:
             raise RuntimeError("No alive AC nodes are available for state estimation")
         self.n_nodes = int(self._ac_node_ids.size)
@@ -1277,7 +1286,7 @@ class ACStateEstimator:
         self._state_labels_cache = None
 
         stage_start = time.perf_counter()
-        if not hasattr(self, "_ac_measurement_plan_device_pos_by_type_code"):
+        if not hasattr(self, "_ac_measurement_plan_pos_by_ppc_row"):
             self._build_measurement_plan_lookup_arrays()
         self._record_profile_time("init.measurement_plan_lookup", time.perf_counter() - stage_start)
 
@@ -2373,7 +2382,12 @@ class ACStateEstimator:
             device_name_id = np.asarray([], dtype=np.int64)
         meas_type_code = getattr(table, "meas_type_code", None)
         if meas_type_code is None or np.asarray(meas_type_code).size != row_count:
-            meas_type_code = _meas_type_code_array(table.meas_type)
+            warnings.warn(
+                "AC SE measurement PPC export requires meas_type_code; string fallback is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            meas_type_code = np.zeros(row_count, dtype=np.int16)
             table.meas_type_code = meas_type_code
         status_code = measurement_table_status_code(table)
         meas = np.zeros((row_count, len(MEAS_COLS)), dtype=np.float64)
@@ -2408,61 +2422,46 @@ class ACStateEstimator:
             "device_type": np.asarray(table.device_type, dtype=object),
             "device_name": device_name_array,
             "device_names": np.asarray(device_names, dtype=object),
-            "device_name_id_by_name": dict(
-                zip(np.asarray(device_names, dtype=object), range(int(device_names.size)))
-            ),
             "meas_type": np.asarray(table.meas_type, dtype=object),
             "rows_by_device_type_code": rows_by_device_type_code(table),
             "normalized": bool(getattr(getattr(self, "measurements", None), "normalized", False)),
         }
 
-    def _ensure_measurement_table_device_name_ids(self, table: MeasurementTable) -> bool:
-        n_rows = int(table.idx.size)
-        device_name_id = getattr(table, "device_name_id", None)
-        if device_name_id is not None:
-            device_name_id = np.asarray(device_name_id, dtype=np.int64)
-            if device_name_id.size == n_rows:
-                table.device_name_id = device_name_id
-                return True
+    def _attach_meas_ppc_device_pos(self) -> None:
         meas_ppc = getattr(self, "meas_ppc", None)
         if not isinstance(meas_ppc, dict):
-            warnings.warn(
-                "AC SE measurement device index lookup requires meas_ppc; string fallback is disabled.",
-                RuntimeWarning,
-                stacklevel=2,
+            return
+        self._ensure_measurement_plan_lookup_arrays()
+        rows_by_code = getattr(self, "_ac_measurement_plan_rows_by_type_code", None)
+        if not rows_by_code:
+            return
+        ppc = self._ac_ppc_dict()
+        name_key_by_code = {
+            DEVICE_TYPE_ACNode: "bus_name",
+            DEVICE_TYPE_ACBranch: "branch_name",
+            DEVICE_TYPE_ACTransformer: "transformer_name",
+            DEVICE_TYPE_ACLoad: "load_name",
+            DEVICE_TYPE_ACGenerator: "gen_name",
+            DEVICE_TYPE_ACZeroBranch: "zero_branch_name",
+            DEVICE_TYPE_ACBreak: "break_name",
+            DEVICE_TYPE_ACACConverter: "acac_name",
+            DEVICE_TYPE_ACZeroBranchConstraint: "zero_branch_name",
+            DEVICE_TYPE_ACBreakConstraint: "break_name",
+            DEVICE_TYPE_ACPowerBalance: "bus_name",
+        }
+        name_arrays_by_code = {}
+        for code, rows in rows_by_code.items():
+            name_key = name_key_by_code.get(int(code))
+            if name_key is None:
+                continue
+            name_arrays_by_code[int(code)] = self._ppc_names_for_rows(
+                ppc.get(name_key, np.asarray([], dtype=object)),
+                np.asarray(rows, dtype=np.int64),
             )
-            return False
-        device_name = getattr(table, "device_name", None)
-        if device_name is None:
-            return False
-        device_name_array = np.asarray(device_name, dtype=object)
-        if device_name_array.size != n_rows:
-            return False
-        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
-        if device_name_array.size:
-            unique_names = np.unique(device_name_array)
-            missing_names = (
-                np.setdiff1d(unique_names, device_names, assume_unique=False)
-                if device_names.size
-                else unique_names
-            )
-            if missing_names.size:
-                meas_ppc["device_names"] = np.concatenate((device_names, missing_names.astype(object, copy=False)))
-                id_by_name = meas_ppc.get("device_name_id_by_name")
-                if not isinstance(id_by_name, dict):
-                    id_by_name = dict(
-                        zip(device_names.astype(object, copy=False), range(int(device_names.size)))
-                    )
-                start_pos = int(device_names.size)
-                for offset, name in enumerate(missing_names.astype(object, copy=False)):
-                    id_by_name[name] = start_pos + int(offset)
-                meas_ppc["device_name_id_by_name"] = id_by_name
-                if hasattr(self, "_meas_device_name_sorted_id_cache"):
-                    del self._meas_device_name_sorted_id_cache
-                if hasattr(self, "_ac_measurement_plan_device_pos_by_type_code"):
-                    self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
-        table.device_name_id = self._meas_device_name_ids_for_ppc_names(meas_ppc, device_name_array)
-        return True
+        device_pos = attach_device_pos_from_name_arrays(meas_ppc, name_arrays_by_code)
+        table = getattr(getattr(self, "measurements", None), "table", None)
+        if table is not None and int(getattr(table, "idx", np.asarray([])).size) == int(device_pos.size):
+            table.device_pos = device_pos
 
     def _measurement_device_pos_array(
         self,
@@ -2475,63 +2474,22 @@ class ACStateEstimator:
             precomputed = np.asarray(precomputed, dtype=np.int64)
             if precomputed.size == int(table.idx.size):
                 return precomputed
-        self._ensure_measurement_plan_lookup_arrays()
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if isinstance(meas_ppc, dict):
+            ppc_device_pos = meas_ppc.get("device_pos")
+            if isinstance(ppc_device_pos, np.ndarray) and int(ppc_device_pos.size) == int(table.idx.size):
+                table.device_pos = np.asarray(ppc_device_pos, dtype=np.int64)
+                return table.device_pos
         n_rows = int(table.idx.size)
         device_pos = np.empty(n_rows, dtype=np.int64)
         device_pos.fill(-1)
-        if n_rows == 0:
-            return device_pos
-
-        device_name_id = getattr(table, "device_name_id", None)
-        if device_name_id is not None:
-            device_name_id = np.asarray(device_name_id, dtype=np.int64)
-            if device_name_id.size != n_rows:
-                device_name_id = None
-        if device_name_id is None:
-            if self._ensure_measurement_table_device_name_ids(table):
-                device_name_id = np.asarray(table.device_name_id, dtype=np.int64)
-            else:
-                warnings.warn(
-                    "AC SE measurement device index lookup requires device_name_id; string fallback is disabled.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                return device_pos
-        if device_name_id is None:
+        if n_rows:
             warnings.warn(
-                "AC SE measurement device index lookup requires device_name_id; string fallback is disabled.",
+                "AC SE measurement device_pos is missing; name-id/string fallback is disabled.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return device_pos
-
-        device_maps = device_pos_by_type_code or self._ac_measurement_plan_device_pos_by_type_code
-        if device_pos_by_type_code is None:
-            device_pos_by_id = getattr(self, "_measurement_plan_device_pos_by_type_code_id", {})
-        else:
-            device_pos_by_id = self._measurement_device_id_maps_for(device_maps)
-        if not device_pos_by_id:
-            warnings.warn(
-                "AC SE measurement device index lookup requires indexed device maps; string fallback is disabled.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return device_pos
-
-        for code_int, code_rows in rows_by_device_type_code(table).items():
-            rows = np.asarray(code_rows, dtype=np.int64)
-            if rows.size == 0:
-                continue
-            lookup = device_pos_by_id.get(int(code_int))
-            if lookup is None or lookup.size == 0:
-                continue
-            ids = device_name_id[rows]
-            values = np.empty(rows.size, dtype=np.int64)
-            values.fill(-1)
-            in_range = (ids >= 0) & (ids < lookup.size)
-            if np.any(in_range):
-                values[in_range] = lookup[ids[in_range].astype(np.intp, copy=False)]
-            device_pos[rows] = values
+        table.device_pos = device_pos
         return device_pos
 
     def _node_scale_arrays_by_pos(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -2841,11 +2799,11 @@ class ACStateEstimator:
         device_type_code = np.asarray(device_type_code, dtype=np.int16)
         device_pos = np.asarray(device_pos, dtype=np.int64)
         out = np.full(device_type_code.size, -1, dtype=np.int64)
-        plan_name_rows = getattr(self, "_ac_measurement_plan_name_rows_by_type_code", None)
-        if not plan_name_rows:
+        rows_by_code = getattr(self, "_ac_measurement_plan_rows_by_type_code", None)
+        if not rows_by_code:
             return out
-        for code_int, name_rows in plan_name_rows.items():
-            rows = np.asarray(name_rows[1], dtype=np.int64)
+        for code_int, rows in rows_by_code.items():
+            rows = np.asarray(rows, dtype=np.int64)
             if rows.size == 0:
                 continue
             target = np.flatnonzero(device_type_code == int(code_int)).astype(np.int64, copy=False)
@@ -2869,13 +2827,13 @@ class ACStateEstimator:
                 if np.any(in_range):
                     out[in_range] = lookup[rows[in_range].astype(np.intp, copy=False)]
                 return out
-        plan_name_rows = getattr(self, "_ac_measurement_plan_name_rows_by_type_code", None)
-        if not plan_name_rows or rows.size == 0:
+        rows_by_code = getattr(self, "_ac_measurement_plan_rows_by_type_code", None)
+        if not rows_by_code or rows.size == 0:
             return out
-        name_rows = plan_name_rows.get(int(device_type_code))
-        if name_rows is None:
+        plan_rows = rows_by_code.get(int(device_type_code))
+        if plan_rows is None:
             return out
-        plan_rows = np.asarray(name_rows[1], dtype=np.int64)
+        plan_rows = np.asarray(plan_rows, dtype=np.int64)
         if plan_rows.size == 0:
             return out
         lookup_size = max(int(table_size), int(np.max(plan_rows)) + 1, int(np.max(rows)) + 1)
@@ -3227,41 +3185,8 @@ class ACStateEstimator:
             "value": np.asarray(table.value, dtype=np.float64)[rows],
         }
 
-    def _meas_device_name_ids_for_ppc_names(self, meas_ppc: Dict, names: np.ndarray) -> np.ndarray:
-        names = np.asarray(names, dtype=object)
-        if names.size == 0:
-            return np.empty(0, dtype=np.int64)
-        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
-        if device_names.size == 0:
-            out = np.empty(names.size, dtype=np.int64)
-            out.fill(-1)
-            return out
-        id_by_name = meas_ppc.get("device_name_id_by_name")
-        if isinstance(id_by_name, dict):
-            name_get = id_by_name.get
-            return np.fromiter((int(name_get(name, -1)) for name in names), dtype=np.int64, count=int(names.size))
-        cache = getattr(self, "_meas_device_name_sorted_id_cache", None)
-        cache_key = (id(device_names), int(device_names.size))
-        if cache is None or cache[0] != cache_key:
-            order = np.argsort(device_names, kind="stable")
-            cache = (cache_key, order, device_names[order])
-            self._meas_device_name_sorted_id_cache = cache
-        order = cache[1]
-        sorted_names = cache[2]
-        pos = np.searchsorted(sorted_names, names)
-        out = np.empty(names.size, dtype=np.int64)
-        out.fill(-1)
-        in_range = pos < sorted_names.size
-        if np.any(in_range):
-            idx = np.flatnonzero(in_range)
-            matched = sorted_names[pos[idx]] == names[idx]
-            if np.any(matched):
-                out[idx[matched]] = order[pos[idx[matched]]].astype(np.int64, copy=False)
-        return out
-
     def _measurement_runtime_array_cache_key(self) -> Tuple[object, ...]:
         return (
-            id(getattr(self, "_measurement_plan_device_pos_by_type_code_id", None)),
             id(getattr(self, "_ac_node_plan_pos", None)),
             id(getattr(self, "_ac_branch_plan_i", None)),
             id(getattr(self, "_ac_branch_plan_j", None)),
@@ -3307,44 +3232,41 @@ class ACStateEstimator:
         status_array = measurement_table_status_code(table)
         idx_array = table.idx
         n_rows = int(value_array.size)
-        device_name_id = meas_ppc.get("device_name_id_array")
+        device_pos = getattr(table, "device_pos", None)
+        if device_pos is not None:
+            device_pos = np.asarray(device_pos, dtype=np.int64)
+            if int(device_pos.size) != n_rows:
+                device_pos = None
+        if device_pos is None:
+            ppc_device_pos = meas_ppc.get("device_pos")
+            if isinstance(ppc_device_pos, np.ndarray) and int(ppc_device_pos.size) == n_rows:
+                device_pos = np.asarray(ppc_device_pos, dtype=np.int64)
         device_type_code_array = meas_ppc.get("device_type_code_array")
         meas_type_code_array = meas_ppc.get("meas_type_code_array")
-        if not isinstance(device_name_id, np.ndarray) and has_meas:
-            device_name_id = meas[:, cols["device_name_id"]].astype(np.int64, copy=False)
         if not isinstance(device_type_code_array, np.ndarray) and has_meas:
             device_type_code_array = meas[:, cols["device_type_code"]].astype(np.int16, copy=False)
         if not isinstance(meas_type_code_array, np.ndarray) and has_meas:
             meas_type_code_array = meas[:, cols["meas_type_code"]].astype(np.int16, copy=False)
-        if isinstance(device_name_id, np.ndarray):
-            device_name_id = np.asarray(device_name_id, dtype=np.int64)
         if isinstance(device_type_code_array, np.ndarray):
             device_type_code_array = np.asarray(device_type_code_array, dtype=np.int16)
         if isinstance(meas_type_code_array, np.ndarray):
             meas_type_code_array = np.asarray(meas_type_code_array, dtype=np.int16)
         if (
-            not isinstance(device_name_id, np.ndarray)
+            device_pos is None
             or not isinstance(device_type_code_array, np.ndarray)
             or not isinstance(meas_type_code_array, np.ndarray)
         ):
             return False
-        if device_name_id.size != n_rows or device_type_code_array.size != n_rows or meas_type_code_array.size != n_rows:
+        if device_pos.size != n_rows or device_type_code_array.size != n_rows or meas_type_code_array.size != n_rows:
             return False
 
-        table.device_name_id = device_name_id
+        table.device_pos = device_pos
         table.meas_type_code = meas_type_code_array
         table.device_type_code = device_type_code_array
         self._ensure_measurement_plan_lookup_arrays()
         runtime_cache_key = self._measurement_runtime_array_cache_key()
         cached_runtime = self._cached_measurement_runtime_arrays(meas_ppc, n_rows, runtime_cache_key)
         if cached_runtime is None:
-            device_pos = getattr(table, "device_pos", None)
-            if device_pos is not None:
-                device_pos = np.asarray(device_pos, dtype=np.int64)
-                if int(device_pos.size) != n_rows:
-                    device_pos = None
-            if device_pos is None:
-                device_pos = self._measurement_device_pos_array(table)
             available, scale_array, from_pos, to_pos = self._measurement_scale_for_codes(
                 device_type_code_array,
                 device_pos,
@@ -3587,7 +3509,12 @@ class ACStateEstimator:
                 if meas_type_code.size != table.idx.size:
                     meas_type_code = None
             if meas_type_code is None:
-                meas_type_code = _meas_type_code_array(table.meas_type)
+                warnings.warn(
+                    "AC SE measurement summary requires meas_type_code; string fallback is disabled.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                meas_type_code = np.zeros(int(table.idx.size), dtype=np.int16)
                 table.meas_type_code = meas_type_code
             device_pos = getattr(table, "device_pos", None)
             if device_pos is None or np.asarray(device_pos).size != int(table.idx.size):
@@ -3708,22 +3635,13 @@ class ACStateEstimator:
         device_name_array = object_array_or_empty(device_names, "device_name")
         meas_type_array = object_array_or_empty(meas_types, "meas_type")
         if device_type_codes is None:
-            if device_type_array.size != row_count:
-                raise ValueError("pseudo measurement device_type_code is required when device_type strings are omitted")
-            code_get = _DEVICE_TYPE_CODES.get
-            device_type_code = np.fromiter(
-                (code_get(str(device_type), 0) for device_type in device_type_array),
-                dtype=np.int16,
-                count=int(device_type_array.size),
-            )
+            raise ValueError("pseudo measurement device_type_code array is required; string fallback is disabled")
         else:
             device_type_code = np.asarray(device_type_codes, dtype=np.int16)
             if device_type_code.size != row_count:
                 raise ValueError("pseudo measurement device_type_code array size does not match row count")
         if meas_type_codes is None:
-            if meas_type_array.size != row_count:
-                raise ValueError("pseudo measurement meas_type_code is required when meas_type strings are omitted")
-            meas_type_code = _meas_type_code_array(meas_type_array)
+            raise ValueError("pseudo measurement meas_type_code array is required; string fallback is disabled")
         else:
             meas_type_code = np.asarray(meas_type_codes, dtype=np.int16)
             if meas_type_code.size != row_count:
@@ -4835,7 +4753,12 @@ class ACStateEstimator:
         device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
         meas_type_code = getattr(table, "meas_type_code", None)
         if meas_type_code is None or np.asarray(meas_type_code).size != int(table.idx.size):
-            meas_type_code = _meas_type_code_array(table.meas_type)
+            warnings.warn(
+                "AC SE rank-restoring candidates require meas_type_code; string fallback is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            meas_type_code = np.zeros(int(table.idx.size), dtype=np.int16)
             table.meas_type_code = meas_type_code
         else:
             meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
@@ -5211,10 +5134,10 @@ class ACStateEstimator:
             return new_idx, 1
 
         def plan_ppc_row(target_device_type_code: int, target_device_pos: int) -> int:
-            name_rows = getattr(self, "_ac_measurement_plan_name_rows_by_type_code", {}).get(int(target_device_type_code))
-            if name_rows is None:
+            rows = getattr(self, "_ac_measurement_plan_rows_by_type_code", {}).get(int(target_device_type_code))
+            if rows is None:
                 return -1
-            rows = np.asarray(name_rows[1], dtype=np.int64)
+            rows = np.asarray(rows, dtype=np.int64)
             if target_device_pos < 0 or target_device_pos >= rows.size:
                 return -1
             return int(rows[target_device_pos])
@@ -6200,11 +6123,6 @@ class ACStateEstimator:
         return name_array[rows.astype(np.intp, copy=False)]
 
     @staticmethod
-    def _ppc_name_to_plan_pos(names, rows: np.ndarray) -> Dict[str, int]:
-        row_names = ACStateEstimator._ppc_names_for_rows(names, rows)
-        return {str(name): int(pos) for pos, name in enumerate(row_names)}
-
-    @staticmethod
     def _sorted_alive_ppc_rows(table: np.ndarray, idx_col: int, alive_mask: np.ndarray) -> np.ndarray:
         rows = np.flatnonzero(np.asarray(alive_mask, dtype=bool)).astype(np.int64, copy=False)
         if rows.size <= 1:
@@ -6459,10 +6377,6 @@ class ACStateEstimator:
 
         node_rows = np.flatnonzero(np.asarray(node_solver_pos, dtype=np.int32) >= 0).astype(np.int64, copy=False)
         node_plan_pos = node_solver_pos[node_rows.astype(np.intp, copy=False)].astype(np.int64, copy=False)
-        build_name_maps = not bool(getattr(self, "_array_only_runtime", False))
-        self._ac_node_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc["bus_name"], node_rows) if build_name_maps else {}
-        )
         self._ac_node_plan_pos = node_plan_pos
 
         def terminal_solver_positions(device_topology):
@@ -6495,9 +6409,6 @@ class ACStateEstimator:
             )
         else:
             yff = yft = ytf = ytt = np.asarray([], dtype=np.complex128)
-        self._ac_branch_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc["branch_name"], branch_rows) if build_name_maps else {}
-        )
         self._ac_branch_plan_i = branch_i_pos[branch_rows.astype(np.intp, copy=False)].astype(np.int64, copy=False)
         self._ac_branch_plan_j = branch_j_pos[branch_rows.astype(np.intp, copy=False)].astype(np.int64, copy=False)
         self._ac_branch_plan_yff = np.asarray(yff, dtype=np.complex128)
@@ -6519,9 +6430,6 @@ class ACStateEstimator:
             )
         else:
             yff = yft = ytf = ytt = np.asarray([], dtype=np.complex128)
-        self._ac_transformer_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc["transformer_name"], transformer_rows) if build_name_maps else {}
-        )
         self._ac_transformer_plan_i = transformer_i_pos[transformer_rows.astype(np.intp, copy=False)].astype(
             np.int64,
             copy=False,
@@ -6553,9 +6461,6 @@ class ACStateEstimator:
             "zero_branch_name",
             getattr(self, "_ac_zero_branch_current_pos_by_ppc_row", np.asarray([], dtype=np.int32)),
         )
-        self._ac_zero_branch_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc["zero_branch_name"], zero_rows) if build_name_maps else {}
-        )
         self._ac_zero_branch_plan_i = zero_i
         self._ac_zero_branch_plan_j = zero_j
         self._ac_zero_branch_plan_current_pos = zero_current
@@ -6565,16 +6470,10 @@ class ACStateEstimator:
             "break_name",
             getattr(self, "_ac_break_current_pos_by_ppc_row", np.asarray([], dtype=np.int32)),
         )
-        self._ac_break_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc.get("break_name", np.asarray([], dtype=object)), break_rows)
-            if build_name_maps
-            else {}
-        )
         self._ac_break_plan_i = break_i
         self._ac_break_plan_j = break_j
         self._ac_break_plan_current_pos = break_current
 
-        acac = np.asarray(ppc.get("acac", np.zeros((0, len(ACAC_COLS)))), dtype=np.float64)
         acac_rows, acac_i_pos, acac_j_pos = terminal_alive_rows("acac")
         if acac_rows.size:
             acac_state_index = np.asarray(
@@ -6594,11 +6493,6 @@ class ACStateEstimator:
                 acac_rows = acac_i_values = acac_j_values = acac_state_values = np.asarray([], dtype=np.int64)
         else:
             acac_i_values = acac_j_values = acac_state_values = np.asarray([], dtype=np.int64)
-        self._ac_acac_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc.get("acac_name", np.asarray([], dtype=object)), acac_rows)
-            if build_name_maps
-            else {}
-        )
         self._ac_acac_plan_i = acac_i_values
         self._ac_acac_plan_j = acac_j_values
         self._ac_acac_plan_index = acac_state_values
@@ -6635,9 +6529,6 @@ class ACStateEstimator:
             "gen_name",
             getattr(self, "_ac_generator_state_index_by_ppc_row", np.asarray([], dtype=np.int32)),
         )
-        self._ac_generator_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc["gen_name"], gen_rows) if build_name_maps else {}
-        )
         self._ac_generator_plan_node_pos = gen_node_pos
         self._ac_generator_plan_index = gen_state_index
 
@@ -6646,43 +6537,26 @@ class ACStateEstimator:
             "load_name",
             getattr(self, "_ac_load_state_index_by_ppc_row", np.asarray([], dtype=np.int32)),
         )
-        self._ac_load_plan_name_to_pos = (
-            self._ppc_name_to_plan_pos(ppc["load_name"], load_rows) if build_name_maps else {}
-        )
         self._ac_load_plan_node_pos = load_node_pos
         self._ac_load_plan_index = load_state_index
 
-        self._ac_measurement_plan_device_pos_by_type_code = {
-            DEVICE_TYPE_ACNode: self._ac_node_plan_name_to_pos,
-            DEVICE_TYPE_ACBranch: self._ac_branch_plan_name_to_pos,
-            DEVICE_TYPE_ACTransformer: self._ac_transformer_plan_name_to_pos,
-            DEVICE_TYPE_ACLoad: self._ac_load_plan_name_to_pos,
-            DEVICE_TYPE_ACGenerator: self._ac_generator_plan_name_to_pos,
-            DEVICE_TYPE_ACZeroBranch: self._ac_zero_branch_plan_name_to_pos,
-            DEVICE_TYPE_ACBreak: self._ac_break_plan_name_to_pos,
-            DEVICE_TYPE_ACACConverter: self._ac_acac_plan_name_to_pos,
-            DEVICE_TYPE_ACZeroBranchConstraint: self._ac_zero_branch_plan_name_to_pos,
-            DEVICE_TYPE_ACBreakConstraint: self._ac_break_plan_name_to_pos,
-            DEVICE_TYPE_ACPowerBalance: self._ac_node_plan_name_to_pos,
-        }
-        self._ac_measurement_plan_name_rows_by_type_code = {
-            DEVICE_TYPE_ACNode: (ppc["bus_name"], node_rows),
-            DEVICE_TYPE_ACBranch: (ppc["branch_name"], branch_rows),
-            DEVICE_TYPE_ACTransformer: (ppc["transformer_name"], transformer_rows),
-            DEVICE_TYPE_ACLoad: (ppc["load_name"], load_rows),
-            DEVICE_TYPE_ACGenerator: (ppc["gen_name"], gen_rows),
-            DEVICE_TYPE_ACZeroBranch: (ppc["zero_branch_name"], zero_rows),
-            DEVICE_TYPE_ACBreak: (ppc.get("break_name", np.asarray([], dtype=object)), break_rows),
-            DEVICE_TYPE_ACACConverter: (ppc.get("acac_name", np.asarray([], dtype=object)), acac_rows),
-            DEVICE_TYPE_ACZeroBranchConstraint: (ppc["zero_branch_name"], zero_rows),
-            DEVICE_TYPE_ACBreakConstraint: (ppc.get("break_name", np.asarray([], dtype=object)), break_rows),
-            DEVICE_TYPE_ACPowerBalance: (ppc["bus_name"], node_rows),
+        self._ac_measurement_plan_rows_by_type_code = {
+            DEVICE_TYPE_ACNode: node_rows,
+            DEVICE_TYPE_ACBranch: branch_rows,
+            DEVICE_TYPE_ACTransformer: transformer_rows,
+            DEVICE_TYPE_ACLoad: load_rows,
+            DEVICE_TYPE_ACGenerator: gen_rows,
+            DEVICE_TYPE_ACZeroBranch: zero_rows,
+            DEVICE_TYPE_ACBreak: break_rows,
+            DEVICE_TYPE_ACACConverter: acac_rows,
+            DEVICE_TYPE_ACZeroBranchConstraint: zero_rows,
+            DEVICE_TYPE_ACBreakConstraint: break_rows,
+            DEVICE_TYPE_ACPowerBalance: node_rows,
         }
         plan_pos_by_row = {}
-        for code, name_rows in self._ac_measurement_plan_name_rows_by_type_code.items():
-            names, rows = name_rows
+        for code, rows in self._ac_measurement_plan_rows_by_type_code.items():
             rows = np.asarray(rows, dtype=np.int64)
-            table_size = int(np.asarray(names, dtype=object).size)
+            table_size = 0
             if rows.size:
                 table_size = max(table_size, int(rows.max()) + 1)
             lookup = np.full(table_size, -1, dtype=np.int64)
@@ -6699,7 +6573,6 @@ class ACStateEstimator:
             else:
                 present_device_codes = set(np.unique(np.asarray(table.device_type_code, dtype=np.int16)).astype(object, copy=False))
         self._ac_measurement_present_device_codes = present_device_codes
-        self._measurement_plan_device_pos_by_type_code_id = self._measurement_plan_device_id_lookup_arrays()
         self._ac_branch_transformer_plan_kind_by_type_code = {
             DEVICE_TYPE_ACBranch: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
             DEVICE_TYPE_ACTransformer: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
@@ -6750,90 +6623,6 @@ class ACStateEstimator:
                 for code, kind_map in self._ac_balance_plan_kind_by_type_code.items()
             },
         }
-
-    def _measurement_plan_device_id_lookup_arrays(self, include_codes: Optional[set] = None) -> Dict[int, np.ndarray]:
-        meas_ppc = self.meas_ppc
-        device_names = np.asarray(meas_ppc.get("device_names", ()), dtype=object)
-        if include_codes is None:
-            include_codes = getattr(self, "_ac_measurement_present_device_codes", None)
-        device_name_id_array = meas_ppc.get("device_name_id_array")
-        if isinstance(device_name_id_array, np.ndarray):
-            device_name_id_array = np.asarray(device_name_id_array, dtype=np.int64)
-        else:
-            device_name_id_array = np.asarray([], dtype=np.int64)
-        rows_by_meas_code = meas_ppc.get("rows_by_device_type_code")
-        rows_by_meas_code = rows_by_meas_code if isinstance(rows_by_meas_code, dict) else {}
-        plan_name_rows = getattr(self, "_ac_measurement_plan_name_rows_by_type_code", None)
-        if not plan_name_rows:
-            warnings.warn(
-                "AC SE measurement plan lookup requires PPC name-row arrays; string fallback is disabled.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return {}
-
-        def lookup_from_ids(name_ids: np.ndarray) -> np.ndarray:
-            name_ids = np.asarray(name_ids, dtype=np.int64)
-            if name_ids.size == 0:
-                return np.asarray([], dtype=np.int64)
-            lookup = np.empty(int(name_ids.max()) + 1, dtype=np.int64)
-            lookup.fill(-1)
-            lookup[name_ids.astype(np.intp, copy=False)] = np.arange(name_ids.size, dtype=np.int64)
-            return lookup
-
-        def lookup_for(device_type_code: int, row_names: np.ndarray) -> np.ndarray:
-            row_names = np.asarray(row_names, dtype=object)
-            if row_names.size == 0:
-                return np.asarray([], dtype=np.int64)
-            if device_name_id_array.size:
-                rows = rows_by_meas_code.get(int(device_type_code))
-                rows = np.asarray(rows, dtype=np.int64) if rows is not None else np.asarray([], dtype=np.int64)
-                if rows.size:
-                    row_ids = device_name_id_array[rows.astype(np.intp, copy=False)]
-                    row_ids = row_ids[row_ids >= 0]
-                    if row_ids.size:
-                        first_mask = np.empty(row_ids.size, dtype=bool)
-                        first_mask[0] = True
-                        first_mask[1:] = row_ids[1:] != row_ids[:-1]
-                        ordered_ids = row_ids[first_mask]
-                        if ordered_ids.size == row_names.size:
-                            if device_names.size == 0:
-                                return lookup_from_ids(ordered_ids)
-                            valid_ids = (ordered_ids >= 0) & (ordered_ids < device_names.size)
-                            if np.all(valid_ids) and np.array_equal(
-                                device_names[ordered_ids.astype(np.intp, copy=False)],
-                                row_names,
-                            ):
-                                return lookup_from_ids(ordered_ids)
-            name_ids = self._meas_device_name_ids_for_ppc_names(meas_ppc, row_names)
-            valid = name_ids >= 0
-            if not np.any(valid):
-                return np.asarray([], dtype=np.int64)
-            lookup = np.empty(int(name_ids[valid].max()) + 1, dtype=np.int64)
-            lookup.fill(-1)
-            plan_pos = np.arange(name_ids.size, dtype=np.int64)
-            lookup[name_ids[valid].astype(np.intp, copy=False)] = plan_pos[valid]
-            return lookup
-
-        result: Dict[int, np.ndarray] = {}
-        for code, name_rows in plan_name_rows.items():
-            if include_codes is not None and int(code) not in include_codes:
-                continue
-            names, rows = name_rows
-            row_names = self._ppc_names_for_rows(names, np.asarray(rows, dtype=np.int64))
-            result[int(code)] = lookup_for(int(code), row_names)
-        return result
-
-    def _measurement_device_id_maps_for(
-        self,
-        device_pos_by_type_code: Dict[int, Dict[str, int]],
-    ) -> Dict[int, np.ndarray]:
-        warnings.warn(
-            "AC SE custom measurement device maps require indexed PPC maps; string fallback is disabled.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return {}
 
     def _measurement_kind_code_maps_for(
         self,
@@ -6888,7 +6677,7 @@ class ACStateEstimator:
         return _measurement_table_from_measurements(measurements)
 
     def _ensure_measurement_plan_lookup_arrays(self) -> None:
-        if not hasattr(self, "_ac_measurement_plan_device_pos_by_type_code"):
+        if not hasattr(self, "_ac_measurement_plan_pos_by_ppc_row"):
             self._build_measurement_plan_lookup_arrays()
 
     def _measurement_plan_table(
@@ -6898,16 +6687,10 @@ class ACStateEstimator:
         device_pos_by_type_code: Optional[Dict[int, Dict[str, int]]] = None,
     ):
         self._ensure_measurement_plan_lookup_arrays()
-        device_maps = device_pos_by_type_code or self._ac_measurement_plan_device_pos_by_type_code
-        device_id_maps = (
-            getattr(self, "_measurement_plan_device_pos_by_type_code_id", {})
-            if device_pos_by_type_code is None
-            else self._measurement_device_id_maps_for(device_maps)
-        )
         return build_measurement_plan_table(
             measurements,
-            device_pos_by_type_code=device_maps,
-            device_pos_by_type_code_id=device_id_maps,
+            device_pos_by_type_code={},
+            device_pos_by_type_code_id={},
             meas_kind_by_type_code=meas_kind_by_type_code,
             meas_kind_code_by_type_code=self._measurement_kind_code_maps_for(meas_kind_by_type_code),
             require_index_arrays=True,

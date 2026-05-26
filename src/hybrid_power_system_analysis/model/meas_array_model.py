@@ -223,6 +223,85 @@ def _build_ppc(
     }
 
 
+def attach_device_pos_from_name_arrays(
+    ppc: Dict,
+    name_arrays_by_type_code: Dict[int, np.ndarray],
+) -> np.ndarray:
+    """Attach per-row device_pos to a meas PPC using typed PPC name arrays.
+
+    The parser keeps device names compacted as ``device_names`` plus
+    ``device_name_id_array``.  SE runtimes should consume the final
+    ``device_pos`` array instead of rebuilding name-id lookup maps.
+    """
+    idx = ppc.get("idx_array")
+    meas = ppc.get("meas")
+    if isinstance(idx, np.ndarray):
+        row_count = int(idx.size)
+    elif isinstance(meas, np.ndarray) and meas.ndim == 2:
+        row_count = int(meas.shape[0])
+    else:
+        row_count = 0
+    existing = ppc.get("device_pos")
+    if isinstance(existing, np.ndarray) and int(existing.size) == row_count:
+        device_pos = existing.astype(np.int64, copy=True)
+    else:
+        device_pos = np.full(row_count, -1, dtype=np.int64)
+    if row_count == 0:
+        ppc["device_pos"] = device_pos
+        return device_pos
+
+    device_name_id = ppc.get("device_name_id_array")
+    device_names = ppc.get("device_names")
+    rows_by_code = ppc.get("rows_by_device_type_code")
+    if not isinstance(device_name_id, np.ndarray) or int(device_name_id.size) != row_count:
+        ppc["device_pos"] = device_pos
+        return device_pos
+    if not isinstance(device_names, np.ndarray) or int(device_names.size) == 0:
+        ppc["device_pos"] = device_pos
+        return device_pos
+    if not isinstance(rows_by_code, dict):
+        ppc["device_pos"] = device_pos
+        return device_pos
+
+    device_name_id = np.asarray(device_name_id, dtype=np.int64)
+    device_names = np.asarray(device_names, dtype=object)
+    for code, plan_names in name_arrays_by_type_code.items():
+        rows = rows_by_code.get(int(code))
+        if rows is None:
+            continue
+        rows = np.asarray(rows, dtype=np.int64)
+        rows = rows[(rows >= 0) & (rows < row_count)]
+        if rows.size == 0:
+            continue
+        unresolved = device_pos[rows.astype(np.intp, copy=False)] < 0
+        if not np.any(unresolved):
+            continue
+        rows = rows[unresolved]
+        names = np.asarray(plan_names, dtype=object)
+        if names.size == 0:
+            continue
+        ids = device_name_id[rows.astype(np.intp, copy=False)]
+        valid_ids = (ids >= 0) & (ids < device_names.size)
+        if not np.any(valid_ids):
+            continue
+        rows_valid = rows[valid_ids]
+        query = device_names[ids[valid_ids].astype(np.intp, copy=False)]
+        order = np.argsort(names, kind="stable")
+        sorted_names = names[order.astype(np.intp, copy=False)]
+        loc = np.searchsorted(sorted_names, query)
+        in_range = loc < sorted_names.size
+        if not np.any(in_range):
+            continue
+        valid_loc_idx = np.flatnonzero(in_range)
+        matched = sorted_names[loc[valid_loc_idx].astype(np.intp, copy=False)] == query[valid_loc_idx]
+        if np.any(matched):
+            target_rows = rows_valid[valid_loc_idx[matched]].astype(np.intp, copy=False)
+            target_pos = order[loc[valid_loc_idx[matched]].astype(np.intp, copy=False)].astype(np.int64, copy=False)
+            device_pos[target_rows] = target_pos
+    ppc["device_pos"] = device_pos
+    return device_pos
+
+
 def _empty_meas_ppc(source: Path, *, include_matrix: bool = True) -> Dict:
     return _build_ppc(
         source=source,
