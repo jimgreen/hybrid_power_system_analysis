@@ -1,7 +1,7 @@
 import sys
 import threading
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -192,6 +192,50 @@ ACAC_COLS = {
     "i_i": 16,
     "j_i": 17,
 }
+
+MP_BUS_I = 0
+MP_BUS_TYPE = 1
+MP_PD = 2
+MP_QD = 3
+MP_GS = 4
+MP_BS = 5
+MP_BUS_AREA = 6
+MP_VM = 7
+MP_VA = 8
+MP_BASE_KV = 9
+MP_ZONE = 10
+MP_VMAX = 11
+MP_VMIN = 12
+
+MP_GEN_BUS = 0
+MP_PG = 1
+MP_QG = 2
+MP_QMAX = 3
+MP_QMIN = 4
+MP_VG = 5
+MP_MBASE = 6
+MP_GEN_STATUS = 7
+MP_PMAX = 8
+MP_PMIN = 9
+
+MP_F_BUS = 0
+MP_T_BUS = 1
+MP_BR_R = 2
+MP_BR_X = 3
+MP_BR_B = 4
+MP_RATE_A = 5
+MP_RATE_B = 6
+MP_RATE_C = 7
+MP_TAP = 8
+MP_SHIFT = 9
+MP_BR_STATUS = 10
+MP_ANGMIN = 11
+MP_ANGMAX = 12
+
+MP_PQ = 1
+MP_PV = 2
+MP_REF = 3
+MP_NONE = 4
 
 _AC_PPC_CACHE = {}
 _AC_PPC_CACHE_LOCK = threading.Lock()
@@ -602,6 +646,495 @@ def build_ac_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build AC ppc from E rows that are already loaded in memory."""
     path = resolve_project_file(file_path).resolve()
     return _build_ac_ppc_from_rows_dict(rows, path)
+
+
+def _base_mva_from_ac_ppc(ppc: Dict) -> float:
+    base = ppc.get("base", {})
+    if isinstance(base, dict):
+        return float(base.get("p_base", 1.0))
+    arr = np.asarray(base, dtype=np.float64).ravel()
+    return float(arr[0]) if arr.size else 1.0
+
+
+def _matpower_empty(cols: int) -> np.ndarray:
+    return np.zeros((0, int(cols)), dtype=np.float64)
+
+
+def _matpower_matrix(value: Any, min_cols: int, *, required: bool = False) -> np.ndarray:
+    if value is None:
+        if required:
+            raise KeyError("MATPOWER case is missing a required matrix")
+        return _matpower_empty(min_cols)
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.size == 0:
+        return _matpower_empty(min_cols)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    else:
+        arr = np.atleast_2d(arr)
+    if arr.shape[1] < min_cols:
+        if required:
+            raise ValueError(f"MATPOWER matrix has {arr.shape[1]} columns; expected at least {min_cols}")
+        padded = np.zeros((arr.shape[0], min_cols), dtype=np.float64)
+        padded[:, : arr.shape[1]] = arr
+        arr = padded
+    return np.asarray(arr, dtype=np.float64)
+
+
+def _matpower_scalar(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return float(default)
+    return float(np.asarray(arr, dtype=np.float64).ravel()[0])
+
+
+def _matpower_struct_to_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, np.ndarray) and value.dtype.names:
+        item = value.reshape(-1)[0]
+        return {name: item[name] for name in value.dtype.names}
+    if isinstance(value, np.ndarray) and value.size == 1:
+        return _matpower_struct_to_dict(value.reshape(-1)[0])
+    if isinstance(value, np.void) and value.dtype.names:
+        return {name: value[name] for name in value.dtype.names}
+    field_names = getattr(value, "_fieldnames", None)
+    if field_names:
+        return {name: getattr(value, name) for name in field_names}
+    raise ValueError("MAT file does not contain a MATPOWER/PYPOWER ppc structure")
+
+
+def _load_matpower_case_from_mat_file(file_path, variable_name: str = "mpc") -> Dict[str, Any]:
+    from scipy.io import loadmat
+
+    path = Path(file_path)
+    data = loadmat(str(path), squeeze_me=True, struct_as_record=False)
+    if variable_name in data:
+        return _matpower_struct_to_dict(data[variable_name])
+    if {"baseMVA", "bus", "gen", "branch"}.issubset(data.keys()):
+        return data
+    for key, value in data.items():
+        if key.startswith("__"):
+            continue
+        try:
+            candidate = _matpower_struct_to_dict(value)
+        except ValueError:
+            continue
+        if {"baseMVA", "bus", "gen", "branch"}.issubset(candidate.keys()):
+            return candidate
+    raise KeyError(f"MAT file {path} does not contain variable {variable_name!r} or ppc fields")
+
+
+def _active_rows(rows: np.ndarray, run_col: int) -> np.ndarray:
+    if rows.size == 0:
+        return rows
+    return rows[rows[:, run_col] == 1]
+
+
+class _MatpowerDSU:
+    def __init__(self, size: int):
+        self.parent = np.arange(int(size), dtype=np.int64)
+
+    def find(self, value: int) -> int:
+        value = int(value)
+        while int(self.parent[value]) != value:
+            self.parent[value] = self.parent[int(self.parent[value])]
+            value = int(self.parent[value])
+        return value
+
+    def union(self, left: int, right: int) -> None:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root != right_root:
+            self.parent[right_root] = left_root
+
+
+def _build_matpower_components(ac_ppc: Dict) -> Tuple[np.ndarray, List[List[int]], Dict[int, int], np.ndarray]:
+    bus = np.asarray(ac_ppc["bus"], dtype=np.float64)
+    zero = np.asarray(ac_ppc.get("zero_branch", _empty(len(ZERO_BRANCH_COLS))), dtype=np.float64)
+    switch = np.asarray(ac_ppc.get("switch", _empty(len(SWITCH_COLS))), dtype=np.float64)
+    breaker = np.asarray(ac_ppc.get("break", _empty(len(BREAK_COLS))), dtype=np.float64)
+
+    node_ids = bus[:, BUS_COLS["idx"]].astype(np.int64, copy=False)
+    row_by_node = {int(node): row for row, node in enumerate(node_ids)}
+    active_bus = bus[:, BUS_COLS["run_stat"]] == 1
+    dsu = _MatpowerDSU(bus.shape[0])
+
+    for row in _active_rows(zero, ZERO_BRANCH_COLS["run_stat"]):
+        left = row_by_node.get(int(row[ZERO_BRANCH_COLS["i_node"]]))
+        right = row_by_node.get(int(row[ZERO_BRANCH_COLS["j_node"]]))
+        if left is not None and right is not None and active_bus[left] and active_bus[right]:
+            dsu.union(left, right)
+
+    if switch.size:
+        live = (switch[:, SWITCH_COLS["run_stat"]] == 1) & (switch[:, SWITCH_COLS["status"]] == 1)
+        for row in switch[live]:
+            left = row_by_node.get(int(row[SWITCH_COLS["i_node"]]))
+            right = row_by_node.get(int(row[SWITCH_COLS["j_node"]]))
+            if left is not None and right is not None and active_bus[left] and active_bus[right]:
+                dsu.union(left, right)
+
+    if breaker.size:
+        live = (breaker[:, BREAK_COLS["run_stat"]] == 1) & (breaker[:, BREAK_COLS["status"]] == 1)
+        for row in breaker[live]:
+            left = row_by_node.get(int(row[BREAK_COLS["i_node"]]))
+            right = row_by_node.get(int(row[BREAK_COLS["j_node"]]))
+            if left is not None and right is not None and active_bus[left] and active_bus[right]:
+                dsu.union(left, right)
+
+    root_to_comp: Dict[int, int] = {}
+    comp_rows: List[List[int]] = []
+    for row in np.flatnonzero(active_bus):
+        root = dsu.find(int(row))
+        if root not in root_to_comp:
+            root_to_comp[root] = len(comp_rows)
+            comp_rows.append([])
+        comp_rows[root_to_comp[root]].append(int(row))
+
+    row_to_comp = np.full(bus.shape[0], -1, dtype=np.int64)
+    for comp, rows in enumerate(comp_rows):
+        row_to_comp[rows] = comp
+    comp_to_bus_id = np.arange(1, len(comp_rows) + 1, dtype=np.int64)
+    row_to_bus_id = np.where(row_to_comp >= 0, comp_to_bus_id[np.maximum(row_to_comp, 0)], -1)
+    return row_to_comp, comp_rows, row_by_node, row_to_bus_id
+
+
+def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
+    """Project this project's AC ppc into a MATPOWER/PYPOWER v2 ppc.
+
+    Zero branches, closed switches, and closed breakers are collapsed into one
+    MATPOWER bus. ZIP loads are exported as static P/Q at V=1. Transformer
+    ``gt/bt`` grounding admittance is converted to an equivalent i-side bus
+    shunt referred through the tap magnitude.
+    """
+
+    base_mva = _base_mva_from_ac_ppc(ac_ppc)
+    bus0 = np.asarray(ac_ppc["bus"], dtype=np.float64)
+    branch0 = np.asarray(ac_ppc.get("branch", _empty(len(BRANCH_COLS))), dtype=np.float64)
+    transformer0 = np.asarray(ac_ppc.get("transformer", _empty(len(TRANSFORMER_COLS))), dtype=np.float64)
+    gen0 = np.asarray(ac_ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
+    load0 = np.asarray(ac_ppc.get("load", _empty(len(LOAD_COLS))), dtype=np.float64)
+    shunt0 = np.asarray(ac_ppc.get("shunt", _empty(len(SHUNT_COLS))), dtype=np.float64)
+
+    row_to_comp, comp_rows, row_by_node, row_to_bus_id = _build_matpower_components(ac_ppc)
+    comp_count = len(comp_rows)
+    comp_to_bus_id = np.arange(1, comp_count + 1, dtype=np.int64)
+
+    pd = np.zeros(comp_count, dtype=np.float64)
+    qd = np.zeros(comp_count, dtype=np.float64)
+    gs = np.zeros(comp_count, dtype=np.float64)
+    bs = np.zeros(comp_count, dtype=np.float64)
+    bus_type = np.full(comp_count, MP_PQ, dtype=np.float64)
+    base_kv = np.zeros(comp_count, dtype=np.float64)
+    vm0 = np.ones(comp_count, dtype=np.float64)
+    va0 = np.zeros(comp_count, dtype=np.float64)
+
+    for comp, rows in enumerate(comp_rows):
+        first = rows[0]
+        base_kv[comp] = bus0[first, BUS_COLS["vbase"]]
+        vm0[comp] = bus0[first, BUS_COLS["voltage"]]
+        va0[comp] = np.degrees(bus0[first, BUS_COLS["angle"]])
+
+    for row in _active_rows(load0, LOAD_COLS["run_stat"]):
+        bus_row = row_by_node.get(int(row[LOAD_COLS["node"]]))
+        if bus_row is None or row_to_comp[bus_row] < 0:
+            continue
+        comp = int(row_to_comp[bus_row])
+        pd[comp] += row[LOAD_COLS["pbase"]] * (row[LOAD_COLS["pv0"]] + row[LOAD_COLS["pv1"]] + row[LOAD_COLS["pv2"]]) * base_mva
+        qd[comp] += row[LOAD_COLS["qbase"]] * (row[LOAD_COLS["qv0"]] + row[LOAD_COLS["qv1"]] + row[LOAD_COLS["qv2"]]) * base_mva
+
+    for row in _active_rows(shunt0, SHUNT_COLS["run_stat"]):
+        bus_row = row_by_node.get(int(row[SHUNT_COLS["node"]]))
+        if bus_row is None or row_to_comp[bus_row] < 0:
+            continue
+        comp = int(row_to_comp[bus_row])
+        gs[comp] += row[SHUNT_COLS["g_set"]] * base_mva
+        bs[comp] += row[SHUNT_COLS["b_set"]] * base_mva
+
+    for row in _active_rows(transformer0, TRANSFORMER_COLS["run_stat"]):
+        bus_row = row_by_node.get(int(row[TRANSFORMER_COLS["i_node"]]))
+        if bus_row is None or row_to_comp[bus_row] < 0:
+            continue
+        comp = int(row_to_comp[bus_row])
+        tap = row[TRANSFORMER_COLS["tap"]]
+        tap_mag = tap if abs(tap) > 1e-12 else 1.0
+        scale = 1.0 / (tap_mag * tap_mag)
+        gs[comp] += row[TRANSFORMER_COLS["gt"]] * scale * base_mva
+        bs[comp] += row[TRANSFORMER_COLS["bt"]] * scale * base_mva
+
+    for row in _active_rows(gen0, GEN_COLS["run_stat"]):
+        bus_row = row_by_node.get(int(row[GEN_COLS["node"]]))
+        if bus_row is None or row_to_comp[bus_row] < 0:
+            continue
+        comp = int(row_to_comp[bus_row])
+        control = int(row[GEN_COLS["control_type"]])
+        if control == CTRL_SLACK:
+            bus_type[comp] = MP_REF
+        elif bus_type[comp] != MP_REF and control in (CTRL_PV, CTRL_P):
+            bus_type[comp] = MP_PV
+
+    bus = np.zeros((comp_count, 13), dtype=np.float64)
+    bus[:, MP_BUS_I] = comp_to_bus_id
+    bus[:, MP_BUS_TYPE] = bus_type
+    bus[:, MP_PD] = pd
+    bus[:, MP_QD] = qd
+    bus[:, MP_GS] = gs
+    bus[:, MP_BS] = bs
+    bus[:, MP_BUS_AREA] = 1
+    bus[:, MP_VM] = vm0
+    bus[:, MP_VA] = va0
+    bus[:, MP_BASE_KV] = base_kv
+    bus[:, MP_ZONE] = 1
+    bus[:, MP_VMAX] = 1.2
+    bus[:, MP_VMIN] = 0.8
+
+    gen_rows = []
+    for row in _active_rows(gen0, GEN_COLS["run_stat"]):
+        bus_row = row_by_node.get(int(row[GEN_COLS["node"]]))
+        if bus_row is None or row_to_comp[bus_row] < 0:
+            continue
+        gen_row = np.zeros(21, dtype=np.float64)
+        gen_row[MP_GEN_BUS] = row_to_bus_id[bus_row]
+        gen_row[MP_PG] = row[GEN_COLS["p_set"]] * base_mva
+        gen_row[MP_QG] = row[GEN_COLS["q_set"]] * base_mva
+        gen_row[MP_QMAX] = 1e9
+        gen_row[MP_QMIN] = -1e9
+        gen_row[MP_VG] = row[GEN_COLS["v_set"]]
+        gen_row[MP_MBASE] = base_mva
+        gen_row[MP_GEN_STATUS] = 1
+        gen_row[MP_PMAX] = 1e9
+        gen_row[MP_PMIN] = -1e9
+        gen_rows.append(gen_row)
+    gen = np.vstack(gen_rows) if gen_rows else np.zeros((0, 21), dtype=np.float64)
+
+    branch_rows = []
+
+    def add_branch_devices(devices: np.ndarray, cols: Dict[str, int], is_transformer: bool) -> None:
+        for row in devices:
+            if int(row[cols["run_stat"]]) != 1:
+                continue
+            i_row = row_by_node.get(int(row[cols["i_node"]]))
+            j_row = row_by_node.get(int(row[cols["j_node"]]))
+            if i_row is None or j_row is None or row_to_comp[i_row] < 0 or row_to_comp[j_row] < 0:
+                continue
+            i_bus = row_to_bus_id[i_row]
+            j_bus = row_to_bus_id[j_row]
+            if i_bus == j_bus:
+                continue
+            branch_row = np.zeros(13, dtype=np.float64)
+            branch_row[MP_F_BUS] = i_bus
+            branch_row[MP_T_BUS] = j_bus
+            branch_row[MP_BR_R] = row[cols["r"]]
+            branch_row[MP_BR_X] = row[cols["x"]]
+            branch_row[MP_BR_B] = 0.0 if is_transformer else row[cols["b"]]
+            branch_row[MP_RATE_A] = 0.0
+            branch_row[MP_RATE_B] = 0.0
+            branch_row[MP_RATE_C] = 0.0
+            if is_transformer:
+                tap = row[cols["tap"]]
+                branch_row[MP_TAP] = 0.0 if abs(tap - 1.0) < 1e-12 else tap
+                branch_row[MP_SHIFT] = row[cols["shift"]]
+            branch_row[MP_BR_STATUS] = 1
+            branch_row[MP_ANGMIN] = -360.0
+            branch_row[MP_ANGMAX] = 360.0
+            branch_rows.append(branch_row)
+
+    add_branch_devices(branch0, BRANCH_COLS, False)
+    add_branch_devices(transformer0, TRANSFORMER_COLS, True)
+    branch = np.vstack(branch_rows) if branch_rows else np.zeros((0, 13), dtype=np.float64)
+    return {"version": "2", "baseMVA": base_mva, "bus": bus, "gen": gen, "branch": branch}
+
+
+def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict:
+    """Read a MATPOWER/PYPOWER ``.mat`` case and build this project's AC ppc.
+
+    The input must provide ``baseMVA``, ``bus``, ``gen`` and ``branch`` either
+    inside a MATLAB struct named by ``variable_name`` or as top-level MAT
+    variables. Bus loads and shunts are converted into ACLoad/ACShunt rows.
+    MATPOWER branches with tap or phase shift are converted into ACTransformer
+    rows; ordinary branches stay in the ACBranch table.
+    """
+
+    path = Path(file_path).resolve()
+    mpc = _load_matpower_case_from_mat_file(path, variable_name=variable_name)
+    base_mva = _matpower_scalar(mpc.get("baseMVA"), 1.0)
+    bus_mp = _matpower_matrix(mpc.get("bus"), 13, required=True)
+    gen_mp = _matpower_matrix(mpc.get("gen"), 10)
+    branch_mp = _matpower_matrix(mpc.get("branch"), 13)
+
+    bus = np.zeros((bus_mp.shape[0], len(BUS_COLS)), dtype=np.float64)
+    if bus_mp.size:
+        bus[:, BUS_COLS["idx"]] = bus_mp[:, MP_BUS_I].astype(np.int64)
+        bus[:, BUS_COLS["vbase"]] = bus_mp[:, MP_BASE_KV]
+        bus[:, BUS_COLS["voltage"]] = bus_mp[:, MP_VM]
+        bus[:, BUS_COLS["angle"]] = np.deg2rad(bus_mp[:, MP_VA])
+        bus[:, BUS_COLS["isl"]] = 0.0
+        bus[:, BUS_COLS["run_stat"]] = (bus_mp[:, MP_BUS_TYPE].astype(np.int64) != MP_NONE).astype(np.float64)
+    bus_names = np.asarray([f"bus_{int(idx)}" for idx in bus[:, BUS_COLS["idx"]]], dtype=object)
+
+    load_rows = []
+    for pos, row in enumerate(bus_mp):
+        if int(row[MP_BUS_TYPE]) == MP_NONE:
+            continue
+        pd = float(row[MP_PD])
+        qd = float(row[MP_QD])
+        if abs(pd) <= 1e-12 and abs(qd) <= 1e-12:
+            continue
+        out = np.zeros(len(LOAD_COLS), dtype=np.float64)
+        out[LOAD_COLS["idx"]] = len(load_rows) + 1
+        out[LOAD_COLS["node"]] = bus[pos, BUS_COLS["idx"]]
+        out[LOAD_COLS["pbase"]] = pd / base_mva
+        out[LOAD_COLS["pv0"]] = 1.0
+        out[LOAD_COLS["qbase"]] = qd / base_mva
+        out[LOAD_COLS["qv0"]] = 1.0
+        out[LOAD_COLS["run_stat"]] = 1.0
+        load_rows.append(out)
+    load = np.vstack(load_rows) if load_rows else _empty(len(LOAD_COLS))
+    load_names = np.asarray([f"load_{int(row[LOAD_COLS['idx']])}" for row in load], dtype=object)
+
+    shunt_rows = []
+    for pos, row in enumerate(bus_mp):
+        if int(row[MP_BUS_TYPE]) == MP_NONE:
+            continue
+        gs = float(row[MP_GS])
+        bs = float(row[MP_BS])
+        if abs(gs) <= 1e-12 and abs(bs) <= 1e-12:
+            continue
+        out = np.zeros(len(SHUNT_COLS), dtype=np.float64)
+        out[SHUNT_COLS["idx"]] = len(shunt_rows) + 1
+        out[SHUNT_COLS["node"]] = bus[pos, BUS_COLS["idx"]]
+        out[SHUNT_COLS["control_type"]] = SHUNT_B
+        out[SHUNT_COLS["g_set"]] = gs / base_mva
+        out[SHUNT_COLS["b_set"]] = bs / base_mva
+        out[SHUNT_COLS["run_stat"]] = 1.0
+        shunt_rows.append(out)
+
+    bus_type_by_idx = {int(row[MP_BUS_I]): int(row[MP_BUS_TYPE]) for row in bus_mp}
+    gen = np.zeros((gen_mp.shape[0], len(GEN_COLS)), dtype=np.float64)
+    for row_idx, row in enumerate(gen_mp):
+        gen[row_idx, GEN_COLS["idx"]] = row_idx + 1
+        gen[row_idx, GEN_COLS["node"]] = row[MP_GEN_BUS]
+        bus_type = bus_type_by_idx.get(int(row[MP_GEN_BUS]), MP_PQ)
+        if bus_type == MP_REF:
+            control = CTRL_SLACK
+        elif bus_type == MP_PV:
+            control = CTRL_PV
+        else:
+            control = CTRL_PQ
+        gen[row_idx, GEN_COLS["control_type"]] = control
+        gen[row_idx, GEN_COLS["p_set"]] = row[MP_PG] / base_mva
+        gen[row_idx, GEN_COLS["q_set"]] = row[MP_QG] / base_mva
+        gen[row_idx, GEN_COLS["v_set"]] = row[MP_VG] if abs(row[MP_VG]) > 1e-12 else 1.0
+        gen[row_idx, GEN_COLS["alpha"]] = 1.0
+        gen[row_idx, GEN_COLS["run_stat"]] = row[MP_GEN_STATUS] if gen_mp.shape[1] > MP_GEN_STATUS else 1.0
+        gen[row_idx, GEN_COLS["p"]] = row[MP_PG] / base_mva
+        gen[row_idx, GEN_COLS["q"]] = row[MP_QG] / base_mva
+    gen_names = np.asarray([f"gen_{int(row[GEN_COLS['idx']])}" for row in gen], dtype=object)
+
+    branch_rows = []
+    transformer_rows = []
+    for row in branch_mp:
+        status = row[MP_BR_STATUS] if branch_mp.shape[1] > MP_BR_STATUS else 1.0
+        tap = row[MP_TAP] if branch_mp.shape[1] > MP_TAP and abs(row[MP_TAP]) > 1e-12 else 1.0
+        shift = row[MP_SHIFT] if branch_mp.shape[1] > MP_SHIFT else 0.0
+        charging = row[MP_BR_B] if branch_mp.shape[1] > MP_BR_B else 0.0
+        as_transformer = abs(tap - 1.0) > 1e-12 or abs(shift) > 1e-12
+        if as_transformer:
+            out = np.zeros(len(TRANSFORMER_COLS), dtype=np.float64)
+            out[TRANSFORMER_COLS["idx"]] = len(transformer_rows) + 1
+            out[TRANSFORMER_COLS["i_node"]] = row[MP_F_BUS]
+            out[TRANSFORMER_COLS["j_node"]] = row[MP_T_BUS]
+            out[TRANSFORMER_COLS["r"]] = row[MP_BR_R]
+            out[TRANSFORMER_COLS["x"]] = row[MP_BR_X]
+            out[TRANSFORMER_COLS["gt"]] = 0.0
+            out[TRANSFORMER_COLS["bt"]] = 0.5 * charging
+            out[TRANSFORMER_COLS["tap"]] = tap
+            out[TRANSFORMER_COLS["shift"]] = shift
+            out[TRANSFORMER_COLS["run_stat"]] = status
+            transformer_rows.append(out)
+            if abs(charging) > 1e-12:
+                shunt = np.zeros(len(SHUNT_COLS), dtype=np.float64)
+                shunt[SHUNT_COLS["idx"]] = len(shunt_rows) + 1
+                shunt[SHUNT_COLS["node"]] = row[MP_T_BUS]
+                shunt[SHUNT_COLS["control_type"]] = SHUNT_B
+                shunt[SHUNT_COLS["b_set"]] = 0.5 * charging
+                shunt[SHUNT_COLS["run_stat"]] = status
+                shunt_rows.append(shunt)
+        else:
+            out = np.zeros(len(BRANCH_COLS), dtype=np.float64)
+            out[BRANCH_COLS["idx"]] = len(branch_rows) + 1
+            out[BRANCH_COLS["i_node"]] = row[MP_F_BUS]
+            out[BRANCH_COLS["j_node"]] = row[MP_T_BUS]
+            out[BRANCH_COLS["r"]] = row[MP_BR_R]
+            out[BRANCH_COLS["x"]] = row[MP_BR_X]
+            out[BRANCH_COLS["b"]] = charging
+            out[BRANCH_COLS["run_stat"]] = status
+            branch_rows.append(out)
+    branch = np.vstack(branch_rows) if branch_rows else _empty(len(BRANCH_COLS))
+    transformer = np.vstack(transformer_rows) if transformer_rows else _empty(len(TRANSFORMER_COLS))
+    shunt = np.vstack(shunt_rows) if shunt_rows else _empty(len(SHUNT_COLS))
+
+    ppc = {
+        "format": "ac_ppc_v1",
+        "source": str(path),
+        "base": {
+            "p_base": float(base_mva),
+            "u_scale": 1.0,
+            "p_scale": 0.001,
+            "i_scale": 1.0,
+            "p_base_kW": float(base_mva / 0.001),
+        },
+        "bus": bus,
+        "branch": branch,
+        "transformer": transformer,
+        "gen": gen,
+        "load": load,
+        "shunt": shunt,
+        "zero_branch": _empty(len(ZERO_BRANCH_COLS)),
+        "switch": _empty(len(SWITCH_COLS)),
+        "break": _empty(len(BREAK_COLS)),
+        "acac": _empty(len(ACAC_COLS)),
+        "bus_name": bus_names,
+        "branch_name": np.asarray([f"branch_{int(row[BRANCH_COLS['idx']])}" for row in branch], dtype=object),
+        "transformer_name": np.asarray([f"transformer_{int(row[TRANSFORMER_COLS['idx']])}" for row in transformer], dtype=object),
+        "gen_name": gen_names,
+        "load_name": load_names,
+        "shunt_name": np.asarray([f"shunt_{int(row[SHUNT_COLS['idx']])}" for row in shunt], dtype=object),
+        "zero_branch_name": np.asarray([], dtype=object),
+        "switch_name": np.asarray([], dtype=object),
+        "break_name": np.asarray([], dtype=object),
+        "acac_name": np.asarray([], dtype=object),
+        "bus_cols": BUS_COLS,
+        "branch_cols": BRANCH_COLS,
+        "transformer_cols": TRANSFORMER_COLS,
+        "gen_cols": GEN_COLS,
+        "load_cols": LOAD_COLS,
+        "shunt_cols": SHUNT_COLS,
+        "zero_branch_cols": ZERO_BRANCH_COLS,
+        "switch_cols": SWITCH_COLS,
+        "break_cols": BREAK_COLS,
+        "acac_cols": ACAC_COLS,
+        "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
+        "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
+    }
+    ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
+    return ppc
+
+
+def save_ac_ppc_to_mat_file(ppc: Dict, file_path, *, variable_name: str = "mpc") -> Path:
+    """Save this project's AC ppc as a MATPOWER/PYPOWER ``.mat`` case."""
+
+    from scipy.io import savemat
+
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    matpower_ppc = build_matpower_ppc_from_ac_ppc(ppc)
+    savemat(str(path), {variable_name: matpower_ppc}, do_compression=True, oned_as="row")
+    return path
 
 
 def build_ac_ppc_from_network(network) -> Dict:

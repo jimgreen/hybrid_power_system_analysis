@@ -308,6 +308,75 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual("ac_ppc_v1", ppc["format"])
         self.assertEqual(300, ppc["bus"].shape[0])
 
+    def test_ac_ppc_matpower_mat_read_write(self):
+        from scipy.io import loadmat, savemat
+
+        from ac_array_model import (
+            BRANCH_COLS,
+            BUS_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            TRANSFORMER_COLS,
+            build_ac_ppc_from_mat_file,
+            save_ac_ppc_to_mat_file,
+        )
+
+        bus = np.array(
+            [
+                [1, 3, 0, 0, 0, 0, 1, 1.02, 5.0, 230, 1, 1.1, 0.9],
+                [2, 1, 50, 20, 1.0, 3.0, 1, 0.98, -2.0, 230, 1, 1.1, 0.9],
+            ],
+            dtype=np.float64,
+        )
+        gen = np.zeros((1, 21), dtype=np.float64)
+        gen[0, 0] = 1
+        gen[0, 1] = 80
+        gen[0, 2] = 15
+        gen[0, 5] = 1.02
+        gen[0, 6] = 100
+        gen[0, 7] = 1
+        gen[0, 8] = 200
+        branch = np.array(
+            [
+                [1, 2, 0.01, 0.05, 0.02, 0, 0, 0, 0, 0, 1, -360, 360],
+                [1, 2, 0.02, 0.08, 0.04, 0, 0, 0, 1.1, 10, 1, -360, 360],
+            ],
+            dtype=np.float64,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mat_path = Path(tmp_dir) / "case2.mat"
+            savemat(str(mat_path), {"mpc": {"version": "2", "baseMVA": 100.0, "bus": bus, "gen": gen, "branch": branch}})
+
+            ppc = build_ac_ppc_from_mat_file(mat_path)
+            self.assertEqual("ac_ppc_v1", ppc["format"])
+            self.assertEqual(100.0, ppc["base"]["p_base"])
+            self.assertEqual((2, len(BUS_COLS)), ppc["bus"].shape)
+            self.assertEqual((1, len(BRANCH_COLS)), ppc["branch"].shape)
+            self.assertEqual((1, len(TRANSFORMER_COLS)), ppc["transformer"].shape)
+            self.assertEqual((1, len(GEN_COLS)), ppc["gen"].shape)
+            self.assertEqual((1, len(LOAD_COLS)), ppc["load"].shape)
+            self.assertEqual((2, len(SHUNT_COLS)), ppc["shunt"].shape)
+            self.assertAlmostEqual(0.5, ppc["load"][0, LOAD_COLS["pbase"]])
+            self.assertAlmostEqual(0.2, ppc["load"][0, LOAD_COLS["qbase"]])
+            self.assertAlmostEqual(0.01, ppc["shunt"][0, SHUNT_COLS["g_set"]])
+            self.assertAlmostEqual(0.03, ppc["shunt"][0, SHUNT_COLS["b_set"]])
+            self.assertAlmostEqual(0.02, ppc["transformer"][0, TRANSFORMER_COLS["bt"]])
+            self.assertAlmostEqual(1.1, ppc["transformer"][0, TRANSFORMER_COLS["tap"]])
+            self.assertAlmostEqual(10.0, ppc["transformer"][0, TRANSFORMER_COLS["shift"]])
+
+            out_path = Path(tmp_dir) / "roundtrip.mat"
+            returned = save_ac_ppc_to_mat_file(ppc, out_path)
+            self.assertEqual(out_path, returned)
+            saved = loadmat(str(out_path), squeeze_me=True, struct_as_record=False)
+            self.assertIn("mpc", saved)
+            saved_mpc = saved["mpc"]
+            self.assertAlmostEqual(100.0, float(saved_mpc.baseMVA))
+            self.assertEqual((2, 13), np.asarray(saved_mpc.bus).shape)
+            self.assertEqual((1, 21), np.atleast_2d(np.asarray(saved_mpc.gen)).shape)
+            self.assertEqual((2, 13), np.asarray(saved_mpc.branch).shape)
+
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
         source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
             encoding="utf-8"
