@@ -369,39 +369,43 @@ class Snapshot:
         return None
 
     def _dcac_value(self, dev, meas_type: str) -> Optional[float]:
+        dc_node = getattr(dev, "dc_node_obj", None) or self.dc_nodes_by_idx.get(getattr(dev, "dc_node", None))
+        ac_node = getattr(dev, "ac_node_obj", None) or self.ac_nodes_by_idx.get(getattr(dev, "ac_node", None))
         if meas_type == "P_DC":
             return self.power_to_file(self._float(dev.dc_p))
         if meas_type == "V_DC":
-            return self.dc_voltage_to_file(dev.dc_node_obj)
+            return None if dc_node is None else self.dc_voltage_to_file(dc_node)
         if meas_type == "I_DC":
-            return self.dc_current_to_file(dev.dc_node_obj, self._float(dev.dc_i))
+            return None if dc_node is None else self.dc_current_to_file(dc_node, self._float(dev.dc_i))
         if meas_type == "P_AC":
             return self.power_to_file(self._float(dev.ac_p))
         if meas_type == "Q_AC":
             return self.power_to_file(self._float(dev.ac_q))
         if meas_type == "V_AC":
-            return self.ac_voltage_to_file(dev.ac_node_obj)
+            return None if ac_node is None else self.ac_voltage_to_file(ac_node)
         if meas_type == "I_AC":
-            return self.ac_current_to_file(dev.ac_node_obj, self._float(dev.ac_i))
+            return None if ac_node is None else self.ac_current_to_file(ac_node, self._float(dev.ac_i))
         return None
 
     def _acac_value(self, dev, meas_type: str) -> Optional[float]:
+        i_node = getattr(dev, "i_node_obj", None) or self.ac_nodes_by_idx.get(getattr(dev, "i_node", None))
+        j_node = getattr(dev, "j_node_obj", None) or self.ac_nodes_by_idx.get(getattr(dev, "j_node", None))
         if meas_type == "P_FROM":
             return self.power_to_file(self._float(dev.i_p))
         if meas_type == "Q_FROM":
             return self.power_to_file(self._float(dev.i_q))
         if meas_type == "V_FROM":
-            return self.ac_voltage_to_file(dev.i_node_obj)
+            return None if i_node is None else self.ac_voltage_to_file(i_node)
         if meas_type == "I_FROM":
-            return self.ac_current_to_file(dev.i_node_obj, self._float(dev.i_i))
+            return None if i_node is None else self.ac_current_to_file(i_node, self._float(dev.i_i))
         if meas_type == "P_TO":
             return self.power_to_file(self._float(dev.j_p))
         if meas_type == "Q_TO":
             return self.power_to_file(self._float(dev.j_q))
         if meas_type == "V_TO":
-            return self.ac_voltage_to_file(dev.j_node_obj)
+            return None if j_node is None else self.ac_voltage_to_file(j_node)
         if meas_type == "I_TO":
-            return self.ac_current_to_file(dev.j_node_obj, self._float(dev.j_i))
+            return None if j_node is None else self.ac_current_to_file(j_node, self._float(dev.j_i))
         return None
 
 

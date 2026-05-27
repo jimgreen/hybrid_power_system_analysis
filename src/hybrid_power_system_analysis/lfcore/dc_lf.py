@@ -37,6 +37,7 @@
 """
 
 import argparse
+import warnings
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Dict, Optional
@@ -329,6 +330,30 @@ class DCPowerFlowCalc:
     def _should_eliminate_dcdc_j_power(self) -> bool:
         return bool(not self.keep_node_objects)
 
+    def _warn_dcdc_loss_condition(self, tag: str, count: int, detail_value: float) -> None:
+        if count <= 0:
+            return
+        warning_tags = getattr(self, "_dcdc_loss_warning_tags", None)
+        if warning_tags is None:
+            warning_tags = set()
+            self._dcdc_loss_warning_tags = warning_tags
+        if tag in warning_tags:
+            return
+        warning_tags.add(tag)
+        if tag == "infeasible":
+            message = (
+                "DCDC loss equation infeasible: "
+                f"{count} active converter(s) have negative discriminant "
+                f"(minimum {detail_value:.3e}); using the transfer-limit model."
+            )
+        else:
+            message = (
+                "DCDC loss equation limit reached: "
+                f"{count} active converter(s) have near-zero denominator "
+                f"(minimum |denom| {detail_value:.3e}); using the transfer-limit model derivative."
+            )
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+
     def _dcdc_j_power_from_loss(self, pi, vi, vj):
         pi = np.asarray(pi, dtype=np.float64)
         vi = np.asarray(vi, dtype=np.float64)
@@ -338,13 +363,41 @@ class DCPowerFlowCalc:
         a = self.dcdc_r2 * vi2
         b = vi2 * vj2
         c = vj2 * pi * (vi2 - self.dcdc_r1 * pi)
-        disc = np.maximum(b * b + 4.0 * a * c, 0.0)
+        raw_disc = b * b + 4.0 * a * c
+        disc_eps = float(getattr(self, "dcdc_loss_discriminant_eps", 1e-10))
+        denom_eps = float(getattr(self, "dcdc_loss_denominator_eps", 1e-12))
+        quad_mask = np.abs(a) > 1e-12
+        infeasible_mask = quad_mask & (raw_disc < -disc_eps)
+        self.last_dcdc_loss_discriminant = raw_disc
+        self.last_dcdc_loss_infeasible_mask = infeasible_mask
+        if np.any(infeasible_mask):
+            self._warn_dcdc_loss_condition(
+                "infeasible",
+                int(np.count_nonzero(infeasible_mask)),
+                float(np.min(raw_disc[infeasible_mask])),
+            )
+
+        disc = np.maximum(raw_disc, 0.0)
         sqrt_disc = np.sqrt(disc)
         pj_linear = np.divide(-c, b, out=np.zeros_like(c), where=np.abs(b) > 1e-12)
         pj_quad = np.divide(b - sqrt_disc, 2.0 * a, out=pj_linear.copy(), where=np.abs(a) > 1e-12)
 
         denom = b - 2.0 * self.dcdc_r2 * pj_quad * vi2
-        safe = np.abs(denom) > 1e-12
+        near_limit_mask = quad_mask & ~infeasible_mask & (np.abs(denom) <= denom_eps)
+        limited_mask = infeasible_mask | near_limit_mask
+        self.last_dcdc_loss_limited_mask = limited_mask
+        if np.any(near_limit_mask):
+            self._warn_dcdc_loss_condition(
+                "limit",
+                int(np.count_nonzero(near_limit_mask)),
+                float(np.min(np.abs(denom[near_limit_mask]))),
+            )
+        if np.any(limited_mask):
+            pj_limit = np.divide(b, 2.0 * a, out=pj_linear.copy(), where=quad_mask)
+            pj_quad[limited_mask] = pj_limit[limited_mask]
+            denom = b - 2.0 * self.dcdc_r2 * pj_quad * vi2
+
+        safe = (~limited_mask) & (np.abs(denom) > denom_eps)
         dpj_dpi = np.divide(
             -vj2 * (vi2 - 2.0 * self.dcdc_r1 * pi),
             denom,
@@ -355,6 +408,15 @@ class DCPowerFlowCalc:
         df_dvj = 2.0 * vj * vi2 * (pi + pj_quad) - 2.0 * self.dcdc_r1 * pi * pi * vj
         dpj_dvi = np.divide(-df_dvi, denom, out=np.zeros_like(pi), where=safe)
         dpj_dvj = np.divide(-df_dvj, denom, out=np.zeros_like(pi), where=safe)
+        if np.any(limited_mask):
+            dpj_dpi[limited_mask] = 0.0
+            dpj_dvi[limited_mask] = 0.0
+            dpj_dvj[limited_mask] = np.divide(
+                vj[limited_mask],
+                self.dcdc_r2[limited_mask],
+                out=np.zeros_like(vj[limited_mask]),
+                where=np.abs(self.dcdc_r2[limited_mask]) > 1e-12,
+            )
         return pj_quad, dpj_dpi, dpj_dvi, dpj_dvj
 
     def _prepare_direct_ppc_topology(self):

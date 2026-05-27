@@ -644,8 +644,16 @@ def build_ac_ppc_from_e_file(file_path) -> Dict:
 
 def build_ac_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build AC ppc from E rows that are already loaded in memory."""
-    path = resolve_project_file(file_path).resolve()
-    return _build_ac_ppc_from_rows_dict(rows, path)
+    file_key = _file_cache_key(file_path)
+    with _AC_PPC_CACHE_LOCK:
+        cached = _AC_PPC_CACHE.get(file_key[0])
+        if cached is not None and cached[0] == file_key:
+            return cached[1]
+    ppc = _build_ac_ppc_from_rows_dict(rows, file_key[0])
+    ppc["source"] = str(file_key[0])
+    with _AC_PPC_CACHE_LOCK:
+        _AC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    return ppc
 
 
 def _base_mva_from_ac_ppc(ppc: Dict) -> float:

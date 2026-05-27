@@ -32,7 +32,11 @@ from model.dc_array_model import (
     GEN_COLS as DC_GEN_COLS,
     LOAD_COLS as DC_LOAD_COLS,
 )
-from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+from model.ppc_topology import (
+    build_ac_ppc_with_topology_from_efile_rows,
+    build_dc_ppc_with_topology_from_efile_rows,
+    build_hybrid_ppc_with_topology_from_efile_rows,
+)
 from model.meas_array_model import (
     attach_device_pos_from_name_arrays,
     build_meas_ppc_from_e_file,
@@ -363,6 +367,36 @@ def _build_hybrid_se_network_from_ppc(ppc: Dict) -> _SELightweightHybridNetwork:
     return network
 
 
+def _detect_se_rows_kind(rows) -> str:
+    has_ac = bool(rows.get("ACNode", {}).get("rows"))
+    has_dc = bool(rows.get("DCNode", {}).get("rows"))
+    has_dcac = bool(rows.get("DCACConverter", {}).get("rows"))
+    if has_dcac or (has_ac and has_dc):
+        return "hybrid"
+    if has_ac:
+        return "ac"
+    if has_dc:
+        return "dc"
+    return "hybrid"
+
+
+def _empty_se_side(base: Dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        _se_lightweight=True,
+        ppc=None,
+        base=base,
+        topology=None,
+        _topology_arrays=None,
+        p_base=float(base.get("p_base", 1.0)),
+        p_base_kW=float(base.get("p_base_kW", base.get("p_base", 1.0))),
+        u_scale=float(base.get("u_scale", 1.0)),
+        p_scale=float(base.get("p_scale", 1.0)),
+        i_scale=float(base.get("i_scale", 1.0)),
+        nodes=[],
+        node_dict={},
+    )
+
+
 class _HybridStateLabelSlice:
     __slots__ = ("_parent", "_start", "_stop", "_step")
 
@@ -500,6 +534,32 @@ class _HybridStateSideView:
             yield "dc"
         for _ in range(self.hybrid_n):
             yield "hybrid"
+
+
+class _DelegatedSequenceView:
+    __slots__ = ("_delegate", "_attr")
+
+    def __init__(self, delegate, attr: str):
+        self._delegate = delegate
+        self._attr = str(attr)
+
+    def _target(self):
+        return getattr(self._delegate, self._attr)
+
+    def __len__(self) -> int:
+        n_state = getattr(self._delegate, "n_state", None)
+        if self._attr in {"state_labels", "state_meta"} and n_state is not None:
+            return int(n_state)
+        return len(self._target())
+
+    def __getitem__(self, key):
+        return self._target()[key]
+
+    def __iter__(self):
+        return iter(self._target())
+
+    def __contains__(self, value) -> bool:
+        return value in self._target()
 
 
 def _state_meta_from_estimator_arrays(estimator, pos: int) -> Optional[StateMeta]:
@@ -893,13 +953,55 @@ class HybridStateEstimator:
             return self
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
-        self.network = self._load_network(self.e_file)
+        efile_rows = _read_efile_rows(self.e_file)
+        rows_kind = _detect_se_rows_kind(efile_rows)
+        if rows_kind == "ac":
+            ac_ppc = build_ac_ppc_with_topology_from_efile_rows(self.e_file, efile_rows)
+            base = ac_ppc["base"]
+            self.network = _SELightweightHybridNetwork(
+                _se_lightweight=True,
+                ac=_build_ac_se_ppc_namespace(ac_ppc, self.e_file),
+                dc=_empty_se_side(base),
+                dcac_converters=[],
+                acac_converters=[],
+                hybrid_islands=[],
+                ppc={"format": "hybrid_ppc_v1", "source": str(Path(self.e_file).resolve()), "base": base, "ac": ac_ppc, "dc": None},
+                _ac_ppc=ac_ppc,
+                _dc_ppc=None,
+            )
+        elif rows_kind == "dc":
+            dc_ppc = build_dc_ppc_with_topology_from_efile_rows(self.e_file, efile_rows)
+            base = dc_ppc["base"]
+            self.network = _SELightweightHybridNetwork(
+                _se_lightweight=True,
+                ac=_empty_se_side(base),
+                dc=_build_dc_se_ppc_namespace(dc_ppc),
+                dcac_converters=[],
+                acac_converters=[],
+                hybrid_islands=[],
+                ppc={"format": "hybrid_ppc_v1", "source": str(Path(self.e_file).resolve()), "base": base, "ac": None, "dc": dc_ppc},
+                _ac_ppc=None,
+                _dc_ppc=dc_ppc,
+            )
+        else:
+            self.network = _build_hybrid_se_network_from_ppc(
+                build_hybrid_ppc_with_topology_from_efile_rows(self.e_file, efile_rows)
+            )
+        if rows_kind in ("ac", "dc"):
+            base = self.network.ppc["base"]
+            self.network.p_base = float(base["p_base"])
+            self.network.u_scale = float(base["u_scale"])
+            self.network.p_scale = float(base["p_scale"])
+            self.network.i_scale = float(base["i_scale"])
+            self.network.p_base_kW = float(base["p_base_kW"])
         self._record_profile_time("init.load_network", time.perf_counter() - stage_start)
         self.p_base = float(getattr(self.network, "p_base", 1.0))
         self.p_base_kW = float(getattr(self.network, "p_base_kW", self.p_base))
         self.u_scale = float(getattr(self.network, "u_scale", 1.0))
         self.p_scale = float(getattr(self.network, "p_scale", 1.0))
         self.i_scale = float(getattr(self.network, "i_scale", 1.0))
+        if rows_kind in ("ac", "dc"):
+            return self._prepare_uncoupled_direct_delegate(rows_kind, profile_start)
         stage_start = time.perf_counter()
         self.meas_ppc = build_meas_ppc_from_e_file(
             self.meas_file,
@@ -962,6 +1064,81 @@ class HybridStateEstimator:
         stage_start = time.perf_counter()
         self.ac_angle_reference_anchor_count = self._add_ac_angle_reference_anchor_measurements()
         self._record_profile_time("init.add_ac_angle_reference_anchors", time.perf_counter() - stage_start)
+        self._prepared = True
+        self._record_profile_time("init.total", time.perf_counter() - profile_start)
+        return self
+
+    def _prepare_uncoupled_direct_delegate(self, side: str, profile_start: float) -> "HybridStateEstimator":
+        stage_start = time.perf_counter()
+        self.meas_ppc = build_meas_ppc_from_e_file(
+            self.meas_file,
+            include_strings=False,
+            use_cache=False,
+            include_matrix=False,
+        )
+        self.meas_ppc["_mutable_runtime_arrays"] = True
+        self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
+        self._sub_measurement_sources_by_side = None
+        self._sub_measurement_source_rows_by_side = None
+        self._sub_measurement_summary_attrs_by_side = {}
+        self._sub_measurement_global_summary_attrs = None
+        self._sub_measurements_converted_by_side = {"ac": False, "dc": False}
+        self._measurements_normalized = False
+        self._sub_estimators_enabled = False
+        self._delegate_estimator = None
+        self._initial_observability_cache = None
+        self._observability_matrix_cache = None
+        self.dcac_converters = []
+        self.acac_converters = []
+
+        stage_start = time.perf_counter()
+        self._direct_delegate_fast_path = True
+        if side == "ac":
+            self._dc_sub_estimator = None
+            self._ac_sub_estimator = ACStateEstimator(
+                e_file=self.e_file,
+                meas_file=self.meas_file,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                diff_step=self.diff_step,
+                flat_start=self.flat_start,
+                parameters=self.params,
+                network=self.network.ac,
+                measurements=self.meas_ppc,
+                profile=self.profile_enabled,
+                auto_prepare=False,
+                power_flow_linear_solver=self._sub_power_flow_linear_solver(),
+            )
+            self._ac_sub_estimator.prepare()
+            delegate = self._ac_sub_estimator
+        elif side == "dc":
+            self._ac_sub_estimator = None
+            self._dc_sub_estimator = DCStateEstimator(
+                e_file=self.e_file,
+                meas_file=self.meas_file,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                diff_step=self.diff_step,
+                flat_start=self.flat_start,
+                parameters=self.params,
+                network=self.network.dc,
+                measurements=self.meas_ppc,
+                profile=self.profile_enabled,
+                auto_prepare=False,
+                power_flow_linear_solver=self._sub_power_flow_linear_solver(),
+            )
+            self._dc_sub_estimator.prepare()
+            delegate = self._dc_sub_estimator
+        else:
+            raise ValueError(f"Unsupported direct delegate side: {side}")
+        self._record_profile_time("init.prepare_sub_estimators", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
+        self._build_device_maps()
+        self._record_profile_time("init.device_maps", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
+        self._adopt_delegate(delegate, side)
+        self.meas_ppc = getattr(delegate, "meas_ppc", self.meas_ppc)
+        self._record_profile_time("init.adopt_delegate", time.perf_counter() - stage_start)
         self._prepared = True
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
         return self
@@ -1134,26 +1311,36 @@ class HybridStateEstimator:
         return False
 
     def _adopt_delegate(self, delegate, side: str) -> None:
+        direct_delegate = bool(getattr(self, "_direct_delegate_fast_path", False))
         self._delegate_estimator = delegate
         self._sub_estimators_enabled = True
-        self.calc = self._calc_adapter()
+        self.calc = SimpleNamespace(ac_calc=None, dc_calc=None) if direct_delegate else self._calc_adapter()
         self.measurements = delegate.measurements
         self.active_measurements = delegate.active_measurements
         self.active_z = delegate.active_z
         self.active_weight = delegate.active_weight
         active_table = getattr(self.active_measurements, "table", None)
-        if active_table is not None and len(active_table.idx) == len(self.active_measurements):
+        delegate_angle_mask = getattr(delegate, "active_angle_residual_mask", None)
+        if direct_delegate and delegate_angle_mask is not None:
+            self.active_angle_residual_mask = delegate_angle_mask
+        elif active_table is not None and len(active_table.idx) == len(self.active_measurements):
             self.active_angle_residual_mask = np.asarray(active_table.angle_mask, dtype=bool)
         else:
             self.active_angle_residual_mask = angle_residual_mask(self.active_measurements)
-        self.state_meta = list(getattr(delegate, "state_meta", []))
-        self.state_labels = list(delegate.state_labels)
-        self.ac_state_labels = list(delegate.state_labels) if side == "ac" else []
-        self.dc_state_labels = list(delegate.state_labels) if side == "dc" else []
-        self.ac_state_layout = delegate.state_layout() if side == "ac" else {"state_labels": [], "n_state": 0}
+        delegate_state_labels = _DelegatedSequenceView(delegate, "state_labels") if direct_delegate else delegate.state_labels
+        delegate_state_meta = _DelegatedSequenceView(delegate, "state_meta") if direct_delegate else getattr(delegate, "state_meta", [])
+        self.state_meta = delegate_state_meta
+        self.state_labels = delegate_state_labels
+        self.ac_state_labels = delegate_state_labels if side == "ac" else []
+        self.dc_state_labels = delegate_state_labels if side == "dc" else []
+        self.ac_state_layout = (
+            {"state_labels": delegate_state_labels, "n_state": int(delegate.n_state)}
+            if direct_delegate and side == "ac"
+            else delegate.state_layout() if side == "ac" else {"state_labels": [], "n_state": 0}
+        )
         self.dc_state_layout = (
             {
-                "state_labels": delegate.state_labels,
+                "state_labels": delegate_state_labels,
                 "voltage_col": getattr(delegate, "voltage_col", np.array([], dtype=np.int32)),
                 "n_state": delegate.n_state,
                 "references": getattr(delegate, "references", []),
@@ -1161,16 +1348,17 @@ class HybridStateEstimator:
             if side == "dc"
             else {"state_labels": [], "n_state": 0}
         )
-        self.state_sides = [side] * len(self.state_labels)
         self.n_state = int(delegate.n_state)
         self.ac_n_state = int(delegate.n_state) if side == "ac" else 0
         self.dc_n_state = int(delegate.n_state) if side == "dc" else 0
         self.hybrid_n_state = 0
         self.dc_state_start = self.ac_n_state
         self.hybrid_state_start = self.ac_n_state + self.dc_n_state
+        self.state_sides = _HybridStateSideView(self.ac_n_state, self.dc_n_state, 0)
         self.voltage_cols = np.asarray(getattr(delegate, "voltage_cols", []), dtype=np.int32)
-        self.power_flow_state = delegate.initial_state()
-        self.flat_state = delegate.initial_state()
+        self.power_flow_state = np.array([], dtype=np.float64)
+        self.flat_state = np.array([], dtype=np.float64)
+        self._initial_state_cache_ready = False
         self.dc_reference_nodes = getattr(delegate, "references", []) if side == "dc" else []
         self.ac_reference_nodes = getattr(delegate, "references", []) if side == "ac" else []
         self.dc_node_voltage_measurements = getattr(delegate, "node_voltage_measurements", {}) if side == "dc" else {}
@@ -1179,8 +1367,45 @@ class HybridStateEstimator:
         self.ac_voltage_state_col = getattr(delegate, "voltage_col", np.array([], dtype=np.int32)) if side == "ac" else np.array([], dtype=np.int32)
         self.dc_voltage_state_col = getattr(delegate, "voltage_col", np.array([], dtype=np.int32)) if side == "dc" else np.array([], dtype=np.int32)
         self.targeted_observability_pseudo_count = getattr(delegate, "targeted_observability_pseudo_count", 0)
-        self._adopt_delegate_active_partition(side)
-        self._partition_state_variables()
+        if direct_delegate:
+            empty_rows = np.array([], dtype=np.int32)
+            self.ac_meas_rows = empty_rows
+            self.dc_meas_rows = empty_rows
+            self.hybrid_meas_rows = empty_rows
+            self.ac_meas = []
+            self.dc_meas = []
+            self.hybrid_meas = []
+            self._active_ac_sub_measurements = []
+            self._active_dc_sub_measurements = []
+            self._active_ac_sub_rows = empty_rows
+            self._active_dc_sub_rows = empty_rows
+            self._active_ac_hybrid_rows = empty_rows
+            self._active_dc_hybrid_rows = empty_rows
+            self._active_ac_delegated_row_mask = np.array([], dtype=bool)
+            self._active_dc_delegated_row_mask = np.array([], dtype=bool)
+            self._jacobian_static_skip = np.array([], dtype=bool)
+        else:
+            self._adopt_delegate_active_partition(side)
+        if side == "ac":
+            self.ac_state_cols = np.arange(self.n_state, dtype=np.int32)
+            self.dc_state_cols = np.array([], dtype=np.int32)
+            self.hybrid_state_cols = np.array([], dtype=np.int32)
+            self.ac_vars = self.state_labels
+            self.dc_vars = []
+            self.hybrid_vars = []
+            self.ac_state_slice = slice(0, self.n_state)
+            self.dc_state_slice = slice(self.n_state, self.n_state)
+            self.hybrid_state_slice = slice(self.n_state, self.n_state)
+        else:
+            self.ac_state_cols = np.array([], dtype=np.int32)
+            self.dc_state_cols = np.arange(self.n_state, dtype=np.int32)
+            self.hybrid_state_cols = np.array([], dtype=np.int32)
+            self.ac_vars = []
+            self.dc_vars = self.state_labels
+            self.hybrid_vars = []
+            self.ac_state_slice = slice(0, 0)
+            self.dc_state_slice = slice(0, self.n_state)
+            self.hybrid_state_slice = slice(self.n_state, self.n_state)
 
     def _adopt_delegate_active_partition(self, side: str) -> None:
         count = len(self.active_measurements)
@@ -6590,6 +6815,28 @@ class HybridStateEstimator:
         array_only = mode == "array"
         if array_only and remove_bad_data:
             raise ValueError("result_mode='array' cannot be combined with remove_bad_data=True")
+        delegate = self._delegate()
+        if delegate is not None:
+            result = delegate.run(
+                result_mode=mode,
+                remove_bad_data=remove_bad_data,
+                bad_threshold=threshold,
+                max_remove=max_remove,
+                skip_bad_data=skip_bad_data,
+                verbose=verbose,
+                final_diagnostics=final_diagnostics,
+                observability=observability,
+            )
+            self.observability_result = getattr(delegate, "observability_result", None)
+            self.estimate_result = getattr(delegate, "estimate_result", None)
+            self.removed_bad_data = list(getattr(delegate, "removed_bad_data", []) or [])
+            self.bad_items = list(getattr(delegate, "bad_items", []) or [])
+            self.normalized_residual = np.asarray(
+                getattr(delegate, "normalized_residual", np.array([], dtype=np.float64)),
+                dtype=np.float64,
+            )
+            self.se_result = getattr(delegate, "se_result", None)
+            return result
         needs_bad_data = not skip_bad_data
         if observability is None:
             observability = self.observability_analysis()

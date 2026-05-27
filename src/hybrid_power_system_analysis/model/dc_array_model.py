@@ -386,8 +386,16 @@ def build_dc_ppc_from_e_file(file_path) -> Dict:
 
 def build_dc_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build DC ppc from E rows that are already loaded in memory."""
-    path = resolve_project_file(file_path).resolve()
-    return _build_dc_ppc_from_rows_dict(rows, path)
+    file_key = _file_cache_key(file_path)
+    with _DC_PPC_CACHE_LOCK:
+        cached = _DC_PPC_CACHE.get(file_key[0])
+        if cached is not None and cached[0] == file_key:
+            return cached[1]
+    ppc = _build_dc_ppc_from_rows_dict(rows, file_key[0])
+    ppc["source"] = str(file_key[0])
+    with _DC_PPC_CACHE_LOCK:
+        _DC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    return ppc
 
 
 _VALUE_FLOAT = 0

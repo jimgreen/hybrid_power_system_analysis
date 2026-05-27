@@ -777,7 +777,7 @@ class ACStateEstimator:
                 normalized=bool(self.meas_ppc.get("normalized", False)),
             )
         elif isinstance(measurements, dict):
-            self.meas_ppc = copy_meas_ppc(measurements)
+            self.meas_ppc = measurements if measurements.get("_mutable_runtime_arrays") else copy_meas_ppc(measurements)
             self.meas_ppc["_mutable_runtime_arrays"] = True
             self.measurements = self._measurement_sequence_from_table(
                 measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
