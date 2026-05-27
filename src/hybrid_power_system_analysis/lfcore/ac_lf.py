@@ -56,6 +56,7 @@ from ac_array_model import (
     SWITCH_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
+    build_ac_ppc_from_mat_file,
     build_ac_ppc_from_network,
 )
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
@@ -113,8 +114,14 @@ class ACLFResult:
 
 
 def load_ac_ppc_from_e_file(file_name) -> Dict:
-    """Read an AC E file into PPC with topology arrays attached."""
-    return build_ac_ppc_with_topology_from_e_file(file_name)
+    """Read an AC E/MATPOWER file into PPC with topology arrays attached."""
+    path = Path(file_name)
+    suffix = path.suffix.lower()
+    if suffix in {".m", ".mat"}:
+        ppc = build_ac_ppc_from_mat_file(path)
+        ppc["source"] = str(path.resolve())
+        return ensure_ac_ppc_topology(ppc)
+    return build_ac_ppc_with_topology_from_e_file(path)
 
 
 def _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, n_rows: int):

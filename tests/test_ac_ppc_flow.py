@@ -377,6 +377,91 @@ class ACPPCFlowTest(unittest.TestCase):
             self.assertEqual((1, 21), np.atleast_2d(np.asarray(saved_mpc.gen)).shape)
             self.assertEqual((2, 13), np.asarray(saved_mpc.branch).shape)
 
+    def test_ac_ppc_matpower_export_maps_acac_ports_to_gen_or_load(self):
+        from ac_array_model import (
+            ACAC_COLS,
+            ACAC_CONTROL_CODE,
+            BUS_COLS,
+            build_matpower_ppc_from_ac_ppc,
+        )
+
+        bus = np.zeros((2, len(BUS_COLS)), dtype=np.float64)
+        bus[:, BUS_COLS["idx"]] = [1, 2]
+        bus[:, BUS_COLS["vbase"]] = [230.0, 230.0]
+        bus[:, BUS_COLS["voltage"]] = [1.02, 0.98]
+        bus[:, BUS_COLS["run_stat"]] = 1.0
+
+        acac = np.zeros((1, len(ACAC_COLS)), dtype=np.float64)
+        acac[0, ACAC_COLS["idx"]] = 1
+        acac[0, ACAC_COLS["i_node"]] = 1
+        acac[0, ACAC_COLS["j_node"]] = 2
+        acac[0, ACAC_COLS["control_type"]] = ACAC_CONTROL_CODE["PVQ"]
+        acac[0, ACAC_COLS["i_v_set"]] = 1.04
+        acac[0, ACAC_COLS["run_stat"]] = 1.0
+        acac[0, ACAC_COLS["i_p"]] = -0.30
+        acac[0, ACAC_COLS["i_q"]] = -0.10
+        acac[0, ACAC_COLS["j_p"]] = 0.31
+        acac[0, ACAC_COLS["j_q"]] = 0.12
+
+        ppc = {
+            "format": "ac_ppc_v1",
+            "base": {"p_base": 100.0},
+            "bus": bus,
+            "acac": acac,
+        }
+
+        matpower = build_matpower_ppc_from_ac_ppc(ppc)
+
+        self.assertEqual((2, 13), matpower["bus"].shape)
+        self.assertEqual((1, 21), matpower["gen"].shape)
+        self.assertEqual(2.0, matpower["bus"][0, 1])
+        self.assertAlmostEqual(30.0, matpower["gen"][0, 1])
+        self.assertAlmostEqual(10.0, matpower["gen"][0, 2])
+        self.assertAlmostEqual(1.04, matpower["gen"][0, 5])
+        self.assertAlmostEqual(31.0, matpower["bus"][1, 2])
+        self.assertAlmostEqual(12.0, matpower["bus"][1, 3])
+
+    def test_ac_and_hybrid_lf_load_matpower_m_files_as_ac_ppc(self):
+        import ac_lf
+        import hybrid_lf
+        from ac_array_model import BUS_COLS
+        from ac_lf import ACPowerFlowCalc
+        from hybrid_lf import HybridPowerFlowCalc
+
+        case_text = """function mpc = case2
+mpc.version = '2';
+mpc.baseMVA = 100;
+mpc.bus = [
+  1 3 0 0 0 0 1 1 0 230 1 1.1 0.9;
+  2 1 20 8 0 0 1 1 0 230 1 1.1 0.9;
+];
+mpc.gen = [
+  1 30 0 100 -100 1 100 1 100 0 0 0 0 0 0 0 0 0 0 0 0;
+];
+mpc.branch = [
+  1 2 0.01 0.05 0.02 0 0 0 0 0 1 -360 360;
+];
+"""
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_path = Path(tmp_dir) / "case2.m"
+            case_path.write_text(case_text, encoding="utf-8")
+
+            ppc = ac_lf.load_ac_ppc_from_e_file(case_path)
+            self.assertEqual("ac_ppc_v1", ppc["format"])
+            self.assertIn("_topology_arrays", ppc)
+            self.assertEqual((2, len(BUS_COLS)), ppc["bus"].shape)
+            ac_calc = ACPowerFlowCalc(ppc, result_mode="array", verbose=False)
+            self.assertEqual(0, ac_calc.run())
+            self.assertTrue(ac_calc.converged)
+
+            network = hybrid_lf._read_lf_network_from_file(case_path)
+            self.assertIsNotNone(network._ac_ppc)
+            self.assertIsNone(network.ppc.get("dc"))
+            hybrid_calc = HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+            self.assertEqual(0, hybrid_calc.run())
+            self.assertTrue(hybrid_calc.converged)
+
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
         source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
             encoding="utf-8"

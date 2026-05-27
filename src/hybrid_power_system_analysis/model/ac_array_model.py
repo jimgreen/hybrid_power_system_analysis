@@ -729,6 +729,60 @@ def _load_matpower_case_from_mat_file(file_path, variable_name: str = "mpc") -> 
     raise KeyError(f"MAT file {path} does not contain variable {variable_name!r} or ppc fields")
 
 
+def _strip_matpower_comment(line: str) -> str:
+    in_quote = False
+    out = []
+    for char in line:
+        if char == "'":
+            in_quote = not in_quote
+        if char == "%" and not in_quote:
+            break
+        out.append(char)
+    return "".join(out)
+
+
+def _parse_matpower_numeric_matrix(text: str, name: str) -> np.ndarray:
+    import re
+
+    pattern = re.compile(rf"mpc\.{re.escape(name)}\s*=\s*\[(.*?)\]\s*;", re.IGNORECASE | re.DOTALL)
+    match = pattern.search(text)
+    if match is None:
+        return _matpower_empty(0)
+    rows = []
+    for raw_row in match.group(1).split(";"):
+        cleaned = " ".join(_strip_matpower_comment(line) for line in raw_row.splitlines()).replace(",", " ").strip()
+        if not cleaned:
+            continue
+        rows.append([float(value) for value in cleaned.split()])
+    if not rows:
+        return _matpower_empty(0)
+    width = len(rows[0])
+    if any(len(row) != width for row in rows):
+        raise ValueError(f"MATPOWER mpc.{name} matrix rows are not rectangular")
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _load_matpower_case_from_m_file(file_path, variable_name: str = "mpc") -> Dict[str, Any]:
+    import re
+
+    path = Path(file_path)
+    text = path.read_text(encoding="utf-8")
+    if variable_name != "mpc":
+        text = re.sub(rf"\b{re.escape(variable_name)}\.", "mpc.", text)
+    no_comments = "\n".join(_strip_matpower_comment(line) for line in text.splitlines())
+    base_match = re.search(r"mpc\.baseMVA\s*=\s*([^;]+);", no_comments, re.IGNORECASE)
+    if base_match is None:
+        raise KeyError(f"MATPOWER file {path} does not define mpc.baseMVA")
+    version_match = re.search(r"mpc\.version\s*=\s*'([^']+)'", no_comments, re.IGNORECASE)
+    return {
+        "version": version_match.group(1) if version_match is not None else "2",
+        "baseMVA": float(base_match.group(1).strip()),
+        "bus": _parse_matpower_numeric_matrix(text, "bus"),
+        "gen": _parse_matpower_numeric_matrix(text, "gen"),
+        "branch": _parse_matpower_numeric_matrix(text, "branch"),
+    }
+
+
 def _active_rows(rows: np.ndarray, run_col: int) -> np.ndarray:
     if rows.size == 0:
         return rows
@@ -809,7 +863,10 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
     Zero branches, closed switches, and closed breakers are collapsed into one
     MATPOWER bus. ZIP loads are exported as static P/Q at V=1. Transformer
     ``gt/bt`` grounding admittance is converted to an equivalent i-side bus
-    shunt referred through the tap magnitude.
+    shunt referred through the tap magnitude. ACAC converter terminal powers
+    are projected to MATPOWER bus loads or generator rows: positive terminal
+    P/Q is a PQ load, while injected or voltage-controlled terminals become
+    PQ/PV/reference generator rows.
     """
 
     base_mva = _base_mva_from_ac_ppc(ac_ppc)
@@ -819,6 +876,7 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
     gen0 = np.asarray(ac_ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
     load0 = np.asarray(ac_ppc.get("load", _empty(len(LOAD_COLS))), dtype=np.float64)
     shunt0 = np.asarray(ac_ppc.get("shunt", _empty(len(SHUNT_COLS))), dtype=np.float64)
+    acac0 = np.asarray(ac_ppc.get("acac", _empty(len(ACAC_COLS))), dtype=np.float64)
 
     row_to_comp, comp_rows, row_by_node, row_to_bus_id = _build_matpower_components(ac_ppc)
     comp_count = len(comp_rows)
@@ -877,6 +935,69 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         elif bus_type[comp] != MP_REF and control in (CTRL_PV, CTRL_P):
             bus_type[comp] = MP_PV
 
+    acac_gen_rows = []
+
+    def add_acac_terminal_power(node_id: float, p: float, q: float, control_kind: str, voltage_set: float) -> None:
+        bus_row = row_by_node.get(int(node_id))
+        if bus_row is None or row_to_comp[bus_row] < 0:
+            return
+        comp = int(row_to_comp[bus_row])
+        kind = str(control_kind).upper()
+        is_voltage_source = kind in {"V", "H", "PH", "SLACK"}
+        is_source = is_voltage_source or p < -1e-12
+        if is_source:
+            gen_row = np.zeros(21, dtype=np.float64)
+            gen_row[MP_GEN_BUS] = row_to_bus_id[bus_row]
+            gen_row[MP_PG] = -p * base_mva
+            gen_row[MP_QG] = -q * base_mva
+            gen_row[MP_QMAX] = 1e9
+            gen_row[MP_QMIN] = -1e9
+            gen_row[MP_VG] = voltage_set if abs(voltage_set) > 1e-12 else vm0[comp]
+            gen_row[MP_MBASE] = base_mva
+            gen_row[MP_GEN_STATUS] = 1
+            gen_row[MP_PMAX] = 1e9
+            gen_row[MP_PMIN] = -1e9
+            acac_gen_rows.append(gen_row)
+            if kind in {"H", "PH", "SLACK"}:
+                bus_type[comp] = MP_REF
+            elif kind == "V" and bus_type[comp] != MP_REF:
+                bus_type[comp] = MP_PV
+            return
+        if abs(p) <= 1e-12 and abs(q) <= 1e-12:
+            return
+        pd[comp] += p * base_mva
+        qd[comp] += q * base_mva
+
+    for row in _active_rows(acac0, ACAC_COLS["run_stat"]):
+        control_label = ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ")
+        i_control = control_label[1] if len(control_label) > 1 else "Q"
+        j_control = control_label[2] if len(control_label) > 2 else "Q"
+        i_p = float(row[ACAC_COLS["i_p"]])
+        i_q = float(row[ACAC_COLS["i_q"]])
+        j_p = float(row[ACAC_COLS["j_p"]])
+        j_q = float(row[ACAC_COLS["j_q"]])
+        if abs(i_p) <= 1e-12 and abs(j_p) <= 1e-12 and abs(row[ACAC_COLS["p_set"]]) > 1e-12:
+            i_p = float(row[ACAC_COLS["p_set"]])
+            j_p = -i_p
+        if i_control == "Q" and abs(i_q) <= 1e-12 and abs(row[ACAC_COLS["i_q_set"]]) > 1e-12:
+            i_q = float(row[ACAC_COLS["i_q_set"]])
+        if j_control == "Q" and abs(j_q) <= 1e-12 and abs(row[ACAC_COLS["j_q_set"]]) > 1e-12:
+            j_q = float(row[ACAC_COLS["j_q_set"]])
+        add_acac_terminal_power(
+            row[ACAC_COLS["i_node"]],
+            i_p,
+            i_q,
+            i_control,
+            float(row[ACAC_COLS["i_v_set"]]),
+        )
+        add_acac_terminal_power(
+            row[ACAC_COLS["j_node"]],
+            j_p,
+            j_q,
+            j_control,
+            float(row[ACAC_COLS["j_v_set"]]),
+        )
+
     bus = np.zeros((comp_count, 13), dtype=np.float64)
     bus[:, MP_BUS_I] = comp_to_bus_id
     bus[:, MP_BUS_TYPE] = bus_type
@@ -909,6 +1030,7 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         gen_row[MP_PMAX] = 1e9
         gen_row[MP_PMIN] = -1e9
         gen_rows.append(gen_row)
+    gen_rows.extend(acac_gen_rows)
     gen = np.vstack(gen_rows) if gen_rows else np.zeros((0, 21), dtype=np.float64)
 
     branch_rows = []
@@ -954,13 +1076,18 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
 
     The input must provide ``baseMVA``, ``bus``, ``gen`` and ``branch`` either
     inside a MATLAB struct named by ``variable_name`` or as top-level MAT
-    variables. Bus loads and shunts are converted into ACLoad/ACShunt rows.
+    variables. Text MATPOWER ``.m`` files using ``mpc.*`` assignments are also
+    accepted. Bus loads and shunts are converted into ACLoad/ACShunt rows.
     MATPOWER branches with tap or phase shift are converted into ACTransformer
     rows; ordinary branches stay in the ACBranch table.
     """
 
     path = Path(file_path).resolve()
-    mpc = _load_matpower_case_from_mat_file(path, variable_name=variable_name)
+    mpc = (
+        _load_matpower_case_from_m_file(path, variable_name=variable_name)
+        if path.suffix.lower() == ".m"
+        else _load_matpower_case_from_mat_file(path, variable_name=variable_name)
+    )
     base_mva = _matpower_scalar(mpc.get("baseMVA"), 1.0)
     bus_mp = _matpower_matrix(mpc.get("bus"), 13, required=True)
     gen_mp = _matpower_matrix(mpc.get("gen"), 10)

@@ -73,6 +73,7 @@ from ac_array_model import (
     SWITCH_COLS as AC_SWITCH_COLS,
     TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
     ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
+    build_ac_ppc_from_mat_file,
 )
 from dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
@@ -96,6 +97,7 @@ from model.ppc_topology import (
     build_dc_ppc_with_topology_from_e_file,
     build_dc_ppc_with_topology_from_efile_rows,
     build_hybrid_ppc_with_topology_from_efile_rows,
+    ensure_ac_ppc_topology,
 )
 
 
@@ -381,6 +383,10 @@ def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightH
         if rows is None
         else build_ac_ppc_with_topology_from_efile_rows(file_name, rows)
     )
+    return _build_lf_network_from_single_ac_ppc(file_name, ac_ppc)
+
+
+def _build_lf_network_from_single_ac_ppc(file_name, ac_ppc) -> _LightweightHybridNetwork:
     base = ac_ppc["base"]
     ac_network = _lightweight_ac_network(ac_ppc)
     dc_network = _lightweight_dc_network()
@@ -525,6 +531,12 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
 
 
 def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
+    path = Path(file_name)
+    if path.suffix.lower() in {".m", ".mat"}:
+        ac_ppc = build_ac_ppc_from_mat_file(path)
+        ac_ppc["source"] = str(path.resolve())
+        return _build_lf_network_from_single_ac_ppc(path, ensure_ac_ppc_topology(ac_ppc))
+
     efile_rows = _read_efile_rows(file_name)
     file_kind = _detect_lf_rows_kind(efile_rows)
     if file_kind == "ac":
