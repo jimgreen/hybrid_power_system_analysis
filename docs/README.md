@@ -10,6 +10,7 @@
 | 直流状态估计 | [dc_se.md](dc_se.md) | `src/hybrid_power_system_analysis/secore/dc_se.py` |
 | 交直流联合潮流 | [hybrid_lf.md](hybrid_lf.md) | `src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` |
 | 交直流联合状态估计 | [hybrid_se.md](hybrid_se.md) | `src/hybrid_power_system_analysis/secore/hybrid_se.py` |
+| LF/SE 模型与算法总览 | [lf_se_models_algorithms.md](lf_se_models_algorithms.md) | `src/hybrid_power_system_analysis/lfcore/*.py`, `src/hybrid_power_system_analysis/secore/*.py` |
 | 潮流设备模型汇总 | [load_flow_device_models.md](load_flow_device_models.md) | `src/hybrid_power_system_analysis/lfcore/*.py` |
 | AC/Hybrid 与 MATPOWER 对比 | [load_flow_matpower_comparison.md](load_flow_matpower_comparison.md) | 对比口径与基准结果 |
 
