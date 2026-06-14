@@ -655,6 +655,8 @@ class HybridPowerFlowCalc:
         solver_name = str(linear_solver).strip().lower() if linear_solver is not None else ""
         self.linear_solver = solver_name or _default_hybrid_linear_solver(self.has_dc)
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
+        # 实例级可选求解器黑名单: 失败时只在本实例回退 scipy, 不污染模块缓存。
+        self._instance_solver_blacklist: set = set()
         self.ac_calc = self._build_ac_subcalc()
         self.dc_calc = self._build_dc_subcalc()
         self.converged = False
@@ -2063,6 +2065,13 @@ class HybridPowerFlowCalc:
         solver_fn = self._linear_solver_fn
         reusable_factorizer = None
 
+        # 若本实例已把 KLU/UMFPACK 加入黑名单, 直接走 scipy, 避免重复触发失败路径。
+        if self._instance_solver_blacklist and resolved_name in self._instance_solver_blacklist:
+            resolved_name = "scipy"
+            solver_fn = _scipy_spsolve
+            self._linear_solver_resolved = "scipy"
+            self._linear_solver_fn = _scipy_spsolve
+
         for it in range(self.max_iter):
             F, J = self._build_newton_system(x)
             self.iterations = it + 1
@@ -2102,10 +2111,13 @@ class HybridPowerFlowCalc:
                     else _factor_jacobian(J, resolved_name, solver_fn)
                 )
                 delta = factor.solve(F)
-            except Exception:
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                # 可选稀疏求解器失败时, 只在本实例回退到 scipy, 避免污染模块缓存。
+                if resolved_name not in {"scipy", "superlu", "default"}:
+                    self._instance_solver_blacklist.add(resolved_name)
+                    if self.verbose:
+                        print(f"[hybrid_lf] 可选稀疏求解器 {resolved_name!r} 失败，回退到 scipy: {exc}")
                 reusable_factorizer = None
-                _AC_OPTIONAL_SPARSE_SOLVERS.pop(resolved_name, None)
-                _AC_OPTIONAL_SPARSE_MISSING.add(resolved_name)
                 resolved_name = "scipy"
                 solver_fn = _scipy_spsolve
                 self._linear_solver_resolved = "scipy"

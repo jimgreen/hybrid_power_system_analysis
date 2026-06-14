@@ -288,6 +288,8 @@ class ACPowerFlowCalc:
         # 由 _resolve_linear_solver 决定，未安装时回退 SuperLU。
         self.linear_solver = str(linear_solver or "pyklu").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
+        # 实例级可选求解器黑名单: 失败时只在本实例回退 scipy, 不污染模块缓存。
+        self._instance_solver_blacklist: set = set()
         self.verbose = bool(verbose)
         self.target_island = island
         self.skipped_islands: List = []
@@ -2287,6 +2289,10 @@ class ACPowerFlowCalc:
         self.iterations = 0
         x = self.x.copy()
 
+        # 若本实例已把 KLU/UMFPACK 加入黑名单, 直接走 scipy, 避免重复触发失败路径。
+        if self._instance_solver_blacklist and self._linear_solver_resolved in self._instance_solver_blacklist:
+            self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
+
         for it in range(self.max_iter):
             self.iterations += 1
 
@@ -2308,10 +2314,13 @@ class ACPowerFlowCalc:
             try:
                 factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
                 delta = factor.solve(F)
-            except Exception:
-                # 因子分解或解算失败时，回退到 SuperLU spsolve 单步路径。
-                _OPTIONAL_SPARSE_SOLVERS.pop(self._linear_solver_resolved, None)
-                _OPTIONAL_SPARSE_MISSING.add(self._linear_solver_resolved)
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                # 因子分解或解算失败时, 仅本实例回退到 SuperLU spsolve 单步路径,
+                # 避免污染模块级缓存 (同进程内其他 calc 仍可继续尝试 KLU)。
+                if self._linear_solver_resolved not in {"scipy", "superlu", "default"}:
+                    self._instance_solver_blacklist.add(self._linear_solver_resolved)
+                    if self.verbose:
+                        print(f"[ac_lf] 可选稀疏求解器 {self._linear_solver_resolved!r} 失败，回退到 scipy: {exc}")
                 self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
                 delta = spsolve(J, F)
             # 方程定义为 F(x)=0，这里使用 x_new = x - J^{-1}F。

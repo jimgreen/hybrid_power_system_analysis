@@ -233,6 +233,9 @@ class DCPowerFlowCalc:
         # 由 _resolve_linear_solver 决定，未安装时回退 SuperLU。
         self.linear_solver = str(linear_solver or "pyklu").strip().lower()
         self._linear_solver_resolved, self._linear_solver_fn = _resolve_linear_solver(self.linear_solver)
+        # 实例级可选求解器黑名单: 当 KLU/UMFPACK 失败时,只把本实例切换到 scipy,
+        # 不会污染模块级缓存 (这样同进程内其他 calc 仍可继续尝试 KLU)。
+        self._instance_solver_blacklist = set()
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
         self._cache_csr_jacobian_pattern = self.result_mode == "full"
@@ -2017,6 +2020,12 @@ class DCPowerFlowCalc:
         self.iterations = 0
         x = self.x.copy()
 
+        # 若实例级黑名单上仍有非 scipy 求解器,本次迭代直接走 scipy,
+        # 避免重复进入 _factor_jacobian 的同一失败路径。
+        if self._instance_solver_blacklist and self._linear_solver_resolved in self._instance_solver_blacklist:
+            self._linear_solver_resolved = "scipy"
+            self._linear_solver_fn = spsolve
+
         for it in range(self.max_iter):
             self.iterations += 1
             F, J = self._build_newton_system(x)
@@ -2035,9 +2044,14 @@ class DCPowerFlowCalc:
             try:
                 factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
                 delta = factor.solve(F)
-            except Exception:
-                _OPTIONAL_SPARSE_SOLVERS.pop(self._linear_solver_resolved, None)
-                _OPTIONAL_SPARSE_MISSING.add(self._linear_solver_resolved)
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                # 仅在真正与求解器/数值相关的异常上降级；其他异常继续向上抛。
+                # 不要污染模块级缓存:同一进程内其他 calc 实例仍可继续使用
+                # KLU/UMFPACK,本次只在当前实例上回退到 scipy SuperLU。
+                if self._linear_solver_resolved not in {"scipy", "superlu", "default"}:
+                    self._instance_solver_blacklist.add(self._linear_solver_resolved)
+                    if self.verbose:
+                        print(f"[dc_lf] 可选稀疏求解器 {self._linear_solver_resolved!r} 失败，回退到 scipy: {exc}")
                 self._linear_solver_resolved = "scipy"
                 self._linear_solver_fn = spsolve
                 delta = spsolve(J, F)
