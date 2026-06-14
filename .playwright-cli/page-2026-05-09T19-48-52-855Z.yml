@@ -1,0 +1,100 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - link "电网规划系统" [ref=e4] [cursor=pointer]:
+      - /url: index.html
+    - navigation "主功能导航" [ref=e5]:
+      - link "系统首页" [ref=e6] [cursor=pointer]:
+        - /url: index.html
+      - link "参数维护" [ref=e7] [cursor=pointer]:
+        - /url: planning.html
+      - button "启动优化" [disabled] [ref=e8]
+      - button "方案评估" [disabled] [ref=e9]
+      - button "结果比对" [disabled] [ref=e10]
+  - generic [ref=e11]:
+    - complementary [ref=e12]:
+      - generic [ref=e13]: 方案列表
+      - generic [ref=e14]:
+        - button "1111" [ref=e15] [cursor=pointer]
+        - button "222" [ref=e16] [cursor=pointer]
+        - button "2222" [ref=e17] [cursor=pointer]
+        - button "aaa" [ref=e18] [cursor=pointer]
+        - button "aaa_bbb_ccc" [ref=e19] [cursor=pointer]
+        - button "aaa_bbb_ccc_副本" [ref=e20] [cursor=pointer]
+    - generic [ref=e21]:
+      - generic [ref=e22]:
+        - generic [ref=e24]:
+          - generic [ref=e25]: "当前方案:"
+          - strong [ref=e26]: "1111"
+        - tablist "参数维护标签" [ref=e27]:
+          - button "8760时序数据" [ref=e28] [cursor=pointer]
+          - button "设备参数" [ref=e29] [cursor=pointer]
+          - button "规划参数" [ref=e30] [cursor=pointer]
+          - button "方案概览" [ref=e31] [cursor=pointer]
+        - generic "方案操作" [ref=e32]:
+          - button "新建方案" [ref=e33] [cursor=pointer]
+          - button "复制方案" [ref=e34] [cursor=pointer]
+          - button "修改名称" [ref=e35] [cursor=pointer]
+          - button "保存方案" [ref=e36] [cursor=pointer]
+          - button "删除方案" [ref=e37] [cursor=pointer]
+      - generic [ref=e38]:
+        - generic [ref=e39]:
+          - generic [ref=e41]:
+            - generic [ref=e42]:
+              - radio "风速" [checked] [ref=e43]
+              - text: 风速
+            - generic [ref=e44]:
+              - radio "太阳辐照" [ref=e45]
+              - text: 太阳辐照
+            - generic [ref=e46]:
+              - radio "温度" [ref=e47]
+              - text: 温度
+            - generic [ref=e48]:
+              - radio "负荷" [ref=e49]
+              - text: 负荷
+          - generic "历史气象数据获取" [ref=e50]:
+            - generic [ref=e51]:
+              - text: 地名
+              - textbox "地名" [ref=e52]:
+                - /placeholder: 例如：秦岭站
+            - button "获取坐标" [ref=e53] [cursor=pointer]
+            - button "地图选点" [ref=e54] [cursor=pointer]
+            - generic [ref=e55]:
+              - text: 纬度
+              - spinbutton "纬度" [ref=e56]
+            - generic [ref=e57]:
+              - text: 经度
+              - spinbutton "经度" [ref=e58]
+            - generic [ref=e59]:
+              - text: 历史数据年
+              - spinbutton "历史数据年" [ref=e60]
+            - button "获取历史气象" [ref=e61] [cursor=pointer]
+            - status
+          - img "8760点风光温荷曲线" [ref=e62]:
+            - generic [ref=e64]: 时序数据加载中...
+        - separator "调整时序图高度" [ref=e65]
+        - generic [ref=e66]:
+          - generic [ref=e67]:
+            - generic "小时级数据月份分页" [ref=e68]:
+              - button "1月" [ref=e69] [cursor=pointer]
+              - button "2月" [ref=e70] [cursor=pointer]
+              - button "3月" [ref=e71] [cursor=pointer]
+              - button "4月" [ref=e72] [cursor=pointer]
+              - button "5月" [ref=e73] [cursor=pointer]
+              - button "6月" [ref=e74] [cursor=pointer]
+              - button "7月" [ref=e75] [cursor=pointer]
+              - button "8月" [ref=e76] [cursor=pointer]
+              - button "9月" [ref=e77] [cursor=pointer]
+              - button "10月" [ref=e78] [cursor=pointer]
+              - button "11月" [ref=e79] [cursor=pointer]
+              - button "12月" [ref=e80] [cursor=pointer]
+            - generic [ref=e81]: 加载中
+          - generic [ref=e83]: 时序数据加载中...
+    - complementary [ref=e84]:
+      - generic [ref=e85]: 校验与摘要
+      - generic [ref=e86]:
+        - generic [ref=e87]:
+          - text: 当前方案：
+          - strong [ref=e88]: "1111"
+        - generic [ref=e89]: 8760行数：8760
+        - generic [ref=e90]: 设备条目：8
+      - generic [ref=e92]: 8760时序数据延迟加载，当前行数为8760

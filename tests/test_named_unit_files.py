@@ -23,15 +23,15 @@ class NamedUnitFileTest(unittest.TestCase):
         from efile_read import EBook
         from hybrid_lf import HybridPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "hybrid" / "qinling.e"
+        case_path = ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
         raw = EBook(case_path).to_dict()
 
         self.assertIn("PowerBase", raw)
         power_base = raw["PowerBase"]["data"][0]
         self.assertAlmostEqual(float(power_base["p_base"]), 100.0)
-        self.assertAlmostEqual(float(power_base["u_scale"]), 1000.0)
-        self.assertAlmostEqual(float(power_base["p_scale"]), 1.0)
-        self.assertAlmostEqual(float(power_base["i_scale"]), 1000.0)
+        self.assertEqual(power_base["u_unit"], "V")
+        self.assertEqual(power_base["p_unit"], "kW")
+        self.assertEqual(power_base["i_unit"], "A")
 
         ac_node = next(row for row in raw["ACNode"]["data"] if row["name"] == "wt01_src")
         dcac = next(row for row in raw["DCACConverter"]["data"] if row["name"] == "wt01_rect")
@@ -48,7 +48,7 @@ class NamedUnitFileTest(unittest.TestCase):
         from efile_read import EBook
         from secore.hybrid_se import HybridStateEstimator
 
-        meas_path = ROOT_DIR / "data" / "hybrid" / "qinling.meas"
+        meas_path = ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"
         raw = EBook(meas_path).to_dict()
         self.assertNotIn("PowerBase", raw)
         node_meas = next(row for row in raw["Measurement"]["data"] if row["name"] == "vm_wt01_src")
@@ -58,7 +58,7 @@ class NamedUnitFileTest(unittest.TestCase):
         self.assertAlmostEqual(float(conv_meas["value"]), 10.0, places=6)
 
         estimator = HybridStateEstimator(
-            e_file=ROOT_DIR / "data" / "hybrid" / "qinling.e",
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
             meas_file=meas_path,
         )
         node_est = next(meas for meas in estimator.active_measurements if meas.name == "vm_wt01_src")
@@ -128,7 +128,7 @@ class NamedUnitFileTest(unittest.TestCase):
         from efile_read import EBook
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"
         raw = EBook(case_path).to_dict()
         raw_node = next(row for row in raw["ACNode"]["data"] if row["name"] == "bus_1")
         raw_angle_deg = float(raw_node["angle"])
@@ -145,7 +145,7 @@ class NamedUnitFileTest(unittest.TestCase):
         from efile_read import EBook
         from secore.ac_se import ACStateEstimator
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"
         raw = EBook(case_path).to_dict()
         raw_node = next(row for row in raw["ACNode"]["data"] if row["name"] == "bus_1")
         raw_angle_deg = float(raw_node["angle"])
@@ -176,7 +176,7 @@ class NamedUnitFileTest(unittest.TestCase):
     def test_hybrid_state_estimator_angle_measurement_is_degrees_in_file(self):
         from secore.hybrid_se import HybridStateEstimator
 
-        case_path = ROOT_DIR / "data" / "hybrid" / "qinling.e"
+        case_path = ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
         raw_angle_deg = 30.0
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -206,7 +206,7 @@ class NamedUnitFileTest(unittest.TestCase):
         from unit_system import normalize_model_named_units
 
         model = SimpleNamespace(
-            PowerBase=[SimpleNamespace(p_base=100000.0, u_scale=1000.0, p_scale=1000.0, i_scale=1000.0)],
+            PowerBase=[SimpleNamespace(p_base=100000.0, u_unit="V", p_unit="W", i_unit="A")],
             ACNode=[
                 SimpleNamespace(idx=1, vbase=300.0, voltage=300.0),
                 SimpleNamespace(idx=2, vbase=300.0, voltage=297.0),

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Packaging and builds
+build/
+dist/
+*.egg-info/
+build_nuitka/
+nuitka-crash-report.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and OS local files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime logs and temporary runs
+log/
+tmp/
+tmp_*/
+*.prof
+tmp_ac_lf_profile*.txt
+tmp_ieee_ac_hybrid_se_bench.json
+
+# Generated result snapshots
+ieee300_ac_se_result.e
+ieee300_hybrid_se_result.e
+
+# Local third-party scratch installs
+tmp_pypower/

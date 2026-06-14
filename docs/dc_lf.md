@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`lfcore/dc_lf.py` 实现直流电网 Newton 潮流计算。核心类是 `DCPowerFlowCalc`。
+`src/hybrid_power_system_analysis/lfcore/dc_lf.py` 实现直流电网 Newton 潮流计算。核心类是 `DCPowerFlowCalc`。
 
 该模块负责：
 
@@ -17,11 +17,11 @@
 ```python
 from lfcore.dc_lf import DCPowerFlowCalc
 
-calc = DCPowerFlowCalc(network)
-rc = calc.run(tol=1e-8, max_iter=50, min_voltage=0.01, verbose=False)
+calc = DCPowerFlowCalc(network, tol=1e-8, max_iter=50, min_voltage=0.01, verbose=False)
+rc = calc.run()
 ```
 
-`run()` 内部会调用 `prepare()`，因此一般不需要外部单独调用。
+`run()` 内部会在需要时自动调用 `prepare()`；外部只有在需要调试或复用中间矩阵时才需要单独调用 `prepare()`。
 
 ## 支持的模型对象
 
@@ -128,4 +128,3 @@ P_load(V) = pv0 + pv1 * V + pv2 * V^2
 - 每个存活直流岛必须至少有一个电压控制源。
 - 多个定电压源位于同一岛时需要确认拓扑和控制设定合理。
 - 零阻抗支路不应以极小电阻普通支路替代。
-

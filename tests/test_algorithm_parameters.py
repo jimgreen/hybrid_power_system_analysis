@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -73,10 +74,8 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             normF = 0.0
 
             def __init__(self, ppc, **kwargs):
-                calls.append(("calc", ppc["format"], kwargs.get("parameter_file")))
-
-            def prepare(self):
-                calls.append("prepare")
+                calls.append(("calc", ppc["format"], kwargs.get("parameter_file"), kwargs.get("result_mode")))
+                self.result_mode = kwargs.get("result_mode")
 
             def run(self):
                 calls.append("run")
@@ -92,13 +91,13 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         ac_lf.load_ac_ppc_from_e_file = fake_loader
         ac_lf.ACPowerFlowCalc = FakeCalc
         try:
-            rc = ac_lf.main(["data/ac/ieee39.e", "--para", "custom_lf.para", "--quiet"])
+            rc = ac_lf.main(["data/model/ac/ieee39.e", "--para", "custom_lf.para", "--result-mode", "array", "--quiet"])
         finally:
             ac_lf.load_ac_ppc_from_e_file = original_loader
             ac_lf.ACPowerFlowCalc = original_calc
 
         self.assertEqual(0, rc)
-        self.assertEqual([("load", "ieee39.e"), ("calc", "ac_ppc_v1", "custom_lf.para"), "prepare", "run"], calls)
+        self.assertEqual([("load", "ieee39.e"), ("calc", "ac_ppc_v1", "custom_lf.para", "array"), "run"], calls)
 
     def test_dc_lf_cli_accepts_parameter_file_argument(self):
         import lfcore.dc_lf as dc_lf
@@ -114,7 +113,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
                 calls.append(("calc", network, kwargs.get("parameter_file")))
                 self.model = network
 
-            def run(self, **_kwargs):
+            def run(self):
                 calls.append("run")
                 return 0
 
@@ -133,7 +132,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         dc_lf._dc_network_from_ppc = fake_network_builder
         dc_lf.DCPowerFlowCalc = FakeCalc
         try:
-            rc = dc_lf.main(["data/dc/dc_net_30.e", "--para", "custom_lf.para", "--quiet"])
+            rc = dc_lf.main(["data/model/dc/dc_net_30.e", "--para", "custom_lf.para", "--quiet"])
         finally:
             dc_lf.load_dc_ppc_from_e_file = original_loader
             dc_lf._dc_network_from_ppc = original_network_builder
@@ -156,8 +155,41 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             def __init__(self, network, **kwargs):
                 calls.append(("calc", network, kwargs.get("parameter_file")))
 
-            def prepare(self):
-                calls.append("prepare")
+            def run(self):
+                calls.append("run")
+                return 0
+
+            def _build_lf_result(self):
+                return hybrid_lf.HybridLFResult(calc=self, rc=0)
+
+        original_loader = hybrid_lf._read_lf_network_from_file
+        original_calc = hybrid_lf.HybridPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return "hybrid-network"
+
+        hybrid_lf._read_lf_network_from_file = fake_loader
+        hybrid_lf.HybridPowerFlowCalc = FakeCalc
+        try:
+            rc = hybrid_lf.main(["data/model/hybrid/hybrid_net_40.e", "--para", "custom_lf.para", "--quiet"])
+        finally:
+            hybrid_lf._read_lf_network_from_file = original_loader
+            hybrid_lf.HybridPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "custom_lf.para"), "run"], calls)
+
+    def test_hybrid_lf_cli_accepts_linear_solver_argument(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        calls = []
+
+        class FakeCalc:
+            converged = True
+
+            def __init__(self, network, **kwargs):
+                calls.append(("calc", network, kwargs.get("linear_solver")))
 
             def run(self):
                 calls.append("run")
@@ -176,13 +208,228 @@ class AlgorithmParameterFileTest(unittest.TestCase):
         hybrid_lf._read_lf_network_from_file = fake_loader
         hybrid_lf.HybridPowerFlowCalc = FakeCalc
         try:
-            rc = hybrid_lf.main(["data/hybrid/hybrid_net_40.e", "--para", "custom_lf.para", "--quiet"])
+            rc = hybrid_lf.main(
+                [
+                    "data/model/hybrid/hybrid_net_40.e",
+                    "--linear-solver",
+                    "custom.experimental_solver",
+                    "--quiet",
+                ]
+            )
         finally:
             hybrid_lf._read_lf_network_from_file = original_loader
             hybrid_lf.HybridPowerFlowCalc = original_calc
 
         self.assertEqual(0, rc)
-        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "custom_lf.para"), "prepare", "run"], calls)
+        self.assertEqual(
+            [
+                ("load", "hybrid_net_40.e"),
+                ("calc", "hybrid-network", "custom.experimental_solver"),
+                "run",
+            ],
+            calls,
+        )
+
+    def test_lf_cli_defaults_to_automatic_linear_solver(self):
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
+        import lfcore.hybrid_lf as hybrid_lf
+
+        cases = (
+            (
+                ac_lf,
+                "load_ac_ppc_from_e_file",
+                "ACPowerFlowCalc",
+                ["data/model/ac/ieee300.e", "--quiet"],
+                lambda _file_name: {"format": "ac_ppc_v1"},
+            ),
+            (
+                dc_lf,
+                "load_dc_ppc_from_e_file",
+                "DCPowerFlowCalc",
+                ["data/model/dc/dc_net_30.e", "--quiet"],
+                lambda _file_name: {"format": "dc_ppc_v1"},
+            ),
+            (
+                hybrid_lf,
+                "_read_lf_network_from_file",
+                "HybridPowerFlowCalc",
+                ["data/model/hybrid/hybrid_net_40.e", "--quiet"],
+                lambda _file_name: "hybrid-network",
+                None,
+            ),
+        )
+
+        for case in cases:
+            if len(case) == 5:
+                module, loader_name, calc_name, argv, loader = case
+                expected_solver = "pyklu"
+            else:
+                module, loader_name, calc_name, argv, loader, expected_solver = case
+            calls = []
+
+            class FakeCalc:
+                skipped_islands = []
+                converged = True
+                iterations = 0
+                normF = 0.0
+                result_mode = "full"
+
+                def __init__(self, network, **kwargs):
+                    calls.append(kwargs.get("linear_solver"))
+
+                def run(self):
+                    return 0
+
+            original_loader = getattr(module, loader_name)
+            original_calc = getattr(module, calc_name)
+            setattr(module, loader_name, loader)
+            setattr(module, calc_name, FakeCalc)
+            try:
+                self.assertEqual(0, module.main(argv))
+            finally:
+                setattr(module, loader_name, original_loader)
+                setattr(module, calc_name, original_calc)
+
+            self.assertEqual([expected_solver], calls, calc_name)
+
+    def test_lf_calc_classes_default_to_automatic_linear_solver(self):
+        from lfcore.ac_lf import ACPowerFlowCalc
+        from lfcore.dc_lf import DCPowerFlowCalc
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        ac_calc = ACPowerFlowCalc({"format": "ac_ppc_v1"})
+        dc_calc = DCPowerFlowCalc({"format": "dc_ppc_v1"})
+        hybrid_network = SimpleNamespace(
+            ac=SimpleNamespace(nodes=[]),
+            dc=SimpleNamespace(nodes=[]),
+            dcac_converters=[],
+            acac_converters=[],
+        )
+        hybrid_calc = HybridPowerFlowCalc(hybrid_network, verbose=False)
+        hybrid_dc_network = SimpleNamespace(
+            ac=SimpleNamespace(nodes=[]),
+            dc=SimpleNamespace(nodes=[SimpleNamespace(idx=1)]),
+            dcac_converters=[],
+            acac_converters=[],
+        )
+        hybrid_dc_calc = HybridPowerFlowCalc(hybrid_dc_network, verbose=False)
+        explicit_hybrid_dc_calc = HybridPowerFlowCalc(hybrid_dc_network, verbose=False, linear_solver="pyklu")
+
+        self.assertEqual("pyklu", ac_calc.linear_solver)
+        self.assertEqual("pyklu", dc_calc.linear_solver)
+        self.assertEqual("pyklu", hybrid_calc.linear_solver)
+        self.assertEqual("umfpack", hybrid_dc_calc.linear_solver)
+        self.assertEqual("pyklu", explicit_hybrid_dc_calc.linear_solver)
+
+    def test_ac_dc_sparse_solver_registry_supports_sksparse_klu_solve(self):
+        import types
+
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
+        import lfcore.solver_common as solver_common
+
+        fake_solver = object()
+        original_find_spec = solver_common.importlib.util.find_spec
+        original_import_module = solver_common.importlib.import_module
+
+        def fake_find_spec(module_name):
+            return object() if module_name == "sksparse.klu" else None
+
+        def fake_import_module(module_name):
+            if module_name == "sksparse.klu":
+                return types.SimpleNamespace(klu_solve=fake_solver)
+            raise ImportError(module_name)
+
+        solver_common.importlib.util.find_spec = fake_find_spec
+        solver_common.importlib.import_module = fake_import_module
+        try:
+            for module in (ac_lf, dc_lf):
+                for solver_name in ("sksparse.klu.klu_solve", "klu_solve", "auto"):
+                    module._OPTIONAL_SPARSE_SOLVERS.clear()
+                    module._OPTIONAL_SPARSE_MISSING.clear()
+                    self.assertIs(fake_solver, module._load_named_sparse_solver(solver_name))
+        finally:
+            solver_common.importlib.util.find_spec = original_find_spec
+            solver_common.importlib.import_module = original_import_module
+
+    def test_ac_dc_sparse_solver_registry_supports_pyklu_wrapper(self):
+        import types
+
+        import numpy as np
+        from scipy.sparse import csr_matrix
+
+        import lfcore.ac_lf as ac_lf
+        import lfcore.dc_lf as dc_lf
+        import lfcore.solver_common as solver_common
+
+        calls = []
+        original_find_spec = solver_common.importlib.util.find_spec
+        original_import_module = solver_common.importlib.import_module
+
+        class FakeKlu:
+            def __init__(self, matrix):
+                calls.append(("init", matrix.getformat()))
+
+            def solve(self, rhs):
+                calls.append(("solve", tuple(rhs.tolist())))
+                return np.asarray(rhs, dtype=float) + 1.0
+
+        def fake_find_spec(module_name):
+            return object() if module_name == "PyKLU" else None
+
+        def fake_import_module(module_name):
+            if module_name == "PyKLU":
+                return types.SimpleNamespace(Klu=FakeKlu)
+            raise ImportError(module_name)
+
+        solver_common.importlib.util.find_spec = fake_find_spec
+        solver_common.importlib.import_module = fake_import_module
+        try:
+            for module in (ac_lf, dc_lf):
+                module._OPTIONAL_SPARSE_SOLVERS.clear()
+                module._OPTIONAL_SPARSE_MISSING.clear()
+                solver = module._load_named_sparse_solver("pyklu")
+                result = solver(csr_matrix([[1.0]]), np.array([2.0]))
+                np.testing.assert_allclose([3.0], result)
+        finally:
+            solver_common.importlib.util.find_spec = original_find_spec
+            solver_common.importlib.import_module = original_import_module
+
+        self.assertEqual([("init", "csc"), ("solve", (2.0,)), ("init", "csc"), ("solve", (2.0,))], calls)
+
+    def test_hybrid_lf_cli_defers_unknown_linear_solver_to_calc(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        calls = []
+
+        class FakeCalc:
+            converged = True
+
+            def __init__(self, network, **kwargs):
+                calls.append(("calc", network, kwargs.get("linear_solver")))
+
+            def run(self):
+                calls.append("run")
+                return 0
+
+        original_loader = hybrid_lf._read_lf_network_from_file
+        original_calc = hybrid_lf.HybridPowerFlowCalc
+
+        def fake_loader(file_name):
+            calls.append(("load", Path(file_name).name))
+            return "hybrid-network"
+
+        hybrid_lf._read_lf_network_from_file = fake_loader
+        hybrid_lf.HybridPowerFlowCalc = FakeCalc
+        try:
+            rc = hybrid_lf.main(["data/model/hybrid/hybrid_net_40.e", "--linear-solver", "unknown-solver", "--quiet"])
+        finally:
+            hybrid_lf._read_lf_network_from_file = original_loader
+            hybrid_lf.HybridPowerFlowCalc = original_calc
+
+        self.assertEqual(0, rc)
+        self.assertEqual([("load", "hybrid_net_40.e"), ("calc", "hybrid-network", "unknown-solver"), "run"], calls)
 
     def test_power_flow_classes_read_algorithm_parameters_from_lf_para(self):
         from algorithm_parameters import load_lf_parameters
@@ -200,17 +447,17 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             self.assertEqual(0.123, params.min_voltage)
             self.assertEqual(98765.0, params.divergence_threshold)
 
-            ac_calc = ACPowerFlowCalc(object(), parameter_file=para_file)
+            ac_calc = ACPowerFlowCalc({"format": "ac_ppc_v1"}, parameter_file=para_file)
             self.assertEqual(params.tol, ac_calc.tol)
             self.assertEqual(params.max_iter, ac_calc.max_iter)
             self.assertEqual(params.min_voltage, ac_calc.min_voltage)
 
-            dc_calc = DCPowerFlowCalc(object(), parameter_file=para_file)
+            dc_calc = DCPowerFlowCalc({"format": "dc_ppc_v1"}, parameter_file=para_file)
             self.assertEqual(params.tol, dc_calc.params.tol)
             self.assertEqual(params.max_iter, dc_calc.params.max_iter)
             self.assertEqual(params.min_voltage, dc_calc.params.min_voltage)
 
-            network = HybridPowerNetwork.read_from_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+            network = HybridPowerNetwork.read_from_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
             hybrid_calc = HybridPowerFlowCalc(network, parameter_file=para_file, verbose=False)
             self.assertEqual(params.tol, hybrid_calc.tol)
             self.assertEqual(params.max_iter, hybrid_calc.max_iter)
@@ -218,6 +465,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
 
     def test_state_estimator_reads_algorithm_parameters_from_se_para(self):
         from algorithm_parameters import load_se_parameters
+        from model.meas_model import is_pseudo_measurement
         from secore.ac_se import ACStateEstimator
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -243,7 +491,7 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             self.assertEqual(5, params.targeted_pseudo_measurement_step)
 
             estimator = ACStateEstimator(
-                e_file=ROOT_DIR / "data" / "ac" / "ac_net_10.e",
+                e_file=ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e",
                 meas_file=meas_file,
                 parameter_file=para_file,
             )
@@ -262,9 +510,9 @@ class AlgorithmParameterFileTest(unittest.TestCase):
             pseudo_weights = {
                 meas.weight
                 for meas in estimator.active_measurements
-                if meas.name.startswith("pseudo_")
+                if is_pseudo_measurement(meas)
             }
-            self.assertEqual({0.002}, pseudo_weights)
+            self.assertEqual({0.002, 0.002 * 1e-4}, pseudo_weights)
 
 
 if __name__ == "__main__":

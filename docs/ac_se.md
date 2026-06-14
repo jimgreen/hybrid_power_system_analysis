@@ -2,7 +2,7 @@
 
 ## 模块定位
 
-`secore/ac_se.py` 实现交流电网加权最小二乘状态估计。核心类是 `ACStateEstimator`。
+`src/hybrid_power_system_analysis/secore/ac_se.py` 实现交流电网加权最小二乘状态估计。核心类是 `ACStateEstimator`。
 
 该模块负责：
 
@@ -20,8 +20,8 @@
 from secore.ac_se import ACStateEstimator
 
 estimator = ACStateEstimator(
-    e_file="data/ac/ieee300.e",
-    meas_file="data/ac/ieee300.meas",
+    e_file="data/model/ac/ieee300.e",
+    meas_file="data/meas/ac/ieee300.meas",
     flat_start=True,
 )
 result = estimator.estimate(verbose=False)
@@ -30,7 +30,7 @@ result = estimator.estimate(verbose=False)
 命令行：
 
 ```powershell
-python secore\ac_se.py --case data\ac\ieee300.e --meas data\ac\ieee300.meas --flat-start --quiet
+python -m secore.ac_se --case data\model\ac\ieee300.e --meas data\meas\ac\ieee300.meas --flat-start --quiet
 ```
 
 常用参数：
@@ -64,7 +64,7 @@ idx name dev_type dev_name meas_type weight valid value
 | --- | --- |
 | `ACNode` | `V`, `ANGLE`/`THETA` |
 | `ACBranch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, `P_TO`, `Q_TO`, `V_TO`, `I_TO` |
-| `ACTransformer` | 同 `ACBranch` |
+| `ACTransformer` | 两端 P/Q/V/I，导纳模型与潮流一致：串联阻抗加 i 侧单端对地 `gt/bt` |
 | `ACSwitch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, `P_TO`, `Q_TO`, `V_TO`, `I_TO` |
 | `ACZeroBranch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, 以及 `V_DIFF`, `ANGLE_DIFF` |
 | `ACGenerator` | `P_GEN`, `Q_GEN`, `V_GEN`, `I_GEN` |
@@ -190,4 +190,3 @@ rN_i = abs(r_i) / sqrt(R_ii - h_i * G^-1 * h_i.T)
 - `.meas` 中的相角是度，内部自动转弧度。
 - E 文件和 `.meas` 的功率、电压、电流都应使用有名值，单位由 E 文件的 scale 字段解释。
 - AC 大规模拼接算例必须保留 `ACZeroBranch`，不要用普通极小阻抗线路替代。
-

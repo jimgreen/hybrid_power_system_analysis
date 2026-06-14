@@ -50,7 +50,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import SWITCH_COLS, build_ac_ppc_from_e_file
         from ac_model import ACPowerNetwork, ACBreak
 
-        source = ROOT_DIR / "data" / "ac" / "ac_net_10.e"
+        source = ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e"
         with tempfile.TemporaryDirectory() as tmp_dir:
             case_path = Path(tmp_dir) / "ac_break.e"
             text = source.read_text(encoding="utf-8")
@@ -89,7 +89,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "hybrid" / "qinling_100.e"
+        case_path = ROOT_DIR / "data" / "model" / "hybrid" / "qinling_100.e"
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             network.read_from_file(case_path)
@@ -112,7 +112,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee39.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee39.e"
         expected_network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             expected_network.read_from_file(case_path)
@@ -141,11 +141,11 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(calc.Y.toarray(), expected_calc.Y.toarray(), atol=1e-12)
 
     def test_ppc_flow_matches_object_flow_for_ieee300(self):
-        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_array_model import BUS_COLS, build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
 
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -167,76 +167,51 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual(0, ppc_rc)
         self.assertTrue(ppc_calc.converged)
 
-        object_voltage = np.asarray([node.voltage for node in object_calc.node_list])
-        object_angle = np.asarray([node.angle for node in object_calc.node_list])
+        self.assertFalse(object_calc.keep_node_objects)
+        self.assertEqual([], object_calc.node_list)
+        object_voltage = object_calc.result["bus"][:, BUS_COLS["voltage"]]
+        object_angle = object_calc.result["bus"][:, BUS_COLS["angle"]]
 
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["voltage"]], object_voltage, atol=1e-10)
         np.testing.assert_allclose(ppc_calc.result["bus"][:, ppc["bus_cols"]["angle"]], object_angle, atol=1e-10)
 
-    def test_ppc_flow_supports_pq_decoupled_algorithm(self):
+    def test_ac_lf_rejects_pq_decoupled_algorithm(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
 
-        nr_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
-        pq_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
-        with contextlib.redirect_stdout(io.StringIO()):
-            nr_calc.prepare()
-            nr_rc = nr_calc.run()
-            pq_calc.prepare()
-            pq_rc = pq_calc.run()
+        with self.assertRaises(TypeError):
+            ACPowerFlowCalc(ppc, algorithm="pq")
 
-        self.assertEqual("nr", nr_calc.algorithm)
-        self.assertEqual("pq", pq_calc.algorithm)
-        self.assertEqual(0, nr_rc)
-        self.assertEqual(0, pq_rc)
-        self.assertTrue(pq_calc.converged)
-        self.assertEqual("pq", pq_calc.used_algorithm)
-        self.assertLess(pq_calc.iterations, 50)
-
-        cols = ppc["bus_cols"]
-        np.testing.assert_allclose(
-            pq_calc.result["bus"][:, cols["voltage"]],
-            nr_calc.result["bus"][:, cols["voltage"]],
-            atol=1e-5,
-        )
-        np.testing.assert_allclose(
-            pq_calc.result["bus"][:, cols["angle"]],
-            nr_calc.result["bus"][:, cols["angle"]],
-            atol=1e-5,
-        )
-
-    def test_invalid_power_flow_algorithm_is_rejected(self):
+    def test_invalid_power_flow_algorithm_parameter_is_removed(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             ACPowerFlowCalc(ppc, algorithm="bad")
 
     def test_ac_power_flow_can_load_e_file_through_efile_reader_path(self):
         import ac_lf
-        from ac_array_model import build_ac_ppc_from_network as original_builder
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         previous_builder = getattr(ac_lf, "build_ac_ppc_from_network", None)
-        previous_file_builder = getattr(ac_lf, "build_ac_ppc_from_e_file", None)
+        previous_common_loader = ac_lf.build_ac_ppc_with_topology_from_e_file
         calls = []
 
-        def counted_builder(network):
-            calls.append((network.__class__.__name__, len(network.nodes)))
-            return original_builder(network)
+        def counted_common_loader(path):
+            calls.append(Path(path).name)
+            return previous_common_loader(path)
 
-        def reject_file_builder(*_args, **_kwargs):
-            raise AssertionError("AC LF should build ppc from an already loaded ACPowerNetwork")
+        def reject_network_builder(*_args, **_kwargs):
+            raise AssertionError("AC LF should use the shared E-to-PPC topology loader")
 
-        ac_lf.build_ac_ppc_from_network = counted_builder
-        if previous_file_builder is not None:
-            ac_lf.build_ac_ppc_from_e_file = reject_file_builder
+        ac_lf.build_ac_ppc_from_network = reject_network_builder
+        ac_lf.build_ac_ppc_with_topology_from_e_file = counted_common_loader
         try:
             ppc = ac_lf.load_ac_ppc_from_e_file(case_path)
             calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
@@ -245,25 +220,25 @@ class ACPPCFlowTest(unittest.TestCase):
                 del ac_lf.build_ac_ppc_from_network
             else:
                 ac_lf.build_ac_ppc_from_network = previous_builder
-            if previous_file_builder is not None:
-                ac_lf.build_ac_ppc_from_e_file = previous_file_builder
+            ac_lf.build_ac_ppc_with_topology_from_e_file = previous_common_loader
 
-        self.assertEqual([("ACPowerNetwork", 300)], calls)
-        self.assertTrue(calc.array_mode)
+        self.assertEqual(["ieee300.e"], calls)
+        self.assertFalse(hasattr(calc, "array_mode"))
         self.assertEqual("ac_ppc_v1", calc.ppc["format"])
+        self.assertIn("_topology_arrays", calc.ppc)
 
     def test_network_input_uses_array_kernel_and_writes_back_objects(self):
         from ac_array_model import BUS_COLS, GEN_COLS
         from ac_lf import ACPowerFlowCalc
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
             network.read_from_file(case_path)
 
         calc = ACPowerFlowCalc(network, tol=1e-8, max_iter=50)
-        self.assertTrue(calc.array_mode)
+        self.assertFalse(hasattr(calc, "array_mode"))
 
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -290,7 +265,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import BUS_COLS, build_ac_ppc_from_e_file, build_ac_ppc_from_network
         from ac_model import ACPowerNetwork
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         expected = build_ac_ppc_from_e_file(case_path)
         network = ACPowerNetwork()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -305,94 +280,294 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(ppc["bus"][1:], expected["bus"][1:])
         np.testing.assert_array_equal(ppc["bus_name"], expected["bus_name"])
 
-    def test_build_ac_ppc_from_e_file_delegates_through_network_model(self):
+    def test_build_ac_ppc_from_e_file_builds_directly_from_loaded_rows(self):
         import ac_array_model
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ac_array_model.clear_ac_ppc_cache(case_path)
-        original = ac_array_model.build_ac_ppc_from_network
-        calls = []
+        original_network_builder = ac_array_model.build_ac_ppc_from_network
+        original_model_builder = ac_array_model._build_ac_ppc_from_model
+        original_file_factory = ac_array_model.efile_factory_from_file
+        original_rows_factory = ac_array_model.efile_factory_from_rows
 
-        def counted_builder(network):
-            calls.append((network.__class__.__name__, len(network.nodes)))
-            return original(network)
+        def reject_object_path(*_args, **_kwargs):
+            raise AssertionError("AC E-file PPC load should not build dynamic model/network objects")
 
-        ac_array_model.build_ac_ppc_from_network = counted_builder
+        ac_array_model.build_ac_ppc_from_network = reject_object_path
+        ac_array_model._build_ac_ppc_from_model = reject_object_path
+        ac_array_model.efile_factory_from_file = reject_object_path
+        ac_array_model.efile_factory_from_rows = reject_object_path
         try:
             ppc = ac_array_model.build_ac_ppc_from_e_file(case_path)
         finally:
-            ac_array_model.build_ac_ppc_from_network = original
+            ac_array_model.build_ac_ppc_from_network = original_network_builder
+            ac_array_model._build_ac_ppc_from_model = original_model_builder
+            ac_array_model.efile_factory_from_file = original_file_factory
+            ac_array_model.efile_factory_from_rows = original_rows_factory
 
-        self.assertEqual([("ACPowerNetwork", 300)], calls)
         self.assertEqual("ac_ppc_v1", ppc["format"])
+        self.assertEqual(300, ppc["bus"].shape[0])
+
+    def test_ac_ppc_matpower_mat_read_write(self):
+        from scipy.io import loadmat, savemat
+
+        from ac_array_model import (
+            BRANCH_COLS,
+            BUS_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            TRANSFORMER_COLS,
+            build_ac_ppc_from_mat_file,
+            save_ac_ppc_to_mat_file,
+        )
+
+        bus = np.array(
+            [
+                [1, 3, 0, 0, 0, 0, 1, 1.02, 5.0, 230, 1, 1.1, 0.9],
+                [2, 1, 50, 20, 1.0, 3.0, 1, 0.98, -2.0, 230, 1, 1.1, 0.9],
+            ],
+            dtype=np.float64,
+        )
+        gen = np.zeros((1, 21), dtype=np.float64)
+        gen[0, 0] = 1
+        gen[0, 1] = 80
+        gen[0, 2] = 15
+        gen[0, 5] = 1.02
+        gen[0, 6] = 100
+        gen[0, 7] = 1
+        gen[0, 8] = 200
+        branch = np.array(
+            [
+                [1, 2, 0.01, 0.05, 0.02, 0, 0, 0, 0, 0, 1, -360, 360],
+                [1, 2, 0.02, 0.08, 0.04, 0, 0, 0, 1.1, 10, 1, -360, 360],
+            ],
+            dtype=np.float64,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mat_path = Path(tmp_dir) / "case2.mat"
+            savemat(str(mat_path), {"mpc": {"version": "2", "baseMVA": 100.0, "bus": bus, "gen": gen, "branch": branch}})
+
+            ppc = build_ac_ppc_from_mat_file(mat_path)
+            self.assertEqual("ac_ppc_v1", ppc["format"])
+            self.assertEqual(100.0, ppc["base"]["p_base"])
+            self.assertEqual((2, len(BUS_COLS)), ppc["bus"].shape)
+            self.assertEqual((1, len(BRANCH_COLS)), ppc["branch"].shape)
+            self.assertEqual((1, len(TRANSFORMER_COLS)), ppc["transformer"].shape)
+            self.assertEqual((1, len(GEN_COLS)), ppc["gen"].shape)
+            self.assertEqual((1, len(LOAD_COLS)), ppc["load"].shape)
+            self.assertEqual((2, len(SHUNT_COLS)), ppc["shunt"].shape)
+            self.assertAlmostEqual(0.5, ppc["load"][0, LOAD_COLS["pbase"]])
+            self.assertAlmostEqual(0.2, ppc["load"][0, LOAD_COLS["qbase"]])
+            self.assertAlmostEqual(0.01, ppc["shunt"][0, SHUNT_COLS["g_set"]])
+            self.assertAlmostEqual(0.03, ppc["shunt"][0, SHUNT_COLS["b_set"]])
+            self.assertAlmostEqual(0.02, ppc["transformer"][0, TRANSFORMER_COLS["bt"]])
+            self.assertAlmostEqual(1.1, ppc["transformer"][0, TRANSFORMER_COLS["tap"]])
+            self.assertAlmostEqual(10.0, ppc["transformer"][0, TRANSFORMER_COLS["shift"]])
+
+            out_path = Path(tmp_dir) / "roundtrip.mat"
+            returned = save_ac_ppc_to_mat_file(ppc, out_path)
+            self.assertEqual(out_path, returned)
+            saved = loadmat(str(out_path), squeeze_me=True, struct_as_record=False)
+            self.assertIn("mpc", saved)
+            saved_mpc = saved["mpc"]
+            self.assertAlmostEqual(100.0, float(saved_mpc.baseMVA))
+            self.assertEqual((2, 13), np.asarray(saved_mpc.bus).shape)
+            self.assertEqual((1, 21), np.atleast_2d(np.asarray(saved_mpc.gen)).shape)
+            self.assertEqual((2, 13), np.asarray(saved_mpc.branch).shape)
+
+    def test_ac_ppc_matpower_export_maps_acac_ports_to_gen_or_load(self):
+        from ac_array_model import (
+            ACAC_COLS,
+            ACAC_CONTROL_CODE,
+            BUS_COLS,
+            build_matpower_ppc_from_ac_ppc,
+        )
+
+        bus = np.zeros((2, len(BUS_COLS)), dtype=np.float64)
+        bus[:, BUS_COLS["idx"]] = [1, 2]
+        bus[:, BUS_COLS["vbase"]] = [230.0, 230.0]
+        bus[:, BUS_COLS["voltage"]] = [1.02, 0.98]
+        bus[:, BUS_COLS["run_stat"]] = 1.0
+
+        acac = np.zeros((1, len(ACAC_COLS)), dtype=np.float64)
+        acac[0, ACAC_COLS["idx"]] = 1
+        acac[0, ACAC_COLS["i_node"]] = 1
+        acac[0, ACAC_COLS["j_node"]] = 2
+        acac[0, ACAC_COLS["control_type"]] = ACAC_CONTROL_CODE["PVQ"]
+        acac[0, ACAC_COLS["i_v_set"]] = 1.04
+        acac[0, ACAC_COLS["run_stat"]] = 1.0
+        acac[0, ACAC_COLS["i_p"]] = -0.30
+        acac[0, ACAC_COLS["i_q"]] = -0.10
+        acac[0, ACAC_COLS["j_p"]] = 0.31
+        acac[0, ACAC_COLS["j_q"]] = 0.12
+
+        ppc = {
+            "format": "ac_ppc_v1",
+            "base": {"p_base": 100.0},
+            "bus": bus,
+            "acac": acac,
+        }
+
+        matpower = build_matpower_ppc_from_ac_ppc(ppc)
+
+        self.assertEqual((2, 13), matpower["bus"].shape)
+        self.assertEqual((1, 21), matpower["gen"].shape)
+        self.assertEqual(2.0, matpower["bus"][0, 1])
+        self.assertAlmostEqual(30.0, matpower["gen"][0, 1])
+        self.assertAlmostEqual(10.0, matpower["gen"][0, 2])
+        self.assertAlmostEqual(1.04, matpower["gen"][0, 5])
+        self.assertAlmostEqual(31.0, matpower["bus"][1, 2])
+        self.assertAlmostEqual(12.0, matpower["bus"][1, 3])
+
+    def test_ac_and_hybrid_lf_load_matpower_m_files_as_ac_ppc(self):
+        import ac_lf
+        import hybrid_lf
+        from ac_array_model import BUS_COLS
+        from ac_lf import ACPowerFlowCalc
+        from hybrid_lf import HybridPowerFlowCalc
+
+        case_text = """function mpc = case2
+mpc.version = '2';
+mpc.baseMVA = 100;
+mpc.bus = [
+  1 3 0 0 0 0 1 1 0 230 1 1.1 0.9;
+  2 1 20 8 0 0 1 1 0 230 1 1.1 0.9;
+];
+mpc.gen = [
+  1 30 0 100 -100 1 100 1 100 0 0 0 0 0 0 0 0 0 0 0 0;
+];
+mpc.branch = [
+  1 2 0.01 0.05 0.02 0 0 0 0 0 1 -360 360;
+];
+"""
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_path = Path(tmp_dir) / "case2.m"
+            case_path.write_text(case_text, encoding="utf-8")
+
+            ppc = ac_lf.load_ac_ppc_from_e_file(case_path)
+            self.assertEqual("ac_ppc_v1", ppc["format"])
+            self.assertIn("_topology_arrays", ppc)
+            self.assertEqual((2, len(BUS_COLS)), ppc["bus"].shape)
+            ac_calc = ACPowerFlowCalc(ppc, result_mode="array", verbose=False)
+            self.assertEqual(0, ac_calc.run())
+            self.assertTrue(ac_calc.converged)
+
+            network = hybrid_lf._read_lf_network_from_file(case_path)
+            self.assertIsNotNone(network._ac_ppc)
+            self.assertIsNone(network.ppc.get("dc"))
+            hybrid_calc = HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+            self.assertEqual(0, hybrid_calc.run())
+            self.assertTrue(hybrid_calc.converged)
 
     def test_ac_lf_script_entry_loads_e_file_once_through_array_path(self):
-        source = (ROOT_DIR / "lfcore" / "ac_lf.py").read_text(encoding="utf-8")
+        source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
+            encoding="utf-8"
+        )
         main_block = source.split("def main", 1)[1].split('if __name__ == "__main__":', 1)[0]
 
         self.assertIn("load_ac_ppc_from_e_file(args.file)", main_block)
         self.assertIn("ACPowerFlowCalc(", main_block)
         self.assertIn("verbose=not args.quiet", main_block)
-        self.assertIn("calc.prepare()", main_block)
         self.assertIn("calc.run()", main_block)
+        self.assertNotIn("calc.prepare()", main_block)
         self.assertNotIn("_run_with_optional_output", main_block)
+        self.assertNotIn("--algorithm", main_block)
         self.assertNotIn("ACPowerFlowCalc.from_e_file", main_block)
         self.assertNotIn("read_from_file", main_block)
         self.assertNotIn("ACPowerNetwork", main_block)
 
-    def test_ac_lf_benchmark_accepts_algorithm_option(self):
-        from lfcore import ac_lf_benchmark
+    def test_ac_lf_pq_decoupled_code_is_removed(self):
+        source = (ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py").read_text(
+            encoding="utf-8"
+        )
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = ac_lf_benchmark.run_case("ieee300", repeats=1, profile=False, algorithm="pq")
+        self.assertNotIn("_run_pq_decoupled", source)
+        self.assertNotIn("_cache_pq_decoupled_matrices", source)
+        self.assertNotIn("_build_fast_decoupled_b_matrix", source)
+        self.assertNotIn("pq_Bp", source)
+        self.assertNotIn("pq_Bpp", source)
+        self.assertNotIn("used_algorithm", source)
+        self.assertNotIn("self.algorithm", source)
+        self.assertNotIn('algorithm == "pq"', source)
+        self.assertNotIn('"pq"', source.split("def main", 1)[1].split('if __name__ == "__main__":', 1)[0])
 
-        self.assertEqual("pq", result["algorithm"])
-        self.assertEqual(0, result["rc"])
-        self.assertTrue(result["converged"])
-        self.assertLess(result["iterations"], 50)
-
-    def test_pq_algorithm_reuses_fixed_b_matrix_factorization(self):
-        import ac_lf
+    def test_ac_run_prepares_when_called_directly(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
-        ppc = build_ac_ppc_from_e_file(case_path)
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
 
-        original_splu = ac_lf.splu
-        original_spsolve = ac_lf.spsolve
-        factor_shapes = []
-
-        def wrapped_splu(matrix, *args, **kwargs):
-            factor_shapes.append(matrix.shape)
-            return original_splu(matrix, *args, **kwargs)
-
-        def reject_spsolve(*_args, **_kwargs):
-            raise AssertionError("PQ iterations should reuse fixed B' and B'' factorizations")
-
-        ac_lf.splu = wrapped_splu
-        try:
-            calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=80, algorithm="pq")
-            with contextlib.redirect_stdout(io.StringIO()):
-                calc.prepare()
-            ac_lf.spsolve = reject_spsolve
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    rc = calc.run()
-            finally:
-                ac_lf.spsolve = original_spsolve
-        finally:
-            ac_lf.splu = original_splu
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
 
         self.assertEqual(0, rc)
-        self.assertEqual("pq", calc.used_algorithm)
-        self.assertEqual([calc.pq_Bp.shape, calc.pq_Bpp.shape], factor_shapes)
+        self.assertTrue(calc.converged)
+        self.assertGreater(calc.x.size, 0)
+        self.assertIn("bus", calc.result)
+
+    def test_ac_node_type_uses_numeric_codes_in_solver_path(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        self.assertTrue(np.issubdtype(calc.node_type.dtype, np.integer))
+        self.assertEqual((calc.N,), calc.node_type.shape)
+        self.assertGreater(np.unique(calc.node_type).size, 1)
+
+        checked_sources = [
+            ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "ac_lf.py",
+            ROOT_DIR / "src" / "hybrid_power_system_analysis" / "lfcore" / "hybrid_lf.py",
+        ]
+        offenders = []
+        for source_path in checked_sources:
+            for line_no, line in enumerate(source_path.read_text(encoding="utf-8").splitlines(), start=1):
+                if "node_type" not in line:
+                    continue
+                if "label" in line.lower() or "LABEL" in line:
+                    continue
+                if any(token in line for token in ("'PQ'", '"PQ"', "'PV'", '"PV"', "'SLACK'", '"SLACK"')):
+                    offenders.append(f"{source_path.name}:{line_no}:{line.strip()}")
+        self.assertEqual([], offenders)
+
+    def test_full_ac_result_exposes_array_result_tables(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee39.e")
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="full")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertIsNotNone(calc.lf_result)
+        self.assertIn("bus", calc.lf_result.arrays)
+        self.assertIn("branch", calc.lf_result.arrays)
+        self.assertIs(calc.lf_result.arrays["bus"], calc.result["bus"])
+        self.assertIs(calc.lf_result.arrays["branch"], calc.result["branch"])
+
+    def test_ac_lf_benchmark_uses_nr_only(self):
+        from lfcore import ac_lf_benchmark
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = ac_lf_benchmark.run_case("ieee300", repeats=1, profile=False)
+
+        self.assertNotIn("algorithm", result)
+        self.assertEqual(0, result["rc"])
+        self.assertTrue(result["converged"])
 
     def test_state_extraction_reuses_iteration_work_arrays(self):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -411,12 +586,14 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
         self.assertEqual(0, calc.N_phi)
+        self.assertEqual(0, calc.full_jac_raw_data.size)
+        self.assertEqual(0, calc.full_jac_csr_indices.size)
 
         original_hstack = ac_lf.hstack
         original_vstack = ac_lf.vstack
@@ -436,7 +613,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -459,11 +636,27 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_array_equal(first.indices, second.indices)
         np.testing.assert_allclose(first.data, second.data, atol=1e-12)
 
+    def test_newton_system_returns_solver_ready_csc_jacobian(self):
+        from ac_array_model import build_ac_ppc_from_e_file
+        from ac_lf import ACPowerFlowCalc
+
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
+        ppc = build_ac_ppc_from_e_file(case_path)
+        calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            calc.prepare()
+
+        _f, solver_jac = calc._build_newton_system(calc.x)
+        public_jac = calc.get_jacobi(calc.x)
+
+        self.assertEqual("csc", solver_jac.format)
+        np.testing.assert_allclose(solver_jac.toarray(), public_jac.toarray(), atol=1e-12)
+
     def test_ppc_zero_branch_jacobian_caches_coordinate_pattern(self):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -496,7 +689,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -524,11 +717,33 @@ class ACPPCFlowTest(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected, atol=1e-12)
 
+    def test_full_jacobian_csr_pattern_maps_duplicate_raw_coordinates(self):
+        from scipy.sparse import coo_matrix, csr_matrix
+
+        from ac_lf import _build_csr_pattern_from_raw_coords
+
+        raw_rows = np.asarray([1, 0, 1, 0, 1, 2], dtype=np.int32)
+        raw_cols = np.asarray([2, 1, 2, 1, 3, 0], dtype=np.int32)
+        raw_data = np.asarray([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float64)
+
+        indices, indptr, raw_to_csr = _build_csr_pattern_from_raw_coords(
+            raw_rows,
+            raw_cols,
+            n_rows=3,
+        )
+        actual_data = np.bincount(raw_to_csr, weights=raw_data, minlength=indices.size)
+        actual = csr_matrix((actual_data, indices, indptr), shape=(3, 4))
+        expected = coo_matrix((raw_data, (raw_rows, raw_cols)), shape=(3, 4)).tocsr()
+
+        np.testing.assert_array_equal(actual.indptr, expected.indptr)
+        np.testing.assert_array_equal(actual.indices, expected.indices)
+        np.testing.assert_allclose(actual.data, expected.data, atol=1e-12)
+
     def test_ppc_zero_branch_jacobian_uses_precomputed_kind_groups(self):
         from hybrid_array_model import build_hybrid_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         calc = ACPowerFlowCalc(ppc["ac"], tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
@@ -548,7 +763,7 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "ac" / "ieee300.e")
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee300.e")
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="none", verbose=False)
 
         captured = io.StringIO()
@@ -563,22 +778,27 @@ class ACPPCFlowTest(unittest.TestCase):
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "ac" / "ieee300.e")
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ieee300.e")
         ppc.pop("_pf_static", None)
 
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="none")
         with contextlib.redirect_stdout(io.StringIO()):
             calc.prepare()
 
-        def reject_full_backfill():
-            raise AssertionError("result_mode='none' should skip full AC result backfill")
+        none_calls = []
+        original_none_write_back_ppc = calc._write_back_ppc
 
-        calc._write_back_ppc = reject_full_backfill
+        def counted_none_write_back_ppc():
+            none_calls.append(calc.result_mode)
+            return original_none_write_back_ppc()
+
+        calc._write_back_ppc = counted_none_write_back_ppc
         with contextlib.redirect_stdout(io.StringIO()):
             rc = calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(calc.converged)
+        self.assertEqual(["none"], none_calls)
         self.assertEqual({}, calc.result)
         self.assertIsNone(getattr(calc, "lf_result", None))
         self.assertTrue(hasattr(calc, "x"))
@@ -586,70 +806,86 @@ class ACPPCFlowTest(unittest.TestCase):
         summary_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="summary")
         with contextlib.redirect_stdout(io.StringIO()):
             summary_calc.prepare()
-        summary_calc._write_back_ppc = reject_full_backfill
+        summary_calls = []
+        original_summary_write_back_ppc = summary_calc._write_back_ppc
+
+        def counted_summary_write_back_ppc():
+            summary_calls.append(summary_calc.result_mode)
+            return original_summary_write_back_ppc()
+
+        summary_calc._write_back_ppc = counted_summary_write_back_ppc
         with contextlib.redirect_stdout(io.StringIO()):
             rc = summary_calc.run()
 
         self.assertEqual(0, rc)
         self.assertTrue(summary_calc.converged)
+        self.assertEqual(["summary"], summary_calls)
         self.assertEqual({"node_id", "voltage", "angle", "summary"}, set(summary_calc.result))
         self.assertEqual(summary_calc.N, summary_calc.result["voltage"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["angle"].size)
         self.assertEqual(summary_calc.N, summary_calc.result["node_id"].size)
 
-    def test_ppc_prepare_uses_sparse_connected_components(self):
-        import ac_lf
+        array_calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50, result_mode="array")
+        with contextlib.redirect_stdout(io.StringIO()):
+            array_calc.prepare()
+        self.assertEqual([], array_calc.node_list)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = array_calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(array_calc.converged)
+        self.assertIn("bus", array_calc.result)
+        self.assertIn("branch", array_calc.result)
+        self.assertIsNone(getattr(array_calc, "lf_result", None))
+
+    def test_ppc_prepare_uses_shared_ppc_topology(self):
+        from model import ppc_topology
         from ac_array_model import build_ac_ppc_from_e_file
         from ac_lf import ACPowerFlowCalc
 
-        case_path = ROOT_DIR / "data" / "ac" / "ieee300.e"
+        case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
         ppc = build_ac_ppc_from_e_file(case_path)
         ppc.pop("_pf_static", None)
+        ppc.pop("_topology_arrays", None)
         calc = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
 
-        original_connected_components = ac_lf.connected_components
+        original_prepare_topology = ppc_topology.network_topology.prepare_ac_topology_ppc
         calls = []
 
-        def wrapped_connected_components(*args, **kwargs):
-            calls.append(args[0].shape)
-            return original_connected_components(*args, **kwargs)
+        def wrapped_prepare_topology(arg):
+            calls.append(arg)
+            return original_prepare_topology(arg)
 
-        ac_lf.connected_components = wrapped_connected_components
+        ppc_topology.network_topology.prepare_ac_topology_ppc = wrapped_prepare_topology
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 calc.prepare()
         finally:
-            ac_lf.connected_components = original_connected_components
+            ppc_topology.network_topology.prepare_ac_topology_ppc = original_prepare_topology
 
-        self.assertEqual([(ppc["bus"].shape[0], ppc["bus"].shape[0])], calls)
+        self.assertEqual([ppc], calls)
+        self.assertIn("_topology_arrays", ppc)
         self.assertGreater(calc.N, 0)
 
-    def test_ppc_prepare_reuses_static_cache_for_second_calc(self):
-        import ac_lf
+    def test_ppc_prepare_ignores_static_cache_field(self):
         from ac_lf import ACPowerFlowCalc
         from hybrid_array_model import build_hybrid_ppc_from_e_file
 
-        _, hybrid_ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "hybrid" / "hybrid_net_40.e")
+        _, hybrid_ppc = build_hybrid_ppc_from_e_file(ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e")
         ppc = hybrid_ppc["ac"]
         first = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
         with contextlib.redirect_stdout(io.StringIO()):
             first.prepare()
 
-        self.assertIn("_pf_static", ppc)
+        self.assertNotIn("_pf_static", ppc)
 
-        original_connected_components = ac_lf.connected_components
+        stale_static = {"N": -1}
+        ppc["_pf_static"] = stale_static
+        second = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
+        with contextlib.redirect_stdout(io.StringIO()):
+            second.prepare()
 
-        def reject_connected_components(*_args, **_kwargs):
-            raise AssertionError("second PPC prepare should reuse cached static data")
-
-        ac_lf.connected_components = reject_connected_components
-        try:
-            second = ACPowerFlowCalc(ppc, tol=1e-8, max_iter=50)
-            with contextlib.redirect_stdout(io.StringIO()):
-                second.prepare()
-        finally:
-            ac_lf.connected_components = original_connected_components
-
+        self.assertIs(stale_static, ppc["_pf_static"])
         self.assertEqual(first.total_vars, second.total_vars)
         self.assertEqual(first.total_eq, second.total_eq)
 
@@ -659,8 +895,8 @@ class ACPPCFlowTest(unittest.TestCase):
         content = "\n".join(
             [
                 "<PowerBase>",
-                "@ p_base u_scale p_scale i_scale",
-                "# 100 1.0 0.001 1.0",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100 kV MW kA",
                 "</PowerBase>",
                 "",
             ]

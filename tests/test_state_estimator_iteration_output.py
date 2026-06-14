@@ -12,8 +12,8 @@ class StateEstimatorIterationOutputTest(unittest.TestCase):
         from secore.ac_se import ACStateEstimator
 
         estimator = ACStateEstimator(
-            e_file=ROOT_DIR / "data" / "ac" / "ieee39.e",
-            meas_file=ROOT_DIR / "data" / "ac" / "ieee39.meas",
+            e_file=ROOT_DIR / "data" / "model" / "ac" / "ieee39.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
             max_iter=5,
         )
 
@@ -33,8 +33,8 @@ class StateEstimatorIterationOutputTest(unittest.TestCase):
         from secore.dc_se import DCStateEstimator
 
         estimator = DCStateEstimator(
-            e_file=ROOT_DIR / "data" / "dc" / "dc_net_30.e",
-            meas_file=ROOT_DIR / "data" / "dc" / "dc_net_30.meas",
+            e_file=ROOT_DIR / "data" / "model" / "dc" / "dc_net_30.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "dc" / "dc_net_30.meas",
             max_iter=5,
         )
 

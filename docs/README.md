@@ -4,12 +4,15 @@
 
 | 模块 | 文档 | 源码 |
 | --- | --- | --- |
-| 交流潮流 | [ac_lf.md](ac_lf.md) | `lfcore/ac_lf.py` |
-| 交流状态估计 | [ac_se.md](ac_se.md) | `secore/ac_se.py` |
-| 直流潮流 | [dc_lf.md](dc_lf.md) | `lfcore/dc_lf.py` |
-| 直流状态估计 | [dc_se.md](dc_se.md) | `secore/dc_se.py` |
-| 交直流联合潮流 | [hybrid_lf.md](hybrid_lf.md) | `lfcore/hybrid_lf.py` |
-| 交直流联合状态估计 | [hybrid_se.md](hybrid_se.md) | `secore/hybrid_se.py` |
+| 交流潮流 | [ac_lf.md](ac_lf.md) | `src/hybrid_power_system_analysis/lfcore/ac_lf.py` |
+| 交流状态估计 | [ac_se.md](ac_se.md) | `src/hybrid_power_system_analysis/secore/ac_se.py` |
+| 直流潮流 | [dc_lf.md](dc_lf.md) | `src/hybrid_power_system_analysis/lfcore/dc_lf.py` |
+| 直流状态估计 | [dc_se.md](dc_se.md) | `src/hybrid_power_system_analysis/secore/dc_se.py` |
+| 交直流联合潮流 | [hybrid_lf.md](hybrid_lf.md) | `src/hybrid_power_system_analysis/lfcore/hybrid_lf.py` |
+| 交直流联合状态估计 | [hybrid_se.md](hybrid_se.md) | `src/hybrid_power_system_analysis/secore/hybrid_se.py` |
+| LF/SE 模型与算法总览 | [lf_se_models_algorithms.md](lf_se_models_algorithms.md) | `src/hybrid_power_system_analysis/lfcore/*.py`, `src/hybrid_power_system_analysis/secore/*.py` |
+| 潮流设备模型汇总 | [load_flow_device_models.md](load_flow_device_models.md) | `src/hybrid_power_system_analysis/lfcore/*.py` |
+| AC/Hybrid 与 MATPOWER 对比 | [load_flow_matpower_comparison.md](load_flow_matpower_comparison.md) | 对比口径与基准结果 |
 
 ## 公共约定
 
@@ -19,12 +22,12 @@ E 文件采用有名值输入，并通过模型中的基准配置转换为内部
 
 | 字段 | 含义 |
 | --- | --- |
-| `p_base` | 系统功率基准，配合 `p_scale` 解释输入有功/无功单位 |
-| `u_scale` | 电压单位缩放，`1.0` 表示 kV，`1000.0` 表示 V |
-| `p_scale` | 功率单位缩放，`1.0` 表示 kW/kVar，`1000.0` 表示 W/Var，`0.001` 表示 MW/MVar |
-| `i_scale` | 电流单位缩放，`1.0` 表示 kA，`1000.0` 表示 A |
+| `p_base` | 系统功率基准，按 `p_unit` 解释输入有功/无功单位 |
+| `u_unit` | 电压单位，取值 `mV`、`V`、`kV` |
+| `p_unit` | 功率单位，取值 `W`、`kW`、`MW` |
+| `i_unit` | 电流单位，取值 `mA`、`A`、`kA` |
 
-内部计算统一使用标幺值；状态估计量测文件中的有功、无功、电压、电流、相角会在读取后转换为内部单位。相角文件值为度，内部为弧度。
+程序读取 E 文件后会由 `p_unit`、`u_unit`、`i_unit` 自动生成内部 `p_scale`、`u_scale`、`i_scale`，再统一转换为标幺值；状态估计量测文件中的有功、无功、电压、电流、相角会在读取后转换为内部单位。相角文件值为度，内部为弧度。
 
 ### 参数文件
 
@@ -56,7 +59,7 @@ E 文件采用有名值输入，并通过模型中的基准配置转换为内部
 
 ### 公共数值实现
 
-状态估计公共稀疏矩阵工具位于 `secore/se_math.py`：
+状态估计公共稀疏矩阵工具位于 `src/hybrid_power_system_analysis/secore/se_math.py`：
 
 - `SparseJacobianBuilder`：以 COO triplet 方式批量构造稀疏 Jacobian。
 - `build_normal_equations()`：生成正规方程 `G = H.T W H` 和右端 `H.T W r`。
@@ -64,3 +67,6 @@ E 文件采用有名值输入，并通过模型中的基准配置转换为内部
 - `observability_rank_details()`：可观测性秩分析，优先复用正规矩阵或分解信息。
 - `identify_bad_data()` 在各 SE 模块内调用 `inverse_gain_for_bad_data()` 和 `measurement_leverage()` 计算归一化残差。
 
+### MATPOWER 对比口径
+
+当前 `ACTransformer` 采用 T 型单端对地模型，`gt/bt` 是 i 侧对地导纳；MATPOWER 标准 branch/tap 模型只能表达两端平分的 `BR_B` 线路充电。因此与 MATPOWER/PYPOWER 结果对比时，需先确认是否为同一物理模型。`load_flow_matpower_comparison.md` 给出了 `ieee300`、`ieee3k` 的实测结果和误差解释。

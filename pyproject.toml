@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-power-system-analysis"
+version = "0.1.0"
+description = "Hybrid AC/DC power-flow, state-estimation, simulation, AGC, and contingency-analysis tools."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cplex",
+    "cvxpy",
+    "gurobipy",
+    "mosek",
+    "numpy",
+    "pyklu",
+    "PyMySQL",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+benchmark = [
+    "pypower",
+]
+solver = [
+    "pypower",
+    "scikit-sparse",
+    "scikit-umfpack",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [
+    "src",
+    "src/hybrid_power_system_analysis",
+    "src/hybrid_power_system_analysis/model",
+    "src/hybrid_power_system_analysis/lfcore",
+    "src/hybrid_power_system_analysis/secore",
+    "src/hybrid_power_system_analysis/agc",
+    "src/hybrid_power_system_analysis/cacore",
+    "src/hybrid_power_system_analysis/simu",
+    "scripts",
+    "benchmarks",
+]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "benchmarks",
+    "build_nuitka",
+    "scripts",
+    "tests",
+    "tmp_*",
+    "log",
+    "power_plan",
+    "power_plan/data",
+]
+
+[tool.ruff.lint]
+select = ["F"]
+ignore = [
+    "F401",
+    "F541",
+    "F841",
+]
+
+[tool.ruff.format]
+line-ending = "auto"

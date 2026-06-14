@@ -1,6 +1,0 @@
-name,status,detail
-主站 A,normal,延迟 22 ms
-变电站 110kV,normal,质量 99.9%
-采集终端 D3,warn,质量 96.2%
-主站 B,normal,延迟 25 ms
-馈线终端 F8,normal,质量 99.3%
