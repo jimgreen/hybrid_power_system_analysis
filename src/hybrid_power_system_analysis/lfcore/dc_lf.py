@@ -89,6 +89,7 @@ from model.dc_array_model import (
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
     build_dc_network_from_ppc,
+    build_dc_ppc_from_e_file,
     build_dc_ppc_from_network,
 )
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
@@ -247,6 +248,37 @@ class DCPowerFlowCalc:
         self.lf_result = None
         self.G = None
         self.x = np.array([], dtype=np.float64)
+
+    @classmethod
+    def from_file_fast(
+        cls,
+        file_name,
+        tol: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        min_voltage: Optional[float] = None,
+        parameter_file=DEFAULT_LF_PARAMETER_FILE,
+        parameters: Optional[PowerFlowParameters] = None,
+        linear_solver: str = "pyklu",
+        result_mode: str = "array",
+        verbose: bool = False,
+    ) -> "DCPowerFlowCalc":
+        """Build a PPC-backed DC solver directly from file.
+
+        This mirrors `HybridPowerFlowCalc.from_file_fast()` so AC/DC/Hybrid share a
+        consistent API for file→PPC→solver fast paths.
+        """
+        ppc = build_dc_ppc_from_e_file(file_name)
+        return cls(
+            ppc,
+            tol=tol,
+            max_iter=max_iter,
+            min_voltage=min_voltage,
+            parameter_file=parameter_file,
+            parameters=parameters,
+            linear_solver=linear_solver,
+            result_mode=result_mode,
+            verbose=verbose,
+        )
 
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
@@ -1982,7 +2014,10 @@ class DCPowerFlowCalc:
             self._write_summary_result()
             return
 
-        self._write_ppc_result_to_network()
+        # array 模式: 不再把 PPC 数组结果写回 Python 对象网络 (DCPowerNetwork)。
+        # 这是 array 模式能省下 0.4-0.5s 的关键: 30k 节点逐设备 setattr 循环被跳过。
+        if self.result_mode != "array":
+            self._write_ppc_result_to_network()
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
         return

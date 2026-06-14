@@ -711,6 +711,39 @@ class HybridPowerFlowCalc:
         self._single_dc_newton_block = False
         self.result = {}
 
+    @classmethod
+    def from_file_fast(
+        cls,
+        file_name,
+        tol=None,
+        max_iter=None,
+        min_voltage=None,
+        parameter_file=DEFAULT_LF_PARAMETER_FILE,
+        parameters: Optional[PowerFlowParameters] = None,
+        linear_solver: Optional[str] = None,
+        result_mode: str = "array",
+        verbose: bool = False,
+    ) -> "HybridPowerFlowCalc":
+        """Build a lightweight PPC-backed hybrid solver directly from file.
+
+        This path uses `_read_lf_network_from_file()`, which returns a `_LightweightHybridNetwork`
+        backed by PPC arrays and lightweight facades. It avoids `HybridPowerNetwork.read_from_file()`
+        and the expensive Python object graph construction (tens of thousands of AC/DC node objects),
+        while remaining API-compatible for LF array-mode workloads.
+        """
+        network = _read_lf_network_from_file(file_name)
+        return cls(
+            network,
+            tol=tol,
+            max_iter=max_iter,
+            min_voltage=min_voltage,
+            parameter_file=parameter_file,
+            parameters=parameters,
+            linear_solver=linear_solver,
+            result_mode=result_mode,
+            verbose=verbose,
+        )
+
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
         return _normalize_lf_result_mode(result_mode, "Hybrid")

@@ -56,6 +56,7 @@ from ac_array_model import (
     SWITCH_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
+    build_ac_ppc_from_e_file,
     build_ac_ppc_from_mat_file,
     build_ac_ppc_from_network,
 )
@@ -515,6 +516,41 @@ class ACPowerFlowCalc:
         self._load_aux_work = np.array([], dtype=np.float64)
         self._residual_work = np.array([], dtype=np.float64)
         self.result: Dict = {}
+
+    @classmethod
+    def from_file_fast(
+        cls,
+        file_name,
+        tol: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        min_voltage: Optional[float] = None,
+        parameter_file=DEFAULT_LF_PARAMETER_FILE,
+        parameters: Optional[PowerFlowParameters] = None,
+        linear_solver: str = "pyklu",
+        result_mode: str = "array",
+        verbose: bool = False,
+    ) -> "ACPowerFlowCalc":
+        """Build an AC PPC-backed solver directly from file.
+
+        This mirrors `HybridPowerFlowCalc.from_file_fast()` and keeps AC/DC/Hybrid
+        file→PPC→solver fast paths API-consistent.
+        """
+        path = Path(file_name)
+        if path.suffix.lower() in {".m", ".mat"}:
+            ppc = build_ac_ppc_from_mat_file(path)
+        else:
+            ppc = build_ac_ppc_from_e_file(path)
+        return cls(
+            ppc,
+            tol=tol,
+            max_iter=max_iter,
+            min_voltage=min_voltage,
+            parameter_file=parameter_file,
+            parameters=parameters,
+            linear_solver=linear_solver,
+            result_mode=result_mode,
+            verbose=verbose,
+        )
 
     @staticmethod
     def _normalize_result_mode(result_mode: str) -> str:
