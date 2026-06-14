@@ -112,7 +112,7 @@ def _node_count(network_part) -> int:
 
 
 def _default_hybrid_linear_solver(has_dc: bool) -> str:
-    return "umfpack" if has_dc else "pyklu"
+    return "pyklu"
 
 
 def _array_device(idx, name=None, **values):
