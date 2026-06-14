@@ -76,6 +76,7 @@ try:
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
+        make_reusable_factorizer as _make_reusable_factorizer,
         resolve_linear_solver as _resolve_linear_solver,
     )
 except ImportError:  # pragma: no cover - direct script import path
@@ -83,6 +84,7 @@ except ImportError:  # pragma: no cover - direct script import path
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
+        make_reusable_factorizer as _make_reusable_factorizer,
         resolve_linear_solver as _resolve_linear_solver,
     )
 
@@ -2336,6 +2338,9 @@ class ACPowerFlowCalc:
         # 若本实例已把 KLU/UMFPACK 加入黑名单, 直接走 scipy, 避免重复触发失败路径。
         if self._instance_solver_blacklist and self._linear_solver_resolved in self._instance_solver_blacklist:
             self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
+        resolved_name = self._linear_solver_resolved
+        solver_fn = self._linear_solver_fn
+        reusable_factorizer = None
 
         for it in range(self.max_iter):
             self.iterations += 1
@@ -2356,15 +2361,23 @@ class ACPowerFlowCalc:
                 return 0
 
             try:
-                factor = _factor_jacobian(J, self._linear_solver_resolved, self._linear_solver_fn)
+                if reusable_factorizer is None:
+                    reusable_factorizer = _make_reusable_factorizer(J, resolved_name)
+                factor = (
+                    reusable_factorizer.factor(J)
+                    if reusable_factorizer is not None
+                    else _factor_jacobian(J, resolved_name, solver_fn)
+                )
                 delta = factor.solve(F)
             except (RuntimeError, ValueError, ArithmeticError) as exc:
                 # 因子分解或解算失败时, 仅本实例回退到 SuperLU spsolve 单步路径,
                 # 避免污染模块级缓存 (同进程内其他 calc 仍可继续尝试 KLU)。
-                if self._linear_solver_resolved not in {"scipy", "superlu", "default"}:
-                    self._instance_solver_blacklist.add(self._linear_solver_resolved)
+                if resolved_name not in {"scipy", "superlu", "default"}:
+                    self._instance_solver_blacklist.add(resolved_name)
                     if self.verbose:
-                        print(f"[ac_lf] 可选稀疏求解器 {self._linear_solver_resolved!r} 失败，回退到 scipy: {exc}")
+                        print(f"[ac_lf] 可选稀疏求解器 {resolved_name!r} 失败，回退到 scipy: {exc}")
+                reusable_factorizer = None
+                resolved_name, solver_fn = "scipy", spsolve
                 self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
                 delta = spsolve(J, F)
             # 方程定义为 F(x)=0，这里使用 x_new = x - J^{-1}F。
