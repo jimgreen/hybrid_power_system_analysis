@@ -787,7 +787,11 @@ class HybridPowerFlowCalc:
             self.dc_calc.keep_node_objects = False
 
     def prepare(self):
-        """Build the global hybrid state vector and block equation layout."""
+        """Build the global hybrid state vector and block equation layout.
+
+        调用方无需先对 HybridPowerNetwork 显式执行 `prepare()` 或 `topo()`；
+        HybridPowerFlowCalc.prepare() 会直接准备 AC/DC 子求解器和全局状态布局。
+        """
         self._sync_sub_result_modes()
         parts = []
         if self.ac_calc is not None:

@@ -75,10 +75,9 @@ def run_dc_e2e(e_file: Path, result_mode: str = "full") -> dict:
     # 1. 构建网络
     network = DCPowerNetwork()
     network.read_from_file(e_file)
-    network.topo()
-    # 2. flat start 默认
+    # 2. flat start 默认；调用方无需先 topo()
     calc = DCPowerFlowCalc(network, tol=1e-8, max_iter=50, verbose=False, result_mode=result_mode)
-    # 3. 求解
+    # 3. prepare() / run() 内会确保拓扑/PPC 就绪
     rc = calc.run()
     return {
         "rc": rc, "converged": calc.converged, "iter": calc.iterations,
@@ -106,8 +105,7 @@ def run_hybrid_e2e(e_file: Path, result_mode: str = "full", fast_hybrid: bool = 
         }
 
     network = HybridPowerNetwork.read_from_file(e_file)
-    with contextlib.redirect_stdout(io.StringIO()):
-        network.prepare(False)
+    # 调用方无需先 network.prepare(False)；calc.prepare()/run() 会直接准备子求解器
     calc = HybridPowerFlowCalc(network, tol=1e-8, max_iter=50, verbose=False, result_mode=result_mode)
     rc = calc.run()
     return {

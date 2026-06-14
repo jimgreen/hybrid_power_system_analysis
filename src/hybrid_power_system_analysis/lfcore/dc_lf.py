@@ -516,7 +516,11 @@ class DCPowerFlowCalc:
         self.alive_nodes = []
 
     def prepare(self):
-        """预处理：合并带电拓扑岛，初始化参数并定义变量/方程索引。"""
+        """预处理并确保拓扑/PPC 就绪。
+
+        调用方无需先对 DCPowerNetwork 显式执行 `topo()`；prepare() 会基于
+        当前 PPC 数据自动补齐所需的拓扑信息。
+        """
         self._prepare_from_ppc()
 
     def _prepare_from_ppc(self):

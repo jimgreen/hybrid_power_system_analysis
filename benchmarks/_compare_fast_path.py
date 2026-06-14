@@ -28,7 +28,6 @@ from hybrid_power_system_analysis.lfcore.hybrid_lf import HybridPowerFlowCalc, H
 def run_old(path: Path):
     t0 = time.perf_counter()
     net = HybridPowerNetwork.read_from_file(path)
-    net.prepare(False)
     calc = HybridPowerFlowCalc(net, tol=1e-8, max_iter=50, verbose=False, result_mode="array")
     calc.prepare()
     rc = calc.run()
