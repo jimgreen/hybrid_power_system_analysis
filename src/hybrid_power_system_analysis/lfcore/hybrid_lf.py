@@ -624,17 +624,17 @@ class HybridPowerFlowCalc:
 
     def __init__(
         self,
-        network: HybridPowerNetwork,
-        tol=None,
-        max_iter=None,
-        min_voltage=None,
+        network,
+        tol: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        min_voltage: Optional[float] = None,
         island=None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
-        keep_node_objects=True,
+        keep_node_objects: bool = True,
         linear_solver: Optional[str] = None,
         result_mode: str = "full",
-        verbose=False,
+        verbose: bool = False,
     ):
         self.network = network
         self.island = island
@@ -2595,6 +2595,14 @@ class HybridPowerFlowCalc:
                 j_v=j_v,
             )
         return result
+
+    def _build_lf_result_from_ppc(self) -> HybridLFResult:
+        """Compatibility helper matching AC/DC naming.
+
+        Hybrid LF already stores PPC-backed AC/DC sub-results before building the
+        final HybridLFResult, so this delegates to `_build_lf_result()`.
+        """
+        return self._build_lf_result()
 
 
 def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int) -> None:
