@@ -258,16 +258,19 @@ class DCPowerFlowCalc:
         min_voltage: Optional[float] = None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
-        linear_solver: str = "pyklu",
+        linear_solver: Optional[str] = None,
         result_mode: str = "array",
         verbose: bool = False,
     ) -> "DCPowerFlowCalc":
         """Build a PPC-backed DC solver directly from file.
 
-        This mirrors `HybridPowerFlowCalc.from_file_fast()` so AC/DC/Hybrid share a
-        consistent API for file→PPC→solver fast paths.
+        Accepted inputs:
+        - `.e` named-unit/network files
         """
-        ppc = build_dc_ppc_from_e_file(file_name)
+        path = Path(file_name)
+        if path.suffix.lower() != ".e":
+            raise ValueError(f"DCPowerFlowCalc.from_file_fast() only supports .e files, got: {path}")
+        ppc = build_dc_ppc_from_e_file(path)
         return cls(
             ppc,
             tol=tol,

@@ -715,9 +715,9 @@ class HybridPowerFlowCalc:
     def from_file_fast(
         cls,
         file_name,
-        tol=None,
-        max_iter=None,
-        min_voltage=None,
+        tol: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        min_voltage: Optional[float] = None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
         linear_solver: Optional[str] = None,
@@ -726,12 +726,18 @@ class HybridPowerFlowCalc:
     ) -> "HybridPowerFlowCalc":
         """Build a lightweight PPC-backed hybrid solver directly from file.
 
+        Accepted inputs:
+        - `.e` named-unit/network files
+
         This path uses `_read_lf_network_from_file()`, which returns a `_LightweightHybridNetwork`
         backed by PPC arrays and lightweight facades. It avoids `HybridPowerNetwork.read_from_file()`
         and the expensive Python object graph construction (tens of thousands of AC/DC node objects),
         while remaining API-compatible for LF array-mode workloads.
         """
-        network = _read_lf_network_from_file(file_name)
+        path = Path(file_name)
+        if path.suffix.lower() != ".e":
+            raise ValueError(f"HybridPowerFlowCalc.from_file_fast() only supports .e files, got: {path}")
+        network = _read_lf_network_from_file(path)
         return cls(
             network,
             tol=tol,
@@ -2295,6 +2301,27 @@ class HybridPowerFlowCalc:
                 breaker.q = float(row[SWITCH_COLS["q"]])
                 breaker.current = float(row[SWITCH_COLS["current"]])
                 breaker.is_alive = int(row[SWITCH_COLS["run_stat"]]) == 1 and int(row[SWITCH_COLS["status"]]) == 1
+
+    def _write_back_ppc(self):
+        """Compatibility helper matching AC/DC naming.
+
+        Hybrid LF delegates PPC write-back to the AC/DC subcalculators after splitting
+        the global state vector. This helper prepares that state and triggers the PPC-only
+        write-back path on each subsolver without building the final HybridLFResult.
+        """
+        x = self.x
+        ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
+        if self.ac_calc is not None:
+            self._set_ac_converter_power_injections(dcac_x, acac_x)
+            self.ac_calc.x = ac_x
+            self.ac_calc.converged = self.converged
+            self.ac_calc.iterations = self.iterations
+            self.ac_calc._write_back_ppc()
+        if self.dc_calc is not None:
+            self.dc_calc.x = dc_x
+            self.dc_calc.converged = self.converged
+            self.dc_calc.iterations = self.iterations
+            self.dc_calc._write_back_ppc()
 
     def _write_back(self):
         """Write final global state back into AC, DC and converter model objects."""

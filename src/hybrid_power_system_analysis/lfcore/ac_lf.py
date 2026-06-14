@@ -526,20 +526,24 @@ class ACPowerFlowCalc:
         min_voltage: Optional[float] = None,
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
-        linear_solver: str = "pyklu",
+        linear_solver: Optional[str] = None,
         result_mode: str = "array",
         verbose: bool = False,
     ) -> "ACPowerFlowCalc":
         """Build an AC PPC-backed solver directly from file.
 
-        This mirrors `HybridPowerFlowCalc.from_file_fast()` and keeps AC/DC/Hybrid
-        file→PPC→solver fast paths API-consistent.
+        Accepted inputs:
+        - `.e` named-unit/network files
+        - `.m` / `.mat` MATPOWER cases
         """
         path = Path(file_name)
-        if path.suffix.lower() in {".m", ".mat"}:
+        suffix = path.suffix.lower()
+        if suffix in {".m", ".mat"}:
             ppc = build_ac_ppc_from_mat_file(path)
-        else:
+        elif suffix == ".e":
             ppc = build_ac_ppc_from_e_file(path)
+        else:
+            raise ValueError(f"ACPowerFlowCalc.from_file_fast() only supports .e/.m/.mat files, got: {path}")
         return cls(
             ppc,
             tol=tol,
