@@ -21,6 +21,7 @@ for path in (ROOT_DIR,):
         sys.path.insert(0, str(path))
 
 from lfcore.dc_lf import DCPowerFlowCalc
+from model import topology as network_topology
 from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BREAK_COLS as DC_BREAK_COLS,
@@ -308,19 +309,48 @@ def _build_dc_se_ppc_namespace(ppc: Dict) -> SimpleNamespace:
     ensure_dc_ppc_topology(ppc)
     topology_arrays = ppc["_topology_arrays"]
     base = ppc["base"]
-    return SimpleNamespace(
+    node_ids = np.asarray(topology_arrays.node_ids, dtype=np.int64)
+    bus_names = np.asarray(ppc.get("bus_name", ()), dtype=object)
+    nodes = [
+        SimpleNamespace(idx=int(node_id), name=str(bus_names[pos]) if pos < bus_names.size else f"bus_{int(node_id)}")
+        for pos, node_id in enumerate(node_ids)
+    ]
+
+    def device_objects(table_key: str, name_key: str, cols: Dict[str, int]):
+        table = np.asarray(ppc.get(table_key, np.zeros((0, len(cols)))), dtype=np.float64)
+        names = np.asarray(ppc.get(name_key, ()), dtype=object)
+        idx_col = int(cols.get("idx", 0))
+        return [
+            SimpleNamespace(
+                idx=int(table[row, idx_col]) if table.size else int(row),
+                name=str(names[row]) if row < names.size else f"{table_key}_{int(table[row, idx_col]) if table.size else int(row)}",
+            )
+            for row in range(int(table.shape[0]) if table.ndim == 2 else 0)
+        ]
+
+    network = SimpleNamespace(
         _se_lightweight=True,
         ppc=ppc,
         _array_model=ppc,
         base=base,
         topology=topology_arrays,
         _topology_arrays=topology_arrays,
+        nodes=nodes,
+        branches=device_objects("branch", "branch_name", DC_BRANCH_COLS),
+        generators=device_objects("gen", "gen_name", DC_GEN_COLS),
+        loads=device_objects("load", "load_name", DC_LOAD_COLS),
+        zero_branches=device_objects("zero_branch", "zero_branch_name", DC_ZERO_BRANCH_COLS),
+        switches=device_objects("switch", "switch_name", DC_SWITCH_COLS),
+        breakers=device_objects("break", "break_name", DC_SWITCH_COLS),
+        dcdc_converters=device_objects("dcdc", "dcdc_name", DC_DCDC_COLS),
         p_base=float(base["p_base"]),
         p_base_kW=float(base["p_base_kW"]),
         u_scale=float(base["u_scale"]),
         p_scale=float(base["p_scale"]),
         i_scale=float(base["i_scale"]),
     )
+    network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, populate_device_links=False)
+    return network
 
 
 class DCStateEstimator:
@@ -339,7 +369,7 @@ class DCStateEstimator:
         measurements: Optional[object] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
-        auto_prepare: bool = True,
+        auto_prepare: bool = False,
         matrix_dump_dir: Optional[Path] = None,
         power_flow_linear_solver: Optional[str] = None,
     ):
@@ -2210,7 +2240,8 @@ class DCStateEstimator:
             )
         return shrunk
 
-    def _load_network(self, e_file: Path) -> SimpleNamespace:
+    @staticmethod
+    def _load_network(e_file: Path) -> SimpleNamespace:
         """Read the DC case and build topology references used by measurements."""
         ppc = load_dc_ppc_from_e_file(e_file)
         return _build_dc_se_ppc_namespace(ppc)
@@ -5224,6 +5255,8 @@ class DCStateEstimator:
         observability: Optional[ObservabilityResult] = None,
     ) -> EstimateResult:
         """Solve the weighted least-squares DC state estimate with damped Newton steps."""
+        if not self._prepared:
+            self.prepare()
         solve_profile_start = time.perf_counter() if self.profile_enabled else None
         source_measurements = (
             None
@@ -5703,6 +5736,33 @@ class DCStateEstimator:
         )
         return self.se_result
 
+    def write_back(
+        self,
+        result: EstimateResult,
+        *,
+        bad_items: Optional[Sequence[BadDataItem]] = None,
+        normalized_residual: Optional[Sequence[float]] = None,
+        threshold: Optional[float] = None,
+        result_mode: str = "full",
+    ) -> Optional[SEResult]:
+        """Store estimate_result / bad-data / se_result after run()."""
+        self.estimate_result = result
+        if bad_items is None or normalized_residual is None:
+            computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
+            if bad_items is None:
+                bad_items = computed_bad_items
+            if normalized_residual is None:
+                normalized_residual = computed_normalized
+        self.bad_items = list(bad_items)
+        self.normalized_residual = np.asarray(normalized_residual, dtype=np.float64)
+        return self.build_se_result(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized_residual,
+            threshold=threshold,
+            result_mode=result_mode,
+        )
+
     def run(
         self,
         *,
@@ -5746,22 +5806,17 @@ class DCStateEstimator:
         finally:
             self._array_only_estimate_result = previous_array_only
             self._array_only_runtime = True
-        self.estimate_result = result
         self.removed_bad_data = removed
         if skip_bad_data:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:
             bad_items, normalized = self.identify_bad_data(result, threshold)
-        self.bad_items = bad_items
-        self.normalized_residual = normalized
-        if mode in ("none", "array"):
-            self.se_result = None
-            return None
-        return self.build_se_result(
+        return self.write_back(
             result,
             bad_items=bad_items,
             normalized_residual=normalized,
+            threshold=threshold,
             result_mode=mode,
         )
 

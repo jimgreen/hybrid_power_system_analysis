@@ -558,7 +558,7 @@ def _build_ac_se_ppc_namespace(ppc: Dict, source: Optional[Path] = None):
         ppc["source"] = str(Path(source).resolve())
     ensure_ac_ppc_topology(ppc)
     base = ppc["base"]
-    return SimpleNamespace(ppc=ppc, base=base, topology=ppc["_topology_arrays"])
+    return SimpleNamespace(_se_lightweight=True, ppc=ppc, base=base, topology=ppc["_topology_arrays"])
 
 
 class ACStateEstimator:
@@ -9639,6 +9639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         auto_prepare=False,
         matrix_dump_dir=Path(args.matrix_dump_dir) if args.matrix_dump_dir else None,
     )
+    estimator.prepare()
 
     bad_threshold = estimator.params.bad_threshold if args.bad_threshold is None else args.bad_threshold
     result_mode = args.result_mode if args.result_mode is not None else ("full" if args.se_result else "none")

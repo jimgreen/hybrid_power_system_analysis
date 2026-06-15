@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 class StateEstimatorPrepareTest(unittest.TestCase):
-    def test_ac_constructor_delegates_preparation(self):
+    def test_ac_constructor_defers_preparation(self):
         from secore.ac_se import ACStateEstimator
 
         calls = []
@@ -31,12 +31,12 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             else:
                 ACStateEstimator.prepare = original_prepare
 
-        self.assertEqual([(network, measurements, False)], calls)
+        self.assertEqual([], calls)
         self.assertEqual(Path("case.e"), estimator.e_file)
         self.assertEqual(Path("case.meas"), estimator.meas_file)
-        self.assertTrue(estimator._prepared)
+        self.assertFalse(estimator._prepared)
 
-    def test_dc_constructor_delegates_preparation(self):
+    def test_dc_constructor_defers_preparation(self):
         from secore.dc_se import DCStateEstimator
 
         calls = []
@@ -64,12 +64,12 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             else:
                 DCStateEstimator.prepare = original_prepare
 
-        self.assertEqual([(network, measurements, False)], calls)
+        self.assertEqual([], calls)
         self.assertEqual(Path("case.e"), estimator.e_file)
         self.assertEqual(Path("case.meas"), estimator.meas_file)
-        self.assertTrue(estimator._prepared)
+        self.assertFalse(estimator._prepared)
 
-    def test_hybrid_constructor_delegates_preparation(self):
+    def test_hybrid_constructor_defers_preparation(self):
         from secore.hybrid_se import HybridStateEstimator
 
         calls = []
@@ -89,10 +89,10 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             else:
                 HybridStateEstimator.prepare = original_prepare
 
-        self.assertEqual([True], calls)
+        self.assertEqual([], calls)
         self.assertEqual(Path("case.e"), estimator.e_file)
         self.assertEqual(Path("case.meas"), estimator.meas_file)
-        self.assertTrue(estimator._prepared)
+        self.assertFalse(estimator._prepared)
 
     def test_ac_load_network_returns_ppc_namespace_without_object_topology(self):
         from model import topology as network_topology
