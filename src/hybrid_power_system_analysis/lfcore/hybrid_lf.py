@@ -2133,13 +2133,14 @@ class HybridPowerFlowCalc:
 
             if self.verbose:
                 print(
-                    f"Hybrid iter {it}: "
-                    f"|F|={self.normF:.3e}, "
-                    f"|F_ac|={ac_norm:.3e}, "
-                    f"|F_dc|={dc_norm:.3e}"
+                    f"Iter {it + 1}: |F| = {self.normF:.2e}, "
+                    f"|F_ac| = {ac_norm:.2e}, "
+                    f"|F_dc| = {dc_norm:.2e}"
                 )
 
             if self.normF < self.tol:
+                if self.verbose:
+                    print(f"收敛于第 {it + 1} 次迭代")
                 self.converged = True
                 self.x = x
                 self._write_back()
@@ -2169,6 +2170,8 @@ class HybridPowerFlowCalc:
             # 与 AC/DC 潮流一致：方程定义为 F(x)=0，使用 x_new = x - J^{-1}F。
             x -= delta
 
+        if self.verbose:
+            print(f"达到最大迭代次数 {self.max_iter}，未收敛")
         self.x = x
         self._write_back()
         return -1

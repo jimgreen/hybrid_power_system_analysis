@@ -577,7 +577,7 @@ class ACStateEstimator:
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
-        auto_prepare: bool = True,
+        auto_prepare: bool = False,
         matrix_dump_dir: Optional[Path] = None,
         power_flow_linear_solver: Optional[str] = None,
     ):
@@ -8885,6 +8885,8 @@ class ACStateEstimator:
         observability: Optional[ObservabilityResult] = None,
     ) -> EstimateResult:
         """Run weighted least squares with simple damping to avoid voltage divergence."""
+        if not self._prepared:
+            self.prepare()
         solve_profile_start = time.perf_counter() if self.profile_enabled else None
         source_measurements = None if measurements is None or isinstance(measurements, dict) else self._normalize_measurements(measurements)
         measurement_plan_tables = self._measurement_plan_tables_for(
@@ -9377,6 +9379,33 @@ class ACStateEstimator:
         )
         return self.se_result
 
+    def write_back(
+        self,
+        result: EstimateResult,
+        *,
+        bad_items: Optional[Sequence[BadDataItem]] = None,
+        normalized_residual: Optional[Sequence[float]] = None,
+        threshold: Optional[float] = None,
+        result_mode: str = "full",
+    ) -> Optional[SEResult]:
+        """Store estimate_result / bad-data / se_result after run()."""
+        self.estimate_result = result
+        if bad_items is None or normalized_residual is None:
+            computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
+            if bad_items is None:
+                bad_items = computed_bad_items
+            if normalized_residual is None:
+                normalized_residual = computed_normalized
+        self.bad_items = list(bad_items)
+        self.normalized_residual = np.asarray(normalized_residual, dtype=np.float64)
+        return self.build_se_result(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized_residual,
+            threshold=threshold,
+            result_mode=result_mode,
+        )
+
     def run(
         self,
         *,
@@ -9420,22 +9449,17 @@ class ACStateEstimator:
         finally:
             self._array_only_estimate_result = previous_array_only
             self._array_only_runtime = True
-        self.estimate_result = result
         self.removed_bad_data = removed
         if skip_bad_data:
             bad_items = []
             normalized = np.array([], dtype=np.float64)
         else:
             bad_items, normalized = self.identify_bad_data(result, threshold)
-        self.bad_items = bad_items
-        self.normalized_residual = normalized
-        if mode in ("none", "array"):
-            self.se_result = None
-            return None
-        return self.build_se_result(
+        return self.write_back(
             result,
             bad_items=bad_items,
             normalized_residual=normalized,
+            threshold=threshold,
             result_mode=mode,
         )
 
