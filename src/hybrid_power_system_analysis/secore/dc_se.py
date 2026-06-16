@@ -304,52 +304,84 @@ def load_dc_ppc_from_e_file(file_name) -> Dict:
     return build_dc_ppc_with_topology_from_e_file(file_name)
 
 
+class _LazyDCSENetwork(SimpleNamespace):
+    """DC SE network namespace that builds its device/object graph lazily.
+
+    Array-mode SE reads only the scalar scale factors (``p_base`` etc.) and the
+    ppc/topology arrays, which are populated eagerly. The node and per-device
+    ``SimpleNamespace`` graph plus the topology-derived dicts/alive-maps (used
+    only by full-result write-back and external consumers) are built on first
+    access of any of those attributes, so cold-start array runs avoid
+    constructing ~10^5 throwaway objects.
+    """
+
+    def __getattr__(self, name):
+        # Only called when normal attribute lookup fails. Skip dunder probes so
+        # copy/pickle/introspection never force materialization.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        state = self.__dict__
+        materialize = state.get("_materialize")
+        if materialize is None or state.get("_materialized"):
+            raise AttributeError(name)
+        state["_materialized"] = True
+        materialize(self)
+        try:
+            return state[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
 def _build_dc_se_ppc_namespace(ppc: Dict) -> SimpleNamespace:
-    """Create the DC SE PPC namespace without materializing device objects."""
+    """Create the DC SE PPC namespace, deferring the device/object graph."""
     ensure_dc_ppc_topology(ppc)
     topology_arrays = ppc["_topology_arrays"]
     base = ppc["base"]
-    node_ids = np.asarray(topology_arrays.node_ids, dtype=np.int64)
-    bus_names = np.asarray(ppc.get("bus_name", ()), dtype=object)
-    nodes = [
-        SimpleNamespace(idx=int(node_id), name=str(bus_names[pos]) if pos < bus_names.size else f"bus_{int(node_id)}")
-        for pos, node_id in enumerate(node_ids)
-    ]
 
-    def device_objects(table_key: str, name_key: str, cols: Dict[str, int]):
-        table = np.asarray(ppc.get(table_key, np.zeros((0, len(cols)))), dtype=np.float64)
-        names = np.asarray(ppc.get(name_key, ()), dtype=object)
-        idx_col = int(cols.get("idx", 0))
-        return [
-            SimpleNamespace(
-                idx=int(table[row, idx_col]) if table.size else int(row),
-                name=str(names[row]) if row < names.size else f"{table_key}_{int(table[row, idx_col]) if table.size else int(row)}",
-            )
-            for row in range(int(table.shape[0]) if table.ndim == 2 else 0)
+    def _materialize(network) -> None:
+        node_ids = np.asarray(topology_arrays.node_ids, dtype=np.int64)
+        bus_names = np.asarray(ppc.get("bus_name", ()), dtype=object)
+        network.nodes = [
+            SimpleNamespace(idx=int(node_id), name=str(bus_names[pos]) if pos < bus_names.size else f"bus_{int(node_id)}")
+            for pos, node_id in enumerate(node_ids)
         ]
 
-    network = SimpleNamespace(
+        def device_objects(table_key: str, name_key: str, cols: Dict[str, int]):
+            table = np.asarray(ppc.get(table_key, np.zeros((0, len(cols)))), dtype=np.float64)
+            names = np.asarray(ppc.get(name_key, ()), dtype=object)
+            idx_col = int(cols.get("idx", 0))
+            return [
+                SimpleNamespace(
+                    idx=int(table[row, idx_col]) if table.size else int(row),
+                    name=str(names[row]) if row < names.size else f"{table_key}_{int(table[row, idx_col]) if table.size else int(row)}",
+                )
+                for row in range(int(table.shape[0]) if table.ndim == 2 else 0)
+            ]
+
+        network.branches = device_objects("branch", "branch_name", DC_BRANCH_COLS)
+        network.generators = device_objects("gen", "gen_name", DC_GEN_COLS)
+        network.loads = device_objects("load", "load_name", DC_LOAD_COLS)
+        network.zero_branches = device_objects("zero_branch", "zero_branch_name", DC_ZERO_BRANCH_COLS)
+        network.switches = device_objects("switch", "switch_name", DC_SWITCH_COLS)
+        network.breakers = device_objects("break", "break_name", DC_SWITCH_COLS)
+        network.dcdc_converters = device_objects("dcdc", "dcdc_name", DC_DCDC_COLS)
+        network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, populate_device_links=False)
+
+    network = _LazyDCSENetwork(
         _se_lightweight=True,
         ppc=ppc,
         _array_model=ppc,
         base=base,
         topology=topology_arrays,
         _topology_arrays=topology_arrays,
-        nodes=nodes,
-        branches=device_objects("branch", "branch_name", DC_BRANCH_COLS),
-        generators=device_objects("gen", "gen_name", DC_GEN_COLS),
-        loads=device_objects("load", "load_name", DC_LOAD_COLS),
-        zero_branches=device_objects("zero_branch", "zero_branch_name", DC_ZERO_BRANCH_COLS),
-        switches=device_objects("switch", "switch_name", DC_SWITCH_COLS),
-        breakers=device_objects("break", "break_name", DC_SWITCH_COLS),
-        dcdc_converters=device_objects("dcdc", "dcdc_name", DC_DCDC_COLS),
         p_base=float(base["p_base"]),
         p_base_kW=float(base["p_base_kW"]),
         u_scale=float(base["u_scale"]),
         p_scale=float(base["p_scale"]),
         i_scale=float(base["i_scale"]),
     )
-    network_topology.apply_dc_topology_arrays(network, topology_arrays, compact=True, populate_device_links=False)
+    network.__dict__["_materialize"] = _materialize
+    network.__dict__["_materialized"] = False
     return network
 
 
@@ -689,7 +721,6 @@ class DCStateEstimator:
             self.meas_ppc = build_meas_ppc_from_e_file(
                 self.meas_file,
                 include_strings=False,
-                use_cache=False,
                 include_matrix=False,
             )
             self.meas_ppc["_mutable_runtime_arrays"] = True
@@ -3632,7 +3663,7 @@ class DCStateEstimator:
                 continue
             device_pos = np.arange(device_count, dtype=np.int64)
             terminal_measured = np.zeros(device_count, dtype=bool)
-            for meas_code in (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO):
+            for meas_code in (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO):
                 keys = self._active_measurement_key_array_for_type(
                     int(device_type_code),
                     device_pos,

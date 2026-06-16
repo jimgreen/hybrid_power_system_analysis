@@ -516,7 +516,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertEqual(0, calc.public_f_calls)
         self.assertEqual(0, calc.public_j_calls)
 
-    def test_build_dc_ppc_from_e_file_creates_cached_array_model(self):
+    def test_build_dc_ppc_from_e_file_creates_array_model(self):
         import numpy as np
         from model.dc_array_model import (
             BRANCH_COLS,
@@ -529,9 +529,9 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
         ppc = build_dc_ppc_from_e_file(e_file)
-        cached_ppc = build_dc_ppc_from_e_file(e_file)
+        second_ppc = build_dc_ppc_from_e_file(e_file)
 
-        self.assertIs(ppc, cached_ppc)
+        self.assertIsNot(ppc, second_ppc)
         self.assertEqual("dc_ppc_v1", ppc["format"])
         self.assertEqual((30, len(BUS_COLS)), ppc["bus"].shape)
         self.assertEqual((37, len(BRANCH_COLS)), ppc["branch"].shape)
@@ -592,7 +592,6 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         from model import dc_array_model
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
-        dc_array_model.clear_dc_ppc_cache(e_file)
         original_network_builder = dc_array_model.build_dc_ppc_from_network
         original_model_builder = dc_array_model._build_dc_ppc_from_model
         original_file_factory = dc_array_model.efile_factory_from_file
@@ -634,10 +633,9 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
     def test_dc_ppc_builds_and_reuses_topology_input_like_ac_model(self):
         import numpy as np
         from model import topology
-        from model.dc_array_model import build_dc_ppc_from_e_file, clear_dc_ppc_cache
+        from model.dc_array_model import build_dc_ppc_from_e_file
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
-        clear_dc_ppc_cache(e_file)
         ppc = build_dc_ppc_from_e_file(e_file)
 
         self.assertIn("_topology_input", ppc)
@@ -662,10 +660,9 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
     def test_dc_e_file_name_arrays_are_lazy_until_materialized(self):
         import numpy as np
-        from model.dc_array_model import build_dc_ppc_from_e_file, clear_dc_ppc_cache
+        from model.dc_array_model import build_dc_ppc_from_e_file
 
         e_file = Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
-        clear_dc_ppc_cache(e_file)
         ppc = build_dc_ppc_from_e_file(e_file)
         bus_names = ppc["bus_name"]
 

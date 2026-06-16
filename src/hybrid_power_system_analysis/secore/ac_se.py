@@ -768,7 +768,6 @@ class ACStateEstimator:
             self.meas_ppc = build_meas_ppc_from_e_file(
                 self.meas_file,
                 include_strings=False,
-                use_cache=False,
                 include_matrix=False,
             )
             self.meas_ppc["_mutable_runtime_arrays"] = True
@@ -3304,6 +3303,15 @@ class ACStateEstimator:
             status_array[angle_mask] = MEAS_STATUS_INVALID
             invalidated_mask[angle_mask] = True
 
+        ac_current_mask = np.isin(
+            meas_type_code_array,
+            np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO, MEAS_TYPE_I_LOAD, MEAS_TYPE_I_GEN), dtype=np.int16),
+        )
+        if ac_current_mask.any():
+            valid_array[ac_current_mask] = False
+            status_array[ac_current_mask] = MEAS_STATUS_INVALID
+            invalidated_mask[ac_current_mask] = True
+
         candidate_mask = valid_array & (weight_array > 0.0) & (~angle_mask)
         flagged_unavailable = candidate_mask & unavailable_mask
         if flagged_unavailable.any():
@@ -3460,6 +3468,18 @@ class ACStateEstimator:
         sorted_keys = np.sort(keys) if keys.size else np.empty(0, dtype=np.int64)
         self._active_measurement_key_sorted_array_cache = (cache_key, sorted_keys)
         return sorted_keys
+
+    def _active_measurement_key_set_ref(self) -> set:
+        """Return active measurement keys as a Python set for O(1) single-key membership probes."""
+        key_array = self._active_measurement_key_array_ref()
+        cache_key = (id(key_array), int(np.asarray(key_array).size))
+        cached = getattr(self, "_active_measurement_key_set_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
+            return cached[1]
+        keys = np.asarray(key_array, dtype=np.int64).reshape(-1)
+        key_set = set(keys.tolist())
+        self._active_measurement_key_set_cache = (cache_key, key_set)
+        return key_set
 
     def _active_measurement_key_membership(self, keys: np.ndarray) -> np.ndarray:
         """Vectorized membership against packed active measurement keys without np.isin uniquing."""
@@ -3969,7 +3989,6 @@ class ACStateEstimator:
         topology_weight = float(self.pseudo_measurement_weight) * 1e-4
         ppc = self._ac_ppc_dict()
         store_strings = False
-        key_probe = np.empty(1, dtype=np.int64)
         pseudo_rows = _PseudoMeasurementBuffer(
             3
             * (
@@ -3981,8 +4000,7 @@ class ACStateEstimator:
         )
 
         def key_is_active(key: int) -> bool:
-            key_probe[0] = int(key)
-            return bool(self._active_measurement_key_membership(key_probe)[0])
+            return int(key) in self._active_measurement_key_set_ref()
 
         def queue_topology_pseudo(
             device_type_code: int,
@@ -4028,11 +4046,7 @@ class ACStateEstimator:
                 if int(pos) < 0:
                     continue
                 device_name = str(name) if store_strings else ""
-                has_terminal_current = any(
-                    key_is_active(self._active_measurement_key(device_type_code, int(pos), meas_type_code))
-                    for meas_type_code in (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO)
-                )
-                if not has_terminal_current and not any(
+                if not any(
                     key_is_active(self._active_measurement_key(device_type_code, int(pos), meas_type_code))
                     for meas_type_code in (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO)
                 ):
@@ -4045,7 +4059,7 @@ class ACStateEstimator:
                         MEAS_TYPE_P_FROM,
                         float(device_values[cols["p"]] or 0.0),
                     )
-                if not has_terminal_current and not any(
+                if not any(
                     key_is_active(self._active_measurement_key(device_type_code, int(pos), meas_type_code))
                     for meas_type_code in (MEAS_TYPE_Q_FROM, MEAS_TYPE_Q_TO)
                 ):
@@ -8702,7 +8716,7 @@ class ACStateEstimator:
                 H.reset()
             else:
                 H = SparseJacobianBuilder((n_meas, self.n_state))
-                H._assume_fixed_pattern = True
+                H._assume_fixed_pattern = False
                 if len(cache) > 4:
                     cache.clear()
                 cache[key] = (measurement_plan_tables, H)

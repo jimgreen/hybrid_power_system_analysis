@@ -162,7 +162,7 @@ class MeasurementArrayModelTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            ppc = build_meas_ppc_from_e_file(meas_file, include_strings=False, include_matrix=False, use_cache=False)
+            ppc = build_meas_ppc_from_e_file(meas_file, include_strings=False, include_matrix=False)
 
         self.assertIsNone(ppc["meas"])
         table = measurement_table_from_meas_ppc(ppc, include_strings=False)

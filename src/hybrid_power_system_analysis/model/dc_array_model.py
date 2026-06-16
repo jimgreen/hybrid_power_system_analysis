@@ -1,4 +1,3 @@
-import threading
 import sys
 from pathlib import Path
 from typing import Dict, Tuple
@@ -131,18 +130,6 @@ DCDC_COLS = {
     "i_c": 13,
     "j_c": 14,
 }
-
-_DC_PPC_CACHE = {}
-_DC_PPC_CACHE_LOCK = threading.Lock()
-
-
-def clear_dc_ppc_cache(file_path=None) -> None:
-    with _DC_PPC_CACHE_LOCK:
-        if file_path is None:
-            _DC_PPC_CACHE.clear()
-        else:
-            path = Path(file_path).resolve()
-            _DC_PPC_CACHE.pop(path, None)
 
 def _build_switch_like_from_rows(
     table_rows,
@@ -371,30 +358,17 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
 
 def build_dc_ppc_from_e_file(file_path) -> Dict:
     """Build a DC ppc from an E file through the shared model factory."""
-    file_key = _file_cache_key(file_path)
-    with _DC_PPC_CACHE_LOCK:
-        cached = _DC_PPC_CACHE.get(file_key[0])
-        if cached is not None and cached[0] == file_key:
-            return cached[1]
-
-    ppc = _build_dc_ppc_from_rows_dict(_read_efile_rows(file_key[0]), file_key[0])
-    ppc["source"] = str(file_key[0])
-    with _DC_PPC_CACHE_LOCK:
-        _DC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    source = resolve_project_file(file_path).resolve()
+    ppc = _build_dc_ppc_from_rows_dict(_read_efile_rows(source), source)
+    ppc["source"] = str(source)
     return ppc
 
 
 def build_dc_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build DC ppc from E rows that are already loaded in memory."""
-    file_key = _file_cache_key(file_path)
-    with _DC_PPC_CACHE_LOCK:
-        cached = _DC_PPC_CACHE.get(file_key[0])
-        if cached is not None and cached[0] == file_key:
-            return cached[1]
-    ppc = _build_dc_ppc_from_rows_dict(rows, file_key[0])
-    ppc["source"] = str(file_key[0])
-    with _DC_PPC_CACHE_LOCK:
-        _DC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    source = resolve_project_file(file_path).resolve()
+    ppc = _build_dc_ppc_from_rows_dict(rows, source)
+    ppc["source"] = str(source)
     return ppc
 
 

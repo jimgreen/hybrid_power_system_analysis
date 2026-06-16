@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.sparse import eye as sparse_eye
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -74,6 +75,8 @@ from model.meas_type import (
     MEAS_TYPE_I_AC,
     MEAS_TYPE_I_DC,
     MEAS_TYPE_I_FROM,
+    MEAS_TYPE_I_GEN,
+    MEAS_TYPE_I_LOAD,
     MEAS_TYPE_I_TO,
     MEAS_TYPE_P_AC,
     MEAS_TYPE_P_DC,
@@ -313,33 +316,32 @@ def _build_se_acac_converters(ppc: Dict) -> List[SimpleNamespace]:
 
 
 def _assign_se_converter_topology(network: _SELightweightHybridNetwork) -> None:
-    ac_nodes = getattr(network.ac, "node_dict", {})
-    dc_nodes = getattr(network.dc, "node_dict", {})
+    # Converter node/island object links are unused by the array-mode SE path
+    # (only the load-flow path consumes them, and it wires its own). Alive flags
+    # are derived from the topology arrays via the side alive lookups, so this
+    # avoids touching ``network.dc.node_dict`` and keeps the DC object graph
+    # unmaterialized for hybrid cold starts.
     ac_alive = _side_alive_node_lookup(network.ac)
     dc_alive = _side_alive_node_lookup(network.dc)
     for conv in network.dcac_converters:
-        ac_node = ac_nodes.get(int(conv.ac_node))
-        dc_node = dc_nodes.get(int(conv.dc_node))
-        conv.ac_node_obj = ac_node
-        conv.dc_node_obj = dc_node
-        conv.ac_isl_obj = None if ac_node is None else getattr(ac_node, "isl_obj", None)
-        conv.dc_isl_obj = None if dc_node is None else getattr(dc_node, "isl_obj", None)
+        conv.ac_node_obj = None
+        conv.dc_node_obj = None
+        conv.ac_isl_obj = None
+        conv.dc_isl_obj = None
         conv.is_alive = bool(
             int(getattr(conv, "run_stat", 1)) == 1
-            and ac_alive.get(int(conv.ac_node), getattr(ac_node, "is_alive", False))
-            and dc_alive.get(int(conv.dc_node), getattr(dc_node, "is_alive", False))
+            and ac_alive.get(int(conv.ac_node), False)
+            and dc_alive.get(int(conv.dc_node), False)
         )
     for conv in network.acac_converters:
-        i_node = ac_nodes.get(int(conv.i_node))
-        j_node = ac_nodes.get(int(conv.j_node))
-        conv.i_node_obj = i_node
-        conv.j_node_obj = j_node
-        conv.i_isl_obj = None if i_node is None else getattr(i_node, "isl_obj", None)
-        conv.j_isl_obj = None if j_node is None else getattr(j_node, "isl_obj", None)
+        conv.i_node_obj = None
+        conv.j_node_obj = None
+        conv.i_isl_obj = None
+        conv.j_isl_obj = None
         conv.is_alive = bool(
             int(getattr(conv, "run_stat", 1)) == 1
-            and ac_alive.get(int(conv.i_node), getattr(i_node, "is_alive", False))
-            and ac_alive.get(int(conv.j_node), getattr(j_node, "is_alive", False))
+            and ac_alive.get(int(conv.i_node), False)
+            and ac_alive.get(int(conv.j_node), False)
         )
 
 
@@ -1006,7 +1008,6 @@ class HybridStateEstimator:
         self.meas_ppc = build_meas_ppc_from_e_file(
             self.meas_file,
             include_strings=False,
-            use_cache=False,
             include_matrix=False,
         )
         self.measurements = measurement_list_from_meas_ppc(self.meas_ppc)
@@ -1038,6 +1039,7 @@ class HybridStateEstimator:
 
         stage_start = time.perf_counter()
         self._disable_angle_measurements()
+        self._disable_ac_current_measurements()
         self._disable_unavailable_measurements()
         self._convert_measurements_to_pu()
         self._record_profile_time("init.convert_measurements_to_pu", time.perf_counter() - stage_start)
@@ -1059,6 +1061,14 @@ class HybridStateEstimator:
         self._refresh_active_measurement_state_layout()
         self._record_profile_time("init.refresh_active_measurements", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
+        fast_observability = self._fast_active_observability_certificate()
+        if fast_observability is not None:
+            self._initial_observability_cache = fast_observability
+            self.required_pseudo_measurement_count = 0
+        else:
+            self.required_pseudo_measurement_count = self._add_required_missing_pseudo_measurements()
+        self._record_profile_time("init.required_missing_pseudo", time.perf_counter() - stage_start)
+        stage_start = time.perf_counter()
         self.targeted_observability_pseudo_count = self._add_targeted_observability_pseudo_measurements()
         self._record_profile_time("init.targeted_observability_pseudo", time.perf_counter() - stage_start)
         stage_start = time.perf_counter()
@@ -1073,7 +1083,6 @@ class HybridStateEstimator:
         self.meas_ppc = build_meas_ppc_from_e_file(
             self.meas_file,
             include_strings=False,
-            use_cache=False,
             include_matrix=False,
         )
         self.meas_ppc["_mutable_runtime_arrays"] = True
@@ -1678,6 +1687,49 @@ class HybridStateEstimator:
             RuntimeWarning,
             stacklevel=2,
         )
+
+    def _disable_ac_current_measurements(self) -> None:
+        """Mark all AC-side current measurements unavailable before active measurement setup."""
+        table = getattr(self.measurements, "table", None)
+        if table is None:
+            warnings.warn(
+                "Hybrid SE AC-current disable requires table-backed measurements; Measurement object iteration is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        row_count = int(np.asarray(getattr(table, "idx", np.asarray([]))).size)
+        if row_count == 0:
+            return
+        device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
+        meas_type_code = np.asarray(getattr(table, "meas_type_code", np.asarray([], dtype=np.int16)), dtype=np.int16)
+        if device_type_code.size != row_count or meas_type_code.size != row_count:
+            return
+        ac_terminal_devices = np.asarray(
+            (
+                DEVICE_TYPE_ACBranch,
+                DEVICE_TYPE_ACTransformer,
+                DEVICE_TYPE_ACZeroBranch,
+                DEVICE_TYPE_ACBreak,
+                DEVICE_TYPE_ACACConverter,
+            ),
+            dtype=np.int16,
+        )
+        ac_single_devices = np.asarray((DEVICE_TYPE_ACLoad, DEVICE_TYPE_ACGenerator), dtype=np.int16)
+        ac_current_mask = (
+            np.isin(device_type_code, ac_terminal_devices)
+            & np.isin(meas_type_code, np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO), dtype=np.int16))
+        )
+        ac_current_mask |= (
+            np.isin(device_type_code, ac_single_devices)
+            & np.isin(meas_type_code, np.asarray((MEAS_TYPE_I_LOAD, MEAS_TYPE_I_GEN), dtype=np.int16))
+        )
+        ac_current_mask |= (device_type_code == DEVICE_TYPE_DCACConverter) & (meas_type_code == MEAS_TYPE_I_AC)
+        if not np.any(ac_current_mask):
+            return
+        table.valid[ac_current_mask] = False
+        measurement_table_status_code(table)[ac_current_mask] = MEAS_STATUS_INVALID
+        self._invalidate_measurement_activity_summary()
 
     def _measurement_device_count_by_type_code(self) -> Dict[int, int]:
         ac = getattr(self, "_ac_sub_estimator", None)
@@ -5099,76 +5151,165 @@ class HybridStateEstimator:
             weak_states=[],
         )
 
+    def _add_required_missing_pseudo_measurements(self) -> int:
+        """Add all required pseudo rows for missing P/Q/V topology states without a max-count cap."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return 0
+        existing_keys = set(self._active_measurement_keys())
+        required_specs = []
+        power_codes_by_device = {
+            DEVICE_TYPE_ACGenerator: {MEAS_TYPE_P_GEN, MEAS_TYPE_Q_GEN},
+            DEVICE_TYPE_ACLoad: {MEAS_TYPE_P_LOAD, MEAS_TYPE_Q_LOAD},
+            DEVICE_TYPE_ACZeroBranch: {MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM},
+            DEVICE_TYPE_ACBreak: {MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM},
+            DEVICE_TYPE_DCGenerator: {MEAS_TYPE_P_GEN},
+            DEVICE_TYPE_DCLoad: {MEAS_TYPE_P_LOAD},
+            DEVICE_TYPE_DCZeroBranch: {MEAS_TYPE_P_FROM},
+            DEVICE_TYPE_DCBreak: {MEAS_TYPE_P_FROM},
+            DEVICE_TYPE_DCACConverter: {MEAS_TYPE_P_DC, MEAS_TYPE_P_AC, MEAS_TYPE_Q_AC},
+            DEVICE_TYPE_ACACConverter: {MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_Q_TO},
+        }
+        voltage_codes_by_device = {
+            DEVICE_TYPE_ACNode: {MEAS_TYPE_V},
+            DEVICE_TYPE_DCNode: {MEAS_TYPE_V},
+        }
+
+        def accept(spec) -> bool:
+            device_type_code = int(spec.device_type_code)
+            meas_type_code = int(spec.meas_type_code)
+            return (
+                meas_type_code in power_codes_by_device.get(device_type_code, set())
+                or meas_type_code in voltage_codes_by_device.get(device_type_code, set())
+            )
+
+        for spec in self._side_observability_pseudo_specs("ac"):
+            if accept(spec):
+                required_specs.append(spec)
+        for spec in self._side_observability_pseudo_specs("dc"):
+            if accept(spec):
+                required_specs.append(spec)
+        for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
+            if accept(spec):
+                required_specs.append(spec)
+        if not required_specs:
+            return 0
+
+        idx_values = []
+        device_type_codes = []
+        device_positions = []
+        meas_type_codes = []
+        values = []
+        next_idx = self._next_measurement_idx()
+        for spec in required_specs:
+            device_type_code = int(spec.device_type_code)
+            meas_type_code = int(spec.meas_type_code)
+            device_pos = int(spec.device_pos)
+            if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
+                continue
+            key = self._packed_measurement_key(device_type_code, device_pos, meas_type_code)
+            if key < 0 or key in existing_keys:
+                continue
+            if self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code):
+                continue
+            idx_values.append(next_idx)
+            next_idx += 1
+            device_type_codes.append(device_type_code)
+            device_positions.append(device_pos)
+            meas_type_codes.append(meas_type_code)
+            values.append(float(spec.value))
+            existing_keys.add(key)
+        count = len(idx_values)
+        if count == 0:
+            return 0
+        tail_table = MeasurementTable(
+            idx=np.asarray(idx_values, dtype=np.int64),
+            name=np.asarray([], dtype=object),
+            device_type=np.asarray([], dtype=object),
+            device_name=np.asarray([], dtype=object),
+            meas_type=np.asarray([], dtype=object),
+            weight=np.full(count, self.pseudo_measurement_weight, dtype=np.float64),
+            valid=np.ones(count, dtype=bool),
+            value=np.asarray(values, dtype=np.float64),
+            device_type_code=np.asarray(device_type_codes, dtype=np.int16),
+            angle_mask=np.zeros(count, dtype=bool),
+            status_code=np.full(count, MEAS_STATUS_PSEUDO, dtype=np.int16),
+            device_name_id=np.full(count, -1, dtype=np.int64),
+            meas_type_code=np.asarray(meas_type_codes, dtype=np.int16),
+            device_pos=np.asarray(device_positions, dtype=np.int64),
+        )
+        master_table = getattr(self.measurements, "table", None)
+        if master_table is None or int(master_table.idx.size) != len(self.measurements):
+            master_table = _measurement_table_from_measurements(self.measurements)
+        self.measurement_table = concat_measurement_tables(master_table, tail_table)
+        self.measurements = TableBackedMeasurementList(
+            self.measurement_table,
+            normalized=getattr(self.measurements, "normalized", False),
+        )
+        self._invalidate_measurement_activity_summary()
+        self._refresh_active_measurement_state_layout()
+        self._initial_observability_cache = None
+        self._observability_matrix_cache = None
+        return count
+
     def _add_targeted_observability_pseudo_measurements(self) -> int:
-        """Patch hybrid rank deficiencies and optional post-observability redundancy."""
+        """Patch remaining hybrid rank deficiencies without applying a pseudo-count cap."""
         delegate = self._delegate()
         if delegate is not None:
             return int(getattr(delegate, "targeted_observability_pseudo_count", 0))
-        total_added = 0
-        max_count = max(0, int(self.targeted_pseudo_measurement_max))
-        if max_count <= 0:
-            return 0
-        step = max(1, int(getattr(self, "targeted_pseudo_measurement_step", 10)))
-        redundancy_target = targeted_redundancy_count(
-            getattr(self, "n_state", 0),
-            getattr(self, "targeted_pseudo_measurement_redundancy_ratio", 0.0),
-        )
         fast_observability = self._fast_active_observability_certificate()
         if fast_observability is not None:
             self._initial_observability_cache = fast_observability
             return 0
-        observability = None
-        while total_added < max_count:
-            observability = self.observability_analysis()
-            deficiency_batch = max(1, int(getattr(observability, "deficiency", 0) or 0))
-            batch_limit = min(max_count - total_added, max(step, deficiency_batch))
-            if observability.observable:
-                redundancy = max(0, int(observability.measurement_count) - int(observability.state_count))
-                missing = redundancy_target - redundancy
-                if missing <= 0:
-                    break
-                added = self._add_weak_direction_observability_pseudo_measurements(
-                    observability,
-                    min(batch_limit, missing),
-                )
-                if added == 0:
-                    break
-                total_added += added
-                observability = None
+        observability = self.observability_analysis()
+        if observability.observable:
+            self._initial_observability_cache = observability
+            return 0
+        angle_col = np.asarray(getattr(self, "ac_theta_state_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
+        active_angle_cols = angle_col[angle_col >= 0]
+        if active_angle_cols.size:
+            cache = self._observability_matrix_cache_for(observability, self.active_measurements, self.initial_state())
+            H = cache.get("H") if cache is not None else self.jacobian_sparse(self.initial_state(), self.active_measurements)
+            unanchored = unanchored_angle_state_indices(H, active_angle_cols)
+            if unanchored and int(getattr(observability, "deficiency", 0) or 0) <= len(unanchored):
+                return 0
+        candidates = self._observability_pseudo_candidate_measurements()
+        if not candidates:
+            self._initial_observability_cache = observability
+            return 0
+        existing_keys = set(self._active_measurement_keys())
+        next_idx = self._next_measurement_idx()
+        selected = []
+        for candidate in candidates:
+            device_type_code = int(getattr(candidate, "device_type_code", 0))
+            meas_type_code = int(getattr(candidate, "meas_type_code", 0))
+            device_pos = int(getattr(candidate, "device_pos", -1))
+            if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
                 continue
-            next_idx = self._next_measurement_idx()
-            existing_keys = self._active_measurement_keys()
-            added = 0
-            refreshed = False
-            measurement_count_before = len(self.measurements)
-            remaining = batch_limit
-            targeted_state_limit = remaining if remaining <= step else 0
-            for state_idx, _score in observability.weak_states:
-                if added >= targeted_state_limit:
-                    break
-                next_idx, added_count = self._append_targeted_observability_pseudo(
-                    next_idx,
-                    state_idx,
-                    existing_keys,
-                    remaining - added,
-                )
-                added += added_count
-            if added == 0:
-                added = self._add_weak_direction_observability_pseudo_measurements(observability, remaining)
-                refreshed = added > 0
-            if added == 0:
-                break
-            total_added += added
-            if not refreshed:
-                refreshed = self._incremental_update_active_measurement_state_layout(
-                    self.measurements[measurement_count_before:]
-                )
-            if not refreshed:
-                self._refresh_active_measurement_state_layout()
-            observability = None
-        if observability is None and total_added < max_count:
-            observability = self.observability_analysis()
-        return total_added
+            key = self._packed_measurement_key(device_type_code, device_pos, meas_type_code)
+            if key < 0 or key in existing_keys:
+                continue
+            if self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code):
+                continue
+            candidate.idx = next_idx
+            next_idx += 1
+            candidate.device_type_code = device_type_code
+            candidate.meas_type_code = meas_type_code
+            candidate.device_pos = device_pos
+            mark_measurement_pseudo(candidate)
+            selected.append(candidate)
+            existing_keys.add(key)
+        if not selected:
+            self._initial_observability_cache = observability
+            return 0
+        measurement_count_before = len(self.measurements)
+        self._append_pseudo_measurement_objects(selected)
+        appended = self.measurements[measurement_count_before:]
+        if not self._incremental_update_active_measurement_state_layout(appended):
+            self._refresh_active_measurement_state_layout()
+        self._observability_matrix_cache = None
+        self._initial_observability_cache = self.observability_analysis()
+        return len(selected)
 
     def _add_weak_direction_observability_pseudo_measurements(
         self,
@@ -5519,6 +5660,16 @@ class HybridStateEstimator:
                             self._measurement_spec(code, device_pos, MEAS_TYPE_Q_TO, 0.0, name),
                         )
                     )
+            for code in (DEVICE_TYPE_ACZeroBranch, DEVICE_TYPE_ACBreak):
+                terminal_names = names_for(code)
+                for device_pos in range(int(terminal_names.size)):
+                    name = str(terminal_names[device_pos])
+                    specs.extend(
+                        (
+                            self._measurement_spec(code, device_pos, MEAS_TYPE_P_FROM, 0.0, name),
+                            self._measurement_spec(code, device_pos, MEAS_TYPE_Q_FROM, 0.0, name),
+                        )
+                    )
             return specs
         if side == "dc":
             dc = self._dc_sub_estimator
@@ -5589,6 +5740,11 @@ class HybridStateEstimator:
                         self._measurement_spec(DEVICE_TYPE_DCBranch, device_pos, MEAS_TYPE_P_TO, 0.0, name),
                     )
                 )
+            for code in (DEVICE_TYPE_DCZeroBranch, DEVICE_TYPE_DCBreak):
+                terminal_names = names_for(code)
+                for device_pos in range(int(terminal_names.size)):
+                    name = str(terminal_names[device_pos])
+                    specs.append(self._measurement_spec(code, device_pos, MEAS_TYPE_P_FROM, 0.0, name))
             return specs
         return specs
 
@@ -6051,10 +6207,11 @@ class HybridStateEstimator:
             if rows.size:
                 out[rows] = float(value)
         invalid_rows = np.flatnonzero(~valid_pos)
-        node_dict = getattr(getattr(self.network, "dc", None), "node_dict", {})
-        for row in invalid_rows:
-            node = node_dict.get(int(nodes[row]))
-            out[row] = float(getattr(node, "voltage", 1.0) or 1.0)
+        if invalid_rows.size:
+            node_dict = getattr(getattr(self.network, "dc", None), "node_dict", {})
+            for row in invalid_rows:
+                node = node_dict.get(int(nodes[row]))
+                out[row] = float(getattr(node, "voltage", 1.0) or 1.0)
         return out
 
     def _dc_voltage_col_for_node(self, node_idx: int) -> int:
@@ -6246,7 +6403,15 @@ class HybridStateEstimator:
         """
         if estimator is None or len(block.measurements) == 0:
             return
-        sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
+        builder = getattr(estimator, "_jacobian_builder", None)
+        previous_fixed_pattern = getattr(builder, "_assume_fixed_pattern", None)
+        if builder is not None:
+            builder._assume_fixed_pattern = False
+        try:
+            sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
+        finally:
+            if builder is not None and previous_fixed_pattern is not None:
+                builder._assume_fixed_pattern = previous_fixed_pattern
         if sub_csr.nnz == 0:
             return
         cache_store = self._sub_jacobian_stamp_cache if cache_key is not None else None
@@ -6606,6 +6771,42 @@ class HybridStateEstimator:
                 assume_normal_pattern_matches=measurements is self.active_measurements,
             )
             dx, normal_factor_diag = normal_solver.solve(gain, rhs, return_factor_diag=final_diagnostics)
+            if dx.size and not np.all(np.isfinite(dx)):
+                diag_scale = 1.0
+                if is_sparse_matrix(gain):
+                    diag_values = np.asarray(gain.diagonal(), dtype=np.float64)
+                    finite_diag = diag_values[np.isfinite(diag_values) & (diag_values > 0.0)]
+                    if finite_diag.size:
+                        diag_scale = float(np.median(finite_diag))
+                    identity = sparse_eye(gain.shape[0], format="csc", dtype=np.float64)
+                    for damping_factor in (1e-10, 1e-8, 1e-6, 1e-4):
+                        damped_gain = gain + identity * (diag_scale * damping_factor)
+                        dx_candidate, normal_factor_diag = NormalEquationSolver().solve(
+                            damped_gain,
+                            rhs,
+                            return_factor_diag=final_diagnostics,
+                        )
+                        if dx_candidate.size == 0 or np.all(np.isfinite(dx_candidate)):
+                            dx = dx_candidate
+                            self._record_profile_time("solve.damped_normal_fallback", damping_factor)
+                            break
+                else:
+                    diag_values = np.diag(gain)
+                    finite_diag = diag_values[np.isfinite(diag_values) & (diag_values > 0.0)]
+                    if finite_diag.size:
+                        diag_scale = float(np.median(finite_diag))
+                    for damping_factor in (1e-10, 1e-8, 1e-6, 1e-4):
+                        damped_gain = np.array(gain, dtype=np.float64, copy=True)
+                        damped_gain[np.diag_indices_from(damped_gain)] += diag_scale * damping_factor
+                        dx_candidate, normal_factor_diag = NormalEquationSolver().solve(
+                            damped_gain,
+                            rhs,
+                            return_factor_diag=final_diagnostics,
+                        )
+                        if dx_candidate.size == 0 or np.all(np.isfinite(dx_candidate)):
+                            dx = dx_candidate
+                            self._record_profile_time("solve.damped_normal_fallback", damping_factor)
+                            break
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
             if max_correction < self.tol:
                 converged = True

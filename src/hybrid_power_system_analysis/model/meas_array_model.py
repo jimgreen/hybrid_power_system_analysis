@@ -1,5 +1,4 @@
 import sys
-import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -46,22 +45,8 @@ ANGLE_MEASUREMENT_TYPES = frozenset(MEAS_TYPE_NAMES[int(code)] for code in ANGLE
 
 _DEVICE_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in DEVICE_TYPE_CODES.items()}
 _MEAS_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in MEAS_TYPE_CODES.items()}
-_MEAS_PPC_CACHE = {}
-_MEAS_PPC_CACHE_LOCK = threading.Lock()
 _REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
 _REQUIRED_COLUMNS_BYTES = tuple(name.encode("utf8") for name in _REQUIRED_COLUMNS)
-
-
-def clear_meas_ppc_cache(file_path=None) -> None:
-    with _MEAS_PPC_CACHE_LOCK:
-        if file_path is None:
-            _MEAS_PPC_CACHE.clear()
-            return
-        path = resolve_project_file(file_path).resolve()
-        for key in list(_MEAS_PPC_CACHE):
-            key_path = key[0] if isinstance(key, tuple) and key else key
-            if key_path == path:
-                _MEAS_PPC_CACHE.pop(key, None)
 
 
 def _file_cache_key(file_path) -> Tuple[Path, int, int]:
@@ -1014,31 +999,15 @@ def build_meas_ppc_from_e_file(
     file_path,
     *,
     include_strings: bool = True,
-    use_cache: bool = True,
     include_matrix: bool = True,
 ) -> Dict:
     """Read a measurement file directly into a PPC-style NumPy dictionary."""
-    file_key = _file_cache_key(file_path)
-    if not use_cache:
-        return _build_meas_ppc_from_measurement_file(
-            file_key[0],
-            include_strings=bool(include_strings),
-            include_matrix=bool(include_matrix),
-        )
-    cache_key = (file_key[0], bool(include_strings), bool(include_matrix))
-    with _MEAS_PPC_CACHE_LOCK:
-        cached = _MEAS_PPC_CACHE.get(cache_key)
-        if cached is not None and cached[0] == file_key:
-            return cached[1]
-
-    ppc = _build_meas_ppc_from_measurement_file(
-        file_key[0],
+    source = resolve_project_file(file_path).resolve()
+    return _build_meas_ppc_from_measurement_file(
+        source,
         include_strings=bool(include_strings),
         include_matrix=bool(include_matrix),
     )
-    with _MEAS_PPC_CACHE_LOCK:
-        _MEAS_PPC_CACHE[cache_key] = (file_key, ppc)
-    return ppc
 
 
 def copy_meas_ppc(ppc: Dict) -> Dict:

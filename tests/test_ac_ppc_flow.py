@@ -284,7 +284,6 @@ class ACPPCFlowTest(unittest.TestCase):
         import ac_array_model
 
         case_path = ROOT_DIR / "data" / "model" / "ac" / "ieee300.e"
-        ac_array_model.clear_ac_ppc_cache(case_path)
         original_network_builder = ac_array_model.build_ac_ppc_from_network
         original_model_builder = ac_array_model._build_ac_ppc_from_model
         original_file_factory = ac_array_model.efile_factory_from_file

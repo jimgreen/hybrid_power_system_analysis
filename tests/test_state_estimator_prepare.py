@@ -145,11 +145,15 @@ class StateEstimatorPrepareTest(unittest.TestCase):
             network = DCStateEstimator._load_network(
                 Path(__file__).resolve().parents[1] / "data" / "model" / "dc" / "dc_net_30.e"
             )
+            # Object topology application is deferred until the device/object
+            # graph is first accessed; array-mode SE never triggers it.
+            self.assertEqual(0, len(calls))
+            _ = network.node_dict
+            self.assertEqual(1, len(calls))
         finally:
             dc_se.network_topology.apply_dc_topology_arrays = original_apply_topology
             dc_se.network_topology.prepare_dc_topology = original_prepare_topology
 
-        self.assertEqual(1, len(calls))
         self.assertIs(network, calls[0][0])
         self.assertIs(network._topology_arrays, calls[0][1])
         self.assertTrue(calls[0][2].get("compact"))

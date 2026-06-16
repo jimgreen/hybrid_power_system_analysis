@@ -2,8 +2,9 @@
 
 The E and MEAS files store named values, while the load-flow solvers work in
 per-unit internally.  This utility solves each matching E file, converts the
-solved P/Q/V/I values back to file units, and rewrites only the Measurement
-value column.  Weight and valid flags are intentionally preserved.
+solved P/Q/V/I values back to file units, rewrites the Measurement value
+column, and marks all measurement rows as valid.  Weights are intentionally
+preserved.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -104,10 +106,30 @@ class Snapshot:
         }
         self.dcac_by_name = self._by_name(self.dcac_converters)
         self.acac_by_name = self._by_name(self.acac_converters)
+        self._add_first_parallel_aliases(self.ac_devices["ACBranch"])
+        self._add_first_parallel_aliases(self.ac_devices["ACTransformer"])
+        self._add_legacy_generator_aliases(self.ac_devices["ACGenerator"])
 
     @staticmethod
     def _by_name(devices: Iterable) -> Dict[str, object]:
         return {str(dev.name): dev for dev in devices if hasattr(dev, "name")}
+
+    @staticmethod
+    def _add_first_parallel_aliases(devices_by_name: Dict[str, object]) -> None:
+        for name, dev in list(devices_by_name.items()):
+            alias = f"{name}_1"
+            devices_by_name.setdefault(alias, dev)
+
+    @staticmethod
+    def _add_legacy_generator_aliases(devices_by_name: Dict[str, object]) -> None:
+        for name, dev in list(devices_by_name.items()):
+            match = re.fullmatch(r"(gen_.+)_([0-9]+)", name)
+            if match is None:
+                continue
+            number = int(match.group(2))
+            if number <= 0:
+                continue
+            devices_by_name.setdefault(f"{match.group(1)}_{number - 1}", dev)
 
     @staticmethod
     def _float(value, default: float = 0.0) -> float:
@@ -530,6 +552,7 @@ def rewrite_measurements(meas_file: Path, snapshot: Snapshot) -> Tuple[int, int]
     updated = 0
     missing = 0
     for row in rows:
+        row[6] = "1"
         dev_type, dev_name, meas_type = row[2], row[3], row[4].upper()
         value = snapshot.value(dev_type, dev_name, meas_type)
         if value is None:

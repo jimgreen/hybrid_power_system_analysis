@@ -1,5 +1,4 @@
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -236,19 +235,6 @@ MP_PQ = 1
 MP_PV = 2
 MP_REF = 3
 MP_NONE = 4
-
-_AC_PPC_CACHE = {}
-_AC_PPC_CACHE_LOCK = threading.Lock()
-
-
-def clear_ac_ppc_cache(file_path=None) -> None:
-    with _AC_PPC_CACHE_LOCK:
-        if file_path is None:
-            _AC_PPC_CACHE.clear()
-        else:
-            path = Path(file_path).resolve()
-            _AC_PPC_CACHE.pop(path, None)
-
 
 def _build_switch_like_from_rows(
     table_rows,
@@ -629,30 +615,17 @@ def build_ac_ppc_from_e_file(file_path) -> Dict:
     The returned arrays are in pu/radians and should be treated as read-only by
     callers.
     """
-    file_key = _file_cache_key(file_path)
-    with _AC_PPC_CACHE_LOCK:
-        cached = _AC_PPC_CACHE.get(file_key[0])
-        if cached is not None and cached[0] == file_key:
-            return cached[1]
-
-    ppc = _build_ac_ppc_from_rows_dict(_read_efile_rows(file_key[0]), file_key[0])
-    ppc["source"] = str(file_key[0])
-    with _AC_PPC_CACHE_LOCK:
-        _AC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    source = resolve_project_file(file_path).resolve()
+    ppc = _build_ac_ppc_from_rows_dict(_read_efile_rows(source), source)
+    ppc["source"] = str(source)
     return ppc
 
 
 def build_ac_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build AC ppc from E rows that are already loaded in memory."""
-    file_key = _file_cache_key(file_path)
-    with _AC_PPC_CACHE_LOCK:
-        cached = _AC_PPC_CACHE.get(file_key[0])
-        if cached is not None and cached[0] == file_key:
-            return cached[1]
-    ppc = _build_ac_ppc_from_rows_dict(rows, file_key[0])
-    ppc["source"] = str(file_key[0])
-    with _AC_PPC_CACHE_LOCK:
-        _AC_PPC_CACHE[file_key[0]] = (file_key, ppc)
+    source = resolve_project_file(file_path).resolve()
+    ppc = _build_ac_ppc_from_rows_dict(rows, source)
+    ppc["source"] = str(source)
     return ppc
 
 
