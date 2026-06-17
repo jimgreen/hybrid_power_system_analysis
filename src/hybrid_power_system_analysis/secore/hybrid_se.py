@@ -4695,7 +4695,21 @@ class HybridStateEstimator:
             valid[valid] = ids[valid_locs] == query[valid]
         if not np.any(valid):
             return np.asarray([], dtype=np.int64)
-        return np.unique(pos[loc[valid].astype(np.intp, copy=False)].astype(np.int64, copy=False))
+        solver_pos = pos[loc[valid].astype(np.intp, copy=False)].astype(np.int64, copy=False)
+        plan_pos = np.asarray(getattr(ac, "_ac_node_plan_pos", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        node_count = int(getattr(ac, "n_nodes", 0) or 0)
+        if plan_pos.size and node_count > 0:
+            solver_to_plan = np.full(node_count, -1, dtype=np.int64)
+            valid_plan = (plan_pos >= 0) & (plan_pos < node_count)
+            if np.any(valid_plan):
+                solver_to_plan[plan_pos[valid_plan].astype(np.intp, copy=False)] = np.nonzero(valid_plan)[0]
+                in_range = (solver_pos >= 0) & (solver_pos < solver_to_plan.size)
+                mapped = np.full(solver_pos.size, -1, dtype=np.int64)
+                mapped[in_range] = solver_to_plan[solver_pos[in_range].astype(np.intp, copy=False)]
+                mapped = mapped[mapped >= 0]
+                if mapped.size:
+                    return np.unique(mapped)
+        return np.unique(solver_pos)
 
     def _real_voltage_observation_nodes(self, side: str) -> Dict[int, float]:
         """Return side nodes covered by real usable voltage measurements on any device."""
