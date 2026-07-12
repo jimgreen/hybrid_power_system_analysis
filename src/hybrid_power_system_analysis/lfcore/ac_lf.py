@@ -973,7 +973,13 @@ class ACPowerFlowCalc:
             live_gen = gen[self.ppc_gen_rows]
             controls = live_gen[:, GEN_COLS["control_type"]].astype(np.int32, copy=False)
 
-            slack_mask = controls == CTRL_SLACK
+            auto_slack_rows = np.asarray(self.ppc.get("_auto_slack_gen_rows", ()), dtype=np.int32)
+            auto_slack_mask = (
+                np.isin(self.ppc_gen_rows, auto_slack_rows)
+                if auto_slack_rows.size
+                else np.zeros(self.ppc_gen_rows.size, dtype=bool)
+            )
+            slack_mask = (controls == CTRL_SLACK) | auto_slack_mask
             if np.any(slack_mask):
                 slack_pos = self.ppc_gen_pos[slack_mask]
                 self.node_type[slack_pos] = AC_NODE_TYPE_SLACK

@@ -18,6 +18,52 @@ sys.path.insert(0, str(ROOT_DIR / "lfcore"))
 
 
 class ACPPCFlowTest(unittest.TestCase):
+    def test_ppc_flow_applies_automatic_ph_reference_to_each_island(self):
+        from ac_array_model import build_ac_ppc_from_efile_rows
+        from ac_lf import AC_NODE_TYPE_SLACK, ACPowerFlowCalc
+        from model.ppc_topology import ensure_ac_ppc_topology
+
+        def table(header, rows):
+            return {"header_list": header.split(), "rows": rows}
+
+        rows = {
+            "Model": table("path name p_base u_unit p_unit i_unit", [["IEEE", "two_islands", 100, "V", "kW", "A"]]),
+            "ACNode": table(
+                "idx name vbase voltage angle run_stat",
+                [[idx, f"bus_{idx}", 380, 380, 0, 1] for idx in range(1, 5)],
+            ),
+            "ACBranch": table(
+                "idx name i_node j_node r x b run_stat",
+                [
+                    [1, "branch_1_2", 1, 2, 0.01, 0.1, 0.0, 1],
+                    [2, "branch_3_4", 3, 4, 0.01, 0.1, 0.0, 1],
+                ],
+            ),
+            "ACGenerator": table(
+                "idx name node control_type p_set q_set v_set alpha p_max run_stat",
+                [
+                    [1, "gen_1", 1, "PV", 0, 0, 380, 1.0, 80, 1],
+                    [2, "gen_2", 3, "PV", 0, 0, 380, 1.0, 60, 1],
+                ],
+            ),
+            "ACLoad": table(
+                "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                [
+                    [1, "load_1", 2, 10, 1, 0, 0, 2, 1, 0, 0, 1],
+                    [2, "load_2", 4, 5, 1, 0, 0, 1, 1, 0, 0, 1],
+                ],
+            ),
+        }
+        ppc = ensure_ac_ppc_topology(build_ac_ppc_from_efile_rows(Path("two_islands.e"), rows))
+        self.assertEqual([0, 1], ppc["_auto_slack_gen_rows"].tolist())
+
+        calc = ACPowerFlowCalc(ppc, tol=1e-10, max_iter=50, verbose=False)
+        calc.prepare()
+
+        self.assertEqual(2, int(np.count_nonzero(calc.node_type == AC_NODE_TYPE_SLACK)))
+        self.assertEqual(0, calc.run())
+        self.assertTrue(calc.converged)
+
     def test_ac_topology_contracts_closed_switches_to_buses_before_islands(self):
         from ac_model import ACPowerNetwork
 
