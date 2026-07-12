@@ -704,6 +704,44 @@ def _mark_reference_bus(reference: np.ndarray, island_pos: int, bus_pos: int, bu
         reference[island_pos] = int(bus_pos)
 
 
+def _select_ac_auto_slack_gen_rows(
+    gen: np.ndarray,
+    gen_islands: np.ndarray,
+    gen_run_mask: np.ndarray,
+    valid_gen: np.ndarray,
+    island_has_reference: np.ndarray,
+    gen_cols: Dict[str, int],
+    ctrl_pv: int,
+) -> np.ndarray:
+    if gen.size == 0 or island_has_reference.size == 0:
+        return _EMPTY_INT
+
+    controls = gen[:, gen_cols["control_type"]].astype(np.int64, copy=False)
+    base_candidates = gen_run_mask & valid_gen & (gen_islands >= 0) & (controls == int(ctrl_pv))
+    selected = []
+    for island_pos in np.flatnonzero(~island_has_reference):
+        candidates = np.flatnonzero(base_candidates & (gen_islands == int(island_pos)))
+        if candidates.size == 0:
+            continue
+
+        p_max = gen[candidates, gen_cols["p_max"]]
+        finite_p_max = np.isfinite(p_max)
+        if np.any(finite_p_max):
+            ranked_rows = candidates[finite_p_max]
+            capacity = p_max[finite_p_max]
+        else:
+            ranked_rows = candidates
+            capacity = np.abs(gen[ranked_rows, gen_cols["p_set"]])
+            capacity = np.nan_to_num(capacity, nan=-np.inf)
+
+        alpha = np.nan_to_num(gen[ranked_rows, gen_cols["alpha"]], nan=0.0, posinf=0.0, neginf=0.0)
+        idx = gen[ranked_rows, gen_cols["idx"]]
+        order = np.lexsort((ranked_rows, idx, -alpha, -capacity))
+        selected.append(int(ranked_rows[int(order[0])]))
+
+    return np.asarray(selected, dtype=np.int32)
+
+
 def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
     """Precompute AC PPC node positions and run/status masks for topology."""
     try:
@@ -826,6 +864,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             BREAK_COLS,
             ACAC_COLS,
             BRANCH_COLS,
+            CTRL_PV,
             CTRL_SLACK,
             GEN_COLS,
             LOAD_COLS,
@@ -841,6 +880,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             BREAK_COLS,
             ACAC_COLS,
             BRANCH_COLS,
+            CTRL_PV,
             CTRL_SLACK,
             GEN_COLS,
             LOAD_COLS,
@@ -949,10 +989,11 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         gen_nodes = _map_node_positions(gen[:, GEN_COLS["node"]], node_lookup)
     else:
         gen_nodes = _EMPTY_INT
+    gen_islands = np.full(gen_count, -1, dtype=np.int32)
+    gen_buses = np.full(gen_count, -1, dtype=np.int32)
+    gen_run_mask = np.zeros(gen_count, dtype=bool)
+    valid_gen = gen_nodes >= 0
     if gen_nodes.size:
-        valid_gen = gen_nodes >= 0
-        gen_islands = np.full(gen_nodes.shape, -1, dtype=np.int32)
-        gen_buses = np.full(gen_nodes.shape, -1, dtype=np.int32)
         if np.any(valid_gen):
             gen_islands[valid_gen] = topology.node_to_island_pos[gen_nodes[valid_gen]]
             gen_buses[valid_gen] = topology.node_to_bus_pos[gen_nodes[valid_gen]]
@@ -986,6 +1027,23 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             topology.island_alive_mask[ref_islands[valid_island]] = True
             for island_pos, bus_pos in zip(ref_islands[valid_island], ref_buses[valid_island]):
                 _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
+
+    auto_slack_gen_rows = _select_ac_auto_slack_gen_rows(
+        gen,
+        gen_islands,
+        gen_run_mask,
+        valid_gen,
+        topology.island_reference_bus_pos >= 0,
+        GEN_COLS,
+        CTRL_PV,
+    )
+    ppc["_auto_slack_gen_rows"] = auto_slack_gen_rows
+    if auto_slack_gen_rows.size:
+        auto_islands = gen_islands[auto_slack_gen_rows]
+        auto_buses = gen_buses[auto_slack_gen_rows]
+        topology.island_alive_mask[auto_islands] = True
+        for island_pos, bus_pos in zip(auto_islands, auto_buses):
+            _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
 
     valid_bus = topology.bus_to_island_pos >= 0
     if np.any(valid_bus):

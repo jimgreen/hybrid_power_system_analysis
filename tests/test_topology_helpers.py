@@ -4,7 +4,127 @@ from pathlib import Path
 import numpy as np
 
 
+def _table(header, rows):
+    return {"header_list": header.split(), "rows": rows}
+
+
+def _build_auto_ph_ppc(node_ids, branches, generators):
+    from model.ac_array_model import build_ac_ppc_from_efile_rows
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["IEEE", "auto_ph", 100, "V", "kW", "A"]]),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[node_id, f"bus_{node_id}", 380, 380, 0, 1] for node_id in node_ids],
+        ),
+        "ACBranch": _table(
+            "idx name i_node j_node r x b run_stat",
+            [
+                [row + 1, f"branch_{i_node}_{j_node}", i_node, j_node, 0.01, 0.1, 0.0, 1]
+                for row, (i_node, j_node) in enumerate(branches)
+            ],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha p_max run_stat",
+            [
+                [idx, f"gen_{idx}", node, control, p_set, 0.0, 380, alpha, p_max, 1]
+                for idx, node, control, p_set, alpha, p_max in generators
+            ],
+        ),
+    }
+    return build_ac_ppc_from_efile_rows(Path("auto_ph.e"), rows)
+
+
 class TopologyHelperTest(unittest.TestCase):
+    def test_ac_ppc_topology_auto_selects_one_capacity_ranked_pv_per_island(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        ppc = _build_auto_ph_ppc(
+            node_ids=[1, 2, 3, 4],
+            branches=[(1, 2), (3, 4)],
+            generators=[
+                (1, 1, "PV", 90, 1.0, 80),
+                (2, 2, "PV", 10, 1.0, 100),
+                (3, 3, "PV", 40, 1.0, np.nan),
+                (4, 4, "PV", 30, 5.0, np.nan),
+            ],
+        )
+
+        arrays = prepare_ac_topology_ppc(ppc)
+
+        self.assertEqual([1, 2], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([True, True], arrays.island_alive_mask.tolist())
+        self.assertEqual(
+            [
+                int(arrays.node_to_bus_pos[1]),
+                int(arrays.node_to_bus_pos[2]),
+            ],
+            arrays.island_reference_bus_pos.tolist(),
+        )
+
+    def test_ac_ppc_topology_auto_slack_falls_back_to_alpha_then_smallest_idx(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        ppc = _build_auto_ph_ppc(
+            node_ids=[1, 2, 3],
+            branches=[(1, 2), (2, 3)],
+            generators=[
+                (20, 1, "PV", 10, 1.0, np.nan),
+                (30, 2, "PV", -10, 2.0, np.nan),
+                (10, 3, "PV", 10, 2.0, np.nan),
+            ],
+        )
+
+        arrays = prepare_ac_topology_ppc(ppc)
+
+        self.assertEqual([2], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([True], arrays.island_alive_mask.tolist())
+        self.assertEqual(int(arrays.node_to_bus_pos[2]), int(arrays.island_reference_bus_pos[0]))
+
+    def test_ac_ppc_topology_keeps_explicit_and_external_references_ahead_of_auto_slack(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        explicit = _build_auto_ph_ppc(
+            node_ids=[1, 2],
+            branches=[(1, 2)],
+            generators=[
+                (1, 1, "SLACK", 0, 1.0, 10),
+                (2, 2, "PV", 0, 1.0, 100),
+            ],
+        )
+        explicit_arrays = prepare_ac_topology_ppc(explicit)
+
+        external = _build_auto_ph_ppc(
+            node_ids=[1, 2],
+            branches=[(1, 2)],
+            generators=[
+                (1, 1, "PV", 0, 1.0, 10),
+                (2, 2, "PV", 0, 1.0, 100),
+            ],
+        )
+        external["_external_angle_reference_node_ids"] = np.asarray([1], dtype=np.int64)
+        external_arrays = prepare_ac_topology_ppc(external)
+
+        self.assertEqual([], explicit["_auto_slack_gen_rows"].tolist())
+        self.assertEqual(int(explicit_arrays.node_to_bus_pos[0]), int(explicit_arrays.island_reference_bus_pos[0]))
+        self.assertEqual([], external["_auto_slack_gen_rows"].tolist())
+        self.assertEqual(int(external_arrays.node_to_bus_pos[0]), int(external_arrays.island_reference_bus_pos[0]))
+
+    def test_ac_ppc_topology_leaves_island_dead_when_no_online_pv_exists(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        ppc = _build_auto_ph_ppc(
+            node_ids=[1],
+            branches=[],
+            generators=[(1, 1, "PQ", 10, 1.0, 100)],
+        )
+
+        arrays = prepare_ac_topology_ppc(ppc)
+
+        self.assertEqual([], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([False], arrays.island_alive_mask.tolist())
+        self.assertEqual([-1], arrays.island_reference_bus_pos.tolist())
+
     def test_parent_index_uses_dense_storage_for_contiguous_ids(self):
         from model.topology import _make_parent_index, _parent_contains, _union_parent, _find_parent
 
