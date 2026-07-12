@@ -1,5 +1,6 @@
 """Shared E-file to PPC loaders with precomputed topology arrays."""
 
+import hashlib
 from pathlib import Path
 from typing import Dict
 
@@ -7,8 +8,20 @@ import numpy as np
 
 from efile_read import _read_efile_rows
 from model import topology as network_topology
-from model.ac_array_model import BUS_COLS as AC_BUS_COLS
-from model.ac_array_model import build_ac_ppc_from_e_file, build_ac_ppc_from_efile_rows
+from model.ac_array_model import (
+    ACAC_COLS as AC_ACAC_COLS,
+    BRANCH_COLS as AC_BRANCH_COLS,
+    BREAK_COLS as AC_BREAK_COLS,
+    BUS_COLS as AC_BUS_COLS,
+    GEN_COLS as AC_GEN_COLS,
+    SWITCH_COLS as AC_SWITCH_COLS,
+    THREE_WINDING_TRANSFORMER_COLS as AC_THREE_WINDING_TRANSFORMER_COLS,
+    TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
+    ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
+    build_ac_ppc_from_e_file,
+    build_ac_ppc_from_efile_rows,
+    ensure_ac_ppc_gen_columns,
+)
 from model.dc_array_model import BUS_COLS as DC_BUS_COLS
 from model.dc_array_model import build_dc_ppc_from_e_file, build_dc_ppc_from_efile_rows
 from model.hybrid_array_model import (
@@ -18,10 +31,102 @@ from model.hybrid_array_model import (
 )
 
 
+def _update_signature_table(digest, ppc: Dict, key: str, columns) -> None:
+    table = np.asarray(ppc.get(key, ()), dtype=np.float64)
+    digest.update(key.encode("ascii"))
+    digest.update(np.asarray(table.shape, dtype=np.int64).tobytes())
+    if table.ndim == 2 and table.size:
+        values = np.ascontiguousarray(table[:, columns])
+        digest.update(values.tobytes())
+
+
+def _ac_topology_signature(ppc: Dict) -> bytes:
+    digest = hashlib.blake2b(digest_size=16)
+    _update_signature_table(
+        digest,
+        ppc,
+        "gen",
+        [
+            AC_GEN_COLS["idx"],
+            AC_GEN_COLS["node"],
+            AC_GEN_COLS["control_type"],
+            AC_GEN_COLS["p_set"],
+            AC_GEN_COLS["alpha"],
+            AC_GEN_COLS["run_stat"],
+            AC_GEN_COLS["p_max"],
+        ],
+    )
+    _update_signature_table(digest, ppc, "bus", [AC_BUS_COLS["idx"], AC_BUS_COLS["run_stat"]])
+    _update_signature_table(
+        digest,
+        ppc,
+        "branch",
+        [AC_BRANCH_COLS["i_node"], AC_BRANCH_COLS["j_node"], AC_BRANCH_COLS["run_stat"]],
+    )
+    _update_signature_table(
+        digest,
+        ppc,
+        "transformer",
+        [AC_TRANSFORMER_COLS["i_node"], AC_TRANSFORMER_COLS["j_node"], AC_TRANSFORMER_COLS["run_stat"]],
+    )
+    _update_signature_table(
+        digest,
+        ppc,
+        "three_winding_transformer",
+        [
+            AC_THREE_WINDING_TRANSFORMER_COLS["i_node"],
+            AC_THREE_WINDING_TRANSFORMER_COLS["j_node"],
+            AC_THREE_WINDING_TRANSFORMER_COLS["k_node"],
+            AC_THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+        ],
+    )
+    _update_signature_table(
+        digest,
+        ppc,
+        "zero_branch",
+        [AC_ZERO_BRANCH_COLS["i_node"], AC_ZERO_BRANCH_COLS["j_node"], AC_ZERO_BRANCH_COLS["run_stat"]],
+    )
+    for key, columns in (
+        (
+            "switch",
+            [
+                AC_SWITCH_COLS["i_node"],
+                AC_SWITCH_COLS["j_node"],
+                AC_SWITCH_COLS["status"],
+                AC_SWITCH_COLS["run_stat"],
+            ],
+        ),
+        (
+            "break",
+            [
+                AC_BREAK_COLS["i_node"],
+                AC_BREAK_COLS["j_node"],
+                AC_BREAK_COLS["status"],
+                AC_BREAK_COLS["run_stat"],
+            ],
+        ),
+        (
+            "acac",
+            [AC_ACAC_COLS["i_node"], AC_ACAC_COLS["j_node"], AC_ACAC_COLS["run_stat"]],
+        ),
+    ):
+        _update_signature_table(digest, ppc, key, columns)
+    external_refs = np.ascontiguousarray(
+        np.asarray(ppc.get("_external_angle_reference_node_ids", ()), dtype=np.int64)
+    )
+    digest.update(np.asarray(external_refs.shape, dtype=np.int64).tobytes())
+    digest.update(external_refs.tobytes())
+    return digest.digest()
+
+
 def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
     """Attach AC PPC topology arrays when they are not already present."""
-    if ppc.get("_topology_arrays") is None:
+    ensure_ac_ppc_gen_columns(ppc)
+    signature = _ac_topology_signature(ppc)
+    if ppc.get("_topology_arrays") is None or ppc.get("_ac_topology_signature") != signature:
+        ppc.pop("_topology_input", None)
         ppc["_topology_arrays"] = network_topology.prepare_ac_topology_ppc(ppc)
+        ppc["_ac_topology_signature"] = signature
     return ppc
 
 

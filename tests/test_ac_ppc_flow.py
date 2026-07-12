@@ -64,6 +64,69 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual(0, calc.run())
         self.assertTrue(calc.converged)
 
+    def test_external_angle_reference_does_not_promote_an_additional_pv_slack(self):
+        from ac_array_model import CTRL_PV, GEN_COLS, build_ac_ppc_from_e_file
+        from ac_lf import AC_NODE_TYPE_SLACK, ACPowerFlowCalc
+        from model.ppc_topology import ensure_ac_ppc_topology
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e")
+        ppc["gen"][:, GEN_COLS["control_type"]] = CTRL_PV
+        ppc["_external_angle_reference_node_ids"] = np.asarray([1], dtype=np.int64)
+        ppc.pop("_topology_arrays", None)
+
+        ensure_ac_ppc_topology(ppc)
+        self.assertEqual([], ppc["_auto_slack_gen_rows"].tolist())
+
+        calc = ACPowerFlowCalc(ppc, verbose=False)
+        calc.prepare()
+
+        self.assertEqual(0, int(np.count_nonzero(calc.node_type == AC_NODE_TYPE_SLACK)))
+        self.assertEqual(-1, calc.slack_node)
+
+    def test_automatic_ph_only_absorbs_residual_power_for_its_generator_row(self):
+        from ac_array_model import GEN_COLS, build_ac_ppc_from_efile_rows
+        from ac_lf import ACPowerFlowCalc
+        from model.ppc_topology import ensure_ac_ppc_topology
+
+        def table(header, rows):
+            return {"header_list": header.split(), "rows": rows}
+
+        rows = {
+            "Model": table("path name p_base u_unit p_unit i_unit", [["IEEE", "shared_bus", 100, "V", "kW", "A"]]),
+            "ACNode": table(
+                "idx name vbase voltage angle run_stat",
+                [[1, "source", 380, 380, 0, 1], [2, "load", 380, 380, 0, 1]],
+            ),
+            "ACBranch": table(
+                "idx name i_node j_node r x b run_stat",
+                [[1, "branch", 1, 2, 0.01, 0.1, 0.0, 1]],
+            ),
+            "ACGenerator": table(
+                "idx name node control_type p_set q_set v_set alpha p_max run_stat",
+                [
+                    [1, "auto_ph", 1, "PV", 0, 0, 380, 1.0, 100, 1],
+                    [2, "fixed_pv", 1, "PV", 40, 0, 380, 1.0, 50, 1],
+                ],
+            ),
+            "ACLoad": table(
+                "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                [[1, "load", 2, 50, 1, 0, 0, 10, 1, 0, 0, 1]],
+            ),
+        }
+        ppc = ensure_ac_ppc_topology(build_ac_ppc_from_efile_rows(Path("shared_bus.e"), rows))
+        self.assertEqual([0], ppc["_auto_slack_gen_rows"].tolist())
+
+        calc = ACPowerFlowCalc(ppc, tol=1e-10, max_iter=50, verbose=False)
+        self.assertEqual(0, calc.run())
+
+        result_gen = calc.result["gen"]
+        self.assertAlmostEqual(0.4, result_gen[1, GEN_COLS["p"]], places=10)
+        self.assertAlmostEqual(
+            np.sum(result_gen[:, GEN_COLS["p"]]) - 0.4,
+            result_gen[0, GEN_COLS["p"]],
+            places=10,
+        )
+
     def test_ac_topology_contracts_closed_switches_to_buses_before_islands(self):
         from ac_model import ACPowerNetwork
 
@@ -372,6 +435,32 @@ class ACPPCFlowTest(unittest.TestCase):
         ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e")
 
         self.assertTrue(np.isnan(ppc["gen"][:, GEN_COLS["p_max"]]).all())
+
+    def test_legacy_ac_ppc_generator_width_is_upgraded_before_use(self):
+        from ac_array_model import (
+            CTRL_PV,
+            GEN_COLS,
+            build_ac_network_from_ppc,
+            build_ac_ppc_from_e_file,
+            build_matpower_ppc_from_ac_ppc,
+        )
+        from model.topology import prepare_ac_topology_ppc
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e")
+        ppc["gen"][:, GEN_COLS["control_type"]] = CTRL_PV
+        ppc["gen"] = ppc["gen"][:, :11].copy()
+        ppc.pop("_topology_input", None)
+
+        arrays = prepare_ac_topology_ppc(ppc)
+
+        self.assertEqual(len(GEN_COLS), ppc["gen"].shape[1])
+        self.assertTrue(np.isnan(ppc["gen"][:, GEN_COLS["p_max"]]).all())
+        self.assertTrue(arrays.island_alive_mask.any())
+        self.assertTrue(ppc["_auto_slack_gen_rows"].size)
+
+        network = build_ac_network_from_ppc(ppc)
+        self.assertTrue(all(gen.p_max is None for gen in network.generators))
+        self.assertTrue(build_matpower_ppc_from_ac_ppc(ppc)["gen"].size)
 
     def test_build_ac_ppc_from_e_file_builds_directly_from_loaded_rows(self):
         import ac_array_model

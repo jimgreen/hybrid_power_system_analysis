@@ -151,6 +151,25 @@ GEN_COLS = {
     "current": 10,
     "p_max": 11,
 }
+
+
+def ensure_ac_ppc_gen_columns(ppc: Dict) -> Dict:
+    """Upgrade legacy ac_ppc_v1 generator arrays with the optional p_max column."""
+    gen = np.asarray(ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
+    required_width = len(GEN_COLS)
+    if gen.ndim != 2:
+        raise ValueError(f"AC PPC gen array must be two-dimensional, got shape {gen.shape}")
+    if gen.shape[1] >= required_width:
+        return ppc
+    if gen.shape[0] and gen.shape[1] != GEN_COLS["p_max"]:
+        raise ValueError(
+            f"Legacy AC PPC gen array must have {GEN_COLS['p_max']} columns, got {gen.shape[1]}"
+        )
+    upgraded = np.full((gen.shape[0], required_width), np.nan, dtype=np.float64)
+    if gen.shape[1]:
+        upgraded[:, :gen.shape[1]] = gen
+    ppc["gen"] = upgraded
+    return ppc
 LOAD_COLS = {
     "idx": 0,
     "node": 1,
@@ -1003,6 +1022,7 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
     PQ/PV/reference generator rows.
     """
 
+    ensure_ac_ppc_gen_columns(ac_ppc)
     base_mva = _base_mva_from_ac_ppc(ac_ppc)
     bus0 = np.asarray(ac_ppc["bus"], dtype=np.float64)
     branch0 = np.asarray(ac_ppc.get("branch", _empty(len(BRANCH_COLS))), dtype=np.float64)
@@ -1761,6 +1781,7 @@ def _list_ppc_names(ppc: Dict, key: str, prefix: str, count: int) -> List[str]:
 
 
 def build_ac_network_from_ppc(ppc: Dict):
+    ensure_ac_ppc_gen_columns(ppc)
     from ac_model import (
         ACBreak,
         ACBranch,

@@ -125,6 +125,56 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertEqual([False], arrays.island_alive_mask.tolist())
         self.assertEqual([-1], arrays.island_reference_bus_pos.tolist())
 
+    def test_ac_ppc_topology_refreshes_auto_slack_when_generator_ranking_changes(self):
+        from model.ac_array_model import GEN_COLS
+        from model.ppc_topology import ensure_ac_ppc_topology
+
+        ppc = _build_auto_ph_ppc(
+            node_ids=[1, 2],
+            branches=[(1, 2)],
+            generators=[
+                (1, 1, "PV", 0, 1.0, 100),
+                (2, 2, "PV", 0, 1.0, 50),
+            ],
+        )
+
+        ensure_ac_ppc_topology(ppc)
+        self.assertEqual([0], ppc["_auto_slack_gen_rows"].tolist())
+
+        ppc["gen"][0, GEN_COLS["p_max"]] = 10
+        ppc["gen"][1, GEN_COLS["p_max"]] = 200
+        ensure_ac_ppc_topology(ppc)
+        self.assertEqual([1], ppc["_auto_slack_gen_rows"].tolist())
+
+        ppc["gen"][1, GEN_COLS["run_stat"]] = 0
+        ensure_ac_ppc_topology(ppc)
+        self.assertEqual([0], ppc["_auto_slack_gen_rows"].tolist())
+
+    def test_ac_ppc_topology_refreshes_auto_slack_when_islands_merge(self):
+        from model.ac_array_model import BRANCH_COLS
+        from model.ppc_topology import ensure_ac_ppc_topology
+
+        ppc = _build_auto_ph_ppc(
+            node_ids=[1, 2],
+            branches=[(1, 2)],
+            generators=[
+                (1, 1, "PV", 0, 1.0, 100),
+                (2, 2, "PV", 0, 1.0, 50),
+            ],
+        )
+        ppc["branch"][0, BRANCH_COLS["run_stat"]] = 0
+        ppc.pop("_topology_input", None)
+
+        ensure_ac_ppc_topology(ppc)
+        self.assertEqual(2, len(ppc["_topology_arrays"].island_ids))
+        self.assertEqual([0, 1], ppc["_auto_slack_gen_rows"].tolist())
+
+        ppc["branch"][0, BRANCH_COLS["run_stat"]] = 1
+        ensure_ac_ppc_topology(ppc)
+
+        self.assertEqual(1, len(ppc["_topology_arrays"].island_ids))
+        self.assertEqual([0], ppc["_auto_slack_gen_rows"].tolist())
+
     def test_parent_index_uses_dense_storage_for_contiguous_ids(self):
         from model.topology import _make_parent_index, _parent_contains, _union_parent, _find_parent
 

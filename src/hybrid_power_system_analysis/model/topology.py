@@ -867,6 +867,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             CTRL_PV,
             CTRL_SLACK,
             GEN_COLS,
+            ensure_ac_ppc_gen_columns,
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
@@ -883,6 +884,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             CTRL_PV,
             CTRL_SLACK,
             GEN_COLS,
+            ensure_ac_ppc_gen_columns,
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
@@ -892,6 +894,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             _empty,
         )
 
+    ensure_ac_ppc_gen_columns(ppc)
     bus = np.asarray(ppc["bus"], dtype=np.float64)
     branch = np.asarray(ppc["branch"], dtype=np.float64)
     transformer = np.asarray(ppc["transformer"], dtype=np.float64)

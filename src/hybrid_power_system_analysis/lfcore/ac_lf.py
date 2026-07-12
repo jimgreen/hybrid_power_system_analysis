@@ -616,6 +616,7 @@ class ACPowerFlowCalc:
         self.ppc_gen_rows = np.array([], dtype=np.int32)
         self.ppc_gen_pos = np.array([], dtype=np.int32)
         self.ppc_gen_share = np.array([], dtype=np.float64)
+        self.ppc_auto_slack_mask = np.array([], dtype=bool)
         self._external_ac_p_injection = None
         self._external_ac_q_injection = None
         self.ppc_load_rows = np.array([], dtype=np.int32)
@@ -979,6 +980,7 @@ class ACPowerFlowCalc:
                 if auto_slack_rows.size
                 else np.zeros(self.ppc_gen_rows.size, dtype=bool)
             )
+            self.ppc_auto_slack_mask = auto_slack_mask
             slack_mask = (controls == CTRL_SLACK) | auto_slack_mask
             if np.any(slack_mask):
                 slack_pos = self.ppc_gen_pos[slack_mask]
@@ -1050,14 +1052,14 @@ class ACPowerFlowCalc:
                 )
             )
 
-        if self.slack_node == -1:
+        external_refs = np.asarray(self.ppc.get("_external_angle_reference_node_ids", []), dtype=np.int64)
+        if self.slack_node == -1 and external_refs.size == 0:
             pv_indices = np.where(self.node_type == AC_NODE_TYPE_PV)[0]
             if pv_indices.size:
                 self.slack_node = int(pv_indices[0])
                 self.node_type[self.slack_node] = AC_NODE_TYPE_SLACK
                 self.theta_spec[self.slack_node] = self.ppc["bus"][self.active_bus_rows[self.slack_node], BUS_COLS["angle"]]
         if self.slack_node == -1:
-            external_refs = np.asarray(self.ppc.get("_external_angle_reference_node_ids", []), dtype=np.int64)
             if external_refs.size == 0:
                 raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
 
@@ -2926,6 +2928,21 @@ class ACPowerFlowCalc:
         if self.ppc_gen_rows.size:
             gen_p = self.ppc_gen_share * P_gen[self.ppc_gen_pos]
             gen_q = self.ppc_gen_share * Q_gen[self.ppc_gen_pos]
+            if np.any(self.ppc_auto_slack_mask):
+                for node_pos in np.unique(self.ppc_gen_pos[self.ppc_auto_slack_mask]):
+                    on_node = self.ppc_gen_pos == node_pos
+                    auto_on_node = on_node & self.ppc_auto_slack_mask
+                    fixed_on_node = on_node & ~self.ppc_auto_slack_mask
+                    fixed_p = gen[self.ppc_gen_rows[fixed_on_node], GEN_COLS["p_set"]]
+                    gen_p[fixed_on_node] = fixed_p
+                    residual_p = P_gen[node_pos] - np.sum(fixed_p)
+                    auto_share = self.ppc_gen_share[auto_on_node]
+                    share_sum = np.sum(auto_share)
+                    if share_sum <= 0.0:
+                        auto_share = np.full(auto_share.size, 1.0 / auto_share.size)
+                    else:
+                        auto_share = auto_share / share_sum
+                    gen_p[auto_on_node] = auto_share * residual_p
             gen_v = V[self.ppc_gen_pos]
             gen_current = np.divide(
                 np.hypot(gen_p, gen_q),
