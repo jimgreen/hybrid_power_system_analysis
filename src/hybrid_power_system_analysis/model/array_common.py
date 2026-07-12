@@ -247,28 +247,32 @@ def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -
 
 
 def _base_from_rows(data: Dict) -> Tuple[float, float, float, float, float]:
-    columns, table_rows = _rows_for(data, "PowerBase")
+    block_name = "Model"
+    columns, table_rows = _rows_for(data, block_name)
     if not table_rows:
-        raise RuntimeError("E file must define <PowerBase> with p_base, u_unit, p_unit, and i_unit")
+        block_name = "PowerBase"
+        columns, table_rows = _rows_for(data, block_name)
+    if not table_rows:
+        raise RuntimeError("E file must define <Model> with p_base, u_unit, p_unit, and i_unit")
     row = table_rows[0]
     if "p_base" not in columns:
-        raise RuntimeError("E file <PowerBase> must define p_base")
+        raise RuntimeError(f"E file <{block_name}> must define p_base")
     p_base = float(_cell(row, columns["p_base"], 0.0))
     if p_base <= 0.0:
-        raise RuntimeError(f"Invalid p_base in <PowerBase>: {p_base}")
+        raise RuntimeError(f"Invalid p_base in <{block_name}>: {p_base}")
 
     def unit_or_legacy_scale(unit_attr: str, scale_attr: str, mapping, default_unit: str) -> float:
         if unit_attr in columns:
             unit = str(_cell(row, columns[unit_attr], default_unit)).strip()
             if unit not in mapping:
                 allowed = "/".join(mapping.keys())
-                raise RuntimeError(f"Invalid {unit_attr} in <PowerBase>: {unit!r}; expected one of {allowed}")
+                raise RuntimeError(f"Invalid {unit_attr} in <{block_name}>: {unit!r}; expected one of {allowed}")
             return float(mapping[unit])
         if scale_attr not in columns:
-            raise RuntimeError("E file <PowerBase> must define p_base, u_unit, p_unit, and i_unit")
+            raise RuntimeError(f"E file <{block_name}> must define p_base, u_unit, p_unit, and i_unit")
         value = float(_cell(row, columns[scale_attr], 0.0))
         if value <= 0.0:
-            raise RuntimeError(f"Invalid {scale_attr} in <PowerBase>: {value}")
+            raise RuntimeError(f"Invalid {scale_attr} in <{block_name}>: {value}")
         return value
 
     u_scale = unit_or_legacy_scale("u_unit", "u_scale", _U_UNIT_TO_SCALE, "kV")

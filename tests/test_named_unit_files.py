@@ -19,6 +19,32 @@ E_FILES.extend(path for path in (ROOT_DIR / "simu").glob("*.e"))
 
 
 class NamedUnitFileTest(unittest.TestCase):
+    def test_array_unit_settings_accept_model_block(self):
+        from model.array_common import _base_from_rows
+
+        rows = {
+            "Model": {
+                "header_list": ["path", "name", "p_base", "u_unit", "p_unit", "i_unit"],
+                "rows": [["IEEE", "qinling", "100", "V", "kW", "A"]],
+            }
+        }
+
+        self.assertEqual((100.0, 1000.0, 1.0, 1000.0, 100.0), _base_from_rows(rows))
+
+    def test_object_unit_settings_accept_model_block(self):
+        from unit_system import get_unit_settings
+
+        model = SimpleNamespace(
+            Model=[SimpleNamespace(path="IEEE", name="qinling", p_base=100.0, u_unit="V", p_unit="kW", i_unit="A")]
+        )
+
+        settings = get_unit_settings(model)
+
+        self.assertEqual(100.0, settings.p_base)
+        self.assertEqual(1000.0, settings.u_scale)
+        self.assertEqual(1.0, settings.p_scale)
+        self.assertEqual(1000.0, settings.i_scale)
+
     def test_qinling_e_file_uses_named_values_but_network_uses_pu(self):
         from efile_read import EBook
         from hybrid_lf import HybridPowerNetwork

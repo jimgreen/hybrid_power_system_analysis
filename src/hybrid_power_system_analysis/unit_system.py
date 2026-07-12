@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 
 
+MODEL_BLOCK = "Model"
 POWER_BASE_BLOCK = "PowerBase"
 
 
@@ -20,14 +21,14 @@ class UnitSettings:
         return self.p_base / self.p_scale
 
 
-def _positive_float(obj, attr: str) -> float:
+def _positive_float(obj, attr: str, block_name: str) -> float:
     if not hasattr(obj, attr):
         raise RuntimeError(
-            "E file <PowerBase> must define p_base, u_unit, p_unit, and i_unit"
+            f"E file <{block_name}> must define p_base, u_unit, p_unit, and i_unit"
         )
     value = float(getattr(obj, attr))
     if value <= 0.0:
-        raise RuntimeError(f"Invalid {attr} in <PowerBase>: {value}")
+        raise RuntimeError(f"Invalid {attr} in <{block_name}>: {value}")
     return value
 
 
@@ -48,7 +49,14 @@ _I_UNIT_TO_SCALE = {
 }
 
 
-def _unit_scale(obj, unit_attr: str, scale_attr: str, mapping, default_unit: str) -> tuple[float, str]:
+def _unit_scale(
+    obj,
+    unit_attr: str,
+    scale_attr: str,
+    mapping,
+    default_unit: str,
+    block_name: str,
+) -> tuple[float, str]:
     """Return the numeric scale implied by the named E-file unit.
 
     New E files define p/u/i units by name.  Legacy in-memory test objects may
@@ -60,23 +68,27 @@ def _unit_scale(obj, unit_attr: str, scale_attr: str, mapping, default_unit: str
         unit = str(unit_value).strip()
         if unit not in mapping:
             allowed = "/".join(mapping.keys())
-            raise RuntimeError(f"Invalid {unit_attr} in <PowerBase>: {unit!r}; expected one of {allowed}")
+            raise RuntimeError(f"Invalid {unit_attr} in <{block_name}>: {unit!r}; expected one of {allowed}")
         return float(mapping[unit]), unit
-    return _positive_float(obj, scale_attr), default_unit
+    return _positive_float(obj, scale_attr, block_name), default_unit
 
 
 def get_unit_settings(model) -> UnitSettings:
-    rows = getattr(model, POWER_BASE_BLOCK, None)
+    block_name = MODEL_BLOCK
+    rows = getattr(model, block_name, None)
+    if not rows:
+        block_name = POWER_BASE_BLOCK
+        rows = getattr(model, block_name, None)
     if not rows:
         raise RuntimeError(
-            "E file must define <PowerBase> with p_base, u_unit, p_unit, and i_unit"
+            "E file must define <Model> with p_base, u_unit, p_unit, and i_unit"
         )
     row = rows[0]
-    u_scale, u_unit = _unit_scale(row, "u_unit", "u_scale", _U_UNIT_TO_SCALE, "kV")
-    p_scale, p_unit = _unit_scale(row, "p_unit", "p_scale", _P_UNIT_TO_SCALE, "kW")
-    i_scale, i_unit = _unit_scale(row, "i_unit", "i_scale", _I_UNIT_TO_SCALE, "kA")
+    u_scale, u_unit = _unit_scale(row, "u_unit", "u_scale", _U_UNIT_TO_SCALE, "kV", block_name)
+    p_scale, p_unit = _unit_scale(row, "p_unit", "p_scale", _P_UNIT_TO_SCALE, "kW", block_name)
+    i_scale, i_unit = _unit_scale(row, "i_unit", "i_scale", _I_UNIT_TO_SCALE, "kA", block_name)
     return UnitSettings(
-        p_base=_positive_float(row, "p_base"),
+        p_base=_positive_float(row, "p_base", block_name),
         u_scale=u_scale,
         p_scale=p_scale,
         i_scale=i_scale,
