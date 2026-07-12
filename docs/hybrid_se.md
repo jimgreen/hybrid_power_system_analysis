@@ -76,6 +76,7 @@ python -m secore.hybrid_se --case data\model\hybrid\qinling.e --meas data\meas\h
 | `ACNode` | `V`, `ANGLE`/`THETA` |
 | `DCNode` | `V` |
 | `ACBranch`, `ACTransformer` | 两端 P/Q/V/I |
+| `ACThreeWindingTransformer` | i/j/k 三端 P/Q/V/I，k 端使用 `*_THIRD`，并接受 `*_K` 别名 |
 | `DCBranch` | 两端 P/V/I |
 | `ACSwitch`, `ACZeroBranch` | 两端 P/Q/V/I |
 | `DCSwitch`, `DCZeroBranch` | 两端 P/V/I |
@@ -113,7 +114,7 @@ python -m secore.hybrid_se --case data\model\hybrid\qinling.e --meas data\meas\h
 
 1. 预索引静态 Jacobian 行，如节点电压、固定电压量测。
 2. 批量追加 DCBranch、DCZero、DCDC、DCAC、ACAC 等动态导数。
-3. 批量追加 ACBranch/ACTransformer P/Q/I 导数。
+3. 批量追加 ACBranch、ACTransformer、ACThreeWindingTransformer P/Q/I 导数。
 4. 批量追加 ACGenerator 注入导数。
 5. 对少量未覆盖场景走通用逐量测解析路径。
 

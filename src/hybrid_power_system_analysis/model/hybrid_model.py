@@ -340,6 +340,11 @@ class HybridPowerNetwork:
             if tr.run_stat:
                 add(tr.i_node)
                 add(tr.j_node)
+        for tr in getattr(self.ac, "three_winding_transformers", ()):
+            if tr.run_stat:
+                add(tr.i_node)
+                add(tr.j_node)
+                add(tr.k_node)
         for zb in self.ac.zero_branches:
             if zb.run_stat:
                 add(zb.i_node)

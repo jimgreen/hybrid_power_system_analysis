@@ -627,6 +627,7 @@ def build_hybrid_model_from_ppc(ppc: Dict):
     model.ACSwitch = ac_network.switches
     model.ACBreak = getattr(ac_network, "breakers", [])
     model.ACTransformer = ac_network.transformers
+    model.ACThreeWindingTransformer = getattr(ac_network, "three_winding_transformers", [])
     model.ACShuntCompensator = ac_network.shunt_compensators
     model.DCNode = dc_network.nodes
     model.DCBranch = dc_network.branches

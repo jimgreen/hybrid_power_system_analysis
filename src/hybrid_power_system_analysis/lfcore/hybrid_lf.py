@@ -71,6 +71,7 @@ from ac_array_model import (
     LOAD_COLS as AC_LOAD_COLS,
     SHUNT_COLS as AC_SHUNT_COLS,
     SWITCH_COLS as AC_SWITCH_COLS,
+    THREE_WINDING_TRANSFORMER_COLS as AC_THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
     ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
     build_ac_ppc_from_mat_file,
@@ -193,10 +194,14 @@ class _PpcDeviceList:
         result_table = result.get(self.table_key, table)
         names = self.ppc.get(self.name_key)
         node_by_idx = {int(node.idx): node for node in self.facade.nodes}
+        topology = self.ppc.get("_topology_arrays")
+        device_topology = None if topology is None else topology.devices.get(self.table_key)
+        alive_mask = None if device_topology is None else np.asarray(device_topology.alive_mask, dtype=bool)
         for pos, source_row in enumerate(table):
             row = result_table[pos] if pos < len(result_table) else source_row
             name = None if names is None or pos >= len(names) else names[pos]
-            yield _ppc_device(source_row, row, name, self.cols, node_by_idx)
+            alive = None if alive_mask is None or pos >= alive_mask.size else bool(alive_mask[pos])
+            yield _ppc_device(source_row, row, name, self.cols, node_by_idx, alive=alive)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -204,11 +209,47 @@ class _PpcDeviceList:
         return list(self)[int(index)]
 
 
-def _ppc_device(static_row, row, name, cols, node_by_idx):
-    int_fields = {"idx", "node", "i_node", "j_node", "status", "run_stat", "control_type", "i_control_type", "j_control_type"}
+def _ppc_device(static_row, row, name, cols, node_by_idx, *, alive=None):
+    int_fields = {
+        "idx",
+        "node",
+        "i_node",
+        "j_node",
+        "k_node",
+        "status",
+        "run_stat",
+        "control_type",
+        "i_control_type",
+        "j_control_type",
+    }
+    static_fields = {
+        "node",
+        "i_node",
+        "j_node",
+        "k_node",
+        "r",
+        "x",
+        "b",
+        "gt",
+        "bt",
+        "tap",
+        "shift",
+        "i_r",
+        "i_x",
+        "j_r",
+        "j_x",
+        "k_r",
+        "k_x",
+        "i_tap",
+        "i_shift",
+        "j_tap",
+        "j_shift",
+        "k_tap",
+        "k_shift",
+    }
     values = {}
     for attr, col in cols.items():
-        source = static_row if attr in {"node", "i_node", "j_node", "r", "x", "b", "gt", "bt", "tap", "shift"} else row
+        source = static_row if attr in static_fields else row
         value = source[col]
         values[attr] = int(value) if attr in int_fields else float(value)
     if "node" in values:
@@ -217,9 +258,11 @@ def _ppc_device(static_row, row, name, cols, node_by_idx):
         values["i_node_obj"] = node_by_idx.get(int(values["i_node"]))
     if "j_node" in values:
         values["j_node_obj"] = node_by_idx.get(int(values["j_node"]))
+    if "k_node" in values:
+        values["k_node_obj"] = node_by_idx.get(int(values["k_node"]))
     run_stat = int(values.get("run_stat", 1))
     status = int(values.get("status", 1))
-    values["is_alive"] = run_stat == 1 and status == 1
+    values["is_alive"] = (run_stat == 1 and status == 1) if alive is None else bool(alive)
     return _array_device(values.pop("idx", 0), name, **values)
 
 
@@ -287,6 +330,13 @@ def _lightweight_ac_network(ac_ppc):
     network.nodes = _PpcACNodeList(network, ac_ppc)
     network.branches = _PpcDeviceList(network, ac_ppc, "branch", "branch_name", AC_BRANCH_COLS)
     network.transformers = _PpcDeviceList(network, ac_ppc, "transformer", "transformer_name", AC_TRANSFORMER_COLS)
+    network.three_winding_transformers = _PpcDeviceList(
+        network,
+        ac_ppc,
+        "three_winding_transformer",
+        "three_winding_transformer_name",
+        AC_THREE_WINDING_TRANSFORMER_COLS,
+    )
     network.generators = _PpcDeviceList(network, ac_ppc, "gen", "gen_name", AC_GEN_COLS)
     network.loads = _PpcDeviceList(network, ac_ppc, "load", "load_name", AC_LOAD_COLS)
     network.shunt_compensators = _PpcDeviceList(network, ac_ppc, "shunt", "shunt_name", AC_SHUNT_COLS)
@@ -2215,6 +2265,7 @@ class HybridPowerFlowCalc:
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS,
             TRANSFORMER_COLS,
             ZERO_BRANCH_COLS,
         )
@@ -2283,6 +2334,37 @@ class HybridPowerFlowCalc:
                 transformer.j_q = float(row[TRANSFORMER_COLS["j_q"]])
                 transformer.j_c = float(row[TRANSFORMER_COLS["j_c"]])
                 transformer.is_alive = int(row[TRANSFORMER_COLS["run_stat"]]) == 1
+
+        three_alive_by_idx = {}
+        topology = getattr(self.ac_calc, "_ppc_topology", None)
+        topology_device = None if topology is None else topology.devices.get("three_winding_transformer")
+        source_three_rows = np.asarray(
+            self.ac_calc.ppc.get(
+                "three_winding_transformer",
+                np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS)), dtype=np.float64),
+            ),
+            dtype=np.float64,
+        )
+        if topology_device is not None and len(topology_device.alive_mask) == len(source_three_rows):
+            three_alive_by_idx = {
+                int(row[THREE_WINDING_TRANSFORMER_COLS["idx"]]): bool(alive)
+                for row, alive in zip(source_three_rows, topology_device.alive_mask)
+            }
+        for transformer, row in iter_aligned(
+            getattr(self.network.ac, "three_winding_transformers", ()),
+            result.get(
+                "three_winding_transformer",
+                np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS)), dtype=np.float64),
+            ),
+            THREE_WINDING_TRANSFORMER_COLS["idx"],
+        ):
+            if transformer is not None:
+                for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c"):
+                    setattr(transformer, attr, float(row[THREE_WINDING_TRANSFORMER_COLS[attr]]))
+                transformer.is_alive = three_alive_by_idx.get(
+                    int(row[THREE_WINDING_TRANSFORMER_COLS["idx"]]),
+                    int(row[THREE_WINDING_TRANSFORMER_COLS["run_stat"]]) == 1,
+                )
 
         for zero_branch, row in iter_aligned(self.network.ac.zero_branches, result["zero_branch"], ZERO_BRANCH_COLS["idx"]):
             if zero_branch is not None:

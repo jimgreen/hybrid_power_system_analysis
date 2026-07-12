@@ -25,6 +25,7 @@ DEVICE_TYPE_ACBreak = 22
 DEVICE_TYPE_ACBreakConstraint = 23
 DEVICE_TYPE_DCBreak = 24
 DEVICE_TYPE_DCBreakConstraint = 25
+DEVICE_TYPE_ACThreeWindingTransformer = 26
 
 DEVICE_TYPE_CODES = {
     "ACNode": DEVICE_TYPE_ACNode,
@@ -52,6 +53,8 @@ DEVICE_TYPE_CODES = {
     "ACBreakConstraint": DEVICE_TYPE_ACBreakConstraint,
     "DCBreak": DEVICE_TYPE_DCBreak,
     "DCBreakConstraint": DEVICE_TYPE_DCBreakConstraint,
+    "AC3WTransformer": DEVICE_TYPE_ACThreeWindingTransformer,
+    "ACThreeWindingTransformer": DEVICE_TYPE_ACThreeWindingTransformer,
 }
 DEVICE_TYPE_NAMES = {code: name for name, code in DEVICE_TYPE_CODES.items()}
 
@@ -90,6 +93,10 @@ MEAS_TYPE_I_AC = 31
 MEAS_TYPE_P_IN = 32
 MEAS_TYPE_P_OUT = 33
 MEAS_TYPE_I_OUT = 34
+MEAS_TYPE_P_THIRD = 35
+MEAS_TYPE_Q_THIRD = 36
+MEAS_TYPE_V_THIRD = 37
+MEAS_TYPE_I_THIRD = 38
 
 MEAS_TYPE_CODES = {
     "UNKNOWN": MEAS_TYPE_UNKNOWN,
@@ -127,5 +134,17 @@ MEAS_TYPE_CODES = {
     "P_IN": MEAS_TYPE_P_IN,
     "P_OUT": MEAS_TYPE_P_OUT,
     "I_OUT": MEAS_TYPE_I_OUT,
+    "P_THIRD": MEAS_TYPE_P_THIRD,
+    "Q_THIRD": MEAS_TYPE_Q_THIRD,
+    "V_THIRD": MEAS_TYPE_V_THIRD,
+    "I_THIRD": MEAS_TYPE_I_THIRD,
 }
 MEAS_TYPE_NAMES = {code: name for name, code in MEAS_TYPE_CODES.items()}
+MEAS_TYPE_CODES.update(
+    {
+        "P_K": MEAS_TYPE_P_THIRD,
+        "Q_K": MEAS_TYPE_Q_THIRD,
+        "V_K": MEAS_TYPE_V_THIRD,
+        "I_K": MEAS_TYPE_I_THIRD,
+    }
+)

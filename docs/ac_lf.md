@@ -9,7 +9,7 @@
 - 读取或接收交流网络拓扑与设备参数。
 - 生成交流节点导纳矩阵 `Y`。
 - 支持 MATPOWER 风格线路 stamp，包括线路充电电纳 `b`；变压器按 T 型单端对地支路建模，支持 `gt/bt/tap/shift`。
-- 支持普通线路、主变、ZIP 负荷、并联补偿、发电机控制、开关和零阻抗支路。
+- 支持普通线路、双绕组主变、三绕组主变、ZIP 负荷、并联补偿、发电机控制、开关和零阻抗支路。
 - 生成残差向量 `F(x)` 和稀疏 Jacobian `J(x)`。
 - 迭代求解后把节点电压、相角、设备潮流、电流和发电机出力回填到模型对象或 array-mode 结果。
 
@@ -45,6 +45,7 @@ result = calc.result
 | `ACNode` | 交流节点，含电压基准、初始电压和初始相角 |
 | `ACBranch` | 普通交流线路，参数 `r/x/b` |
 | `ACTransformer` | 主变，参数 `r/x/gt/bt/tap/shift`，其中 `gt/bt` 为 i 侧单端对地导纳 |
+| `ACThreeWindingTransformer` | 三绕组主变，三个外部端口通过星形等值漏阻抗连接，内部星点在求解前解析消元 |
 | `ACGenerator` | 发电机，支持 `V/SLACK/PH/PV/P/PQ` 等控制类型 |
 | `ACLoad` | ZIP 负荷，`pv0/pv1/pv2/qv0/qv1/qv2` |
 | `ACShuntCompensator` | 并联设备，支持 `g_set/b_set/q_set/v_set` |
@@ -53,7 +54,7 @@ result = calc.result
 
 所有设备都通过 `run_stat` 控制是否参与计算。
 
-E 文件中的设备块只保存拓扑、参数和控制设定。`ACBranch`、`ACTransformer`、
+E 文件中的设备块只保存拓扑、参数和控制设定。`ACBranch`、`ACTransformer`、`ACThreeWindingTransformer`、
 `ACLoad`、`ACGenerator`、`ACShuntCompensator`、`ACSwitch`、`ACBreak`、`ACZeroBranch` 等块不再保存
 `p/q/current` 或两端 `i_p/i_q/i_c/j_p/j_q/j_c` 运行结果列；这些结果由潮流
 求解后写入运行时对象或 `calc.result` 数组。
@@ -107,6 +108,26 @@ Ytt = y
 
 `gt/bt` 是 i 侧单端对地导纳，经复变比折算到 i 端自导纳；它不是 MATPOWER `BR_B` 的两端平分线路充电。因此与 MATPOWER/PYPOWER 对比时，如果把变压器 `bt` 投影为 `BR_B=2*bt`，只能得到近似参照，端口无功和发电机无功会出现系统性差异。
 
+三绕组主变使用 `ACThreeWindingTransformer` 块，规范列为：
+
+```text
+idx name i_node j_node k_node
+i_r i_x j_r j_x k_r k_x
+gt bt
+i_tap i_shift j_tap j_shift k_tap k_shift
+run_stat
+```
+
+`i_r/i_x`、`j_r/j_x`、`k_r/k_x` 是三个绕组到内部星点的漏阻抗。每个绕组可独立设置变比和移相角；`gt+j*bt` 仍表示折算到 i 侧的单端励磁导纳。兼容导入名称 `AC3WTransformer`，也兼容成对短路阻抗列 `ij_r/ij_x`、`ik_r/ik_x`、`jk_r/jk_x`。成对阻抗按下式转换为星形阻抗：
+
+```text
+Zi = (Zij + Zik - Zjk) / 2
+Zj = (Zij + Zjk - Zik) / 2
+Zk = (Zik + Zjk - Zij) / 2
+```
+
+求解器不创建可见的内部节点，而是对星点做 Kron 消元，直接得到三个外部端口的 `3 x 3` 导纳印章。若恰有一个星形臂为零阻抗，则按该臂趋近于零时的解析极限处理，不会误判为开路；两个及以上零阻抗臂需要理想电压约束，当前会明确拒绝。只有三个端口都属于同一个存活交流岛时，该设备才参与拓扑和潮流。MATPOWER 导出时，普通三绕组主变会临时恢复一个内部星点母线和三条变压器支路；单零阻抗臂则消去该星点，导出为另外两个端口到零阻抗端口的两条等值变压器支路。
+
 ## 残差方程
 
 `get_f(x)` 计算非线性方程残差，主要包括：
@@ -155,7 +176,8 @@ Ytt = y
 - 发电机 `p/q/current`
 - 负荷 `p/q/current`
 - 并联补偿 `p/q/current`
-- 线路和主变两端 `i_p/i_q/i_c/j_p/j_q/j_c`
+- 线路和双绕组主变两端 `i_p/i_q/i_c/j_p/j_q/j_c`
+- 三绕组主变三个端口 `i_p/i_q/i_c/j_p/j_q/j_c/k_p/k_q/k_c`
 - 开关和零阻抗支路 `p/q/current`
 
 array-mode 下结果写入 `calc.result`，不会直接修改输入 `ppc`。

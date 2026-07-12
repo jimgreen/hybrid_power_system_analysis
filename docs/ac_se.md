@@ -65,6 +65,7 @@ idx name dev_type dev_name meas_type weight valid value
 | `ACNode` | `V`, `ANGLE`/`THETA` |
 | `ACBranch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, `P_TO`, `Q_TO`, `V_TO`, `I_TO` |
 | `ACTransformer` | 两端 P/Q/V/I，导纳模型与潮流一致：串联阻抗加 i 侧单端对地 `gt/bt` |
+| `ACThreeWindingTransformer` | i 端使用 `*_FROM`，j 端使用 `*_TO`，k 端使用 `P_THIRD/Q_THIRD/V_THIRD/I_THIRD`；`P_K/Q_K/V_K/I_K` 可作为导入别名 |
 | `ACSwitch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, `P_TO`, `Q_TO`, `V_TO`, `I_TO` |
 | `ACZeroBranch` | `P_FROM`, `Q_FROM`, `V_FROM`, `I_FROM`, 以及 `V_DIFF`, `ANGLE_DIFF` |
 | `ACGenerator` | `P_GEN`, `Q_GEN`, `V_GEN`, `I_GEN` |
@@ -114,7 +115,8 @@ ACZeroBranchConstraint ANGLE_DIFF = 0
 `evaluate(x)` 按设备类型计算估计量测 `h(x)`：
 
 - 节点电压/相角直接取状态。
-- 线路/主变潮流通过 MATPOWER stamp 计算端口电流和复功率。
+- 线路/双绕组主变潮流通过两端 stamp 计算端口电流和复功率。
+- 三绕组主变复用潮流模块的 Kron 消元 `3 x 3` 导纳印章，不向状态向量暴露内部星点。
 - 开关/零阻抗支路通过显式电流状态计算 P/Q/I。
 - 发电机功率由节点网络注入、负荷和零阻抗支路注入推断，并按同节点多发电机 `alpha` 分摊。
 - 负荷按 ZIP 模型随电压计算。
@@ -123,7 +125,7 @@ ACZeroBranchConstraint ANGLE_DIFF = 0
 
 `jacobian_sparse(x)` 返回解析稀疏 Jacobian。主要优化：
 
-- 线路和主变 P/Q/I 对相角、电压导数向量化。
+- 线路、双绕组主变和三绕组主变 P/Q/I 对各端口相角、电压导数向量化。
 - 开关和零阻抗支路 P/Q/I 对电压和显式电流导数批量生成。
 - 负荷 P/Q/I 对电压导数批量生成。
 - 发电机节点注入导数按节点/设备分组复用。
@@ -190,3 +192,4 @@ rN_i = abs(r_i) / sqrt(R_ii - h_i * G^-1 * h_i.T)
 - `.meas` 中的相角是度，内部自动转弧度。
 - E 文件和 `.meas` 的功率、电压、电流都应使用有名值，单位由 E 文件的 scale 字段解释。
 - AC 大规模拼接算例必须保留 `ACZeroBranch`，不要用普通极小阻抗线路替代。
+- 三绕组主变只有在 i/j/k 三个端口均在线且处于同一个存活交流岛时才接受量测；任一端口离线时，设备及其量测均按不可用处理。

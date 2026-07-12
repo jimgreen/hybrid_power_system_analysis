@@ -107,6 +107,36 @@ TRANSFORMER_COLS = {
     "j_q": 14,
     "j_c": 15,
 }
+THREE_WINDING_TRANSFORMER_COLS = {
+    "idx": 0,
+    "i_node": 1,
+    "j_node": 2,
+    "k_node": 3,
+    "i_r": 4,
+    "i_x": 5,
+    "j_r": 6,
+    "j_x": 7,
+    "k_r": 8,
+    "k_x": 9,
+    "gt": 10,
+    "bt": 11,
+    "i_tap": 12,
+    "i_shift": 13,
+    "j_tap": 14,
+    "j_shift": 15,
+    "k_tap": 16,
+    "k_shift": 17,
+    "run_stat": 18,
+    "i_p": 19,
+    "i_q": 20,
+    "i_c": 21,
+    "j_p": 22,
+    "j_q": 23,
+    "j_c": 24,
+    "k_p": 25,
+    "k_q": 26,
+    "k_c": 27,
+}
 GEN_COLS = {
     "idx": 0,
     "node": 1,
@@ -235,6 +265,55 @@ MP_PQ = 1
 MP_PV = 2
 MP_REF = 3
 MP_NONE = 4
+
+
+def _first_existing_column(columns: Dict[str, int], *names: str):
+    for name in names:
+        if name in columns:
+            return name
+    return None
+
+
+def _aliased_float_column(table_rows, columns, names, default=0.0):
+    name = _first_existing_column(columns, *names)
+    if name is None:
+        return np.full(len(table_rows), float(default), dtype=np.float64)
+    return _float_column(table_rows, columns, name, default)
+
+
+def _three_winding_star_impedances(table_rows, columns):
+    """Return star-equivalent winding impedances.
+
+    Canonical E columns are ``i_r/i_x``, ``j_r/j_x`` and ``k_r/k_x``.
+    For utility data that stores pairwise short-circuit impedances, the
+    aliases ``ij_*``, ``ik_*`` and ``jk_*`` are also accepted and converted.
+    """
+    direct = all(
+        _first_existing_column(columns, f"{terminal}_{part}", f"{part}_{terminal}") is not None
+        for terminal in ("i", "j", "k")
+        for part in ("r", "x")
+    )
+    if direct:
+        return tuple(
+            _aliased_float_column(table_rows, columns, (f"{terminal}_{part}", f"{part}_{terminal}"))
+            for terminal in ("i", "j", "k")
+            for part in ("r", "x")
+        )
+
+    z_ij = _aliased_float_column(table_rows, columns, ("ij_r", "r_ij")) + 1j * _aliased_float_column(
+        table_rows, columns, ("ij_x", "x_ij")
+    )
+    z_ik = _aliased_float_column(table_rows, columns, ("ik_r", "ki_r", "r_ik", "r_ki")) + 1j * _aliased_float_column(
+        table_rows, columns, ("ik_x", "ki_x", "x_ik", "x_ki")
+    )
+    z_jk = _aliased_float_column(table_rows, columns, ("jk_r", "kj_r", "r_jk", "r_kj")) + 1j * _aliased_float_column(
+        table_rows, columns, ("jk_x", "kj_x", "x_jk", "x_kj")
+    )
+    z_i = 0.5 * (z_ij + z_ik - z_jk)
+    z_j = 0.5 * (z_ij + z_jk - z_ik)
+    z_k = 0.5 * (z_ik + z_jk - z_ij)
+    return z_i.real, z_i.imag, z_j.real, z_j.imag, z_k.real, z_k.imag
+
 
 def _build_switch_like_from_rows(
     table_rows,
@@ -437,6 +516,75 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         )
     transformer_names = _names_from_rows(table_rows, columns, "transformer", transformer[:, TRANSFORMER_COLS["idx"]])
 
+    columns, table_rows = _rows_for(rows, "ACThreeWindingTransformer")
+    if not table_rows:
+        columns, table_rows = _rows_for(rows, "AC3WTransformer")
+    three_winding_transformer = np.zeros(
+        (len(table_rows), len(THREE_WINDING_TRANSFORMER_COLS)),
+        dtype=np.float64,
+    )
+    if table_rows:
+        cols = THREE_WINDING_TRANSFORMER_COLS
+        three_winding_transformer[:, cols["idx"]] = _int_column(table_rows, columns, "idx")
+        three_winding_transformer[:, cols["i_node"]] = _int_column(table_rows, columns, "i_node")
+        three_winding_transformer[:, cols["j_node"]] = _int_column(table_rows, columns, "j_node")
+        three_winding_transformer[:, cols["k_node"]] = _int_column(table_rows, columns, "k_node")
+        i_r, i_x, j_r, j_x, k_r, k_x = _three_winding_star_impedances(table_rows, columns)
+        for attr, values in (
+            ("i_r", i_r),
+            ("i_x", i_x),
+            ("j_r", j_r),
+            ("j_x", j_x),
+            ("k_r", k_r),
+            ("k_x", k_x),
+        ):
+            three_winding_transformer[:, cols[attr]] = values
+        three_winding_transformer[:, cols["gt"]] = _aliased_float_column(table_rows, columns, ("gt", "g"))
+        three_winding_transformer[:, cols["bt"]] = _aliased_float_column(table_rows, columns, ("bt", "b"))
+        for terminal in ("i", "j", "k"):
+            three_winding_transformer[:, cols[f"{terminal}_tap"]] = _aliased_float_column(
+                table_rows,
+                columns,
+                (f"{terminal}_tap", f"tap_{terminal}"),
+                1.0,
+            )
+            three_winding_transformer[:, cols[f"{terminal}_shift"]] = _aliased_float_column(
+                table_rows,
+                columns,
+                (f"{terminal}_shift", f"shift_{terminal}"),
+            )
+        three_winding_transformer[:, cols["run_stat"]] = _float_column(
+            table_rows,
+            columns,
+            "run_stat",
+            1.0,
+        )
+        for attr in ("i_p", "i_q", "j_p", "j_q", "k_p", "k_q"):
+            _assign_power_if_present(
+                three_winding_transformer,
+                cols[attr],
+                table_rows,
+                columns,
+                attr,
+                p_base,
+            )
+        for terminal in ("i", "j", "k"):
+            _assign_current_if_present(
+                three_winding_transformer,
+                cols[f"{terminal}_c"],
+                table_rows,
+                columns,
+                f"{terminal}_c",
+                three_winding_transformer[:, cols[f"{terminal}_node"]],
+                get_current_scale_by_node,
+            )
+    three_winding_transformer_names = _names_from_rows(
+        table_rows,
+        columns,
+        "three_winding_transformer",
+        three_winding_transformer[:, THREE_WINDING_TRANSFORMER_COLS["idx"]],
+    )
+
     columns, table_rows = _rows_for(rows, "ACGenerator")
     gen = np.zeros((len(table_rows), len(GEN_COLS)), dtype=np.float64)
     if table_rows:
@@ -572,6 +720,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "bus": bus,
         "branch": branch,
         "transformer": transformer,
+        "three_winding_transformer": three_winding_transformer,
         "gen": gen,
         "load": load,
         "shunt": shunt,
@@ -583,6 +732,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
         "transformer_cols": TRANSFORMER_COLS,
+        "three_winding_transformer_cols": THREE_WINDING_TRANSFORMER_COLS,
         "gen_cols": GEN_COLS,
         "load_cols": LOAD_COLS,
         "shunt_cols": SHUNT_COLS,
@@ -594,6 +744,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
         "branch_name": branch_names,
         "transformer_name": transformer_names,
+        "three_winding_transformer_name": three_winding_transformer_names,
         "gen_name": gen_names,
         "load_name": load_names,
         "shunt_name": shunt_names,
@@ -854,6 +1005,13 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
     bus0 = np.asarray(ac_ppc["bus"], dtype=np.float64)
     branch0 = np.asarray(ac_ppc.get("branch", _empty(len(BRANCH_COLS))), dtype=np.float64)
     transformer0 = np.asarray(ac_ppc.get("transformer", _empty(len(TRANSFORMER_COLS))), dtype=np.float64)
+    three_winding_transformer0 = np.asarray(
+        ac_ppc.get(
+            "three_winding_transformer",
+            _empty(len(THREE_WINDING_TRANSFORMER_COLS)),
+        ),
+        dtype=np.float64,
+    )
     gen0 = np.asarray(ac_ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
     load0 = np.asarray(ac_ppc.get("load", _empty(len(LOAD_COLS))), dtype=np.float64)
     shunt0 = np.asarray(ac_ppc.get("shunt", _empty(len(SHUNT_COLS))), dtype=np.float64)
@@ -904,6 +1062,50 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         scale = 1.0 / (tap_mag * tap_mag)
         gs[comp] += row[TRANSFORMER_COLS["gt"]] * scale * base_mva
         bs[comp] += row[TRANSFORMER_COLS["bt"]] * scale * base_mva
+
+    active_three_winding = []
+    zero_arm_three_winding = []
+    for row in _active_rows(
+        three_winding_transformer0,
+        THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+    ):
+        cols3 = THREE_WINDING_TRANSFORMER_COLS
+        terminal_bus_rows = [
+            row_by_node.get(int(row[cols3[f"{terminal}_node"]]))
+            for terminal in ("i", "j", "k")
+        ]
+        if any(bus_row is None or row_to_comp[bus_row] < 0 for bus_row in terminal_bus_rows):
+            continue
+        terminal_bus_ids = [int(row_to_bus_id[bus_row]) for bus_row in terminal_bus_rows]
+        i_comp = int(row_to_comp[terminal_bus_rows[0]])
+        i_tap = float(row[cols3["i_tap"]])
+        i_tap = i_tap if abs(i_tap) > 1e-12 else 1.0
+        scale = 1.0 / (i_tap * i_tap)
+        gs[i_comp] += row[cols3["gt"]] * scale * base_mva
+        bs[i_comp] += row[cols3["bt"]] * scale * base_mva
+
+        winding_z = np.asarray(
+            [
+                complex(row[cols3[f"{terminal}_r"]], row[cols3[f"{terminal}_x"]])
+                for terminal in ("i", "j", "k")
+            ],
+            dtype=np.complex128,
+        )
+        zero_arm = np.abs(winding_z) <= 1e-12
+        zero_count = int(np.count_nonzero(zero_arm))
+        if zero_count > 1:
+            raise ValueError(
+                "ACThreeWindingTransformer cannot contain more than one zero-impedance winding "
+                f"during MATPOWER export; device idx={int(row[cols3['idx']])}"
+            )
+        if zero_count == 1:
+            zero_arm_three_winding.append(
+                (row, terminal_bus_ids, winding_z, int(np.flatnonzero(zero_arm)[0]))
+            )
+            continue
+
+        star_bus_id = comp_count + len(active_three_winding) + 1
+        active_three_winding.append((row, terminal_bus_rows, terminal_bus_ids, star_bus_id))
 
     for row in _active_rows(gen0, GEN_COLS["run_stat"]):
         bus_row = row_by_node.get(int(row[GEN_COLS["node"]]))
@@ -993,6 +1195,20 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
     bus[:, MP_ZONE] = 1
     bus[:, MP_VMAX] = 1.2
     bus[:, MP_VMIN] = 0.8
+    if active_three_winding:
+        star_rows = np.zeros((len(active_three_winding), 13), dtype=np.float64)
+        for pos, (_row, terminal_bus_rows, _terminal_bus_ids, star_bus_id) in enumerate(active_three_winding):
+            source_comp = int(row_to_comp[terminal_bus_rows[0]])
+            star_rows[pos, MP_BUS_I] = star_bus_id
+            star_rows[pos, MP_BUS_TYPE] = MP_PQ
+            star_rows[pos, MP_BUS_AREA] = 1
+            star_rows[pos, MP_VM] = vm0[source_comp]
+            star_rows[pos, MP_VA] = va0[source_comp]
+            star_rows[pos, MP_BASE_KV] = base_kv[source_comp]
+            star_rows[pos, MP_ZONE] = 1
+            star_rows[pos, MP_VMAX] = 1.2
+            star_rows[pos, MP_VMIN] = 0.8
+        bus = np.vstack((bus, star_rows))
 
     gen_rows = []
     for row in _active_rows(gen0, GEN_COLS["run_stat"]):
@@ -1048,6 +1264,51 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
 
     add_branch_devices(branch0, BRANCH_COLS, False)
     add_branch_devices(transformer0, TRANSFORMER_COLS, True)
+    for row, _terminal_bus_rows, terminal_bus_ids, star_bus_id in active_three_winding:
+        cols3 = THREE_WINDING_TRANSFORMER_COLS
+        for terminal, terminal_bus_id in zip(("i", "j", "k"), terminal_bus_ids):
+            branch_row = np.zeros(13, dtype=np.float64)
+            branch_row[MP_F_BUS] = terminal_bus_id
+            branch_row[MP_T_BUS] = star_bus_id
+            branch_row[MP_BR_R] = row[cols3[f"{terminal}_r"]]
+            branch_row[MP_BR_X] = row[cols3[f"{terminal}_x"]]
+            tap = row[cols3[f"{terminal}_tap"]]
+            branch_row[MP_TAP] = 0.0 if abs(tap - 1.0) < 1e-12 else tap
+            branch_row[MP_SHIFT] = row[cols3[f"{terminal}_shift"]]
+            branch_row[MP_BR_STATUS] = 1
+            branch_row[MP_ANGMIN] = -360.0
+            branch_row[MP_ANGMAX] = 360.0
+            branch_rows.append(branch_row)
+    for row, terminal_bus_ids, winding_z, anchor in zero_arm_three_winding:
+        cols3 = THREE_WINDING_TRANSFORMER_COLS
+        terminal_labels = ("i", "j", "k")
+        tap_complex = []
+        for terminal in terminal_labels:
+            tap = float(row[cols3[f"{terminal}_tap"]])
+            tap = tap if abs(tap) > 1e-12 else 1.0
+            shift = float(row[cols3[f"{terminal}_shift"]])
+            tap_complex.append(tap * np.exp(1j * np.deg2rad(shift)))
+        anchor_tap = tap_complex[anchor]
+        for terminal in range(3):
+            if terminal == anchor:
+                continue
+            equivalent_z = winding_z[terminal] * abs(tap_complex[terminal]) ** 2
+            equivalent_tap = anchor_tap / tap_complex[terminal]
+            branch_row = np.zeros(13, dtype=np.float64)
+            branch_row[MP_F_BUS] = terminal_bus_ids[anchor]
+            branch_row[MP_T_BUS] = terminal_bus_ids[terminal]
+            branch_row[MP_BR_R] = equivalent_z.real
+            branch_row[MP_BR_X] = equivalent_z.imag
+            branch_row[MP_RATE_A] = 0.0
+            branch_row[MP_RATE_B] = 0.0
+            branch_row[MP_RATE_C] = 0.0
+            tap_magnitude = abs(equivalent_tap)
+            branch_row[MP_TAP] = 0.0 if abs(tap_magnitude - 1.0) < 1e-12 else tap_magnitude
+            branch_row[MP_SHIFT] = np.degrees(np.angle(equivalent_tap))
+            branch_row[MP_BR_STATUS] = 1
+            branch_row[MP_ANGMIN] = -360.0
+            branch_row[MP_ANGMAX] = 360.0
+            branch_rows.append(branch_row)
     branch = np.vstack(branch_rows) if branch_rows else np.zeros((0, 13), dtype=np.float64)
     return {"version": "2", "baseMVA": base_mva, "bus": bus, "gen": gen, "branch": branch}
 
@@ -1199,6 +1460,7 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "bus": bus,
         "branch": branch,
         "transformer": transformer,
+        "three_winding_transformer": _empty(len(THREE_WINDING_TRANSFORMER_COLS)),
         "gen": gen,
         "load": load,
         "shunt": shunt,
@@ -1209,6 +1471,7 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "bus_name": bus_names,
         "branch_name": np.asarray([f"branch_{int(row[BRANCH_COLS['idx']])}" for row in branch], dtype=object),
         "transformer_name": np.asarray([f"transformer_{int(row[TRANSFORMER_COLS['idx']])}" for row in transformer], dtype=object),
+        "three_winding_transformer_name": np.asarray([], dtype=object),
         "gen_name": gen_names,
         "load_name": load_names,
         "shunt_name": np.asarray([f"shunt_{int(row[SHUNT_COLS['idx']])}" for row in shunt], dtype=object),
@@ -1219,6 +1482,7 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
         "transformer_cols": TRANSFORMER_COLS,
+        "three_winding_transformer_cols": THREE_WINDING_TRANSFORMER_COLS,
         "gen_cols": GEN_COLS,
         "load_cols": LOAD_COLS,
         "shunt_cols": SHUNT_COLS,
@@ -1250,6 +1514,7 @@ def build_ac_ppc_from_network(network) -> Dict:
     nodes = list(getattr(network, "nodes", []))
     branches = list(getattr(network, "branches", []))
     transformers = list(getattr(network, "transformers", []))
+    three_winding_transformers = list(getattr(network, "three_winding_transformers", []))
     generators = list(getattr(network, "generators", []))
     loads = list(getattr(network, "loads", []))
     shunts = list(getattr(network, "shunt_compensators", []))
@@ -1299,6 +1564,39 @@ def build_ac_ppc_from_network(network) -> Dict:
         transformer[row, TRANSFORMER_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
     for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c"):
         _fill_float_column_if_present(transformer, transformers, TRANSFORMER_COLS[attr], attr)
+
+    three_winding_transformer = np.zeros(
+        (len(three_winding_transformers), len(THREE_WINDING_TRANSFORMER_COLS)),
+        dtype=np.float64,
+    )
+    tw_cols = THREE_WINDING_TRANSFORMER_COLS
+    for row, dev in enumerate(three_winding_transformers):
+        for attr in ("idx", "i_node", "j_node", "k_node"):
+            three_winding_transformer[row, tw_cols[attr]] = _int_value(dev, attr)
+        for attr in (
+            "i_r",
+            "i_x",
+            "j_r",
+            "j_x",
+            "k_r",
+            "k_x",
+            "gt",
+            "bt",
+            "i_shift",
+            "j_shift",
+            "k_shift",
+        ):
+            three_winding_transformer[row, tw_cols[attr]] = _float_value(dev, attr)
+        for attr in ("i_tap", "j_tap", "k_tap"):
+            three_winding_transformer[row, tw_cols[attr]] = _float_value(dev, attr, 1.0)
+        three_winding_transformer[row, tw_cols["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+    for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c"):
+        _fill_float_column_if_present(
+            three_winding_transformer,
+            three_winding_transformers,
+            tw_cols[attr],
+            attr,
+        )
 
     gen = np.zeros((len(generators), len(GEN_COLS)), dtype=np.float64)
     for row, dev in enumerate(generators):
@@ -1393,6 +1691,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         "bus": bus,
         "branch": branch,
         "transformer": transformer,
+        "three_winding_transformer": three_winding_transformer,
         "gen": gen,
         "load": load,
         "shunt": shunt,
@@ -1404,6 +1703,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
         "transformer_cols": TRANSFORMER_COLS,
+        "three_winding_transformer_cols": THREE_WINDING_TRANSFORMER_COLS,
         "gen_cols": GEN_COLS,
         "load_cols": LOAD_COLS,
         "shunt_cols": SHUNT_COLS,
@@ -1417,6 +1717,10 @@ def build_ac_ppc_from_network(network) -> Dict:
     ppc.update(
         branch_name=_name_array(branches, "branch"),
         transformer_name=_name_array(transformers, "transformer"),
+        three_winding_transformer_name=_name_array(
+            three_winding_transformers,
+            "three_winding_transformer",
+        ),
         gen_name=_name_array(generators, "gen"),
         load_name=_name_array(loads, "load"),
         shunt_name=_name_array(shunts, "shunt"),
@@ -1462,6 +1766,7 @@ def build_ac_network_from_ppc(ppc: Dict):
         ACPowerNetwork,
         ACShuntCompensator,
         ACSwitch,
+        ACThreeWindingTransformer,
         ACTransformer,
         ACZeroBranch,
     )
@@ -1471,6 +1776,16 @@ def build_ac_network_from_ppc(ppc: Dict):
     bus_names = _list_ppc_names(ppc, "bus_name", "bus", ppc["bus"].shape[0])
     branch_names = _list_ppc_names(ppc, "branch_name", "branch", ppc["branch"].shape[0])
     transformer_names = _list_ppc_names(ppc, "transformer_name", "transformer", ppc["transformer"].shape[0])
+    three_winding_table = np.asarray(
+        ppc.get("three_winding_transformer", _empty(len(THREE_WINDING_TRANSFORMER_COLS))),
+        dtype=np.float64,
+    )
+    three_winding_transformer_names = _list_ppc_names(
+        ppc,
+        "three_winding_transformer_name",
+        "three_winding_transformer",
+        three_winding_table.shape[0],
+    )
     gen_names = _list_ppc_names(ppc, "gen_name", "gen", ppc["gen"].shape[0])
     load_names = _list_ppc_names(ppc, "load_name", "load", ppc["load"].shape[0])
     shunt_names = _list_ppc_names(ppc, "shunt_name", "shunt", ppc["shunt"].shape[0])
@@ -1510,6 +1825,7 @@ def build_ac_network_from_ppc(ppc: Dict):
         node.breakers = []
         node.zero_branches = []
         node.transformers = []
+        node.three_winding_transformers = []
         node.shunt_compensators = []
         node.acac_converters = []
 
@@ -1541,6 +1857,31 @@ def build_ac_network_from_ppc(ppc: Dict):
             int(row[TRANSFORMER_COLS["run_stat"]]),
         )
         for row in ppc["transformer"]
+    ]
+    tw_cols = THREE_WINDING_TRANSFORMER_COLS
+    network.three_winding_transformers = [
+        ACThreeWindingTransformer(
+            int(row[tw_cols["idx"]]),
+            int(row[tw_cols["i_node"]]),
+            int(row[tw_cols["j_node"]]),
+            int(row[tw_cols["k_node"]]),
+            float(row[tw_cols["i_r"]]),
+            float(row[tw_cols["i_x"]]),
+            float(row[tw_cols["j_r"]]),
+            float(row[tw_cols["j_x"]]),
+            float(row[tw_cols["k_r"]]),
+            float(row[tw_cols["k_x"]]),
+            float(row[tw_cols["i_tap"]]),
+            float(row[tw_cols["i_shift"]]),
+            float(row[tw_cols["j_tap"]]),
+            float(row[tw_cols["j_shift"]]),
+            float(row[tw_cols["k_tap"]]),
+            float(row[tw_cols["k_shift"]]),
+            float(row[tw_cols["gt"]]),
+            float(row[tw_cols["bt"]]),
+            int(row[tw_cols["run_stat"]]),
+        )
+        for row in three_winding_table
     ]
     network.generators = [
         ACGenerator(
@@ -1638,6 +1979,7 @@ def build_ac_network_from_ppc(ppc: Dict):
     network.zero_branch_dict = {}
     network.branch_dict = {}
     network.transformer_dict = {}
+    network.three_winding_transformer_dict = {}
     network.shunt_compensator_dict = {}
     network.acac_converter_dict = {}
     network.islands = []
@@ -1661,6 +2003,15 @@ def build_ac_network_from_ppc(ppc: Dict):
         obj.j_p = float(row[TRANSFORMER_COLS["j_p"]])
         obj.j_q = float(row[TRANSFORMER_COLS["j_q"]])
         obj.j_c = float(row[TRANSFORMER_COLS["j_c"]])
+        obj.is_alive = False
+    for obj, row, name in zip(
+        network.three_winding_transformers,
+        three_winding_table,
+        three_winding_transformer_names,
+    ):
+        obj.name = name
+        for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c"):
+            setattr(obj, attr, float(row[tw_cols[attr]]))
         obj.is_alive = False
     for obj, row, name in zip(network.generators, ppc["gen"], gen_names):
         obj.name = name

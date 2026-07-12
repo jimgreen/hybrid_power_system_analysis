@@ -556,13 +556,13 @@ class SparseJacobianBuilder:
             self.data.append(float(value))
 
     def add_many(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray, mask: np.ndarray = None) -> None:
-        if mask is None and self._try_append_fixed_data_chunk(values):
-            return
         rows = _as_array_dtype(rows, np.int32)
         cols = _as_array_dtype(cols, np.int32)
         values = _as_array_dtype(values, np.float64)
         if mask is None:
             mask = cols >= 0
+            if mask.all() and self._try_append_fixed_data_chunk(values):
+                return
         else:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
         if mask.any():

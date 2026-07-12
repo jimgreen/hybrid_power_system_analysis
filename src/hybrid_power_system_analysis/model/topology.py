@@ -23,6 +23,21 @@ class TerminalDeviceTopologyArrays:
 
 
 @dataclass
+class ThreeTerminalDeviceTopologyArrays:
+    i_node_pos: np.ndarray
+    j_node_pos: np.ndarray
+    k_node_pos: np.ndarray
+    i_bus_pos: np.ndarray
+    j_bus_pos: np.ndarray
+    k_bus_pos: np.ndarray
+    i_island_pos: np.ndarray
+    j_island_pos: np.ndarray
+    k_island_pos: np.ndarray
+    island_pos: np.ndarray
+    alive_mask: np.ndarray
+
+
+@dataclass
 class SingleDeviceTopologyArrays:
     node_pos: np.ndarray
     bus_pos: np.ndarray
@@ -89,6 +104,48 @@ def _empty_terminal_device(count: int = 0) -> TerminalDeviceTopologyArrays:
 def _empty_single_device(count: int = 0) -> SingleDeviceTopologyArrays:
     values = np.full(int(count), -1, dtype=np.int32)
     return SingleDeviceTopologyArrays(values.copy(), values.copy(), values.copy(), np.zeros(int(count), dtype=bool))
+
+
+def _three_terminal_device_arrays(
+    ij: TerminalDeviceTopologyArrays,
+    ik: TerminalDeviceTopologyArrays,
+) -> ThreeTerminalDeviceTopologyArrays:
+    count = int(ij.alive_mask.size)
+    if count == 0:
+        values = np.full(0, -1, dtype=np.int32)
+        return ThreeTerminalDeviceTopologyArrays(
+            values,
+            values,
+            values,
+            values,
+            values,
+            values,
+            values,
+            values,
+            values,
+            values,
+            np.zeros(0, dtype=bool),
+        )
+    same_island = (
+        (ij.i_island_pos == ij.j_island_pos)
+        & (ij.i_island_pos == ik.j_island_pos)
+        & (ij.i_island_pos >= 0)
+    )
+    alive = ij.alive_mask & ik.alive_mask & same_island
+    island_pos = np.where(alive, ij.i_island_pos, -1).astype(np.int32, copy=False)
+    return ThreeTerminalDeviceTopologyArrays(
+        ij.i_node_pos,
+        ij.j_node_pos,
+        ik.j_node_pos,
+        ij.i_bus_pos,
+        ij.j_bus_pos,
+        ik.j_bus_pos,
+        ij.i_island_pos,
+        ij.j_island_pos,
+        ik.j_island_pos,
+        island_pos,
+        alive,
+    )
 
 
 def _pos_parent(parent, item: int) -> int:
@@ -159,6 +216,38 @@ def _terminal_topology_input(
         _map_node_positions(rows[:, i_col], node_lookup),
         _map_node_positions(rows[:, j_col], node_lookup),
         run_mask,
+    )
+
+
+def _three_terminal_topology_inputs(
+    table,
+    i_col: int,
+    j_col: int,
+    k_col: int,
+    run_col: int,
+    node_lookup,
+    node_run_mask: np.ndarray,
+) -> Tuple[TerminalDeviceTopologyInput, TerminalDeviceTopologyInput]:
+    rows = np.asarray(table)
+    count = int(rows.shape[0]) if rows.size else 0
+    if count == 0:
+        empty = TerminalDeviceTopologyInput(_EMPTY_INT, _EMPTY_INT, _EMPTY_BOOL)
+        return empty, empty
+    i_node_pos = _map_node_positions(rows[:, i_col], node_lookup)
+    j_node_pos = _map_node_positions(rows[:, j_col], node_lookup)
+    k_node_pos = _map_node_positions(rows[:, k_col], node_lookup)
+    run_mask = rows[:, run_col].astype(np.int64, copy=False) == 1
+    valid = run_mask & (i_node_pos >= 0) & (j_node_pos >= 0) & (k_node_pos >= 0)
+    if np.any(valid):
+        valid_rows = np.flatnonzero(valid)
+        valid[valid_rows] &= (
+            node_run_mask[i_node_pos[valid_rows].astype(np.intp, copy=False)]
+            & node_run_mask[j_node_pos[valid_rows].astype(np.intp, copy=False)]
+            & node_run_mask[k_node_pos[valid_rows].astype(np.intp, copy=False)]
+        )
+    return (
+        TerminalDeviceTopologyInput(i_node_pos, j_node_pos, valid.copy()),
+        TerminalDeviceTopologyInput(i_node_pos, k_node_pos, valid.copy()),
     )
 
 
@@ -627,6 +716,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS,
             TRANSFORMER_COLS,
             ZERO_BRANCH_COLS,
             _empty,
@@ -641,6 +731,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS,
             TRANSFORMER_COLS,
             ZERO_BRANCH_COLS,
             _empty,
@@ -649,6 +740,10 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
     bus = np.asarray(ppc["bus"], dtype=np.float64)
     branch = np.asarray(ppc["branch"], dtype=np.float64)
     transformer = np.asarray(ppc["transformer"], dtype=np.float64)
+    three_winding_transformer = np.asarray(
+        ppc.get("three_winding_transformer", _empty(len(THREE_WINDING_TRANSFORMER_COLS))),
+        dtype=np.float64,
+    )
     gen = np.asarray(ppc["gen"], dtype=np.float64)
     load = np.asarray(ppc["load"], dtype=np.float64)
     shunt = np.asarray(ppc["shunt"], dtype=np.float64)
@@ -659,6 +754,15 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
     node_ids = bus[:, BUS_COLS["idx"]].astype(np.int32, copy=False)
     node_run_mask = bus[:, BUS_COLS["run_stat"]].astype(np.int64, copy=False) == 1
     node_lookup = _make_node_pos_lookup(node_ids)
+    three_winding_ij, three_winding_ik = _three_terminal_topology_inputs(
+        three_winding_transformer,
+        THREE_WINDING_TRANSFORMER_COLS["i_node"],
+        THREE_WINDING_TRANSFORMER_COLS["j_node"],
+        THREE_WINDING_TRANSFORMER_COLS["k_node"],
+        THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+        node_lookup,
+        node_run_mask,
+    )
     terminals = {
         "branch": _terminal_topology_input(
             branch,
@@ -674,6 +778,8 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             TRANSFORMER_COLS["run_stat"],
             node_lookup,
         ),
+        "three_winding_transformer_ij": three_winding_ij,
+        "three_winding_transformer_ik": three_winding_ik,
         "zero_branch": _terminal_topology_input(
             zero_branch,
             ZERO_BRANCH_COLS["i_node"],
@@ -725,6 +831,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS,
             TRANSFORMER_COLS,
             ZERO_BRANCH_COLS,
             _empty,
@@ -739,6 +846,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             LOAD_COLS,
             SHUNT_COLS,
             SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS,
             TRANSFORMER_COLS,
             ZERO_BRANCH_COLS,
             _empty,
@@ -747,6 +855,10 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
     bus = np.asarray(ppc["bus"], dtype=np.float64)
     branch = np.asarray(ppc["branch"], dtype=np.float64)
     transformer = np.asarray(ppc["transformer"], dtype=np.float64)
+    three_winding_transformer = np.asarray(
+        ppc.get("three_winding_transformer", _empty(len(THREE_WINDING_TRANSFORMER_COLS))),
+        dtype=np.float64,
+    )
     gen = np.asarray(ppc["gen"], dtype=np.float64)
     load = np.asarray(ppc["load"], dtype=np.float64)
     shunt = np.asarray(ppc["shunt"], dtype=np.float64)
@@ -793,6 +905,22 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 TRANSFORMER_COLS["run_stat"],
                 None,
                 terminals.get("transformer"),
+            ),
+            (
+                three_winding_transformer,
+                THREE_WINDING_TRANSFORMER_COLS["i_node"],
+                THREE_WINDING_TRANSFORMER_COLS["j_node"],
+                THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+                None,
+                terminals.get("three_winding_transformer_ij"),
+            ),
+            (
+                three_winding_transformer,
+                THREE_WINDING_TRANSFORMER_COLS["i_node"],
+                THREE_WINDING_TRANSFORMER_COLS["k_node"],
+                THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+                None,
+                terminals.get("three_winding_transformer_ik"),
             ),
             (
                 zero_branch,
@@ -886,6 +1014,26 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             node_lookup,
             topology,
             precomputed=terminals.get("transformer"),
+        ),
+        "three_winding_transformer": _three_terminal_device_arrays(
+            _terminal_device_arrays(
+                three_winding_transformer,
+                THREE_WINDING_TRANSFORMER_COLS["i_node"],
+                THREE_WINDING_TRANSFORMER_COLS["j_node"],
+                THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+                node_lookup,
+                topology,
+                precomputed=terminals.get("three_winding_transformer_ij"),
+            ),
+            _terminal_device_arrays(
+                three_winding_transformer,
+                THREE_WINDING_TRANSFORMER_COLS["i_node"],
+                THREE_WINDING_TRANSFORMER_COLS["k_node"],
+                THREE_WINDING_TRANSFORMER_COLS["run_stat"],
+                node_lookup,
+                topology,
+                precomputed=terminals.get("three_winding_transformer_ik"),
+            ),
         ),
         "zero_branch": _terminal_device_arrays(
             zero_branch,
@@ -1500,6 +1648,7 @@ def apply_ac_topology_arrays(
 
     branches = _device_seq(network, "branches")
     transformers = _device_seq(network, "transformers")
+    three_winding_transformers = _device_seq(network, "three_winding_transformers")
     generators = _device_seq(network, "generators")
     loads = _device_seq(network, "loads")
     shunts = _device_seq(network, "shunt_compensators")
@@ -1521,6 +1670,9 @@ def apply_ac_topology_arrays(
             network.alive_buses = network.alive_nodes
             network.alive_branch_by_name = {br.name: br for br in branches if br.is_alive}
             network.alive_transformer_by_name = {tr.name: tr for tr in transformers if tr.is_alive}
+            network.alive_three_winding_transformer_by_name = {
+                tr.name: tr for tr in three_winding_transformers if tr.is_alive
+            }
             network.alive_generator_by_name = {gen.name: gen for gen in generators if gen.is_alive}
             network.alive_load_by_name = {load.name: load for load in loads if load.is_alive}
             network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}
@@ -1536,6 +1688,7 @@ def apply_ac_topology_arrays(
             network.alive_buses = network.alive_nodes
             network.alive_branch_by_name = {}
             network.alive_transformer_by_name = {}
+            network.alive_three_winding_transformer_by_name = {}
             network.alive_generator_by_name = {}
             network.alive_load_by_name = {}
             network.alive_zero_branch_by_name = {}
@@ -1550,6 +1703,7 @@ def apply_ac_topology_arrays(
     if compact:
         network.branch_dict = {}
         network.transformer_dict = {}
+        network.three_winding_transformer_dict = {}
         network.generator_dict = {}
         network.load_dict = {}
         network.shunt_compensator_dict = {}
@@ -1562,6 +1716,9 @@ def apply_ac_topology_arrays(
         network.branch_dict = {int(dev.idx): dev for dev in branches}
         network.branche_dict = network.branch_dict
         network.transformer_dict = {int(dev.idx): dev for dev in transformers}
+        network.three_winding_transformer_dict = {
+            int(dev.idx): dev for dev in three_winding_transformers
+        }
         network.generator_dict = {int(dev.idx): dev for dev in generators}
         network.load_dict = {int(dev.idx): dev for dev in loads}
         network.shunt_compensator_dict = {int(dev.idx): dev for dev in shunts}
@@ -1579,6 +1736,7 @@ def apply_ac_topology_arrays(
             node.breakers = []
             node.zero_branches = []
             node.transformers = []
+            node.three_winding_transformers = []
             node.shunt_compensators = []
             node.v_gens = []
 
@@ -1588,6 +1746,11 @@ def apply_ac_topology_arrays(
         _apply_topology_alive_flags(shunts, topology, "shunt")
         _apply_topology_alive_flags(branches, topology, "branch")
         _apply_topology_alive_flags(transformers, topology, "transformer")
+        _apply_topology_alive_flags(
+            three_winding_transformers,
+            topology,
+            "three_winding_transformer",
+        )
         _apply_topology_alive_flags(zero_branches, topology, "zero_branch")
         _apply_topology_alive_flags(switches, topology, "switch")
         _apply_topology_alive_flags(breakers, topology, "break")
@@ -1681,6 +1844,45 @@ def apply_ac_topology_arrays(
 
     finalize_terminal(branches, "branch", "branches", "branches")
     finalize_terminal(transformers, "transformer", "transformers", "transformers")
+
+    three_topology = topology.devices.get("three_winding_transformer")
+    if three_topology is not None:
+        alive = np.asarray(three_topology.alive_mask, dtype=bool)
+        i_pos_values = np.asarray(three_topology.i_node_pos, dtype=np.int32)
+        j_pos_values = np.asarray(three_topology.j_node_pos, dtype=np.int32)
+        k_pos_values = np.asarray(three_topology.k_node_pos, dtype=np.int32)
+        island_pos_values = np.asarray(three_topology.island_pos, dtype=np.int32)
+    else:
+        alive = np.zeros(len(three_winding_transformers), dtype=bool)
+        i_pos_values = j_pos_values = k_pos_values = np.full(
+            len(three_winding_transformers),
+            -1,
+            dtype=np.int32,
+        )
+        island_pos_values = np.full(len(three_winding_transformers), -1, dtype=np.int32)
+    for pos, dev in enumerate(three_winding_transformers):
+        terminal_nodes = []
+        for attr, positions, node_id in (
+            ("i_node_obj", i_pos_values, dev.i_node),
+            ("j_node_obj", j_pos_values, dev.j_node),
+            ("k_node_obj", k_pos_values, dev.k_node),
+        ):
+            node_pos = int(positions[pos]) if pos < positions.size else -1
+            node = nodes[node_pos] if 0 <= node_pos < len(nodes) else node_dict.get(int(node_id))
+            setattr(dev, attr, node)
+            terminal_nodes.append(node)
+            if not compact and node is not None:
+                node.three_winding_transformers.append(dev)
+        dev.is_alive = bool(alive[pos]) if pos < alive.size else False
+        if (
+            not compact
+            and dev.is_alive
+            and pos < island_pos_values.size
+            and int(island_pos_values[pos]) >= 0
+            and terminal_nodes[0] is not None
+            and terminal_nodes[0].isl_obj is not None
+        ):
+            terminal_nodes[0].isl_obj.three_winding_transformers.append(dev)
     finalize_terminal(zero_branches, "zero_branch", "zero_branches", "zero_branches")
     finalize_terminal(switches, "switch", "switches", "switches")
     finalize_terminal(breakers, "break", "breakers", "breakers")
@@ -1939,6 +2141,8 @@ def _make_ac_island(idx, island_cls):
     island = island_cls(idx, False)
     if not hasattr(island, "transformers"):
         island.transformers = []
+    if not hasattr(island, "three_winding_transformers"):
+        island.three_winding_transformers = []
     if not hasattr(island, "shunt_compensators"):
         island.shunt_compensators = []
     if not hasattr(island, "acac_converters"):
@@ -1958,6 +2162,7 @@ def prepare_ac_topology(network) -> None:
     nodes = _device_seq(network, "nodes")
     branches = _device_seq(network, "branches")
     transformers = _device_seq(network, "transformers")
+    three_winding_transformers = _device_seq(network, "three_winding_transformers")
     generators = _device_seq(network, "generators")
     loads = _device_seq(network, "loads")
     shunts = _device_seq(network, "shunt_compensators")
@@ -1970,6 +2175,9 @@ def prepare_ac_topology(network) -> None:
     network.node_dict = node_dict
     network.branch_dict = {dev.idx: dev for dev in branches}
     network.transformer_dict = {dev.idx: dev for dev in transformers}
+    network.three_winding_transformer_dict = {
+        dev.idx: dev for dev in three_winding_transformers
+    }
     network.generator_dict = {dev.idx: dev for dev in generators}
     network.load_dict = {dev.idx: dev for dev in loads}
     network.shunt_compensator_dict = {dev.idx: dev for dev in shunts}
@@ -1993,6 +2201,7 @@ def prepare_ac_topology(network) -> None:
         node.breakers = []
         node.zero_branches = []
         node.transformers = []
+        node.three_winding_transformers = []
         node.shunt_compensators = []
         node.acac_converters = []
         node.v_gens = []
@@ -2067,6 +2276,15 @@ def prepare_ac_topology(network) -> None:
         connect_bus_device(dev)
     for dev in transformers:
         connect_bus_device(dev)
+    for dev in three_winding_transformers:
+        terminal_ids = (int(dev.i_node), int(dev.j_node), int(dev.k_node))
+        if dev.run_stat != 1 or not all(contains_running_node(node_id) for node_id in terminal_ids):
+            continue
+        for left, right in ((terminal_ids[0], terminal_ids[1]), (terminal_ids[0], terminal_ids[2])):
+            i_bus = get_bus(int(left))
+            j_bus = get_bus(int(right))
+            if i_bus is not None and j_bus is not None and i_bus.idx != j_bus.idx:
+                union_bus_parent(bus_parent, i_bus.idx, j_bus.idx)
     for dev in zero_branches:
         connect_bus_device(dev)
     for dev in breakers:
@@ -2158,6 +2376,23 @@ def prepare_ac_topology(network) -> None:
         finalize_branch_like(dev, "branches")
     for dev in transformers:
         finalize_branch_like(dev, "transformers")
+
+    for dev in three_winding_transformers:
+        dev.i_node_obj = node_dict.get(dev.i_node)
+        dev.j_node_obj = node_dict.get(dev.j_node)
+        dev.k_node_obj = node_dict.get(dev.k_node)
+        terminal_nodes = (dev.i_node_obj, dev.j_node_obj, dev.k_node_obj)
+        dev.is_alive = (
+            dev.run_stat == 1
+            and all(node is not None and node.is_alive for node in terminal_nodes)
+            and terminal_nodes[0].isl_obj is terminal_nodes[1].isl_obj
+            and terminal_nodes[0].isl_obj is terminal_nodes[2].isl_obj
+        )
+        for node in terminal_nodes:
+            if node is not None:
+                node.three_winding_transformers.append(dev)
+        if dev.is_alive and terminal_nodes[0].isl_obj is not None:
+            terminal_nodes[0].isl_obj.three_winding_transformers.append(dev)
     for dev in zero_branches:
         finalize_branch_like(dev, "zero_branches")
     for dev in breakers:
@@ -2171,6 +2406,9 @@ def prepare_ac_topology(network) -> None:
     network.alive_buses = network.alive_nodes
     network.alive_branch_by_name = {br.name: br for br in branches if br.is_alive}
     network.alive_transformer_by_name = {tr.name: tr for tr in transformers if tr.is_alive}
+    network.alive_three_winding_transformer_by_name = {
+        tr.name: tr for tr in three_winding_transformers if tr.is_alive
+    }
     network.alive_generator_by_name = {gen.name: gen for gen in generators if gen.is_alive}
     network.alive_load_by_name = {load.name: load for load in loads if load.is_alive}
     network.alive_zero_branch_by_name = {zbr.name: zbr for zbr in zero_branches if zbr.is_alive}

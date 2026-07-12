@@ -56,6 +56,7 @@ from model.meas_type import (
     DEVICE_TYPE_ACSwitch,
     DEVICE_TYPE_ACSwitchConstraint,
     DEVICE_TYPE_ACTransformer,
+    DEVICE_TYPE_ACThreeWindingTransformer,
     DEVICE_TYPE_ACZeroBranch,
     DEVICE_TYPE_ACZeroBranchConstraint,
     DEVICE_TYPE_DCBreak,
@@ -78,22 +79,26 @@ from model.meas_type import (
     MEAS_TYPE_I_GEN,
     MEAS_TYPE_I_LOAD,
     MEAS_TYPE_I_TO,
+    MEAS_TYPE_I_THIRD,
     MEAS_TYPE_P_AC,
     MEAS_TYPE_P_DC,
     MEAS_TYPE_P_FROM,
     MEAS_TYPE_P_GEN,
     MEAS_TYPE_P_LOAD,
     MEAS_TYPE_P_TO,
+    MEAS_TYPE_P_THIRD,
     MEAS_TYPE_Q_AC,
     MEAS_TYPE_Q_FROM,
     MEAS_TYPE_Q_GEN,
     MEAS_TYPE_Q_LOAD,
     MEAS_TYPE_Q_TO,
+    MEAS_TYPE_Q_THIRD,
     MEAS_TYPE_V,
     MEAS_TYPE_V_AC,
     MEAS_TYPE_V_DC,
     MEAS_TYPE_V_FROM,
     MEAS_TYPE_V_TO,
+    MEAS_TYPE_V_THIRD,
     MEAS_TYPE_V_GEN,
     MEAS_TYPE_V_LOAD,
     MEAS_TYPE_NAMES,
@@ -659,6 +664,8 @@ class HybridStateEstimator:
             "ACNode",
             "ACBranch",
             "ACTransformer",
+            "ACThreeWindingTransformer",
+            "AC3WTransformer",
             "ACSwitch",
             "ACBreak",
             "ACZeroBranch",
@@ -687,12 +694,15 @@ class HybridStateEstimator:
         )
     )
     _HYBRID_MEASUREMENT_DEVICE_TYPES = frozenset(("DCACConverter",))
-    _VOLTAGE_MEASUREMENT_TYPES = frozenset(("V", "V_FROM", "V_TO", "V_GEN", "V_LOAD", "V_DC", "V_AC"))
+    _VOLTAGE_MEASUREMENT_TYPES = frozenset(
+        ("V", "V_FROM", "V_TO", "V_THIRD", "V_GEN", "V_LOAD", "V_DC", "V_AC")
+    )
     _VOLTAGE_MEASUREMENT_TYPE_TUPLE = tuple(_VOLTAGE_MEASUREMENT_TYPES)
     _MEASUREMENT_SIDE_BY_DEVICE_TYPE_CODE = {
         DEVICE_TYPE_ACNode: "ac",
         DEVICE_TYPE_ACBranch: "ac",
         DEVICE_TYPE_ACTransformer: "ac",
+        DEVICE_TYPE_ACThreeWindingTransformer: "ac",
         DEVICE_TYPE_ACSwitch: "ac",
         DEVICE_TYPE_ACBreak: "ac",
         DEVICE_TYPE_ACZeroBranch: "ac",
@@ -1709,6 +1719,7 @@ class HybridStateEstimator:
             (
                 DEVICE_TYPE_ACBranch,
                 DEVICE_TYPE_ACTransformer,
+                DEVICE_TYPE_ACThreeWindingTransformer,
                 DEVICE_TYPE_ACZeroBranch,
                 DEVICE_TYPE_ACBreak,
                 DEVICE_TYPE_ACACConverter,
@@ -1718,7 +1729,10 @@ class HybridStateEstimator:
         ac_single_devices = np.asarray((DEVICE_TYPE_ACLoad, DEVICE_TYPE_ACGenerator), dtype=np.int16)
         ac_current_mask = (
             np.isin(device_type_code, ac_terminal_devices)
-            & np.isin(meas_type_code, np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO), dtype=np.int16))
+            & np.isin(
+                meas_type_code,
+                np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO, MEAS_TYPE_I_THIRD), dtype=np.int16),
+            )
         )
         ac_current_mask |= (
             np.isin(device_type_code, ac_single_devices)
@@ -1752,6 +1766,7 @@ class HybridStateEstimator:
             DEVICE_TYPE_ACPowerBalance: ac_node_count,
             DEVICE_TYPE_ACBranch: size(ac, "_ac_branch_plan_i"),
             DEVICE_TYPE_ACTransformer: size(ac, "_ac_transformer_plan_i"),
+            DEVICE_TYPE_ACThreeWindingTransformer: size(ac, "_ac_three_winding_transformer_plan_i"),
             DEVICE_TYPE_ACLoad: size(ac, "_ac_load_plan_node_pos"),
             DEVICE_TYPE_ACGenerator: size(ac, "_ac_generator_plan_node_pos"),
             DEVICE_TYPE_ACZeroBranch: ac_zero_count,
@@ -1921,7 +1936,7 @@ class HybridStateEstimator:
                     self._warn_missing_device_pos("sub_summary_voltage", 0)
                     meas_type_code = np.asarray([], dtype=np.int16)
                 voltage_codes = np.asarray(
-                    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD, MEAS_TYPE_V_DC, MEAS_TYPE_V_AC],
+                    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_THIRD, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD, MEAS_TYPE_V_DC, MEAS_TYPE_V_AC],
                     dtype=np.int16,
                 )
                 voltage_mask = (
@@ -2320,6 +2335,7 @@ class HybridStateEstimator:
                 DEVICE_TYPE_ACNode: "bus_name",
                 DEVICE_TYPE_ACBranch: "branch_name",
                 DEVICE_TYPE_ACTransformer: "transformer_name",
+                DEVICE_TYPE_ACThreeWindingTransformer: "three_winding_transformer_name",
                 DEVICE_TYPE_ACLoad: "load_name",
                 DEVICE_TYPE_ACGenerator: "gen_name",
                 DEVICE_TYPE_ACZeroBranch: "zero_branch_name",
@@ -4466,6 +4482,7 @@ class HybridStateEstimator:
             MEAS_TYPE_V,
             MEAS_TYPE_V_FROM,
             MEAS_TYPE_V_TO,
+            MEAS_TYPE_V_THIRD,
             MEAS_TYPE_V_GEN,
             MEAS_TYPE_V_LOAD,
             MEAS_TYPE_V_DC,
@@ -4504,7 +4521,7 @@ class HybridStateEstimator:
             device_pos = self._hybrid_measurement_device_pos_array(table)
             if meas_type_code.size == table.idx.size and device_pos.size == table.idx.size:
                 voltage_codes = np.asarray(
-                    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD, MEAS_TYPE_V_DC, MEAS_TYPE_V_AC],
+                    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_THIRD, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD, MEAS_TYPE_V_DC, MEAS_TYPE_V_AC],
                     dtype=np.int16,
                 )
                 rows = np.flatnonzero(active_real & np.isin(meas_type_code, voltage_codes) & (device_pos >= 0))
@@ -4738,7 +4755,7 @@ class HybridStateEstimator:
             device_pos = self._hybrid_measurement_device_pos_array(table)
             if meas_type_code.size == table.idx.size and device_pos.size == table.idx.size:
                 voltage_codes = np.asarray(
-                    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD, MEAS_TYPE_V_DC, MEAS_TYPE_V_AC],
+                    [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_THIRD, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD, MEAS_TYPE_V_DC, MEAS_TYPE_V_AC],
                     dtype=np.int16,
                 )
                 voltage_rows = np.flatnonzero(active_real & np.isin(meas_type_code, voltage_codes) & (device_pos >= 0))
@@ -4834,6 +4851,31 @@ class HybridStateEstimator:
                 return ac_solver_node(getattr(self._ac_sub_estimator, "_ac_transformer_plan_i", np.asarray([], dtype=np.int64)))
             if meas_code == MEAS_TYPE_V_TO:
                 return ac_solver_node(getattr(self._ac_sub_estimator, "_ac_transformer_plan_j", np.asarray([], dtype=np.int64)))
+        if code == DEVICE_TYPE_ACThreeWindingTransformer:
+            if meas_code == MEAS_TYPE_V_FROM:
+                return ac_solver_node(
+                    getattr(
+                        self._ac_sub_estimator,
+                        "_ac_three_winding_transformer_plan_i",
+                        np.asarray([], dtype=np.int64),
+                    )
+                )
+            if meas_code == MEAS_TYPE_V_TO:
+                return ac_solver_node(
+                    getattr(
+                        self._ac_sub_estimator,
+                        "_ac_three_winding_transformer_plan_j",
+                        np.asarray([], dtype=np.int64),
+                    )
+                )
+            if meas_code == MEAS_TYPE_V_THIRD:
+                return ac_solver_node(
+                    getattr(
+                        self._ac_sub_estimator,
+                        "_ac_three_winding_transformer_plan_k",
+                        np.asarray([], dtype=np.int64),
+                    )
+                )
         if code == DEVICE_TYPE_ACZeroBranch:
             if meas_code == MEAS_TYPE_V_FROM:
                 return ac_solver_node(getattr(self._ac_sub_estimator, "_ac_zero_branch_plan_i", np.asarray([], dtype=np.int64)))
@@ -5674,6 +5716,19 @@ class HybridStateEstimator:
                             self._measurement_spec(code, device_pos, MEAS_TYPE_Q_TO, 0.0, name),
                         )
                     )
+            terminal_names = names_for(DEVICE_TYPE_ACThreeWindingTransformer)
+            for device_pos in range(int(terminal_names.size)):
+                name = str(terminal_names[device_pos])
+                specs.extend(
+                    (
+                        self._measurement_spec(DEVICE_TYPE_ACThreeWindingTransformer, device_pos, MEAS_TYPE_P_FROM, 0.0, name),
+                        self._measurement_spec(DEVICE_TYPE_ACThreeWindingTransformer, device_pos, MEAS_TYPE_Q_FROM, 0.0, name),
+                        self._measurement_spec(DEVICE_TYPE_ACThreeWindingTransformer, device_pos, MEAS_TYPE_P_TO, 0.0, name),
+                        self._measurement_spec(DEVICE_TYPE_ACThreeWindingTransformer, device_pos, MEAS_TYPE_Q_TO, 0.0, name),
+                        self._measurement_spec(DEVICE_TYPE_ACThreeWindingTransformer, device_pos, MEAS_TYPE_P_THIRD, 0.0, name),
+                        self._measurement_spec(DEVICE_TYPE_ACThreeWindingTransformer, device_pos, MEAS_TYPE_Q_THIRD, 0.0, name),
+                    )
+                )
             for code in (DEVICE_TYPE_ACZeroBranch, DEVICE_TYPE_ACBreak):
                 terminal_names = names_for(code)
                 for device_pos in range(int(terminal_names.size)):

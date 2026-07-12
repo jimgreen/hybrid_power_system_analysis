@@ -23,7 +23,7 @@
 
 AC 和 DC 求解都会先剔除停运设备、断开开关以及无有效平衡源的拓扑岛。闭合开关在拓扑上可合并节点或作为零阻抗约束参与计算，具体取决于 AC/DC 求解器路径。
 
-AC、DC 和 Hybrid 模型输入 E 文件只保留设备拓扑、参数和控制设定。`ACBranch`、`ACTransformer`、`ACLoad`、`ACGenerator`、`ACShuntCompensator`、`ACSwitch`、`ACBreak`、`ACZeroBranch`，以及 `DCBranch`、`DCLoad`、`DCGenerator`、`DCZeroBranch`、`DCSwitch`、`DCBreak`、`DCDCConverter`、`DCACConverter`、`ACACConverter` 的 `p/q/current`、端口功率或端口电流属于潮流结果，不再写入输入 E 文件；求解器仍会在运行时对象和数组结果中生成这些状态。
+AC、DC 和 Hybrid 模型输入 E 文件只保留设备拓扑、参数和控制设定。`ACBranch`、`ACTransformer`、`ACThreeWindingTransformer`、`ACLoad`、`ACGenerator`、`ACShuntCompensator`、`ACSwitch`、`ACBreak`、`ACZeroBranch`，以及 `DCBranch`、`DCLoad`、`DCGenerator`、`DCZeroBranch`、`DCSwitch`、`DCBreak`、`DCDCConverter`、`DCACConverter`、`ACACConverter` 的 `p/q/current`、端口功率或端口电流属于潮流结果，不再写入输入 E 文件；求解器仍会在运行时对象和数组结果中生成这些状态。
 
 ## 3. AC 设备模型
 
@@ -109,7 +109,35 @@ AC、DC 和 Hybrid 模型输入 E 文件只保留设备拓扑、参数和控制�
 - 不单独引入控制方程；变比和移相角在一次潮流中作为给定参数。
 - 与 MATPOWER/PYPOWER 的标准 branch/tap 模型对比时，`gt/bt` 不能无损映射为 `BR_B`。若临时使用 `BR_B=2*bt`，只能得到对称充电近似，端口无功和发电机无功可能出现系统性偏差。
 
-### 3.4 ACGenerator
+### 3.4 ACThreeWindingTransformer
+
+典型参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `i_node`, `j_node`, `k_node` | 三个外部 AC 节点 |
+| `i_r/i_x`, `j_r/j_x`, `k_r/k_x` | 各绕组到内部星点的漏阻抗 |
+| `i_tap/i_shift`, `j_tap/j_shift`, `k_tap/k_shift` | 三个绕组各自的变比幅值和移相角 |
+| `gt`, `bt` | i 侧单端励磁导纳 |
+| `run_stat` | 整台三绕组主变运行状态 |
+
+计算模型：
+
+- 内部采用三个绕组连接到同一星点的等值网络。
+- 星点通过 Kron 消元解析消除，交流潮流和状态估计仅看到三个外部端口的 `3 x 3` 导纳印章。
+- 输入也可使用 `ij/ik/jk` 成对短路阻抗，导入时转换为三个星形绕组阻抗。
+- 恰有一个星形臂为零阻抗时使用解析极限模型；两个及以上零阻抗臂因需要理想电压约束而明确报错，不会静默当成开路。
+- 任一端口节点停运或三个端口不在同一存活岛时，整台设备不参与计算；不会把剩余两个端口误当作独立双绕组变压器。
+
+结果状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `i_p`, `i_q`, `i_c` | i 端有功、无功、电流 |
+| `j_p`, `j_q`, `j_c` | j 端有功、无功、电流 |
+| `k_p`, `k_q`, `k_c` | k 端有功、无功、电流 |
+
+### 3.5 ACGenerator
 
 典型参数：
 
@@ -140,7 +168,7 @@ AC、DC 和 Hybrid 模型输入 E 文件只保留设备拓扑、参数和控制�
 - 同一可计算岛通常需要一个平衡电源。
 - 多个平衡源只有在零阻抗等值相连且电压设定一致时可被视作同一理想母线，否则拓扑检查会报错或告警。
 
-### 3.5 ACLoad
+### 3.6 ACLoad
 
 典型参数：
 
@@ -169,7 +197,7 @@ Q_load(V) = qbase * (qv0 + qv1 * V + qv2 * V^2)
 - 负荷作为节点注入的负项进入 P/Q 平衡。
 - ZIP 负荷对电压的偏导进入 Jacobian。
 
-### 3.6 ACShuntCompensator
+### 3.7 ACShuntCompensator
 
 典型参数：
 
@@ -192,7 +220,7 @@ Q_load(V) = qbase * (qv0 + qv1 * V + qv2 * V^2)
 - 并联导纳进入节点导纳矩阵。
 - 定无功或定电压控制进入节点功率/电压约束。
 
-### 3.7 ACZeroBranch / ACSwitch / ACBreak
+### 3.8 ACZeroBranch / ACSwitch / ACBreak
 
 典型参数：
 

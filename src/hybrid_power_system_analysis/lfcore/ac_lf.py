@@ -54,6 +54,7 @@ from ac_array_model import (
     SHUNT_V,
     SHUNT_Z,
     SWITCH_COLS,
+    THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
     build_ac_ppc_from_e_file,
@@ -109,6 +110,7 @@ class ACLFResult:
     acac_converters: Dict[str, SimpleNamespace] = field(default_factory=dict)
     branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
     transformers: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    three_winding_transformers: Dict[str, SimpleNamespace] = field(default_factory=dict)
     nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
     zero_branches: Dict[str, SimpleNamespace] = field(default_factory=dict)
     breakers: Dict[str, SimpleNamespace] = field(default_factory=dict)
@@ -235,6 +237,127 @@ def matpower_transformer_stamp_vectorized(r, x, gt=0.0, bt=0.0, tap=1.0, shift=0
         -y / tap_complex,
         y,
     )
+
+
+def three_winding_transformer_stamp_vectorized(
+    i_r,
+    i_x,
+    j_r,
+    j_x,
+    k_r,
+    k_x,
+    gt=0.0,
+    bt=0.0,
+    i_tap=1.0,
+    i_shift=0.0,
+    j_tap=1.0,
+    j_shift=0.0,
+    k_tap=1.0,
+    k_shift=0.0,
+):
+    """Return the Kron-reduced 3x3 terminal admittance stamp.
+
+    The three leakage impedances connect each terminal to an internal star
+    point. The star voltage is analytically eliminated, so no synthetic bus is
+    exposed to load flow or state estimation. The result shape is ``(n, 3, 3)``.
+    """
+    inputs = np.broadcast_arrays(
+        np.asarray(i_r, dtype=np.float64),
+        np.asarray(i_x, dtype=np.float64),
+        np.asarray(j_r, dtype=np.float64),
+        np.asarray(j_x, dtype=np.float64),
+        np.asarray(k_r, dtype=np.float64),
+        np.asarray(k_x, dtype=np.float64),
+        np.asarray(gt, dtype=np.float64),
+        np.asarray(bt, dtype=np.float64),
+        np.asarray(i_tap, dtype=np.float64),
+        np.asarray(i_shift, dtype=np.float64),
+        np.asarray(j_tap, dtype=np.float64),
+        np.asarray(j_shift, dtype=np.float64),
+        np.asarray(k_tap, dtype=np.float64),
+        np.asarray(k_shift, dtype=np.float64),
+    )
+    (
+        i_r,
+        i_x,
+        j_r,
+        j_x,
+        k_r,
+        k_x,
+        gt,
+        bt,
+        i_tap,
+        i_shift,
+        j_tap,
+        j_shift,
+        k_tap,
+        k_shift,
+    ) = inputs
+    shape = i_r.shape
+    z = np.stack((i_r + 1j * i_x, j_r + 1j * j_x, k_r + 1j * k_x), axis=-1)
+    tap = np.stack((i_tap, j_tap, k_tap), axis=-1)
+    tap = np.where(np.abs(tap) > 1e-12, tap, 1.0)
+    shift = np.stack((i_shift, j_shift, k_shift), axis=-1)
+    tapc = tap * np.exp(1j * np.deg2rad(shift))
+    z_flat = z.reshape(-1, 3)
+    tapc_flat = tapc.reshape(-1, 3)
+    zero_arm = np.abs(z_flat) <= 1e-12
+    zero_count = np.count_nonzero(zero_arm, axis=1)
+    invalid = np.flatnonzero(zero_count > 1)
+    if invalid.size:
+        raise ValueError(
+            "ACThreeWindingTransformer cannot contain more than one zero-impedance winding; "
+            f"invalid flattened row(s): {invalid.tolist()}"
+        )
+
+    y_flat = np.divide(
+        1.0,
+        z_flat,
+        out=np.zeros(z_flat.shape, dtype=np.complex128),
+        where=~zero_arm,
+    )
+    stamp_flat = np.zeros((z_flat.shape[0], 3, 3), dtype=np.complex128)
+
+    regular = zero_count == 0
+    if np.any(regular):
+        y_regular = y_flat[regular]
+        tap_regular = tapc_flat[regular]
+        y_sum = np.sum(y_regular, axis=1)
+        inv_y_sum = np.divide(
+            1.0,
+            y_sum,
+            out=np.zeros(y_sum.shape, dtype=np.complex128),
+            where=np.abs(y_sum) > 1e-12,
+        )
+        from_star = y_regular / np.conj(tap_regular)
+        to_star = y_regular / tap_regular
+        regular_stamp = -from_star[:, :, None] * to_star[:, None, :] * inv_y_sum[:, None, None]
+        diag = np.arange(3)
+        regular_stamp[:, diag, diag] += y_regular / (tap_regular * np.conj(tap_regular))
+        stamp_flat[regular] = regular_stamp
+
+    single_zero = zero_count == 1
+    for anchor in range(3):
+        rows = np.flatnonzero(single_zero & zero_arm[:, anchor])
+        if rows.size == 0:
+            continue
+        anchor_tap = tapc_flat[rows, anchor]
+        for terminal in range(3):
+            if terminal == anchor:
+                continue
+            terminal_y = y_flat[rows, terminal]
+            terminal_tap = tapc_flat[rows, terminal]
+            stamp_flat[rows, anchor, anchor] += terminal_y / (anchor_tap * np.conj(anchor_tap))
+            stamp_flat[rows, terminal, terminal] += terminal_y / (terminal_tap * np.conj(terminal_tap))
+            stamp_flat[rows, anchor, terminal] -= terminal_y / (np.conj(anchor_tap) * terminal_tap)
+            stamp_flat[rows, terminal, anchor] -= terminal_y / (np.conj(terminal_tap) * anchor_tap)
+
+    gt_flat = np.asarray(gt, dtype=np.float64).reshape(-1)
+    bt_flat = np.asarray(bt, dtype=np.float64).reshape(-1)
+    stamp_flat[:, 0, 0] += (gt_flat + 1j * bt_flat) / (
+        tapc_flat[:, 0] * np.conj(tapc_flat[:, 0])
+    )
+    return stamp_flat.reshape(shape + (3, 3))
 
 
 # ==============================================================================
@@ -745,6 +868,13 @@ class ACPowerFlowCalc:
         bus = np.asarray(ppc["bus"], dtype=np.float64)
         branch = np.asarray(ppc.get("branch", np.zeros((0, len(BRANCH_COLS)))), dtype=np.float64)
         transformer = np.asarray(ppc.get("transformer", np.zeros((0, len(TRANSFORMER_COLS)))), dtype=np.float64)
+        three_winding_transformer = np.asarray(
+            ppc.get(
+                "three_winding_transformer",
+                np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS))),
+            ),
+            dtype=np.float64,
+        )
         gen = np.asarray(ppc.get("gen", np.zeros((0, len(GEN_COLS)))), dtype=np.float64)
         load = np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64)
         shunt = np.asarray(ppc.get("shunt", np.zeros((0, len(SHUNT_COLS)))), dtype=np.float64)
@@ -826,7 +956,7 @@ class ACPowerFlowCalc:
         self.slack_node = -1
 
         self._prepare_ppc_devices(branch, transformer, gen, load, shunt, zero_branch, switch, active_bus)
-        self._prepare_ppc_y_matrix(branch, transformer, shunt)
+        self._prepare_ppc_y_matrix(branch, transformer, three_winding_transformer, shunt)
         self._prepare_ppc_zero_edges(zero_branch, switch, active_bus, breaker)
         self._finalize_prepared_arrays()
         if self.verbose:
@@ -925,8 +1055,13 @@ class ACPowerFlowCalc:
             if external_refs.size == 0:
                 raise RuntimeError("电网中无平衡节点，无法进行潮流计算")
 
-    def _prepare_ppc_y_matrix(self, branch, transformer, shunt):
+    def _prepare_ppc_y_matrix(self, branch, transformer, three_winding_transformer, shunt):
         row_parts, col_parts, data_parts = [], [], []
+        self.ppc_three_winding_transformer_rows = np.asarray([], dtype=np.int32)
+        self.three_winding_transformer_i = np.asarray([], dtype=np.int32)
+        self.three_winding_transformer_j = np.asarray([], dtype=np.int32)
+        self.three_winding_transformer_k = np.asarray([], dtype=np.int32)
+        self.three_winding_transformer_y = np.zeros((0, 3, 3), dtype=np.complex128)
         if branch.size:
             i_rows = self._ppc_node_rows(branch[:, BRANCH_COLS["i_node"]])
             j_rows = self._ppc_node_rows(branch[:, BRANCH_COLS["j_node"]])
@@ -982,6 +1117,50 @@ class ACPowerFlowCalc:
             data_parts.append(
                 np.column_stack((self.transformer_yff, self.transformer_yft, self.transformer_ytf, self.transformer_ytt)).ravel()
             )
+
+        if three_winding_transformer.size:
+            cols3 = THREE_WINDING_TRANSFORMER_COLS
+            i_rows = self._ppc_node_rows(three_winding_transformer[:, cols3["i_node"]])
+            j_rows = self._ppc_node_rows(three_winding_transformer[:, cols3["j_node"]])
+            k_rows = self._ppc_node_rows(three_winding_transformer[:, cols3["k_node"]])
+            live = (
+                (three_winding_transformer[:, cols3["run_stat"]] == 1)
+                & (self.row_to_pos[i_rows] >= 0)
+                & (self.row_to_pos[j_rows] >= 0)
+                & (self.row_to_pos[k_rows] >= 0)
+            )
+            self.ppc_three_winding_transformer_rows = np.where(live)[0].astype(np.int32)
+            rows3 = self.ppc_three_winding_transformer_rows
+            self.three_winding_transformer_i = self.row_to_pos[i_rows[rows3]]
+            self.three_winding_transformer_j = self.row_to_pos[j_rows[rows3]]
+            self.three_winding_transformer_k = self.row_to_pos[k_rows[rows3]]
+            table = three_winding_transformer[rows3]
+            self.three_winding_transformer_y = three_winding_transformer_stamp_vectorized(
+                table[:, cols3["i_r"]],
+                table[:, cols3["i_x"]],
+                table[:, cols3["j_r"]],
+                table[:, cols3["j_x"]],
+                table[:, cols3["k_r"]],
+                table[:, cols3["k_x"]],
+                table[:, cols3["gt"]],
+                table[:, cols3["bt"]],
+                table[:, cols3["i_tap"]],
+                table[:, cols3["i_shift"]],
+                table[:, cols3["j_tap"]],
+                table[:, cols3["j_shift"]],
+                table[:, cols3["k_tap"]],
+                table[:, cols3["k_shift"]],
+            )
+            terminal_pos = np.column_stack(
+                (
+                    self.three_winding_transformer_i,
+                    self.three_winding_transformer_j,
+                    self.three_winding_transformer_k,
+                )
+            )
+            row_parts.append(np.repeat(terminal_pos, 3, axis=1).ravel())
+            col_parts.append(np.tile(terminal_pos, (1, 3)).ravel())
+            data_parts.append(self.three_winding_transformer_y.reshape(-1))
 
         if shunt.size and self.ppc_shunt_rows.size:
             shunt_live = shunt[self.ppc_shunt_rows]
@@ -2496,6 +2675,28 @@ class ACPowerFlowCalc:
 
         _build_two_port(self.result.get("branch"), "branch_name", BRANCH_COLS, result.branches)
         _build_two_port(self.result.get("transformer"), "transformer_name", TRANSFORMER_COLS, result.transformers)
+        three_rows = self.result.get("three_winding_transformer")
+        if three_rows is not None and len(three_rows):
+            cols3 = THREE_WINDING_TRANSFORMER_COLS
+            names = _name_list("three_winding_transformer_name", len(three_rows))
+            i_v = _lookup_voltage(three_rows[:, cols3["i_node"]]).tolist()
+            j_v = _lookup_voltage(three_rows[:, cols3["j_node"]]).tolist()
+            k_v = _lookup_voltage(three_rows[:, cols3["k_node"]]).tolist()
+            for name, row, iv, jv, kv in zip(names, three_rows, i_v, j_v, k_v):
+                result.three_winding_transformers[name] = SimpleNamespace(
+                    i_p=float(row[cols3["i_p"]]),
+                    i_q=float(row[cols3["i_q"]]),
+                    i_c=float(row[cols3["i_c"]]),
+                    i_v=iv,
+                    j_p=float(row[cols3["j_p"]]),
+                    j_q=float(row[cols3["j_q"]]),
+                    j_c=float(row[cols3["j_c"]]),
+                    j_v=jv,
+                    k_p=float(row[cols3["k_p"]]),
+                    k_q=float(row[cols3["k_q"]]),
+                    k_c=float(row[cols3["k_c"]]),
+                    k_v=kv,
+                )
         acac_rows = self.result.get("acac")
         if acac_rows is not None and len(acac_rows):
             names = _name_list("acac_name", len(acac_rows))
@@ -2629,6 +2830,17 @@ class ACPowerFlowCalc:
                 ("j_p", TRANSFORMER_COLS["j_p"]),
                 ("j_q", TRANSFORMER_COLS["j_q"]),
                 ("j_c", TRANSFORMER_COLS["j_c"]),
+            ),
+        )
+        copy_fields(
+            getattr(network, "three_winding_transformers", []),
+            rows_by_idx(
+                "three_winding_transformer",
+                THREE_WINDING_TRANSFORMER_COLS["idx"],
+            ),
+            tuple(
+                (attr, THREE_WINDING_TRANSFORMER_COLS[attr])
+                for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c")
             ),
         )
         copy_fields(
@@ -2791,6 +3003,40 @@ class ACPowerFlowCalc:
             transformer[rows, TRANSFORMER_COLS["j_q"]] = S_ji.imag
             transformer[rows, TRANSFORMER_COLS["j_c"]] = np.abs(I_ji)
 
+        three_winding_transformer = self.ppc.get(
+            "three_winding_transformer",
+            np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS)), dtype=np.float64),
+        ).copy()
+        cols3 = THREE_WINDING_TRANSFORMER_COLS
+        three_result_cols = [
+            cols3[attr]
+            for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c")
+        ]
+        if three_winding_transformer.size:
+            three_winding_transformer[:, three_result_cols] = 0.0
+        if self.ppc_three_winding_transformer_rows.size:
+            rows = self.ppc_three_winding_transformer_rows
+            terminal_pos = np.column_stack(
+                (
+                    self.three_winding_transformer_i,
+                    self.three_winding_transformer_j,
+                    self.three_winding_transformer_k,
+                )
+            )
+            terminal_voltage = Vc[terminal_pos]
+            terminal_current = np.einsum(
+                "nij,nj->ni",
+                self.three_winding_transformer_y,
+                terminal_voltage,
+            )
+            terminal_power = terminal_voltage * np.conj(terminal_current)
+            for terminal_pos_idx, terminal in enumerate(("i", "j", "k")):
+                three_winding_transformer[rows, cols3[f"{terminal}_p"]] = terminal_power[:, terminal_pos_idx].real
+                three_winding_transformer[rows, cols3[f"{terminal}_q"]] = terminal_power[:, terminal_pos_idx].imag
+                three_winding_transformer[rows, cols3[f"{terminal}_c"]] = np.abs(
+                    terminal_current[:, terminal_pos_idx]
+                )
+
         zero_branch = self.ppc["zero_branch"].copy()
         switch = self.ppc["switch"].copy()
         breaker = self.ppc.get("break", np.zeros((0, len(SWITCH_COLS)))).copy()
@@ -2816,6 +3062,7 @@ class ACPowerFlowCalc:
             "shunt": shunt,
             "branch": branch,
             "transformer": transformer,
+            "three_winding_transformer": three_winding_transformer,
             "zero_branch": zero_branch,
             "switch": switch,
             "break": breaker,
@@ -2889,6 +3136,41 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
         )
         print(f"     有功损耗: {loss:.6f} pu")
 
+    three_winding_transformer = calc.result.get(
+        "three_winding_transformer",
+        np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS)), dtype=np.float64),
+    )
+    three_winding_names = _names(
+        "three_winding_transformer_name",
+        three_winding_transformer.shape[0],
+    )
+    p_loss_tr3 = (
+        float(
+            np.sum(
+                three_winding_transformer[:, THREE_WINDING_TRANSFORMER_COLS["i_p"]]
+                + three_winding_transformer[:, THREE_WINDING_TRANSFORMER_COLS["j_p"]]
+                + three_winding_transformer[:, THREE_WINDING_TRANSFORMER_COLS["k_p"]]
+            )
+        )
+        if three_winding_transformer.size
+        else 0.0
+    )
+    print("\n3.1 三绕组主变信息:")
+    for row, name in zip(three_winding_transformer, three_winding_names):
+        cols3 = THREE_WINDING_TRANSFORMER_COLS
+        loss = row[cols3["i_p"]] + row[cols3["j_p"]] + row[cols3["k_p"]]
+        print(
+            f"   三绕组主变 {int(row[cols3['idx']])} {name} "
+            f"({int(row[cols3['i_node']])}/{int(row[cols3['j_node']])}/{int(row[cols3['k_node']])}):"
+        )
+        for terminal, label in (("i", "i端"), ("j", "j端"), ("k", "k端")):
+            print(
+                f"     {label}功率: {row[cols3[f'{terminal}_p']]:.6f} "
+                f"+ j {row[cols3[f'{terminal}_q']]:.6f} pu, "
+                f"电流: {row[cols3[f'{terminal}_c']]:.6f} pu"
+            )
+        print(f"     有功损耗: {loss:.6f} pu")
+
     # 其他设备信息
     zero_branch = calc.result["zero_branch"]
     zero_names = _names("zero_branch_name", zero_branch.shape[0])
@@ -2955,7 +3237,11 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     print("\n9. 功率平衡校验:")
     print(f"   总发电功率: {total_gen_power:.6f} pu")
     print(f"   总负荷功率: {total_load_power:.6f} pu")
-    print(f"   总网损: {total_loss:.6f} pu (支路: {p_loss_br:.6f} pu, 变压器: {p_loss_tr:.6f} pu, 并联电导: {p_loss_gs:.6f} pu)")
+    print(
+        f"   总网损: {total_loss:.6f} pu "
+        f"(支路: {p_loss_br:.6f} pu, 双绕组主变: {p_loss_tr:.6f} pu, "
+        f"三绕组主变: {p_loss_tr3:.6f} pu, 并联电导: {p_loss_gs:.6f} pu)"
+    )
 
 
 def main(argv=None) -> int:

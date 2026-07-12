@@ -26,6 +26,7 @@ from ac_lf import (
     ACPowerFlowCalc,
     matpower_branch_stamp_vectorized,
     matpower_transformer_stamp_vectorized,
+    three_winding_transformer_stamp_vectorized,
 )
 from ac_model import ACPowerNetwork
 from ac_array_model import (
@@ -39,6 +40,7 @@ from ac_array_model import (
     SHUNT_COLS,
     SHUNT_V,
     SHUNT_Z,
+    THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
 )
@@ -55,6 +57,7 @@ from model.meas_type import (
     DEVICE_TYPE_ACNode,
     DEVICE_TYPE_ACBranch,
     DEVICE_TYPE_ACTransformer,
+    DEVICE_TYPE_ACThreeWindingTransformer,
     DEVICE_TYPE_ACLoad,
     DEVICE_TYPE_ACGenerator,
     DEVICE_TYPE_ACZeroBranch,
@@ -75,6 +78,10 @@ from model.meas_type import (
     MEAS_TYPE_Q_TO,
     MEAS_TYPE_V_TO,
     MEAS_TYPE_I_TO,
+    MEAS_TYPE_P_THIRD,
+    MEAS_TYPE_Q_THIRD,
+    MEAS_TYPE_V_THIRD,
+    MEAS_TYPE_I_THIRD,
     MEAS_TYPE_P_LOAD,
     MEAS_TYPE_Q_LOAD,
     MEAS_TYPE_V_LOAD,
@@ -166,6 +173,8 @@ _TERMINAL_POWER_MEASUREMENT_TYPES = frozenset(
         MEAS_TYPE_Q_FROM,
         MEAS_TYPE_P_TO,
         MEAS_TYPE_Q_TO,
+        MEAS_TYPE_P_THIRD,
+        MEAS_TYPE_Q_THIRD,
     )
 )
 _VOLTAGE_MEASUREMENT_TYPES = frozenset(
@@ -173,6 +182,7 @@ _VOLTAGE_MEASUREMENT_TYPES = frozenset(
         MEAS_TYPE_V,
         MEAS_TYPE_V_FROM,
         MEAS_TYPE_V_TO,
+        MEAS_TYPE_V_THIRD,
         MEAS_TYPE_V_GEN,
         MEAS_TYPE_V_LOAD,
     )
@@ -230,6 +240,22 @@ _AC_TERMINAL_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
         MEAS_TYPE_Q_TO,
         MEAS_TYPE_V_TO,
         MEAS_TYPE_I_TO,
+    )
+)
+_AC_THREE_TERMINAL_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
+    (
+        MEAS_TYPE_P_FROM,
+        MEAS_TYPE_Q_FROM,
+        MEAS_TYPE_V_FROM,
+        MEAS_TYPE_I_FROM,
+        MEAS_TYPE_P_TO,
+        MEAS_TYPE_Q_TO,
+        MEAS_TYPE_V_TO,
+        MEAS_TYPE_I_TO,
+        MEAS_TYPE_P_THIRD,
+        MEAS_TYPE_Q_THIRD,
+        MEAS_TYPE_V_THIRD,
+        MEAS_TYPE_I_THIRD,
     )
 )
 _AC_ZERO_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
@@ -2294,6 +2320,7 @@ class ACStateEstimator:
             "shunt",
             "branch",
             "transformer",
+            "three_winding_transformer",
             "zero_branch",
             "switch",
             "break",
@@ -2439,6 +2466,7 @@ class ACStateEstimator:
             DEVICE_TYPE_ACNode: "bus_name",
             DEVICE_TYPE_ACBranch: "branch_name",
             DEVICE_TYPE_ACTransformer: "transformer_name",
+            DEVICE_TYPE_ACThreeWindingTransformer: "three_winding_transformer_name",
             DEVICE_TYPE_ACLoad: "load_name",
             DEVICE_TYPE_ACGenerator: "gen_name",
             DEVICE_TYPE_ACZeroBranch: "zero_branch_name",
@@ -2640,6 +2668,46 @@ class ACStateEstimator:
             mask = mtypes == MEAS_TYPE_I_TO
             scale[rows_valid[mask]] = node_current_scale[j_valid[mask]]
 
+        def apply_three_terminal(rows: np.ndarray) -> None:
+            if rows.size == 0:
+                return
+            arrays = (
+                self._ac_three_winding_transformer_plan_i,
+                self._ac_three_winding_transformer_plan_j,
+                self._ac_three_winding_transformer_plan_k,
+            )
+            resolved = [self._values_for_plan_pos(values, device_pos[rows]) for values in arrays]
+            valid_node = np.logical_and.reduce([item[0] for item in resolved])
+            positions = [item[1] for item in resolved]
+            for pos_values in positions:
+                valid_node &= (pos_values >= 0) & (pos_values < node_valid.size)
+            if np.any(valid_node):
+                idx = np.flatnonzero(valid_node)
+                for pos_values in positions:
+                    valid_node[idx] &= node_valid[pos_values[idx].astype(np.intp, copy=False)]
+            rows_valid = rows[valid_node]
+            if rows_valid.size == 0:
+                return
+            i_valid, j_valid, k_valid = [values[valid_node].astype(np.intp, copy=False) for values in positions]
+            from_pos[rows_valid] = i_valid
+            to_pos[rows_valid] = j_valid
+            available[rows_valid] = True
+            mtypes = meas_type_code[rows_valid]
+            power_mask = np.isin(
+                mtypes,
+                (MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_Q_TO, MEAS_TYPE_P_THIRD, MEAS_TYPE_Q_THIRD),
+            )
+            scale[rows_valid[power_mask]] = self.p_base
+            for v_code, i_code, terminal_pos_values in (
+                (MEAS_TYPE_V_FROM, MEAS_TYPE_I_FROM, i_valid),
+                (MEAS_TYPE_V_TO, MEAS_TYPE_I_TO, j_valid),
+                (MEAS_TYPE_V_THIRD, MEAS_TYPE_I_THIRD, k_valid),
+            ):
+                mask = mtypes == v_code
+                scale[rows_valid[mask]] = node_voltage_scale[terminal_pos_values[mask]]
+                mask = mtypes == i_code
+                scale[rows_valid[mask]] = node_current_scale[terminal_pos_values[mask]]
+
         def apply_single(rows: np.ndarray, node_plan_pos: np.ndarray, power_codes: Tuple[int, int], voltage_code: int, current_code: int) -> None:
             if rows.size == 0:
                 return
@@ -2676,6 +2744,7 @@ class ACStateEstimator:
             self._ac_transformer_plan_i,
             self._ac_transformer_plan_j,
         )
+        apply_three_terminal(rows_for(DEVICE_TYPE_ACThreeWindingTransformer))
         apply_terminal(
             rows_for(DEVICE_TYPE_ACZeroBranch),
             self._ac_zero_branch_plan_i,
@@ -2772,6 +2841,25 @@ class ACStateEstimator:
             getattr(self, "_ac_transformer_plan_i", np.asarray([], dtype=np.int64)),
             getattr(self, "_ac_transformer_plan_j", np.asarray([], dtype=np.int64)),
         )
+        assign_terminal(
+            DEVICE_TYPE_ACThreeWindingTransformer,
+            getattr(self, "_ac_three_winding_transformer_plan_i", np.asarray([], dtype=np.int64)),
+            getattr(self, "_ac_three_winding_transformer_plan_j", np.asarray([], dtype=np.int64)),
+        )
+        third_rows = np.flatnonzero(
+            (device_type_code == DEVICE_TYPE_ACThreeWindingTransformer)
+            & (meas_type_code == MEAS_TYPE_V_THIRD)
+        ).astype(np.int64, copy=False)
+        if third_rows.size:
+            valid, values = self._values_for_plan_pos(
+                np.asarray(
+                    getattr(self, "_ac_three_winding_transformer_plan_k", np.asarray([], dtype=np.int64)),
+                    dtype=np.int64,
+                ),
+                device_pos[third_rows],
+            )
+            if np.any(valid):
+                from_pos[third_rows[valid]] = values[valid]
         assign_terminal(
             DEVICE_TYPE_ACZeroBranch,
             getattr(self, "_ac_zero_branch_plan_i", np.asarray([], dtype=np.int64)),
@@ -3061,6 +3149,7 @@ class ACStateEstimator:
         terminal_device_mask = (
             (device_type_code == DEVICE_TYPE_ACBranch)
             | (device_type_code == DEVICE_TYPE_ACTransformer)
+            | (device_type_code == DEVICE_TYPE_ACThreeWindingTransformer)
             | (device_type_code == DEVICE_TYPE_ACZeroBranch)
             | (device_type_code == DEVICE_TYPE_ACBreak)
         )
@@ -3068,6 +3157,12 @@ class ACStateEstimator:
         terminal_v_to_rows = row_index[real_mask & terminal_device_mask & (meas_type_code == MEAS_TYPE_V_TO)]
         update_best_arrays(terminal_v_from_rows, from_pos[terminal_v_from_rows], real_best_weight, real_best_value)
         update_best_arrays(terminal_v_to_rows, to_pos[terminal_v_to_rows], real_best_weight, real_best_value)
+        terminal_v_third_rows = row_index[
+            real_mask
+            & (device_type_code == DEVICE_TYPE_ACThreeWindingTransformer)
+            & (meas_type_code == MEAS_TYPE_V_THIRD)
+        ]
+        update_best_arrays(terminal_v_third_rows, from_pos[terminal_v_third_rows], real_best_weight, real_best_value)
         node_valid_pos = node_idx_by_pos >= 0
         self._node_voltage_measurement_pos_mask_cache = np.isfinite(node_best_weight) & node_valid_pos
         self._real_voltage_observation_pos_mask_cache = np.isfinite(real_best_weight) & node_valid_pos
@@ -3191,6 +3286,9 @@ class ACStateEstimator:
             id(getattr(self, "_ac_branch_plan_j", None)),
             id(getattr(self, "_ac_transformer_plan_i", None)),
             id(getattr(self, "_ac_transformer_plan_j", None)),
+            id(getattr(self, "_ac_three_winding_transformer_plan_i", None)),
+            id(getattr(self, "_ac_three_winding_transformer_plan_j", None)),
+            id(getattr(self, "_ac_three_winding_transformer_plan_k", None)),
             id(getattr(self, "_ac_zero_branch_plan_i", None)),
             id(getattr(self, "_ac_zero_branch_plan_j", None)),
             id(getattr(self, "_ac_break_plan_i", None)),
@@ -3305,7 +3403,10 @@ class ACStateEstimator:
 
         ac_current_mask = np.isin(
             meas_type_code_array,
-            np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO, MEAS_TYPE_I_LOAD, MEAS_TYPE_I_GEN), dtype=np.int16),
+            np.asarray(
+                (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO, MEAS_TYPE_I_THIRD, MEAS_TYPE_I_LOAD, MEAS_TYPE_I_GEN),
+                dtype=np.int16,
+            ),
         )
         if ac_current_mask.any():
             valid_array[ac_current_mask] = False
@@ -3948,6 +4049,14 @@ class ACStateEstimator:
                 else getattr(self, "_ac_transformer_plan_j", np.asarray([], dtype=np.int64))
             )
             valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
+        elif code == DEVICE_TYPE_ACThreeWindingTransformer:
+            if meas_code == MEAS_TYPE_V_FROM:
+                values = getattr(self, "_ac_three_winding_transformer_plan_i", np.asarray([], dtype=np.int64))
+            elif meas_code == MEAS_TYPE_V_TO:
+                values = getattr(self, "_ac_three_winding_transformer_plan_j", np.asarray([], dtype=np.int64))
+            else:
+                values = getattr(self, "_ac_three_winding_transformer_plan_k", np.asarray([], dtype=np.int64))
+            valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_THIRD)
         elif code == DEVICE_TYPE_ACZeroBranch:
             values = (
                 getattr(self, "_ac_zero_branch_plan_i", np.asarray([], dtype=np.int64))
@@ -4523,6 +4632,16 @@ class ACStateEstimator:
                     ppc.get("transformer", np.zeros((0, len(TRANSFORMER_COLS)))),
                     dtype=np.float64,
                 ).shape[0]
+            )
+            + 6
+            * int(
+                np.asarray(
+                    ppc.get(
+                        "three_winding_transformer",
+                        np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS))),
+                    ),
+                    dtype=np.float64,
+                ).shape[0]
             ),
             store_strings=store_strings,
         )
@@ -4701,6 +4820,67 @@ class ACStateEstimator:
 
         add_terminal_candidates(DEVICE_TYPE_ACBranch, "ACBranch", "branch", "branch_name", "branch", BRANCH_COLS)
         add_terminal_candidates(DEVICE_TYPE_ACTransformer, "ACTransformer", "transformer", "transformer_name", "transformer", TRANSFORMER_COLS)
+
+        def add_three_terminal_candidates() -> None:
+            table = np.asarray(
+                ppc.get(
+                    "three_winding_transformer",
+                    np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS))),
+                ),
+                dtype=np.float64,
+            )
+            device_topology = topology.devices.get("three_winding_transformer")
+            rows = (
+                self._sorted_alive_ppc_rows(
+                    table,
+                    THREE_WINDING_TRANSFORMER_COLS["idx"],
+                    device_topology.alive_mask,
+                )
+                if device_topology is not None
+                else np.asarray([], dtype=np.int64)
+            )
+            if rows.size == 0:
+                return
+            table_rows = table[rows.astype(np.intp, copy=False)]
+            plan_pos = self._plan_pos_for_ppc_rows(
+                DEVICE_TYPE_ACThreeWindingTransformer,
+                rows,
+                table.shape[0],
+            )
+            names = (
+                self._ppc_names_for_rows(ppc["three_winding_transformer_name"], rows)
+                if store_strings
+                else repeat("", int(rows.size))
+            )
+            terminal_specs = (
+                ("i", MEAS_TYPE_P_FROM, "P_FROM", MEAS_TYPE_Q_FROM, "Q_FROM"),
+                ("j", MEAS_TYPE_P_TO, "P_TO", MEAS_TYPE_Q_TO, "Q_TO"),
+                ("k", MEAS_TYPE_P_THIRD, "P_THIRD", MEAS_TYPE_Q_THIRD, "Q_THIRD"),
+            )
+            cols = THREE_WINDING_TRANSFORMER_COLS
+            for name, pos, values in zip(names, plan_pos, table_rows):
+                device_name = str(name) if store_strings else ""
+                for terminal, p_code, p_name, q_code, q_name in terminal_specs:
+                    add(
+                        DEVICE_TYPE_ACThreeWindingTransformer,
+                        "ACThreeWindingTransformer",
+                        device_name,
+                        int(pos),
+                        p_code,
+                        p_name,
+                        float(values[cols[f"{terminal}_p"]] or 0.0),
+                    )
+                    add(
+                        DEVICE_TYPE_ACThreeWindingTransformer,
+                        "ACThreeWindingTransformer",
+                        device_name,
+                        int(pos),
+                        q_code,
+                        q_name,
+                        float(values[cols[f"{terminal}_q"]] or 0.0),
+                    )
+
+        add_three_terminal_candidates()
 
         candidate_table = self._pseudo_measurement_table(
             candidate_rows.names,
@@ -5324,7 +5504,7 @@ class ACStateEstimator:
         return getattr(self, "_node_voltage_measurement_cache", {})
 
     def _node_incident_degrees(self) -> Dict[int, int]:
-        """Count live incident AC branches, transformers, switches and zero branches."""
+        """Count live incident AC terminal devices at each solver node."""
         ppc = self._ac_ppc_dict()
         topology = ppc.get("_topology_arrays")
         if topology is None:
@@ -5332,31 +5512,28 @@ class ACStateEstimator:
         bus_solver_pos = self._topology_bus_solver_pos(topology)
         node_ids = np.asarray(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)), dtype=np.int64)
         degree_array = np.zeros(node_ids.size, dtype=np.int32)
+
+        def add_terminal_bus_positions(device_topology, terminal_attr: str) -> None:
+            if device_topology is None or not hasattr(device_topology, terminal_attr):
+                return
+            alive = np.asarray(device_topology.alive_mask, dtype=bool)
+            bus_pos = np.asarray(getattr(device_topology, terminal_attr), dtype=np.int32)
+            valid = alive & (bus_pos >= 0) & (bus_pos < bus_solver_pos.size)
+            if not np.any(valid):
+                return
+            solver_pos = bus_solver_pos[bus_pos[valid].astype(np.intp, copy=False)]
+            solver_pos = solver_pos[(solver_pos >= 0) & (solver_pos < degree_array.size)]
+            if solver_pos.size:
+                np.add.at(degree_array, solver_pos.astype(np.intp, copy=False), 1)
+
         for device_key in ("branch", "transformer", "zero_branch", "switch", "break"):
             device_topology = topology.devices.get(device_key)
-            if device_topology is None:
-                continue
-            if not hasattr(device_topology, "i_bus_pos") or not hasattr(device_topology, "j_bus_pos"):
-                continue
-            alive = np.asarray(device_topology.alive_mask, dtype=bool)
-            i_bus = np.asarray(device_topology.i_bus_pos, dtype=np.int32)
-            j_bus = np.asarray(device_topology.j_bus_pos, dtype=np.int32)
-            i_valid = alive & (i_bus >= 0) & (i_bus < bus_solver_pos.size)
-            j_valid = alive & (j_bus >= 0) & (j_bus < bus_solver_pos.size)
-            if np.any(i_valid):
-                i_pos = bus_solver_pos[i_bus[i_valid].astype(np.intp, copy=False)]
-                i_pos = i_pos[i_pos >= 0]
-                if i_pos.size:
-                    i_pos = i_pos[i_pos < degree_array.size]
-                    if i_pos.size:
-                        np.add.at(degree_array, i_pos.astype(np.intp, copy=False), 1)
-            if np.any(j_valid):
-                j_pos = bus_solver_pos[j_bus[j_valid].astype(np.intp, copy=False)]
-                j_pos = j_pos[j_pos >= 0]
-                if j_pos.size:
-                    j_pos = j_pos[j_pos < degree_array.size]
-                    if j_pos.size:
-                        np.add.at(degree_array, j_pos.astype(np.intp, copy=False), 1)
+            add_terminal_bus_positions(device_topology, "i_bus_pos")
+            add_terminal_bus_positions(device_topology, "j_bus_pos")
+        three_topology = topology.devices.get("three_winding_transformer")
+        add_terminal_bus_positions(three_topology, "i_bus_pos")
+        add_terminal_bus_positions(three_topology, "j_bus_pos")
+        add_terminal_bus_positions(three_topology, "k_bus_pos")
         self.node_degree_array = degree_array
         return {int(node_ids[pos]): int(degree_array[pos]) for pos in range(int(node_ids.size))}
 
@@ -5837,6 +6014,10 @@ class ACStateEstimator:
             "_ac_transformer_plan_yft",
             "_ac_transformer_plan_ytf",
             "_ac_transformer_plan_ytt",
+            "_ac_three_winding_transformer_plan_i",
+            "_ac_three_winding_transformer_plan_j",
+            "_ac_three_winding_transformer_plan_k",
+            "_ac_three_winding_transformer_plan_y",
         )
         missing_plan_attrs = [name for name in required_plan_attrs if not hasattr(self, name)]
         if missing_plan_attrs:
@@ -5857,6 +6038,20 @@ class ACStateEstimator:
             self._ac_transformer_plan_ytf,
             self._ac_transformer_plan_ytt,
         )
+        three_i = np.asarray(self._ac_three_winding_transformer_plan_i, dtype=np.int64)
+        if three_i.size:
+            terminal_pos = np.column_stack(
+                (
+                    three_i,
+                    np.asarray(self._ac_three_winding_transformer_plan_j, dtype=np.int64),
+                    np.asarray(self._ac_three_winding_transformer_plan_k, dtype=np.int64),
+                )
+            )
+            row_chunks.append(np.repeat(terminal_pos, 3, axis=1).ravel())
+            col_chunks.append(np.tile(terminal_pos, (1, 3)).ravel())
+            data_chunks.append(
+                np.asarray(self._ac_three_winding_transformer_plan_y, dtype=np.complex128).reshape(-1)
+            )
 
         ppc = self._ac_ppc_dict()
         shunt_rows = self._required_array_attr("_ac_shunt_device_rows", dtype=np.int64, context="Y matrix build")
@@ -6459,6 +6654,58 @@ class ACStateEstimator:
         self._ac_transformer_plan_ytf = np.asarray(ytf, dtype=np.complex128)
         self._ac_transformer_plan_ytt = np.asarray(ytt, dtype=np.complex128)
 
+        three_winding_transformer = np.asarray(
+            ppc.get(
+                "three_winding_transformer",
+                np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS))),
+            ),
+            dtype=np.float64,
+        )
+        three_topology = topology.devices.get("three_winding_transformer")
+        if three_winding_transformer.size and three_topology is not None:
+            three_rows = self._sorted_alive_ppc_rows(
+                three_winding_transformer,
+                THREE_WINDING_TRANSFORMER_COLS["idx"],
+                three_topology.alive_mask,
+            )
+            i_bus = np.asarray(three_topology.i_bus_pos, dtype=np.int32)
+            j_bus = np.asarray(three_topology.j_bus_pos, dtype=np.int32)
+            k_bus = np.asarray(three_topology.k_bus_pos, dtype=np.int32)
+            i_pos = bus_solver_pos[i_bus[three_rows].astype(np.intp, copy=False)]
+            j_pos = bus_solver_pos[j_bus[three_rows].astype(np.intp, copy=False)]
+            k_pos = bus_solver_pos[k_bus[three_rows].astype(np.intp, copy=False)]
+            valid = (i_pos >= 0) & (j_pos >= 0) & (k_pos >= 0)
+            three_rows = three_rows[valid]
+            i_pos = i_pos[valid]
+            j_pos = j_pos[valid]
+            k_pos = k_pos[valid]
+            table3 = three_winding_transformer[three_rows.astype(np.intp, copy=False)]
+            cols3 = THREE_WINDING_TRANSFORMER_COLS
+            y3 = three_winding_transformer_stamp_vectorized(
+                table3[:, cols3["i_r"]],
+                table3[:, cols3["i_x"]],
+                table3[:, cols3["j_r"]],
+                table3[:, cols3["j_x"]],
+                table3[:, cols3["k_r"]],
+                table3[:, cols3["k_x"]],
+                table3[:, cols3["gt"]],
+                table3[:, cols3["bt"]],
+                table3[:, cols3["i_tap"]],
+                table3[:, cols3["i_shift"]],
+                table3[:, cols3["j_tap"]],
+                table3[:, cols3["j_shift"]],
+                table3[:, cols3["k_tap"]],
+                table3[:, cols3["k_shift"]],
+            )
+        else:
+            three_rows = np.asarray([], dtype=np.int64)
+            i_pos = j_pos = k_pos = np.asarray([], dtype=np.int32)
+            y3 = np.zeros((0, 3, 3), dtype=np.complex128)
+        self._ac_three_winding_transformer_plan_i = np.asarray(i_pos, dtype=np.int64)
+        self._ac_three_winding_transformer_plan_j = np.asarray(j_pos, dtype=np.int64)
+        self._ac_three_winding_transformer_plan_k = np.asarray(k_pos, dtype=np.int64)
+        self._ac_three_winding_transformer_plan_y = np.asarray(y3, dtype=np.complex128)
+
         def zero_current_plan(device_key: str, name_key: str, current_pos_by_row: np.ndarray):
             rows, i_pos, j_pos = terminal_alive_rows(device_key)
             if rows.size:
@@ -6560,6 +6807,7 @@ class ACStateEstimator:
             DEVICE_TYPE_ACNode: node_rows,
             DEVICE_TYPE_ACBranch: branch_rows,
             DEVICE_TYPE_ACTransformer: transformer_rows,
+            DEVICE_TYPE_ACThreeWindingTransformer: three_rows,
             DEVICE_TYPE_ACLoad: load_rows,
             DEVICE_TYPE_ACGenerator: gen_rows,
             DEVICE_TYPE_ACZeroBranch: zero_rows,
@@ -6592,6 +6840,7 @@ class ACStateEstimator:
         self._ac_branch_transformer_plan_kind_by_type_code = {
             DEVICE_TYPE_ACBranch: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
             DEVICE_TYPE_ACTransformer: _AC_TERMINAL_MEAS_TYPE_LOOKUP,
+            DEVICE_TYPE_ACThreeWindingTransformer: _AC_THREE_TERMINAL_MEAS_TYPE_LOOKUP,
         }
         self._ac_zero_current_plan_kind_by_type_code = {
             DEVICE_TYPE_ACZeroBranch: _AC_ZERO_MEAS_TYPE_LOOKUP,
@@ -6851,23 +7100,32 @@ class ACStateEstimator:
                 "power_is_p": empty_b,
                 "power_own": empty_i,
                 "power_other": empty_i,
+                "power_third": empty_i,
                 "power_own_angle_cols": empty_i,
                 "power_other_angle_cols": empty_i,
+                "power_third_angle_cols": empty_i,
                 "power_own_voltage_cols": empty_i,
                 "power_other_voltage_cols": empty_i,
+                "power_third_voltage_cols": empty_i,
                 "power_y_self": empty_c,
                 "power_y_mutual": empty_c,
+                "power_y_third": empty_c,
                 "power_y_self_conj": empty_c,
                 "power_y_mutual_conj": empty_c,
+                "power_y_third_conj": empty_c,
                 "current_rows": empty_i,
                 "current_own": empty_i,
                 "current_other": empty_i,
+                "current_third": empty_i,
                 "current_own_angle_cols": empty_i,
                 "current_other_angle_cols": empty_i,
+                "current_third_angle_cols": empty_i,
                 "current_own_voltage_cols": empty_i,
                 "current_other_voltage_cols": empty_i,
+                "current_third_voltage_cols": empty_i,
                 "current_y_self": empty_c,
                 "current_y_mutual": empty_c,
+                "current_y_third": empty_c,
             }
 
         def build_device_rows(device_code, device_pos, i_array, j_array, yff, yft, ytf, ytt):
@@ -6893,13 +7151,112 @@ class ACStateEstimator:
                 "power_is_p": self._concat_plan_arrays((p_from[from_power], p_to[to_power]), bool),
                 "power_own": self._concat_plan_arrays((i[from_power], j[to_power]), np.int64),
                 "power_other": self._concat_plan_arrays((j[from_power], i[to_power]), np.int64),
+                "power_third": self._concat_plan_arrays((i[from_power], j[to_power]), np.int64),
                 "power_y_self": self._concat_plan_arrays((yff[pos[from_power]], ytt[pos[to_power]]), np.complex128),
                 "power_y_mutual": self._concat_plan_arrays((yft[pos[from_power]], ytf[pos[to_power]]), np.complex128),
+                "power_y_third": np.zeros(np.count_nonzero(from_power) + np.count_nonzero(to_power), dtype=np.complex128),
                 "current_rows": self._concat_plan_arrays((rows[i_from], rows[i_to]), np.int64),
                 "current_own": self._concat_plan_arrays((i[i_from], j[i_to]), np.int64),
                 "current_other": self._concat_plan_arrays((j[i_from], i[i_to]), np.int64),
+                "current_third": self._concat_plan_arrays((i[i_from], j[i_to]), np.int64),
                 "current_y_self": self._concat_plan_arrays((yff[pos[i_from]], ytt[pos[i_to]]), np.complex128),
                 "current_y_mutual": self._concat_plan_arrays((yft[pos[i_from]], ytf[pos[i_to]]), np.complex128),
+                "current_y_third": np.zeros(np.count_nonzero(i_from) + np.count_nonzero(i_to), dtype=np.complex128),
+            }
+
+        def build_three_winding_rows(device_pos):
+            rows = row[(code == DEVICE_TYPE_ACThreeWindingTransformer) & handled_mask]
+            pos = device_pos[rows]
+            row_kind = kind[rows]
+            terminal_pos = (
+                self._ac_three_winding_transformer_plan_i[pos],
+                self._ac_three_winding_transformer_plan_j[pos],
+                self._ac_three_winding_transformer_plan_k[pos],
+            )
+            y = self._ac_three_winding_transformer_plan_y[pos]
+            terminal_specs = (
+                (
+                    MEAS_TYPE_V_FROM,
+                    MEAS_TYPE_P_FROM,
+                    MEAS_TYPE_Q_FROM,
+                    MEAS_TYPE_I_FROM,
+                    0,
+                    1,
+                    2,
+                ),
+                (
+                    MEAS_TYPE_V_TO,
+                    MEAS_TYPE_P_TO,
+                    MEAS_TYPE_Q_TO,
+                    MEAS_TYPE_I_TO,
+                    1,
+                    0,
+                    2,
+                ),
+                (
+                    MEAS_TYPE_V_THIRD,
+                    MEAS_TYPE_P_THIRD,
+                    MEAS_TYPE_Q_THIRD,
+                    MEAS_TYPE_I_THIRD,
+                    2,
+                    0,
+                    1,
+                ),
+            )
+            result = {
+                "voltage_rows": [],
+                "voltage_pos": [],
+                "power_rows": [],
+                "power_is_p": [],
+                "power_own": [],
+                "power_other": [],
+                "power_third": [],
+                "power_y_self": [],
+                "power_y_mutual": [],
+                "power_y_third": [],
+                "current_rows": [],
+                "current_own": [],
+                "current_other": [],
+                "current_third": [],
+                "current_y_self": [],
+                "current_y_mutual": [],
+                "current_y_third": [],
+            }
+            for v_code, p_code, q_code, i_code, own_idx, other_idx, third_idx in terminal_specs:
+                voltage_mask = row_kind == v_code
+                p_mask = row_kind == p_code
+                q_mask = row_kind == q_code
+                power_mask = p_mask | q_mask
+                current_mask = row_kind == i_code
+                result["voltage_rows"].append(rows[voltage_mask])
+                result["voltage_pos"].append(terminal_pos[own_idx][voltage_mask])
+                result["power_rows"].append(rows[power_mask])
+                result["power_is_p"].append(p_mask[power_mask])
+                result["power_own"].append(terminal_pos[own_idx][power_mask])
+                result["power_other"].append(terminal_pos[other_idx][power_mask])
+                result["power_third"].append(terminal_pos[third_idx][power_mask])
+                result["power_y_self"].append(y[power_mask, own_idx, own_idx])
+                result["power_y_mutual"].append(y[power_mask, own_idx, other_idx])
+                result["power_y_third"].append(y[power_mask, own_idx, third_idx])
+                result["current_rows"].append(rows[current_mask])
+                result["current_own"].append(terminal_pos[own_idx][current_mask])
+                result["current_other"].append(terminal_pos[other_idx][current_mask])
+                result["current_third"].append(terminal_pos[third_idx][current_mask])
+                result["current_y_self"].append(y[current_mask, own_idx, own_idx])
+                result["current_y_mutual"].append(y[current_mask, own_idx, other_idx])
+                result["current_y_third"].append(y[current_mask, own_idx, third_idx])
+            dtype_by_key = {
+                "power_is_p": bool,
+                "power_y_self": np.complex128,
+                "power_y_mutual": np.complex128,
+                "power_y_third": np.complex128,
+                "current_y_self": np.complex128,
+                "current_y_mutual": np.complex128,
+                "current_y_third": np.complex128,
+            }
+            return {
+                key: self._concat_plan_arrays(value, dtype_by_key.get(key, np.int64))
+                for key, value in result.items()
             }
 
         branch_plan = build_device_rows(
@@ -6922,26 +7279,35 @@ class ACStateEstimator:
             self._ac_transformer_plan_ytf,
             self._ac_transformer_plan_ytt,
         )
-        voltage_rows = self._concat_plan_arrays((branch_plan["voltage_rows"], transformer_plan["voltage_rows"]), np.int64)
-        voltage_pos = self._concat_plan_arrays((branch_plan["voltage_pos"], transformer_plan["voltage_pos"]), np.int64)
-        power_rows = self._concat_plan_arrays((branch_plan["power_rows"], transformer_plan["power_rows"]), np.int64)
-        power_is_p = self._concat_plan_arrays((branch_plan["power_is_p"], transformer_plan["power_is_p"]), bool)
-        power_own = self._concat_plan_arrays((branch_plan["power_own"], transformer_plan["power_own"]), np.int64)
-        power_other = self._concat_plan_arrays((branch_plan["power_other"], transformer_plan["power_other"]), np.int64)
-        power_y_self = self._concat_plan_arrays((branch_plan["power_y_self"], transformer_plan["power_y_self"]), np.complex128)
+        three_winding_plan = build_three_winding_rows(plan_table.device_pos)
+        plans = (branch_plan, transformer_plan, three_winding_plan)
+        voltage_rows = self._concat_plan_arrays(tuple(plan["voltage_rows"] for plan in plans), np.int64)
+        voltage_pos = self._concat_plan_arrays(tuple(plan["voltage_pos"] for plan in plans), np.int64)
+        power_rows = self._concat_plan_arrays(tuple(plan["power_rows"] for plan in plans), np.int64)
+        power_is_p = self._concat_plan_arrays(tuple(plan["power_is_p"] for plan in plans), bool)
+        power_own = self._concat_plan_arrays(tuple(plan["power_own"] for plan in plans), np.int64)
+        power_other = self._concat_plan_arrays(tuple(plan["power_other"] for plan in plans), np.int64)
+        power_third = self._concat_plan_arrays(tuple(plan["power_third"] for plan in plans), np.int64)
+        power_y_self = self._concat_plan_arrays(tuple(plan["power_y_self"] for plan in plans), np.complex128)
         power_y_mutual = self._concat_plan_arrays(
-            (branch_plan["power_y_mutual"], transformer_plan["power_y_mutual"]),
+            tuple(plan["power_y_mutual"] for plan in plans),
             np.complex128,
         )
-        current_rows = self._concat_plan_arrays((branch_plan["current_rows"], transformer_plan["current_rows"]), np.int64)
-        current_own = self._concat_plan_arrays((branch_plan["current_own"], transformer_plan["current_own"]), np.int64)
-        current_other = self._concat_plan_arrays((branch_plan["current_other"], transformer_plan["current_other"]), np.int64)
+        power_y_third = self._concat_plan_arrays(tuple(plan["power_y_third"] for plan in plans), np.complex128)
+        current_rows = self._concat_plan_arrays(tuple(plan["current_rows"] for plan in plans), np.int64)
+        current_own = self._concat_plan_arrays(tuple(plan["current_own"] for plan in plans), np.int64)
+        current_other = self._concat_plan_arrays(tuple(plan["current_other"] for plan in plans), np.int64)
+        current_third = self._concat_plan_arrays(tuple(plan["current_third"] for plan in plans), np.int64)
         current_y_self = self._concat_plan_arrays(
-            (branch_plan["current_y_self"], transformer_plan["current_y_self"]),
+            tuple(plan["current_y_self"] for plan in plans),
             np.complex128,
         )
         current_y_mutual = self._concat_plan_arrays(
-            (branch_plan["current_y_mutual"], transformer_plan["current_y_mutual"]),
+            tuple(plan["current_y_mutual"] for plan in plans),
+            np.complex128,
+        )
+        current_y_third = self._concat_plan_arrays(
+            tuple(plan["current_y_third"] for plan in plans),
             np.complex128,
         )
         return {
@@ -6954,23 +7320,32 @@ class ACStateEstimator:
             "power_is_p": power_is_p,
             "power_own": power_own,
             "power_other": power_other,
+            "power_third": power_third,
             "power_own_angle_cols": self.angle_col[power_own].astype(np.int64, copy=False),
             "power_other_angle_cols": self.angle_col[power_other].astype(np.int64, copy=False),
+            "power_third_angle_cols": self.angle_col[power_third].astype(np.int64, copy=False),
             "power_own_voltage_cols": self.voltage_col[power_own].astype(np.int64, copy=False),
             "power_other_voltage_cols": self.voltage_col[power_other].astype(np.int64, copy=False),
+            "power_third_voltage_cols": self.voltage_col[power_third].astype(np.int64, copy=False),
             "power_y_self": power_y_self,
             "power_y_mutual": power_y_mutual,
+            "power_y_third": power_y_third,
             "power_y_self_conj": np.conj(power_y_self),
             "power_y_mutual_conj": np.conj(power_y_mutual),
+            "power_y_third_conj": np.conj(power_y_third),
             "current_rows": current_rows,
             "current_own": current_own,
             "current_other": current_other,
+            "current_third": current_third,
             "current_own_angle_cols": self.angle_col[current_own].astype(np.int64, copy=False),
             "current_other_angle_cols": self.angle_col[current_other].astype(np.int64, copy=False),
+            "current_third_angle_cols": self.angle_col[current_third].astype(np.int64, copy=False),
             "current_own_voltage_cols": self.voltage_col[current_own].astype(np.int64, copy=False),
             "current_other_voltage_cols": self.voltage_col[current_other].astype(np.int64, copy=False),
+            "current_third_voltage_cols": self.voltage_col[current_third].astype(np.int64, copy=False),
             "current_y_self": current_y_self,
             "current_y_mutual": current_y_mutual,
+            "current_y_third": current_y_third,
         }
 
     def _fill_branch_transformer_values_vectorized(
@@ -6989,18 +7364,30 @@ class ACStateEstimator:
         if rows.size:
             own = plan["power_own"]
             other = plan["power_other"]
+            third = plan["power_third"]
             y_self = plan["power_y_self"]
             y_mutual = plan["power_y_mutual"]
-            power = voltage_complex[own] * np.conj(y_self * voltage_complex[own] + y_mutual * voltage_complex[other])
+            y_third = plan["power_y_third"]
+            power = voltage_complex[own] * np.conj(
+                y_self * voltage_complex[own]
+                + y_mutual * voltage_complex[other]
+                + y_third * voltage_complex[third]
+            )
             values[rows] = np.where(plan["power_is_p"], power.real, power.imag)
 
         rows = plan["current_rows"]
         if rows.size:
             own = plan["current_own"]
             other = plan["current_other"]
+            third = plan["current_third"]
             y_self = plan["current_y_self"]
             y_mutual = plan["current_y_mutual"]
-            current = y_self * voltage_complex[own] + y_mutual * voltage_complex[other]
+            y_third = plan["current_y_third"]
+            current = (
+                y_self * voltage_complex[own]
+                + y_mutual * voltage_complex[other]
+                + y_third * voltage_complex[third]
+            )
             values[rows] = np.abs(current)
 
         return plan["handled_mask"]
@@ -7470,47 +7857,65 @@ class ACStateEstimator:
         if rows.size:
             own = plan["power_own"]
             other = plan["power_other"]
+            third = plan["power_third"]
             y_self_conj = plan["power_y_self_conj"]
             y_mutual_conj = plan["power_y_mutual_conj"]
-            off = y_mutual_conj * voltage_complex[own] * np.conj(voltage_complex[other])
+            y_third_conj = plan["power_y_third_conj"]
+            off_other = y_mutual_conj * voltage_complex[own] * np.conj(voltage_complex[other])
+            off_third = y_third_conj * voltage_complex[own] * np.conj(voltage_complex[third])
+            off = off_other + off_third
             dtheta_own = 1j * off
-            dtheta_other = -1j * off
+            dtheta_other = -1j * off_other
+            dtheta_third = -1j * off_third
             dvoltage_own = 2.0 * y_self_conj * voltage[own] + off / voltage[own]
-            dvoltage_other = off / voltage[other]
+            dvoltage_other = off_other / voltage[other]
+            dvoltage_third = off_third / voltage[third]
             is_p = plan["power_is_p"]
 
             own_angle_cols = plan["power_own_angle_cols"]
             other_angle_cols = plan["power_other_angle_cols"]
+            third_angle_cols = plan["power_third_angle_cols"]
             own_voltage_cols = plan["power_own_voltage_cols"]
             other_voltage_cols = plan["power_other_voltage_cols"]
+            third_voltage_cols = plan["power_third_voltage_cols"]
             values = (
                 np.where(is_p, dtheta_own.real, dtheta_own.imag),
                 np.where(is_p, dtheta_other.real, dtheta_other.imag),
+                np.where(is_p, dtheta_third.real, dtheta_third.imag),
                 np.where(is_p, dvoltage_own.real, dvoltage_own.imag),
                 np.where(is_p, dvoltage_other.real, dvoltage_other.imag),
+                np.where(is_p, dvoltage_third.real, dvoltage_third.imag),
             )
             if hasattr(H, "add_many"):
                 H.add_many(rows, own_angle_cols, values[0])
                 H.add_many(rows, other_angle_cols, values[1])
-                H.add_many(rows, own_voltage_cols, values[2])
-                H.add_many(rows, other_voltage_cols, values[3])
+                H.add_many(rows, third_angle_cols, values[2])
+                H.add_many(rows, own_voltage_cols, values[3])
+                H.add_many(rows, other_voltage_cols, values[4])
+                H.add_many(rows, third_voltage_cols, values[5])
             else:
                 self._add_indexed_values(H, rows, own_angle_cols, values[0])
                 self._add_indexed_values(H, rows, other_angle_cols, values[1])
-                self._add_indexed_values(H, rows, own_voltage_cols, values[2])
-                self._add_indexed_values(H, rows, other_voltage_cols, values[3])
+                self._add_indexed_values(H, rows, third_angle_cols, values[2])
+                self._add_indexed_values(H, rows, own_voltage_cols, values[3])
+                self._add_indexed_values(H, rows, other_voltage_cols, values[4])
+                self._add_indexed_values(H, rows, third_voltage_cols, values[5])
 
         rows = plan["current_rows"]
         if rows.size:
             own = plan["current_own"]
             other = plan["current_other"]
+            third = plan["current_third"]
             y_self = plan["current_y_self"]
             y_mutual = plan["current_y_mutual"]
+            y_third = plan["current_y_third"]
             v_own = voltage_complex[own]
             v_other = voltage_complex[other]
+            v_third = voltage_complex[third]
             exp_own = v_own / voltage[own]
             exp_other = v_other / voltage[other]
-            current = y_self * v_own + y_mutual * v_other
+            exp_third = v_third / voltage[third]
+            current = y_self * v_own + y_mutual * v_other + y_third * v_third
             current_abs = np.abs(current)
             valid = current_abs > 1e-12
             current_conj = np.conj(current)
@@ -7522,28 +7927,38 @@ class ACStateEstimator:
 
             dtheta_own = 1j * y_self * v_own
             dtheta_other = 1j * y_mutual * v_other
+            dtheta_third = 1j * y_third * v_third
             dvoltage_own = y_self * exp_own
             dvoltage_other = y_mutual * exp_other
+            dvoltage_third = y_third * exp_third
             own_angle_cols = plan["current_own_angle_cols"]
             other_angle_cols = plan["current_other_angle_cols"]
+            third_angle_cols = plan["current_third_angle_cols"]
             own_voltage_cols = plan["current_own_voltage_cols"]
             other_voltage_cols = plan["current_other_voltage_cols"]
+            third_voltage_cols = plan["current_third_voltage_cols"]
             values = (
                 project(dtheta_own),
                 project(dtheta_other),
+                project(dtheta_third),
                 project(dvoltage_own),
                 project(dvoltage_other),
+                project(dvoltage_third),
             )
             if hasattr(H, "add_many"):
                 H.add_many(rows, own_angle_cols, values[0])
                 H.add_many(rows, other_angle_cols, values[1])
-                H.add_many(rows, own_voltage_cols, values[2])
-                H.add_many(rows, other_voltage_cols, values[3])
+                H.add_many(rows, third_angle_cols, values[2])
+                H.add_many(rows, own_voltage_cols, values[3])
+                H.add_many(rows, other_voltage_cols, values[4])
+                H.add_many(rows, third_voltage_cols, values[5])
             else:
                 self._add_indexed_values(H, rows, own_angle_cols, values[0])
                 self._add_indexed_values(H, rows, other_angle_cols, values[1])
-                self._add_indexed_values(H, rows, own_voltage_cols, values[2])
-                self._add_indexed_values(H, rows, other_voltage_cols, values[3])
+                self._add_indexed_values(H, rows, third_angle_cols, values[2])
+                self._add_indexed_values(H, rows, own_voltage_cols, values[3])
+                self._add_indexed_values(H, rows, other_voltage_cols, values[4])
+                self._add_indexed_values(H, rows, third_voltage_cols, values[5])
 
         return plan["handled_mask"]
 

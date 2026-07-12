@@ -195,6 +195,20 @@ def normalize_model_named_units(model) -> float:
         if j_scale_base is not None:
             _scale_attr_in_dict(tr, "j_c", j_scale_base)
 
+    three_winding_transformers = getattr(model, "ACThreeWindingTransformer", None)
+    if three_winding_transformers is None:
+        three_winding_transformers = getattr(model, "AC3WTransformer", [])
+    for tr in three_winding_transformers:
+        _scale_power_attrs_in_dict(
+            tr,
+            ("i_p", "i_q", "j_p", "j_q", "k_p", "k_q"),
+            p_base,
+        )
+        for terminal in ("i", "j", "k"):
+            scale_base = ac_current_scales.get(getattr(tr, f"{terminal}_node", None))
+            if scale_base is not None:
+                _scale_attr_in_dict(tr, f"{terminal}_c", scale_base)
+
     for load in getattr(model, "ACLoad", []):
         if not hasattr(load, "pbase"):
             load.pbase = 1.0

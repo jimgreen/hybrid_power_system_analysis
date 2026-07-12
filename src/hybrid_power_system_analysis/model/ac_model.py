@@ -6,6 +6,7 @@ class ACIsl:
         self.gens = []
         self.loads = []
         self.branches = []
+        self.three_winding_transformers = []
         self.zero_branches = []
         self.switches = []
         self.breakers = []
@@ -51,6 +52,7 @@ class ACBus:
         self.breakers = []
         self.zero_branches = []
         self.transformers = []
+        self.three_winding_transformers = []
         self.shunt_compensators = []
         self.acac_converters = []
         self.v_gens = []
@@ -184,6 +186,71 @@ class ACTransformer:
         self.j_c = None
 
 
+class ACThreeWindingTransformer:
+    """Three-winding AC transformer represented by a star equivalent.
+
+    ``i_r/i_x``, ``j_r/j_x`` and ``k_r/k_x`` are the three winding leakage
+    impedances from each external terminal to the eliminated internal star
+    point. ``gt + j*bt`` is the i-side single-ended magnetizing admittance.
+    Each winding may have its own complex tap ratio.
+    """
+
+    def __init__(
+        self,
+        idx,
+        i_node,
+        j_node,
+        k_node,
+        i_r,
+        i_x,
+        j_r,
+        j_x,
+        k_r,
+        k_x,
+        i_tap=1.0,
+        i_shift=0.0,
+        j_tap=1.0,
+        j_shift=0.0,
+        k_tap=1.0,
+        k_shift=0.0,
+        gt=0.0,
+        bt=0.0,
+        run_stat=1,
+    ):
+        self.idx = idx
+        self.i_node = i_node
+        self.j_node = j_node
+        self.k_node = k_node
+        self.i_r = i_r
+        self.i_x = i_x
+        self.j_r = j_r
+        self.j_x = j_x
+        self.k_r = k_r
+        self.k_x = k_x
+        self.gt = gt
+        self.bt = bt
+        self.i_tap = i_tap
+        self.i_shift = i_shift
+        self.j_tap = j_tap
+        self.j_shift = j_shift
+        self.k_tap = k_tap
+        self.k_shift = k_shift
+        self.run_stat = run_stat
+        self.is_alive = True
+        self.i_p = None
+        self.i_q = None
+        self.i_c = None
+        self.j_p = None
+        self.j_q = None
+        self.j_c = None
+        self.k_p = None
+        self.k_q = None
+        self.k_c = None
+        self.i_node_obj = None
+        self.j_node_obj = None
+        self.k_node_obj = None
+
+
 ACAC_CONTROL_TYPES = {"PQQ", "PVQ", "PQV", "PVV"}
 
 
@@ -238,6 +305,7 @@ _AC_ROW_CLASS_BY_TABLE = {
     "ACSwitch": ACSwitch,
     "ACBreak": ACBreak,
     "ACTransformer": ACTransformer,
+    "ACThreeWindingTransformer": ACThreeWindingTransformer,
     "ACACConverter": ACACConverter,
 }
 
@@ -381,6 +449,41 @@ _AC_ROW_DEFAULT_ATTRS = {
         "i_node_obj": None,
         "j_node_obj": None,
     },
+    "ACThreeWindingTransformer": {
+        "idx": 0,
+        "name": "",
+        "i_node": 0,
+        "j_node": 0,
+        "k_node": 0,
+        "i_r": 0.0,
+        "i_x": 0.0,
+        "j_r": 0.0,
+        "j_x": 0.0,
+        "k_r": 0.0,
+        "k_x": 0.0,
+        "gt": 0.0,
+        "bt": 0.0,
+        "i_tap": 1.0,
+        "i_shift": 0.0,
+        "j_tap": 1.0,
+        "j_shift": 0.0,
+        "k_tap": 1.0,
+        "k_shift": 0.0,
+        "run_stat": 1,
+        "is_alive": True,
+        "i_p": None,
+        "i_q": None,
+        "i_c": None,
+        "j_p": None,
+        "j_q": None,
+        "j_c": None,
+        "k_p": None,
+        "k_q": None,
+        "k_c": None,
+        "i_node_obj": None,
+        "j_node_obj": None,
+        "k_node_obj": None,
+    },
     "ACACConverter": {
         "idx": 0,
         "name": "",
@@ -407,6 +510,58 @@ _AC_ROW_DEFAULT_ATTRS = {
 }
 
 
+def _float_row_alias(row_values, names, default=0.0):
+    for name in names:
+        value = row_values.get(name)
+        if value not in (None, ""):
+            return float(value)
+    return float(default)
+
+
+def _normalize_three_winding_row_values(row_values, values):
+    direct_aliases = {
+        f"{terminal}_{part}": (f"{terminal}_{part}", f"{part}_{terminal}")
+        for terminal in ("i", "j", "k")
+        for part in ("r", "x")
+    }
+    if all(any(name in row_values for name in aliases) for aliases in direct_aliases.values()):
+        for attr, aliases in direct_aliases.items():
+            values[attr] = _float_row_alias(row_values, aliases)
+    else:
+        z_ij = complex(
+            _float_row_alias(row_values, ("ij_r", "ji_r", "r_ij", "r_ji")),
+            _float_row_alias(row_values, ("ij_x", "ji_x", "x_ij", "x_ji")),
+        )
+        z_ik = complex(
+            _float_row_alias(row_values, ("ik_r", "ki_r", "r_ik", "r_ki")),
+            _float_row_alias(row_values, ("ik_x", "ki_x", "x_ik", "x_ki")),
+        )
+        z_jk = complex(
+            _float_row_alias(row_values, ("jk_r", "kj_r", "r_jk", "r_kj")),
+            _float_row_alias(row_values, ("jk_x", "kj_x", "x_jk", "x_kj")),
+        )
+        z_i = 0.5 * (z_ij + z_ik - z_jk)
+        z_j = 0.5 * (z_ij + z_jk - z_ik)
+        z_k = 0.5 * (z_ik + z_jk - z_ij)
+        for terminal, impedance in (("i", z_i), ("j", z_j), ("k", z_k)):
+            values[f"{terminal}_r"] = float(impedance.real)
+            values[f"{terminal}_x"] = float(impedance.imag)
+
+    values["gt"] = _float_row_alias(row_values, ("gt", "g"), values.get("gt", 0.0))
+    values["bt"] = _float_row_alias(row_values, ("bt", "b"), values.get("bt", 0.0))
+    for terminal in ("i", "j", "k"):
+        values[f"{terminal}_tap"] = _float_row_alias(
+            row_values,
+            (f"{terminal}_tap", f"tap_{terminal}"),
+            values.get(f"{terminal}_tap", 1.0),
+        )
+        values[f"{terminal}_shift"] = _float_row_alias(
+            row_values,
+            (f"{terminal}_shift", f"shift_{terminal}"),
+            values.get(f"{terminal}_shift", 0.0),
+        )
+
+
 def _coerce_ac_rows(rows, table_name):
     row_cls = _AC_ROW_CLASS_BY_TABLE[table_name]
     defaults = _AC_ROW_DEFAULT_ATTRS.get(table_name, {})
@@ -418,6 +573,8 @@ def _coerce_ac_rows(rows, table_name):
                     row.gt = 0.0
                 if not hasattr(row, "bt") and hasattr(row, "b"):
                     row.bt = float(row.b) / 2.0
+            elif table_name == "ACThreeWindingTransformer":
+                _normalize_three_winding_row_values(row.__dict__, row.__dict__)
             output.append(row)
             continue
         row_values = getattr(row, "__dict__", {})
@@ -434,6 +591,8 @@ def _coerce_ac_rows(rows, table_name):
                 values["gt"] = 0.0
             if "bt" not in row_values and "b" in row_values:
                 values["bt"] = float(values["b"]) / 2.0
+        elif table_name == "ACThreeWindingTransformer":
+            _normalize_three_winding_row_values(row_values, obj.__dict__)
         output.append(obj)
     return output
 
@@ -448,6 +607,7 @@ class ACPowerNetwork:
         self.switches = []
         self.breakers = []
         self.transformers = []
+        self.three_winding_transformers = []
         self.shunt_compensators = []
         self.acac_converters = []
         self.islands = []
@@ -465,6 +625,7 @@ class ACPowerNetwork:
         self.zero_branche_dict = self.zero_branch_dict
         self.branche_dict = self.branch_dict
         self.transformer_dict = {}
+        self.three_winding_transformer_dict = {}
         self.shunt_compensator_dict = {}
         self.acac_converter_dict = {}
 
@@ -506,6 +667,52 @@ class ACPowerNetwork:
     def add_transformer(self, idx, i_node, j_node, r, x, tap, shift, gt=0.0, bt=0.0, run_stat=1, b=None):
         trfm = ACTransformer(idx, i_node, j_node, r, x, tap, shift, gt, bt, run_stat, b=b)
         self.transformers.append(trfm)
+        return trfm
+
+    def add_three_winding_transformer(
+        self,
+        idx,
+        i_node,
+        j_node,
+        k_node,
+        i_r,
+        i_x,
+        j_r,
+        j_x,
+        k_r,
+        k_x,
+        i_tap=1.0,
+        i_shift=0.0,
+        j_tap=1.0,
+        j_shift=0.0,
+        k_tap=1.0,
+        k_shift=0.0,
+        gt=0.0,
+        bt=0.0,
+        run_stat=1,
+    ):
+        trfm = ACThreeWindingTransformer(
+            idx,
+            i_node,
+            j_node,
+            k_node,
+            i_r,
+            i_x,
+            j_r,
+            j_x,
+            k_r,
+            k_x,
+            i_tap,
+            i_shift,
+            j_tap,
+            j_shift,
+            k_tap,
+            k_shift,
+            gt,
+            bt,
+            run_stat,
+        )
+        self.three_winding_transformers.append(trfm)
         return trfm
 
     def add_acac_converter(
@@ -561,6 +768,13 @@ class ACPowerNetwork:
         self.breakers = _coerce_ac_rows(getattr(self.model, 'ACBreak', []), "ACBreak")
         self.zero_branches = _coerce_ac_rows(getattr(self.model, 'ACZeroBranch', []), "ACZeroBranch")
         self.transformers = _coerce_ac_rows(getattr(self.model, 'ACTransformer', []), "ACTransformer")
+        three_winding_rows = getattr(self.model, 'ACThreeWindingTransformer', None)
+        if three_winding_rows is None:
+            three_winding_rows = getattr(self.model, 'AC3WTransformer', [])
+        self.three_winding_transformers = _coerce_ac_rows(
+            three_winding_rows,
+            "ACThreeWindingTransformer",
+        )
         self.shunt_compensators = _coerce_ac_rows(getattr(self.model, 'ACShuntCompensator', []), "ACShuntCompensator")
         self.acac_converters = _coerce_ac_rows(getattr(self.model, 'ACACConverter', []), "ACACConverter")
         self.node_dict = {}
@@ -575,6 +789,7 @@ class ACPowerNetwork:
         self.zero_branche_dict = self.zero_branch_dict
         self.branche_dict = self.branch_dict
         self.transformer_dict = {}
+        self.three_winding_transformer_dict = {}
         self.shunt_compensator_dict = {}
         self.acac_converter_dict = {}
         self.islands = []
@@ -604,6 +819,9 @@ class ACPowerNetwork:
         self.zero_branche_dict = self.zero_branch_dict
         self.branche_dict = self.branch_dict
         self.transformer_dict = {trfm.idx: trfm for trfm in self.transformers}
+        self.three_winding_transformer_dict = {
+            trfm.idx: trfm for trfm in self.three_winding_transformers
+        }
         self.shunt_compensator_dict = {scp.idx: scp for scp in self.shunt_compensators}
         self.acac_converter_dict = {conv.idx: conv for conv in self.acac_converters}
 
@@ -615,6 +833,7 @@ class ACPowerNetwork:
             node.breakers = []
             node.zero_branches = []
             node.transformers = []
+            node.three_winding_transformers = []
             node.shunt_compensators = []
             node.acac_converters = []
             node.bus = None
@@ -651,6 +870,14 @@ class ACPowerNetwork:
                 nb.i_node_obj.transformers.append(nb)
             if nb.j_node_obj:
                 nb.j_node_obj.transformers.append(nb)
+
+        for nb in self.three_winding_transformers:
+            nb.i_node_obj = self.node_dict.get(nb.i_node, None)
+            nb.j_node_obj = self.node_dict.get(nb.j_node, None)
+            nb.k_node_obj = self.node_dict.get(nb.k_node, None)
+            for node_obj in (nb.i_node_obj, nb.j_node_obj, nb.k_node_obj):
+                if node_obj:
+                    node_obj.three_winding_transformers.append(nb)
 
         for sw in self.switches:
             sw.i_node_obj = self.node_dict.get(sw.i_node, None)
@@ -703,6 +930,7 @@ class ACPowerNetwork:
             isl.switches = []
             isl.breakers = []
             isl.transformers = []
+            isl.three_winding_transformers = []
             isl.shunt_compensators = []
             isl.acac_converters = []
 
@@ -719,6 +947,7 @@ class ACPowerNetwork:
             bus.breakers = []
             bus.zero_branches = []
             bus.transformers = []
+            bus.three_winding_transformers = []
             bus.shunt_compensators = []
             bus.acac_converters = []
             if bus.isl_obj is not None:
@@ -785,6 +1014,15 @@ class ACPowerNetwork:
                 continue
             if trfm.i_node_obj.isl_obj and trfm.j_node_obj.isl_obj and trfm.i_node_obj.isl_obj ==  trfm.j_node_obj.isl_obj:
                 trfm.i_node_obj.isl_obj.transformers.append(trfm)
+
+        for trfm in self.three_winding_transformers:
+            if trfm.run_stat == 0:
+                continue
+            terminal_nodes = (trfm.i_node_obj, trfm.j_node_obj, trfm.k_node_obj)
+            if any(node is None or node.isl_obj is None for node in terminal_nodes):
+                continue
+            if terminal_nodes[0].isl_obj is terminal_nodes[1].isl_obj is terminal_nodes[2].isl_obj:
+                terminal_nodes[0].isl_obj.three_winding_transformers.append(trfm)
 
 
         for zbr in self.zero_branches:
@@ -862,6 +1100,15 @@ class ACPowerNetwork:
                 trfm.is_alive = False
                 continue
             trfm.is_alive = trfm.i_node_obj.is_alive and trfm.j_node_obj.is_alive
+
+        for trfm in self.three_winding_transformers:
+            terminal_nodes = (trfm.i_node_obj, trfm.j_node_obj, trfm.k_node_obj)
+            trfm.is_alive = (
+                trfm.run_stat == 1
+                and all(node is not None and node.is_alive for node in terminal_nodes)
+                and terminal_nodes[0].isl_obj is terminal_nodes[1].isl_obj
+                and terminal_nodes[0].isl_obj is terminal_nodes[2].isl_obj
+            )
 
         for zbr in self.zero_branches:
             if zbr.i_node_obj is None or zbr.j_node_obj is None or zbr.run_stat == 0:
@@ -961,6 +1208,13 @@ class ACPowerNetwork:
                 continue
             check_node(trfm.i_node, 'Trfm', trfm)
             check_node(trfm.j_node, 'Trfm', trfm)
+
+        for trfm in self.three_winding_transformers:
+            if trfm.run_stat == 0:
+                continue
+            check_node(trfm.i_node, 'ThreeWindingTrfm', trfm)
+            check_node(trfm.j_node, 'ThreeWindingTrfm', trfm)
+            check_node(trfm.k_node, 'ThreeWindingTrfm', trfm)
 
         for zb in self.zero_branches:
             if zb.run_stat == 0:
