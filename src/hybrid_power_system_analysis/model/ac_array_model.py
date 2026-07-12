@@ -149,6 +149,7 @@ GEN_COLS = {
     "p": 8,
     "q": 9,
     "current": 10,
+    "p_max": 11,
 }
 LOAD_COLS = {
     "idx": 0,
@@ -596,6 +597,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         gen[:, GEN_COLS["v_set"]] = _voltage_set_column(table_rows, columns, "v_set", gen[:, GEN_COLS["node"]], raw_vbase_by_idx)
         gen[:, GEN_COLS["alpha"]] = _float_column(table_rows, columns, "alpha", 1.0)
         gen[:, GEN_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
+        gen[:, GEN_COLS["p_max"]] = _float_column(table_rows, columns, "p_max", np.nan) / p_base
         _assign_power_if_present(gen, GEN_COLS["p"], table_rows, columns, "p", p_base)
         _assign_power_if_present(gen, GEN_COLS["q"], table_rows, columns, "q", p_base)
         _assign_current_if_present(
@@ -1224,7 +1226,8 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         gen_row[MP_VG] = row[GEN_COLS["v_set"]]
         gen_row[MP_MBASE] = base_mva
         gen_row[MP_GEN_STATUS] = 1
-        gen_row[MP_PMAX] = 1e9
+        p_max = row[GEN_COLS["p_max"]]
+        gen_row[MP_PMAX] = p_max * base_mva if np.isfinite(p_max) else 1e9
         gen_row[MP_PMIN] = -1e9
         gen_rows.append(gen_row)
     gen_rows.extend(acac_gen_rows)
@@ -1402,6 +1405,7 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         gen[row_idx, GEN_COLS["run_stat"]] = row[MP_GEN_STATUS] if gen_mp.shape[1] > MP_GEN_STATUS else 1.0
         gen[row_idx, GEN_COLS["p"]] = row[MP_PG] / base_mva
         gen[row_idx, GEN_COLS["q"]] = row[MP_QG] / base_mva
+        gen[row_idx, GEN_COLS["p_max"]] = row[MP_PMAX] / base_mva if gen_mp.shape[1] > MP_PMAX else np.nan
     gen_names = np.asarray([f"gen_{int(row[GEN_COLS['idx']])}" for row in gen], dtype=object)
 
     branch_rows = []
@@ -1608,6 +1612,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         gen[row, GEN_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
         gen[row, GEN_COLS["alpha"]] = _float_value(dev, "alpha", 1.0)
         gen[row, GEN_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
+        gen[row, GEN_COLS["p_max"]] = _float_value(dev, "p_max", np.nan)
     for attr in ("p", "q", "current"):
         _fill_float_column_if_present(gen, generators, GEN_COLS[attr], attr)
 
@@ -1893,6 +1898,7 @@ def build_ac_network_from_ppc(ppc: Dict):
             float(row[GEN_COLS["v_set"]]),
             float(row[GEN_COLS["alpha"]]),
             int(row[GEN_COLS["run_stat"]]),
+            float(row[GEN_COLS["p_max"]]) if np.isfinite(row[GEN_COLS["p_max"]]) else None,
         )
         for row in ppc["gen"]
     ]

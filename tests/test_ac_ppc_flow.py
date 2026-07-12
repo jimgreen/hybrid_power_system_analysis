@@ -280,6 +280,53 @@ class ACPPCFlowTest(unittest.TestCase):
         np.testing.assert_allclose(ppc["bus"][1:], expected["bus"][1:])
         np.testing.assert_array_equal(ppc["bus_name"], expected["bus_name"])
 
+    def test_ac_generator_p_max_round_trips_between_e_ppc_and_object_model(self):
+        from ac_array_model import (
+            GEN_COLS,
+            build_ac_network_from_ppc,
+            build_ac_ppc_from_e_file,
+            build_ac_ppc_from_network,
+            build_matpower_ppc_from_ac_ppc,
+        )
+
+        content = """<Model>
+@ path name p_base u_unit p_unit i_unit
+# IEEE p_max_case 100 V kW A
+</Model>
+
+<ACNode>
+@ idx name vbase run_stat
+# 1 bus_1 380 1
+</ACNode>
+
+<ACGenerator>
+@ idx name node control_type p_set q_set v_set alpha p_max run_stat
+# 7 gen_7 1 PV 20 0 380 1 80 1
+</ACGenerator>
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_path = Path(tmp_dir) / "p_max.e"
+            case_path.write_text(content, encoding="utf-8")
+            ppc = build_ac_ppc_from_e_file(case_path)
+
+        self.assertAlmostEqual(0.8, ppc["gen"][0, GEN_COLS["p_max"]])
+
+        network = build_ac_network_from_ppc(ppc)
+        self.assertAlmostEqual(0.8, network.generators[0].p_max)
+
+        round_trip = build_ac_ppc_from_network(network)
+        self.assertAlmostEqual(0.8, round_trip["gen"][0, GEN_COLS["p_max"]])
+
+        matpower = build_matpower_ppc_from_ac_ppc(round_trip)
+        self.assertAlmostEqual(80.0, matpower["gen"][0, 8])
+
+    def test_ac_generator_without_p_max_uses_nan_capacity(self):
+        from ac_array_model import GEN_COLS, build_ac_ppc_from_e_file
+
+        ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e")
+
+        self.assertTrue(np.isnan(ppc["gen"][:, GEN_COLS["p_max"]]).all())
+
     def test_build_ac_ppc_from_e_file_builds_directly_from_loaded_rows(self):
         import ac_array_model
 
@@ -364,6 +411,7 @@ class ACPPCFlowTest(unittest.TestCase):
             self.assertAlmostEqual(0.02, ppc["transformer"][0, TRANSFORMER_COLS["bt"]])
             self.assertAlmostEqual(1.1, ppc["transformer"][0, TRANSFORMER_COLS["tap"]])
             self.assertAlmostEqual(10.0, ppc["transformer"][0, TRANSFORMER_COLS["shift"]])
+            self.assertAlmostEqual(2.0, ppc["gen"][0, GEN_COLS["p_max"]])
 
             out_path = Path(tmp_dir) / "roundtrip.mat"
             returned = save_ac_ppc_to_mat_file(ppc, out_path)
@@ -375,6 +423,7 @@ class ACPPCFlowTest(unittest.TestCase):
             self.assertEqual((2, 13), np.asarray(saved_mpc.bus).shape)
             self.assertEqual((1, 21), np.atleast_2d(np.asarray(saved_mpc.gen)).shape)
             self.assertEqual((2, 13), np.asarray(saved_mpc.branch).shape)
+            self.assertAlmostEqual(200.0, np.atleast_2d(np.asarray(saved_mpc.gen))[0, 8])
 
     def test_ac_ppc_matpower_export_maps_acac_ports_to_gen_or_load(self):
         from ac_array_model import (
