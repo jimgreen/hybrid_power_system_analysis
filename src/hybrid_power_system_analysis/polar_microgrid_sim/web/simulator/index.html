@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div class="app-shell">
+    <div class="app-shell" data-default-page="overview">
       <header class="topbar">
         <div class="brand">
           <span class="brand-mark"></span>
@@ -43,116 +43,146 @@
         </div>
       </header>
 
-      <main class="workspace">
-        <aside class="rail">
-          <section class="panel compact">
-            <h2>内核状态</h2>
-            <dl class="metric-grid">
-              <div><dt>量测</dt><dd id="metricScada">0</dd></div>
-              <div><dt>命令</dt><dd id="metricCommands">0</dd></div>
-              <div><dt>告警</dt><dd id="metricAlarms">0</dd></div>
-              <div><dt>刷新</dt><dd id="metricRefresh">--</dd></div>
-            </dl>
-          </section>
-          <section class="panel compact">
-            <h2>典型日曲线</h2>
-            <label>风速峰值 <input id="windPeak" type="range" min="0" max="50" value="38" /></label>
-            <label>太阳峰值 <input id="solarPeak" type="range" min="0" max="1100" value="720" /></label>
-            <label>气温均值 <input id="tempMean" type="range" min="-45" max="5" value="-18" /></label>
-            <label>负荷基准 <input id="loadBase" type="range" min="40" max="400" value="180" /></label>
-            <div class="button-row">
-              <button id="pushCurves" class="primary">写入曲线</button>
-              <button id="randomCurves">扰动</button>
-            </div>
-          </section>
-          <section class="panel compact">
-            <h2>学生命令</h2>
-            <div id="commandInbox" class="log-list"></div>
-          </section>
-        </aside>
+      <nav class="page-nav" aria-label="模拟台主题导航">
+        <button data-nav-page="overview" class="is-active">主页</button>
+        <button data-nav-page="curves">曲线设置</button>
+        <button data-nav-page="faults">故障设置</button>
+        <button data-nav-page="modes">运行模式</button>
+        <button data-nav-page="runtime">计算监视</button>
+      </nav>
 
-        <section class="center-stack">
-          <section class="panel visual-panel">
-            <div class="panel-head">
-              <h2>天气与负荷</h2>
-              <span id="curveStatus">未写入</span>
-            </div>
-            <div class="chart-grid">
-              <canvas id="weatherChart" width="720" height="260"></canvas>
-              <canvas id="loadChart" width="360" height="260"></canvas>
-            </div>
-          </section>
+      <main class="page-main">
+        <section class="page-section is-active" data-page="overview">
+          <div class="overview-grid">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>运行总览</h2>
+                <span id="overviewRefresh">--</span>
+              </div>
+              <dl class="metric-grid">
+                <div><dt>量测</dt><dd id="metricScada">0</dd></div>
+                <div><dt>命令</dt><dd id="metricCommands">0</dd></div>
+                <div><dt>告警</dt><dd id="metricAlarms">0</dd></div>
+                <div><dt>刷新</dt><dd id="metricRefresh">--</dd></div>
+              </dl>
+            </section>
 
-          <section class="panel visual-panel">
-            <div class="panel-head">
-              <h2>交直流混联系统</h2>
-              <span id="solverInfo">solver</span>
-            </div>
-            <svg class="one-line" viewBox="0 0 900 260" role="img" aria-label="交直流微电网单线图">
-              <defs>
-                <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                  <path d="M0,0 L8,4 L0,8 z"></path>
-                </marker>
-              </defs>
-              <path class="bus ac" d="M70 90H440"></path>
-              <path class="bus dc" d="M520 90H830"></path>
-              <path class="link" d="M440 90 C470 70,490 70,520 90" marker-end="url(#arrow)"></path>
-              <g class="node online" transform="translate(95 90)"><circle r="18"></circle><text y="46">柴发</text></g>
-              <g class="node online" transform="translate(225 90)"><circle r="18"></circle><text y="46">负荷</text></g>
-              <g class="node online" transform="translate(355 90)"><circle r="18"></circle><text y="46">AC母线</text></g>
-              <g class="node online" transform="translate(580 90)"><rect x="-20" y="-20" width="40" height="40"></rect><text y="50">DCAC</text></g>
-              <g class="node online" transform="translate(700 90)"><rect x="-20" y="-20" width="40" height="40"></rect><text y="50">储能</text></g>
-              <g class="node warn" transform="translate(800 90)"><rect x="-20" y="-20" width="40" height="40"></rect><text y="50">风光</text></g>
-              <path class="drop" d="M225 108V190H355"></path>
-              <path class="drop" d="M700 110V190H800"></path>
-              <text class="caption" x="70" y="40">AC侧</text>
-              <text class="caption" x="520" y="40">DC侧</text>
-            </svg>
-            <div id="deviceTable" class="data-table"></div>
-          </section>
+            <section class="panel overview-wide">
+              <div class="panel-head">
+                <h2>交直流混联系统</h2>
+                <span id="overviewSolverInfo">待运行</span>
+              </div>
+              <svg class="one-line" viewBox="0 0 900 260" role="img" aria-label="交直流微电网单线图">
+                <path class="bus ac" d="M70 90H440"></path>
+                <path class="bus dc" d="M520 90H830"></path>
+                <path class="link" d="M440 90 C470 70,490 70,520 90"></path>
+                <g class="node online" transform="translate(95 90)"><circle r="18"></circle><text y="46">柴发</text></g>
+                <g class="node online" transform="translate(225 90)"><circle r="18"></circle><text y="46">负荷</text></g>
+                <g class="node online" transform="translate(355 90)"><circle r="18"></circle><text y="46">AC母线</text></g>
+                <g class="node online" transform="translate(580 90)"><rect x="-20" y="-20" width="40" height="40"></rect><text y="50">DCAC</text></g>
+                <g class="node online" transform="translate(700 90)"><rect x="-20" y="-20" width="40" height="40"></rect><text y="50">储能</text></g>
+                <g class="node warn" transform="translate(800 90)"><rect x="-20" y="-20" width="40" height="40"></rect><text y="50">风光</text></g>
+                <path class="drop" d="M225 108V190H355"></path>
+                <path class="drop" d="M700 110V190H800"></path>
+                <text class="caption" x="70" y="40">AC侧</text>
+                <text class="caption" x="520" y="40">DC侧</text>
+              </svg>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>学生命令</h2>
+                <span id="overviewCommandCount">0</span>
+              </div>
+              <div id="commandInbox" class="log-list"></div>
+            </section>
+          </div>
         </section>
 
-        <aside class="settings">
-          <section class="panel">
-            <div class="panel-head">
-              <h2>设备故障</h2>
-              <button id="addDeviceFault">添加</button>
-            </div>
-            <div class="form-grid">
-              <input id="faultDevType" placeholder="dev_type" value="ACBreak" />
-              <input id="faultDevName" placeholder="dev_name" value="sw_diesel_ac" />
-              <input id="faultStart" type="number" min="0" max="1439" value="60" />
-              <input id="faultClear" type="number" min="0" max="1439" value="120" />
-            </div>
-            <div id="deviceFaults" class="fault-list"></div>
-          </section>
+        <section class="page-section" data-page="curves">
+          <div class="topic-layout">
+            <aside class="panel side-editor">
+              <div class="panel-head">
+                <h2>典型日曲线</h2>
+                <span id="curveStatus">未写入</span>
+              </div>
+              <label>风速峰值 <input id="windPeak" type="range" min="0" max="50" value="38" /></label>
+              <label>太阳峰值 <input id="solarPeak" type="range" min="0" max="1100" value="720" /></label>
+              <label>气温均值 <input id="tempMean" type="range" min="-45" max="5" value="-18" /></label>
+              <label>负荷基准 <input id="loadBase" type="range" min="40" max="400" value="180" /></label>
+              <div class="button-row">
+                <button id="pushCurves" class="primary">写入曲线</button>
+                <button id="randomCurves">扰动</button>
+              </div>
+            </aside>
+            <section class="panel visual-panel topic-content">
+              <div class="panel-head">
+                <h2>天气与负荷</h2>
+                <span>96点</span>
+              </div>
+              <div class="chart-grid">
+                <canvas id="weatherChart" width="720" height="260"></canvas>
+                <canvas id="loadChart" width="360" height="260"></canvas>
+              </div>
+            </section>
+          </div>
+        </section>
 
-          <section class="panel">
-            <div class="panel-head">
-              <h2>量测故障</h2>
-              <button id="addMeasFault">添加</button>
-            </div>
-            <div class="form-grid">
-              <input id="measTarget" placeholder="量测名" value="p_load" />
-              <select id="measFaultType">
-                <option value="dead">死数</option>
-                <option value="zero">0值</option>
-                <option value="bias">大偏差</option>
-              </select>
-              <input id="measStart" type="number" min="0" max="1439" value="180" />
-              <input id="measClear" type="number" min="0" max="1439" value="240" />
-            </div>
-            <div id="measFaults" class="fault-list"></div>
-          </section>
+        <section class="page-section" data-page="faults">
+          <div class="topic-layout two-column">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>设备故障</h2>
+                <button id="addDeviceFault">添加</button>
+              </div>
+              <div class="form-grid">
+                <input id="faultDevType" placeholder="dev_type" value="ACBreak" />
+                <input id="faultDevName" placeholder="dev_name" value="sw_diesel_ac" />
+                <input id="faultStart" type="number" min="0" max="1439" value="60" />
+                <input id="faultClear" type="number" min="0" max="1439" value="120" />
+              </div>
+              <div id="deviceFaults" class="fault-list"></div>
+            </section>
 
-          <section class="panel">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>量测故障</h2>
+                <button id="addMeasFault">添加</button>
+              </div>
+              <div class="form-grid">
+                <input id="measTarget" placeholder="量测名" value="p_load" />
+                <select id="measFaultType">
+                  <option value="dead">死数</option>
+                  <option value="zero">0值</option>
+                  <option value="bias">大偏差</option>
+                </select>
+                <input id="measStart" type="number" min="0" max="1439" value="180" />
+                <input id="measClear" type="number" min="0" max="1439" value="240" />
+              </div>
+              <div id="measFaults" class="fault-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page-section" data-page="modes">
+          <section class="panel narrow-page">
             <div class="panel-head">
               <h2>运行模式</h2>
               <button id="pushModes">下发</button>
             </div>
-            <div id="modeTable" class="mode-table"></div>
+            <div id="modeTable" class="mode-table mode-table-large"></div>
           </section>
-        </aside>
+        </section>
+
+        <section class="page-section" data-page="runtime">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>计算监视</h2>
+              <span id="solverInfo">待运行</span>
+            </div>
+            <div id="deviceTable" class="data-table runtime-table"></div>
+          </section>
+        </section>
       </main>
     </div>
     <script src="./app.js"></script>

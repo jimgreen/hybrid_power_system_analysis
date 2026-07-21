@@ -282,3 +282,23 @@ def test_http_server_exposes_snapshot_command_and_step_endpoints():
     assert accepted == {"run_status": 1, "set_values": 0}
     assert stepped["measurements"]["scada"][0]["value"] == 223.0
     assert snapshot["clock"]["minute"] == 1
+
+
+def test_web_consoles_are_split_into_home_and_topic_pages():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web"
+    expected = {
+        "simulator": ["overview", "curves", "faults", "modes", "runtime"],
+        "trainee": ["overview", "measurements", "controls", "commands", "history"],
+    }
+
+    for role, pages in expected.items():
+        html = (web_root / role / "index.html").read_text(encoding="utf-8")
+        js = (web_root / role / "app.js").read_text(encoding="utf-8")
+        assert 'data-default-page="overview"' in html
+        assert 'class="page-nav"' in html
+        assert html.count('class="page-section') >= len(pages)
+        for page in pages:
+            assert f'data-page="{page}"' in html
+            assert f'data-nav-page="{page}"' in html
+        assert "function showPage" in js
+        assert "location.hash" in js

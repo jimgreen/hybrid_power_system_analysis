@@ -4,6 +4,31 @@ const trend = [];
 
 const $ = (id) => document.getElementById(id);
 
+function pageFromHash() {
+  const fallback = document.querySelector(".app-shell")?.dataset.defaultPage || "overview";
+  return (location.hash || "").replace("#", "") || fallback;
+}
+
+function showPage(page, updateHash = true) {
+  const sections = Array.from(document.querySelectorAll("[data-page]"));
+  const target = sections.some((section) => section.dataset.page === page) ? page : "overview";
+  sections.forEach((section) => section.classList.toggle("is-active", section.dataset.page === target));
+  document.querySelectorAll("[data-nav-page]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.navPage === target);
+  });
+  if (updateHash && location.hash !== `#${target}`) {
+    history.replaceState(null, "", `#${target}`);
+  }
+}
+
+function initPageNavigation() {
+  document.querySelectorAll("[data-nav-page]").forEach((button) => {
+    button.addEventListener("click", () => showPage(button.dataset.navPage));
+  });
+  window.addEventListener("hashchange", () => showPage(pageFromHash(), false));
+  showPage(pageFromHash(), false);
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`${apiBase}${path}`, {
     ...options,
@@ -31,6 +56,8 @@ function renderSnapshot(snapshot) {
   const scada = snapshot.measurements.scada || [];
   $("measureCount").textContent = `${scada.length} 点`;
   $("validCount").textContent = `${scada.filter((m) => m.valid === 1).length} 可用`;
+  $("trendCount").textContent = `${scada.length} 点`;
+  $("measurementValidCount").textContent = `${scada.filter((m) => m.valid === 1).length} 可用`;
   renderMeasurements(scada);
   renderDevices(snapshot.devices || []);
   renderHistory(snapshot.commands.history || []);
@@ -58,12 +85,11 @@ function renderMeasurements(items) {
 }
 
 function renderDevices(devices) {
-  $("deviceControls").innerHTML = devices.slice(0, 28).map((dev) => {
+  $("deviceControls").innerHTML = devices.slice(0, 42).map((dev) => {
     const key = `${dev.dev_type}|${dev.dev_name}`;
     const currentRun = pending.run_status.has(key) ? pending.run_status.get(key).run_stat : dev.run_stat;
-    const setTypes = preferredSetTypes(dev);
     return `
-      <div class="device-row">
+      <div class="device-row run-row">
         <div>
           <div class="device-name">${dev.dev_name}</div>
           <div class="device-type">${dev.dev_type} · ${dev.mode || "--"}</div>
@@ -72,6 +98,19 @@ function renderDevices(devices) {
           <span>${currentRun ? "投入" : "退出"}</span>
           <input type="checkbox" data-run-key="${key}" ${currentRun ? "checked" : ""} />
         </label>
+      </div>`;
+  }).join("") || '<div class="log-item">暂无设备</div>';
+
+  $("setpointControls").innerHTML = devices.slice(0, 42).map((dev) => {
+    const key = `${dev.dev_type}|${dev.dev_name}`;
+    const setTypes = preferredSetTypes(dev);
+    if (!setTypes.length) return "";
+    return `
+      <div class="device-row setpoint-row">
+        <div>
+          <div class="device-name">${dev.dev_name}</div>
+          <div class="device-type">${dev.dev_type} · ${dev.mode || "--"}</div>
+        </div>
         <div class="setpoints">
           ${setTypes.map((setType) => `
             <label>${setType}
@@ -80,7 +119,7 @@ function renderDevices(devices) {
           `).join("")}
         </div>
       </div>`;
-  }).join("") || '<div class="log-item">暂无设备</div>';
+  }).filter(Boolean).join("") || '<div class="log-item">暂无可调设值设备</div>';
 }
 
 function preferredSetTypes(dev) {
@@ -103,6 +142,7 @@ function currentSetValue(dev, setType) {
 }
 
 function renderHistory(history) {
+  $("historyCount").textContent = history.length;
   $("commandHistory").innerHTML = history.slice(-9).reverse().map((item) => `
     <div class="log-item">
       <strong>${item.time || ""}</strong>
@@ -168,8 +208,11 @@ function formatNumber(value) {
 }
 
 function updatePendingCount() {
-  $("pendingCount").textContent = pending.run_status.size + pending.set_values.size;
-  $("commandState").textContent = pending.run_status.size + pending.set_values.size ? "待发送" : "待命";
+  const total = pending.run_status.size + pending.set_values.size;
+  $("pendingCount").textContent = total;
+  $("runPendingCount").textContent = pending.run_status.size;
+  $("setpointPendingCount").textContent = pending.set_values.size;
+  $("commandState").textContent = total ? "待发送" : "待命";
 }
 
 document.addEventListener("change", (event) => {
@@ -210,4 +253,5 @@ $("sendCommands").addEventListener("click", async () => {
 });
 
 setInterval(refresh, 2000);
+initPageNavigation();
 refresh();

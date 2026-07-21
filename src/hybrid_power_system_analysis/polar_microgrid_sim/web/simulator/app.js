@@ -10,6 +10,31 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+function pageFromHash() {
+  const fallback = document.querySelector(".app-shell")?.dataset.defaultPage || "overview";
+  return (location.hash || "").replace("#", "") || fallback;
+}
+
+function showPage(page, updateHash = true) {
+  const sections = Array.from(document.querySelectorAll("[data-page]"));
+  const target = sections.some((section) => section.dataset.page === page) ? page : "overview";
+  sections.forEach((section) => section.classList.toggle("is-active", section.dataset.page === target));
+  document.querySelectorAll("[data-nav-page]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.navPage === target);
+  });
+  if (updateHash && location.hash !== `#${target}`) {
+    history.replaceState(null, "", `#${target}`);
+  }
+}
+
+function initPageNavigation() {
+  document.querySelectorAll("[data-nav-page]").forEach((button) => {
+    button.addEventListener("click", () => showPage(button.dataset.navPage));
+  });
+  window.addEventListener("hashchange", () => showPage(pageFromHash(), false));
+  showPage(pageFromHash(), false);
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`${apiBase}${path}`, {
     ...options,
@@ -127,6 +152,9 @@ function renderSnapshot(snapshot) {
   $("metricAlarms").textContent = snapshot.summary.alarm_count;
   $("metricRefresh").textContent = new Date().toLocaleTimeString();
   $("solverInfo").textContent = snapshot.result.solver_info || "待运行";
+  $("overviewSolverInfo").textContent = snapshot.result.solver_info || "待运行";
+  $("overviewRefresh").textContent = snapshot.clock.time;
+  $("overviewCommandCount").textContent = snapshot.summary.command_count;
   renderCommands(snapshot.commands.history || []);
   renderDevices(snapshot.devices || []);
   if (!state.modes.length) {
@@ -270,6 +298,7 @@ document.addEventListener("click", async (event) => {
   }
 });
 
+initPageNavigation();
 generateCurves(0);
 renderFaults();
 setInterval(refresh, 2000);
