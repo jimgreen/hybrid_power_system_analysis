@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>极地微电网学员台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <div>
+            <h1>极地微电网学员台</h1>
+            <p><span id="connectionDot"></span><span id="connectionText">连接中</span></p>
+          </div>
+        </div>
+        <div class="operator-strip">
+          <strong id="simTime">00:00:00</strong>
+          <span id="simState">stopped</span>
+          <button id="sendCommands" class="primary">发送指令</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="device-pane">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>设备投退</h2>
+              <span id="pendingCount">0</span>
+            </div>
+            <div id="deviceControls" class="device-list"></div>
+          </section>
+        </aside>
+
+        <section class="center-pane">
+          <section class="panel visual-panel">
+            <div class="panel-head">
+              <h2>SCADA趋势</h2>
+              <span id="measureCount">0</span>
+            </div>
+            <canvas id="trendChart" width="780" height="260"></canvas>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>微电网拓扑</h2>
+              <span id="topologyState">在线</span>
+            </div>
+            <svg class="one-line" viewBox="0 0 900 250" aria-label="极地微电网拓扑">
+              <path class="bus ac" d="M70 90H430"></path>
+              <path class="bus dc" d="M520 90H830"></path>
+              <path class="converter" d="M430 90C470 45 485 45 520 90"></path>
+              <g class="device diesel" transform="translate(100 90)"><circle r="22"></circle><text y="52">柴发</text></g>
+              <g class="device load" transform="translate(235 90)"><circle r="22"></circle><text y="52">负荷</text></g>
+              <g class="device bus-node" transform="translate(365 90)"><circle r="22"></circle><text y="52">AC</text></g>
+              <g class="device conv" transform="translate(575 90)"><rect x="-24" y="-24" width="48" height="48"></rect><text y="56">变流器</text></g>
+              <g class="device ess" transform="translate(705 90)"><rect x="-24" y="-24" width="48" height="48"></rect><text y="56">储能</text></g>
+              <g class="device renewable" transform="translate(805 90)"><rect x="-24" y="-24" width="48" height="48"></rect><text y="56">风光</text></g>
+              <path class="feeder" d="M100 112V185H235V112"></path>
+              <path class="feeder" d="M705 114V185H805V114"></path>
+            </svg>
+          </section>
+        </section>
+
+        <aside class="right-pane">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>量测表</h2>
+              <span id="validCount">0</span>
+            </div>
+            <div id="measurementTable" class="table-wrap"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>指令记录</h2>
+              <span id="commandState">待命</span>
+            </div>
+            <div id="commandHistory" class="log-list"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

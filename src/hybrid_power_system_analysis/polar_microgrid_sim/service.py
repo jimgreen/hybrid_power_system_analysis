@@ -1,0 +1,822 @@
+"""Service layer for the polar microgrid time-series simulation system.
+
+The service deliberately keeps the web/API layer thin.  It owns the runtime
+copies of the E files, projects curve/settings/trainee-command overlays into
+those files, calls the existing load-flow kernel, and exposes JSON snapshots
+that both the simulator console and trainee console can poll.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from hybrid_power_system_analysis.efile_read import EBlock, EBook
+from hybrid_power_system_analysis.simu import simu_loop
+from update_meas_from_lf import MEAS_HEADER, format_number, parse_measurement_rows
+
+
+WEATHER_HEADER = (
+    "time",
+    "wind_speed_mps",
+    "air_temp_c",
+    "air_pressure_hpa",
+    "solar_irradiance_w_m2",
+    "humidity_pct",
+    "load_kw",
+)
+
+DEFAULT_WEATHER = {
+    "wind_speed_mps": 12.0,
+    "air_temp_c": -18.0,
+    "air_pressure_hpa": 960.0,
+    "solar_irradiance_w_m2": 0.0,
+    "humidity_pct": 72.0,
+    "load_kw": 100.0,
+}
+
+STAT_HEADERS = {
+    "RunStat": ("dev_type", "dev_name", "run_stat"),
+    "CbOpenStat": ("dev_type", "dev_name", "status"),
+    "SetValue": ("dev_type", "dev_name", "set_type", "set_value"),
+    "StorageSoc": ("dev_type", "idx", "name", "soc_curr"),
+}
+
+INPUT_FILES = ("model.e", "meas.e", "stat.e", "weather.e", "device.e", "yt_ctrl.e")
+
+
+@dataclass
+class ClockState:
+    state: str = "stopped"
+    minute: int = 0
+    absolute_minute: int = 0
+    speed: float = 1.0
+    step_minutes: int = 1
+    updated_at: float = field(default_factory=time.time)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "minute": self.minute,
+            "absolute_minute": self.absolute_minute,
+            "speed": self.speed,
+            "step_minutes": self.step_minutes,
+            "time": minute_to_time(self.minute),
+            "updated_at": self.updated_at,
+        }
+
+
+def minute_to_time(minute: int | float) -> str:
+    total_seconds = int(round((float(minute) % 1440.0) * 60.0))
+    hour = (total_seconds // 3600) % 24
+    minute_part = (total_seconds // 60) % 60
+    second = total_seconds % 60
+    return f"{hour:02d}:{minute_part:02d}:{second:02d}"
+
+
+def _now_text() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _number_text(value: Any) -> str:
+    number = _to_float(value, None)
+    if number is None:
+        return "" if value is None else str(value)
+    return format_number(number)
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _make_book(blocks: Mapping[str, Tuple[Sequence[str], Sequence[Mapping[str, Any]]]]) -> EBook:
+    book = EBook({})
+    for name, (headers, rows) in blocks.items():
+        block = EBlock(name)
+        block.header_list = list(headers)
+        block.data = [{key: row.get(key, "") for key in headers} for row in rows]
+        book.data[name] = block
+    return book
+
+
+def _ensure_block(book: EBook, name: str, headers: Sequence[str]) -> EBlock:
+    block = book.data.get(name)
+    if block is None:
+        block = EBlock(name)
+        block.header_list = list(headers)
+        block.data = []
+        book.data[name] = block
+        return block
+    for header in headers:
+        if header not in block.header_list:
+            block.header_list.append(header)
+            for row in block.data:
+                row[header] = ""
+    return block
+
+
+def _dev_name(row: Mapping[str, Any]) -> str:
+    return str(row.get("dev_name", row.get("name", "")))
+
+
+def _find_dev_row(block: EBlock, dev_type: str, dev_name: str) -> Optional[dict]:
+    for row in block.data:
+        if str(row.get("dev_type", "")) == str(dev_type) and _dev_name(row) == str(dev_name):
+            return row
+    return None
+
+
+def _find_set_row(block: EBlock, dev_type: str, dev_name: str, set_type: str) -> Optional[dict]:
+    for row in block.data:
+        if (
+            str(row.get("dev_type", "")) == str(dev_type)
+            and _dev_name(row) == str(dev_name)
+            and str(row.get("set_type", "")) == str(set_type)
+        ):
+            return row
+    return None
+
+
+def _load_book(path: Path) -> EBook:
+    return EBook(path) if path.exists() else EBook({})
+
+
+def _active_window(item: Mapping[str, Any], minute: int) -> bool:
+    start = int(_to_float(item.get("start_minute", item.get("start", 0)), 0) or 0) % 1440
+    clear_value = item.get("clear_minute", item.get("end_minute", item.get("clear")))
+    if clear_value in (None, ""):
+        return minute >= start
+    clear = int(_to_float(clear_value, 1440) or 1440) % 1440
+    if start < clear:
+        return start <= minute < clear
+    if start > clear:
+        return minute >= start or minute < clear
+    return True
+
+
+def _normalize_points(points: Any, value_aliases: Sequence[str]) -> List[Dict[str, Any]]:
+    if points is None:
+        return []
+    if isinstance(points, Mapping):
+        minutes = points.get("minute", points.get("minutes", []))
+        if not isinstance(minutes, Sequence) or isinstance(minutes, (str, bytes)):
+            minutes = []
+        normalized: List[Dict[str, Any]] = []
+        for idx, minute in enumerate(minutes):
+            row: Dict[str, Any] = {"minute": _to_float(minute, 0.0) or 0.0}
+            for key, values in points.items():
+                if key in ("minute", "minutes"):
+                    continue
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)) and idx < len(values):
+                    row[key] = values[idx]
+            normalized.append(row)
+        if normalized:
+            return normalized
+        row = {"minute": _to_float(points.get("minute", 0), 0.0) or 0.0}
+        for key in value_aliases:
+            if key in points:
+                row[key] = points[key]
+        return [row] if len(row) > 1 else []
+    if isinstance(points, Sequence) and not isinstance(points, (str, bytes)):
+        normalized = []
+        for idx, item in enumerate(points):
+            if isinstance(item, Mapping):
+                row = dict(item)
+                row["minute"] = _to_float(row.get("minute", idx), float(idx)) or 0.0
+                normalized.append(row)
+            else:
+                normalized.append({"minute": float(idx), value_aliases[0]: item})
+        return normalized
+    return []
+
+
+def _interpolate(points: Sequence[Mapping[str, Any]], minute: int, key: str, default: float) -> float:
+    pairs = []
+    for point in points:
+        value = _to_float(point.get(key), None)
+        if value is None:
+            continue
+        pairs.append((float(point.get("minute", 0)) % 1440.0, value))
+    if not pairs:
+        return default
+    pairs.sort(key=lambda item: item[0])
+    m = float(minute % 1440)
+    if len(pairs) == 1:
+        return pairs[0][1]
+    if m < pairs[0][0]:
+        prev_m, prev_v = pairs[-1][0] - 1440.0, pairs[-1][1]
+        next_m, next_v = pairs[0]
+    else:
+        prev_m, prev_v = pairs[-1]
+        next_m, next_v = pairs[0][0] + 1440.0, pairs[0][1]
+        for idx in range(len(pairs) - 1):
+            left_m, left_v = pairs[idx]
+            right_m, right_v = pairs[idx + 1]
+            if left_m <= m <= right_m:
+                prev_m, prev_v = left_m, left_v
+                next_m, next_v = right_m, right_v
+                break
+    span = next_m - prev_m
+    if span <= 1e-9:
+        return prev_v
+    ratio = (m - prev_m) / span
+    return prev_v + ratio * (next_v - prev_v)
+
+
+def _measurement_row_to_dict(row: Sequence[str]) -> Dict[str, Any]:
+    item = dict(zip(MEAS_HEADER, row))
+    item["idx"] = int(_to_float(item.get("idx"), 0) or 0)
+    item["weight"] = _to_float(item.get("weight"), 0.0)
+    item["valid"] = int(_to_float(item.get("valid"), 0) or 0)
+    item["value"] = _to_float(item.get("value"), 0.0)
+    return item
+
+
+class PolarMicrogridSimulator:
+    """Runtime service for simulator and trainee web consoles."""
+
+    def __init__(
+        self,
+        sim_dir: str | Path,
+        runtime_dir: str | Path,
+        kernel: Optional[Callable[[simu_loop.SimulationConfig], Optional[simu_loop.SimulationResult]]] = None,
+        *,
+        period_seconds: float = 60.0,
+        noise_std: Optional[float] = None,
+        random_seed: Optional[int] = None,
+    ) -> None:
+        self.sim_dir = Path(sim_dir).resolve()
+        self.runtime_dir = Path(runtime_dir).resolve()
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.kernel = kernel or simu_loop.run_once
+        self.period_seconds = float(period_seconds)
+        self.noise_std = noise_std
+        self.random_seed = random_seed
+        self.clock = ClockState()
+        self.lock = threading.RLock()
+        self.command_history: List[Dict[str, Any]] = []
+        self.latest_result: Dict[str, Any] = {}
+        self.latest_measurements: Dict[str, Any] = {"real": [], "scada": []}
+        self._fault_restore: Dict[Tuple[str, str, str], str] = {}
+        self._last_scada_values: Dict[str, float] = {}
+
+        self.files = {
+            "model": self.runtime_dir / "model.e",
+            "meas": self.runtime_dir / "meas.e",
+            "stat": self.runtime_dir / "stat.e",
+            "weather": self.runtime_dir / "weather.e",
+            "device": self.runtime_dir / "device.e",
+            "yt_ctrl": self.runtime_dir / "yt_ctrl.e",
+            "real": self.runtime_dir / "real.e",
+            "scada": self.runtime_dir / "scada.e",
+        }
+        self.curves_file = self.runtime_dir / "curves.json"
+        self.settings_file = self.runtime_dir / "local_settings.json"
+
+        self._copy_runtime_inputs()
+        self.weather_defaults = self._read_weather_defaults()
+        self.curves = _read_json(self.curves_file, {"weather": [], "loads": {}})
+        self.local_settings = _read_json(
+            self.settings_file,
+            {"device_faults": [], "measurement_faults": [], "modes": []},
+        )
+        self._ensure_stat_file()
+
+    def _copy_runtime_inputs(self) -> None:
+        for name in INPUT_FILES:
+            source = self.sim_dir / name
+            target = self.runtime_dir / name
+            if source.exists():
+                shutil.copy2(source, target)
+        if not self.files["weather"].exists():
+            self._write_weather_row(DEFAULT_WEATHER | {"time": minute_to_time(0)})
+
+    def _read_weather_defaults(self) -> Dict[str, float]:
+        values = dict(DEFAULT_WEATHER)
+        path = self.files["weather"]
+        if not path.exists():
+            return values
+        try:
+            book = EBook(path)
+        except Exception:
+            return values
+        block = book.data.get("Weather")
+        if block is None or not block.data:
+            return values
+        row = block.data[0]
+        if "name" in block.header_list and "value" in block.header_list:
+            row = {str(item.get("name", "")): item.get("value", "") for item in block.data}
+        for key in DEFAULT_WEATHER:
+            number = _to_float(row.get(key), None)
+            if number is not None:
+                values[key] = number
+        return values
+
+    def _ensure_stat_file(self) -> None:
+        book = _load_book(self.files["stat"])
+        changed = False
+        for name, headers in STAT_HEADERS.items():
+            if name not in book.data:
+                changed = True
+            _ensure_block(book, name, headers)
+        if changed or not self.files["stat"].exists():
+            simu_loop.write_ebook_aligned(book, self.files["stat"])
+
+    def _make_config(self) -> simu_loop.SimulationConfig:
+        return simu_loop.SimulationConfig(
+            model_file=self.files["model"],
+            meas_file=self.files["meas"],
+            weather_file=self.files["weather"],
+            dev_stat_file=self.files["stat"],
+            dev_define_file=self.files["device"],
+            yt_ctrl_file=self.files["yt_ctrl"],
+            real_file=self.files["real"],
+            scada_file=self.files["scada"],
+            period_seconds=self.period_seconds,
+            noise_std=self.noise_std,
+            random_seed=self.random_seed,
+            loop_count=1,
+            log_file=None,
+            step_mode=True,
+        )
+
+    def apply_student_commands(self, payload: Mapping[str, Any], source: str = "student") -> Dict[str, int]:
+        with self.lock:
+            book = _load_book(self.files["stat"])
+            run_block = _ensure_block(book, "RunStat", STAT_HEADERS["RunStat"])
+            cb_block = _ensure_block(book, "CbOpenStat", STAT_HEADERS["CbOpenStat"])
+            set_block = _ensure_block(book, "SetValue", STAT_HEADERS["SetValue"])
+
+            run_items = payload.get("run_status", payload.get("runStatus", [])) or []
+            set_items = payload.get("set_values", payload.get("setValues", payload.get("setpoints", []))) or []
+            accepted_run = 0
+            accepted_set = 0
+
+            for item in run_items:
+                if not isinstance(item, Mapping):
+                    continue
+                dev_type = str(item.get("dev_type", item.get("type", "")))
+                dev_name = str(item.get("dev_name", item.get("name", "")))
+                if not dev_type or not dev_name:
+                    continue
+                run_stat = item.get("run_stat", item.get("running", item.get("value", "")))
+                if isinstance(run_stat, bool):
+                    run_stat = 1 if run_stat else 0
+                row = _find_dev_row(run_block, dev_type, dev_name)
+                if row is None:
+                    row = {"dev_type": dev_type, "dev_name": dev_name, "run_stat": ""}
+                    run_block.data.append(row)
+                row["run_stat"] = _number_text(run_stat)
+                accepted_run += 1
+                if "status" in item:
+                    cb_row = _find_dev_row(cb_block, dev_type, dev_name)
+                    if cb_row is None:
+                        cb_row = {"dev_type": dev_type, "dev_name": dev_name, "status": ""}
+                        cb_block.data.append(cb_row)
+                    cb_row["status"] = _number_text(item.get("status"))
+
+            for item in self._expand_set_values(set_items):
+                dev_type = str(item.get("dev_type", item.get("type", "")))
+                dev_name = str(item.get("dev_name", item.get("name", "")))
+                set_type = str(item.get("set_type", ""))
+                if not dev_type or not dev_name or not set_type:
+                    continue
+                row = _find_set_row(set_block, dev_type, dev_name, set_type)
+                if row is None:
+                    row = {"dev_type": dev_type, "dev_name": dev_name, "set_type": set_type, "set_value": ""}
+                    set_block.data.append(row)
+                row["set_value"] = _number_text(item.get("set_value", ""))
+                accepted_set += 1
+
+            simu_loop.write_ebook_aligned(book, self.files["stat"])
+            accepted = {"run_status": accepted_run, "set_values": accepted_set}
+            self.command_history.append(
+                {
+                    "time": _now_text(),
+                    "source": source,
+                    "accepted": accepted,
+                    "payload": json.loads(json.dumps(payload, ensure_ascii=False, default=str)),
+                }
+            )
+            self.command_history = self.command_history[-200:]
+            return accepted
+
+    def _expand_set_values(self, items: Iterable[Any]) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            if "set_type" in item:
+                expanded.append(dict(item))
+                continue
+            for key in ("p_set", "q_set", "v_set", "p_ac_set", "q_ac_set", "v_ac_set"):
+                if key in item:
+                    expanded.append(
+                        {
+                            "dev_type": item.get("dev_type", item.get("type", "")),
+                            "dev_name": item.get("dev_name", item.get("name", "")),
+                            "set_type": key,
+                            "set_value": item[key],
+                        }
+                    )
+        return expanded
+
+    def set_curves(self, payload: Mapping[str, Any]) -> Dict[str, int]:
+        with self.lock:
+            weather_points = _normalize_points(payload.get("weather"), WEATHER_HEADER[1:])
+            loads_payload = payload.get("loads", {})
+            loads: Dict[str, List[Dict[str, Any]]] = {}
+            if isinstance(loads_payload, Mapping):
+                for name, points in loads_payload.items():
+                    loads[str(name)] = _normalize_points(points, ("p_kw", "value", "load_kw"))
+            elif isinstance(loads_payload, Sequence) and not isinstance(loads_payload, (str, bytes)):
+                for item in loads_payload:
+                    if not isinstance(item, Mapping):
+                        continue
+                    name = str(item.get("dev_name", item.get("name", "load")))
+                    loads.setdefault(name, []).append(
+                        {
+                            "minute": _to_float(item.get("minute", len(loads.get(name, []))), 0.0) or 0.0,
+                            "p_kw": item.get("p_kw", item.get("value", item.get("load_kw", 0))),
+                        }
+                    )
+            self.curves = {"weather": weather_points, "loads": loads}
+            _write_json(self.curves_file, self.curves)
+            return {"weather_points": len(weather_points), "load_devices": len(loads)}
+
+    def set_local_settings(self, payload: Mapping[str, Any]) -> Dict[str, int]:
+        with self.lock:
+            aliases = {
+                "device_faults": ("device_faults", "deviceFaults", "faults"),
+                "measurement_faults": ("measurement_faults", "measurementFaults", "meas_faults"),
+                "modes": ("modes", "device_modes", "deviceModes"),
+            }
+            for target_key, names in aliases.items():
+                for name in names:
+                    if name in payload:
+                        value = payload.get(name) or []
+                        self.local_settings[target_key] = list(value) if isinstance(value, Sequence) else []
+                        break
+            _write_json(self.settings_file, self.local_settings)
+            return {
+                "device_faults": len(self.local_settings.get("device_faults", [])),
+                "measurement_faults": len(self.local_settings.get("measurement_faults", [])),
+                "modes": len(self.local_settings.get("modes", [])),
+            }
+
+    def control_clock(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            action = str(payload.get("action", "")).lower()
+            if "step_minutes" in payload:
+                self.clock.step_minutes = max(1, int(_to_float(payload.get("step_minutes"), 1) or 1))
+            if "minute" in payload:
+                minute = int(_to_float(payload.get("minute"), self.clock.minute) or 0)
+                self.clock.absolute_minute = minute
+                self.clock.minute = minute % 1440
+            if "speed" in payload:
+                self.clock.speed = max(0.1, float(_to_float(payload.get("speed"), self.clock.speed) or self.clock.speed))
+            if action == "start":
+                self.clock.state = "running"
+            elif action == "pause":
+                self.clock.state = "paused"
+            elif action == "stop":
+                self.clock.state = "stopped"
+                self.clock.absolute_minute = 0
+                self.clock.minute = 0
+            elif action in ("faster", "speed_up"):
+                self.clock.speed = min(3600.0, self.clock.speed * 2.0)
+            elif action in ("slower", "speed_down"):
+                self.clock.speed = max(0.1, self.clock.speed / 2.0)
+            elif action == "step":
+                return self.step()["clock"]
+            self.clock.updated_at = time.time()
+            return self.clock.as_dict()
+
+    def step(self) -> Dict[str, Any]:
+        with self.lock:
+            minute = self.clock.minute
+            self._prepare_runtime_inputs(minute)
+            config = self._make_config()
+            kernel_result = self.kernel(config)
+            self._apply_measurement_faults(minute)
+            self.latest_measurements = self.measurements()
+            self.clock.absolute_minute += self.clock.step_minutes
+            self.clock.minute = self.clock.absolute_minute % 1440
+            self.clock.updated_at = time.time()
+            self.latest_result = self._kernel_result_dict(kernel_result)
+            return self.snapshot()
+
+    def _prepare_runtime_inputs(self, minute: int) -> None:
+        self._write_current_weather(minute)
+        self._apply_device_faults(minute)
+        self._apply_modes_to_model()
+
+    def _write_current_weather(self, minute: int) -> None:
+        row = {"time": minute_to_time(minute)}
+        for key, default in self.weather_defaults.items():
+            row[key] = _number_text(_interpolate(self.curves.get("weather", []), minute, key, default))
+        load_total = 0.0
+        load_seen = False
+        loads = self.curves.get("loads", {})
+        if isinstance(loads, Mapping):
+            for points in loads.values():
+                value = _interpolate(points, minute, "p_kw", float("nan"))
+                if value == value:
+                    load_total += value
+                    load_seen = True
+        row["load_kw"] = _number_text(load_total if load_seen else self.weather_defaults.get("load_kw", 0.0))
+        self._write_weather_row(row)
+
+    def _write_weather_row(self, row: Mapping[str, Any]) -> None:
+        clean = {header: row.get(header, "") for header in WEATHER_HEADER}
+        book = _make_book({"Weather": (WEATHER_HEADER, [clean])})
+        simu_loop.write_ebook_aligned(book, self.files["weather"])
+
+    def _apply_device_faults(self, minute: int) -> None:
+        book = _load_book(self.files["stat"])
+        run_block = _ensure_block(book, "RunStat", STAT_HEADERS["RunStat"])
+        cb_block = _ensure_block(book, "CbOpenStat", STAT_HEADERS["CbOpenStat"])
+        active_keys: set[Tuple[str, str, str]] = set()
+
+        for fault in self.local_settings.get("device_faults", []):
+            if not isinstance(fault, Mapping) or not _active_window(fault, minute):
+                continue
+            dev_type = str(fault.get("dev_type", fault.get("type", "")))
+            dev_name = str(fault.get("dev_name", fault.get("name", "")))
+            if not dev_type or not dev_name:
+                continue
+            run_key = ("RunStat", dev_type, dev_name)
+            active_keys.add(run_key)
+            run_row = _find_dev_row(run_block, dev_type, dev_name)
+            if run_row is None:
+                run_row = {"dev_type": dev_type, "dev_name": dev_name, "run_stat": "1"}
+                run_block.data.append(run_row)
+            if run_key not in self._fault_restore:
+                self._fault_restore[run_key] = str(run_row.get("run_stat", "1"))
+            run_row["run_stat"] = _number_text(fault.get("run_stat", 0))
+
+            if "status" in fault or dev_type.endswith("Break") or dev_type.endswith("Switch"):
+                cb_key = ("CbOpenStat", dev_type, dev_name)
+                active_keys.add(cb_key)
+                cb_row = _find_dev_row(cb_block, dev_type, dev_name)
+                if cb_row is None:
+                    cb_row = {"dev_type": dev_type, "dev_name": dev_name, "status": "1"}
+                    cb_block.data.append(cb_row)
+                if cb_key not in self._fault_restore:
+                    self._fault_restore[cb_key] = str(cb_row.get("status", "1"))
+                cb_row["status"] = _number_text(fault.get("status", 0))
+
+        for key, old_value in list(self._fault_restore.items()):
+            if key in active_keys:
+                continue
+            block_name, dev_type, dev_name = key
+            block = run_block if block_name == "RunStat" else cb_block
+            value_column = "run_stat" if block_name == "RunStat" else "status"
+            row = _find_dev_row(block, dev_type, dev_name)
+            if row is not None:
+                row[value_column] = old_value
+            del self._fault_restore[key]
+
+        simu_loop.write_ebook_aligned(book, self.files["stat"])
+
+    def _apply_modes_to_model(self) -> None:
+        modes = self.local_settings.get("modes", [])
+        if not modes or not self.files["model"].exists():
+            return
+        book = EBook(self.files["model"])
+        changed = False
+        for mode in modes:
+            if not isinstance(mode, Mapping):
+                continue
+            dev_type = str(mode.get("dev_type", mode.get("type", "")))
+            dev_name = str(mode.get("dev_name", mode.get("name", "")))
+            mode_value = str(mode.get("mode", mode.get("control_type", "")))
+            if not dev_type or not dev_name or not mode_value:
+                continue
+            block = book.data.get(dev_type)
+            if block is None:
+                continue
+            target = None
+            for row in block.data:
+                if str(row.get("name", "")) == dev_name:
+                    target = row
+                    break
+            if target is None:
+                continue
+            for column in ("control_type", "mode", "ctrl_mode"):
+                if column in block.header_list:
+                    target[column] = mode_value
+                    changed = True
+                    break
+        if changed:
+            simu_loop.write_ebook_aligned(book, self.files["model"])
+
+    def _apply_measurement_faults(self, minute: int) -> None:
+        faults = [fault for fault in self.local_settings.get("measurement_faults", []) if isinstance(fault, Mapping)]
+        active_faults = [fault for fault in faults if _active_window(fault, minute)]
+        if not active_faults or not self.files["scada"].exists():
+            return
+        before, rows, after = parse_measurement_rows(self.files["scada"])
+        changed = False
+        for row in rows:
+            row_key = self._measurement_key(row)
+            for fault in active_faults:
+                if not self._measurement_matches(row, fault):
+                    continue
+                fault_type = str(fault.get("fault_type", fault.get("type", "bias"))).lower()
+                current_value = _to_float(row[7], 0.0) or 0.0
+                if fault_type in ("zero", "0", "zero_value"):
+                    row[7] = "0"
+                elif fault_type in ("dead", "deadband", "stuck", "stale"):
+                    row[7] = _number_text(self._last_scada_values.get(row_key, current_value))
+                else:
+                    bias = _to_float(fault.get("bias", fault.get("offset", 10.0)), 10.0) or 0.0
+                    row[7] = _number_text(current_value + bias)
+                changed = True
+        if changed:
+            simu_loop.write_measurement_snapshot(self.files["scada"], before, rows, after)
+
+    def _measurement_matches(self, row: Sequence[str], fault: Mapping[str, Any]) -> bool:
+        name, dev_type, dev_name, meas_type = row[1], row[2], row[3], row[4]
+        target = str(fault.get("target", fault.get("name", "")))
+        if target and target not in {
+            name,
+            dev_name,
+            f"{dev_type}.{dev_name}.{meas_type}",
+            f"{dev_type}:{dev_name}:{meas_type}",
+            f"{dev_name}.{meas_type}",
+        }:
+            return False
+        if fault.get("dev_type") not in (None, "", dev_type):
+            return False
+        if fault.get("dev_name") not in (None, "", dev_name):
+            return False
+        if str(fault.get("meas_type", "")).upper() not in ("", meas_type.upper()):
+            return False
+        return True
+
+    def _measurement_key(self, row: Sequence[str]) -> str:
+        return f"{row[1]}|{row[2]}|{row[3]}|{row[4]}"
+
+    def _kernel_result_dict(self, result: Optional[simu_loop.SimulationResult]) -> Dict[str, Any]:
+        if result is None:
+            return {"updated": 0, "missing": 0, "overlay_updates": 0, "solver_info": "not-run"}
+        return {
+            "updated": getattr(result, "updated", 0),
+            "missing": getattr(result, "missing", 0),
+            "overlay_updates": getattr(result, "overlay_updates", 0),
+            "solver_info": getattr(result, "solver_info", ""),
+            "real_file": str(getattr(result, "real_file", self.files["real"])),
+            "scada_file": str(getattr(result, "scada_file", self.files["scada"])),
+        }
+
+    def measurements(self) -> Dict[str, List[Dict[str, Any]]]:
+        real = self._read_measurement_file(self.files["real"])
+        scada = self._read_measurement_file(self.files["scada"])
+        for item in scada:
+            self._last_scada_values[
+                f"{item['name']}|{item['dev_type']}|{item['dev_name']}|{item['meas_type']}"
+            ] = item.get("value", 0.0) or 0.0
+        return {"real": real, "scada": scada}
+
+    def _read_measurement_file(self, path: Path) -> List[Dict[str, Any]]:
+        if not path.exists():
+            return []
+        try:
+            _before, rows, _after = parse_measurement_rows(path)
+        except Exception:
+            return []
+        return [_measurement_row_to_dict(row) for row in rows]
+
+    def devices(self) -> List[Dict[str, Any]]:
+        if not self.files["model"].exists():
+            return []
+        try:
+            model_book = EBook(self.files["model"])
+        except Exception:
+            return []
+        run_stats, cb_status, set_values, soc_values = self._stat_maps()
+        devices: List[Dict[str, Any]] = []
+        device_blocks = (
+            "ACGenerator",
+            "DCGenerator",
+            "ACLoad",
+            "DCLoad",
+            "DCDCConverter",
+            "DCACConverter",
+            "ACACConverter",
+            "ACBreak",
+            "DCBreak",
+            "ACSwitch",
+            "DCSwitch",
+        )
+        for dev_type in device_blocks:
+            block = model_book.data.get(dev_type)
+            if block is None:
+                continue
+            for row in block.data:
+                name = str(row.get("name", ""))
+                key = (dev_type, name)
+                set_types = []
+                for column in ("p_set", "q_set", "v_set", "p_ac_set", "q_ac_set", "v_ac_set", "pv0", "qv0"):
+                    if column in block.header_list:
+                        set_types.append(column)
+                devices.append(
+                    {
+                        "dev_type": dev_type,
+                        "dev_name": name,
+                        "run_stat": int(_to_float(run_stats.get(key, row.get("run_stat", 1)), 1) or 0),
+                        "status": int(_to_float(cb_status.get(key, row.get("status", 1)), 1) or 0),
+                        "mode": row.get("control_type", row.get("mode", "")),
+                        "set_types": set_types,
+                        "set_values": set_values.get(key, {}),
+                        "raw": {header: row.get(header, "") for header in block.header_list},
+                    }
+                )
+        for name, soc in soc_values.items():
+            devices.append(
+                {
+                    "dev_type": "ESS",
+                    "dev_name": name,
+                    "run_stat": int(_to_float(run_stats.get(("ESS", name), 1), 1) or 0),
+                    "status": 1,
+                    "mode": "PH",
+                    "set_types": ["p_set"],
+                    "set_values": {},
+                    "soc_curr": soc,
+                    "raw": {"soc_curr": soc},
+                }
+            )
+        return devices
+
+    def _stat_maps(self) -> Tuple[Dict[Tuple[str, str], Any], Dict[Tuple[str, str], Any], Dict[Tuple[str, str], dict], Dict[str, float]]:
+        stat_book = _load_book(self.files["stat"])
+        run_stats: Dict[Tuple[str, str], Any] = {}
+        cb_status: Dict[Tuple[str, str], Any] = {}
+        set_values: Dict[Tuple[str, str], dict] = {}
+        soc_values: Dict[str, float] = {}
+        for row in getattr(stat_book.data.get("RunStat"), "data", []):
+            run_stats[(str(row.get("dev_type", "")), _dev_name(row))] = row.get("run_stat", "")
+        for row in getattr(stat_book.data.get("CbOpenStat"), "data", []):
+            cb_status[(str(row.get("dev_type", "")), _dev_name(row))] = row.get("status", "")
+        for row in getattr(stat_book.data.get("SetValue"), "data", []):
+            key = (str(row.get("dev_type", "")), _dev_name(row))
+            set_values.setdefault(key, {})[str(row.get("set_type", ""))] = row.get("set_value", "")
+        storage_block = stat_book.data.get("StorageSoc") or stat_book.data.get("StorageStatus")
+        for row in getattr(storage_block, "data", []):
+            name = str(row.get("name", row.get("dev_name", "")))
+            soc_values[name] = _to_float(row.get("soc_curr", row.get("soc", 0.0)), 0.0) or 0.0
+        return run_stats, cb_status, set_values, soc_values
+
+    def snapshot(self) -> Dict[str, Any]:
+        measurements = self.latest_measurements or self.measurements()
+        return {
+            "clock": self.clock.as_dict(),
+            "files": {key: str(path) for key, path in self.files.items()},
+            "curves": self.curves,
+            "settings": self.local_settings,
+            "commands": {"history": self.command_history[-50:]},
+            "devices": self.devices(),
+            "measurements": measurements,
+            "result": self.latest_result,
+            "summary": self._summary(measurements),
+        }
+
+    def _summary(self, measurements: Mapping[str, Sequence[Mapping[str, Any]]]) -> Dict[str, Any]:
+        scada = measurements.get("scada", [])
+        valid = [item for item in scada if item.get("valid", 0) == 1]
+        alarms = [
+            item
+            for item in scada
+            if item.get("value") is not None and abs(float(item.get("value") or 0.0)) > 1e4
+        ]
+        return {
+            "scada_count": len(scada),
+            "valid_scada_count": len(valid),
+            "alarm_count": len(alarms),
+            "command_count": len(self.command_history),
+            "runtime_dir": str(self.runtime_dir),
+        }

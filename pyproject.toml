@@ -36,6 +36,16 @@ solver = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"hybrid_power_system_analysis.polar_microgrid_sim" = [
+    "web/simulator/*.html",
+    "web/simulator/*.css",
+    "web/simulator/*.js",
+    "web/trainee/*.html",
+    "web/trainee/*.css",
+    "web/trainee/*.js",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [
