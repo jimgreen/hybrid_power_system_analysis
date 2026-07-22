@@ -32,6 +32,7 @@ const state = {
   measurementTraceWindowMinutes: 60,
   lastMeasurementTraceKey: "",
   modeFilter: { dev_type: "all", dev_name: "" },
+  collapsedDeviceTreeGroups: {},
   runtimeLogs: [],
   lastRuntimeLogKey: "",
 };
@@ -52,6 +53,45 @@ const ENV_CURVE_KEYS = ["wind_speed_mps", "solar_irradiance_w_m2", "air_temp_c"]
 const LOAD_CURVE_META = { label: "负荷", color: "#c93a3a", min: 0, max: 500, digits: 2, unit: "kW" };
 const LOAD_CURVE_COLORS = ["#c93a3a", "#8a4fbf", "#23854a", "#d16300", "#4369b2", "#0a8b8b"];
 const CURVE_PLOT = { left: 58, right: 24, top: 46, bottom: 34 };
+
+function isDeviceTreeGroupCollapsed(scope, groupKey) {
+  return Boolean(state.collapsedDeviceTreeGroups?.[scope]?.[groupKey]);
+}
+
+function toggleDeviceTreeGroup(scope, groupKey) {
+  if (!scope || !groupKey || groupKey === "all") return;
+  if (!state.collapsedDeviceTreeGroups[scope]) {
+    state.collapsedDeviceTreeGroups[scope] = {};
+  }
+  if (state.collapsedDeviceTreeGroups[scope][groupKey]) {
+    delete state.collapsedDeviceTreeGroups[scope][groupKey];
+  } else {
+    state.collapsedDeviceTreeGroups[scope][groupKey] = true;
+  }
+}
+
+function deviceTreeTypeAttrs(scope, groupKey, isCollapsed) {
+  return `
+          data-tree-toggle-scope="${escapeHtml(scope)}"
+          data-tree-toggle-group="${escapeHtml(groupKey)}"
+          aria-expanded="${isCollapsed ? "false" : "true"}"`;
+}
+
+function deviceTreeTypeLabel(label) {
+  return `
+          <span class="tree-title">
+            <i class="tree-toggle" aria-hidden="true"></i>
+            <span class="tree-title-text">${escapeHtml(label)}</span>
+          </span>`;
+}
+
+function deviceTreeChildren(isCollapsed, childrenHtml) {
+  if (isCollapsed) return "";
+  return `
+        <div class="tree-children">
+          ${childrenHtml}
+        </div>`;
+}
 
 function renderClock(clock) {
   if (!clock) return;
@@ -1617,19 +1657,21 @@ function renderGridModelDeviceTree() {
       <span>全部设备</span>
       <strong>${devices.length}</strong>
     </button>
-    ${groupEntries.map(([devType, items]) => `
+    ${groupEntries.map(([devType, items]) => {
+      const isCollapsed = isDeviceTreeGroupCollapsed("model", devType);
+      return `
       <div class="tree-group">
         <button
           type="button"
-          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
+          class="tree-node tree-type ${isCollapsed ? "is-collapsed" : ""} ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
           data-model-tree-type="${escapeHtml(devType)}"
           data-model-tree-name=""
+          ${deviceTreeTypeAttrs("model", devType, isCollapsed)}
         >
-          <span>${escapeHtml(devType)}</span>
+          ${deviceTreeTypeLabel(devType)}
           <strong>${items.length}</strong>
         </button>
-        <div class="tree-children">
-          ${items.map((dev) => {
+        ${deviceTreeChildren(isCollapsed, items.map((dev) => {
             const idx = formatModelParamValue(dev.idx ?? dev.raw?.idx);
             return `
             <button
@@ -1642,10 +1684,10 @@ function renderGridModelDeviceTree() {
               <span class="model-tree-name">${escapeHtml(dev.dev_name)}</span>
             </button>
           `;
-          }).join("")}
-        </div>
+          }).join(""))}
       </div>
-    `).join("")}
+    `;
+    }).join("")}
   `;
 }
 
@@ -1875,19 +1917,21 @@ function renderRuntimeDeviceTree() {
       <span>全部设备</span>
       <strong>${devices.length}</strong>
     </button>
-    ${groupEntries.map(([devType, items]) => `
+    ${groupEntries.map(([devType, items]) => {
+      const isCollapsed = isDeviceTreeGroupCollapsed("runtime", devType);
+      return `
       <div class="tree-group">
         <button
           type="button"
-          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
+          class="tree-node tree-type ${isCollapsed ? "is-collapsed" : ""} ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
           data-runtime-tree-type="${escapeHtml(devType)}"
           data-runtime-tree-name=""
+          ${deviceTreeTypeAttrs("runtime", devType, isCollapsed)}
         >
-          <span>${escapeHtml(devType)}</span>
+          ${deviceTreeTypeLabel(devType)}
           <strong>${items.length}</strong>
         </button>
-        <div class="tree-children">
-          ${items.map((dev) => `
+        ${deviceTreeChildren(isCollapsed, items.map((dev) => `
             <button
               type="button"
               class="tree-node tree-child ${filter.dev_type === dev.dev_type && filter.dev_name === dev.dev_name ? "is-active" : ""}"
@@ -1897,10 +1941,10 @@ function renderRuntimeDeviceTree() {
               <span>${escapeHtml(dev.dev_name)}</span>
               <small>${escapeHtml(deviceTreeBadge(dev))}</small>
             </button>
-          `).join("")}
-        </div>
+          `).join(""))}
       </div>
-    `).join("")}
+    `;
+    }).join("")}
   `;
 }
 
@@ -2482,19 +2526,21 @@ function renderMeasurementCompareDeviceTree(rows = measurementCompareRows()) {
       <span>全部设备</span>
       <strong>${devices.length}</strong>
     </button>
-    ${groupEntries.map(([devType, items]) => `
+    ${groupEntries.map(([devType, items]) => {
+      const isCollapsed = isDeviceTreeGroupCollapsed("measurement", devType);
+      return `
       <div class="tree-group">
         <button
           type="button"
-          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
+          class="tree-node tree-type ${isCollapsed ? "is-collapsed" : ""} ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
           data-measurement-tree-type="${escapeHtml(devType)}"
           data-measurement-tree-name=""
+          ${deviceTreeTypeAttrs("measurement", devType, isCollapsed)}
         >
-          <span>${escapeHtml(devType)}</span>
+          ${deviceTreeTypeLabel(devType)}
           <strong>${items.length}</strong>
         </button>
-        <div class="tree-children">
-          ${items.map((item) => `
+        ${deviceTreeChildren(isCollapsed, items.map((item) => `
             <button
               type="button"
               class="tree-node tree-child ${filter.dev_type === item.dev_type && filter.dev_name === item.dev_name ? "is-active" : ""}"
@@ -2504,10 +2550,10 @@ function renderMeasurementCompareDeviceTree(rows = measurementCompareRows()) {
               <span>${escapeHtml(item.dev_name)}</span>
               <small>${escapeHtml(item.count)}点</small>
             </button>
-          `).join("")}
-        </div>
+          `).join(""))}
       </div>
-    `).join("")}
+    `;
+    }).join("")}
   `;
 }
 
@@ -2756,19 +2802,21 @@ function renderFaultDeviceTree() {
       <span>全部设备</span>
       <strong>${devices.length}</strong>
     </button>
-    ${groupEntries.map(([devType, items]) => `
+    ${groupEntries.map(([devType, items]) => {
+      const isCollapsed = isDeviceTreeGroupCollapsed("faultDevice", devType);
+      return `
       <div class="tree-group">
         <button
           type="button"
-          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
+          class="tree-node tree-type ${isCollapsed ? "is-collapsed" : ""} ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
           data-fault-device-tree-type="${escapeHtml(devType)}"
           data-fault-device-tree-name=""
+          ${deviceTreeTypeAttrs("faultDevice", devType, isCollapsed)}
         >
-          <span>${escapeHtml(devType)}</span>
+          ${deviceTreeTypeLabel(devType)}
           <strong>${items.length}</strong>
         </button>
-        <div class="tree-children">
-          ${items.map((dev) => `
+        ${deviceTreeChildren(isCollapsed, items.map((dev) => `
             <button
               type="button"
               class="tree-node tree-child ${filter.dev_type === dev.dev_type && filter.dev_name === dev.dev_name ? "is-active" : ""}"
@@ -2778,10 +2826,10 @@ function renderFaultDeviceTree() {
               <span>${escapeHtml(dev.dev_name)}</span>
               <small>${escapeHtml(deviceTreeBadge(dev))}</small>
             </button>
-          `).join("")}
-        </div>
+          `).join(""))}
       </div>
-    `).join("")}
+    `;
+    }).join("")}
   `;
 }
 
@@ -2803,19 +2851,21 @@ function renderFaultMeasurementTree() {
       <span>全部设备</span>
       <strong>${devices.length}</strong>
     </button>
-    ${groupEntries.map(([devType, items]) => `
+    ${groupEntries.map(([devType, items]) => {
+      const isCollapsed = isDeviceTreeGroupCollapsed("faultMeasurement", devType);
+      return `
       <div class="tree-group">
         <button
           type="button"
-          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
+          class="tree-node tree-type ${isCollapsed ? "is-collapsed" : ""} ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
           data-fault-measurement-tree-type="${escapeHtml(devType)}"
           data-fault-measurement-tree-name=""
+          ${deviceTreeTypeAttrs("faultMeasurement", devType, isCollapsed)}
         >
-          <span>${escapeHtml(devType)}</span>
+          ${deviceTreeTypeLabel(devType)}
           <strong>${items.length}</strong>
         </button>
-        <div class="tree-children">
-          ${items.map((dev) => `
+        ${deviceTreeChildren(isCollapsed, items.map((dev) => `
             <button
               type="button"
               class="tree-node tree-child ${filter.dev_type === dev.dev_type && filter.dev_name === dev.dev_name ? "is-active" : ""}"
@@ -2825,10 +2875,10 @@ function renderFaultMeasurementTree() {
               <span>${escapeHtml(dev.dev_name)}</span>
               <small>${escapeHtml(dev.count)}点</small>
             </button>
-          `).join("")}
-        </div>
+          `).join(""))}
       </div>
-    `).join("")}
+    `;
+    }).join("")}
   `;
 }
 
@@ -3062,19 +3112,21 @@ function renderModeDeviceTree() {
       <span>全部设备</span>
       <strong>${state.modes.length}</strong>
     </button>
-    ${groupEntries.map(([devType, items]) => `
+    ${groupEntries.map(([devType, items]) => {
+      const isCollapsed = isDeviceTreeGroupCollapsed("mode", devType);
+      return `
       <div class="tree-group">
         <button
           type="button"
-          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : ""}"
+          class="tree-node tree-type ${isCollapsed ? "is-collapsed" : ""} ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
           data-mode-tree-type="${escapeHtml(devType)}"
           data-mode-tree-name=""
+          ${deviceTreeTypeAttrs("mode", devType, isCollapsed)}
         >
-          <span>${escapeHtml(devType)}</span>
+          ${deviceTreeTypeLabel(devType)}
           <strong>${items.length}</strong>
         </button>
-        <div class="tree-children">
-          ${items.map((item) => `
+        ${deviceTreeChildren(isCollapsed, items.map((item) => `
             <button
               type="button"
               class="tree-node tree-child ${filter.dev_type === item.dev_type && filter.dev_name === item.dev_name ? "is-active" : ""}"
@@ -3084,10 +3136,10 @@ function renderModeDeviceTree() {
               <span>${escapeHtml(item.dev_name)}</span>
               <small>${escapeHtml(item.mode)}</small>
             </button>
-          `).join("")}
-        </div>
+          `).join(""))}
       </div>
-    `).join("")}
+    `;
+    }).join("")}
   `;
 }
 
@@ -3242,6 +3294,12 @@ document.addEventListener("click", (event) => {
   }
   const faultDeviceTreeButton = event.target.closest("[data-fault-device-tree-type]");
   if (faultDeviceTreeButton) {
+    if (faultDeviceTreeButton.dataset.treeToggleScope) {
+      toggleDeviceTreeGroup(
+        faultDeviceTreeButton.dataset.treeToggleScope,
+        faultDeviceTreeButton.dataset.treeToggleGroup,
+      );
+    }
     setDeviceFaultFilter(
       faultDeviceTreeButton.dataset.faultDeviceTreeType,
       faultDeviceTreeButton.dataset.faultDeviceTreeName || "",
@@ -3249,6 +3307,12 @@ document.addEventListener("click", (event) => {
   }
   const faultMeasurementTreeButton = event.target.closest("[data-fault-measurement-tree-type]");
   if (faultMeasurementTreeButton) {
+    if (faultMeasurementTreeButton.dataset.treeToggleScope) {
+      toggleDeviceTreeGroup(
+        faultMeasurementTreeButton.dataset.treeToggleScope,
+        faultMeasurementTreeButton.dataset.treeToggleGroup,
+      );
+    }
     setMeasurementFaultFilter(
       faultMeasurementTreeButton.dataset.faultMeasurementTreeType,
       faultMeasurementTreeButton.dataset.faultMeasurementTreeName || "",
@@ -3260,6 +3324,12 @@ document.addEventListener("click", (event) => {
   }
   const measurementTreeButton = event.target.closest("[data-measurement-tree-type]");
   if (measurementTreeButton) {
+    if (measurementTreeButton.dataset.treeToggleScope) {
+      toggleDeviceTreeGroup(
+        measurementTreeButton.dataset.treeToggleScope,
+        measurementTreeButton.dataset.treeToggleGroup,
+      );
+    }
     setMeasurementCompareFilter(
       measurementTreeButton.dataset.measurementTreeType,
       measurementTreeButton.dataset.measurementTreeName || "",
@@ -3267,6 +3337,12 @@ document.addEventListener("click", (event) => {
   }
   const modelTreeButton = event.target.closest("[data-model-tree-type]");
   if (modelTreeButton) {
+    if (modelTreeButton.dataset.treeToggleScope) {
+      toggleDeviceTreeGroup(
+        modelTreeButton.dataset.treeToggleScope,
+        modelTreeButton.dataset.treeToggleGroup,
+      );
+    }
     setGridModelFilter(
       modelTreeButton.dataset.modelTreeType,
       modelTreeButton.dataset.modelTreeName || "",
@@ -3274,6 +3350,12 @@ document.addEventListener("click", (event) => {
   }
   const runtimeTreeButton = event.target.closest("[data-runtime-tree-type]");
   if (runtimeTreeButton) {
+    if (runtimeTreeButton.dataset.treeToggleScope) {
+      toggleDeviceTreeGroup(
+        runtimeTreeButton.dataset.treeToggleScope,
+        runtimeTreeButton.dataset.treeToggleGroup,
+      );
+    }
     setRuntimeDeviceFilter(
       runtimeTreeButton.dataset.runtimeTreeType,
       runtimeTreeButton.dataset.runtimeTreeName || "",
@@ -3281,6 +3363,12 @@ document.addEventListener("click", (event) => {
   }
   const modeTreeButton = event.target.closest("[data-mode-tree-type]");
   if (modeTreeButton) {
+    if (modeTreeButton.dataset.treeToggleScope) {
+      toggleDeviceTreeGroup(
+        modeTreeButton.dataset.treeToggleScope,
+        modeTreeButton.dataset.treeToggleGroup,
+      );
+    }
     setModeFilter(modeTreeButton.dataset.modeTreeType, modeTreeButton.dataset.modeTreeName || "");
   }
 });

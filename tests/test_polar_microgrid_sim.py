@@ -914,6 +914,33 @@ def test_simulator_mode_page_uses_device_tree_and_editable_mode_table():
     assert "mode-editor-table" in css
 
 
+def test_simulator_device_trees_support_collapsible_type_groups():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'data-nav-page="runtime">控制指令</button>' in html
+    assert 'aria-label="控制指令设备树"' in html
+    assert "计算监视" not in html
+    assert "collapsedDeviceTreeGroups" in js
+    assert "function isDeviceTreeGroupCollapsed" in js
+    assert "function toggleDeviceTreeGroup" in js
+    assert "function deviceTreeTypeAttrs" in js
+    assert "function deviceTreeTypeLabel" in js
+    assert "function deviceTreeChildren" in js
+    assert 'data-tree-toggle-scope="${escapeHtml(scope)}"' in js
+    for scope in ("model", "faultDevice", "faultMeasurement", "mode", "runtime", "measurement"):
+        assert f'isDeviceTreeGroupCollapsed("{scope}", devType)' in js
+        assert f'deviceTreeTypeAttrs("{scope}", devType, isCollapsed)' in js
+    assert "dataset.treeToggleScope" in js
+    assert "dataset.treeToggleGroup" in js
+    assert "aria-expanded" in js
+    assert "tree-title" in css
+    assert "tree-toggle" in css
+    assert ".tree-type.is-collapsed .tree-toggle" in css
+
+
 def test_simulator_runtime_page_uses_device_tree_table_and_trace_chart():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
     html = (web_root / "index.html").read_text(encoding="utf-8")
@@ -928,6 +955,7 @@ def test_simulator_runtime_page_uses_device_tree_table_and_trace_chart():
     assert 'id="runtimeDeviceSummary"' in html
     assert 'id="runtimeTraceWindow"' in html
     assert 'id="runtimeTraceChart"' in html
+    assert 'aria-label="控制指令设备树"' in html
     assert '<option value="120">2小时</option>' in html
     assert 'data-runtime-role="device-table"' in html
     assert 'data-runtime-role="trace-chart"' in html

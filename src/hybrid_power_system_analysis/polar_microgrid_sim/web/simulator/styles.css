@@ -683,6 +683,35 @@ input[type="range"] { padding: 0; accent-color: var(--teal); }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.tree-title {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.tree-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-toggle {
+  width: 0;
+  height: 0;
+  flex: 0 0 auto;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid currentColor;
+  opacity: 0.72;
+  transform: translateY(1px);
+}
+.tree-type.is-collapsed .tree-toggle {
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 6px solid currentColor;
+  border-right: 0;
+  transform: translateX(1px);
+}
 .tree-node strong,
 .tree-node small {
   color: var(--muted);
