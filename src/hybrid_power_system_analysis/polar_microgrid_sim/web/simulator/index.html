@@ -13,37 +13,39 @@
           <span class="brand-mark"></span>
           <div>
             <h1>极地微电网模拟台</h1>
-            <p id="runtimePath">runtime</p>
           </div>
         </div>
-        <label class="model-switcher">显示模型
-          <select id="modelSelector">
-            <option value="">默认模型</option>
-          </select>
-          <span id="activeModelName">默认模型</span>
-        </label>
+        <div class="model-toolbar">
+          <label class="model-switcher">显示模型
+            <select id="modelSelector">
+              <option value="">默认模型</option>
+            </select>
+            <span id="activeModelName">默认模型</span>
+          </label>
+          <button id="cloneModelButton" class="model-clone-button" type="button">复制新模型</button>
+        </div>
         <div class="clock-strip">
           <div class="clock-readout">
             <span id="simState">stopped</span>
             <strong id="simTime">00:00:00</strong>
             <small id="simSpeed">x1</small>
           </div>
-          <button class="icon-button" data-clock="start" title="启动">
+          <button class="icon-button" type="button" data-clock="start" title="启动" aria-pressed="false">
             <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
           </button>
-          <button class="icon-button" data-clock="pause" title="暂停">
+          <button class="icon-button" type="button" data-clock="pause" title="暂停" aria-pressed="false">
             <svg viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z" /></svg>
           </button>
-          <button class="icon-button" data-clock="stop" title="停止">
+          <button class="icon-button" type="button" data-clock="stop" title="停止" aria-pressed="true">
             <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
           </button>
-          <button class="icon-button" data-clock="step" title="单步">
+          <button class="icon-button" type="button" data-clock="step" title="单步">
             <svg viewBox="0 0 24 24"><path d="M5 5v14l9-7-9-7zm11 0h3v14h-3z" /></svg>
           </button>
-          <button class="icon-button" data-clock="slower" title="减速">
+          <button class="icon-button" type="button" data-clock="slower" title="减速">
             <svg viewBox="0 0 24 24"><path d="M11 7 6 12l5 5V7zm7 0-5 5 5 5V7z" /></svg>
           </button>
-          <button class="icon-button" data-clock="faster" title="加速">
+          <button class="icon-button" type="button" data-clock="faster" title="加速">
             <svg viewBox="0 0 24 24"><path d="m6 7 5 5-5 5V7zm7 0 5 5-5 5V7z" /></svg>
           </button>
         </div>
@@ -483,6 +485,26 @@
           </section>
         </section>
       </main>
+
+      <div id="cloneModelDialog" class="modal-backdrop" hidden>
+        <form id="cloneModelForm" class="modal-card" aria-modal="true" role="dialog" aria-labelledby="cloneModelTitle">
+          <div class="modal-head">
+            <h2 id="cloneModelTitle">复制新模型</h2>
+            <button id="closeCloneModelDialog" class="icon-button" type="button" title="关闭">
+              <svg viewBox="0 0 24 24"><path d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4 17.6 5 12 10.6z" /></svg>
+            </button>
+          </div>
+          <label class="modal-field">模型名称
+            <input id="cloneModelName" name="cloneModelName" type="text" autocomplete="off" required />
+          </label>
+          <p id="cloneModelHint" class="modal-hint">将复制当前模型文件夹中的模型、曲线、状态、量测、指令与运行结果。</p>
+          <p id="cloneModelMessage" class="modal-message" aria-live="polite"></p>
+          <div class="modal-actions">
+            <button id="cancelCloneModel" type="button">取消</button>
+            <button id="confirmCloneModel" class="primary" type="submit">复制</button>
+          </div>
+        </form>
+      </div>
     </div>
     <script src="./app.js"></script>
   </body>

@@ -49,6 +49,7 @@ STAT_HEADERS = {
 }
 
 INPUT_FILES = ("model.e", "meas.e", "stat.e", "weather.e", "device.e", "yt_ctrl.e")
+CLONE_FILES = INPUT_FILES + ("real.e", "scada.e", "curves.json", "local_settings.json", "commands.json")
 
 
 @dataclass
@@ -129,6 +130,10 @@ def _safe_model_id(value: Any) -> str:
     text = str(value or "default").strip()
     cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in text)
     return cleaned.strip("_") or "default"
+
+
+def _model_key(value: Any) -> str:
+    return _safe_model_id(value).casefold()
 
 
 def _make_book(blocks: Mapping[str, Tuple[Sequence[str], Sequence[Mapping[str, Any]]]]) -> EBook:
@@ -325,6 +330,7 @@ class PolarMicrogridSimulator:
         }
         self.curves_file = self.runtime_dir / "curves.json"
         self.settings_file = self.runtime_dir / "local_settings.json"
+        self.commands_file = self.runtime_dir / "commands.json"
 
         self._copy_runtime_inputs()
         self.weather_defaults = self._read_weather_defaults()
@@ -333,16 +339,39 @@ class PolarMicrogridSimulator:
             self.settings_file,
             {"device_faults": [], "measurement_faults": [], "modes": []},
         )
+        self.command_history = self._read_command_history()
         self._ensure_stat_file()
 
     def _copy_runtime_inputs(self) -> None:
-        for name in INPUT_FILES:
+        for name in CLONE_FILES:
             source = self.sim_dir / name
             target = self.runtime_dir / name
             if source.exists():
                 shutil.copy2(source, target)
         if not self.files["weather"].exists():
             self._write_weather_row(DEFAULT_WEATHER | {"time": minute_to_time(0)})
+
+    def _read_command_history(self) -> List[Dict[str, Any]]:
+        items = _read_json(self.commands_file, [])
+        if not isinstance(items, list):
+            return []
+        return [item for item in items[-200:] if isinstance(item, dict)]
+
+    def _write_command_history(self) -> None:
+        _write_json(self.commands_file, self.command_history[-200:])
+
+    def clone_files_to(self, target_dir: Path) -> None:
+        with self.lock:
+            _write_json(self.curves_file, self.curves)
+            _write_json(self.settings_file, self.local_settings)
+            self._write_command_history()
+            target_dir.mkdir(parents=True, exist_ok=False)
+            for name in CLONE_FILES:
+                source = self.runtime_dir / name
+                if not source.exists():
+                    source = self.sim_dir / name
+                if source.exists():
+                    shutil.copy2(source, target_dir / name)
 
     def _read_weather_defaults(self) -> Dict[str, float]:
         values = dict(DEFAULT_WEATHER)
@@ -452,6 +481,7 @@ class PolarMicrogridSimulator:
                 }
             )
             self.command_history = self.command_history[-200:]
+            self._write_command_history()
             return accepted
 
     def _expand_set_values(self, items: Iterable[Any]) -> List[Dict[str, Any]]:
@@ -548,6 +578,7 @@ class PolarMicrogridSimulator:
                 self.clock.state = "stopped"
                 self.clock.absolute_minute = 0
                 self.clock.minute = 0
+                self.clock.speed = 1.0
             elif action in ("faster", "speed_up"):
                 self.clock.speed = min(3600.0, self.clock.speed * 2.0)
             elif action in ("slower", "speed_down"):
@@ -904,13 +935,23 @@ class MultiModelSimulator:
         period_seconds: float = 60.0,
         noise_std: Optional[float] = None,
         random_seed: Optional[int] = None,
+        models_root: str | Path | None = None,
+        directory_backed: bool = False,
     ) -> None:
         self.runtime_dir = Path(runtime_dir).resolve()
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        normalized_specs = self._unique_specs([self._normalize_spec(raw_spec) for raw_spec in specs])
+        self.models_root = Path(models_root).resolve() if models_root else self._infer_models_root(normalized_specs)
+        self.models_root.mkdir(parents=True, exist_ok=True)
+        self.directory_backed = directory_backed
+        self.kernel = kernel
+        self.period_seconds = period_seconds
+        self.noise_std = noise_std
+        self.random_seed = random_seed
         self._services: Dict[str, PolarMicrogridSimulator] = {}
+        self.lock = threading.RLock()
         self.default_model_id = ""
-        for raw_spec in specs:
-            spec = self._normalize_spec(raw_spec)
+        for spec in normalized_specs:
             if spec.model_id in self._services:
                 raise ValueError(f"Duplicate simulation model id: {spec.model_id}")
             service = PolarMicrogridSimulator(
@@ -928,6 +969,28 @@ class MultiModelSimulator:
                 self.default_model_id = spec.model_id
         if not self._services:
             raise ValueError("At least one simulation model is required")
+
+    @staticmethod
+    def _unique_specs(specs: Sequence[SimulationModelSpec]) -> List[SimulationModelSpec]:
+        unique: List[SimulationModelSpec] = []
+        seen_keys: set[str] = set()
+        for spec in specs:
+            keys = {_model_key(spec.model_id), _model_key(spec.name or spec.model_id)}
+            if seen_keys.intersection(keys):
+                continue
+            unique.append(spec)
+            seen_keys.update(keys)
+        return unique
+
+    @staticmethod
+    def _infer_models_root(specs: Sequence[SimulationModelSpec]) -> Path:
+        if not specs:
+            return Path("models").resolve()
+        parents = [Path(spec.sim_dir).resolve().parent for spec in specs]
+        first = parents[0]
+        if all(parent == first for parent in parents):
+            return first
+        return Path(specs[0].sim_dir).resolve().parent
 
     @staticmethod
     def _normalize_spec(raw_spec: SimulationModelSpec | Mapping[str, Any]) -> SimulationModelSpec:
@@ -948,9 +1011,11 @@ class MultiModelSimulator:
         period_seconds: float = 60.0,
         noise_std: Optional[float] = None,
         random_seed: Optional[int] = None,
+        models_dir: str | Path | None = None,
     ) -> "MultiModelSimulator":
         root = Path(sim_dir).resolve()
-        specs = cls._discover_specs(root)
+        models_root = Path(models_dir).resolve() if models_dir else root / "models"
+        specs = cls._discover_specs(root, models_root)
         return cls(
             specs,
             runtime_dir=runtime_dir,
@@ -958,10 +1023,26 @@ class MultiModelSimulator:
             period_seconds=period_seconds,
             noise_std=noise_std,
             random_seed=random_seed,
+            models_root=models_root,
+            directory_backed=True,
         )
 
     @staticmethod
-    def _discover_specs(root: Path) -> List[SimulationModelSpec]:
+    def _directory_specs(models_root: Path) -> List[SimulationModelSpec]:
+        if not models_root.exists():
+            return []
+        return [
+            SimulationModelSpec(child.name, child, child.name).normalized()
+            for child in sorted(models_root.iterdir(), key=lambda path: path.name.casefold())
+            if child.is_dir() and (child / "model.e").exists()
+        ]
+
+    @staticmethod
+    def _discover_specs(root: Path, models_root: Path) -> List[SimulationModelSpec]:
+        specs = MultiModelSimulator._directory_specs(models_root)
+        if specs:
+            return specs
+
         manifest = root / "models.json"
         if manifest.exists():
             payload = _read_json(manifest, [])
@@ -978,30 +1059,125 @@ class MultiModelSimulator:
             if specs:
                 return specs
 
-        models_dir = root / "models"
-        if models_dir.exists():
-            specs = [
-                SimulationModelSpec(child.name, child, child.name).normalized()
-                for child in sorted(models_dir.iterdir())
-                if child.is_dir() and (child / "model.e").exists()
-            ]
-            if specs:
-                return specs
+        specs: List[SimulationModelSpec] = []
+        if (root / "model.e").exists():
+            specs.append(SimulationModelSpec("default", root, "默认模型").normalized())
 
-        return [SimulationModelSpec("default", root, "默认模型").normalized()]
+        return specs or [SimulationModelSpec("default", root, "默认模型").normalized()]
+
+    def _make_service(self, spec: SimulationModelSpec) -> PolarMicrogridSimulator:
+        return PolarMicrogridSimulator(
+            sim_dir=spec.sim_dir,
+            runtime_dir=self.runtime_dir / spec.model_id,
+            kernel=self.kernel,
+            period_seconds=self.period_seconds,
+            noise_std=self.noise_std,
+            random_seed=self.random_seed,
+            model_id=spec.model_id,
+            model_name=spec.name,
+        )
+
+    def _sync_models_from_directory_locked(self) -> None:
+        specs = self._unique_specs(self._directory_specs(self.models_root))
+        if not specs:
+            return
+        ordered_ids: List[str] = []
+        for spec in specs:
+            ordered_ids.append(spec.model_id)
+            if spec.model_id not in self._services:
+                self._services[spec.model_id] = self._make_service(spec)
+            else:
+                self._services[spec.model_id].model_name = spec.name
+        self._services = {model_id: self._services[model_id] for model_id in ordered_ids}
+        if self.default_model_id not in self._services:
+            self.default_model_id = ordered_ids[0]
+
+    def clone_model(self, source_model_id: Optional[str], new_model_id: Any) -> Dict[str, Any]:
+        with self.lock:
+            source = self.service_for(source_model_id)
+            target_id = _safe_model_id(new_model_id)
+            target_keys = {_model_key(new_model_id), _model_key(target_id)}
+            existing_keys = {
+                key
+                for service in self._services.values()
+                for key in (_model_key(service.model_id), _model_key(service.model_name))
+            }
+            if existing_keys.intersection(target_keys):
+                raise ValueError(f"模型已存在: {target_id}")
+            target_dir = (self.models_root / target_id).resolve()
+            try:
+                target_dir.relative_to(self.models_root)
+            except ValueError as exc:
+                raise ValueError(f"模型名称无效: {new_model_id}") from exc
+            if target_dir.exists():
+                raise ValueError(f"模型文件夹已存在: {target_id}")
+
+            source.clone_files_to(target_dir)
+            service = PolarMicrogridSimulator(
+                sim_dir=target_dir,
+                runtime_dir=self.runtime_dir / target_id,
+                kernel=self.kernel,
+                period_seconds=self.period_seconds,
+                noise_std=self.noise_std,
+                random_seed=self.random_seed,
+                model_id=target_id,
+                model_name=target_id,
+            )
+            with source.lock:
+                service.command_history = [
+                    json.loads(json.dumps(item, ensure_ascii=False, default=str)) for item in source.command_history[-200:]
+                ]
+                service._write_command_history()
+                service.latest_result = json.loads(json.dumps(source.latest_result, ensure_ascii=False, default=str))
+                service.latest_measurements = json.loads(
+                    json.dumps(source.latest_measurements, ensure_ascii=False, default=str)
+                )
+            self._services[target_id] = service
+            self._append_manifest_model(target_id, target_dir)
+            return service.model_info()
+
+    def _append_manifest_model(self, model_id: str, sim_dir: Path) -> None:
+        manifest = self.models_root.parent / "models.json"
+        if not manifest.exists():
+            return
+        payload = _read_json(manifest, {"models": []})
+        is_mapping = isinstance(payload, Mapping)
+        items = payload.get("models", []) if is_mapping else payload
+        if not isinstance(items, list):
+            items = []
+        if any(isinstance(item, Mapping) and _safe_model_id(item.get("id", item.get("model_id", ""))) == model_id for item in items):
+            return
+        try:
+            rel_dir = sim_dir.relative_to(self.models_root.parent).as_posix()
+        except ValueError:
+            rel_dir = str(sim_dir)
+        items.append({"id": model_id, "name": model_id, "sim_dir": rel_dir})
+        if is_mapping:
+            payload = dict(payload)
+            payload["models"] = items
+        else:
+            payload = items
+        _write_json(manifest, payload)
 
     def service_for(self, model_id: Optional[str] = None) -> PolarMicrogridSimulator:
-        target = _safe_model_id(model_id or self.default_model_id)
-        service = self._services.get(target)
+        with self.lock:
+            if self.directory_backed:
+                self._sync_models_from_directory_locked()
+            target = _safe_model_id(model_id or self.default_model_id)
+            service = self._services.get(target)
         if service is None:
             raise KeyError(f"Unknown simulation model: {model_id}")
         return service
 
     def iter_services(self) -> List[PolarMicrogridSimulator]:
-        return list(self._services.values())
+        with self.lock:
+            return list(self._services.values())
 
     def models(self) -> List[Dict[str, Any]]:
-        return [service.model_info() for service in self.iter_services()]
+        with self.lock:
+            if self.directory_backed:
+                self._sync_models_from_directory_locked()
+            return [service.model_info() for service in self._services.values()]
 
     def snapshot(self, model_id: Optional[str] = None) -> Dict[str, Any]:
         return self.service_for(model_id).snapshot()

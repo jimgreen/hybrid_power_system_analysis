@@ -53,6 +53,194 @@ const LOAD_CURVE_META = { label: "负荷", color: "#c93a3a", min: 0, max: 500, d
 const LOAD_CURVE_COLORS = ["#c93a3a", "#8a4fbf", "#23854a", "#d16300", "#4369b2", "#0a8b8b"];
 const CURVE_PLOT = { left: 58, right: 24, top: 46, bottom: 34 };
 
+function renderClock(clock) {
+  if (!clock) return;
+  $("simState").textContent = clock.state || "stopped";
+  $("simTime").textContent = clock.time || "00:00:00";
+  $("simSpeed").textContent = `x${clock.speed ?? 1}`;
+  const readout = document.querySelector(".clock-readout");
+  if (readout) {
+    readout.dataset.clockState = clock.state || "stopped";
+  }
+  document.querySelectorAll("[data-clock]").forEach((button) => {
+    const action = button.dataset.clock;
+    const isActive =
+      (action === "start" && clock.state === "running") ||
+      (action === "pause" && clock.state === "paused") ||
+      (action === "stop" && clock.state === "stopped");
+    button.classList.toggle("is-active", isActive);
+    if (["start", "pause", "stop"].includes(action)) {
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    }
+  });
+}
+
+function setClockButtonsBusy(isBusy) {
+  document.querySelectorAll("[data-clock]").forEach((button) => {
+    button.disabled = isBusy;
+    button.classList.toggle("is-busy", isBusy);
+  });
+}
+
+async function controlClock(action) {
+  setClockButtonsBusy(true);
+  try {
+    const clock = await api("/api/clock", { method: "POST", body: JSON.stringify({ action }) });
+    renderClock(clock);
+    await refresh();
+  } catch (error) {
+    $("simState").textContent = "error";
+    $("solverInfo").textContent = "时钟控制失败";
+    throw error;
+  } finally {
+    setClockButtonsBusy(false);
+  }
+}
+
+function setCloneModelMessage(text, kind = "") {
+  const message = $("cloneModelMessage");
+  if (!message) return;
+  message.textContent = text || "";
+  message.classList.toggle("is-error", kind === "error");
+  message.classList.toggle("is-ok", kind === "ok");
+}
+
+function setCloneConfirmEnabled(isEnabled) {
+  const confirm = $("confirmCloneModel");
+  if (confirm) confirm.disabled = !isEnabled;
+}
+
+function validateCloneModelName(showBlank = false) {
+  const input = $("cloneModelName");
+  const name = String(input?.value || "").trim();
+  if (!name) {
+    setCloneConfirmEnabled(false);
+    setCloneModelMessage(showBlank ? "请输入新模型名称。" : "", showBlank ? "error" : "");
+    return false;
+  }
+  if (isModelNameTaken(name)) {
+    setCloneConfirmEnabled(false);
+    setCloneModelMessage(`模型已存在：${name}`, "error");
+    return false;
+  }
+  setCloneConfirmEnabled(true);
+  setCloneModelMessage("");
+  return true;
+}
+
+function openCloneModelDialog() {
+  const dialog = $("cloneModelDialog");
+  const input = $("cloneModelName");
+  if (!dialog || !input) return;
+  input.value = modelCloneDefaultName();
+  validateCloneModelName();
+  dialog.hidden = false;
+  requestAnimationFrame(() => {
+    input.focus();
+    input.select();
+  });
+}
+
+function closeCloneModelDialog() {
+  const dialog = $("cloneModelDialog");
+  if (dialog) dialog.hidden = true;
+}
+
+function apiErrorText(error) {
+  try {
+    return JSON.parse(error.message)?.error || error.message;
+  } catch (_parseError) {
+    return error.message || "操作失败";
+  }
+}
+
+function modelKey(value) {
+  const text = String(value ?? "").trim();
+  const cleaned = Array.from(text).map((char) => (
+    /[\p{L}\p{N}_-]/u.test(char) ? char : "_"
+  )).join("").replace(/^_+|_+$/g, "");
+  return (cleaned || "default").toLocaleLowerCase();
+}
+
+function normalizeModels(models) {
+  const seen = new Set();
+  const unique = [];
+  (models || []).forEach((model) => {
+    const keys = [modelKey(model.id), modelKey(model.name || model.id)];
+    if (keys.some((key) => seen.has(key))) return;
+    keys.forEach((key) => seen.add(key));
+    unique.push(model);
+  });
+  return unique;
+}
+
+function isModelNameTaken(name) {
+  const key = modelKey(name);
+  return normalizeModels(state.models).some((model) => (
+    modelKey(model.id) === key || modelKey(model.name || model.id) === key
+  ));
+}
+
+function uniqueCloneName(baseName) {
+  const base = String(baseName || "model").trim().replace(/\s+/g, "_") || "model";
+  const taken = new Set();
+  normalizeModels(state.models).forEach((model) => {
+    taken.add(modelKey(model.id));
+    taken.add(modelKey(model.name || model.id));
+  });
+  const first = `${base}_copy`;
+  if (!taken.has(modelKey(first))) return first;
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base}_copy_${index}`;
+    if (!taken.has(modelKey(candidate))) return candidate;
+  }
+  return `${base}_copy_${Date.now()}`;
+}
+
+function modelCloneDefaultName() {
+  const active = state.models.find((model) => model.id === state.activeModelId) || state.models[0] || {};
+  const base = String(active.name || active.id || "model").replace(/\s+/g, "_");
+  return uniqueCloneName(base);
+}
+
+function setCloneModelBusy(isBusy) {
+  const confirm = $("confirmCloneModel");
+  const button = $("cloneModelButton");
+  const input = $("cloneModelName");
+  if (confirm) {
+    confirm.disabled = isBusy;
+    confirm.textContent = isBusy ? "复制中" : "复制";
+  }
+  if (button) button.disabled = isBusy;
+  if (input) input.disabled = isBusy;
+}
+
+async function cloneCurrentModel() {
+  const input = $("cloneModelName");
+  const name = String(input?.value || "").trim();
+  if (!validateCloneModelName(true)) {
+    input?.focus();
+    return;
+  }
+  setCloneModelBusy(true);
+  setCloneModelMessage("正在复制模型文件夹...");
+  try {
+    const result = await api("/api/models/clone", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    state.models = normalizeModels(Array.isArray(result.models) ? result.models : []);
+    const newModelId = result.model?.id || result.active_model_id || name;
+    closeCloneModelDialog();
+    setActiveModel(newModelId, true);
+  } catch (error) {
+    setCloneModelMessage(apiErrorText(error), "error");
+  } finally {
+    setCloneModelBusy(false);
+    if (!$("cloneModelDialog").hidden) validateCloneModelName();
+  }
+}
+
 function pageFromHash() {
   const fallback = document.querySelector(".app-shell")?.dataset.defaultPage || "overview";
   return (location.hash || "").replace("#", "") || fallback;
@@ -113,6 +301,7 @@ async function api(path, options = {}) {
 function renderModelSelector() {
   const selector = $("modelSelector");
   if (!selector) return;
+  state.models = normalizeModels(state.models);
   const models = state.models.length ? state.models : [{ id: state.activeModelId || "", name: "默认模型" }];
   selector.innerHTML = models.map((model) => `
     <option value="${escapeHtml(model.id)}">${escapeHtml(model.name || model.id)}</option>
@@ -162,7 +351,7 @@ function setActiveModel(modelId, shouldRefresh = true) {
 async function loadModels() {
   try {
     const catalog = await api("/api/models", { modelScoped: false });
-    state.models = Array.isArray(catalog.models) ? catalog.models : [];
+    state.models = normalizeModels(Array.isArray(catalog.models) ? catalog.models : []);
     const preferred = state.activeModelId || catalog.active_model_id || state.models[0]?.id || "";
     const exists = state.models.some((model) => model.id === preferred);
     setActiveModel(exists ? preferred : state.models[0]?.id || "", false);
@@ -1138,10 +1327,7 @@ function renderSnapshot(snapshot) {
     state.activeModelId = snapshot.model.id;
   }
   renderModelSelector();
-  $("simState").textContent = snapshot.clock.state;
-  $("simTime").textContent = snapshot.clock.time;
-  $("simSpeed").textContent = `x${snapshot.clock.speed}`;
-  $("runtimePath").textContent = snapshot.summary.runtime_dir || "runtime";
+  renderClock(snapshot.clock);
   $("metricScada").textContent = snapshot.summary.scada_count;
   $("metricCommands").textContent = snapshot.summary.command_count;
   $("metricAlarms").textContent = snapshot.summary.alarm_count;
@@ -1807,12 +1993,34 @@ function runtimeTraceWindowPoints() {
   return history.filter((point) => point.minute >= range.startMinute && point.minute <= range.endMinute);
 }
 
+function traceAxisStepMinutes(windowMinutes) {
+  const minutes = Math.max(1, Number(windowMinutes) || 60);
+  if (minutes <= 15) return 5;
+  if (minutes <= 60) return 15;
+  if (minutes <= 180) return 30;
+  if (minutes <= 360) return 60;
+  if (minutes <= 1440) return 240;
+  return Math.max(60, Math.round(minutes / 6 / 60) * 60);
+}
+
+function alignedTraceWindowRange(history, windowMinutes, fallbackMinute) {
+  const axisStepMinutes = traceAxisStepMinutes(windowMinutes);
+  const latestMinute = history.length ? history[history.length - 1].minute : fallbackMinute;
+  const endMinute = Math.ceil(latestMinute / axisStepMinutes) * axisStepMinutes;
+  return {
+    startMinute: endMinute - windowMinutes,
+    endMinute,
+    latestMinute,
+    windowMinutes,
+    axisStepMinutes,
+  };
+}
+
 function runtimeTraceWindowRange() {
   const history = state.runtimeTraceHistory || [];
   const windowMinutes = Math.max(1, Number(state.runtimeTraceWindowMinutes) || 60);
   const fallbackMinute = Number(state.snapshot?.clock?.absolute_minute ?? state.snapshot?.clock?.minute ?? 0) || 0;
-  const endMinute = history.length ? history[history.length - 1].minute : fallbackMinute;
-  return { startMinute: endMinute - windowMinutes, endMinute, windowMinutes };
+  return alignedTraceWindowRange(history, windowMinutes, fallbackMinute);
 }
 
 function runtimeFormatClockMinute(minute) {
@@ -1822,23 +2030,23 @@ function runtimeFormatClockMinute(minute) {
   return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:00`;
 }
 
-function runtimeFormatWindowSpan(minutes) {
-  if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60}小时`;
-  return `${minutes}分钟`;
-}
-
 function runtimeAxisTickLabel(minute, range, index, lastIndex) {
-  if (index === 0) return `-${runtimeFormatWindowSpan(range.windowMinutes)}`;
   if (index === lastIndex) return runtimeFormatClockMinute(range.endMinute);
   return runtimeFormatClockMinute(minute);
 }
 
 function runtimeTraceAxisTicks(range, canvasWidth) {
-  const tickCount = canvasWidth < 480 ? 3 : canvasWidth < 760 ? 4 : 6;
-  return Array.from({ length: tickCount }, (_unused, index) => {
-    const ratio = index / Math.max(1, tickCount - 1);
-    return range.startMinute + ratio * range.windowMinutes;
-  });
+  const maxTicks = canvasWidth < 480 ? 4 : canvasWidth < 760 ? 5 : 8;
+  let step = range.axisStepMinutes || traceAxisStepMinutes(range.windowMinutes);
+  while (Math.floor(range.windowMinutes / step) + 1 > maxTicks) {
+    step *= 2;
+  }
+  const ticks = [];
+  for (let minute = range.startMinute; minute <= range.endMinute + 1e-9; minute += step) {
+    ticks.push(minute);
+  }
+  if (ticks[ticks.length - 1] !== range.endMinute) ticks.push(range.endMinute);
+  return ticks;
 }
 
 function runtimeAggregateTracePoint(point, devices) {
@@ -2093,8 +2301,7 @@ function measurementTraceWindowRange() {
   const history = state.measurementTraceHistory || [];
   const windowMinutes = Math.max(1, Number(state.measurementTraceWindowMinutes) || 60);
   const fallbackMinute = Number(state.snapshot?.clock?.absolute_minute ?? state.snapshot?.clock?.minute ?? 0) || 0;
-  const endMinute = history.length ? history[history.length - 1].minute : fallbackMinute;
-  return { startMinute: endMinute - windowMinutes, endMinute, windowMinutes };
+  return alignedTraceWindowRange(history, windowMinutes, fallbackMinute);
 }
 
 function measurementTraceWindowPoints(key = state.selectedMeasurementKey) {
@@ -2971,10 +3178,23 @@ async function pushSettings() {
 }
 
 document.querySelectorAll("[data-clock]").forEach((button) => {
-  button.addEventListener("click", async () => {
-    await api("/api/clock", { method: "POST", body: JSON.stringify({ action: button.dataset.clock }) });
-    await refresh();
-  });
+  button.addEventListener("click", () => controlClock(button.dataset.clock));
+});
+$("cloneModelButton").addEventListener("click", openCloneModelDialog);
+$("closeCloneModelDialog").addEventListener("click", closeCloneModelDialog);
+$("cancelCloneModel").addEventListener("click", closeCloneModelDialog);
+$("cloneModelDialog").addEventListener("click", (event) => {
+  if (event.target.id === "cloneModelDialog") closeCloneModelDialog();
+});
+$("cloneModelForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  cloneCurrentModel();
+});
+$("cloneModelName").addEventListener("input", () => validateCloneModelName());
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("cloneModelDialog").hidden) {
+    closeCloneModelDialog();
+  }
 });
 
 $("generateDenseCurves").addEventListener("click", () => {

@@ -1,8 +1,12 @@
 import re
 import json
 import threading
+import time
+import uuid
 from urllib.request import Request, urlopen
 from pathlib import Path
+
+import pytest
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -444,6 +448,118 @@ def test_multi_model_manager_keeps_runtime_clock_and_settings_isolated():
     assert snapshot_b["summary"]["runtime_dir"].endswith("station_b")
 
 
+def test_multi_model_manager_clones_current_model_folder_and_runtime_state():
+    from simu.simu_loop import SimulationResult, write_measurement_snapshot
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator
+
+    sim_root = TMP_ROOT / f"clone_model_root_{uuid.uuid4().hex[:8]}"
+    runtime_dir = TMP_ROOT / f"clone_model_runtime_{uuid.uuid4().hex[:8]}"
+    _write_minimal_inputs(sim_root)
+
+    def fake_kernel(config):
+        write_measurement_snapshot(
+            config.real_file,
+            [],
+            [["1", "p_load", "ACLoad", "load_ac_1", "P_LOAD", "4.0", "1", "155.0"]],
+            [],
+        )
+        write_measurement_snapshot(
+            config.scada_file,
+            [],
+            [["1", "p_load", "ACLoad", "load_ac_1", "P_LOAD", "4.0", "1", "156.0"]],
+            [],
+        )
+        return SimulationResult(config.real_file, config.scada_file, 1, 0, 3, "fake")
+
+    manager = MultiModelSimulator.discover(sim_dir=sim_root, runtime_dir=runtime_dir, kernel=fake_kernel)
+    manager.set_curves(
+        {
+            "mode": "day",
+            "weather": [{"minute": 0, "wind_speed_mps": 31}],
+            "loads": {"load_ac_1": [{"minute": 0, "p_kw": 188}]},
+        },
+        model_id="default",
+    )
+    manager.set_local_settings(
+        {
+            "device_faults": [{"dev_type": "ACBreak", "dev_name": "sw_diesel_ac", "start_minute": 10}],
+            "measurement_faults": [{"name": "p_load", "fault_type": "dead"}],
+            "modes": [{"dev_type": "ACGenerator", "dev_name": "diesel_300kw", "mode": "PQ"}],
+        },
+        model_id="default",
+    )
+    manager.apply_student_commands(
+        {"set_values": [{"dev_type": "ACLoad", "dev_name": "load_ac_1", "set_type": "p_set", "set_value": 188}]},
+        source="student-01",
+        model_id="default",
+    )
+    manager.step("default")
+
+    clone_name = f"station_copy_{uuid.uuid4().hex[:8]}"
+    model = manager.clone_model("default", clone_name)
+    snapshot = manager.snapshot(clone_name)
+    clone_dir = sim_root / "models" / clone_name
+
+    assert model["id"] == clone_name
+    assert clone_dir.is_dir()
+    assert (clone_dir / "model.e").exists()
+    assert (clone_dir / "curves.json").exists()
+    assert (clone_dir / "local_settings.json").exists()
+    assert (clone_dir / "commands.json").exists()
+    assert snapshot["curves"]["weather"][0]["wind_speed_mps"] == 31
+    assert snapshot["settings"]["measurement_faults"][0]["fault_type"] == "dead"
+    assert snapshot["commands"]["history"][0]["source"] == "student-01"
+    assert snapshot["measurements"]["scada"][0]["value"] == 156.0
+
+
+def test_multi_model_manager_discovers_models_from_specified_subdirectories():
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator
+
+    sim_root = TMP_ROOT / f"specified_models_root_{uuid.uuid4().hex[:8]}"
+    runtime_dir = TMP_ROOT / f"specified_models_runtime_{uuid.uuid4().hex[:8]}"
+    models_dir = sim_root / "model_cases"
+    _write_minimal_inputs(sim_root)
+    _write_minimal_inputs(sim_root / "models" / "ignored_default_models_dir")
+    _write_minimal_inputs(models_dir / "station_b")
+    _write_minimal_inputs(models_dir / "station_a")
+    (sim_root / "models.json").write_text(
+        json.dumps({"models": [{"id": "stale_manifest_model", "sim_dir": "."}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    manager = MultiModelSimulator.discover(
+        sim_dir=sim_root,
+        runtime_dir=runtime_dir,
+        models_dir=models_dir,
+        kernel=lambda _config: None,
+    )
+    models = manager.models()
+
+    assert [model["id"] for model in models] == ["station_a", "station_b"]
+    assert manager.default_model_id == "station_a"
+    assert all(Path(model["sim_dir"]).parent == models_dir for model in models)
+
+
+def test_multi_model_manager_deduplicates_model_names_and_rejects_duplicate_clone_names():
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator
+
+    sim_root = TMP_ROOT / f"dedupe_model_root_{uuid.uuid4().hex[:8]}"
+    runtime_dir = TMP_ROOT / f"dedupe_model_runtime_{uuid.uuid4().hex[:8]}"
+    _write_minimal_inputs(sim_root)
+    _write_minimal_inputs(sim_root / "models" / "默认模型")
+    _write_minimal_inputs(sim_root / "models" / "默认模型_copy")
+
+    manager = MultiModelSimulator.discover(sim_dir=sim_root, runtime_dir=runtime_dir, kernel=lambda _config: None)
+    models = manager.models()
+
+    assert [model["id"] for model in models] == ["默认模型", "默认模型_copy"]
+    assert [model["name"] for model in models].count("默认模型") == 1
+    with pytest.raises(ValueError, match="模型已存在"):
+        manager.clone_model("默认模型", "默认模型")
+    with pytest.raises(ValueError, match="模型已存在"):
+        manager.clone_model("默认模型", "默认模型_copy")
+
+
 def test_http_server_routes_model_scoped_requests_to_independent_simulators():
     from hybrid_power_system_analysis.polar_microgrid_sim.server import make_http_server
     from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator, SimulationModelSpec
@@ -497,6 +613,79 @@ def test_http_server_routes_model_scoped_requests_to_independent_simulators():
     assert snapshot_b["model"]["id"] == "station_b"
 
 
+def test_http_server_can_clone_current_model_folder():
+    from hybrid_power_system_analysis.polar_microgrid_sim.server import make_http_server
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator
+
+    sim_root = TMP_ROOT / f"http_clone_root_{uuid.uuid4().hex[:8]}"
+    runtime_dir = TMP_ROOT / f"http_clone_runtime_{uuid.uuid4().hex[:8]}"
+    _write_minimal_inputs(sim_root)
+    manager = MultiModelSimulator.discover(sim_dir=sim_root, runtime_dir=runtime_dir, kernel=lambda _config: None)
+    server = make_http_server(("127.0.0.1", 0), manager, role="simulator")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    clone_name = f"station_http_copy_{uuid.uuid4().hex[:8]}"
+    try:
+        clone_payload = json.dumps({"name": clone_name}).encode("utf-8")
+        with urlopen(
+            Request(
+                f"{base_url}/api/models/clone?model_id=default",
+                data=clone_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=5,
+        ) as response:
+            cloned = json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{base_url}/api/models", timeout=5) as response:
+            models = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert cloned["model"]["id"] == clone_name
+    assert cloned["active_model_id"] == clone_name
+    assert clone_name in [item["id"] for item in models["models"]]
+    assert (sim_root / "models" / clone_name / "model.e").exists()
+
+
+def test_clock_worker_advances_running_clock_and_obeys_pause_stop():
+    from hybrid_power_system_analysis.polar_microgrid_sim.server import start_clock_worker
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
+
+    sim_dir = TMP_ROOT / "worker_clock_inputs"
+    runtime_dir = TMP_ROOT / "worker_clock_runtime"
+    _write_minimal_inputs(sim_dir)
+    service = PolarMicrogridSimulator(sim_dir=sim_dir, runtime_dir=runtime_dir, kernel=lambda _config: None)
+    stop_event = threading.Event()
+    worker = start_clock_worker(service, stop_event)
+    try:
+        service.control_clock({"action": "start", "speed": 10})
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and service.snapshot()["clock"]["minute"] < 2:
+            time.sleep(0.05)
+        running_clock = service.snapshot()["clock"]
+
+        service.control_clock({"action": "pause"})
+        paused_minute = service.snapshot()["clock"]["minute"]
+        time.sleep(0.25)
+        paused_clock = service.snapshot()["clock"]
+
+        stopped_clock = service.control_clock({"action": "stop"})
+    finally:
+        stop_event.set()
+        worker.join(timeout=2)
+
+    assert running_clock["minute"] >= 1
+    assert paused_clock["state"] == "paused"
+    assert paused_clock["minute"] == paused_minute
+    assert stopped_clock["state"] == "stopped"
+    assert stopped_clock["minute"] == 0
+    assert stopped_clock["speed"] == 1.0
+
+
 def test_web_consoles_are_split_into_home_and_topic_pages():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web"
     expected = {
@@ -534,6 +723,49 @@ def test_web_consoles_support_switching_between_independent_models():
         assert 'api("/api/models", { modelScoped: false })' in js
         assert "model_id" in js
         assert "model-switcher" in css
+
+
+def test_simulator_clock_buttons_are_actionable_controls():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+
+    clock_buttons = re.findall(r"<button\b[^>]*data-clock=\"([^\"]+)\"[^>]*>", html)
+    assert clock_buttons == ["start", "pause", "stop", "step", "slower", "faster"]
+    for button_html in re.findall(r"<button\b[^>]*data-clock=\"[^\"]+\"[^>]*>", html):
+        assert 'type="button"' in button_html
+    for action in ("start", "pause", "stop"):
+        pattern = rf"<button\b(?=[^>]*data-clock=\"{action}\")(?=[^>]*aria-pressed=\")[^>]*>"
+        assert re.search(pattern, html)
+
+    assert "function renderClock" in js
+    assert "function controlClock" in js
+    assert 'api("/api/clock", { method: "POST", body: JSON.stringify({ action }) })' in js
+    assert 'document.querySelectorAll("[data-clock]")' in js
+    assert "button.addEventListener(\"click\", () => controlClock(button.dataset.clock))" in js
+    assert "button.disabled = isBusy" in js
+    assert "button.setAttribute(\"aria-pressed\", isActive ? \"true\" : \"false\")" in js
+
+
+def test_simulator_can_clone_current_model_from_header():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="cloneModelButton"' in html
+    assert 'id="cloneModelDialog"' in html
+    assert 'id="cloneModelName"' in html
+    assert "复制新模型" in html
+    assert "function openCloneModelDialog" in js
+    assert "function cloneCurrentModel" in js
+    assert "function normalizeModels" in js
+    assert "function isModelNameTaken" in js
+    assert "function uniqueCloneName" in js
+    assert 'api("/api/models/clone"' in js
+    assert "setActiveModel(newModelId" in js
+    assert "model-toolbar" in css
+    assert "modal-backdrop" in css
 
 
 def test_simulator_curve_page_uses_dense_curve_editor_and_hourly_table():
@@ -711,6 +943,11 @@ def test_simulator_runtime_page_uses_device_tree_table_and_trace_chart():
     assert "function runtimeTraceWindowRange" in js
     assert "function runtimeTraceAxisTicks" in js
     assert "function runtimeAxisTickLabel" in js
+    assert "function traceAxisStepMinutes" in js
+    assert "function alignedTraceWindowRange" in js
+    assert "axisStepMinutes" in js
+    assert "Math.ceil(latestMinute / axisStepMinutes)" in js
+    assert "runtimeFormatWindowSpan" not in js
     assert "xForMinute" in js
     assert "data-runtime-tree-type" in js
     assert "data-runtime-tree-name" in js
@@ -763,6 +1000,7 @@ def test_simulator_has_runtime_log_and_realtime_measurement_pages():
     assert "function measurementTraceWindowRange" in js
     assert "function measurementTraceWindowPoints" in js
     assert "function drawMeasurementTraceChart" in js
+    assert "alignedTraceWindowRange(history, windowMinutes, fallbackMinute)" in js
     assert "function initMeasurementMonitor" in js
     assert "function renderMeasurementCompareTable" in js
     assert "data-measurement-select-key" in js

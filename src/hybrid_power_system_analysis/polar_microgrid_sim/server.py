@@ -20,6 +20,7 @@ from hybrid_power_system_analysis.simu import simu_loop
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 WEB_DIR = PACKAGE_DIR / "web"
+CLOCK_BASE_INTERVAL_SECONDS = 1.0
 
 
 class JsonApiError(Exception):
@@ -136,6 +137,21 @@ def make_http_server(
         def _handle_api_post(self) -> None:
             path = urlparse(self.path).path
             payload = self._read_json_body()
+            if path == "/api/models/clone":
+                if not hasattr(service, "clone_model"):
+                    raise JsonApiError(400, "Current simulator does not support multiple model folders")
+                model_name = payload.get("name", payload.get("model_name", payload.get("new_model_id", "")))
+                if not str(model_name or "").strip():
+                    raise JsonApiError(400, "New model name is required")
+                try:
+                    model = service.clone_model(self._request_model_id(payload), model_name)  # type: ignore[union-attr]
+                except ValueError as exc:
+                    raise JsonApiError(400, str(exc)) from exc
+                catalog = dict(self._model_catalog())
+                catalog["active_model_id"] = model["id"]
+                self._send_json({"model": model, **catalog})
+                return
+
             target = self._target_service(payload)
             if path == "/api/student/commands":
                 self._send_json(target.apply_student_commands(payload, source=str(payload.get("source", "student"))))
@@ -235,25 +251,49 @@ def make_http_server(
     return server
 
 
+def _advance_clock_if_due(service: PolarMicrogridSimulator, last_step: float) -> float:
+    clock = service.snapshot()["clock"]
+    if clock["state"] != "running":
+        return time.monotonic()
+    interval = max(0.05, CLOCK_BASE_INTERVAL_SECONDS / max(float(clock["speed"]), 0.1))
+    now = time.monotonic()
+    if now - last_step >= interval:
+        try:
+            service.step()
+        except Exception:
+            service.control_clock({"action": "pause"})
+        return now
+    return last_step
+
+
 def start_clock_worker(service: PolarMicrogridSimulator, stop_event: threading.Event) -> threading.Thread:
     def worker() -> None:
         last_step = time.monotonic()
         while not stop_event.is_set():
-            clock = service.snapshot()["clock"]
-            if clock["state"] == "running":
-                interval = max(0.05, 60.0 / max(float(clock["speed"]), 0.1))
-                now = time.monotonic()
-                if now - last_step >= interval:
-                    try:
-                        service.step()
-                    except Exception:
-                        service.control_clock({"action": "pause"})
-                    last_step = now
-            else:
-                last_step = time.monotonic()
+            last_step = _advance_clock_if_due(service, last_step)
             stop_event.wait(0.05)
 
     thread = threading.Thread(target=worker, name=f"polar-microgrid-clock-{service.model_id}", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_multi_model_clock_worker(service: MultiModelSimulator, stop_event: threading.Event) -> threading.Thread:
+    def worker() -> None:
+        last_steps: dict[str, float] = {}
+        while not stop_event.is_set():
+            current_ids = set()
+            for item in service.iter_services():
+                current_ids.add(item.model_id)
+                last_steps[item.model_id] = _advance_clock_if_due(
+                    item,
+                    last_steps.get(item.model_id, time.monotonic()),
+                )
+            for stale_id in set(last_steps) - current_ids:
+                last_steps.pop(stale_id, None)
+            stop_event.wait(0.05)
+
+    thread = threading.Thread(target=worker, name="polar-microgrid-clock-models", daemon=True)
     thread.start()
     return thread
 
@@ -263,7 +303,7 @@ def start_clock_workers(
     stop_event: threading.Event,
 ) -> list[threading.Thread]:
     if hasattr(service, "iter_services"):
-        return [start_clock_worker(item, stop_event) for item in service.iter_services()]  # type: ignore[union-attr]
+        return [start_multi_model_clock_worker(service, stop_event)]  # type: ignore[arg-type]
     return [start_clock_worker(service, stop_event)]  # type: ignore[arg-type]
 
 
@@ -273,6 +313,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--sim-dir", default=str(simu_loop.SIMU_DIR))
+    parser.add_argument("--models-dir", default=None, help="Directory whose direct subfolders are simulation models.")
     parser.add_argument("--runtime-dir", default=None)
     parser.add_argument("--sim-url", default=None, help="Simulator API base URL for trainee proxy mode.")
     parser.add_argument("--static-root", default=None)
@@ -292,6 +333,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         runtime_dir=runtime_dir,
         noise_std=args.noise_std,
         random_seed=args.seed,
+        models_dir=args.models_dir,
     )
     server = make_http_server(
         (args.host, port),
@@ -304,6 +346,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     workers = [] if args.no_worker else start_clock_workers(service, stop_event)
     print(f"{args.role} console: http://{args.host}:{port}/")
     print(f"runtime dir: {runtime_dir}")
+    print(f"models dir: {service.models_root}")
     print(f"models: {', '.join(item['id'] for item in service.models())}")
     try:
         server.serve_forever()
