@@ -928,6 +928,7 @@ def test_simulator_runtime_page_uses_device_tree_table_and_trace_chart():
     assert 'id="runtimeDeviceSummary"' in html
     assert 'id="runtimeTraceWindow"' in html
     assert 'id="runtimeTraceChart"' in html
+    assert '<option value="120">2小时</option>' in html
     assert 'data-runtime-role="device-table"' in html
     assert 'data-runtime-role="trace-chart"' in html
     assert "控制指令" in html
@@ -944,9 +945,11 @@ def test_simulator_runtime_page_uses_device_tree_table_and_trace_chart():
     assert "function runtimeTraceAxisTicks" in js
     assert "function runtimeAxisTickLabel" in js
     assert "function traceAxisStepMinutes" in js
+    assert "function traceWindowAlignmentMinutes" in js
     assert "function alignedTraceWindowRange" in js
     assert "axisStepMinutes" in js
-    assert "Math.ceil(latestMinute / axisStepMinutes)" in js
+    assert "alignmentMinutes" in js
+    assert "Math.floor(latestMinute / alignmentMinutes)" in js
     assert "runtimeFormatWindowSpan" not in js
     assert "xForMinute" in js
     assert "data-runtime-tree-type" in js
@@ -979,6 +982,7 @@ def test_simulator_has_runtime_log_and_realtime_measurement_pages():
     assert 'id="measurementCompareTreeSummary"' in html
     assert 'id="measurementTraceWindow"' in html
     assert 'id="measurementTraceChart"' in html
+    assert '<option value="120">2小时</option>' in html
     assert 'data-measurement-role="trace-chart"' in html
     assert "运行日志" in html
     assert "量测值与真值" in html

@@ -2003,15 +2003,24 @@ function traceAxisStepMinutes(windowMinutes) {
   return Math.max(60, Math.round(minutes / 6 / 60) * 60);
 }
 
+function traceWindowAlignmentMinutes(windowMinutes) {
+  const minutes = Math.max(1, Number(windowMinutes) || 60);
+  if (minutes <= 15) return 15;
+  if (minutes <= 1440) return minutes;
+  return 1440;
+}
+
 function alignedTraceWindowRange(history, windowMinutes, fallbackMinute) {
+  const alignmentMinutes = traceWindowAlignmentMinutes(windowMinutes);
   const axisStepMinutes = traceAxisStepMinutes(windowMinutes);
   const latestMinute = history.length ? history[history.length - 1].minute : fallbackMinute;
-  const endMinute = Math.ceil(latestMinute / axisStepMinutes) * axisStepMinutes;
+  const startMinute = Math.floor(latestMinute / alignmentMinutes) * alignmentMinutes;
   return {
-    startMinute: endMinute - windowMinutes,
-    endMinute,
+    startMinute,
+    endMinute: startMinute + windowMinutes,
     latestMinute,
     windowMinutes,
+    alignmentMinutes,
     axisStepMinutes,
   };
 }
