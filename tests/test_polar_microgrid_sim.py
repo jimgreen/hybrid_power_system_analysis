@@ -224,6 +224,75 @@ def test_local_curves_faults_and_modes_are_projected_before_kernel_call():
     assert result["measurements"]["scada"][0]["value"] == 0.0
 
 
+def test_snapshot_exposes_measurement_definitions_before_first_step():
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
+
+    sim_dir = TMP_ROOT / "measurement_definition_inputs"
+    runtime_dir = TMP_ROOT / "measurement_definition_runtime"
+    _write_minimal_inputs(sim_dir)
+    service = PolarMicrogridSimulator(sim_dir=sim_dir, runtime_dir=runtime_dir, kernel=lambda _config: None)
+
+    snapshot = service.snapshot()
+
+    assert snapshot["measurements"]["definitions"][0]["name"] == "p_load"
+    assert snapshot["measurements"]["definitions"][0]["dev_name"] == "load_ac_1"
+
+
+def test_measurement_fault_normal_is_noop_and_dead_fault_can_use_median_value():
+    from simu.simu_loop import SimulationResult, write_measurement_snapshot
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
+
+    sim_dir = TMP_ROOT / "measurement_fault_inputs"
+    runtime_dir = TMP_ROOT / "measurement_fault_runtime"
+    _write_minimal_inputs(sim_dir)
+
+    def fake_kernel(config):
+        write_measurement_snapshot(
+            config.real_file,
+            [],
+            [["1", "p_load", "ACLoad", "load_ac_1", "P_LOAD", "4.0", "1", "123.4"]],
+            [],
+        )
+        write_measurement_snapshot(
+            config.scada_file,
+            [],
+            [["1", "p_load", "ACLoad", "load_ac_1", "P_LOAD", "4.0", "1", "124.0"]],
+            [],
+        )
+        return SimulationResult(config.real_file, config.scada_file, 1, 0, 3, "fake")
+
+    service = PolarMicrogridSimulator(sim_dir=sim_dir, runtime_dir=runtime_dir, kernel=fake_kernel)
+    service.set_local_settings(
+        {
+            "measurement_faults": [
+                {"name": "p_load", "fault_type": "normal", "start_minute": 0, "clear_minute": 2, "bias": 99}
+            ]
+        }
+    )
+    normal_result = service.step()
+
+    assert normal_result["measurements"]["scada"][0]["value"] == 124.0
+
+    service.control_clock({"action": "stop"})
+    service.set_local_settings(
+        {
+            "measurement_faults": [
+                {
+                    "name": "p_load",
+                    "fault_type": "dead",
+                    "start_minute": 0,
+                    "clear_minute": 2,
+                    "median": 88.8,
+                    "bias": 1.2,
+                }
+            ]
+        }
+    )
+    dead_result = service.step()
+
+    assert dead_result["measurements"]["scada"][0]["value"] == 90.0
+
+
 def test_http_server_exposes_snapshot_command_and_step_endpoints():
     from simu.simu_loop import SimulationResult, write_measurement_snapshot
     from hybrid_power_system_analysis.polar_microgrid_sim.server import make_http_server
@@ -287,7 +356,7 @@ def test_http_server_exposes_snapshot_command_and_step_endpoints():
 def test_web_consoles_are_split_into_home_and_topic_pages():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web"
     expected = {
-        "simulator": ["overview", "curves", "faults", "modes", "runtime"],
+        "simulator": ["overview", "curves", "faults", "modes", "runtime", "logs", "measurements"],
         "trainee": ["overview", "measurements", "controls", "commands", "history"],
     }
 
@@ -302,3 +371,107 @@ def test_web_consoles_are_split_into_home_and_topic_pages():
             assert f'data-nav-page="{page}"' in html
         assert "function showPage" in js
         assert "location.hash" in js
+
+
+def test_simulator_curve_page_uses_dense_curve_editor_and_hourly_table():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+
+    assert 'data-page="curves"' in html
+    assert 'id="curveEditorChart"' in html
+    assert 'id="hourlyCurveTable"' in html
+    assert 'id="saveCurves"' in html
+    assert 'data-curve-role="dense-chart"' in html
+    assert 'data-curve-role="hourly-table"' in html
+    assert "9760点" in html
+    assert "const CURVE_POINT_COUNT = 9760" in js
+    assert "function applyCurveDrag" in js
+    assert "function renderHourlyTable" in js
+    assert "function resizeCurveCanvas" in js
+    assert "contenteditable" in js
+    assert "saveCurves" in js
+
+
+def test_simulator_fault_page_uses_device_and_measurement_subtabs():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+
+    assert 'data-page="faults"' in html
+    assert 'data-fault-tab="devices"' in html
+    assert 'data-fault-tab="measurements"' in html
+    assert 'id="deviceFaultTable"' in html
+    assert 'id="measurementFaultTable"' in html
+    assert 'id="saveDeviceFaults"' in html
+    assert 'id="saveMeasurementFaults"' in html
+    assert "设备名称" in html
+    assert "运行状态" in html
+    assert "故障启始时刻" in html
+    assert "结束时刻" in html
+    assert "量测状态" in html
+    assert "正常" in html
+    assert "死数" in html
+    assert "0值" in html
+    assert "中值" in html
+    assert "误差" in html
+    assert "function setFaultTab" in js
+    assert "function renderDeviceFaultTable" in js
+    assert "function renderMeasurementFaultTable" in js
+    assert "data-device-field" in js
+    assert "data-meas-field" in js
+
+
+def test_simulator_mode_page_uses_device_tree_and_editable_mode_table():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'data-page="modes"' in html
+    assert 'class="mode-page-layout"' in html
+    assert 'id="modeDeviceTree"' in html
+    assert 'id="modeDeviceTable"' in html
+    assert 'id="pushModes"' in html
+    assert "设备树" in html
+    assert "设备名称" in html
+    assert "运行模式" in html
+    assert "function syncModesFromDevices" in js
+    assert "function renderModeDeviceTree" in js
+    assert "function renderModeDeviceTable" in js
+    assert "function setModeFilter" in js
+    assert "data-mode-tree-type" in js
+    assert "data-mode-device-index" in js
+    assert "data-mode-field" in js
+    assert "mode-page-layout" in css
+    assert "mode-tree-panel" in css
+    assert "mode-editor-table" in css
+
+
+def test_simulator_has_runtime_log_and_realtime_measurement_pages():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'data-nav-page="logs"' in html
+    assert 'data-nav-page="measurements"' in html
+    assert 'data-page="logs"' in html
+    assert 'data-page="measurements"' in html
+    assert 'id="runtimeLogTable"' in html
+    assert 'id="runtimeLogSummary"' in html
+    assert 'id="measurementCompareTable"' in html
+    assert 'id="measurementCompareSummary"' in html
+    assert "运行日志" in html
+    assert "量测值与真值" in html
+    assert "真值" in html
+    assert "量测值" in html
+    assert "偏差" in html
+    assert "function appendRuntimeLog" in js
+    assert "function renderRuntimeLogs" in js
+    assert "function measurementCompareRows" in js
+    assert "function renderMeasurementCompareTable" in js
+    assert "runtime-log-table" in js
+    assert "measurement-compare-table" in js
+    assert "runtime-log-wrap" in css
+    assert "measurement-compare-wrap" in css

@@ -153,6 +153,17 @@ h1 {
 .page-section.is-active {
   display: block;
 }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 .overview-grid {
   display: grid;
   grid-template-columns: 320px minmax(520px, 1fr) 320px;
@@ -220,6 +231,16 @@ h1 {
   font-size: 12px;
   color: var(--muted);
 }
+.panel-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.panel-actions span {
+  font-size: 12px;
+  color: var(--muted);
+}
 .metric-grid {
   margin: 12px 0 0;
   display: grid;
@@ -267,6 +288,217 @@ input[type="range"] { padding: 0; accent-color: var(--teal); }
 }
 .button-row button { flex: 1; }
 .visual-panel { min-height: 0; }
+.curve-page-layout {
+  display: grid;
+  grid-template-rows: minmax(440px, auto) minmax(220px, auto);
+  gap: 14px;
+}
+.curve-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.curve-toolbar label {
+  width: 220px;
+  margin: 0;
+  grid-template-columns: 72px 1fr;
+}
+#curveEditorChart {
+  height: 420px;
+  cursor: crosshair;
+  touch-action: none;
+}
+.curve-table-wrap {
+  max-height: calc(100vh - 610px);
+  min-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.curve-table th,
+.curve-table td {
+  text-align: right;
+}
+.curve-table th:first-child,
+.curve-table td:first-child {
+  text-align: left;
+}
+.curve-table th small {
+  display: block;
+  margin-top: 2px;
+  color: #8a989f;
+  font-size: 11px;
+  font-weight: 400;
+}
+.curve-table td[contenteditable="true"] {
+  color: var(--ink);
+  background: #fff;
+  outline: none;
+}
+.curve-table td[contenteditable="true"]:focus {
+  background: #eaf6f6;
+  box-shadow: inset 0 0 0 2px rgba(0, 140, 140, 0.38);
+}
+.fault-page-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sub-tabs {
+  display: inline-flex;
+  width: fit-content;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfdfe;
+}
+.sub-tabs button {
+  min-width: 96px;
+  color: var(--muted);
+}
+.sub-tabs button.is-active {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #fff;
+}
+.fault-tab-panel {
+  display: none;
+}
+.fault-tab-panel.is-active {
+  display: block;
+}
+.fault-table-wrap {
+  max-height: calc(100vh - 210px);
+  min-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.fault-editor-table th,
+.fault-editor-table td {
+  vertical-align: middle;
+}
+.fault-editor-table input,
+.fault-editor-table select {
+  min-width: 92px;
+  height: 30px;
+}
+.fault-editor-table input:disabled {
+  color: #9aa7ad;
+  background: #f5f8f9;
+}
+.fault-editor-table td:nth-child(3),
+.fault-editor-table td:nth-child(4),
+.fault-editor-table td:nth-child(5),
+.fault-editor-table td:nth-child(6),
+.fault-editor-table td:nth-child(7),
+.fault-editor-table td:nth-child(8),
+.fault-editor-table td:nth-child(9) {
+  width: 120px;
+}
+.mode-page-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.mode-tree-panel {
+  position: sticky;
+  top: 14px;
+}
+.device-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: calc(100vh - 190px);
+  overflow: auto;
+  padding-right: 2px;
+}
+.tree-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tree-children {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 6px 12px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+.tree-node {
+  width: 100%;
+  height: auto;
+  min-height: 34px;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-color: transparent;
+  background: #f7fafb;
+  color: var(--ink);
+  text-align: left;
+}
+.tree-node:hover,
+.tree-node.is-active {
+  border-color: rgba(0, 140, 140, 0.45);
+  background: #e8f6f6;
+  color: var(--teal-dark);
+}
+.tree-node span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-node strong,
+.tree-node small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.tree-type {
+  font-weight: 700;
+}
+.tree-child {
+  min-height: 30px;
+  background: #fff;
+  font-size: 12px;
+}
+.mode-table-panel {
+  min-width: 0;
+}
+.mode-table-wrap {
+  max-height: calc(100vh - 190px);
+  min-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.mode-editor-table th,
+.mode-editor-table td {
+  vertical-align: middle;
+}
+.mode-editor-table .device-name {
+  font-weight: 700;
+}
+.mode-editor-table select {
+  min-width: 84px;
+  height: 30px;
+}
+.empty-state {
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+}
 .chart-grid {
   display: grid;
   grid-template-columns: 2fr 1fr;
@@ -324,6 +556,38 @@ canvas {
 }
 .runtime-table {
   max-height: calc(100vh - 190px);
+}
+.runtime-log-wrap,
+.measurement-compare-wrap {
+  max-height: calc(100vh - 190px);
+  min-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.runtime-log-table th,
+.runtime-log-table td,
+.measurement-compare-table th,
+.measurement-compare-table td {
+  vertical-align: middle;
+}
+.runtime-log-table td:nth-child(5) {
+  min-width: 220px;
+}
+.numeric-cell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.mono-cell {
+  font-family: Consolas, "Microsoft YaHei", monospace;
+  font-variant-numeric: tabular-nums;
+}
+.diff-neutral {
+  color: var(--muted);
+}
+.diff-active {
+  color: var(--amber);
+  font-weight: 700;
 }
 table {
   width: 100%;
@@ -437,6 +701,52 @@ th {
   .settings {
     grid-column: auto;
     display: flex;
+  }
+  .curve-page-layout {
+    grid-template-rows: auto auto;
+  }
+  .curve-toolbar {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .curve-toolbar label {
+    width: auto;
+    grid-column: 1 / -1;
+  }
+  #curveEditorChart {
+    height: 300px;
+  }
+  .curve-table-wrap {
+    max-height: 320px;
+  }
+  .sub-tabs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+  .fault-table-wrap {
+    max-height: 520px;
+  }
+  .mode-page-layout {
+    grid-template-columns: 1fr;
+  }
+  .mode-tree-panel {
+    position: static;
+  }
+  .device-tree {
+    max-height: 260px;
+  }
+  .mode-table-wrap {
+    max-height: 520px;
+  }
+  .runtime-log-wrap,
+  .measurement-compare-wrap {
+    max-height: 560px;
+    min-height: 320px;
+  }
+  .panel-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
   .chart-grid { grid-template-columns: 1fr; }
   canvas { height: 220px; }

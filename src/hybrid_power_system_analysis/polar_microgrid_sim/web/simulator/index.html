@@ -49,6 +49,8 @@
         <button data-nav-page="faults">故障设置</button>
         <button data-nav-page="modes">运行模式</button>
         <button data-nav-page="runtime">计算监视</button>
+        <button data-nav-page="measurements">实时量测</button>
+        <button data-nav-page="logs">运行日志</button>
       </nav>
 
       <main class="page-main">
@@ -100,78 +102,102 @@
         </section>
 
         <section class="page-section" data-page="curves">
-          <div class="topic-layout">
-            <aside class="panel side-editor">
+          <div class="curve-page-layout">
+            <section class="panel visual-panel">
               <div class="panel-head">
-                <h2>典型日曲线</h2>
-                <span id="curveStatus">未写入</span>
+                <h2>天气与负荷曲线</h2>
+                <span><strong id="curvePointCount">9760点</strong> · <span id="curveStatus">未写入</span></span>
               </div>
-              <label>风速峰值 <input id="windPeak" type="range" min="0" max="50" value="38" /></label>
-              <label>太阳峰值 <input id="solarPeak" type="range" min="0" max="1100" value="720" /></label>
-              <label>气温均值 <input id="tempMean" type="range" min="-45" max="5" value="-18" /></label>
-              <label>负荷基准 <input id="loadBase" type="range" min="40" max="400" value="180" /></label>
-              <div class="button-row">
-                <button id="pushCurves" class="primary">写入曲线</button>
+              <div class="curve-toolbar">
+                <label>拖拽对象
+                  <select id="activeCurve">
+                    <option value="wind_speed_mps">风速</option>
+                    <option value="solar_irradiance_w_m2">太阳辐照</option>
+                    <option value="air_temp_c">气温</option>
+                    <option value="load_kw">负荷</option>
+                  </select>
+                </label>
+                <button id="generateDenseCurves">生成典型日</button>
                 <button id="randomCurves">扰动</button>
+                <button id="saveCurves" class="primary">保存</button>
               </div>
-            </aside>
-            <section class="panel visual-panel topic-content">
+              <canvas
+                id="curveEditorChart"
+                data-curve-role="dense-chart"
+                width="1500"
+                height="420"
+              ></canvas>
+            </section>
+
+            <section class="panel">
               <div class="panel-head">
-                <h2>天气与负荷</h2>
-                <span>96点</span>
+                <h2>小时数据表</h2>
+                <span>1小时间隔 · 可编辑</span>
               </div>
-              <div class="chart-grid">
-                <canvas id="weatherChart" width="720" height="260"></canvas>
-                <canvas id="loadChart" width="360" height="260"></canvas>
-              </div>
+              <div id="hourlyCurveTable" class="curve-table-wrap" data-curve-role="hourly-table"></div>
             </section>
           </div>
         </section>
 
         <section class="page-section" data-page="faults">
-          <div class="topic-layout two-column">
-            <section class="panel">
-              <div class="panel-head">
-                <h2>设备故障</h2>
-                <button id="addDeviceFault">添加</button>
-              </div>
-              <div class="form-grid">
-                <input id="faultDevType" placeholder="dev_type" value="ACBreak" />
-                <input id="faultDevName" placeholder="dev_name" value="sw_diesel_ac" />
-                <input id="faultStart" type="number" min="0" max="1439" value="60" />
-                <input id="faultClear" type="number" min="0" max="1439" value="120" />
-              </div>
-              <div id="deviceFaults" class="fault-list"></div>
+          <div class="fault-page-layout">
+            <div class="sub-tabs" role="tablist" aria-label="故障设置子页面">
+              <button data-fault-tab="devices" class="is-active" role="tab" aria-selected="true">设备</button>
+              <button data-fault-tab="measurements" role="tab" aria-selected="false">量测</button>
+            </div>
+
+            <section class="fault-tab-panel is-active" data-fault-panel="devices" role="tabpanel">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>设备故障</h2>
+                  <div class="panel-actions">
+                    <span id="deviceFaultSummary">待同步</span>
+                    <button id="saveDeviceFaults" class="primary">保存</button>
+                  </div>
+                </div>
+                <div class="sr-only">设备名称 运行状态 故障启始时刻 结束时刻</div>
+                <div id="deviceFaultTable" class="fault-table-wrap" data-fault-role="device-table"></div>
+              </section>
             </section>
 
-            <section class="panel">
-              <div class="panel-head">
-                <h2>量测故障</h2>
-                <button id="addMeasFault">添加</button>
-              </div>
-              <div class="form-grid">
-                <input id="measTarget" placeholder="量测名" value="p_load" />
-                <select id="measFaultType">
-                  <option value="dead">死数</option>
-                  <option value="zero">0值</option>
-                  <option value="bias">大偏差</option>
-                </select>
-                <input id="measStart" type="number" min="0" max="1439" value="180" />
-                <input id="measClear" type="number" min="0" max="1439" value="240" />
-              </div>
-              <div id="measFaults" class="fault-list"></div>
+            <section class="fault-tab-panel" data-fault-panel="measurements" role="tabpanel">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>量测故障</h2>
+                  <div class="panel-actions">
+                    <span id="measurementFaultSummary">待同步</span>
+                    <button id="saveMeasurementFaults" class="primary">保存</button>
+                  </div>
+                </div>
+                <div class="sr-only">量测状态 正常 死数 0值 中值 误差</div>
+                <div id="measurementFaultTable" class="fault-table-wrap" data-fault-role="measurement-table"></div>
+              </section>
             </section>
           </div>
         </section>
 
         <section class="page-section" data-page="modes">
-          <section class="panel narrow-page">
-            <div class="panel-head">
-              <h2>运行模式</h2>
-              <button id="pushModes">下发</button>
-            </div>
-            <div id="modeTable" class="mode-table mode-table-large"></div>
-          </section>
+          <div class="mode-page-layout">
+            <aside class="panel mode-tree-panel">
+              <div class="panel-head">
+                <h2>设备树</h2>
+                <span id="modeTreeSummary">0 类</span>
+              </div>
+              <div id="modeDeviceTree" class="device-tree" aria-label="运行模式设备树"></div>
+            </aside>
+
+            <section class="panel mode-table-panel">
+              <div class="panel-head">
+                <h2>运行模式</h2>
+                <div class="panel-actions">
+                  <span id="modeTableSummary">0 台设备</span>
+                  <button id="pushModes" class="primary">下发</button>
+                </div>
+              </div>
+              <div class="sr-only">设备类型 设备名称 当前状态 当前模式 运行模式</div>
+              <div id="modeDeviceTable" class="mode-table-wrap"></div>
+            </section>
+          </div>
         </section>
 
         <section class="page-section" data-page="runtime">
@@ -181,6 +207,32 @@
               <span id="solverInfo">待运行</span>
             </div>
             <div id="deviceTable" class="data-table runtime-table"></div>
+          </section>
+        </section>
+
+        <section class="page-section" data-page="measurements">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>量测值与真值</h2>
+              <span id="measurementCompareSummary">待同步</span>
+            </div>
+            <div class="sr-only">量测名称 设备 量测类型 真值 量测值 偏差 状态</div>
+            <div
+              id="measurementCompareTable"
+              class="measurement-compare-wrap"
+              data-measurement-role="compare-table"
+            ></div>
+          </section>
+        </section>
+
+        <section class="page-section" data-page="logs">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>运行日志</h2>
+              <span id="runtimeLogSummary">最近 0 条</span>
+            </div>
+            <div class="sr-only">记录时刻 仿真时刻 运行状态 求解器 量测 命令 告警</div>
+            <div id="runtimeLogTable" class="runtime-log-wrap" data-log-role="runtime-table"></div>
           </section>
         </section>
       </main>

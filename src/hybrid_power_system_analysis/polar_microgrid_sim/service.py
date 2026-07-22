@@ -647,13 +647,21 @@ class PolarMicrogridSimulator:
                 if not self._measurement_matches(row, fault):
                     continue
                 fault_type = str(fault.get("fault_type", fault.get("type", "bias"))).lower()
+                if fault_type in ("normal", "ok", "healthy", "none"):
+                    continue
                 current_value = _to_float(row[7], 0.0) or 0.0
                 if fault_type in ("zero", "0", "zero_value"):
                     row[7] = "0"
                 elif fault_type in ("dead", "deadband", "stuck", "stale"):
-                    row[7] = _number_text(self._last_scada_values.get(row_key, current_value))
+                    median = _to_float(
+                        fault.get("median", fault.get("middle", fault.get("fixed_value", fault.get("value")))),
+                        None,
+                    )
+                    bias = _to_float(fault.get("bias", fault.get("error", 0.0)), 0.0) or 0.0
+                    base_value = median if median is not None else self._last_scada_values.get(row_key, current_value)
+                    row[7] = _number_text(base_value + bias)
                 else:
-                    bias = _to_float(fault.get("bias", fault.get("offset", 10.0)), 10.0) or 0.0
+                    bias = _to_float(fault.get("bias", fault.get("error", fault.get("offset", 10.0))), 10.0) or 0.0
                     row[7] = _number_text(current_value + bias)
                 changed = True
         if changed:
@@ -694,13 +702,14 @@ class PolarMicrogridSimulator:
         }
 
     def measurements(self) -> Dict[str, List[Dict[str, Any]]]:
+        definitions = self._read_measurement_file(self.files["meas"])
         real = self._read_measurement_file(self.files["real"])
         scada = self._read_measurement_file(self.files["scada"])
         for item in scada:
             self._last_scada_values[
                 f"{item['name']}|{item['dev_type']}|{item['dev_name']}|{item['meas_type']}"
             ] = item.get("value", 0.0) or 0.0
-        return {"real": real, "scada": scada}
+        return {"definitions": definitions, "real": real, "scada": scada}
 
     def _read_measurement_file(self, path: Path) -> List[Dict[str, Any]]:
         if not path.exists():
@@ -792,7 +801,9 @@ class PolarMicrogridSimulator:
         return run_stats, cb_status, set_values, soc_values
 
     def snapshot(self) -> Dict[str, Any]:
-        measurements = self.latest_measurements or self.measurements()
+        measurements = dict(self.latest_measurements or self.measurements())
+        if "definitions" not in measurements:
+            measurements["definitions"] = self._read_measurement_file(self.files["meas"])
         return {
             "clock": self.clock.as_dict(),
             "files": {key: str(path) for key, path in self.files.items()},
