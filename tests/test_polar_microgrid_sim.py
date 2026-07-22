@@ -224,6 +224,37 @@ def test_local_curves_faults_and_modes_are_projected_before_kernel_call():
     assert result["measurements"]["scada"][0]["value"] == 0.0
 
 
+def test_year_curve_mode_uses_absolute_minute_for_weather_projection():
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
+
+    sim_dir = TMP_ROOT / "year_curve_inputs"
+    runtime_dir = TMP_ROOT / "year_curve_runtime"
+    _write_minimal_inputs(sim_dir)
+    observed = {}
+
+    def fake_kernel(config):
+        observed["weather"] = config.weather_file.read_text(encoding="utf-8")
+        return None
+
+    service = PolarMicrogridSimulator(sim_dir=sim_dir, runtime_dir=runtime_dir, kernel=fake_kernel)
+    service.set_curves(
+        {
+            "mode": "year",
+            "point_count": 8760,
+            "time_step_minutes": 60,
+            "weather": [
+                {"minute": 0, "wind_speed_mps": 10},
+                {"minute": 1440, "wind_speed_mps": 20},
+            ],
+            "loads": {},
+        }
+    )
+    service.control_clock({"minute": 1440})
+    service.step()
+
+    assert re.search(r"^#\s+00:00:00\s+20\b", observed["weather"], re.MULTILINE)
+
+
 def test_snapshot_exposes_measurement_definitions_before_first_step():
     from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
 
@@ -353,6 +384,119 @@ def test_http_server_exposes_snapshot_command_and_step_endpoints():
     assert snapshot["clock"]["minute"] == 1
 
 
+def test_multi_model_manager_keeps_runtime_clock_and_settings_isolated():
+    from simu.simu_loop import SimulationResult, write_measurement_snapshot
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator, SimulationModelSpec
+
+    sim_a = TMP_ROOT / "multi_inputs_a"
+    sim_b = TMP_ROOT / "multi_inputs_b"
+    runtime_dir = TMP_ROOT / "multi_runtime"
+    _write_minimal_inputs(sim_a)
+    _write_minimal_inputs(sim_b)
+
+    def fake_kernel(config):
+        model_id = config.real_file.parent.name
+        value = "301.0" if model_id == "station_a" else "402.0"
+        write_measurement_snapshot(
+            config.real_file,
+            [],
+            [["1", f"p_load_{model_id}", "ACLoad", "load_ac_1", "P_LOAD", "4.0", "1", value]],
+            [],
+        )
+        write_measurement_snapshot(
+            config.scada_file,
+            [],
+            [["1", f"p_load_{model_id}", "ACLoad", "load_ac_1", "P_LOAD", "4.0", "1", value]],
+            [],
+        )
+        return SimulationResult(config.real_file, config.scada_file, 1, 0, 3, f"fake-{model_id}")
+
+    manager = MultiModelSimulator(
+        [
+            SimulationModelSpec("station_a", sim_a, "考察站A"),
+            SimulationModelSpec("station_b", sim_b, "考察站B"),
+        ],
+        runtime_dir=runtime_dir,
+        kernel=fake_kernel,
+    )
+
+    assert [item["id"] for item in manager.models()] == ["station_a", "station_b"]
+    assert manager.default_model_id == "station_a"
+
+    manager.control_clock({"action": "start", "speed": 5}, model_id="station_a")
+    manager.set_curves({"weather": [{"minute": 0, "wind_speed_mps": 33}], "loads": {}}, model_id="station_b")
+    stepped_b = manager.step(model_id="station_b")
+
+    snapshot_a = manager.snapshot("station_a")
+    snapshot_b = manager.snapshot("station_b")
+
+    assert snapshot_a["model"]["id"] == "station_a"
+    assert snapshot_b["model"]["id"] == "station_b"
+    assert snapshot_a["clock"]["state"] == "running"
+    assert snapshot_a["clock"]["speed"] == 5.0
+    assert snapshot_a["clock"]["minute"] == 0
+    assert snapshot_b["clock"]["state"] == "stopped"
+    assert snapshot_b["clock"]["minute"] == 1
+    assert snapshot_a["curves"]["weather"] == []
+    assert snapshot_b["curves"]["weather"][0]["wind_speed_mps"] == 33
+    assert stepped_b["measurements"]["scada"][0]["name"] == "p_load_station_b"
+    assert snapshot_a["summary"]["runtime_dir"].endswith("station_a")
+    assert snapshot_b["summary"]["runtime_dir"].endswith("station_b")
+
+
+def test_http_server_routes_model_scoped_requests_to_independent_simulators():
+    from hybrid_power_system_analysis.polar_microgrid_sim.server import make_http_server
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator, SimulationModelSpec
+
+    sim_a = TMP_ROOT / "http_multi_inputs_a"
+    sim_b = TMP_ROOT / "http_multi_inputs_b"
+    runtime_dir = TMP_ROOT / "http_multi_runtime"
+    _write_minimal_inputs(sim_a)
+    _write_minimal_inputs(sim_b)
+    manager = MultiModelSimulator(
+        [
+            SimulationModelSpec("station_a", sim_a, "考察站A"),
+            SimulationModelSpec("station_b", sim_b, "考察站B"),
+        ],
+        runtime_dir=runtime_dir,
+        kernel=lambda _config: None,
+    )
+    server = make_http_server(("127.0.0.1", 0), manager, role="simulator")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urlopen(f"{base_url}/api/models", timeout=5) as response:
+            models = json.loads(response.read().decode("utf-8"))
+        clock_payload = json.dumps({"action": "start", "speed": 7}).encode("utf-8")
+        with urlopen(
+            Request(
+                f"{base_url}/api/clock?model_id=station_b",
+                data=clock_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=5,
+        ) as response:
+            clock_b = json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{base_url}/api/snapshot?model_id=station_a", timeout=5) as response:
+            snapshot_a = json.loads(response.read().decode("utf-8"))
+        with urlopen(f"{base_url}/api/snapshot?model_id=station_b", timeout=5) as response:
+            snapshot_b = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert [item["id"] for item in models["models"]] == ["station_a", "station_b"]
+    assert models["active_model_id"] == "station_a"
+    assert clock_b["state"] == "running"
+    assert clock_b["speed"] == 7.0
+    assert snapshot_a["clock"]["state"] == "stopped"
+    assert snapshot_b["clock"]["state"] == "running"
+    assert snapshot_b["model"]["id"] == "station_b"
+
+
 def test_web_consoles_are_split_into_home_and_topic_pages():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web"
     expected = {
@@ -373,38 +517,115 @@ def test_web_consoles_are_split_into_home_and_topic_pages():
         assert "location.hash" in js
 
 
+def test_web_consoles_support_switching_between_independent_models():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web"
+    for role in ("simulator", "trainee"):
+        html = (web_root / role / "index.html").read_text(encoding="utf-8")
+        js = (web_root / role / "app.js").read_text(encoding="utf-8")
+        css = (web_root / role / "styles.css").read_text(encoding="utf-8")
+
+        assert 'id="modelSelector"' in html
+        assert 'id="activeModelName"' in html
+        assert "显示模型" in html
+        assert "function modelScopedPath" in js
+        assert "function loadModels" in js
+        assert "function setActiveModel" in js
+        assert "activeModelId" in js
+        assert 'api("/api/models", { modelScoped: false })' in js
+        assert "model_id" in js
+        assert "model-switcher" in css
+
+
 def test_simulator_curve_page_uses_dense_curve_editor_and_hourly_table():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
     html = (web_root / "index.html").read_text(encoding="utf-8")
     js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
 
     assert 'data-page="curves"' in html
+    assert 'id="curveTree"' in html
+    assert 'id="curveTreeSummary"' in html
+    assert 'class="curve-page-layout"' in html
+    assert 'class="curve-workspace"' in html
     assert 'id="curveEditorChart"' in html
     assert 'id="hourlyCurveTable"' in html
     assert 'id="saveCurves"' in html
+    assert 'data-curve-mode="year"' in html
+    assert 'data-curve-mode="day"' in html
+    assert 'id="curveTableTitle"' in html
+    assert 'id="curveTableSummary"' in html
     assert 'data-curve-role="dense-chart"' in html
     assert 'data-curve-role="hourly-table"' in html
-    assert "9760点" in html
-    assert "const CURVE_POINT_COUNT = 9760" in js
+    assert "环境曲线" in html
+    assert "负荷曲线" in html
+    assert "风" in html
+    assert "光" in html
+    assert "温" in html
+    assert "8760点" in html
+    assert "const CURVE_MODES" in js
+    assert "pointCount: 8760" in js
+    assert "stepMinutes: 60" in js
+    assert "pointCount: 1440" in js
+    assert "stepMinutes: 1" in js
+    assert "function curveModeConfig" in js
+    assert "function setCurveMode" in js
+    assert "function renderCurveModeControls" in js
+    assert "function updateCurveModeLabels" in js
+    assert "function formatCurveTableTime" in js
+    assert "function curveLoadDevices" in js
+    assert "function renderCurveTree" in js
+    assert "function setActiveCurve" in js
+    assert "function selectedCurveKeys" in js
+    assert "function visibleCurveKeys" in js
+    assert "function setSelectedCurves" in js
+    assert "function toggleCurveSelection" in js
+    assert "function selectCurveFamily" in js
+    assert "function curveEditKey" in js
+    assert "function setCurveEditKey" in js
+    assert "function cancelCurveEditSelection" in js
+    assert "function curveKeyAtPointer" in js
     assert "function applyCurveDrag" in js
     assert "function renderHourlyTable" in js
     assert "function resizeCurveCanvas" in js
+    assert "data-curve-tree-type" in js
+    assert "data-curve-family" in js
+    assert "aria-pressed" in js
+    assert "data-curve-key" in js
+    assert "data-index" in js
+    assert "data-curve-mode" in js
+    assert "selectedCurveKeys" in js
+    assert "curveEditKey" in js
+    assert 'event.button === 2' in js
+    assert 'canvas.addEventListener("contextmenu"' in js
+    assert "load:" in js
     assert "contenteditable" in js
     assert "saveCurves" in js
+    assert "curve-tree-panel" in css
+    assert "curve-workspace" in css
+    assert "curve-chart-panel" in css
 
 
 def test_simulator_fault_page_uses_device_and_measurement_subtabs():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
     html = (web_root / "index.html").read_text(encoding="utf-8")
     js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
 
     assert 'data-page="faults"' in html
     assert 'data-fault-tab="devices"' in html
     assert 'data-fault-tab="measurements"' in html
+    assert 'class="fault-split-layout"' in html
+    assert 'id="faultDeviceTree"' in html
+    assert 'id="faultDeviceTreeSummary"' in html
+    assert 'id="faultMeasurementTree"' in html
+    assert 'id="faultMeasurementTreeSummary"' in html
+    assert 'aria-label="量测故障设备树"' in html
     assert 'id="deviceFaultTable"' in html
     assert 'id="measurementFaultTable"' in html
     assert 'id="saveDeviceFaults"' in html
     assert 'id="saveMeasurementFaults"' in html
+    assert "设备树" in html
+    assert "全部设备" in html
     assert "设备名称" in html
     assert "运行状态" in html
     assert "故障启始时刻" in html
@@ -416,10 +637,23 @@ def test_simulator_fault_page_uses_device_and_measurement_subtabs():
     assert "中值" in html
     assert "误差" in html
     assert "function setFaultTab" in js
+    assert "function renderFaultDeviceTree" in js
+    assert "function renderFaultMeasurementTree" in js
+    assert "function setDeviceFaultFilter" in js
+    assert "function setMeasurementFaultFilter" in js
+    assert "function filteredFaultDevices" in js
+    assert "function filteredFaultMeasurements" in js
+    assert "function faultMeasurementDevices" in js
     assert "function renderDeviceFaultTable" in js
     assert "function renderMeasurementFaultTable" in js
+    assert "data-fault-device-tree-type" in js
+    assert "data-fault-measurement-tree-type" in js
+    assert "data-fault-measurement-tree-name" in js
     assert "data-device-field" in js
     assert "data-meas-field" in js
+    assert "fault-split-layout" in css
+    assert "fault-tree-panel" in css
+    assert "fault-table-panel" in css
 
 
 def test_simulator_mode_page_uses_device_tree_and_editable_mode_table():
@@ -448,6 +682,46 @@ def test_simulator_mode_page_uses_device_tree_and_editable_mode_table():
     assert "mode-editor-table" in css
 
 
+def test_simulator_runtime_page_uses_device_tree_table_and_trace_chart():
+    web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
+    html = (web_root / "index.html").read_text(encoding="utf-8")
+    js = (web_root / "app.js").read_text(encoding="utf-8")
+    css = (web_root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'data-page="runtime"' in html
+    assert 'class="runtime-page-layout"' in html
+    assert 'id="runtimeDeviceTree"' in html
+    assert 'id="runtimeTreeSummary"' in html
+    assert 'id="deviceTable"' in html
+    assert 'id="runtimeDeviceSummary"' in html
+    assert 'id="runtimeTraceWindow"' in html
+    assert 'id="runtimeTraceChart"' in html
+    assert 'data-runtime-role="device-table"' in html
+    assert 'data-runtime-role="trace-chart"' in html
+    assert "控制指令" in html
+    assert "实时值" in html
+    assert "量测值" in html
+    assert "时间窗口" in html
+    assert "function renderRuntimeDeviceTree" in js
+    assert "function setRuntimeDeviceFilter" in js
+    assert "function renderRuntimeDeviceTable" in js
+    assert "function appendRuntimeTrace" in js
+    assert "function drawRuntimeTraceChart" in js
+    assert "function runtimeTraceWindowPoints" in js
+    assert "function runtimeTraceWindowRange" in js
+    assert "function runtimeTraceAxisTicks" in js
+    assert "function runtimeAxisTickLabel" in js
+    assert "xForMinute" in js
+    assert "data-runtime-tree-type" in js
+    assert "data-runtime-tree-name" in js
+    assert "runtimeTraceHistory" in js
+    assert "runtime-page-layout" in css
+    assert "runtime-tree-panel" in css
+    assert "runtime-workspace" in css
+    assert "runtime-device-wrap" in css
+    assert "runtime-trace-legend" in css
+
+
 def test_simulator_has_runtime_log_and_realtime_measurement_pages():
     web_root = ROOT_DIR / "src" / "hybrid_power_system_analysis" / "polar_microgrid_sim" / "web" / "simulator"
     html = (web_root / "index.html").read_text(encoding="utf-8")
@@ -462,16 +736,46 @@ def test_simulator_has_runtime_log_and_realtime_measurement_pages():
     assert 'id="runtimeLogSummary"' in html
     assert 'id="measurementCompareTable"' in html
     assert 'id="measurementCompareSummary"' in html
+    assert 'class="measurement-page-layout"' in html
+    assert 'class="measurement-workspace"' in html
+    assert 'id="measurementCompareDeviceTree"' in html
+    assert 'id="measurementCompareTreeSummary"' in html
+    assert 'id="measurementTraceWindow"' in html
+    assert 'id="measurementTraceChart"' in html
+    assert 'data-measurement-role="trace-chart"' in html
     assert "运行日志" in html
     assert "量测值与真值" in html
+    assert "测点跟踪曲线" in html
+    assert "时间窗口" in html
+    assert "设备树" in html
+    assert "全部设备" in html
     assert "真值" in html
     assert "量测值" in html
     assert "偏差" in html
     assert "function appendRuntimeLog" in js
     assert "function renderRuntimeLogs" in js
     assert "function measurementCompareRows" in js
+    assert "function measurementCompareDevices" in js
+    assert "function filteredMeasurementCompareRows" in js
+    assert "function renderMeasurementCompareDeviceTree" in js
+    assert "function setMeasurementCompareFilter" in js
+    assert "function appendMeasurementTrace" in js
+    assert "function measurementTraceWindowRange" in js
+    assert "function measurementTraceWindowPoints" in js
+    assert "function drawMeasurementTraceChart" in js
+    assert "function initMeasurementMonitor" in js
     assert "function renderMeasurementCompareTable" in js
+    assert "data-measurement-select-key" in js
+    assert "selectedMeasurementKey" in js
+    assert "data-measurement-tree-type" in js
+    assert "data-measurement-tree-name" in js
     assert "runtime-log-table" in js
     assert "measurement-compare-table" in js
     assert "runtime-log-wrap" in css
     assert "measurement-compare-wrap" in css
+    assert "measurement-page-layout" in css
+    assert "measurement-workspace" in css
+    assert "measurement-tree-panel" in css
+    assert "measurement-table-panel" in css
+    assert "measurement-trace-panel" in css
+    assert "measurement-trace-legend" in css

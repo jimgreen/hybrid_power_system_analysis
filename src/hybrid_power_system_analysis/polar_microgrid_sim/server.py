@@ -11,10 +11,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
+from hybrid_power_system_analysis.polar_microgrid_sim.service import MultiModelSimulator, PolarMicrogridSimulator
 from hybrid_power_system_analysis.simu import simu_loop
 
 
@@ -31,7 +31,7 @@ class JsonApiError(Exception):
 
 def make_http_server(
     server_address: tuple[str, int],
-    service: PolarMicrogridSimulator,
+    service: PolarMicrogridSimulator | MultiModelSimulator,
     *,
     role: str = "simulator",
     static_root: Optional[str | Path] = None,
@@ -82,44 +82,77 @@ def make_http_server(
         def do_PUT(self) -> None:
             self.do_POST()
 
+        def _request_model_id(self, payload: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+            parsed = urlparse(self.path)
+            query_values = parse_qs(parsed.query).get("model_id") or parse_qs(parsed.query).get("model")
+            if query_values and query_values[0]:
+                return query_values[0]
+            if payload:
+                value = payload.get("model_id", payload.get("model"))
+                return str(value) if value not in (None, "") else None
+            return None
+
+        def _target_service(self, payload: Optional[Mapping[str, Any]] = None) -> PolarMicrogridSimulator:
+            if hasattr(service, "service_for"):
+                try:
+                    return service.service_for(self._request_model_id(payload))  # type: ignore[union-attr]
+                except KeyError as exc:
+                    raise JsonApiError(404, str(exc)) from exc
+            return service  # type: ignore[return-value]
+
+        def _model_catalog(self) -> Mapping[str, Any]:
+            if hasattr(service, "models"):
+                return {
+                    "models": service.models(),  # type: ignore[union-attr]
+                    "active_model_id": service.default_model_id,  # type: ignore[union-attr]
+                }
+            return {
+                "models": [service.model_info()],  # type: ignore[union-attr]
+                "active_model_id": service.model_id,  # type: ignore[union-attr]
+            }
+
         def _handle_api_get(self) -> None:
             path = urlparse(self.path).path
+            target = self._target_service()
             if path == "/api/health":
                 self._send_json({"ok": True, "role": role})
+            elif path == "/api/models":
+                self._send_json(self._model_catalog())
             elif path == "/api/snapshot":
-                self._send_json(service.snapshot())
+                self._send_json(target.snapshot())
             elif path == "/api/measurements":
-                self._send_json(service.measurements())
+                self._send_json(target.measurements())
             elif path == "/api/devices":
-                self._send_json({"devices": service.devices()})
+                self._send_json({"devices": target.devices()})
             elif path == "/api/curves":
-                self._send_json(service.curves)
+                self._send_json(target.curves)
             elif path == "/api/settings":
-                self._send_json(service.local_settings)
+                self._send_json(target.local_settings)
             elif path == "/api/config":
-                self._send_json({"role": role, "sim_url": sim_url, "poll_ms": 2000})
+                self._send_json({"role": role, "sim_url": sim_url, "poll_ms": 2000, **self._model_catalog()})
             else:
                 raise JsonApiError(404, f"Unknown API route: {path}")
 
         def _handle_api_post(self) -> None:
             path = urlparse(self.path).path
             payload = self._read_json_body()
+            target = self._target_service(payload)
             if path == "/api/student/commands":
-                self._send_json(service.apply_student_commands(payload, source=str(payload.get("source", "student"))))
+                self._send_json(target.apply_student_commands(payload, source=str(payload.get("source", "student"))))
             elif path == "/api/clock":
-                self._send_json(service.control_clock(payload))
+                self._send_json(target.control_clock(payload))
             elif path == "/api/step":
-                self._send_json(service.step())
+                self._send_json(target.step())
             elif path == "/api/curves":
-                self._send_json(service.set_curves(payload))
+                self._send_json(target.set_curves(payload))
             elif path == "/api/settings":
-                self._send_json(service.set_local_settings(payload))
+                self._send_json(target.set_local_settings(payload))
             elif path == "/api/device-faults":
-                self._send_json(service.set_local_settings({"device_faults": payload.get("items", payload)}))
+                self._send_json(target.set_local_settings({"device_faults": payload.get("items", payload)}))
             elif path == "/api/measurement-faults":
-                self._send_json(service.set_local_settings({"measurement_faults": payload.get("items", payload)}))
+                self._send_json(target.set_local_settings({"measurement_faults": payload.get("items", payload)}))
             elif path == "/api/modes":
-                self._send_json(service.set_local_settings({"modes": payload.get("items", payload)}))
+                self._send_json(target.set_local_settings({"modes": payload.get("items", payload)}))
             else:
                 raise JsonApiError(404, f"Unknown API route: {path}")
 
@@ -220,9 +253,18 @@ def start_clock_worker(service: PolarMicrogridSimulator, stop_event: threading.E
                 last_step = time.monotonic()
             stop_event.wait(0.05)
 
-    thread = threading.Thread(target=worker, name="polar-microgrid-clock", daemon=True)
+    thread = threading.Thread(target=worker, name=f"polar-microgrid-clock-{service.model_id}", daemon=True)
     thread.start()
     return thread
+
+
+def start_clock_workers(
+    service: PolarMicrogridSimulator | MultiModelSimulator,
+    stop_event: threading.Event,
+) -> list[threading.Thread]:
+    if hasattr(service, "iter_services"):
+        return [start_clock_worker(item, stop_event) for item in service.iter_services()]  # type: ignore[union-attr]
+    return [start_clock_worker(service, stop_event)]  # type: ignore[arg-type]
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -245,7 +287,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     port = args.port if args.port is not None else (8720 if args.role == "trainee" else 8710)
     sim_dir = Path(args.sim_dir).resolve()
     runtime_dir = Path(args.runtime_dir).resolve() if args.runtime_dir else sim_dir / f"runtime_{args.role}"
-    service = PolarMicrogridSimulator(
+    service = MultiModelSimulator.discover(
         sim_dir=sim_dir,
         runtime_dir=runtime_dir,
         noise_std=args.noise_std,
@@ -259,16 +301,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         sim_url=args.sim_url,
     )
     stop_event = threading.Event()
-    worker = None if args.no_worker else start_clock_worker(service, stop_event)
+    workers = [] if args.no_worker else start_clock_workers(service, stop_event)
     print(f"{args.role} console: http://{args.host}:{port}/")
     print(f"runtime dir: {runtime_dir}")
+    print(f"models: {', '.join(item['id'] for item in service.models())}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
-        if worker is not None:
+        for worker in workers:
             worker.join(timeout=2)
         server.shutdown()
         server.server_close()

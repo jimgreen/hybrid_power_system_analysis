@@ -72,6 +72,19 @@ class ClockState:
         }
 
 
+@dataclass(frozen=True)
+class SimulationModelSpec:
+    """Input model definition for one independent simulation instance."""
+
+    model_id: str
+    sim_dir: str | Path
+    name: str = ""
+
+    def normalized(self) -> "SimulationModelSpec":
+        model_id = _safe_model_id(self.model_id)
+        return SimulationModelSpec(model_id=model_id, sim_dir=Path(self.sim_dir).resolve(), name=self.name or model_id)
+
+
 def minute_to_time(minute: int | float) -> str:
     total_seconds = int(round((float(minute) % 1440.0) * 60.0))
     hour = (total_seconds // 3600) % 24
@@ -110,6 +123,12 @@ def _read_json(path: Path, default: Any) -> Any:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _safe_model_id(value: Any) -> str:
+    text = str(value or "default").strip()
+    cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in text)
+    return cleaned.strip("_") or "default"
 
 
 def _make_book(blocks: Mapping[str, Tuple[Sequence[str], Sequence[Mapping[str, Any]]]]) -> EBook:
@@ -213,25 +232,32 @@ def _normalize_points(points: Any, value_aliases: Sequence[str]) -> List[Dict[st
     return []
 
 
-def _interpolate(points: Sequence[Mapping[str, Any]], minute: int, key: str, default: float) -> float:
+def _interpolate(
+    points: Sequence[Mapping[str, Any]],
+    minute: int | float,
+    key: str,
+    default: float,
+    *,
+    period_minutes: float = 1440.0,
+) -> float:
     pairs = []
     for point in points:
         value = _to_float(point.get(key), None)
         if value is None:
             continue
-        pairs.append((float(point.get("minute", 0)) % 1440.0, value))
+        pairs.append((float(point.get("minute", 0)) % period_minutes, value))
     if not pairs:
         return default
     pairs.sort(key=lambda item: item[0])
-    m = float(minute % 1440)
+    m = float(minute % period_minutes)
     if len(pairs) == 1:
         return pairs[0][1]
     if m < pairs[0][0]:
-        prev_m, prev_v = pairs[-1][0] - 1440.0, pairs[-1][1]
+        prev_m, prev_v = pairs[-1][0] - period_minutes, pairs[-1][1]
         next_m, next_v = pairs[0]
     else:
         prev_m, prev_v = pairs[-1]
-        next_m, next_v = pairs[0][0] + 1440.0, pairs[0][1]
+        next_m, next_v = pairs[0][0] + period_minutes, pairs[0][1]
         for idx in range(len(pairs) - 1):
             left_m, left_v = pairs[idx]
             right_m, right_v = pairs[idx + 1]
@@ -267,10 +293,14 @@ class PolarMicrogridSimulator:
         period_seconds: float = 60.0,
         noise_std: Optional[float] = None,
         random_seed: Optional[int] = None,
+        model_id: str = "default",
+        model_name: str = "",
     ) -> None:
         self.sim_dir = Path(sim_dir).resolve()
         self.runtime_dir = Path(runtime_dir).resolve()
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.model_id = _safe_model_id(model_id)
+        self.model_name = model_name or self.model_id
         self.kernel = kernel or simu_loop.run_once
         self.period_seconds = float(period_seconds)
         self.noise_std = noise_std
@@ -298,7 +328,7 @@ class PolarMicrogridSimulator:
 
         self._copy_runtime_inputs()
         self.weather_defaults = self._read_weather_defaults()
-        self.curves = _read_json(self.curves_file, {"weather": [], "loads": {}})
+        self.curves = _read_json(self.curves_file, {"mode": "day", "time_step_minutes": 1, "weather": [], "loads": {}})
         self.local_settings = _read_json(
             self.settings_file,
             {"device_faults": [], "measurement_faults": [], "modes": []},
@@ -444,8 +474,14 @@ class PolarMicrogridSimulator:
                     )
         return expanded
 
-    def set_curves(self, payload: Mapping[str, Any]) -> Dict[str, int]:
+    def set_curves(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         with self.lock:
+            mode = str(payload.get("mode", self.curves.get("mode", "day")) or "day").lower()
+            if mode not in ("day", "year"):
+                mode = "day"
+            default_step = 60 if mode == "year" else 1
+            time_step_minutes = int(_to_float(payload.get("time_step_minutes"), default_step) or default_step)
+            point_count = int(_to_float(payload.get("point_count"), 8760 if mode == "year" else 1440) or 0)
             weather_points = _normalize_points(payload.get("weather"), WEATHER_HEADER[1:])
             loads_payload = payload.get("loads", {})
             loads: Dict[str, List[Dict[str, Any]]] = {}
@@ -463,9 +499,15 @@ class PolarMicrogridSimulator:
                             "p_kw": item.get("p_kw", item.get("value", item.get("load_kw", 0))),
                         }
                     )
-            self.curves = {"weather": weather_points, "loads": loads}
+            self.curves = {
+                "mode": mode,
+                "time_step_minutes": time_step_minutes,
+                "point_count": point_count or len(weather_points),
+                "weather": weather_points,
+                "loads": loads,
+            }
             _write_json(self.curves_file, self.curves)
-            return {"weather_points": len(weather_points), "load_devices": len(loads)}
+            return {"weather_points": len(weather_points), "load_devices": len(loads), "mode": mode}
 
     def set_local_settings(self, payload: Mapping[str, Any]) -> Dict[str, int]:
         with self.lock:
@@ -518,7 +560,8 @@ class PolarMicrogridSimulator:
     def step(self) -> Dict[str, Any]:
         with self.lock:
             minute = self.clock.minute
-            self._prepare_runtime_inputs(minute)
+            absolute_minute = self.clock.absolute_minute
+            self._prepare_runtime_inputs(minute, absolute_minute)
             config = self._make_config()
             kernel_result = self.kernel(config)
             self._apply_measurement_faults(minute)
@@ -529,21 +572,26 @@ class PolarMicrogridSimulator:
             self.latest_result = self._kernel_result_dict(kernel_result)
             return self.snapshot()
 
-    def _prepare_runtime_inputs(self, minute: int) -> None:
-        self._write_current_weather(minute)
+    def _prepare_runtime_inputs(self, minute: int, absolute_minute: int) -> None:
+        self._write_current_weather(minute, absolute_minute)
         self._apply_device_faults(minute)
         self._apply_modes_to_model()
 
-    def _write_current_weather(self, minute: int) -> None:
+    def _write_current_weather(self, minute: int, absolute_minute: int | float | None = None) -> None:
+        curve_mode = str(self.curves.get("mode", "day") or "day").lower()
+        period_minutes = 365.0 * 24.0 * 60.0 if curve_mode == "year" else 1440.0
+        target_minute = absolute_minute if curve_mode == "year" and absolute_minute is not None else minute
         row = {"time": minute_to_time(minute)}
         for key, default in self.weather_defaults.items():
-            row[key] = _number_text(_interpolate(self.curves.get("weather", []), minute, key, default))
+            row[key] = _number_text(
+                _interpolate(self.curves.get("weather", []), target_minute, key, default, period_minutes=period_minutes)
+            )
         load_total = 0.0
         load_seen = False
         loads = self.curves.get("loads", {})
         if isinstance(loads, Mapping):
             for points in loads.values():
-                value = _interpolate(points, minute, "p_kw", float("nan"))
+                value = _interpolate(points, target_minute, "p_kw", float("nan"), period_minutes=period_minutes)
                 if value == value:
                     load_total += value
                     load_seen = True
@@ -800,11 +848,20 @@ class PolarMicrogridSimulator:
             soc_values[name] = _to_float(row.get("soc_curr", row.get("soc", 0.0)), 0.0) or 0.0
         return run_stats, cb_status, set_values, soc_values
 
+    def model_info(self) -> Dict[str, Any]:
+        return {
+            "id": self.model_id,
+            "name": self.model_name,
+            "sim_dir": str(self.sim_dir),
+            "runtime_dir": str(self.runtime_dir),
+        }
+
     def snapshot(self) -> Dict[str, Any]:
         measurements = dict(self.latest_measurements or self.measurements())
         if "definitions" not in measurements:
             measurements["definitions"] = self._read_measurement_file(self.files["meas"])
         return {
+            "model": self.model_info(),
             "clock": self.clock.as_dict(),
             "files": {key: str(path) for key, path in self.files.items()},
             "curves": self.curves,
@@ -830,4 +887,142 @@ class PolarMicrogridSimulator:
             "alarm_count": len(alarms),
             "command_count": len(self.command_history),
             "runtime_dir": str(self.runtime_dir),
+            "model_id": self.model_id,
+            "model_name": self.model_name,
         }
+
+
+class MultiModelSimulator:
+    """Owns independent simulator instances for multiple model cases."""
+
+    def __init__(
+        self,
+        specs: Sequence[SimulationModelSpec | Mapping[str, Any]],
+        runtime_dir: str | Path,
+        kernel: Optional[Callable[[simu_loop.SimulationConfig], Optional[simu_loop.SimulationResult]]] = None,
+        *,
+        period_seconds: float = 60.0,
+        noise_std: Optional[float] = None,
+        random_seed: Optional[int] = None,
+    ) -> None:
+        self.runtime_dir = Path(runtime_dir).resolve()
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._services: Dict[str, PolarMicrogridSimulator] = {}
+        self.default_model_id = ""
+        for raw_spec in specs:
+            spec = self._normalize_spec(raw_spec)
+            if spec.model_id in self._services:
+                raise ValueError(f"Duplicate simulation model id: {spec.model_id}")
+            service = PolarMicrogridSimulator(
+                sim_dir=spec.sim_dir,
+                runtime_dir=self.runtime_dir / spec.model_id,
+                kernel=kernel,
+                period_seconds=period_seconds,
+                noise_std=noise_std,
+                random_seed=random_seed,
+                model_id=spec.model_id,
+                model_name=spec.name,
+            )
+            self._services[spec.model_id] = service
+            if not self.default_model_id:
+                self.default_model_id = spec.model_id
+        if not self._services:
+            raise ValueError("At least one simulation model is required")
+
+    @staticmethod
+    def _normalize_spec(raw_spec: SimulationModelSpec | Mapping[str, Any]) -> SimulationModelSpec:
+        if isinstance(raw_spec, SimulationModelSpec):
+            return raw_spec.normalized()
+        model_id = raw_spec.get("id", raw_spec.get("model_id", raw_spec.get("name", "default")))
+        sim_dir = raw_spec.get("sim_dir", raw_spec.get("path", raw_spec.get("dir", "")))
+        name = str(raw_spec.get("label", raw_spec.get("display_name", raw_spec.get("name", model_id))))
+        return SimulationModelSpec(str(model_id), Path(sim_dir), name).normalized()
+
+    @classmethod
+    def discover(
+        cls,
+        sim_dir: str | Path,
+        runtime_dir: str | Path,
+        kernel: Optional[Callable[[simu_loop.SimulationConfig], Optional[simu_loop.SimulationResult]]] = None,
+        *,
+        period_seconds: float = 60.0,
+        noise_std: Optional[float] = None,
+        random_seed: Optional[int] = None,
+    ) -> "MultiModelSimulator":
+        root = Path(sim_dir).resolve()
+        specs = cls._discover_specs(root)
+        return cls(
+            specs,
+            runtime_dir=runtime_dir,
+            kernel=kernel,
+            period_seconds=period_seconds,
+            noise_std=noise_std,
+            random_seed=random_seed,
+        )
+
+    @staticmethod
+    def _discover_specs(root: Path) -> List[SimulationModelSpec]:
+        manifest = root / "models.json"
+        if manifest.exists():
+            payload = _read_json(manifest, [])
+            items = payload.get("models", []) if isinstance(payload, Mapping) else payload
+            specs = [
+                SimulationModelSpec(
+                    str(item.get("id", item.get("model_id", item.get("name", "default")))),
+                    root / str(item.get("sim_dir", item.get("path", item.get("dir", ".")))),
+                    str(item.get("label", item.get("name", item.get("id", "default")))),
+                ).normalized()
+                for item in items
+                if isinstance(item, Mapping)
+            ]
+            if specs:
+                return specs
+
+        models_dir = root / "models"
+        if models_dir.exists():
+            specs = [
+                SimulationModelSpec(child.name, child, child.name).normalized()
+                for child in sorted(models_dir.iterdir())
+                if child.is_dir() and (child / "model.e").exists()
+            ]
+            if specs:
+                return specs
+
+        return [SimulationModelSpec("default", root, "默认模型").normalized()]
+
+    def service_for(self, model_id: Optional[str] = None) -> PolarMicrogridSimulator:
+        target = _safe_model_id(model_id or self.default_model_id)
+        service = self._services.get(target)
+        if service is None:
+            raise KeyError(f"Unknown simulation model: {model_id}")
+        return service
+
+    def iter_services(self) -> List[PolarMicrogridSimulator]:
+        return list(self._services.values())
+
+    def models(self) -> List[Dict[str, Any]]:
+        return [service.model_info() for service in self.iter_services()]
+
+    def snapshot(self, model_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.service_for(model_id).snapshot()
+
+    def measurements(self, model_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+        return self.service_for(model_id).measurements()
+
+    def devices(self, model_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self.service_for(model_id).devices()
+
+    def apply_student_commands(self, payload: Mapping[str, Any], source: str = "student", model_id: Optional[str] = None) -> Dict[str, int]:
+        return self.service_for(model_id).apply_student_commands(payload, source=source)
+
+    def control_clock(self, payload: Mapping[str, Any], model_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.service_for(model_id).control_clock(payload)
+
+    def step(self, model_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.service_for(model_id).step()
+
+    def set_curves(self, payload: Mapping[str, Any], model_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.service_for(model_id).set_curves(payload)
+
+    def set_local_settings(self, payload: Mapping[str, Any], model_id: Optional[str] = None) -> Dict[str, int]:
+        return self.service_for(model_id).set_local_settings(payload)

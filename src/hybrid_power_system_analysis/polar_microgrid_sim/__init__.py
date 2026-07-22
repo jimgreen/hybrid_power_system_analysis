@@ -1,5 +1,5 @@
 """Polar microgrid time-series simulation service and web consoles."""
 
-from .service import PolarMicrogridSimulator
+from .service import MultiModelSimulator, PolarMicrogridSimulator, SimulationModelSpec
 
-__all__ = ["PolarMicrogridSimulator"]
+__all__ = ["MultiModelSimulator", "PolarMicrogridSimulator", "SimulationModelSpec"]

@@ -1,4 +1,8 @@
 const apiBase = (window.POLAR_SIM_API_URL || localStorage.getItem("polarSimApiUrl") || location.origin).replace(/\/$/, "");
+const state = {
+  models: [],
+  activeModelId: localStorage.getItem("polarTraineeModelId") || "",
+};
 const pending = { run_status: new Map(), set_values: new Map() };
 const trend = [];
 
@@ -29,13 +33,65 @@ function initPageNavigation() {
   showPage(pageFromHash(), false);
 }
 
+function modelScopedPath(path) {
+  if (!state.activeModelId) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}model_id=${encodeURIComponent(state.activeModelId)}`;
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(`${apiBase}${path}`, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  const { modelScoped = true, ...fetchOptions } = options;
+  const targetPath = modelScoped ? modelScopedPath(path) : path;
+  const response = await fetch(`${apiBase}${targetPath}`, {
+    ...fetchOptions,
+    headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
   });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]
+  ));
+}
+
+function renderModelSelector() {
+  const selector = $("modelSelector");
+  if (!selector) return;
+  const models = state.models.length ? state.models : [{ id: state.activeModelId || "", name: "默认模型" }];
+  selector.innerHTML = models.map((model) => `
+    <option value="${escapeHtml(model.id)}">${escapeHtml(model.name || model.id)}</option>
+  `).join("");
+  selector.value = state.activeModelId || models[0]?.id || "";
+  selector.disabled = models.length <= 1;
+  const active = models.find((model) => model.id === selector.value) || models[0] || {};
+  $("activeModelName").textContent = active.name || active.id || "默认模型";
+}
+
+function setActiveModel(modelId, shouldRefresh = true) {
+  const nextId = modelId || state.models[0]?.id || "";
+  state.activeModelId = nextId;
+  localStorage.setItem("polarTraineeModelId", nextId);
+  pending.run_status.clear();
+  pending.set_values.clear();
+  trend.length = 0;
+  renderModelSelector();
+  updatePendingCount();
+  if (shouldRefresh) refresh();
+}
+
+async function loadModels() {
+  try {
+    const catalog = await api("/api/models", { modelScoped: false });
+    state.models = Array.isArray(catalog.models) ? catalog.models : [];
+    const preferred = state.activeModelId || catalog.active_model_id || state.models[0]?.id || "";
+    const exists = state.models.some((model) => model.id === preferred);
+    setActiveModel(exists ? preferred : state.models[0]?.id || "", false);
+  } catch (_error) {
+    state.models = [];
+    renderModelSelector();
+  }
 }
 
 async function refresh() {
@@ -51,6 +107,10 @@ async function refresh() {
 }
 
 function renderSnapshot(snapshot) {
+  if (snapshot.model?.id && snapshot.model.id !== state.activeModelId) {
+    state.activeModelId = snapshot.model.id;
+  }
+  renderModelSelector();
   $("simTime").textContent = snapshot.clock.time;
   $("simState").textContent = snapshot.clock.state;
   const scada = snapshot.measurements.scada || [];
@@ -252,6 +312,7 @@ $("sendCommands").addEventListener("click", async () => {
   await refresh();
 });
 
+$("modelSelector").addEventListener("change", (event) => setActiveModel(event.target.value));
 setInterval(refresh, 2000);
 initPageNavigation();
-refresh();
+loadModels().finally(refresh);

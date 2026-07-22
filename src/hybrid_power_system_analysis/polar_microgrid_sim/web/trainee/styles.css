@@ -64,6 +64,33 @@ h1 { font-size: 19px; line-height: 24px; letter-spacing: 0; }
   align-items: center;
   gap: 6px;
 }
+.model-switcher {
+  min-width: 210px;
+  max-width: 280px;
+  display: grid;
+  grid-template-columns: 56px minmax(110px, 1fr);
+  align-items: center;
+  gap: 4px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.model-switcher select {
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: #fff;
+  color: var(--ink);
+}
+.model-switcher span {
+  grid-column: 2;
+  min-width: 0;
+  color: var(--teal-dark);
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 #connectionDot {
   width: 8px;
   height: 8px;
@@ -352,6 +379,10 @@ th {
     flex-direction: column;
     gap: 12px;
     padding: 12px;
+  }
+  .model-switcher {
+    width: 100%;
+    max-width: none;
   }
   .operator-strip {
     flex-wrap: wrap;

@@ -16,6 +16,12 @@
             <p id="runtimePath">runtime</p>
           </div>
         </div>
+        <label class="model-switcher">显示模型
+          <select id="modelSelector">
+            <option value="">默认模型</option>
+          </select>
+          <span id="activeModelName">默认模型</span>
+        </label>
         <div class="clock-strip">
           <div class="clock-readout">
             <span id="simState">stopped</span>
@@ -103,39 +109,105 @@
 
         <section class="page-section" data-page="curves">
           <div class="curve-page-layout">
-            <section class="panel visual-panel">
+            <aside class="panel curve-tree-panel">
               <div class="panel-head">
-                <h2>天气与负荷曲线</h2>
-                <span><strong id="curvePointCount">9760点</strong> · <span id="curveStatus">未写入</span></span>
+                <h2>曲线列表</h2>
+                <span id="curveTreeSummary">0 条</span>
               </div>
-              <div class="curve-toolbar">
-                <label>拖拽对象
-                  <select id="activeCurve">
-                    <option value="wind_speed_mps">风速</option>
-                    <option value="solar_irradiance_w_m2">太阳辐照</option>
-                    <option value="air_temp_c">气温</option>
-                    <option value="load_kw">负荷</option>
-                  </select>
-                </label>
-                <button id="generateDenseCurves">生成典型日</button>
-                <button id="randomCurves">扰动</button>
-                <button id="saveCurves" class="primary">保存</button>
+              <input id="activeCurve" type="hidden" value="wind_speed_mps" />
+              <div id="curveTree" class="curve-tree" aria-label="曲线树">
+                <div class="tree-group">
+                  <button
+                    type="button"
+                    class="tree-node tree-type"
+                    data-curve-tree-type="environment"
+                    data-curve-family="environment"
+                    aria-pressed="false"
+                  >
+                    <span>环境曲线</span>
+                    <strong>3</strong>
+                  </button>
+                  <div class="tree-children">
+                    <button
+                      type="button"
+                      class="tree-node tree-child is-active"
+                      data-curve-tree-type="environment"
+                      data-curve-key="wind_speed_mps"
+                      aria-pressed="true"
+                    >
+                      <span>风</span>
+                      <small>m/s</small>
+                    </button>
+                    <button
+                      type="button"
+                      class="tree-node tree-child"
+                      data-curve-tree-type="environment"
+                      data-curve-key="solar_irradiance_w_m2"
+                      aria-pressed="false"
+                    >
+                      <span>光</span>
+                      <small>W/m2</small>
+                    </button>
+                    <button
+                      type="button"
+                      class="tree-node tree-child"
+                      data-curve-tree-type="environment"
+                      data-curve-key="air_temp_c"
+                      aria-pressed="false"
+                    >
+                      <span>温</span>
+                      <small>℃</small>
+                    </button>
+                  </div>
+                </div>
+                <div class="tree-group">
+                  <button
+                    type="button"
+                    class="tree-node tree-type"
+                    data-curve-tree-type="load"
+                    data-curve-family="load"
+                    aria-pressed="false"
+                  >
+                    <span>负荷曲线</span>
+                    <strong>1</strong>
+                  </button>
+                  <div id="curveLoadTree" class="tree-children"></div>
+                </div>
               </div>
-              <canvas
-                id="curveEditorChart"
-                data-curve-role="dense-chart"
-                width="1500"
-                height="420"
-              ></canvas>
-            </section>
+            </aside>
 
-            <section class="panel">
-              <div class="panel-head">
-                <h2>小时数据表</h2>
-                <span>1小时间隔 · 可编辑</span>
-              </div>
-              <div id="hourlyCurveTable" class="curve-table-wrap" data-curve-role="hourly-table"></div>
-            </section>
+            <div class="curve-workspace">
+              <section class="panel visual-panel curve-chart-panel">
+                <div class="panel-head">
+                  <h2>天气与负荷曲线</h2>
+                  <span><strong id="curvePointCount">8760点</strong> · <span id="curveStatus">未写入</span></span>
+                </div>
+                <div class="curve-toolbar">
+                  <div class="segmented-control curve-mode-control" role="group" aria-label="曲线模式">
+                    <button type="button" class="is-active" data-curve-mode="year" aria-pressed="true">年曲线</button>
+                    <button type="button" data-curve-mode="day" aria-pressed="false">日曲线</button>
+                  </div>
+                  <span id="activeCurveLabel">风速</span>
+                  <button id="generateDenseCurves">生成典型曲线</button>
+                  <button id="randomCurves">扰动</button>
+                  <button id="saveCurves" class="primary">保存</button>
+                </div>
+                <canvas
+                  id="curveEditorChart"
+                  data-curve-role="dense-chart"
+                  width="1500"
+                  height="420"
+                ></canvas>
+              </section>
+
+              <section class="panel curve-table-panel">
+                <div class="panel-head">
+                  <h2 id="curveTableTitle">年曲线数据表</h2>
+                  <span id="curveTableSummary">1小时间隔 · 可编辑</span>
+                </div>
+                <div id="hourlyCurveTable" class="curve-table-wrap" data-curve-role="hourly-table"></div>
+              </section>
+            </div>
           </div>
         </section>
 
@@ -147,31 +219,71 @@
             </div>
 
             <section class="fault-tab-panel is-active" data-fault-panel="devices" role="tabpanel">
-              <section class="panel">
-                <div class="panel-head">
-                  <h2>设备故障</h2>
-                  <div class="panel-actions">
-                    <span id="deviceFaultSummary">待同步</span>
-                    <button id="saveDeviceFaults" class="primary">保存</button>
+              <div class="fault-split-layout">
+                <aside class="panel fault-tree-panel">
+                  <div class="panel-head">
+                    <h2>设备树</h2>
+                    <span id="faultDeviceTreeSummary">0 类 · 0 台</span>
                   </div>
-                </div>
-                <div class="sr-only">设备名称 运行状态 故障启始时刻 结束时刻</div>
-                <div id="deviceFaultTable" class="fault-table-wrap" data-fault-role="device-table"></div>
-              </section>
+                  <div id="faultDeviceTree" class="fault-tree device-tree" aria-label="设备故障设备树">
+                    <button
+                      type="button"
+                      class="tree-node tree-root is-active"
+                      data-fault-device-tree-type="all"
+                      data-fault-device-tree-name=""
+                    >
+                      <span>全部设备</span>
+                      <strong>0</strong>
+                    </button>
+                  </div>
+                </aside>
+
+                <section class="panel fault-table-panel">
+                  <div class="panel-head">
+                    <h2>设备故障</h2>
+                    <div class="panel-actions">
+                      <span id="deviceFaultSummary">待同步</span>
+                      <button id="saveDeviceFaults" class="primary">保存</button>
+                    </div>
+                  </div>
+                  <div class="sr-only">设备名称 运行状态 故障启始时刻 结束时刻</div>
+                  <div id="deviceFaultTable" class="fault-table-wrap" data-fault-role="device-table"></div>
+                </section>
+              </div>
             </section>
 
             <section class="fault-tab-panel" data-fault-panel="measurements" role="tabpanel">
-              <section class="panel">
-                <div class="panel-head">
-                  <h2>量测故障</h2>
-                  <div class="panel-actions">
-                    <span id="measurementFaultSummary">待同步</span>
-                    <button id="saveMeasurementFaults" class="primary">保存</button>
+              <div class="fault-split-layout">
+                <aside class="panel fault-tree-panel">
+                  <div class="panel-head">
+                    <h2>设备树</h2>
+                    <span id="faultMeasurementTreeSummary">0 类 · 0 台</span>
                   </div>
-                </div>
-                <div class="sr-only">量测状态 正常 死数 0值 中值 误差</div>
-                <div id="measurementFaultTable" class="fault-table-wrap" data-fault-role="measurement-table"></div>
-              </section>
+                  <div id="faultMeasurementTree" class="fault-tree device-tree" aria-label="量测故障设备树">
+                    <button
+                      type="button"
+                      class="tree-node tree-root is-active"
+                      data-fault-measurement-tree-type="all"
+                      data-fault-measurement-tree-name=""
+                    >
+                      <span>全部设备</span>
+                      <strong>0</strong>
+                    </button>
+                  </div>
+                </aside>
+
+                <section class="panel fault-table-panel">
+                  <div class="panel-head">
+                    <h2>量测故障</h2>
+                    <div class="panel-actions">
+                      <span id="measurementFaultSummary">待同步</span>
+                      <button id="saveMeasurementFaults" class="primary">保存</button>
+                    </div>
+                  </div>
+                  <div class="sr-only">量测状态 正常 死数 0值 中值 误差</div>
+                  <div id="measurementFaultTable" class="fault-table-wrap" data-fault-role="measurement-table"></div>
+                </section>
+              </div>
             </section>
           </div>
         </section>
@@ -201,28 +313,131 @@
         </section>
 
         <section class="page-section" data-page="runtime">
-          <section class="panel">
-            <div class="panel-head">
-              <h2>计算监视</h2>
-              <span id="solverInfo">待运行</span>
+          <div class="runtime-page-layout">
+            <aside class="panel runtime-tree-panel">
+              <div class="panel-head">
+                <h2>设备树</h2>
+                <span id="runtimeTreeSummary">0 类 · 0 台</span>
+              </div>
+              <div id="runtimeDeviceTree" class="device-tree" aria-label="计算监视设备树">
+                <button
+                  type="button"
+                  class="tree-node tree-root is-active"
+                  data-runtime-tree-type="all"
+                  data-runtime-tree-name=""
+                >
+                  <span>全部设备</span>
+                  <strong>0</strong>
+                </button>
+              </div>
+            </aside>
+
+            <div class="runtime-workspace">
+              <section class="panel runtime-table-panel">
+                <div class="panel-head">
+                  <h2>设备状态</h2>
+                  <div class="panel-actions">
+                    <span id="runtimeDeviceSummary">待同步</span>
+                    <span id="solverInfo">待运行</span>
+                  </div>
+                </div>
+                <div class="sr-only">设备 类型 投运 状态 模式 设值 实时值 量测值</div>
+                <div id="deviceTable" class="runtime-device-wrap" data-runtime-role="device-table"></div>
+              </section>
+
+              <section class="panel runtime-trace-panel">
+                <div class="panel-head">
+                  <h2>控制跟踪曲线</h2>
+                  <div class="panel-actions">
+                    <label class="compact-field">时间窗口
+                      <select id="runtimeTraceWindow">
+                        <option value="15">15分钟</option>
+                        <option value="60" selected>1小时</option>
+                        <option value="180">3小时</option>
+                        <option value="360">6小时</option>
+                        <option value="1440">24小时</option>
+                      </select>
+                    </label>
+                    <span id="runtimeTraceSummary">0 点</span>
+                  </div>
+                </div>
+                <canvas
+                  id="runtimeTraceChart"
+                  data-runtime-role="trace-chart"
+                  aria-label="控制指令、实时值与量测值跟踪曲线"
+                ></canvas>
+                <div class="runtime-trace-legend" aria-label="跟踪曲线图例">
+                  <span><i class="trace-control"></i>控制指令</span>
+                  <span><i class="trace-real"></i>实时值</span>
+                  <span><i class="trace-scada"></i>量测值</span>
+                </div>
+              </section>
             </div>
-            <div id="deviceTable" class="data-table runtime-table"></div>
-          </section>
+          </div>
         </section>
 
         <section class="page-section" data-page="measurements">
-          <section class="panel">
-            <div class="panel-head">
-              <h2>量测值与真值</h2>
-              <span id="measurementCompareSummary">待同步</span>
+          <div class="measurement-page-layout">
+            <aside class="panel measurement-tree-panel">
+              <div class="panel-head">
+                <h2>设备树</h2>
+                <span id="measurementCompareTreeSummary">0 类 · 0 台</span>
+              </div>
+              <div id="measurementCompareDeviceTree" class="device-tree" aria-label="实时量测设备树">
+                <button
+                  type="button"
+                  class="tree-node tree-root is-active"
+                  data-measurement-tree-type="all"
+                  data-measurement-tree-name=""
+                >
+                  <span>全部设备</span>
+                  <strong>0</strong>
+                </button>
+              </div>
+            </aside>
+
+            <div class="measurement-workspace">
+              <section class="panel measurement-table-panel">
+                <div class="panel-head">
+                  <h2>量测值与真值</h2>
+                  <span id="measurementCompareSummary">待同步</span>
+                </div>
+                <div class="sr-only">量测名称 设备 量测类型 真值 量测值 偏差 状态</div>
+                <div
+                  id="measurementCompareTable"
+                  class="measurement-compare-wrap"
+                  data-measurement-role="compare-table"
+                ></div>
+              </section>
+
+              <section class="panel measurement-trace-panel">
+                <div class="panel-head">
+                  <h2>测点跟踪曲线</h2>
+                  <div class="panel-actions">
+                    <label class="compact-field">时间窗口
+                      <select id="measurementTraceWindow">
+                        <option value="15">15分钟</option>
+                        <option value="60" selected>1小时</option>
+                        <option value="180">3小时</option>
+                        <option value="360">6小时</option>
+                        <option value="1440">24小时</option>
+                      </select>
+                    </label>
+                    <span id="measurementTraceSummary">0 点</span>
+                  </div>
+                </div>
+                <canvas
+                  id="measurementTraceChart"
+                  data-measurement-role="trace-chart"
+                  aria-label="选中测点量测值与真值跟踪曲线"
+                ></canvas>
+                <div class="measurement-trace-legend" aria-label="测点曲线图例">
+                  <span><i class="trace-real"></i>真值</span>
+                  <span><i class="trace-scada"></i>量测值</span>
+                </div>
+              </section>
             </div>
-            <div class="sr-only">量测名称 设备 量测类型 真值 量测值 偏差 状态</div>
-            <div
-              id="measurementCompareTable"
-              class="measurement-compare-wrap"
-              data-measurement-role="compare-table"
-            ></div>
-          </section>
+          </div>
         </section>
 
         <section class="page-section" data-page="logs">

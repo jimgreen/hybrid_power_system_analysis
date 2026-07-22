@@ -83,6 +83,33 @@ h1 {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.model-switcher {
+  min-width: 210px;
+  max-width: 280px;
+  display: grid;
+  grid-template-columns: 56px minmax(110px, 1fr);
+  align-items: center;
+  gap: 4px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.model-switcher select {
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: #fff;
+  color: var(--ink);
+}
+.model-switcher span {
+  grid-column: 2;
+  min-width: 0;
+  color: var(--teal-dark);
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .clock-strip {
   display: flex;
   align-items: center;
@@ -290,8 +317,31 @@ input[type="range"] { padding: 0; accent-color: var(--teal); }
 .visual-panel { min-height: 0; }
 .curve-page-layout {
   display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.curve-tree-panel {
+  position: sticky;
+  top: 14px;
+}
+.curve-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: calc(100vh - 190px);
+  overflow: auto;
+  padding-right: 2px;
+}
+.curve-workspace {
+  display: grid;
   grid-template-rows: minmax(440px, auto) minmax(220px, auto);
   gap: 14px;
+  min-width: 0;
+}
+.curve-chart-panel,
+.curve-table-panel {
+  min-width: 0;
 }
 .curve-toolbar {
   display: flex;
@@ -299,6 +349,41 @@ input[type="range"] { padding: 0; accent-color: var(--teal); }
   gap: 8px;
   margin-bottom: 10px;
   flex-wrap: wrap;
+}
+.segmented-control {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7fafb;
+}
+.segmented-control button {
+  height: 26px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 700;
+}
+.segmented-control button.is-active {
+  background: var(--teal);
+  color: #fff;
+}
+.curve-toolbar > span {
+  height: 32px;
+  min-width: 120px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f7fafb;
+  color: var(--teal-dark);
+  font-size: 12px;
+  font-weight: 700;
 }
 .curve-toolbar label {
   width: 220px;
@@ -369,6 +454,22 @@ input[type="range"] { padding: 0; accent-color: var(--teal); }
 }
 .fault-tab-panel.is-active {
   display: block;
+}
+.fault-split-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.fault-tree-panel {
+  position: sticky;
+  top: 14px;
+}
+.fault-tree {
+  max-height: calc(100vh - 220px);
+}
+.fault-table-panel {
+  min-width: 0;
 }
 .fault-table-wrap {
   max-height: calc(100vh - 210px);
@@ -445,10 +546,17 @@ input[type="range"] { padding: 0; accent-color: var(--teal); }
   text-align: left;
 }
 .tree-node:hover,
+.tree-node.is-parent-active,
 .tree-node.is-active {
   border-color: rgba(0, 140, 140, 0.45);
   background: #e8f6f6;
   color: var(--teal-dark);
+}
+.tree-node.is-active {
+  box-shadow: inset 3px 0 0 var(--teal);
+}
+.tree-node.is-edit-target {
+  box-shadow: inset 3px 0 0 var(--teal), 0 0 0 1px rgba(0, 140, 140, 0.2);
 }
 .tree-node span {
   min-width: 0;
@@ -554,8 +662,92 @@ canvas {
   border: 1px solid var(--line);
   border-radius: 8px;
 }
-.runtime-table {
-  max-height: calc(100vh - 190px);
+.runtime-page-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.runtime-tree-panel {
+  position: sticky;
+  top: 14px;
+}
+.runtime-workspace {
+  display: grid;
+  grid-template-rows: minmax(260px, auto) minmax(340px, auto);
+  gap: 14px;
+  min-width: 0;
+}
+.runtime-table-panel,
+.runtime-trace-panel {
+  min-width: 0;
+}
+.runtime-device-wrap {
+  max-height: calc(48vh - 120px);
+  min-height: 210px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.runtime-device-table th,
+.runtime-device-table td {
+  vertical-align: middle;
+}
+.runtime-device-table td:first-child {
+  font-weight: 700;
+}
+#runtimeTraceChart {
+  height: 300px;
+}
+.runtime-trace-legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.runtime-trace-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.runtime-trace-legend i {
+  width: 22px;
+  height: 3px;
+  border-radius: 999px;
+  display: inline-block;
+}
+.trace-control { background: var(--amber); }
+.trace-real { background: var(--teal); }
+.trace-scada { background: var(--red); }
+.compact-field {
+  width: 176px;
+  margin: 0;
+  grid-template-columns: 56px 1fr;
+}
+.measurement-page-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.measurement-tree-panel {
+  position: sticky;
+  top: 14px;
+}
+.measurement-workspace {
+  display: grid;
+  grid-template-rows: minmax(260px, 44vh) minmax(320px, auto);
+  gap: 14px;
+  min-width: 0;
+}
+.measurement-table-panel {
+  min-width: 0;
+}
+.measurement-trace-panel {
+  min-width: 0;
 }
 .runtime-log-wrap,
 .measurement-compare-wrap {
@@ -565,11 +757,50 @@ canvas {
   border: 1px solid var(--line);
   border-radius: 8px;
 }
+.measurement-workspace .measurement-compare-wrap {
+  max-height: calc(44vh - 92px);
+  min-height: 230px;
+}
+#measurementTraceChart {
+  height: 300px;
+}
+.measurement-trace-legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.measurement-trace-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.measurement-trace-legend i {
+  width: 22px;
+  height: 3px;
+  border-radius: 999px;
+  display: inline-block;
+}
 .runtime-log-table th,
 .runtime-log-table td,
 .measurement-compare-table th,
 .measurement-compare-table td {
   vertical-align: middle;
+}
+.measurement-compare-table tbody tr {
+  cursor: pointer;
+}
+.measurement-compare-table tbody tr:hover,
+.measurement-compare-table tbody tr.is-selected {
+  background: #e8f6f6;
+}
+.measurement-compare-table tbody tr.is-selected td:first-child {
+  box-shadow: inset 3px 0 0 var(--teal);
+  color: var(--teal-dark);
+  font-weight: 700;
 }
 .runtime-log-table td:nth-child(5) {
   min-width: 220px;
@@ -688,6 +919,10 @@ th {
     position: static;
   }
   .brand p { max-width: calc(100vw - 84px); }
+  .model-switcher {
+    width: 100%;
+    max-width: none;
+  }
   .clock-strip { flex-wrap: wrap; }
   .clock-readout {
     min-width: 0;
@@ -703,11 +938,24 @@ th {
     display: flex;
   }
   .curve-page-layout {
+    grid-template-columns: 1fr;
+  }
+  .curve-tree-panel {
+    position: static;
+  }
+  .curve-tree {
+    max-height: 260px;
+  }
+  .curve-workspace {
     grid-template-rows: auto auto;
   }
   .curve-toolbar {
     display: grid;
     grid-template-columns: 1fr 1fr;
+  }
+  .curve-toolbar > span {
+    grid-column: 1 / -1;
+    width: 100%;
   }
   .curve-toolbar label {
     width: auto;
@@ -724,6 +972,15 @@ th {
     grid-template-columns: 1fr 1fr;
     width: 100%;
   }
+  .fault-split-layout {
+    grid-template-columns: 1fr;
+  }
+  .fault-tree-panel {
+    position: static;
+  }
+  .fault-tree {
+    max-height: 260px;
+  }
   .fault-table-wrap {
     max-height: 520px;
   }
@@ -732,6 +989,37 @@ th {
   }
   .mode-tree-panel {
     position: static;
+  }
+  .runtime-page-layout {
+    grid-template-columns: 1fr;
+  }
+  .runtime-tree-panel {
+    position: static;
+  }
+  .runtime-workspace {
+    grid-template-rows: auto auto;
+  }
+  .runtime-device-wrap {
+    max-height: 360px;
+  }
+  #runtimeTraceChart {
+    height: 260px;
+  }
+  .compact-field {
+    width: 100%;
+    grid-template-columns: 64px 1fr;
+  }
+  .measurement-page-layout {
+    grid-template-columns: 1fr;
+  }
+  .measurement-tree-panel {
+    position: static;
+  }
+  .measurement-workspace {
+    grid-template-rows: auto auto;
+  }
+  .measurement-page-layout .device-tree {
+    max-height: 260px;
   }
   .device-tree {
     max-height: 260px;
@@ -743,6 +1031,12 @@ th {
   .measurement-compare-wrap {
     max-height: 560px;
     min-height: 320px;
+  }
+  .measurement-workspace .measurement-compare-wrap {
+    max-height: 420px;
+  }
+  #measurementTraceChart {
+    height: 260px;
   }
   .panel-actions {
     flex-wrap: wrap;
