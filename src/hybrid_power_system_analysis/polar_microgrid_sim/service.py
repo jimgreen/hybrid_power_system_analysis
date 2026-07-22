@@ -50,6 +50,7 @@ STAT_HEADERS = {
 
 INPUT_FILES = ("model.e", "meas.e", "stat.e", "weather.e", "device.e", "yt_ctrl.e")
 CLONE_FILES = INPUT_FILES + ("real.e", "scada.e", "curves.json", "local_settings.json", "commands.json")
+CLOCK_SPEED_LEVELS = (1.0, 5.0, 15.0, 30.0, 60.0)
 
 
 @dataclass
@@ -103,6 +104,29 @@ def _to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _nearest_clock_speed(value: Any) -> float:
+    speed = _to_float(value, CLOCK_SPEED_LEVELS[0])
+    if speed is None:
+        return CLOCK_SPEED_LEVELS[0]
+    return min(CLOCK_SPEED_LEVELS, key=lambda level: (abs(level - speed), level))
+
+
+def _next_clock_speed(value: Any) -> float:
+    speed = _to_float(value, CLOCK_SPEED_LEVELS[0]) or CLOCK_SPEED_LEVELS[0]
+    for level in CLOCK_SPEED_LEVELS:
+        if level > speed:
+            return level
+    return CLOCK_SPEED_LEVELS[-1]
+
+
+def _previous_clock_speed(value: Any) -> float:
+    speed = _to_float(value, CLOCK_SPEED_LEVELS[0]) or CLOCK_SPEED_LEVELS[0]
+    for level in reversed(CLOCK_SPEED_LEVELS):
+        if level < speed:
+            return level
+    return CLOCK_SPEED_LEVELS[0]
 
 
 def _number_text(value: Any) -> str:
@@ -569,7 +593,7 @@ class PolarMicrogridSimulator:
                 self.clock.absolute_minute = minute
                 self.clock.minute = minute % 1440
             if "speed" in payload:
-                self.clock.speed = max(0.1, float(_to_float(payload.get("speed"), self.clock.speed) or self.clock.speed))
+                self.clock.speed = _nearest_clock_speed(payload.get("speed"))
             if action == "start":
                 self.clock.state = "running"
             elif action == "pause":
@@ -578,11 +602,11 @@ class PolarMicrogridSimulator:
                 self.clock.state = "stopped"
                 self.clock.absolute_minute = 0
                 self.clock.minute = 0
-                self.clock.speed = 1.0
+                self.clock.speed = CLOCK_SPEED_LEVELS[0]
             elif action in ("faster", "speed_up"):
-                self.clock.speed = min(3600.0, self.clock.speed * 2.0)
+                self.clock.speed = _next_clock_speed(self.clock.speed)
             elif action in ("slower", "speed_down"):
-                self.clock.speed = max(0.1, self.clock.speed / 2.0)
+                self.clock.speed = _previous_clock_speed(self.clock.speed)
             elif action == "step":
                 return self.step()["clock"]
             self.clock.updated_at = time.time()

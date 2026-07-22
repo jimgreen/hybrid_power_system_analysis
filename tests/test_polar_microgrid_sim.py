@@ -151,10 +151,22 @@ def test_clock_control_supports_start_pause_speed_and_single_step():
     service = PolarMicrogridSimulator(sim_dir=sim_dir, runtime_dir=runtime_dir, kernel=lambda _config: None)
 
     assert service.control_clock({"action": "start", "speed": 4})["state"] == "running"
-    assert service.snapshot()["clock"]["speed"] == 4.0
+    assert service.snapshot()["clock"]["speed"] == 5.0
+    assert service.control_clock({"action": "faster"})["speed"] == 15.0
+    assert service.control_clock({"action": "faster"})["speed"] == 30.0
+    assert service.control_clock({"action": "faster"})["speed"] == 60.0
+    assert service.control_clock({"action": "faster"})["speed"] == 60.0
+    assert service.control_clock({"action": "slower"})["speed"] == 30.0
+    assert service.control_clock({"speed": 32})["speed"] == 30.0
+    service.clock.speed = 32.0
+    assert service.control_clock({"action": "slower"})["speed"] == 30.0
+    service.clock.speed = 32.0
+    assert service.control_clock({"action": "faster"})["speed"] == 60.0
     assert service.control_clock({"action": "pause"})["state"] == "paused"
     assert service.control_clock({"action": "step"})["minute"] == 1
-    assert service.control_clock({"action": "stop"})["state"] == "stopped"
+    stopped = service.control_clock({"action": "stop"})
+    assert stopped["state"] == "stopped"
+    assert stopped["speed"] == 1.0
 
 
 def test_local_curves_faults_and_modes_are_projected_before_kernel_call():
@@ -584,7 +596,7 @@ def test_http_server_routes_model_scoped_requests_to_independent_simulators():
     try:
         with urlopen(f"{base_url}/api/models", timeout=5) as response:
             models = json.loads(response.read().decode("utf-8"))
-        clock_payload = json.dumps({"action": "start", "speed": 7}).encode("utf-8")
+        clock_payload = json.dumps({"action": "start", "speed": 15}).encode("utf-8")
         with urlopen(
             Request(
                 f"{base_url}/api/clock?model_id=station_b",
@@ -607,7 +619,7 @@ def test_http_server_routes_model_scoped_requests_to_independent_simulators():
     assert [item["id"] for item in models["models"]] == ["station_a", "station_b"]
     assert models["active_model_id"] == "station_a"
     assert clock_b["state"] == "running"
-    assert clock_b["speed"] == 7.0
+    assert clock_b["speed"] == 15.0
     assert snapshot_a["clock"]["state"] == "stopped"
     assert snapshot_b["clock"]["state"] == "running"
     assert snapshot_b["model"]["id"] == "station_b"
