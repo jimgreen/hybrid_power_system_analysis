@@ -675,8 +675,8 @@ def test_clock_worker_advances_running_clock_and_obeys_pause_stop():
     worker = start_clock_worker(service, stop_event)
     try:
         service.control_clock({"action": "start", "speed": 10})
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline and service.snapshot()["clock"]["minute"] < 2:
+        deadline = time.monotonic() + 1.4
+        while time.monotonic() < deadline and service.snapshot()["clock"]["minute"] < 5:
             time.sleep(0.05)
         running_clock = service.snapshot()["clock"]
 
@@ -690,12 +690,55 @@ def test_clock_worker_advances_running_clock_and_obeys_pause_stop():
         stop_event.set()
         worker.join(timeout=2)
 
-    assert running_clock["minute"] >= 1
+    assert running_clock["minute"] >= 5
     assert paused_clock["state"] == "paused"
     assert paused_clock["minute"] == paused_minute
     assert stopped_clock["state"] == "stopped"
     assert stopped_clock["minute"] == 0
     assert stopped_clock["speed"] == 1.0
+
+
+def test_clock_worker_advances_one_simulation_step_without_elapsed_catchup(monkeypatch):
+    from hybrid_power_system_analysis.polar_microgrid_sim import server
+    from hybrid_power_system_analysis.polar_microgrid_sim.service import PolarMicrogridSimulator
+
+    sim_dir = TMP_ROOT / "worker_integer_speed_inputs"
+    runtime_dir = TMP_ROOT / "worker_integer_speed_runtime"
+    _write_minimal_inputs(sim_dir)
+    observed_periods = []
+
+    def fake_kernel(config):
+        observed_periods.append(config.period_seconds)
+        now[0] += 2.5
+        return None
+
+    service = PolarMicrogridSimulator(sim_dir=sim_dir, runtime_dir=runtime_dir, kernel=fake_kernel)
+    service.control_clock({"action": "start", "speed": 60})
+
+    now = [100.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
+    last_step = 100.0
+
+    now[0] = 100.95
+    last_step = server._advance_clock_if_due(service, last_step)
+    assert service.snapshot()["clock"]["minute"] == 0
+    assert observed_periods == []
+
+    now[0] = 101.0
+    last_step = server._advance_clock_if_due(service, last_step)
+    assert service.snapshot()["clock"]["minute"] == 60
+    assert observed_periods[-1] == 3600.0
+    assert last_step == 103.5
+
+    now[0] = 104.4
+    last_step = server._advance_clock_if_due(service, last_step)
+    assert last_step == 103.5
+    assert service.snapshot()["clock"]["minute"] == 60
+
+    now[0] = 110.0
+    last_step = server._advance_clock_if_due(service, last_step)
+    assert last_step == 112.5
+    assert service.snapshot()["clock"]["minute"] == 120
 
 
 def test_web_consoles_are_split_into_home_and_topic_pages():

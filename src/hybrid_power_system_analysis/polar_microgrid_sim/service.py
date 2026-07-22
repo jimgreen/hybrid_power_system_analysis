@@ -428,7 +428,7 @@ class PolarMicrogridSimulator:
         if changed or not self.files["stat"].exists():
             simu_loop.write_ebook_aligned(book, self.files["stat"])
 
-    def _make_config(self) -> simu_loop.SimulationConfig:
+    def _make_config(self, period_seconds: Optional[float] = None) -> simu_loop.SimulationConfig:
         return simu_loop.SimulationConfig(
             model_file=self.files["model"],
             meas_file=self.files["meas"],
@@ -438,7 +438,7 @@ class PolarMicrogridSimulator:
             yt_ctrl_file=self.files["yt_ctrl"],
             real_file=self.files["real"],
             scada_file=self.files["scada"],
-            period_seconds=self.period_seconds,
+            period_seconds=self.period_seconds if period_seconds is None else period_seconds,
             noise_std=self.noise_std,
             random_seed=self.random_seed,
             loop_count=1,
@@ -612,16 +612,19 @@ class PolarMicrogridSimulator:
             self.clock.updated_at = time.time()
             return self.clock.as_dict()
 
-    def step(self) -> Dict[str, Any]:
+    def step(self, advance_minutes: Optional[int] = None) -> Dict[str, Any]:
         with self.lock:
+            step_minutes = max(1, int(self.clock.step_minutes))
+            clock_advance = step_minutes if advance_minutes is None else max(1, int(advance_minutes))
+            period_seconds = self.period_seconds * clock_advance / step_minutes
             minute = self.clock.minute
             absolute_minute = self.clock.absolute_minute
             self._prepare_runtime_inputs(minute, absolute_minute)
-            config = self._make_config()
+            config = self._make_config(period_seconds=period_seconds)
             kernel_result = self.kernel(config)
             self._apply_measurement_faults(minute)
             self.latest_measurements = self.measurements()
-            self.clock.absolute_minute += self.clock.step_minutes
+            self.clock.absolute_minute += clock_advance
             self.clock.minute = self.clock.absolute_minute % 1440
             self.clock.updated_at = time.time()
             self.latest_result = self._kernel_result_dict(kernel_result)
@@ -1218,8 +1221,8 @@ class MultiModelSimulator:
     def control_clock(self, payload: Mapping[str, Any], model_id: Optional[str] = None) -> Dict[str, Any]:
         return self.service_for(model_id).control_clock(payload)
 
-    def step(self, model_id: Optional[str] = None) -> Dict[str, Any]:
-        return self.service_for(model_id).step()
+    def step(self, model_id: Optional[str] = None, advance_minutes: Optional[int] = None) -> Dict[str, Any]:
+        return self.service_for(model_id).step(advance_minutes=advance_minutes)
 
     def set_curves(self, payload: Mapping[str, Any], model_id: Optional[str] = None) -> Dict[str, Any]:
         return self.service_for(model_id).set_curves(payload)

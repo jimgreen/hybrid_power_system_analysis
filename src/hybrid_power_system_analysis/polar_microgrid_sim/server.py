@@ -23,6 +23,13 @@ WEB_DIR = PACKAGE_DIR / "web"
 CLOCK_BASE_INTERVAL_SECONDS = 1.0
 
 
+def _clock_int_value(value: Any, default: int = 1) -> int:
+    try:
+        return max(1, int(round(float(value))))
+    except (TypeError, ValueError):
+        return default
+
+
 class JsonApiError(Exception):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
@@ -253,17 +260,20 @@ def make_http_server(
 
 def _advance_clock_if_due(service: PolarMicrogridSimulator, last_step: float) -> float:
     clock = service.snapshot()["clock"]
-    if clock["state"] != "running":
-        return time.monotonic()
-    interval = max(0.05, CLOCK_BASE_INTERVAL_SECONDS / max(float(clock["speed"]), 0.1))
     now = time.monotonic()
-    if now - last_step >= interval:
-        try:
-            service.step()
-        except Exception:
-            service.control_clock({"action": "pause"})
+    if clock["state"] != "running":
         return now
-    return last_step
+    if now - last_step < CLOCK_BASE_INTERVAL_SECONDS:
+        return last_step
+    speed_minutes = _clock_int_value(clock.get("speed"), 1)
+    step_minutes = _clock_int_value(clock.get("step_minutes"), 1)
+    # Do not catch up by elapsed wall time: one completed solve advances one logical simulation step.
+    advance_minutes = speed_minutes * step_minutes
+    try:
+        service.step(advance_minutes=advance_minutes)
+    except Exception:
+        service.control_clock({"action": "pause"})
+    return time.monotonic()
 
 
 def start_clock_worker(service: PolarMicrogridSimulator, stop_event: threading.Event) -> threading.Thread:
