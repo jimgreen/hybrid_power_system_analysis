@@ -16,10 +16,12 @@ const state = {
   selectedCurveKeys: ["wind_speed_mps"],
   curveEditKey: "",
   isCurveDragging: false,
+  curveCursor: { visible: false, x: 0, y: 0, index: 0 },
   settingsLoaded: false,
   activeFaultTab: "devices",
   faultDeviceFilter: { dev_type: "all", dev_name: "" },
   faultMeasurementFilter: { dev_type: "all", dev_name: "", key: "" },
+  modelDeviceFilter: { dev_type: "all", dev_name: "" },
   runtimeDeviceFilter: { dev_type: "all", dev_name: "" },
   runtimeTraceHistory: [],
   runtimeTraceWindowMinutes: 60,
@@ -71,6 +73,9 @@ function showPage(page, updateHash = true) {
       resizeCurveCanvas();
       renderCurveEditor(true);
     });
+  }
+  if (target === "model") {
+    requestAnimationFrame(() => renderGridModelPage());
   }
   if (target === "runtime") {
     requestAnimationFrame(() => drawRuntimeTraceChart());
@@ -141,6 +146,7 @@ function setActiveModel(modelId, shouldRefresh = true) {
   state.modeFilter = { dev_type: "all", dev_name: "" };
   state.faultDeviceFilter = { dev_type: "all", dev_name: "" };
   state.faultMeasurementFilter = { dev_type: "all", dev_name: "", key: "" };
+  state.modelDeviceFilter = { dev_type: "all", dev_name: "" };
   state.runtimeDeviceFilter = { dev_type: "all", dev_name: "" };
   state.measurementCompareFilter = { dev_type: "all", dev_name: "" };
   state.activeCurveKey = "wind_speed_mps";
@@ -767,6 +773,7 @@ function drawCurves() {
     ctx.fillStyle = "#63717a";
     ctx.fillText(`${meta.label} (${meta.unit})`, legendX + 26, legendY + 4);
   });
+  drawCurveCursor(ctx, canvas, plot, metas);
 }
 
 function pointerPositionOnCanvas(event) {
@@ -784,6 +791,143 @@ function curvePointIndexFromX(x, canvas) {
   const right = canvas.width - plot.right;
   const pointCount = curvePointCount();
   return clamp(Math.round(((x - left) / (right - left)) * (pointCount - 1)), 0, pointCount - 1);
+}
+
+function curveXFromPointIndex(index, canvas) {
+  const plot = curvePlot(canvas);
+  const left = plot.left;
+  const right = canvas.width - plot.right;
+  return left + (clamp(index, 0, curvePointCount() - 1) / Math.max(1, curvePointCount() - 1)) * (right - left);
+}
+
+function setCurveCursorFromEvent(event, shouldDraw = true) {
+  const canvas = $("curveEditorChart");
+  if (!canvas) return;
+  const pos = pointerPositionOnCanvas(event);
+  const plot = curvePlot(canvas);
+  const left = plot.left;
+  const right = canvas.width - plot.right;
+  const top = plot.top;
+  const bottom = canvas.height - plot.bottom;
+  if (pos.x < left || pos.x > right || pos.y < top || pos.y > bottom) {
+    state.curveCursor = { visible: false, x: pos.x, y: pos.y, index: state.curveCursor.index || 0 };
+    if (shouldDraw) drawCurves();
+    return;
+  }
+  state.curveCursor = {
+    visible: true,
+    x: clamp(pos.x, left, right),
+    y: clamp(pos.y, top, bottom),
+    index: curvePointIndexFromX(pos.x, canvas),
+  };
+  if (shouldDraw) drawCurves();
+}
+
+function hideCurveCursor() {
+  if (!state.curveCursor.visible) return;
+  state.curveCursor.visible = false;
+  drawCurves();
+}
+
+function drawCurveTooltipBox(ctx, x, y, width, height, radius = 8) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + width - radius, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+  ctx.lineTo(x + width, y + height - radius);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+  ctx.lineTo(x + radius, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+function drawCurveCursor(ctx, canvas, plot, metas) {
+  const cursor = state.curveCursor;
+  if (!cursor.visible || !metas.length) return;
+  const left = plot.left;
+  const right = canvas.width - plot.right;
+  const top = plot.top;
+  const bottom = canvas.height - plot.bottom;
+  const index = clamp(cursor.index, 0, curvePointCount() - 1);
+  const x = curveXFromPointIndex(index, canvas);
+  const y = clamp(cursor.y, top, bottom);
+  const tooltipMetas = metas.slice(0, 6);
+  const extraCount = Math.max(0, metas.length - tooltipMetas.length);
+  const timeLabel = formatCurveTableTime(pointMinute(index));
+  const valueLines = tooltipMetas.map((meta) => {
+    const value = roundCurveValue(meta.key, state.curveSeries[meta.key]?.[index] ?? 0);
+    return { meta, text: `${meta.label}: ${value} ${meta.unit}` };
+  });
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(29, 57, 66, 0.58)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.moveTo(x, top);
+  ctx.lineTo(x, bottom);
+  ctx.moveTo(left, y);
+  ctx.lineTo(right, y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  tooltipMetas.forEach((meta) => {
+    const values = state.curveSeries[meta.key] || [];
+    if (!values.length) return;
+    const markerY = valueToY(values[index], meta, canvas);
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = meta.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, markerY, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
+
+  ctx.font = "12px Microsoft YaHei, Arial";
+  const title = `时刻: ${timeLabel}`;
+  const point = `点号: ${index + 1}`;
+  const lineTexts = [title, point, ...valueLines.map((line) => line.text), extraCount ? `另有 ${extraCount} 条曲线` : ""].filter(Boolean);
+  const tooltipWidth = Math.max(154, ...lineTexts.map((line) => ctx.measureText(line).width + 28));
+  const lineHeight = 18;
+  const tooltipHeight = 16 + lineTexts.length * lineHeight;
+  let tooltipX = x + 14;
+  let tooltipY = y + 14;
+  if (tooltipX + tooltipWidth > right - 6) tooltipX = x - tooltipWidth - 14;
+  if (tooltipY + tooltipHeight > bottom - 6) tooltipY = y - tooltipHeight - 14;
+  tooltipX = clamp(tooltipX, left + 6, right - tooltipWidth - 6);
+  tooltipY = clamp(tooltipY, top + 6, bottom - tooltipHeight - 6);
+
+  ctx.shadowColor = "rgba(28, 45, 52, 0.18)";
+  ctx.shadowBlur = 12;
+  ctx.shadowOffsetY = 3;
+  ctx.fillStyle = "rgba(255, 255, 255, 0.96)";
+  drawCurveTooltipBox(ctx, tooltipX, tooltipY, tooltipWidth, tooltipHeight);
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.strokeStyle = "rgba(171, 190, 198, 0.9)";
+  ctx.stroke();
+
+  ctx.fillStyle = "#1f3037";
+  ctx.font = "700 12px Microsoft YaHei, Arial";
+  ctx.fillText(title, tooltipX + 10, tooltipY + 18);
+  ctx.font = "12px Microsoft YaHei, Arial";
+  ctx.fillStyle = "#63717a";
+  ctx.fillText(point, tooltipX + 10, tooltipY + 36);
+  valueLines.forEach((line, lineIndex) => {
+    const textY = tooltipY + 54 + lineIndex * lineHeight;
+    ctx.fillStyle = line.meta.color;
+    ctx.fillRect(tooltipX + 10, textY - 7, 10, 3);
+    ctx.fillStyle = "#314850";
+    ctx.fillText(line.text, tooltipX + 26, textY);
+  });
+  if (extraCount) {
+    ctx.fillStyle = "#63717a";
+    ctx.fillText(`另有 ${extraCount} 条曲线`, tooltipX + 10, tooltipY + 54 + valueLines.length * lineHeight);
+  }
+  ctx.restore();
 }
 
 function curveKeyAtPointer(event) {
@@ -905,6 +1049,7 @@ function initCurveEditor() {
   const table = $("hourlyCurveTable");
   if (!canvas || !table) return;
   canvas.addEventListener("pointerdown", (event) => {
+    setCurveCursorFromEvent(event, false);
     if (event.button === 2) {
       event.preventDefault();
       cancelCurveEditSelection();
@@ -919,10 +1064,14 @@ function initCurveEditor() {
     canvas.setPointerCapture(event.pointerId);
   });
   canvas.addEventListener("pointermove", (event) => {
+    setCurveCursorFromEvent(event, !state.isCurveDragging);
     if (state.isCurveDragging) {
       event.preventDefault();
       applyCurveDrag(event);
     }
+  });
+  canvas.addEventListener("pointerleave", () => {
+    if (!state.isCurveDragging) hideCurveCursor();
   });
   canvas.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -1006,6 +1155,7 @@ function renderSnapshot(snapshot) {
   appendMeasurementTrace(snapshot);
   renderRuntimeLogs();
   renderMeasurementCompareTable();
+  renderGridModelPage();
   if (!state.settingsLoaded) {
     state.deviceFaults = [...(snapshot.settings?.device_faults || [])];
     state.measurementFaults = [...(snapshot.settings?.measurement_faults || [])];
@@ -1105,6 +1255,258 @@ function renderRuntimeLogs() {
         `).join("")}
       </tbody>
     </table>`;
+}
+
+function gridModelDevices() {
+  return state.snapshot?.devices || [];
+}
+
+function gridModelFilterMatches(dev, filter = state.modelDeviceFilter || { dev_type: "all", dev_name: "" }) {
+  if (filter.dev_type && filter.dev_type !== "all" && dev.dev_type !== filter.dev_type) return false;
+  if (filter.dev_name && dev.dev_name !== filter.dev_name) return false;
+  return true;
+}
+
+function filteredGridModelDevices(devices = gridModelDevices()) {
+  return devices.filter((dev) => gridModelFilterMatches(dev));
+}
+
+function gridModelFilterLabel(filter = state.modelDeviceFilter || { dev_type: "all", dev_name: "" }) {
+  if (filter.dev_type === "all") return "全部设备";
+  if (filter.dev_name) return filter.dev_name;
+  return filter.dev_type;
+}
+
+function formatModelParamValue(value) {
+  if (value === null || value === undefined || value === "") return "--";
+  if (Array.isArray(value)) return value.join(", ");
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function modelDeviceIndexValue(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : Number.POSITIVE_INFINITY;
+}
+
+function compareModelRowsByIndex(left, right) {
+  const indexCompare = modelDeviceIndexValue(left.idx ?? left.raw?.idx) - modelDeviceIndexValue(right.idx ?? right.raw?.idx);
+  if (indexCompare) return indexCompare;
+  return String(left.name || left.dev_name || "").localeCompare(String(right.name || right.dev_name || ""));
+}
+
+function modelAttributeRecordForDevice(dev) {
+  const record = {
+    dev_type: dev.dev_type || "--",
+    dev_name: dev.dev_name || "--",
+    idx: formatModelParamValue(dev.idx ?? dev.raw?.idx),
+    name: formatModelParamValue(dev.dev_name || dev.raw?.name),
+  };
+  Object.entries(dev.raw || {}).forEach(([key, value]) => {
+    if (["idx", "name", "dev_name", "dev_type"].includes(key)) return;
+    record[key] = formatModelParamValue(value);
+  });
+  record.run_stat = formatModelParamValue(dev.run_stat ?? record.run_stat);
+  record.status = formatModelParamValue(dev.status ?? record.status);
+  record.mode = formatModelParamValue(dev.mode || dev.raw?.control_type || dev.raw?.ctrl_mode || record.mode);
+  if ((dev.set_types || []).length) record.set_types = formatModelParamValue(dev.set_types);
+  Object.entries(dev.set_values || {}).forEach(([key, value]) => {
+    record[key] = formatModelParamValue(value);
+  });
+  return record;
+}
+
+function modelAttributeLabel(key) {
+  const labels = {
+    idx: "idx",
+    name: "名称",
+  };
+  return labels[key] || key;
+}
+
+function modelAttributeColumns(records) {
+  const fixed = ["idx", "name"];
+  const preferred = [
+    "node",
+    "from_node",
+    "to_node",
+    "ac_node",
+    "dc_node",
+    "control_type",
+    "ctrl_mode",
+    "mode",
+    "run_stat",
+    "status",
+    "p_set",
+    "q_set",
+    "v_set",
+    "p_ac_set",
+    "q_ac_set",
+    "v_ac_set",
+    "p_dc_set",
+    "v_dc_set",
+    "pv0",
+    "pv1",
+    "pv2",
+    "qv0",
+    "qv1",
+    "qv2",
+    "pbase",
+    "qbase",
+    "pmax",
+    "pmin",
+    "qmax",
+    "qmin",
+    "soc_curr",
+    "alpha",
+    "set_types",
+  ];
+  const seen = new Set([...fixed, "dev_type", "dev_name"]);
+  const keys = [];
+  const appendKey = (key) => {
+    if (!key || seen.has(key)) return;
+    if (!records.some((record) => record[key] !== undefined && record[key] !== "--")) return;
+    seen.add(key);
+    keys.push(key);
+  };
+  preferred.forEach(appendKey);
+  records.forEach((record) => {
+    Object.keys(record).forEach(appendKey);
+  });
+  return [...fixed, ...keys].map((key) => ({ key, label: modelAttributeLabel(key) }));
+}
+
+function groupedModelAttributeRecords(records) {
+  const groups = new Map();
+  records.forEach((record) => {
+    const devType = record.dev_type || "未分类";
+    const rows = groups.get(devType) || [];
+    rows.push(record);
+    groups.set(devType, rows);
+  });
+  return Array.from(groups.entries())
+    .map(([devType, rows]) => [
+      devType,
+      rows.sort(compareModelRowsByIndex),
+    ])
+    .sort(([left], [right]) => String(left).localeCompare(String(right)));
+}
+
+function renderModelAttributeTable(rows) {
+  const columns = modelAttributeColumns(rows);
+  return `
+    <table class="model-param-table">
+      <thead>
+        <tr>
+          ${columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("")}
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map((row) => `
+          <tr>
+            ${columns.map((column) => `<td class="attr-value">${escapeHtml(row[column.key] ?? "--")}</td>`).join("")}
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>`;
+}
+
+function renderGridModelDeviceTree() {
+  const container = $("modelDeviceTree");
+  if (!container) return;
+  const devices = gridModelDevices();
+  const filter = state.modelDeviceFilter || { dev_type: "all", dev_name: "" };
+  const groupEntries = groupedByDeviceType(devices).map(([devType, items]) => [
+    devType,
+    [...items].sort(compareModelRowsByIndex),
+  ]);
+  $("modelTreeSummary").textContent = `${groupEntries.length} 类 · ${devices.length} 台`;
+  container.innerHTML = `
+    <button
+      type="button"
+      class="tree-node tree-root ${filter.dev_type === "all" ? "is-active" : ""}"
+      data-model-tree-type="all"
+      data-model-tree-name=""
+    >
+      <span>全部设备</span>
+      <strong>${devices.length}</strong>
+    </button>
+    ${groupEntries.map(([devType, items]) => `
+      <div class="tree-group">
+        <button
+          type="button"
+          class="tree-node tree-type ${filter.dev_type === devType && !filter.dev_name ? "is-active" : filter.dev_type === devType ? "is-parent-active" : ""}"
+          data-model-tree-type="${escapeHtml(devType)}"
+          data-model-tree-name=""
+        >
+          <span>${escapeHtml(devType)}</span>
+          <strong>${items.length}</strong>
+        </button>
+        <div class="tree-children">
+          ${items.map((dev) => {
+            const idx = formatModelParamValue(dev.idx ?? dev.raw?.idx);
+            return `
+            <button
+              type="button"
+              class="tree-node tree-child model-tree-child ${filter.dev_type === dev.dev_type && filter.dev_name === dev.dev_name ? "is-active" : ""}"
+              data-model-tree-type="${escapeHtml(dev.dev_type)}"
+              data-model-tree-name="${escapeHtml(dev.dev_name)}"
+            >
+              <span class="model-tree-idx">${escapeHtml(idx)}</span>
+              <span class="model-tree-name">${escapeHtml(dev.dev_name)}</span>
+            </button>
+          `;
+          }).join("")}
+        </div>
+      </div>
+    `).join("")}
+  `;
+}
+
+function renderGridModelParamTable() {
+  const container = $("modelParamTable");
+  if (!container) return;
+  const devices = gridModelDevices();
+  const rows = filteredGridModelDevices(devices).map(modelAttributeRecordForDevice);
+  const groups = groupedModelAttributeRecords(rows);
+  const singleGroupColumnCount = groups.length === 1 ? modelAttributeColumns(groups[0][1]).length : 0;
+  $("modelParamSummary").textContent = groups.length > 1
+    ? `${gridModelFilterLabel()} · ${rows.length}/${devices.length} 台 · ${groups.length} 类表格`
+    : `${gridModelFilterLabel()} · ${rows.length}/${devices.length} 台 · ${singleGroupColumnCount} 列属性`;
+  if (!devices.length) {
+    container.innerHTML = '<div class="empty-state">暂无电网模型数据</div>';
+    return;
+  }
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty-state">当前筛选无模型参数</div>';
+    return;
+  }
+  if (groups.length <= 1) {
+    container.innerHTML = renderModelAttributeTable(rows);
+    return;
+  }
+  container.innerHTML = groups.map(([devType, groupRows]) => {
+    const columnCount = modelAttributeColumns(groupRows).length;
+    return `
+      <section class="model-param-group">
+        <div class="model-param-group-head">
+          <h3>${escapeHtml(devType)}</h3>
+          <span>${groupRows.length} 台 · ${columnCount} 列属性</span>
+        </div>
+        ${renderModelAttributeTable(groupRows)}
+      </section>
+    `;
+  }).join("");
+}
+
+function renderGridModelPage() {
+  renderGridModelDeviceTree();
+  renderGridModelParamTable();
+}
+
+function setGridModelFilter(devType, devName = "") {
+  state.modelDeviceFilter = { dev_type: devType || "all", dev_name: devName || "" };
+  renderGridModelPage();
 }
 
 function numberOrNull(value) {
@@ -2632,6 +3034,13 @@ document.addEventListener("click", (event) => {
     setMeasurementCompareFilter(
       measurementTreeButton.dataset.measurementTreeType,
       measurementTreeButton.dataset.measurementTreeName || "",
+    );
+  }
+  const modelTreeButton = event.target.closest("[data-model-tree-type]");
+  if (modelTreeButton) {
+    setGridModelFilter(
+      modelTreeButton.dataset.modelTreeType,
+      modelTreeButton.dataset.modelTreeName || "",
     );
   }
   const runtimeTreeButton = event.target.closest("[data-runtime-tree-type]");

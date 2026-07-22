@@ -51,6 +51,7 @@
 
       <nav class="page-nav" aria-label="模拟台主题导航">
         <button data-nav-page="overview" class="is-active">主页</button>
+        <button data-nav-page="model">电网模型</button>
         <button data-nav-page="curves">曲线设置</button>
         <button data-nav-page="faults">故障设置</button>
         <button data-nav-page="modes">运行模式</button>
@@ -103,6 +104,37 @@
                 <span id="overviewCommandCount">0</span>
               </div>
               <div id="commandInbox" class="log-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page-section" data-page="model">
+          <div class="model-page-layout">
+            <aside class="panel model-tree-panel">
+              <div class="panel-head">
+                <h2>设备树</h2>
+                <span id="modelTreeSummary">0 类 · 0 台</span>
+              </div>
+              <div id="modelDeviceTree" class="device-tree" aria-label="电网模型设备树">
+                <button
+                  type="button"
+                  class="tree-node tree-root is-active"
+                  data-model-tree-type="all"
+                  data-model-tree-name=""
+                >
+                  <span>全部设备</span>
+                  <strong>0</strong>
+                </button>
+              </div>
+            </aside>
+
+            <section class="panel model-table-panel">
+              <div class="panel-head">
+                <h2>模型参数</h2>
+                <span id="modelParamSummary">待同步</span>
+              </div>
+              <div class="sr-only">idx 名称 设备属性</div>
+              <div id="modelParamTable" class="model-param-wrap" data-model-role="param-table"></div>
             </section>
           </div>
         </section>
