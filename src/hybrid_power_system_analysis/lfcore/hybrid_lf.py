@@ -120,6 +120,40 @@ def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
 
 
+def _build_group_share_metadata(positions, setpoints, active_mask):
+    positions = np.asarray(positions, dtype=np.int32)
+    setpoints = np.asarray(setpoints, dtype=np.float64)
+    active_mask = np.asarray(active_mask, dtype=bool)
+    n = positions.size
+    avg_set = setpoints.copy()
+    rep_mask = np.zeros(n, dtype=bool)
+    share_mask = np.zeros(n, dtype=bool)
+    ref_idx = np.arange(n, dtype=np.int32)
+    if n == 0 or not np.any(active_mask):
+        return avg_set, rep_mask, share_mask, ref_idx
+    active_idx = np.flatnonzero(active_mask).astype(np.int32, copy=False)
+    pos_active = positions[active_idx]
+    order = np.argsort(pos_active, kind="stable")
+    sorted_idx = active_idx[order]
+    sorted_pos = pos_active[order]
+    start = 0
+    while start < sorted_idx.size:
+        stop = start + 1
+        bus_pos = sorted_pos[start]
+        while stop < sorted_idx.size and sorted_pos[stop] == bus_pos:
+            stop += 1
+        members = sorted_idx[start:stop]
+        ref = int(members[0])
+        avg = float(np.mean(setpoints[members]))
+        avg_set[members] = avg
+        rep_mask[ref] = True
+        if members.size > 1:
+            share_mask[members[1:]] = True
+        ref_idx[members] = ref
+        start = stop
+    return avg_set, rep_mask, share_mask, ref_idx
+
+
 class _LightweightHybridNetwork(SimpleNamespace):
     @property
     def total_nodes(self) -> int:
@@ -1245,8 +1279,20 @@ class HybridPowerFlowCalc:
         self.dcac_ctrl_ac_p_mask = np.array([], dtype=bool)
         self.dcac_ctrl_q_mask = np.array([], dtype=bool)
         self.dcac_ctrl_ac_theta_mask = np.array([], dtype=bool)
+        self.dcac_dcv_avg_set = np.array([], dtype=np.float64)
+        self.dcac_dcv_rep_mask = np.array([], dtype=bool)
+        self.dcac_dcv_share_mask = np.array([], dtype=bool)
+        self.dcac_dcv_ref_idx = np.array([], dtype=np.int32)
+        self.dcac_acv_v_avg_set = np.array([], dtype=np.float64)
+        self.dcac_acv_theta_avg_set = np.array([], dtype=np.float64)
+        self.dcac_acv_rep_mask = np.array([], dtype=bool)
+        self.dcac_acv_share_mask = np.array([], dtype=bool)
+        self.dcac_acv_ref_idx = np.array([], dtype=np.int32)
         self.dcac_ones = np.array([], dtype=np.float64)
         self.dcac_dc_eq_ones = np.array([], dtype=np.float64)
+        self.dcac_ctrl_rows = np.array([], dtype=np.int32)
+        self.dcac_ctrl_cols = np.array([], dtype=np.int32)
+        self.dcac_ctrl_data = np.array([], dtype=np.float64)
 
         self.acac_i_p_col = np.array([], dtype=np.int32)
         self.acac_i_q_col = np.array([], dtype=np.int32)
@@ -1263,6 +1309,17 @@ class HybridPowerFlowCalc:
         self.acac_q_j_mask = np.array([], dtype=bool)
         self.acac_v_j_mask = np.array([], dtype=bool)
         self.acac_ones = np.array([], dtype=np.float64)
+        self.acac_i_v_avg_set = np.array([], dtype=np.float64)
+        self.acac_i_v_rep_mask = np.array([], dtype=bool)
+        self.acac_i_v_share_mask = np.array([], dtype=bool)
+        self.acac_i_v_ref_idx = np.array([], dtype=np.int32)
+        self.acac_j_v_avg_set = np.array([], dtype=np.float64)
+        self.acac_j_v_rep_mask = np.array([], dtype=bool)
+        self.acac_j_v_share_mask = np.array([], dtype=bool)
+        self.acac_j_v_ref_idx = np.array([], dtype=np.int32)
+        self.acac_ctrl_rows = np.array([], dtype=np.int32)
+        self.acac_ctrl_cols = np.array([], dtype=np.int32)
+        self.acac_ctrl_data = np.array([], dtype=np.float64)
 
     def _clear_global_jacobian_pattern(self):
         self.global_jac_raw_data = np.array([], dtype=np.float64)
@@ -1282,21 +1339,13 @@ class HybridPowerFlowCalc:
         self.global_jac_dcac_ac_q_slice = slice(0, 0)
         self.global_jac_dcac_dc_eq_slice = slice(0, 0)
         self.global_jac_dcac_loss_slice = slice(0, 0)
-        self.global_jac_dcac_ctrl_q_slice = slice(0, 0)
-        self.global_jac_dcac_ctrl_theta_slice = slice(0, 0)
-        self.global_jac_dcac_ctrl_dcv_slice = slice(0, 0)
-        self.global_jac_dcac_ctrl_acv_slice = slice(0, 0)
-        self.global_jac_dcac_ctrl_acp_slice = slice(0, 0)
+        self.global_jac_dcac_ctrl_slice = slice(0, 0)
         self.global_jac_acac_i_p_slice = slice(0, 0)
         self.global_jac_acac_i_q_slice = slice(0, 0)
         self.global_jac_acac_j_p_slice = slice(0, 0)
         self.global_jac_acac_j_q_slice = slice(0, 0)
         self.global_jac_acac_loss_slice = slice(0, 0)
-        self.global_jac_acac_ctrl_p_slice = slice(0, 0)
-        self.global_jac_acac_ctrl_q_i_slice = slice(0, 0)
-        self.global_jac_acac_ctrl_v_i_slice = slice(0, 0)
-        self.global_jac_acac_ctrl_q_j_slice = slice(0, 0)
-        self.global_jac_acac_ctrl_v_j_slice = slice(0, 0)
+        self.global_jac_acac_ctrl_slice = slice(0, 0)
 
     def _cache_converter_jacobian_structure(self):
         """Precompute converter Jacobian row/column indices once per prepared case."""
@@ -1329,7 +1378,100 @@ class HybridPowerFlowCalc:
             self.dcac_ctrl_ac_p_mask = self.dcac_ctrl_code == 2
             self.dcac_ctrl_ac_theta_mask = self.dcac_ctrl_ac_v_mask.copy()
             self.dcac_ctrl_q_mask = ~self.dcac_ctrl_ac_theta_mask
+            (
+                self.dcac_dcv_avg_set,
+                self.dcac_dcv_rep_mask,
+                self.dcac_dcv_share_mask,
+                self.dcac_dcv_ref_idx,
+            ) = _build_group_share_metadata(self.dcac_dc_pos, self.dcac_v_dc_set, self.dcac_ctrl_dc_v_mask)
+            (
+                self.dcac_acv_v_avg_set,
+                self.dcac_acv_rep_mask,
+                self.dcac_acv_share_mask,
+                self.dcac_acv_ref_idx,
+            ) = _build_group_share_metadata(self.dcac_ac_pos, self.dcac_v_ac_set, self.dcac_ctrl_ac_v_mask)
+            (
+                self.dcac_acv_theta_avg_set,
+                _theta_rep,
+                _theta_share,
+                _theta_ref,
+            ) = _build_group_share_metadata(self.dcac_ac_pos, self.dcac_ac_theta_set, self.dcac_ctrl_ac_v_mask)
+            self.dcac_acv_rep_mask = self.dcac_acv_rep_mask | _theta_rep
+            self.dcac_acv_share_mask = self.dcac_acv_share_mask | _theta_share
+            self.dcac_acv_ref_idx = _theta_ref
             self.dcac_ones = np.ones(self.N_dcac, dtype=np.float64)
+            ctrl_rows = []
+            ctrl_cols = []
+            ctrl_data = []
+            if np.any(self.dcac_ctrl_ac_p_mask):
+                idx_mask = np.flatnonzero(self.dcac_ctrl_ac_p_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.dcac_eq_ctrl_1[idx_mask])
+                ctrl_cols.append(self.dcac_ac_p_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.dcac_dcv_rep_mask):
+                idx_mask = np.flatnonzero(self.dcac_dcv_rep_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.dcac_eq_ctrl_1[idx_mask])
+                ctrl_cols.append(self.dcac_dc_v_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.dcac_dcv_share_mask):
+                idx_mask = np.flatnonzero(self.dcac_dcv_share_mask).astype(np.int32, copy=False)
+                ref = self.dcac_dcv_ref_idx[idx_mask]
+                rows = np.repeat(self.dcac_eq_ctrl_1[idx_mask], 2)
+                cols = np.empty(2 * idx_mask.size, dtype=np.int32)
+                data = np.empty(2 * idx_mask.size, dtype=np.float64)
+                cols[0::2] = self.dcac_dc_p_col[idx_mask]
+                cols[1::2] = self.dcac_dc_p_col[ref]
+                data[0::2] = 1.0
+                data[1::2] = -1.0
+                ctrl_rows.append(rows)
+                ctrl_cols.append(cols)
+                ctrl_data.append(data)
+            if np.any(self.dcac_acv_rep_mask):
+                idx_mask = np.flatnonzero(self.dcac_acv_rep_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(np.repeat(self.dcac_eq_ctrl_1[idx_mask], 1))
+                ctrl_cols.append(self.dcac_ac_v_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.dcac_acv_share_mask):
+                idx_mask = np.flatnonzero(self.dcac_acv_share_mask).astype(np.int32, copy=False)
+                ref = self.dcac_acv_ref_idx[idx_mask]
+                rows = np.repeat(self.dcac_eq_ctrl_1[idx_mask], 2)
+                cols = np.empty(2 * idx_mask.size, dtype=np.int32)
+                data = np.empty(2 * idx_mask.size, dtype=np.float64)
+                cols[0::2] = self.dcac_ac_p_col[idx_mask]
+                cols[1::2] = self.dcac_ac_p_col[ref]
+                data[0::2] = 1.0
+                data[1::2] = -1.0
+                ctrl_rows.append(rows)
+                ctrl_cols.append(cols)
+                ctrl_data.append(data)
+            q_mask = self.dcac_ctrl_q_mask & ~self.dcac_ctrl_ac_v_mask
+            if np.any(q_mask):
+                idx_mask = np.flatnonzero(q_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.dcac_eq_ctrl_2[idx_mask])
+                ctrl_cols.append(self.dcac_ac_q_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.dcac_acv_rep_mask):
+                idx_mask = np.flatnonzero(self.dcac_acv_rep_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.dcac_eq_ctrl_2[idx_mask])
+                ctrl_cols.append(self.dcac_ac_theta_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.dcac_acv_share_mask):
+                idx_mask = np.flatnonzero(self.dcac_acv_share_mask).astype(np.int32, copy=False)
+                ref = self.dcac_acv_ref_idx[idx_mask]
+                rows = np.repeat(self.dcac_eq_ctrl_2[idx_mask], 2)
+                cols = np.empty(2 * idx_mask.size, dtype=np.int32)
+                data = np.empty(2 * idx_mask.size, dtype=np.float64)
+                cols[0::2] = self.dcac_ac_q_col[idx_mask]
+                cols[1::2] = self.dcac_ac_q_col[ref]
+                data[0::2] = 1.0
+                data[1::2] = -1.0
+                ctrl_rows.append(rows)
+                ctrl_cols.append(cols)
+                ctrl_data.append(data)
+            if ctrl_rows:
+                self.dcac_ctrl_rows = np.concatenate(ctrl_rows).astype(np.int32, copy=False)
+                self.dcac_ctrl_cols = np.concatenate(ctrl_cols).astype(np.int32, copy=False)
+                self.dcac_ctrl_data = np.concatenate(ctrl_data).astype(np.float64, copy=False)
 
         if self.N_acac:
             idx = np.arange(self.N_acac, dtype=np.int32)
@@ -1358,6 +1500,70 @@ class HybridPowerFlowCalc:
             self.acac_q_j_mask = (self.acac_ctrl_code == 0) | (self.acac_ctrl_code == 1)
             self.acac_v_j_mask = ~self.acac_q_j_mask
             self.acac_ones = np.ones(self.N_acac, dtype=np.float64)
+            (
+                self.acac_i_v_avg_set,
+                self.acac_i_v_rep_mask,
+                self.acac_i_v_share_mask,
+                self.acac_i_v_ref_idx,
+            ) = _build_group_share_metadata(self.acac_i_pos, self.acac_i_v_set, self.acac_v_i_mask)
+            (
+                self.acac_j_v_avg_set,
+                self.acac_j_v_rep_mask,
+                self.acac_j_v_share_mask,
+                self.acac_j_v_ref_idx,
+            ) = _build_group_share_metadata(self.acac_j_pos, self.acac_j_v_set, self.acac_v_j_mask)
+            ctrl_rows = [self.acac_eq_ctrl_1]
+            ctrl_cols = [self.acac_i_p_col]
+            ctrl_data = [np.ones(self.N_acac, dtype=np.float64)]
+            if np.any(self.acac_q_i_mask):
+                idx_mask = np.flatnonzero(self.acac_q_i_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.acac_eq_ctrl_2[idx_mask])
+                ctrl_cols.append(self.acac_i_q_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.acac_i_v_rep_mask):
+                idx_mask = np.flatnonzero(self.acac_i_v_rep_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.acac_eq_ctrl_2[idx_mask])
+                ctrl_cols.append(self.acac_i_v_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.acac_i_v_share_mask):
+                idx_mask = np.flatnonzero(self.acac_i_v_share_mask).astype(np.int32, copy=False)
+                ref = self.acac_i_v_ref_idx[idx_mask]
+                rows = np.repeat(self.acac_eq_ctrl_2[idx_mask], 2)
+                cols = np.empty(2 * idx_mask.size, dtype=np.int32)
+                data = np.empty(2 * idx_mask.size, dtype=np.float64)
+                cols[0::2] = self.acac_i_q_col[idx_mask]
+                cols[1::2] = self.acac_i_q_col[ref]
+                data[0::2] = 1.0
+                data[1::2] = -1.0
+                ctrl_rows.append(rows)
+                ctrl_cols.append(cols)
+                ctrl_data.append(data)
+            if np.any(self.acac_q_j_mask):
+                idx_mask = np.flatnonzero(self.acac_q_j_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.acac_eq_ctrl_3[idx_mask])
+                ctrl_cols.append(self.acac_j_q_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.acac_j_v_rep_mask):
+                idx_mask = np.flatnonzero(self.acac_j_v_rep_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.acac_eq_ctrl_3[idx_mask])
+                ctrl_cols.append(self.acac_j_v_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.acac_j_v_share_mask):
+                idx_mask = np.flatnonzero(self.acac_j_v_share_mask).astype(np.int32, copy=False)
+                ref = self.acac_j_v_ref_idx[idx_mask]
+                rows = np.repeat(self.acac_eq_ctrl_3[idx_mask], 2)
+                cols = np.empty(2 * idx_mask.size, dtype=np.int32)
+                data = np.empty(2 * idx_mask.size, dtype=np.float64)
+                cols[0::2] = self.acac_j_q_col[idx_mask]
+                cols[1::2] = self.acac_j_q_col[ref]
+                data[0::2] = 1.0
+                data[1::2] = -1.0
+                ctrl_rows.append(rows)
+                ctrl_cols.append(cols)
+                ctrl_data.append(data)
+            self.acac_ctrl_rows = np.concatenate(ctrl_rows).astype(np.int32, copy=False)
+            self.acac_ctrl_cols = np.concatenate(ctrl_cols).astype(np.int32, copy=False)
+            self.acac_ctrl_data = np.concatenate(ctrl_data).astype(np.float64, copy=False)
 
     @staticmethod
     def _rows_from_csr_indptr(indptr):
@@ -1439,15 +1645,7 @@ class HybridPowerFlowCalc:
             add_part("dcac_ac_q", self.dcac_ac_q_row, self.dcac_ac_q_col)
             add_part("dcac_dc_eq", self.dcac_dc_eq_rows, self.dcac_dc_eq_cols)
             add_part("dcac_loss", self.dcac_loss_rows, self.dcac_loss_cols)
-            add_part("dcac_ctrl_q", self.dcac_eq_ctrl_2[self.dcac_ctrl_q_mask], self.dcac_ac_q_col[self.dcac_ctrl_q_mask])
-            add_part(
-                "dcac_ctrl_theta",
-                self.dcac_eq_ctrl_2[self.dcac_ctrl_ac_theta_mask],
-                self.dcac_ac_theta_col[self.dcac_ctrl_ac_theta_mask],
-            )
-            add_part("dcac_ctrl_dcv", self.dcac_eq_ctrl_1[self.dcac_ctrl_dc_v_mask], self.dcac_dc_v_col[self.dcac_ctrl_dc_v_mask])
-            add_part("dcac_ctrl_acv", self.dcac_eq_ctrl_1[self.dcac_ctrl_ac_v_mask], self.dcac_ac_v_col[self.dcac_ctrl_ac_v_mask])
-            add_part("dcac_ctrl_acp", self.dcac_eq_ctrl_1[self.dcac_ctrl_ac_p_mask], self.dcac_ac_p_col[self.dcac_ctrl_ac_p_mask])
+            add_part("dcac_ctrl", self.dcac_ctrl_rows, self.dcac_ctrl_cols)
 
         if self.N_acac:
             add_part("acac_i_p", self.acac_i_p_row, self.acac_i_p_col)
@@ -1455,11 +1653,7 @@ class HybridPowerFlowCalc:
             add_part("acac_j_p", self.acac_j_p_row, self.acac_j_p_col)
             add_part("acac_j_q", self.acac_j_q_row, self.acac_j_q_col)
             add_part("acac_loss", self.acac_loss_rows, self.acac_loss_cols)
-            add_part("acac_ctrl_p", self.acac_eq_ctrl_1, self.acac_i_p_col)
-            add_part("acac_ctrl_q_i", self.acac_eq_ctrl_2[self.acac_q_i_mask], self.acac_i_q_col[self.acac_q_i_mask])
-            add_part("acac_ctrl_v_i", self.acac_eq_ctrl_2[self.acac_v_i_mask], self.acac_i_v_col[self.acac_v_i_mask])
-            add_part("acac_ctrl_q_j", self.acac_eq_ctrl_3[self.acac_q_j_mask], self.acac_j_q_col[self.acac_q_j_mask])
-            add_part("acac_ctrl_v_j", self.acac_eq_ctrl_3[self.acac_v_j_mask], self.acac_j_v_col[self.acac_v_j_mask])
+            add_part("acac_ctrl", self.acac_ctrl_rows, self.acac_ctrl_cols)
 
         self.global_jac_raw_data = np.empty(raw_count, dtype=np.float64)
         if raw_count == 0:
@@ -1577,22 +1771,30 @@ class HybridPowerFlowCalc:
             - self.dcac_r2 * (ac_p * ac_p + ac_q * ac_q) * vd2
         )
         f_ctrl = dcac_f[1::3]
-        f_ctrl[self.dcac_ctrl_dc_v_mask] = (
-            vd[self.dcac_ctrl_dc_v_mask] - self.dcac_v_dc_set[self.dcac_ctrl_dc_v_mask]
-        )
-        f_ctrl[self.dcac_ctrl_ac_v_mask] = (
-            va[self.dcac_ctrl_ac_v_mask] - self.dcac_v_ac_set[self.dcac_ctrl_ac_v_mask]
-        )
         f_ctrl[self.dcac_ctrl_ac_p_mask] = (
             ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
         )
+        f_ctrl[self.dcac_dcv_rep_mask] = vd[self.dcac_dcv_rep_mask] - self.dcac_dcv_avg_set[self.dcac_dcv_rep_mask]
+        if np.any(self.dcac_dcv_share_mask):
+            share_idx = np.flatnonzero(self.dcac_dcv_share_mask).astype(np.int32, copy=False)
+            ref = self.dcac_dcv_ref_idx[share_idx]
+            f_ctrl[share_idx] = dc_p[share_idx] - dc_p[ref]
+        f_ctrl[self.dcac_acv_rep_mask] = va[self.dcac_acv_rep_mask] - self.dcac_acv_v_avg_set[self.dcac_acv_rep_mask]
+        if np.any(self.dcac_acv_share_mask):
+            share_idx = np.flatnonzero(self.dcac_acv_share_mask).astype(np.int32, copy=False)
+            ref = self.dcac_acv_ref_idx[share_idx]
+            f_ctrl[share_idx] = ac_p[share_idx] - ac_p[ref]
         dcac_f[1::3] = f_ctrl
         f_second = dcac_f[2::3]
         f_second[self.dcac_ctrl_q_mask] = ac_q[self.dcac_ctrl_q_mask] - self.dcac_q_ac_set[self.dcac_ctrl_q_mask]
-        f_second[self.dcac_ctrl_ac_theta_mask] = (
-            ac_theta[self.dcac_ac_pos[self.dcac_ctrl_ac_theta_mask]]
-            - self.dcac_ac_theta_set[self.dcac_ctrl_ac_theta_mask]
+        f_second[self.dcac_acv_rep_mask] = (
+            ac_theta[self.dcac_ac_pos[self.dcac_acv_rep_mask]]
+            - self.dcac_acv_theta_avg_set[self.dcac_acv_rep_mask]
         )
+        if np.any(self.dcac_acv_share_mask):
+            share_idx = np.flatnonzero(self.dcac_acv_share_mask).astype(np.int32, copy=False)
+            ref = self.dcac_acv_ref_idx[share_idx]
+            f_second[share_idx] = ac_q[share_idx] - ac_q[ref]
         dcac_f[2::3] = f_second
         return dcac_f
 
@@ -1623,9 +1825,17 @@ class HybridPowerFlowCalc:
         f2 = acac_f[2::4]
         f3 = acac_f[3::4]
         f2[self.acac_q_i_mask] = i_q[self.acac_q_i_mask] - self.acac_i_q_set[self.acac_q_i_mask]
-        f2[self.acac_v_i_mask] = vi[self.acac_v_i_mask] - self.acac_i_v_set[self.acac_v_i_mask]
         f3[self.acac_q_j_mask] = j_q[self.acac_q_j_mask] - self.acac_j_q_set[self.acac_q_j_mask]
-        f3[self.acac_v_j_mask] = vj[self.acac_v_j_mask] - self.acac_j_v_set[self.acac_v_j_mask]
+        f2[self.acac_i_v_rep_mask] = vi[self.acac_i_v_rep_mask] - self.acac_i_v_avg_set[self.acac_i_v_rep_mask]
+        if np.any(self.acac_i_v_share_mask):
+            share_idx = np.flatnonzero(self.acac_i_v_share_mask).astype(np.int32, copy=False)
+            ref = self.acac_i_v_ref_idx[share_idx]
+            f2[share_idx] = i_q[share_idx] - i_q[ref]
+        f3[self.acac_j_v_rep_mask] = vj[self.acac_j_v_rep_mask] - self.acac_j_v_avg_set[self.acac_j_v_rep_mask]
+        if np.any(self.acac_j_v_share_mask):
+            share_idx = np.flatnonzero(self.acac_j_v_share_mask).astype(np.int32, copy=False)
+            ref = self.acac_j_v_ref_idx[share_idx]
+            f3[share_idx] = j_q[share_idx] - j_q[ref]
         acac_f[2::4] = f2
         acac_f[3::4] = f3
         return acac_f
@@ -1710,14 +1920,13 @@ class HybridPowerFlowCalc:
             self.global_jac_dcac_ac_p_slice,
             self.global_jac_dcac_ac_q_slice,
             self.global_jac_dcac_dc_eq_slice,
-            self.global_jac_dcac_ctrl_q_slice,
-            self.global_jac_dcac_ctrl_theta_slice,
-            self.global_jac_dcac_ctrl_dcv_slice,
-            self.global_jac_dcac_ctrl_acv_slice,
-            self.global_jac_dcac_ctrl_acp_slice,
+            self.global_jac_dcac_ctrl_slice,
         ):
             if self._slice_len(part_slice):
-                raw[part_slice] = 1.0
+                if part_slice == self.global_jac_dcac_ctrl_slice:
+                    raw[part_slice] = self.dcac_ctrl_data
+                else:
+                    raw[part_slice] = 1.0
 
         va = ac_V[self.dcac_ac_pos]
         vd = dc_V[self.dcac_dc_pos]
@@ -1746,14 +1955,13 @@ class HybridPowerFlowCalc:
             self.global_jac_acac_i_q_slice,
             self.global_jac_acac_j_p_slice,
             self.global_jac_acac_j_q_slice,
-            self.global_jac_acac_ctrl_p_slice,
-            self.global_jac_acac_ctrl_q_i_slice,
-            self.global_jac_acac_ctrl_v_i_slice,
-            self.global_jac_acac_ctrl_q_j_slice,
-            self.global_jac_acac_ctrl_v_j_slice,
+            self.global_jac_acac_ctrl_slice,
         ):
             if self._slice_len(part_slice):
-                raw[part_slice] = 1.0
+                if part_slice == self.global_jac_acac_ctrl_slice:
+                    raw[part_slice] = self.acac_ctrl_data
+                else:
+                    raw[part_slice] = 1.0
 
         vi = ac_V[self.acac_i_pos]
         vj = ac_V[self.acac_j_pos]
@@ -1962,23 +2170,10 @@ class HybridPowerFlowCalc:
         col_parts.append(self.dcac_loss_cols)
         data_parts.append(loss_data)
 
-        if np.any(self.dcac_ctrl_q_mask):
-            row_parts.append(self.dcac_eq_ctrl_2[self.dcac_ctrl_q_mask])
-            col_parts.append(self.dcac_ac_q_col[self.dcac_ctrl_q_mask])
-            data_parts.append(self.dcac_ones[self.dcac_ctrl_q_mask])
-        if np.any(self.dcac_ctrl_ac_theta_mask):
-            row_parts.append(self.dcac_eq_ctrl_2[self.dcac_ctrl_ac_theta_mask])
-            col_parts.append(self.dcac_ac_theta_col[self.dcac_ctrl_ac_theta_mask])
-            data_parts.append(self.dcac_ones[self.dcac_ctrl_ac_theta_mask])
-        for mask, ctrl_col in (
-            (self.dcac_ctrl_dc_v_mask, self.dcac_dc_v_col),
-            (self.dcac_ctrl_ac_v_mask, self.dcac_ac_v_col),
-            (self.dcac_ctrl_ac_p_mask, self.dcac_ac_p_col),
-        ):
-            if np.any(mask):
-                row_parts.append(self.dcac_eq_ctrl_1[mask])
-                col_parts.append(ctrl_col[mask])
-                data_parts.append(self.dcac_ones[mask])
+        if self.dcac_ctrl_rows.size:
+            row_parts.append(self.dcac_ctrl_rows)
+            col_parts.append(self.dcac_ctrl_cols)
+            data_parts.append(self.dcac_ctrl_data)
 
     def _append_acac_jacobian_terms(self, row_parts, col_parts, data_parts, acac_x, ac_V):
         """Append AC/AC converter Jacobian entries to global COO buffers."""
@@ -2019,19 +2214,10 @@ class HybridPowerFlowCalc:
         col_parts.append(self.acac_loss_cols)
         data_parts.append(loss_data)
 
-        row_parts.append(self.acac_eq_ctrl_1)
-        col_parts.append(self.acac_i_p_col)
-        data_parts.append(self.acac_ones)
-        for mask, rows_src, cols_src in (
-            (self.acac_q_i_mask, self.acac_eq_ctrl_2, self.acac_i_q_col),
-            (self.acac_v_i_mask, self.acac_eq_ctrl_2, self.acac_i_v_col),
-            (self.acac_q_j_mask, self.acac_eq_ctrl_3, self.acac_j_q_col),
-            (self.acac_v_j_mask, self.acac_eq_ctrl_3, self.acac_j_v_col),
-        ):
-            if np.any(mask):
-                row_parts.append(rows_src[mask])
-                col_parts.append(cols_src[mask])
-                data_parts.append(self.acac_ones[mask])
+        if self.acac_ctrl_rows.size:
+            row_parts.append(self.acac_ctrl_rows)
+            col_parts.append(self.acac_ctrl_cols)
+            data_parts.append(self.acac_ctrl_data)
 
     def _single_block(self):
         if self._single_ac_newton_block:

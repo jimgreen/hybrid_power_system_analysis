@@ -965,6 +965,8 @@ class ACPowerFlowCalc:
 
     def _prepare_ppc_devices(self, branch, transformer, gen, load, shunt, zero_branch, switch, active_bus):
         """Convert live ppc device rows into compact node positions and specification arrays."""
+        v_set_sum = np.zeros(self.N, dtype=np.float64)
+        v_set_count = np.zeros(self.N, dtype=np.int32)
         if gen.size:
             gen_rows = self._ppc_node_rows(gen[:, GEN_COLS["node"]])
             gen_live = (gen[:, GEN_COLS["run_stat"]] == 1) & active_bus[gen_rows]
@@ -985,20 +987,19 @@ class ACPowerFlowCalc:
             if np.any(slack_mask):
                 slack_pos = self.ppc_gen_pos[slack_mask]
                 self.node_type[slack_pos] = AC_NODE_TYPE_SLACK
-                self.V_spec[slack_pos] = live_gen[slack_mask, GEN_COLS["v_set"]]
                 self.theta_spec[slack_pos] = self.ppc["bus"][self.active_bus_rows[slack_pos], BUS_COLS["angle"]]
                 self.slack_node = int(slack_pos[-1])
+                np.add.at(v_set_sum, slack_pos, live_gen[slack_mask, GEN_COLS["v_set"]])
+                np.add.at(v_set_count, slack_pos, 1)
 
             pv_mask = (controls == CTRL_PV) & (self.node_type[self.ppc_gen_pos] != AC_NODE_TYPE_SLACK)
             if np.any(pv_mask):
                 pv_pos = self.ppc_gen_pos[pv_mask]
                 pv_v = live_gen[pv_mask, GEN_COLS["v_set"]]
-                for pos, v_set in zip(pv_pos, pv_v):
-                    if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - v_set) > 1e-6:
-                        raise ValueError(f"节点{pos}多个PV发电机电压设定冲突")
                 self.node_type[pv_pos] = AC_NODE_TYPE_PV
-                self.V_spec[pv_pos] = pv_v
                 np.add.at(self.P_spec, pv_pos, live_gen[pv_mask, GEN_COLS["p_set"]])
+                np.add.at(v_set_sum, pv_pos, pv_v)
+                np.add.at(v_set_count, pv_pos, 1)
 
             pq_mask = (controls == CTRL_PQ) | (controls == CTRL_P)
             if np.any(pq_mask):
@@ -1014,6 +1015,12 @@ class ACPowerFlowCalc:
             no_alpha = ~positive_alpha
             if np.any(no_alpha):
                 self.ppc_gen_share[no_alpha] = 1.0 / gen_count[self.ppc_gen_pos[no_alpha]]
+            slack_count = np.bincount(self.ppc_gen_pos[slack_mask], minlength=self.N) if np.any(slack_mask) else np.zeros(self.N, dtype=np.int32)
+            self.ppc_multi_slack_node_mask = slack_count > 1
+            self.ppc_gen_control = controls.copy()
+        else:
+            self.ppc_multi_slack_node_mask = np.zeros(self.N, dtype=bool)
+            self.ppc_gen_control = np.array([], dtype=np.int32)
 
         if shunt.size:
             shunt_rows = self._ppc_node_rows(shunt[:, SHUNT_COLS["node"]])
@@ -1029,11 +1036,13 @@ class ACPowerFlowCalc:
             if np.any(v_mask):
                 v_pos = self.ppc_shunt_pos[v_mask]
                 v_set_values = live_shunt[v_mask, SHUNT_COLS["v_set"]]
-                for pos, v_set in zip(v_pos, v_set_values):
-                    if not np.isnan(self.V_spec[pos]) and abs(self.V_spec[pos] - v_set) > 1e-6:
-                        raise ValueError(f"节点{pos}电压设定冲突")
                 self.node_type[v_pos] = AC_NODE_TYPE_PV
-                self.V_spec[v_pos] = v_set_values
+                np.add.at(v_set_sum, v_pos, v_set_values)
+                np.add.at(v_set_count, v_pos, 1)
+
+        v_mask = v_set_count > 0
+        if np.any(v_mask):
+            self.V_spec[v_mask] = v_set_sum[v_mask] / v_set_count[v_mask]
 
         if load.size:
             load_rows = self._ppc_node_rows(load[:, LOAD_COLS["node"]])
@@ -2926,23 +2935,57 @@ class ACPowerFlowCalc:
 
         gen = self.ppc["gen"].copy()
         if self.ppc_gen_rows.size:
-            gen_p = self.ppc_gen_share * P_gen[self.ppc_gen_pos]
-            gen_q = self.ppc_gen_share * Q_gen[self.ppc_gen_pos]
-            if np.any(self.ppc_auto_slack_mask):
-                for node_pos in np.unique(self.ppc_gen_pos[self.ppc_auto_slack_mask]):
-                    on_node = self.ppc_gen_pos == node_pos
-                    auto_on_node = on_node & self.ppc_auto_slack_mask
-                    fixed_on_node = on_node & ~self.ppc_auto_slack_mask
-                    fixed_p = gen[self.ppc_gen_rows[fixed_on_node], GEN_COLS["p_set"]]
-                    gen_p[fixed_on_node] = fixed_p
-                    residual_p = P_gen[node_pos] - np.sum(fixed_p)
-                    auto_share = self.ppc_gen_share[auto_on_node]
-                    share_sum = np.sum(auto_share)
-                    if share_sum <= 0.0:
-                        auto_share = np.full(auto_share.size, 1.0 / auto_share.size)
+            live_gen = gen[self.ppc_gen_rows]
+            controls = self.ppc_gen_control
+            slack_mask = (controls == CTRL_SLACK) | self.ppc_auto_slack_mask
+            pv_mask = controls == CTRL_PV
+            pq_mask = (controls == CTRL_PQ) | (controls == CTRL_P)
+            gen_p = np.zeros(self.ppc_gen_rows.size, dtype=np.float64)
+            gen_q = np.zeros(self.ppc_gen_rows.size, dtype=np.float64)
+            if np.any(pq_mask):
+                gen_p[pq_mask] = live_gen[pq_mask, GEN_COLS["p_set"]]
+                gen_q[pq_mask] = live_gen[pq_mask, GEN_COLS["q_set"]]
+            for node_pos in np.unique(self.ppc_gen_pos):
+                on_node = self.ppc_gen_pos == node_pos
+                slack_on_node = on_node & slack_mask
+                pv_on_node = on_node & pv_mask
+                pq_on_node = on_node & pq_mask
+                fixed_q = gen_q[pq_on_node]
+                voltage_on_node = slack_on_node | pv_on_node
+                q_residual = Q_gen[node_pos] - np.sum(fixed_q)
+                if np.any(voltage_on_node):
+                    q_share = self.ppc_gen_share[voltage_on_node]
+                    q_share_sum = np.sum(q_share)
+                    if q_share_sum <= 0.0:
+                        q_share = np.full(np.count_nonzero(voltage_on_node), 1.0 / np.count_nonzero(voltage_on_node))
                     else:
-                        auto_share = auto_share / share_sum
-                    gen_p[auto_on_node] = auto_share * residual_p
+                        q_share = q_share / q_share_sum
+                    gen_q[voltage_on_node] = q_share * q_residual
+                if self.ppc_multi_slack_node_mask[node_pos]:
+                    p_candidates = slack_on_node | pv_on_node
+                    fixed_p = gen_p[pq_on_node]
+                    p_residual = P_gen[node_pos] - np.sum(fixed_p)
+                    if np.any(p_candidates):
+                        p_share = self.ppc_gen_share[p_candidates]
+                        p_share_sum = np.sum(p_share)
+                        if p_share_sum <= 0.0:
+                            p_share = np.full(np.count_nonzero(p_candidates), 1.0 / np.count_nonzero(p_candidates))
+                        else:
+                            p_share = p_share / p_share_sum
+                        gen_p[p_candidates] = p_share * p_residual
+                else:
+                    if np.any(pv_on_node):
+                        gen_p[pv_on_node] = live_gen[pv_on_node, GEN_COLS["p_set"]]
+                    fixed_p = gen_p[pv_on_node | pq_on_node]
+                    p_residual = P_gen[node_pos] - np.sum(fixed_p)
+                    if np.any(slack_on_node):
+                        p_share = self.ppc_gen_share[slack_on_node]
+                        p_share_sum = np.sum(p_share)
+                        if p_share_sum <= 0.0:
+                            p_share = np.full(np.count_nonzero(slack_on_node), 1.0 / np.count_nonzero(slack_on_node))
+                        else:
+                            p_share = p_share / p_share_sum
+                        gen_p[slack_on_node] = p_share * p_residual
             gen_v = V[self.ppc_gen_pos]
             gen_current = np.divide(
                 np.hypot(gen_p, gen_q),

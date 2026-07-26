@@ -163,16 +163,39 @@ class _DenseNodePositionMap:
         for node_id, pos in zip(self.node_ids, self.positions):
             yield int(node_id), int(pos)
 
-    def keys(self):
-        for node_id in self.node_ids:
-            yield int(node_id)
 
-    def values(self):
-        for pos in self.positions:
-            yield int(pos)
-
-    def __len__(self):
-        return int(self.node_ids.size)
+def _build_group_share_metadata(positions, setpoints, active_mask):
+    positions = np.asarray(positions, dtype=np.int32)
+    setpoints = np.asarray(setpoints, dtype=np.float64)
+    active_mask = np.asarray(active_mask, dtype=bool)
+    n = positions.size
+    avg_set = setpoints.copy()
+    rep_mask = np.zeros(n, dtype=bool)
+    share_mask = np.zeros(n, dtype=bool)
+    ref_idx = np.arange(n, dtype=np.int32)
+    if n == 0 or not np.any(active_mask):
+        return avg_set, rep_mask, share_mask, ref_idx
+    active_idx = np.flatnonzero(active_mask).astype(np.int32, copy=False)
+    pos_active = positions[active_idx]
+    order = np.argsort(pos_active, kind="stable")
+    sorted_idx = active_idx[order]
+    sorted_pos = pos_active[order]
+    start = 0
+    while start < sorted_idx.size:
+        stop = start + 1
+        pos = sorted_pos[start]
+        while stop < sorted_idx.size and sorted_pos[stop] == pos:
+            stop += 1
+        members = sorted_idx[start:stop]
+        ref = int(members[0])
+        avg = float(np.mean(setpoints[members]))
+        avg_set[members] = avg
+        rep_mask[ref] = True
+        if members.size > 1:
+            share_mask[members[1:]] = True
+        ref_idx[members] = ref
+        start = stop
+    return avg_set, rep_mask, share_mask, ref_idx
 
 
 def load_dc_ppc_from_e_file(file_name) -> Dict:
@@ -835,10 +858,11 @@ class DCPowerFlowCalc:
 
         # ---------- 4. 确定松弛节点 ----------
         gen = self.ppc["gen"]
-        self.slack_nodes = {
-            node: float(gen[int(gens[0]), DC_GEN_COLS["v_set"]])
-            for node, gens in self.slack_gen_info.items()
-        }
+        self.slack_nodes = {}
+        for node, gens in self.slack_gen_info.items():
+            if not gens:
+                continue
+            self.slack_nodes[node] = float(np.mean(gen[np.asarray(gens, dtype=np.int32), DC_GEN_COLS["v_set"]]))
         self.slack_node_arr = np.fromiter(self.slack_nodes.keys(), dtype=np.int32, count=len(self.slack_nodes))
         self.slack_value_arr = np.fromiter(self.slack_nodes.values(), dtype=np.float64, count=len(self.slack_nodes))
 
@@ -905,11 +929,33 @@ class DCPowerFlowCalc:
         self.dcdc_j_ctrl_p_mask = self.dcdc_j_ctrl_code == DC_CTRL_P
         self.dcdc_j_ctrl_v_mask = self.dcdc_j_ctrl_code == DC_CTRL_V
         self.dcdc_j_ctrl_i_mask = self.dcdc_j_ctrl_code == DC_CTRL_I
+        (
+            self.dcdc_i_v_avg_set,
+            self.dcdc_i_v_rep_mask,
+            self.dcdc_i_v_share_mask,
+            self.dcdc_i_v_ref_idx,
+        ) = _build_group_share_metadata(self.dcdc_i, self.dcdc_v_set, self.dcdc_i_ctrl_v_mask)
+        (
+            self.dcdc_j_v_avg_set,
+            self.dcdc_j_v_rep_mask,
+            self.dcdc_j_v_share_mask,
+            self.dcdc_j_v_ref_idx,
+        ) = _build_group_share_metadata(self.dcdc_j, self.dcdc_v_set, self.dcdc_j_ctrl_v_mask)
         if self.N_dcdc:
             if np.any(self.dcdc_i_ctrl_v_mask):
-                x[self.dcdc_i[self.dcdc_i_ctrl_v_mask]] = self.dcdc_v_set[self.dcdc_i_ctrl_v_mask]
+                i_nodes, inverse = np.unique(self.dcdc_i[self.dcdc_i_ctrl_v_mask], return_inverse=True)
+                avg = np.bincount(
+                    inverse,
+                    weights=self.dcdc_i_v_avg_set[self.dcdc_i_ctrl_v_mask],
+                ) / np.bincount(inverse)
+                x[i_nodes] = avg
             if np.any(self.dcdc_j_ctrl_v_mask):
-                x[self.dcdc_j[self.dcdc_j_ctrl_v_mask]] = self.dcdc_v_set[self.dcdc_j_ctrl_v_mask]
+                j_nodes, inverse = np.unique(self.dcdc_j[self.dcdc_j_ctrl_v_mask], return_inverse=True)
+                avg = np.bincount(
+                    inverse,
+                    weights=self.dcdc_j_v_avg_set[self.dcdc_j_ctrl_v_mask],
+                ) / np.bincount(inverse)
+                x[j_nodes] = avg
             pi_seed = self.P_const[self.dcdc_i].astype(np.float64, copy=True)
             if np.any(self.dcdc_i_ctrl_p_mask):
                 pi_seed[self.dcdc_i_ctrl_p_mask] = self.dcdc_p_set[self.dcdc_i_ctrl_p_mask]
@@ -1019,9 +1065,24 @@ class DCPowerFlowCalc:
                 ctrl_static_data.append(np.ones(i_p_idx.size, dtype=np.float64))
             i_v_idx = np.flatnonzero(self.dcdc_i_ctrl_v_mask).astype(np.int32, copy=False)
             if i_v_idx.size:
-                ctrl_static_rows.append(self.dcdc_eq_ctrl[i_v_idx])
-                ctrl_static_cols.append(self.dcdc_i[i_v_idx])
-                ctrl_static_data.append(np.ones(i_v_idx.size, dtype=np.float64))
+                i_v_rep = i_v_idx[self.dcdc_i_v_rep_mask[i_v_idx]]
+                i_v_share = i_v_idx[self.dcdc_i_v_share_mask[i_v_idx]]
+                if i_v_rep.size:
+                    ctrl_static_rows.append(self.dcdc_eq_ctrl[i_v_rep])
+                    ctrl_static_cols.append(self.dcdc_i[i_v_rep])
+                    ctrl_static_data.append(np.ones(i_v_rep.size, dtype=np.float64))
+                if i_v_share.size:
+                    ref = self.dcdc_i_v_ref_idx[i_v_share]
+                    rows = np.repeat(self.dcdc_eq_ctrl[i_v_share], 2)
+                    cols = np.empty(2 * i_v_share.size, dtype=np.int32)
+                    data = np.empty(2 * i_v_share.size, dtype=np.float64)
+                    cols[0::2] = self.dcdc_p_col[i_v_share]
+                    cols[1::2] = self.dcdc_p_col[ref]
+                    data[0::2] = 1.0
+                    data[1::2] = -1.0
+                    ctrl_static_rows.append(rows)
+                    ctrl_static_cols.append(cols)
+                    ctrl_static_data.append(data)
             i_i_idx = np.flatnonzero(self.dcdc_i_ctrl_i_mask).astype(np.int32, copy=False)
             if i_i_idx.size:
                 ctrl_static_rows.append(np.repeat(self.dcdc_eq_ctrl[i_i_idx], 2))
@@ -1035,9 +1096,27 @@ class DCPowerFlowCalc:
                 ctrl_static_data.append(data)
             j_v_idx = np.flatnonzero(self.dcdc_j_ctrl_v_mask).astype(np.int32, copy=False)
             if j_v_idx.size:
-                ctrl_static_rows.append(self.dcdc_eq_ctrl[j_v_idx])
-                ctrl_static_cols.append(self.dcdc_j[j_v_idx])
-                ctrl_static_data.append(np.ones(j_v_idx.size, dtype=np.float64))
+                j_v_rep = j_v_idx[self.dcdc_j_v_rep_mask[j_v_idx]]
+                j_v_share = j_v_idx[self.dcdc_j_v_share_mask[j_v_idx]]
+                if j_v_rep.size:
+                    ctrl_static_rows.append(self.dcdc_eq_ctrl[j_v_rep])
+                    ctrl_static_cols.append(self.dcdc_j[j_v_rep])
+                    ctrl_static_data.append(np.ones(j_v_rep.size, dtype=np.float64))
+                if j_v_share.size:
+                    ref = self.dcdc_j_v_ref_idx[j_v_share]
+                    rows = np.repeat(self.dcdc_eq_ctrl[j_v_share], 2)
+                    cols = np.empty(2 * j_v_share.size, dtype=np.int32)
+                    data = np.empty(2 * j_v_share.size, dtype=np.float64)
+                    cols[0::2] = self.dcdc_p_col[j_v_share]
+                    cols[1::2] = self.dcdc_p_col[ref]
+                    data[0::2] = 1.0
+                    data[1::2] = -1.0
+                    if not self.dcdc_eliminate_pj:
+                        cols[0::2] = self.dcdc_q_col[j_v_share]
+                        cols[1::2] = self.dcdc_q_col[ref]
+                    ctrl_static_rows.append(rows)
+                    ctrl_static_cols.append(cols)
+                    ctrl_static_data.append(data)
             if not self.dcdc_eliminate_pj:
                 j_p_idx = np.flatnonzero(self.dcdc_j_ctrl_p_mask).astype(np.int32, copy=False)
                 if j_p_idx.size:
@@ -1573,13 +1652,22 @@ class DCPowerFlowCalc:
             vj = terms["dcdc_vj"]
             ctrl_values = np.empty(self.N_dcdc, dtype=np.float64)
             ctrl_values[self.dcdc_i_ctrl_p_mask] = p_from[self.dcdc_i_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_i_ctrl_p_mask]
-            ctrl_values[self.dcdc_i_ctrl_v_mask] = vi[self.dcdc_i_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_i_ctrl_v_mask]
+            ctrl_values[self.dcdc_i_v_rep_mask] = vi[self.dcdc_i_v_rep_mask] - self.dcdc_i_v_avg_set[self.dcdc_i_v_rep_mask]
+            if np.any(self.dcdc_i_v_share_mask):
+                share_idx = np.flatnonzero(self.dcdc_i_v_share_mask).astype(np.int32, copy=False)
+                ref = self.dcdc_i_v_ref_idx[share_idx]
+                ctrl_values[share_idx] = p_from[share_idx] - p_from[ref]
             ctrl_values[self.dcdc_i_ctrl_i_mask] = (
                 p_from[self.dcdc_i_ctrl_i_mask]
                 - self.dcdc_i_set[self.dcdc_i_ctrl_i_mask] * vi[self.dcdc_i_ctrl_i_mask]
             )
             ctrl_values[self.dcdc_j_ctrl_p_mask] = p_to[self.dcdc_j_ctrl_p_mask] - self.dcdc_p_set[self.dcdc_j_ctrl_p_mask]
-            ctrl_values[self.dcdc_j_ctrl_v_mask] = vj[self.dcdc_j_ctrl_v_mask] - self.dcdc_v_set[self.dcdc_j_ctrl_v_mask]
+            ctrl_values[self.dcdc_j_v_rep_mask] = vj[self.dcdc_j_v_rep_mask] - self.dcdc_j_v_avg_set[self.dcdc_j_v_rep_mask]
+            if np.any(self.dcdc_j_v_share_mask):
+                share_idx = np.flatnonzero(self.dcdc_j_v_share_mask).astype(np.int32, copy=False)
+                ref = self.dcdc_j_v_ref_idx[share_idx]
+                share_values = p_from if self.dcdc_eliminate_pj else p_to
+                ctrl_values[share_idx] = share_values[share_idx] - share_values[ref]
             ctrl_values[self.dcdc_j_ctrl_i_mask] = (
                 p_to[self.dcdc_j_ctrl_i_mask]
                 - self.dcdc_i_set[self.dcdc_j_ctrl_i_mask] * vj[self.dcdc_j_ctrl_i_mask]
