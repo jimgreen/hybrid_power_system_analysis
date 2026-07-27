@@ -1,0 +1,196 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1130" height="660" viewBox="0 0 1130 660">
+
+    <style>
+      .background { fill: #ffffff; }
+      .title { font: 700 22px Arial, "Microsoft YaHei", sans-serif; fill: #1f2933; }
+      .subtitle { font: 13px Arial, "Microsoft YaHei", sans-serif; fill: #5b6775; }
+      .node-label { font: 12px Arial, "Microsoft YaHei", sans-serif; fill: #18212f; text-anchor: middle; }
+      .node-meta { font: 10px Arial, "Microsoft YaHei", sans-serif; fill: #64748b; text-anchor: middle; }
+      .edge-label { font: 10px Arial, "Microsoft YaHei", sans-serif; fill: #334155; text-anchor: middle; }
+      .symbol-label { font: 9px Arial, "Microsoft YaHei", sans-serif; fill: #263238; text-anchor: middle; dominant-baseline: middle; }
+      .branch-route { fill: none; stroke-width: 2.2; stroke-linecap: square; stroke-linejoin: miter; }
+      .busbar-ac { stroke: #1f5f9f; stroke-width: 5; stroke-linecap: square; }
+      .busbar-dc { stroke: #c46a17; stroke-width: 5; stroke-linecap: square; }
+      .breaker { fill: #fff; stroke: #334155; stroke-width: 1.2; }
+      .converter { fill: #f8fafc; stroke: #2f8a45; stroke-width: 1.2; }
+      .device-terminal { fill: #ffffff; stroke: #263238; stroke-width: 1.1; }
+      .injection-lead { fill: none; stroke-width: 1.4; stroke-linecap: square; stroke-linejoin: miter; }
+      .injection-terminal { fill: #ffffff; stroke: #263238; stroke-width: 1.1; }
+      .injection-generator { fill: #eef8ee; stroke: #2f7d32; stroke-width: 1.3; }
+      .injection-load { fill: #f4efff; stroke: #8a3ffc; stroke-width: 1.3; }
+      .injection-label { font: 9px Arial, "Microsoft YaHei", sans-serif; fill: #4b5563; text-anchor: middle; }
+      .legend { font: 12px Arial, "Microsoft YaHei", sans-serif; fill: #334155; }
+    </style>
+
+<rect class="background" x="0" y="0" width="1130" height="660"/>
+<text x="32" y="36" class="title">厂站接线图</text>
+<text x="32" y="58" class="subtitle">正交布线：横平竖直；节点数 80，连接数 79，检测交叉 0</text>
+<polyline class="branch-route" data-name="wt01_cable" points="75.0,110.0 75.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt02_cable" points="145.0,110.0 145.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt03_cable" points="215.0,110.0 215.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt04_cable" points="285.0,110.0 285.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt05_cable" points="355.0,110.0 355.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt06_cable" points="425.0,110.0 425.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt07_cable" points="495.0,110.0 495.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt08_cable" points="565.0,110.0 565.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt09_cable" points="635.0,110.0 635.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="wt10_cable" points="705.0,110.0 705.0,214.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="diesel_line" points="845.0,110.0 845.0,200.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="load1_line" points="915.0,110.0 915.0,200.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="load2_line" points="985.0,110.0 985.0,200.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="inv_ac_line" points="775.0,265.5 775.0,200.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="h2_load_line" points="1055.0,110.0 1055.0,200.0" stroke="#1f5f9f"/>
+<polyline class="branch-route" data-name="sw_load1_ac" points="915.0,200.0 915.0,217.5" stroke="#4c78a8" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_load1_ac" points="915.0,247.5 915.0,265.0" stroke="#4c78a8" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_load1_ac"><circle cx="915.0" cy="217.5" r="3.2" class="device-terminal"/><circle cx="915.0" cy="247.5" r="3.2" class="device-terminal"/><rect x="907.0" y="221.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_inv_ac" points="775.0,200.0 775.0,217.5" stroke="#4c78a8" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_inv_ac" points="775.0,247.5 775.0,265.0" stroke="#4c78a8" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_inv_ac"><circle cx="775.0" cy="217.5" r="3.2" class="device-terminal"/><circle cx="775.0" cy="247.5" r="3.2" class="device-terminal"/><rect x="767.0" y="221.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_diesel_ac" points="845.0,200.0 845.0,217.5" stroke="#24476f"/>
+<polyline class="branch-route" data-name="sw_diesel_ac" points="845.0,247.5 845.0,265.0" stroke="#24476f"/>
+<g class="two-terminal-device" data-device-name="sw_diesel_ac"><circle cx="845.0" cy="217.5" r="3.2" class="device-terminal"/><circle cx="845.0" cy="247.5" r="3.2" class="device-terminal"/><rect x="837.0" y="221.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_load2_ac" points="985.0,200.0 985.0,217.5" stroke="#24476f"/>
+<polyline class="branch-route" data-name="sw_load2_ac" points="985.0,247.5 985.0,265.0" stroke="#24476f"/>
+<g class="two-terminal-device" data-device-name="sw_load2_ac"><circle cx="985.0" cy="217.5" r="3.2" class="device-terminal"/><circle cx="985.0" cy="247.5" r="3.2" class="device-terminal"/><rect x="977.0" y="221.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_h2_load_ac" points="1055.0,200.0 1055.0,217.5" stroke="#24476f"/>
+<polyline class="branch-route" data-name="sw_h2_load_ac" points="1055.0,247.5 1055.0,265.0" stroke="#24476f"/>
+<g class="two-terminal-device" data-device-name="sw_h2_load_ac"><circle cx="1055.0" cy="217.5" r="3.2" class="device-terminal"/><circle cx="1055.0" cy="247.5" r="3.2" class="device-terminal"/><rect x="1047.0" y="221.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="wt01_dc_line" points="75.0,266.0 75.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt02_dc_line" points="145.0,266.0 145.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt03_dc_line" points="215.0,266.0 215.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt04_dc_line" points="285.0,266.0 285.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt05_dc_line" points="355.0,266.0 355.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt06_dc_line" points="425.0,266.0 425.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt07_dc_line" points="495.0,266.0 495.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt08_dc_line" points="565.0,266.0 565.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt09_dc_line" points="635.0,266.0 635.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="wt10_dc_line" points="705.0,266.0 705.0,360.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="pv01_dc_line" points="75.0,488.0 75.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="pv02_dc_line" points="145.0,488.0 145.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="pv03_dc_line" points="215.0,488.0 215.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="ess01_dc_line" points="285.0,488.0 285.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="ess02_dc_line" points="355.0,488.0 355.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="ess03_dc_line" points="425.0,488.0 425.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="ess04_dc_line" points="915.0,488.0 915.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="ess05_dc_line" points="985.0,488.0 985.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="inv_dc_line" points="775.0,317.5 775.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="fc01_dc_line" points="1055.0,555.0 1055.0,431.0" stroke="#c46a17"/>
+<polyline class="branch-route" data-name="sw_wt02_dc" points="145.0,360.0 145.0,362.5" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_wt02_dc" points="145.0,392.5 145.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_wt02_dc"><circle cx="145.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="145.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="137.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt04_dc" points="285.0,360.0 285.0,362.5" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_wt04_dc" points="285.0,392.5 285.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_wt04_dc"><circle cx="285.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="285.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="277.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt06_dc" points="425.0,360.0 425.0,362.5" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_wt06_dc" points="425.0,392.5 425.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_wt06_dc"><circle cx="425.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="425.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="417.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt08_dc" points="565.0,360.0 565.0,362.5" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_wt08_dc" points="565.0,392.5 565.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_wt08_dc"><circle cx="565.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="565.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="557.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt10_dc" points="705.0,360.0 705.0,362.5" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_wt10_dc" points="705.0,392.5 705.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_wt10_dc"><circle cx="705.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="705.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="697.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_pv02_dc" points="145.0,431.0 145.0,428.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_pv02_dc" points="145.0,398.0 145.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_pv02_dc"><circle cx="145.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="145.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="137.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_ess01_dc" points="285.0,431.0 285.0,428.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_ess01_dc" points="285.0,398.0 285.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_ess01_dc"><circle cx="285.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="285.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="277.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_ess03_dc" points="425.0,431.0 425.0,428.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_ess03_dc" points="425.0,398.0 425.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_ess03_dc"><circle cx="425.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="425.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="417.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_ess05_dc" points="985.0,431.0 985.0,428.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_ess05_dc" points="985.0,398.0 985.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_ess05_dc"><circle cx="985.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="985.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="977.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_fc01_dc" points="1055.0,431.0 1055.0,428.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<polyline class="branch-route" data-name="sw_fc01_dc" points="1055.0,398.0 1055.0,395.0" stroke="#d38a31" stroke-dasharray="7 5"/>
+<g class="two-terminal-device" data-device-name="sw_fc01_dc"><circle cx="1055.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="1055.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="1047.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt01_dc" points="75.0,360.0 75.0,362.5" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_wt01_dc" points="75.0,392.5 75.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_wt01_dc"><circle cx="75.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="75.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="67.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt03_dc" points="215.0,360.0 215.0,362.5" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_wt03_dc" points="215.0,392.5 215.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_wt03_dc"><circle cx="215.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="215.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="207.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt05_dc" points="355.0,360.0 355.0,362.5" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_wt05_dc" points="355.0,392.5 355.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_wt05_dc"><circle cx="355.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="355.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="347.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt07_dc" points="495.0,360.0 495.0,362.5" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_wt07_dc" points="495.0,392.5 495.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_wt07_dc"><circle cx="495.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="495.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="487.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_wt09_dc" points="635.0,360.0 635.0,362.5" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_wt09_dc" points="635.0,392.5 635.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_wt09_dc"><circle cx="635.0" cy="362.5" r="3.2" class="device-terminal"/><circle cx="635.0" cy="392.5" r="3.2" class="device-terminal"/><rect x="627.0" y="366.5" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_pv01_dc" points="75.0,431.0 75.0,428.0" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_pv01_dc" points="75.0,398.0 75.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_pv01_dc"><circle cx="75.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="75.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="67.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_pv03_dc" points="215.0,431.0 215.0,428.0" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_pv03_dc" points="215.0,398.0 215.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_pv03_dc"><circle cx="215.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="215.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="207.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_ess02_dc" points="355.0,431.0 355.0,428.0" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_ess02_dc" points="355.0,398.0 355.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_ess02_dc"><circle cx="355.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="355.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="347.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_ess04_dc" points="915.0,431.0 915.0,428.0" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_ess04_dc" points="915.0,398.0 915.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_ess04_dc"><circle cx="915.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="915.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="907.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<polyline class="branch-route" data-name="sw_grid_dc" points="775.0,431.0 775.0,428.0" stroke="#9c4f0f"/>
+<polyline class="branch-route" data-name="sw_grid_dc" points="775.0,398.0 775.0,395.0" stroke="#9c4f0f"/>
+<g class="two-terminal-device" data-device-name="sw_grid_dc"><circle cx="775.0" cy="428.0" r="3.2" class="device-terminal"/><circle cx="775.0" cy="398.0" r="3.2" class="device-terminal"/><rect x="767.0" y="402.0" width="16" height="22" class="breaker"/></g>
+<g class="converter-device" data-device-name="pv01_dcdc"><rect x="59.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="pv02_dcdc"><rect x="129.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="pv03_dcdc"><rect x="199.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="ess01_dcdc"><rect x="269.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="ess02_dcdc"><rect x="339.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="ess03_dcdc"><rect x="409.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="ess04_dcdc"><rect x="899.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="ess05_dcdc"><rect x="969.0" y="490.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt01_rect"><rect x="59.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt02_rect"><rect x="129.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt03_rect"><rect x="199.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt04_rect"><rect x="269.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt05_rect"><rect x="339.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt06_rect"><rect x="409.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt07_rect"><rect x="479.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt08_rect"><rect x="549.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt09_rect"><rect x="619.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="wt10_rect"><rect x="689.0" y="216.0" width="32" height="48" rx="3" class="converter"/></g>
+<g class="converter-device" data-device-name="grid_inv_acp"><rect x="759.0" y="267.5" width="32" height="48" rx="3" class="converter"/></g>
+<g class="single-terminal-injection" data-injection-name="wt01_10kw"><polyline class="injection-lead" points="75.0,110.0 75.0,92.0 75.0,82.0" stroke="#2f7d32"/><circle cx="75.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="75.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt02_10kw"><polyline class="injection-lead" points="145.0,110.0 145.0,92.0 145.0,82.0" stroke="#2f7d32"/><circle cx="145.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="145.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt03_10kw"><polyline class="injection-lead" points="215.0,110.0 215.0,92.0 215.0,82.0" stroke="#2f7d32"/><circle cx="215.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="215.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt04_10kw"><polyline class="injection-lead" points="285.0,110.0 285.0,92.0 285.0,82.0" stroke="#2f7d32"/><circle cx="285.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="285.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt05_10kw"><polyline class="injection-lead" points="355.0,110.0 355.0,92.0 355.0,82.0" stroke="#2f7d32"/><circle cx="355.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="355.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt06_10kw"><polyline class="injection-lead" points="425.0,110.0 425.0,92.0 425.0,82.0" stroke="#2f7d32"/><circle cx="425.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="425.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt07_10kw"><polyline class="injection-lead" points="495.0,110.0 495.0,92.0 495.0,82.0" stroke="#2f7d32"/><circle cx="495.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="495.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt08_10kw"><polyline class="injection-lead" points="565.0,110.0 565.0,92.0 565.0,82.0" stroke="#2f7d32"/><circle cx="565.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="565.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt09_10kw"><polyline class="injection-lead" points="635.0,110.0 635.0,92.0 635.0,82.0" stroke="#2f7d32"/><circle cx="635.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="635.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="wt10_10kw"><polyline class="injection-lead" points="705.0,110.0 705.0,92.0 705.0,82.0" stroke="#2f7d32"/><circle cx="705.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="705.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="diesel_300kw"><polyline class="injection-lead" points="845.0,110.0 845.0,92.0 845.0,82.0" stroke="#2f7d32"/><circle cx="845.0" cy="92.0" r="3.2" class="injection-terminal"/><circle cx="845.0" cy="70.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="dc_bus_vctrl"><polyline class="injection-lead" points="565.0,395.0 565.0,413.0 565.0,423.0" stroke="#2f7d32"/><circle cx="565.0" cy="413.0" r="3.2" class="injection-terminal"/><circle cx="565.0" cy="435.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="pv01_vsrc"><polyline class="injection-lead" points="75.0,555.0 75.0,573.0 75.0,583.0" stroke="#2f7d32"/><circle cx="75.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="75.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="pv02_vsrc"><polyline class="injection-lead" points="145.0,555.0 145.0,573.0 145.0,583.0" stroke="#2f7d32"/><circle cx="145.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="145.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="pv03_vsrc"><polyline class="injection-lead" points="215.0,555.0 215.0,573.0 215.0,583.0" stroke="#2f7d32"/><circle cx="215.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="215.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="ess01_vsrc"><polyline class="injection-lead" points="285.0,555.0 285.0,573.0 285.0,583.0" stroke="#2f7d32"/><circle cx="285.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="285.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="ess02_vsrc"><polyline class="injection-lead" points="355.0,555.0 355.0,573.0 355.0,583.0" stroke="#2f7d32"/><circle cx="355.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="355.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="ess03_vsrc"><polyline class="injection-lead" points="425.0,555.0 425.0,573.0 425.0,583.0" stroke="#2f7d32"/><circle cx="425.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="425.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="ess04_vsrc"><polyline class="injection-lead" points="915.0,555.0 915.0,573.0 915.0,583.0" stroke="#2f7d32"/><circle cx="915.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="915.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="ess05_vsrc"><polyline class="injection-lead" points="985.0,555.0 985.0,573.0 985.0,583.0" stroke="#2f7d32"/><circle cx="985.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="985.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="fc01_30kw"><polyline class="injection-lead" points="1055.0,555.0 1055.0,573.0 1055.0,583.0" stroke="#2f7d32"/><circle cx="1055.0" cy="573.0" r="3.2" class="injection-terminal"/><circle cx="1055.0" cy="595.0" r="12" class="injection-generator"/></g>
+<g class="single-terminal-injection" data-injection-name="load_ac_1"><polyline class="injection-lead" points="915.0,110.0 915.0,128.0 915.0,137.0" stroke="#8a3ffc"/><circle cx="915.0" cy="128.0" r="3.2" class="injection-terminal"/><polygon points="915.0,137.0 902.0,160.0 928.0,160.0" class="injection-load"/></g>
+<g class="single-terminal-injection" data-injection-name="load_ac_2"><polyline class="injection-lead" points="985.0,110.0 985.0,128.0 985.0,137.0" stroke="#8a3ffc"/><circle cx="985.0" cy="128.0" r="3.2" class="injection-terminal"/><polygon points="985.0,137.0 972.0,160.0 998.0,160.0" class="injection-load"/></g>
+<g class="single-terminal-injection" data-injection-name="h2_load"><polyline class="injection-lead" points="1055.0,110.0 1055.0,128.0 1055.0,137.0" stroke="#8a3ffc"/><circle cx="1055.0" cy="128.0" r="3.2" class="injection-terminal"/><polygon points="1055.0,137.0 1042.0,160.0 1068.0,160.0" class="injection-load"/></g>
+<line x1="740.0" y1="265.0" x2="1090.0" y2="265.0" class="busbar-ac"/>
+<line x1="40.0" y1="395.0" x2="1090.0" y2="395.0" class="busbar-dc"/>
+<g transform="translate(880,28)">
+<text x="0" y="0" class="legend">图例</text>
+<line x1="0" y1="24" x2="34" y2="24" stroke="#1f5f9f" stroke-width="2.2"/>
+<text x="44" y="28" class="legend">交流线路</text>
+<line x1="0" y1="44" x2="34" y2="44" stroke="#c46a17" stroke-width="2.2"/>
+<text x="44" y="48" class="legend">直流线路</text>
+<line x1="0" y1="64" x2="34" y2="64" stroke="#24476f" stroke-width="2.2"/>
+<text x="44" y="68" class="legend">交流断路器</text>
+<line x1="0" y1="84" x2="34" y2="84" stroke="#be6b00" stroke-width="2.2"/>
+<text x="44" y="88" class="legend">DC/DC</text>
+<line x1="0" y1="104" x2="34" y2="104" stroke="#2f8a45" stroke-width="2.2"/>
+<text x="44" y="108" class="legend">DC/AC</text>
+</g>
+</svg>

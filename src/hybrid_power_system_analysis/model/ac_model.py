@@ -1429,18 +1429,12 @@ class ACPowerNetwork:
 
         # 检查每个岛屿
         for isl in self.islands:
-            # 电压控制源唯一性（松弛节点或定V发电机）
+            # 多平衡节点是允许的运行方式，潮流由各平衡设备共同承担。
             if len(isl.slack_nodes) > 1:
-                if self._multi_slack_nodes_are_zero_tied(isl.slack_nodes):
-                    str_info = f"岛屿 {isl.idx} 存在多个零阻抗等值相连的平衡节点:"
-                    for node in isl.slack_nodes:
-                        str_info += f" {node.name}"
-                    warns.append(str_info)
-                else:
-                    str_info = f"岛屿 {isl.idx} 存在多个平衡节点:"
-                    for node in isl.slack_nodes:
-                        str_info += f" {node.name}"
-                    errors.append(str_info)
+                str_info = f"岛屿 {isl.idx} 存在多个平衡节点:"
+                for node in isl.slack_nodes:
+                    str_info += f" {node.name}"
+                warns.append(str_info)
 
             if len(isl.slack_nodes)  == 0:
                 warns.append(f"岛屿 {isl.idx} , 无平衡节点，跳过潮流计算")
@@ -1455,52 +1449,6 @@ class ACPowerNetwork:
                 errors.append(f"平衡节点 {node.idx} {node.name} 未关联任何平衡发电机设备")
 
         return warns, errors
-
-    def _multi_slack_nodes_are_zero_tied(self, slack_nodes):
-        """Return True when same-setpoint slack nodes are shorted by zero branches.
-
-        Large synthetic IEEE cases intentionally connect copied voltage-source
-        buses through ACZeroBranch devices. In that topology several V sources
-        represent one ideal equal-voltage bus, so topology validation should
-        warn instead of rejecting the case as ordinary multi-slack operation.
-        """
-        if len(slack_nodes) <= 1:
-            return False
-        slack_ids = {node.idx for node in slack_nodes}
-        adj = {node.idx: set() for node in slack_nodes}
-        for zbr in [*self.zero_branches, *self.breakers]:
-            if getattr(zbr, "run_stat", 1) != 1:
-                continue
-            if isinstance(zbr, ACBreak) and getattr(zbr, "status", 1) != 1:
-                continue
-            if zbr.i_node in slack_ids and zbr.j_node in slack_ids:
-                adj[zbr.i_node].add(zbr.j_node)
-                adj[zbr.j_node].add(zbr.i_node)
-        visited = set()
-        stack = [next(iter(slack_ids))]
-        while stack:
-            current = stack.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            stack.extend(adj[current] - visited)
-        if visited != slack_ids:
-            return False
-
-        first = slack_nodes[0]
-        first_voltage = float(getattr(first, "voltage", 1.0) or 1.0)
-        first_angle = float(getattr(first, "angle", 0.0) or 0.0)
-        first_vbase = float(getattr(first, "vbase", 0.0) or 0.0)
-        for node in slack_nodes[1:]:
-            if abs(float(getattr(node, "vbase", 0.0) or 0.0) - first_vbase) > 1e-9:
-                return False
-            if abs(float(getattr(node, "voltage", 1.0) or 1.0) - first_voltage) > 1e-9:
-                return False
-            if abs(float(getattr(node, "angle", 0.0) or 0.0) - first_angle) > 1e-9:
-                return False
-        return True
-
-
 
 if __name__ == "__main__":
 

@@ -1,0 +1,35 @@
+{
+  "label": "fast_hybrid_v3",
+  "cases": {
+    "qinling_1000": {
+      "kind": "hybrid",
+      "nodes": 80000,
+      "min_s": 0.8031366000013804,
+      "median_s": 0.8628598999985115,
+      "max_s": 0.907117400000061,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.603444126947352e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 5
+    },
+    "hybrid_net_4w": {
+      "kind": "hybrid",
+      "nodes": 40000,
+      "min_s": 0.9081360000000132,
+      "median_s": 0.9375244000002567,
+      "max_s": 1.0268720999993093,
+      "iter": 8,
+      "converged": true,
+      "rc": 0,
+      "normF": 1.5987211554602254e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 5
+    }
+  }
+}
+# result_mode: array
+# fast_hybrid: True

@@ -1,0 +1,112 @@
+{
+  "repeat": 2,
+  "summary": {
+    "ieee3k": {
+      "kind": "ac",
+      "min_s": 0.2907835999994859,
+      "max_s": 0.42307830000027025,
+      "avg_s": 0.35693094999987807,
+      "iter": 5,
+      "resid": 4.564614050386932,
+      "converged": true,
+      "observable": true,
+      "state_count": 11398,
+      "measurement_count": 38838,
+      "runs": 2
+    },
+    "dc_net_3000": {
+      "kind": "dc",
+      "min_s": 0.16277530000024854,
+      "max_s": 0.23767769999994925,
+      "avg_s": 0.2002265000000989,
+      "iter": 6,
+      "resid": 9.58309209764252e-10,
+      "converged": true,
+      "observable": true,
+      "state_count": 3450,
+      "measurement_count": 21857,
+      "runs": 2
+    },
+    "qinling_100": {
+      "kind": "hybrid",
+      "min_s": 437.3835693000001,
+      "max_s": 518.3223871,
+      "avg_s": 477.85297820000005,
+      "iter": 1,
+      "resid": 8.386082083498401,
+      "converged": false,
+      "observable": false,
+      "state_count": 15564,
+      "measurement_count": 47453,
+      "runs": 2
+    }
+  },
+  "runs": [
+    {
+      "case": "ieee3k",
+      "kind": "ac",
+      "elapsed_s": 0.2907835999994859,
+      "iter": 5,
+      "resid": 4.564614050386932,
+      "converged": true,
+      "observable": true,
+      "state_count": 11398,
+      "measurement_count": 38838
+    },
+    {
+      "case": "dc_net_3000",
+      "kind": "dc",
+      "elapsed_s": 0.16277530000024854,
+      "iter": 6,
+      "resid": 9.58309209764252e-10,
+      "converged": true,
+      "observable": true,
+      "state_count": 3450,
+      "measurement_count": 21857
+    },
+    {
+      "case": "qinling_100",
+      "kind": "hybrid",
+      "elapsed_s": 518.3223871,
+      "iter": 1,
+      "resid": 8.386082083498401,
+      "converged": false,
+      "observable": false,
+      "state_count": 15564,
+      "measurement_count": 47453
+    },
+    {
+      "case": "ieee3k",
+      "kind": "ac",
+      "elapsed_s": 0.42307830000027025,
+      "iter": 5,
+      "resid": 4.564614050386932,
+      "converged": true,
+      "observable": true,
+      "state_count": 11398,
+      "measurement_count": 38838
+    },
+    {
+      "case": "dc_net_3000",
+      "kind": "dc",
+      "elapsed_s": 0.23767769999994925,
+      "iter": 6,
+      "resid": 9.58309209764252e-10,
+      "converged": true,
+      "observable": true,
+      "state_count": 3450,
+      "measurement_count": 21857
+    },
+    {
+      "case": "qinling_100",
+      "kind": "hybrid",
+      "elapsed_s": 437.3835693000001,
+      "iter": 1,
+      "resid": 8.386082083498401,
+      "converged": false,
+      "observable": false,
+      "state_count": 15564,
+      "measurement_count": 47453
+    }
+  ]
+}

@@ -63,6 +63,7 @@ from ac_model import ACAC_SIDE_CONTROL_TYPES
 from hybrid_model import HybridPowerNetwork
 from ac_array_model import (
     ACAC_COLS,
+    ACAC_SIDE_CONTROL_CODE,
     ACAC_SIDE_CONTROL_LABEL,
     acac_combined_control_code,
     acac_legacy_control_label,
@@ -93,6 +94,7 @@ from dc_array_model import (
 from efile_read import _read_efile_rows
 from hybrid_array_model import (
     DCAC_COLS,
+    DCAC_AC_CONTROL_CODE,
     DCAC_AC_CONTROL_LABEL,
     DCAC_AC_CONTROL_PARSE_CODE,
     DCAC_DC_CONTROL_LABEL,
@@ -788,6 +790,7 @@ class HybridPowerFlowCalc:
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
+        self.failure_reason = ""
         self.x = np.array([], dtype=np.float64)
         self.ac_size = 0
         self.dc_size = 0
@@ -918,6 +921,54 @@ class HybridPowerFlowCalc:
             self.dc_calc.result_mode = "array"
             self.dc_calc.keep_node_objects = False
 
+    def _install_ac_converter_voltage_control_nodes(self):
+        """Expose converter V-control terminals to the AC topology-aware LF layout."""
+        if self.ac_calc is None:
+            return
+        controlled_nodes = []
+        if self._converter_ppc_mode:
+            dcac = np.asarray(self.network.ppc.get("dcac", ()), dtype=np.float64)
+            if dcac.size:
+                run = dcac[:, DCAC_COLS["run_stat"]].astype(np.int8, copy=False) == 1
+                control = dcac[:, DCAC_COLS["ac_control_type"]].astype(np.int8, copy=False)
+                mask = run & np.isin(
+                    control,
+                    (DCAC_AC_CONTROL_CODE["PV"], DCAC_AC_CONTROL_CODE["PH"]),
+                )
+                if np.any(mask):
+                    controlled_nodes.append(dcac[mask, DCAC_COLS["ac_node"]].astype(np.int64, copy=False))
+
+            acac = np.asarray(self.network.ppc.get("acac", ()), dtype=np.float64)
+            if acac.size:
+                run = acac[:, ACAC_COLS["run_stat"]].astype(np.int8, copy=False) == 1
+                i_control = acac[:, ACAC_COLS["i_control_type"]].astype(np.int8, copy=False)
+                j_control = acac[:, ACAC_COLS["j_control_type"]].astype(np.int8, copy=False)
+                voltage_codes = (ACAC_SIDE_CONTROL_CODE["PV"], ACAC_SIDE_CONTROL_CODE["PH"])
+                i_mask = run & np.isin(i_control, voltage_codes)
+                j_mask = run & np.isin(j_control, voltage_codes)
+                if np.any(i_mask):
+                    controlled_nodes.append(acac[i_mask, ACAC_COLS["i_node"]].astype(np.int64, copy=False))
+                if np.any(j_mask):
+                    controlled_nodes.append(acac[j_mask, ACAC_COLS["j_node"]].astype(np.int64, copy=False))
+        else:
+            for conv in self.network.dcac_converters:
+                if conv.run_stat == 1 and str(conv.ac_control_type).upper() in {"PV", "PH"}:
+                    controlled_nodes.append(np.asarray([conv.ac_node], dtype=np.int64))
+            for conv in self.network.acac_converters:
+                if conv.run_stat != 1:
+                    continue
+                if str(conv.i_control_type).upper() in {"PV", "PH"}:
+                    controlled_nodes.append(np.asarray([conv.i_node], dtype=np.int64))
+                if str(conv.j_control_type).upper() in {"PV", "PH"}:
+                    controlled_nodes.append(np.asarray([conv.j_node], dtype=np.int64))
+
+        if controlled_nodes:
+            self.ac_calc.ppc["_external_voltage_control_node_ids"] = np.unique(
+                np.concatenate(controlled_nodes)
+            ).astype(np.int64, copy=False)
+        else:
+            self.ac_calc.ppc.pop("_external_voltage_control_node_ids", None)
+
     def prepare(self):
         """Build the global hybrid state vector and block equation layout.
 
@@ -925,6 +976,7 @@ class HybridPowerFlowCalc:
         HybridPowerFlowCalc.prepare() 会直接准备 AC/DC 子求解器和全局状态布局。
         """
         self._sync_sub_result_modes()
+        self._install_ac_converter_voltage_control_nodes()
         parts = []
         if self.ac_calc is not None:
             self.ac_calc.verbose = self.verbose
@@ -1022,9 +1074,6 @@ class HybridPowerFlowCalc:
             conv.ac_node_obj = self._ac_node_obj_by_idx.get(int(conv.ac_node))
             conv.dc_node_obj = self._dc_node_obj_by_idx.get(int(conv.dc_node))
             ac_pos = self.ac_calc.node_pos[conv.ac_node]
-            if self.ac_calc.node_type[ac_pos] != AC_NODE_TYPE_PQ:
-                current_type = ac_node_type_label(self.ac_calc.node_type[ac_pos])
-                raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}")
             dc_pos = self.dc_calc.alive_node_dict[conv.dc_node]
             ac_ctrl = str(getattr(conv, "ac_control_type", "NONE")).upper()
             dc_ctrl = str(getattr(conv, "dc_control_type", "NONE")).upper()
@@ -1032,6 +1081,7 @@ class HybridPowerFlowCalc:
                 raise ValueError(f"未知 DCACConverter AC 控制模式: {ac_ctrl}")
             if dc_ctrl not in DCAC_DC_CONTROL_PARSE_CODE:
                 raise ValueError(f"未知 DCACConverter DC 控制模式: {dc_ctrl}")
+            self._validate_dcac_ac_terminal_control(conv.idx, ac_pos, ac_ctrl)
             ctrl = dcac_legacy_control_label(ac_ctrl, dc_ctrl)
             conv.is_alive = True
             self.dcac_converters.append((conv, ac_pos, dc_pos, ctrl))
@@ -1058,6 +1108,42 @@ class HybridPowerFlowCalc:
     def _dc_solver_pos(self, node_id: int) -> int:
         return int(self.dc_calc.alive_node_dict.get(int(node_id), -1))
 
+    def _ac_balance_rows(self, positions):
+        """Map AC solver positions to the P/Q balance rows that still exist."""
+        positions = np.asarray(positions, dtype=np.int32)
+        p_rows = np.asarray(self.ac_calc.theta_idx, dtype=np.int32)[positions]
+        v_idx = np.asarray(self.ac_calc.V_idx, dtype=np.int32)[positions]
+        q_rows = np.full(positions.size, -1, dtype=np.int32)
+        active_q = v_idx >= 0
+        q_rows[active_q] = self.ac_calc.n_theta + v_idx[active_q]
+        return p_rows, q_rows
+
+    def _validate_dcac_ac_terminal_control(self, converter_idx, ac_pos, ac_control_type):
+        """Reject only duplicate AC voltage controls after topology grouping."""
+        if ac_control_type not in {"PV", "PH"}:
+            return
+        node_type = self.ac_calc.node_type[int(ac_pos)]
+        if node_type == AC_NODE_TYPE_PQ:
+            return
+        current_type = ac_node_type_label(node_type)
+        raise ValueError(
+            f"DCACConverter[{converter_idx}] 的 AC 端 {ac_control_type} 控制与"
+            f"拓扑后母线已有的 {current_type} 控制重复"
+        )
+
+    def _validate_acac_terminal_control(self, converter_idx, side, ac_pos, control_type):
+        """Allow fixed-power terminals on controlled buses, but not duplicate V controls."""
+        if control_type not in {"PV", "PH"}:
+            return
+        node_type = self.ac_calc.node_type[int(ac_pos)]
+        if node_type == AC_NODE_TYPE_PQ:
+            return
+        current_type = ac_node_type_label(node_type)
+        raise ValueError(
+            f"ACACConverter[{converter_idx}] 的 {side} 侧 {control_type} 控制与"
+            f"拓扑后母线已有的 {current_type} 控制重复"
+        )
+
     def _prepare_dcac_converters_from_ppc(self):
         table = self.network.ppc.get("dcac")
         if table is None or table.size == 0:
@@ -1077,16 +1163,16 @@ class HybridPowerFlowCalc:
             dc_solver_pos = self._dc_solver_pos(dc_node)
             if dc_solver_pos < 0:
                 continue
-            if self.ac_calc.node_type[ac_solver_pos] != AC_NODE_TYPE_PQ:
-                idx = int(row[DCAC_COLS["idx"]])
-                current_type = ac_node_type_label(self.ac_calc.node_type[ac_solver_pos])
-                raise ValueError(
-                    f"DCACConverter[{idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}"
-                )
             ac_ctrl = int(row[DCAC_COLS["ac_control_type"]])
             dc_ctrl = int(row[DCAC_COLS["dc_control_type"]])
+            ac_ctrl_label = DCAC_AC_CONTROL_LABEL.get(ac_ctrl, "NONE")
+            self._validate_dcac_ac_terminal_control(
+                int(row[DCAC_COLS["idx"]]),
+                ac_solver_pos,
+                ac_ctrl_label,
+            )
             ctrl = dcac_combined_control_code(
-                DCAC_AC_CONTROL_LABEL.get(ac_ctrl, "NONE"),
+                ac_ctrl_label,
                 DCAC_DC_CONTROL_LABEL.get(dc_ctrl, "NONE"),
             )
             rows.append(row_pos)
@@ -1113,11 +1199,9 @@ class HybridPowerFlowCalc:
         self.dcac_v_ac_set = active[:, DCAC_COLS["v_ac_set"]].astype(np.float64, copy=True)
         self.dcac_p_ac_set = active[:, DCAC_COLS["p_ac_set"]].astype(np.float64, copy=True)
         self.dcac_q_ac_set = active[:, DCAC_COLS["q_ac_set"]].astype(np.float64, copy=True)
-        self.dcac_ac_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.dcac_ac_pos], dtype=np.int32)
-        self.dcac_ac_q_row = np.asarray(
-            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.dcac_ac_pos],
-            dtype=np.int32,
-        )
+        self.dcac_ac_p_row, self.dcac_ac_q_row = self._ac_balance_rows(self.dcac_ac_pos)
+        self.dcac_ac_p_eq_mask = self.dcac_ac_p_row >= 0
+        self.dcac_ac_q_eq_mask = self.dcac_ac_q_row >= 0
         self.dcac_dc_eq = np.asarray([self.dc_calc.node_eq[int(pos)] for pos in self.dcac_dc_pos], dtype=np.int32)
         self.dcac_dc_eq_mask = self.dcac_dc_eq >= 0
         self.dcac_ac_theta_set = self.ac_calc.ppc_node_angle[self.dcac_ac_pos].astype(np.float64, copy=True)
@@ -1141,6 +1225,8 @@ class HybridPowerFlowCalc:
         self.dcac_q_ac_set = np.array([], dtype=np.float64)
         self.dcac_ac_p_row = np.array([], dtype=np.int32)
         self.dcac_ac_q_row = np.array([], dtype=np.int32)
+        self.dcac_ac_p_eq_mask = np.array([], dtype=bool)
+        self.dcac_ac_q_eq_mask = np.array([], dtype=bool)
         self.dcac_dc_eq = np.array([], dtype=np.int32)
         self.dcac_dc_eq_mask = np.array([], dtype=bool)
         self.dcac_ac_theta_set = np.array([], dtype=np.float64)
@@ -1165,14 +1251,9 @@ class HybridPowerFlowCalc:
         self.dcac_v_ac_set = np.asarray([conv.v_ac_set for conv in convs], dtype=np.float64)
         self.dcac_p_ac_set = np.asarray([conv.p_ac_set for conv in convs], dtype=np.float64)
         self.dcac_q_ac_set = np.asarray([conv.q_ac_set for conv in convs], dtype=np.float64)
-        self.dcac_ac_p_row = np.asarray(
-            [self.ac_calc.theta_idx[int(pos)] for pos in self.dcac_ac_pos],
-            dtype=np.int32,
-        )
-        self.dcac_ac_q_row = np.asarray(
-            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.dcac_ac_pos],
-            dtype=np.int32,
-        )
+        self.dcac_ac_p_row, self.dcac_ac_q_row = self._ac_balance_rows(self.dcac_ac_pos)
+        self.dcac_ac_p_eq_mask = self.dcac_ac_p_row >= 0
+        self.dcac_ac_q_eq_mask = self.dcac_ac_q_row >= 0
         self.dcac_dc_eq = np.asarray([self.dc_calc.node_eq[int(pos)] for pos in self.dcac_dc_pos], dtype=np.int32)
         self.dcac_dc_eq_mask = self.dcac_dc_eq >= 0
         self.dcac_ac_theta_set = self.ac_calc.ppc_node_angle[self.dcac_ac_pos].astype(np.float64, copy=True)
@@ -1203,18 +1284,14 @@ class HybridPowerFlowCalc:
             j_pos = self.ac_calc.node_pos[conv.j_node]
             if i_pos == j_pos:
                 raise ValueError(f"ACACConverter[{conv.idx}] 两端不能连接同一个 AC 节点")
-            if self.ac_calc.node_type[i_pos] != AC_NODE_TYPE_PQ:
-                current_type = ac_node_type_label(self.ac_calc.node_type[i_pos])
-                raise ValueError(f"ACACConverter[{conv.idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {current_type}")
-            if self.ac_calc.node_type[j_pos] != AC_NODE_TYPE_PQ:
-                current_type = ac_node_type_label(self.ac_calc.node_type[j_pos])
-                raise ValueError(f"ACACConverter[{conv.idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}")
             i_ctrl = str(getattr(conv, "i_control_type", "PQ")).upper()
             j_ctrl = str(getattr(conv, "j_control_type", "PQ")).upper()
             if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 raise ValueError(f"未知 ACACConverter i_control_type: {i_ctrl}")
             if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 raise ValueError(f"未知 ACACConverter j_control_type: {j_ctrl}")
+            self._validate_acac_terminal_control(conv.idx, "i", i_pos, i_ctrl)
+            self._validate_acac_terminal_control(conv.idx, "j", j_pos, j_ctrl)
             ctrl = acac_legacy_control_label(i_ctrl, j_ctrl)
             conv.is_alive = True
             self.acac_converters.append((conv, i_pos, j_pos, ctrl))
@@ -1241,19 +1318,13 @@ class HybridPowerFlowCalc:
             idx = int(row[ACAC_COLS["idx"]])
             if i_solver_pos == j_solver_pos:
                 raise ValueError(f"ACACConverter[{idx}] 两端不能连接同一个 AC 节点")
-            if self.ac_calc.node_type[i_solver_pos] != AC_NODE_TYPE_PQ:
-                current_type = ac_node_type_label(self.ac_calc.node_type[i_solver_pos])
-                raise ValueError(
-                    f"ACACConverter[{idx}] 的 i 侧 AC 节点必须是 PQ 节点，当前为 {current_type}"
-                )
-            if self.ac_calc.node_type[j_solver_pos] != AC_NODE_TYPE_PQ:
-                current_type = ac_node_type_label(self.ac_calc.node_type[j_solver_pos])
-                raise ValueError(
-                    f"ACACConverter[{idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}"
-                )
+            i_ctrl = ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "PQ")
+            j_ctrl = ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "PQ")
+            self._validate_acac_terminal_control(idx, "i", i_solver_pos, i_ctrl)
+            self._validate_acac_terminal_control(idx, "j", j_solver_pos, j_ctrl)
             ctrl = acac_combined_control_code(
-                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "PQ"),
-                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "PQ"),
+                i_ctrl,
+                j_ctrl,
             )
             rows.append(row_pos)
             i_pos.append(i_solver_pos)
@@ -1280,16 +1351,12 @@ class HybridPowerFlowCalc:
         self.acac_j_q_set = active[:, ACAC_COLS["j_q_set"]].astype(np.float64, copy=True)
         self.acac_i_v_set = active[:, ACAC_COLS["i_v_set"]].astype(np.float64, copy=True)
         self.acac_j_v_set = active[:, ACAC_COLS["j_v_set"]].astype(np.float64, copy=True)
-        self.acac_i_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.acac_i_pos], dtype=np.int32)
-        self.acac_i_q_row = np.asarray(
-            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.acac_i_pos],
-            dtype=np.int32,
-        )
-        self.acac_j_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.acac_j_pos], dtype=np.int32)
-        self.acac_j_q_row = np.asarray(
-            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.acac_j_pos],
-            dtype=np.int32,
-        )
+        self.acac_i_p_row, self.acac_i_q_row = self._ac_balance_rows(self.acac_i_pos)
+        self.acac_j_p_row, self.acac_j_q_row = self._ac_balance_rows(self.acac_j_pos)
+        self.acac_i_p_eq_mask = self.acac_i_p_row >= 0
+        self.acac_i_q_eq_mask = self.acac_i_q_row >= 0
+        self.acac_j_p_eq_mask = self.acac_j_p_row >= 0
+        self.acac_j_q_eq_mask = self.acac_j_q_row >= 0
         self.acac_i_v_col = self.acac_i_q_row.copy()
         self.acac_j_v_col = self.acac_j_q_row.copy()
 
@@ -1312,6 +1379,10 @@ class HybridPowerFlowCalc:
         self.acac_i_q_row = np.array([], dtype=np.int32)
         self.acac_j_p_row = np.array([], dtype=np.int32)
         self.acac_j_q_row = np.array([], dtype=np.int32)
+        self.acac_i_p_eq_mask = np.array([], dtype=bool)
+        self.acac_i_q_eq_mask = np.array([], dtype=bool)
+        self.acac_j_p_eq_mask = np.array([], dtype=bool)
+        self.acac_j_q_eq_mask = np.array([], dtype=bool)
         self.acac_i_v_col = np.array([], dtype=np.int32)
         self.acac_j_v_col = np.array([], dtype=np.int32)
 
@@ -1414,13 +1485,25 @@ class HybridPowerFlowCalc:
 
             # ACV 表示 AC 侧成网定压：第一控制方程固定电压幅值，
             # 第二控制方程固定相角；DCV/ACP 保持原有定 Q 方程。
-            self.dcac_loss_rows = np.repeat(self.dcac_eq_loss, 5)
-            self.dcac_loss_cols = np.empty(self.N_dcac * 5, dtype=np.int32)
-            self.dcac_loss_cols[0::5] = self.dcac_dc_p_col
-            self.dcac_loss_cols[1::5] = self.dcac_ac_p_col
-            self.dcac_loss_cols[2::5] = self.dcac_ac_q_col
-            self.dcac_loss_cols[3::5] = self.dcac_ac_v_col
-            self.dcac_loss_cols[4::5] = self.dcac_dc_v_col
+            variable_ac_v = self.dcac_ac_v_col >= 0
+            self.dcac_loss_rows = np.concatenate(
+                (
+                    self.dcac_eq_loss,
+                    self.dcac_eq_loss,
+                    self.dcac_eq_loss,
+                    self.dcac_eq_loss[variable_ac_v],
+                    self.dcac_eq_loss,
+                )
+            ).astype(np.int32, copy=False)
+            self.dcac_loss_cols = np.concatenate(
+                (
+                    self.dcac_dc_p_col,
+                    self.dcac_ac_p_col,
+                    self.dcac_ac_q_col,
+                    self.dcac_ac_v_col[variable_ac_v],
+                    self.dcac_dc_v_col,
+                )
+            ).astype(np.int32, copy=False)
 
             if self.dcac_dc_eq_mask.any():
                 self.dcac_dc_eq_rows = self.ac_eq + self.dcac_dc_eq[self.dcac_dc_eq_mask]
@@ -1539,14 +1622,28 @@ class HybridPowerFlowCalc:
 
             # ACAC 损耗方程依赖两端 P/Q 和电压；当前支持的 PQ/PV 端控制组合
             # 通过布尔掩码选择 i/j 侧使用定 Q 或定 V 方程。
-            self.acac_loss_rows = np.repeat(self.acac_eq_loss, 6)
-            self.acac_loss_cols = np.empty(self.N_acac * 6, dtype=np.int32)
-            self.acac_loss_cols[0::6] = self.acac_i_p_col
-            self.acac_loss_cols[1::6] = self.acac_i_q_col
-            self.acac_loss_cols[2::6] = self.acac_j_p_col
-            self.acac_loss_cols[3::6] = self.acac_j_q_col
-            self.acac_loss_cols[4::6] = self.acac_i_v_col
-            self.acac_loss_cols[5::6] = self.acac_j_v_col
+            variable_i_v = self.acac_i_v_col >= 0
+            variable_j_v = self.acac_j_v_col >= 0
+            self.acac_loss_rows = np.concatenate(
+                (
+                    self.acac_eq_loss,
+                    self.acac_eq_loss,
+                    self.acac_eq_loss,
+                    self.acac_eq_loss,
+                    self.acac_eq_loss[variable_i_v],
+                    self.acac_eq_loss[variable_j_v],
+                )
+            ).astype(np.int32, copy=False)
+            self.acac_loss_cols = np.concatenate(
+                (
+                    self.acac_i_p_col,
+                    self.acac_i_q_col,
+                    self.acac_j_p_col,
+                    self.acac_j_q_col,
+                    self.acac_i_v_col[variable_i_v],
+                    self.acac_j_v_col[variable_j_v],
+                )
+            ).astype(np.int32, copy=False)
 
             self.acac_q_i_mask = (self.acac_ctrl_code == 0) | (self.acac_ctrl_code == 2)
             self.acac_v_i_mask = ~self.acac_q_i_mask
@@ -1663,6 +1760,25 @@ class HybridPowerFlowCalc:
         jac = jac.tocsr()
         return self._rows_from_csr_indptr(jac.indptr), jac.indices.astype(np.int32, copy=True)
 
+    @staticmethod
+    def _sub_jacobian_cached_values(calc, is_dc=False):
+        """Return values aligned with the CSC pattern selected above."""
+        candidates = []
+        if is_dc:
+            candidates.append(("_dc_jac_csc_indices", "_dc_jac_csc_data"))
+        candidates.extend(
+            (
+                ("full_jac_csc_indices", "full_jac_csc_data"),
+                ("standard_jac_csc_indices", "standard_jac_csc_data"),
+            )
+        )
+        for index_name, data_name in candidates:
+            indices = getattr(calc, index_name, None)
+            data = getattr(calc, data_name, None)
+            if indices is not None and data is not None and np.asarray(indices).size:
+                return np.asarray(data, dtype=np.float64)
+        return None
+
     def _cache_global_jacobian_pattern(self):
         """Precompute global hybrid Jacobian CSR pattern for repeated Newton iterations."""
         self._clear_global_jacobian_pattern()
@@ -1694,17 +1810,41 @@ class HybridPowerFlowCalc:
             add_part("dc", dc_rows + self.ac_eq, dc_cols + self.ac_size)
 
         if self.N_dcac:
-            add_part("dcac_ac_p", self.dcac_ac_p_row, self.dcac_ac_p_col)
-            add_part("dcac_ac_q", self.dcac_ac_q_row, self.dcac_ac_q_col)
+            add_part(
+                "dcac_ac_p",
+                self.dcac_ac_p_row[self.dcac_ac_p_eq_mask],
+                self.dcac_ac_p_col[self.dcac_ac_p_eq_mask],
+            )
+            add_part(
+                "dcac_ac_q",
+                self.dcac_ac_q_row[self.dcac_ac_q_eq_mask],
+                self.dcac_ac_q_col[self.dcac_ac_q_eq_mask],
+            )
             add_part("dcac_dc_eq", self.dcac_dc_eq_rows, self.dcac_dc_eq_cols)
             add_part("dcac_loss", self.dcac_loss_rows, self.dcac_loss_cols)
             add_part("dcac_ctrl", self.dcac_ctrl_rows, self.dcac_ctrl_cols)
 
         if self.N_acac:
-            add_part("acac_i_p", self.acac_i_p_row, self.acac_i_p_col)
-            add_part("acac_i_q", self.acac_i_q_row, self.acac_i_q_col)
-            add_part("acac_j_p", self.acac_j_p_row, self.acac_j_p_col)
-            add_part("acac_j_q", self.acac_j_q_row, self.acac_j_q_col)
+            add_part(
+                "acac_i_p",
+                self.acac_i_p_row[self.acac_i_p_eq_mask],
+                self.acac_i_p_col[self.acac_i_p_eq_mask],
+            )
+            add_part(
+                "acac_i_q",
+                self.acac_i_q_row[self.acac_i_q_eq_mask],
+                self.acac_i_q_col[self.acac_i_q_eq_mask],
+            )
+            add_part(
+                "acac_j_p",
+                self.acac_j_p_row[self.acac_j_p_eq_mask],
+                self.acac_j_p_col[self.acac_j_p_eq_mask],
+            )
+            add_part(
+                "acac_j_q",
+                self.acac_j_q_row[self.acac_j_q_eq_mask],
+                self.acac_j_q_col[self.acac_j_q_eq_mask],
+            )
             add_part("acac_loss", self.acac_loss_rows, self.acac_loss_cols)
             add_part("acac_ctrl", self.acac_ctrl_rows, self.acac_ctrl_cols)
 
@@ -1751,16 +1891,12 @@ class HybridPowerFlowCalc:
         self.acac_j_q_set = np.asarray([conv.j_q_set for conv in convs], dtype=np.float64)
         self.acac_i_v_set = np.asarray([conv.i_v_set for conv in convs], dtype=np.float64)
         self.acac_j_v_set = np.asarray([conv.j_v_set for conv in convs], dtype=np.float64)
-        self.acac_i_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.acac_i_pos], dtype=np.int32)
-        self.acac_i_q_row = np.asarray(
-            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.acac_i_pos],
-            dtype=np.int32,
-        )
-        self.acac_j_p_row = np.asarray([self.ac_calc.theta_idx[int(pos)] for pos in self.acac_j_pos], dtype=np.int32)
-        self.acac_j_q_row = np.asarray(
-            [self.ac_calc.n_theta + self.ac_calc.V_idx[int(pos)] for pos in self.acac_j_pos],
-            dtype=np.int32,
-        )
+        self.acac_i_p_row, self.acac_i_q_row = self._ac_balance_rows(self.acac_i_pos)
+        self.acac_j_p_row, self.acac_j_q_row = self._ac_balance_rows(self.acac_j_pos)
+        self.acac_i_p_eq_mask = self.acac_i_p_row >= 0
+        self.acac_i_q_eq_mask = self.acac_i_q_row >= 0
+        self.acac_j_p_eq_mask = self.acac_j_p_row >= 0
+        self.acac_j_q_eq_mask = self.acac_j_q_row >= 0
         self.acac_i_v_col = self.acac_i_q_row.copy()
         self.acac_j_v_col = self.acac_j_q_row.copy()
 
@@ -1807,8 +1943,18 @@ class HybridPowerFlowCalc:
         # Converter port powers are injected into the existing AC/DC nodal balance rows.
         # bincount 比 np.add.at 显著更快；ac_f / dc_f 是预分配的全局 F 切片，
         # 这里用 += 把贡献加进去。
-        ac_f += np.bincount(self.dcac_ac_p_row, weights=ac_p, minlength=ac_f.size)
-        ac_f += np.bincount(self.dcac_ac_q_row, weights=ac_q, minlength=ac_f.size)
+        if np.any(self.dcac_ac_p_eq_mask):
+            ac_f += np.bincount(
+                self.dcac_ac_p_row[self.dcac_ac_p_eq_mask],
+                weights=ac_p[self.dcac_ac_p_eq_mask],
+                minlength=ac_f.size,
+            )
+        if np.any(self.dcac_ac_q_eq_mask):
+            ac_f += np.bincount(
+                self.dcac_ac_q_row[self.dcac_ac_q_eq_mask],
+                weights=ac_q[self.dcac_ac_q_eq_mask],
+                minlength=ac_f.size,
+            )
         if self.dcac_dc_eq_mask.any():
             dc_eq_active = self.dcac_dc_eq[self.dcac_dc_eq_mask]
             dc_p_active = dc_p[self.dcac_dc_eq_mask]
@@ -1861,10 +2007,30 @@ class HybridPowerFlowCalc:
         j_p = acac[:, 2]
         j_q = acac[:, 3]
         # ACAC port powers couple two AC PQ nodes inside the same global system.
-        ac_f += np.bincount(self.acac_i_p_row, weights=i_p, minlength=ac_f.size)
-        ac_f += np.bincount(self.acac_i_q_row, weights=i_q, minlength=ac_f.size)
-        ac_f += np.bincount(self.acac_j_p_row, weights=j_p, minlength=ac_f.size)
-        ac_f += np.bincount(self.acac_j_q_row, weights=j_q, minlength=ac_f.size)
+        if np.any(self.acac_i_p_eq_mask):
+            ac_f += np.bincount(
+                self.acac_i_p_row[self.acac_i_p_eq_mask],
+                weights=i_p[self.acac_i_p_eq_mask],
+                minlength=ac_f.size,
+            )
+        if np.any(self.acac_i_q_eq_mask):
+            ac_f += np.bincount(
+                self.acac_i_q_row[self.acac_i_q_eq_mask],
+                weights=i_q[self.acac_i_q_eq_mask],
+                minlength=ac_f.size,
+            )
+        if np.any(self.acac_j_p_eq_mask):
+            ac_f += np.bincount(
+                self.acac_j_p_row[self.acac_j_p_eq_mask],
+                weights=j_p[self.acac_j_p_eq_mask],
+                minlength=ac_f.size,
+            )
+        if np.any(self.acac_j_q_eq_mask):
+            ac_f += np.bincount(
+                self.acac_j_q_row[self.acac_j_q_eq_mask],
+                weights=j_q[self.acac_j_q_eq_mask],
+                minlength=ac_f.size,
+            )
 
         vi = ac_V[self.acac_i_pos]
         vj = ac_V[self.acac_j_pos]
@@ -1946,10 +2112,8 @@ class HybridPowerFlowCalc:
             jac = self.dc_calc.get_jacobi(x)
             self.last_jacobian_shape = jac.shape
             return jac
-        ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
-        ac_j = self.ac_calc.get_jacobi(ac_x) if self.ac_calc is not None else None
-        dc_j = self.dc_calc.get_jacobi(dc_x) if self.dc_calc is not None else None
-        return self._assemble_jacobian(ac_x, dc_x, dcac_x, acac_x, ac_j, dc_j)
+        _residual, jac = self._build_newton_system(x, return_jacobian=True, jacobian_format="csr")
+        return jac
 
     @staticmethod
     def _slice_len(part_slice):
@@ -1989,12 +2153,16 @@ class HybridPowerFlowCalc:
         vd2 = vd * vd
         dc_p2 = dc_p * dc_p
         ac_i2_num = ac_p * ac_p + ac_q * ac_q
-        data = raw[self.global_jac_dcac_loss_slice]
-        data[0::5] = vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2
-        data[1::5] = vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2
-        data[2::5] = -2.0 * self.dcac_r2 * ac_q * vd2
-        data[3::5] = 2.0 * va * vd2 * (dc_p + ac_p) - 2.0 * self.dcac_r1 * dc_p2 * va
-        data[4::5] = 2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd
+        d_va = 2.0 * va * vd2 * (dc_p + ac_p) - 2.0 * self.dcac_r1 * dc_p2 * va
+        raw[self.global_jac_dcac_loss_slice] = np.concatenate(
+            (
+                vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2,
+                vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2,
+                -2.0 * self.dcac_r2 * ac_q * vd2,
+                d_va[self.dcac_ac_q_eq_mask],
+                2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd,
+            )
+        )
 
     def _fill_acac_global_jacobian_data(self, raw, acac_x, ac_V):
         if not self.N_acac:
@@ -2024,13 +2192,18 @@ class HybridPowerFlowCalc:
         vj2 = vj * vj
         i_s2 = i_p * i_p + i_q * i_q
         j_s2 = j_p * j_p + j_q * j_q
-        data = raw[self.global_jac_acac_loss_slice]
-        data[0::6] = vi2 * vj2 - 2.0 * self.acac_r1 * i_p * vj2
-        data[1::6] = -2.0 * self.acac_r1 * i_q * vj2
-        data[2::6] = vi2 * vj2 - 2.0 * self.acac_r2 * j_p * vi2
-        data[3::6] = -2.0 * self.acac_r2 * j_q * vi2
-        data[4::6] = 2.0 * vi * vj2 * (i_p + j_p) - 2.0 * self.acac_r2 * j_s2 * vi
-        data[5::6] = 2.0 * vj * vi2 * (i_p + j_p) - 2.0 * self.acac_r1 * i_s2 * vj
+        d_vi = 2.0 * vi * vj2 * (i_p + j_p) - 2.0 * self.acac_r2 * j_s2 * vi
+        d_vj = 2.0 * vj * vi2 * (i_p + j_p) - 2.0 * self.acac_r1 * i_s2 * vj
+        raw[self.global_jac_acac_loss_slice] = np.concatenate(
+            (
+                vi2 * vj2 - 2.0 * self.acac_r1 * i_p * vj2,
+                -2.0 * self.acac_r1 * i_q * vj2,
+                vi2 * vj2 - 2.0 * self.acac_r2 * j_p * vi2,
+                -2.0 * self.acac_r2 * j_q * vi2,
+                d_vi[self.acac_i_q_eq_mask],
+                d_vj[self.acac_j_q_eq_mask],
+            )
+        )
 
     def _assemble_jacobian_from_precomputed_pattern(
         self,
@@ -2160,7 +2333,9 @@ class HybridPowerFlowCalc:
                 jacobian_format="csc",
             )
             if return_jacobian and ac_j is None and self._slice_len(self.global_jac_ac_slice):
-                ac_j = self.ac_calc.get_jacobi(ac_x)
+                ac_j = self._sub_jacobian_cached_values(self.ac_calc, is_dc=False)
+                if ac_j is None:
+                    ac_j = self.ac_calc.get_jacobi(ac_x)
         if self.dc_calc is not None:
             dc_f, dc_j = self.dc_calc._build_newton_system(
                 dc_x,
@@ -2168,7 +2343,9 @@ class HybridPowerFlowCalc:
                 jacobian_format="csc",
             )
             if return_jacobian and dc_j is None and self._slice_len(self.global_jac_dc_slice):
-                dc_j = self.dc_calc.get_jacobi(dc_x)
+                dc_j = self._sub_jacobian_cached_values(self.dc_calc, is_dc=True)
+                if dc_j is None:
+                    dc_j = self.dc_calc.get_jacobi(dc_x)
 
         ac_theta = ac_V = dc_V = None
         if self.N_dcac or self.N_acac:
@@ -2198,12 +2375,14 @@ class HybridPowerFlowCalc:
         ac_p = dcac[:, 1]
         ac_q = dcac[:, 2]
 
-        row_parts.append(self.dcac_ac_p_row)
-        col_parts.append(self.dcac_ac_p_col)
-        data_parts.append(self.dcac_ones)
-        row_parts.append(self.dcac_ac_q_row)
-        col_parts.append(self.dcac_ac_q_col)
-        data_parts.append(self.dcac_ones)
+        if np.any(self.dcac_ac_p_eq_mask):
+            row_parts.append(self.dcac_ac_p_row[self.dcac_ac_p_eq_mask])
+            col_parts.append(self.dcac_ac_p_col[self.dcac_ac_p_eq_mask])
+            data_parts.append(self.dcac_ones[self.dcac_ac_p_eq_mask])
+        if np.any(self.dcac_ac_q_eq_mask):
+            row_parts.append(self.dcac_ac_q_row[self.dcac_ac_q_eq_mask])
+            col_parts.append(self.dcac_ac_q_col[self.dcac_ac_q_eq_mask])
+            data_parts.append(self.dcac_ones[self.dcac_ac_q_eq_mask])
         if self.dcac_dc_eq_rows.size:
             row_parts.append(self.dcac_dc_eq_rows)
             col_parts.append(self.dcac_dc_eq_cols)
@@ -2215,12 +2394,16 @@ class HybridPowerFlowCalc:
         vd2 = vd * vd
         dc_p2 = dc_p * dc_p
         ac_i2_num = ac_p * ac_p + ac_q * ac_q
-        loss_data = np.empty(n * 5, dtype=np.float64)
-        loss_data[0::5] = vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2
-        loss_data[1::5] = vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2
-        loss_data[2::5] = -2.0 * self.dcac_r2 * ac_q * vd2
-        loss_data[3::5] = 2.0 * va * vd2 * (dc_p + ac_p) - 2.0 * self.dcac_r1 * dc_p2 * va
-        loss_data[4::5] = 2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd
+        d_va = 2.0 * va * vd2 * (dc_p + ac_p) - 2.0 * self.dcac_r1 * dc_p2 * va
+        loss_data = np.concatenate(
+            (
+                vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2,
+                vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2,
+                -2.0 * self.dcac_r2 * ac_q * vd2,
+                d_va[self.dcac_ac_q_eq_mask],
+                2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd,
+            )
+        )
         row_parts.append(self.dcac_loss_rows)
         col_parts.append(self.dcac_loss_cols)
         data_parts.append(loss_data)
@@ -2239,18 +2422,22 @@ class HybridPowerFlowCalc:
         j_p = acac[:, 2]
         j_q = acac[:, 3]
 
-        row_parts.append(self.acac_i_p_row)
-        col_parts.append(self.acac_i_p_col)
-        data_parts.append(self.acac_ones)
-        row_parts.append(self.acac_i_q_row)
-        col_parts.append(self.acac_i_q_col)
-        data_parts.append(self.acac_ones)
-        row_parts.append(self.acac_j_p_row)
-        col_parts.append(self.acac_j_p_col)
-        data_parts.append(self.acac_ones)
-        row_parts.append(self.acac_j_q_row)
-        col_parts.append(self.acac_j_q_col)
-        data_parts.append(self.acac_ones)
+        if np.any(self.acac_i_p_eq_mask):
+            row_parts.append(self.acac_i_p_row[self.acac_i_p_eq_mask])
+            col_parts.append(self.acac_i_p_col[self.acac_i_p_eq_mask])
+            data_parts.append(self.acac_ones[self.acac_i_p_eq_mask])
+        if np.any(self.acac_i_q_eq_mask):
+            row_parts.append(self.acac_i_q_row[self.acac_i_q_eq_mask])
+            col_parts.append(self.acac_i_q_col[self.acac_i_q_eq_mask])
+            data_parts.append(self.acac_ones[self.acac_i_q_eq_mask])
+        if np.any(self.acac_j_p_eq_mask):
+            row_parts.append(self.acac_j_p_row[self.acac_j_p_eq_mask])
+            col_parts.append(self.acac_j_p_col[self.acac_j_p_eq_mask])
+            data_parts.append(self.acac_ones[self.acac_j_p_eq_mask])
+        if np.any(self.acac_j_q_eq_mask):
+            row_parts.append(self.acac_j_q_row[self.acac_j_q_eq_mask])
+            col_parts.append(self.acac_j_q_col[self.acac_j_q_eq_mask])
+            data_parts.append(self.acac_ones[self.acac_j_q_eq_mask])
 
         vi = ac_V[self.acac_i_pos]
         vj = ac_V[self.acac_j_pos]
@@ -2258,13 +2445,18 @@ class HybridPowerFlowCalc:
         vj2 = vj * vj
         i_s2 = i_p * i_p + i_q * i_q
         j_s2 = j_p * j_p + j_q * j_q
-        loss_data = np.empty(n * 6, dtype=np.float64)
-        loss_data[0::6] = vi2 * vj2 - 2.0 * self.acac_r1 * i_p * vj2
-        loss_data[1::6] = -2.0 * self.acac_r1 * i_q * vj2
-        loss_data[2::6] = vi2 * vj2 - 2.0 * self.acac_r2 * j_p * vi2
-        loss_data[3::6] = -2.0 * self.acac_r2 * j_q * vi2
-        loss_data[4::6] = 2.0 * vi * vj2 * (i_p + j_p) - 2.0 * self.acac_r2 * j_s2 * vi
-        loss_data[5::6] = 2.0 * vj * vi2 * (i_p + j_p) - 2.0 * self.acac_r1 * i_s2 * vj
+        d_vi = 2.0 * vi * vj2 * (i_p + j_p) - 2.0 * self.acac_r2 * j_s2 * vi
+        d_vj = 2.0 * vj * vi2 * (i_p + j_p) - 2.0 * self.acac_r1 * i_s2 * vj
+        loss_data = np.concatenate(
+            (
+                vi2 * vj2 - 2.0 * self.acac_r1 * i_p * vj2,
+                -2.0 * self.acac_r1 * i_q * vj2,
+                vi2 * vj2 - 2.0 * self.acac_r2 * j_p * vi2,
+                -2.0 * self.acac_r2 * j_q * vi2,
+                d_vi[self.acac_i_q_eq_mask],
+                d_vj[self.acac_j_q_eq_mask],
+            )
+        )
         row_parts.append(self.acac_loss_rows)
         col_parts.append(self.acac_loss_cols)
         data_parts.append(loss_data)
@@ -2282,11 +2474,14 @@ class HybridPowerFlowCalc:
         return None, None, 0, 0
 
     def _hybrid_summary(self):
-        return {
+        summary = {
             "converged": bool(self.converged),
             "iterations": int(self.iterations),
             "normF": float(self.normF),
         }
+        if self.failure_reason:
+            summary["failure_reason"] = self.failure_reason
+        return summary
 
     def _ac_array_summary(self, ac_result):
         if not ac_result:
@@ -2394,6 +2589,7 @@ class HybridPowerFlowCalc:
 
         self.converged = False
         self.iterations = 0
+        self.failure_reason = ""
         x = self.x.copy()
         resolved_name = self._linear_solver_resolved
         solver_fn = self._linear_solver_fn
@@ -2410,6 +2606,12 @@ class HybridPowerFlowCalc:
             F, J = self._build_newton_system(x)
             self.iterations = it + 1
             self.normF = np.linalg.norm(F, np.inf)
+
+            if it == 0 and not self._validate_initial_jacobian_columns(J):
+                self.x = x
+                if self.verbose:
+                    print(self.failure_reason)
+                return -1
 
             ac_f = F[:self.ac_eq]
             dc_f = F[self.ac_eq:self.ac_eq + self.dc_eq]
@@ -2466,6 +2668,48 @@ class HybridPowerFlowCalc:
         self.x = x
         self._write_back()
         return -1
+
+    def _validate_initial_jacobian_columns(self, jacobian, tol=1e-14):
+        """Reject states that have no effective equation at the initial point."""
+        csc = jacobian if getattr(jacobian, "format", None) == "csc" else jacobian.tocsc()
+        zero_columns = []
+        for col in range(csc.shape[1]):
+            start, stop = int(csc.indptr[col]), int(csc.indptr[col + 1])
+            data = csc.data[start:stop]
+            if data.size == 0 or np.max(np.abs(data)) <= tol:
+                zero_columns.append(col)
+        if not zero_columns:
+            return True
+
+        labels = [self._global_state_label(col) for col in zero_columns]
+        self.failure_reason = (
+            "初始雅可比矩阵存在零列，以下状态缺少独立控制方程: "
+            + ", ".join(labels)
+        )
+        return False
+
+    def _global_state_label(self, column):
+        """Return a compact diagnostic label for a global Newton state column."""
+        column = int(column)
+        if column < self.ac_size:
+            return f"AC_state[{column}]"
+        dc_stop = self.ac_size + self.dc_size
+        if column < dc_stop:
+            local = column - self.ac_size
+            if self.dc_calc is not None and local < self.dc_calc.N:
+                node_ids = sorted(
+                    int(node_id)
+                    for node_id, solver_pos in self.dc_calc.alive_node_dict.items()
+                    if int(solver_pos) == local
+                )
+                if len(node_ids) == 1:
+                    return f"V_DC(node {node_ids[0]})"
+                if node_ids:
+                    return "V_DC(nodes " + ",".join(str(node_id) for node_id in node_ids) + ")"
+            return f"DC_state[{local}]"
+        if column < self.acac_start:
+            return f"DCAC_state[{column - self.dcac_start}]"
+        return f"ACAC_state[{column - self.acac_start}]"
 
     def _write_summary_result(self):
         x = self.x
@@ -2966,6 +3210,8 @@ def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int) -> None:
     result = calc.lf_result
     if result is None:
         print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, 返回码: {rc}, iter={calc.iterations}, normF={calc.normF:.3e}")
+        if calc.failure_reason:
+            print(f"失败原因: {calc.failure_reason}")
         return
     print("\n=== 交直流联合潮流计算结果 ===")
     print(f"节点总数: {result.total_nodes} (AC={len(result.ac_network.nodes)}, DC={len(result.dc_network.nodes)})")
@@ -3066,6 +3312,8 @@ def main(argv=None) -> int:
         print_hybrid_result(calc, rc)
     elif not args.quiet:
         print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
+        if calc.failure_reason:
+            print(f"失败原因: {calc.failure_reason}")
     return 0 if rc == 0 else 1
 
 

@@ -1,0 +1,67 @@
+[
+  {
+    "case": "ieee3w",
+    "kind": "ac",
+    "nodes": 30000,
+    "iter": 6,
+    "converged": true,
+    "rc": 0,
+    "normF": 2.0832224834066437e-12,
+    "total_s": 0.8130574999959208,
+    "hot": {
+      "_get_jacobi_from_precomputed_pattern": 0.0021899000000000003,
+      "_fill_standard_jacobian_data": 0.0355506,
+      "_fill_zero_top_jacobian_data": 0.00026040000000000004,
+      "_get_standard_jacobi_direct": 0.0,
+      "_calc_power_balance": 0.0022873000000000004,
+      "_calc_zero_branch_power": 0.0006104000000000001,
+      "_factor_jacobian": 0.0,
+      "_run_newton_raphson": 0.0072886,
+      "spsolve": 0.0
+    },
+    "V_head": [
+      0.0
+    ],
+    "V_norm": 0.0
+  },
+  {
+    "case": "dc_net_3000",
+    "kind": "dc",
+    "nodes": 3000,
+    "iter": 7,
+    "converged": true,
+    "rc": 0,
+    "normF": 2.618738559334588e-13,
+    "total_s": 0.1557840000023134,
+    "hot": {
+      "_get_jacobi_from_precomputed_pattern": 7.75e-05,
+      "_get_jacobi_from_terms": 1.32e-05,
+      "_factor_jacobian": 0.0,
+      "_run_newton_raphson": 0.0007308000000000001,
+      "_write_back_ppc": 0.001092,
+      "spsolve": 0.0
+    },
+    "V_head": null,
+    "V_norm": null
+  },
+  {
+    "case": "qinling_1000",
+    "kind": "hybrid",
+    "nodes": 80000,
+    "iter": 4,
+    "converged": true,
+    "rc": 0,
+    "normF": 5.245569756340274e-09,
+    "total_s": 3.6149547999957576,
+    "hot": {
+      "_assemble_jacobian": 1.59e-05,
+      "_assemble_jacobian_from_precomputed_pattern": 0.0017591000000000002,
+      "_build_newton_system": 0.00028660000000000003,
+      "_run_newton_raphson": 0.0026081000000000003,
+      "_factor_jacobian": 0.0,
+      "spsolve": 0.0
+    },
+    "V_head": null,
+    "V_norm": null
+  }
+]

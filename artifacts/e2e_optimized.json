@@ -1,0 +1,125 @@
+{
+  "label": "optimized",
+  "cases": {
+    "ieee300": {
+      "kind": "ac",
+      "nodes": 300,
+      "min_s": 0.006413399998564273,
+      "median_s": 0.007129600009648129,
+      "max_s": 0.012336399988271296,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 1.210642697202502e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "ieee3k": {
+      "kind": "ac",
+      "nodes": 3000,
+      "min_s": 0.04703679998056032,
+      "median_s": 0.04971250001108274,
+      "max_s": 0.07605960001819767,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.0708434966820732e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "ieee1w": {
+      "kind": "ac",
+      "nodes": 10200,
+      "min_s": 0.14038530000834726,
+      "median_s": 0.15576329999021254,
+      "max_s": 0.21796740000718273,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 1.6349144260630055e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "ieee3w": {
+      "kind": "ac",
+      "nodes": 30000,
+      "min_s": 0.5492486000002827,
+      "median_s": 0.6303507999982685,
+      "max_s": 0.7500878999999259,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.066513626886035e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "dc_net_1000": {
+      "kind": "dc",
+      "nodes": 1000,
+      "min_s": 0.060346700018271804,
+      "median_s": 0.06581100000767037,
+      "max_s": 0.09640310000395402,
+      "iter": 7,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.5665580771772056e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "dc_net_3000": {
+      "kind": "dc",
+      "nodes": 3000,
+      "min_s": 0.23769650000031106,
+      "median_s": 0.25703179999254644,
+      "max_s": 0.37520320000476204,
+      "iter": 7,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.5665580771772056e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "qinling_100": {
+      "kind": "hybrid",
+      "nodes": 8000,
+      "min_s": 0.5247371999721508,
+      "median_s": 0.5391085000010207,
+      "max_s": 0.622690899996087,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 5.245569756340274e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "qinling_1000": {
+      "kind": "hybrid",
+      "nodes": 80000,
+      "min_s": 6.204356200003531,
+      "median_s": 6.715106399991782,
+      "max_s": 9.169526999990921,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 5.245569756340274e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    }
+  }
+}

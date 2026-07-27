@@ -1,0 +1,35 @@
+{
+  "label": "default_pyklu_final",
+  "cases": {
+    "qinling_1000": {
+      "kind": "hybrid",
+      "nodes": 80000,
+      "min_s": 0.6562095000008412,
+      "median_s": 0.673560200000793,
+      "max_s": 0.693018400001165,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.603444126947352e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 5
+    },
+    "hybrid_net_4w": {
+      "kind": "hybrid",
+      "nodes": 40000,
+      "min_s": 0.5603273999986413,
+      "median_s": 0.6834530999985873,
+      "max_s": 0.7129746999999043,
+      "iter": 8,
+      "converged": true,
+      "rc": 0,
+      "normF": 1.6342482922482304e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 5
+    }
+  }
+}
+# result_mode: array
+# fast_hybrid: True

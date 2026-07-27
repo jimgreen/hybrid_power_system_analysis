@@ -1,0 +1,168 @@
+{
+  "label": "full",
+  "cases": {
+    "ieee300": {
+      "kind": "ac",
+      "nodes": 300,
+      "min_s": 0.006308200012426823,
+      "median_s": 0.007088499987730756,
+      "max_s": 0.009013799979584292,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 1.210642697202502e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "ieee3k": {
+      "kind": "ac",
+      "nodes": 3000,
+      "min_s": 0.045249000017065555,
+      "median_s": 0.04924240001128055,
+      "max_s": 0.055932999996002764,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.0708434966820732e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "ieee1w": {
+      "kind": "ac",
+      "nodes": 10200,
+      "min_s": 0.14746080001350492,
+      "median_s": 0.1543264000210911,
+      "max_s": 0.183605099999113,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 1.6349144260630055e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "ieee3w": {
+      "kind": "ac",
+      "nodes": 30000,
+      "min_s": 0.5694756000011694,
+      "median_s": 0.590356000000611,
+      "max_s": 0.6437559000041801,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.066513626886035e-12,
+      "V_head": [
+        0.0
+      ],
+      "V_norm": 0.0,
+      "n_runs": 7
+    },
+    "dc_net_1000": {
+      "kind": "dc",
+      "nodes": 1000,
+      "min_s": 0.059395299991592765,
+      "median_s": 0.06764690001728013,
+      "max_s": 0.07145960000343621,
+      "iter": 7,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.5665580771772056e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "dc_net_3000": {
+      "kind": "dc",
+      "nodes": 3000,
+      "min_s": 0.24201990000437945,
+      "median_s": 0.24627249999321066,
+      "max_s": 0.26182619997416623,
+      "iter": 7,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.5665580771772056e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "dc_net_3w": {
+      "kind": "dc",
+      "nodes": 30000,
+      "min_s": 4.374985000002198,
+      "median_s": 4.4754461999982595,
+      "max_s": 4.895447100017918,
+      "iter": 7,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.5665580771772056e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "qinling_100": {
+      "kind": "hybrid",
+      "nodes": 8000,
+      "min_s": 0.534174999978859,
+      "median_s": 0.5529846999852452,
+      "max_s": 0.6311779000097886,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 5.245569756340274e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "qinling_1000": {
+      "kind": "hybrid",
+      "nodes": 80000,
+      "min_s": 6.95186110000941,
+      "median_s": 7.046799799980363,
+      "max_s": 7.738776699989103,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 5.245569756340274e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "hybrid_net_4k": {
+      "kind": "hybrid",
+      "nodes": 4000,
+      "min_s": 0.3409338000055868,
+      "median_s": 0.3554969000106212,
+      "max_s": 0.37618510000174865,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.1113866210953347e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    },
+    "hybrid_net_4w": {
+      "kind": "hybrid",
+      "nodes": 40000,
+      "min_s": 5.293325199978426,
+      "median_s": 5.518846899998607,
+      "max_s": 5.823510800022632,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.1113866210953347e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 7
+    }
+  }
+}
+# result_mode: full

@@ -1,0 +1,48 @@
+{
+  "label": "array_v3",
+  "cases": {
+    "dc_net_3w": {
+      "kind": "dc",
+      "nodes": 30000,
+      "min_s": 3.08952760000102,
+      "median_s": 3.601761500000066,
+      "max_s": 4.657894600000873,
+      "iter": 7,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.5665580771772056e-13,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 3
+    },
+    "qinling_1000": {
+      "kind": "hybrid",
+      "nodes": 80000,
+      "min_s": 5.877738999999565,
+      "median_s": 6.985861299999669,
+      "max_s": 7.041995300000053,
+      "iter": 4,
+      "converged": true,
+      "rc": 0,
+      "normF": 5.245569756340274e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 3
+    },
+    "hybrid_net_4w": {
+      "kind": "hybrid",
+      "nodes": 40000,
+      "min_s": 3.9691469999997935,
+      "median_s": 5.093222800000149,
+      "max_s": 6.212998900000457,
+      "iter": 6,
+      "converged": true,
+      "rc": 0,
+      "normF": 2.1113866210953347e-09,
+      "V_head": null,
+      "V_norm": null,
+      "n_runs": 3
+    }
+  }
+}
+# result_mode: array

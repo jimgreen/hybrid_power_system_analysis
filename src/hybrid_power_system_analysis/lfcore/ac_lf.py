@@ -62,6 +62,7 @@ from ac_array_model import (
     build_ac_ppc_from_network,
 )
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
+from model.topology import build_lf_control_bus_groups
 try:
     from lfcore.common import (
         find_spanning_tree_edges,
@@ -441,6 +442,10 @@ class ACPowerFlowCalc:
         self.ppc_node_angle = np.array([], dtype=np.float64)
         self._ppc_node_row_lookup = np.array([], dtype=np.int32)
         self._active_node_solver_lookup = np.array([], dtype=np.int32)
+        self.active_node_rows = np.array([], dtype=np.int32)
+        self.active_node_solver_pos = np.array([], dtype=np.int32)
+        self._topology_bus_to_solver_pos = np.array([], dtype=np.int32)
+        self._lf_control_bus_groups = None
         self.isl = None
         self.Y: Optional[csr_matrix] = None
 
@@ -904,26 +909,21 @@ class ACPowerFlowCalc:
         ensure_ac_ppc_topology(ppc)
         topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
-        active_bus = np.asarray(topology.node_alive_mask, dtype=bool)
-        if not np.any(active_bus):
+        active_node = np.asarray(topology.node_alive_mask, dtype=bool)
+        if not np.any(active_node):
             raise RuntimeError("电网中无带平衡节点的存活拓扑岛，无法进行潮流计算")
 
-        self.active_bus_rows = np.where(active_bus)[0].astype(np.int32)
-        self.row_to_pos = np.full(n_bus_all, -1, dtype=np.int32)
-        self.row_to_pos[self.active_bus_rows] = np.arange(self.active_bus_rows.size, dtype=np.int32)
-        self.N = int(self.active_bus_rows.size)
+        self._prepare_ppc_solver_bus_mapping(topology, bus, gen, shunt)
 
         active_rows = self.active_bus_rows
         self.ppc_node_idx = bus[active_rows, BUS_COLS["idx"]].astype(np.int64, copy=True)
         self.ppc_node_vbase = bus[active_rows, BUS_COLS["vbase"]].astype(np.float64, copy=True)
-        self.ppc_node_voltage = bus[active_rows, BUS_COLS["voltage"]].astype(np.float64, copy=True)
-        self.ppc_node_angle = bus[active_rows, BUS_COLS["angle"]].astype(np.float64, copy=True)
-        if self.ppc_node_idx.size and np.all(self.ppc_node_idx >= 0):
-            self._active_node_solver_lookup = np.full(int(np.max(self.ppc_node_idx)) + 1, -1, dtype=np.int32)
-            self._active_node_solver_lookup[self.ppc_node_idx.astype(np.intp, copy=False)] = np.arange(
-                self.N,
-                dtype=np.int32,
-            )
+        self.ppc_node_voltage = self._solver_initial_voltage.astype(np.float64, copy=True)
+        self.ppc_node_angle = self._solver_initial_angle.astype(np.float64, copy=True)
+        active_node_ids = bus[self.active_node_rows, BUS_COLS["idx"]].astype(np.int64, copy=False)
+        if active_node_ids.size and np.all(active_node_ids >= 0):
+            self._active_node_solver_lookup = np.full(int(np.max(active_node_ids)) + 1, -1, dtype=np.int32)
+            self._active_node_solver_lookup[active_node_ids.astype(np.intp, copy=False)] = self.active_node_solver_pos
         else:
             self._active_node_solver_lookup = np.array([], dtype=np.int32)
         if self.keep_node_objects:
@@ -960,17 +960,117 @@ class ACPowerFlowCalc:
         self.load_info = []
         self.slack_node = -1
 
-        self._prepare_ppc_devices(branch, transformer, gen, load, shunt, zero_branch, switch, active_bus)
+        self._prepare_ppc_devices(branch, transformer, gen, load, shunt, zero_branch, switch, active_node)
         self._prepare_ppc_y_matrix(branch, transformer, three_winding_transformer, shunt)
-        self._prepare_ppc_zero_edges(zero_branch, switch, active_bus, breaker)
+        self._prepare_ppc_zero_edges(zero_branch, switch, active_node, breaker)
         self._finalize_prepared_arrays()
         if self.verbose:
             print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
+
+    def _prepare_ppc_solver_bus_mapping(self, topology, bus, gen, shunt):
+        """Map existing topology buses to LF buses after control-aware ideal-tie grouping."""
+        controlled_bus_parts = []
+        gen_topology = topology.devices.get("gen")
+        if gen.size and gen_topology is not None:
+            controls = gen[:, GEN_COLS["control_type"]].astype(np.int32, copy=False)
+            alive = np.asarray(gen_topology.alive_mask, dtype=bool)
+            controlled = alive & ((controls == CTRL_SLACK) | (controls == CTRL_PV))
+            if np.any(controlled):
+                controlled_bus_parts.append(
+                    np.asarray(gen_topology.bus_pos, dtype=np.int32)[controlled]
+                )
+
+        shunt_topology = topology.devices.get("shunt")
+        if shunt.size and shunt_topology is not None:
+            controls = shunt[:, SHUNT_COLS["control_type"]].astype(np.int32, copy=False)
+            alive = np.asarray(shunt_topology.alive_mask, dtype=bool)
+            controlled = alive & (controls == SHUNT_V)
+            if np.any(controlled):
+                controlled_bus_parts.append(
+                    np.asarray(shunt_topology.bus_pos, dtype=np.int32)[controlled]
+                )
+
+        for key in ("_external_angle_reference_node_ids", "_external_voltage_control_node_ids"):
+            node_ids = np.asarray(self.ppc.get(key, ()), dtype=np.int64)
+            if not node_ids.size:
+                continue
+            node_rows = self._ppc_node_rows(node_ids)
+            valid = (node_rows >= 0) & (node_rows < topology.node_to_bus_pos.size)
+            if np.any(valid):
+                controlled_bus_parts.append(
+                    topology.node_to_bus_pos[node_rows[valid]].astype(np.int32, copy=False)
+                )
+
+        controlled_bus_positions = (
+            np.concatenate(controlled_bus_parts).astype(np.int32, copy=False)
+            if controlled_bus_parts
+            else np.asarray([], dtype=np.int32)
+        )
+        groups = build_lf_control_bus_groups(topology, controlled_bus_positions)
+        self._lf_control_bus_groups = groups
+
+        active_topology_bus = np.flatnonzero(topology.bus_alive_mask).astype(np.int32, copy=False)
+        active_group = np.unique(groups.bus_to_group_pos[active_topology_bus]).astype(np.int32, copy=False)
+        group_to_solver = np.full(groups.group_ids.size, -1, dtype=np.int32)
+        group_to_solver[active_group] = np.arange(active_group.size, dtype=np.int32)
+        self._topology_bus_to_solver_pos = group_to_solver[groups.bus_to_group_pos]
+
+        node_bus_pos = np.asarray(topology.node_to_bus_pos, dtype=np.int32)
+        self.row_to_pos = np.full(bus.shape[0], -1, dtype=np.int32)
+        valid_node = (
+            np.asarray(topology.node_alive_mask, dtype=bool)
+            & (node_bus_pos >= 0)
+            & (node_bus_pos < self._topology_bus_to_solver_pos.size)
+        )
+        self.row_to_pos[valid_node] = self._topology_bus_to_solver_pos[node_bus_pos[valid_node]]
+        self.active_node_rows = np.flatnonzero(self.row_to_pos >= 0).astype(np.int32, copy=False)
+        self.active_node_solver_pos = self.row_to_pos[self.active_node_rows]
+        self.N = int(active_group.size)
+
+        order = np.lexsort(
+            (
+                bus[self.active_node_rows, BUS_COLS["idx"]],
+                self.active_node_solver_pos,
+            )
+        )
+        sorted_rows = self.active_node_rows[order]
+        sorted_solver = self.active_node_solver_pos[order]
+        first = np.concatenate((np.asarray([True]), sorted_solver[1:] != sorted_solver[:-1]))
+        self.active_bus_rows = sorted_rows[first].astype(np.int32, copy=False)
+
+        count = np.bincount(self.active_node_solver_pos, minlength=self.N)
+        voltage_sum = np.bincount(
+            self.active_node_solver_pos,
+            weights=bus[self.active_node_rows, BUS_COLS["voltage"]],
+            minlength=self.N,
+        )
+        angle_sum = np.bincount(
+            self.active_node_solver_pos,
+            weights=bus[self.active_node_rows, BUS_COLS["angle"]],
+            minlength=self.N,
+        )
+        self._solver_initial_voltage = voltage_sum / count
+        self._solver_initial_angle = angle_sum / count
+
+        vbase = bus[self.active_node_rows, BUS_COLS["vbase"]]
+        vbase_min = np.full(self.N, np.inf, dtype=np.float64)
+        vbase_max = np.full(self.N, -np.inf, dtype=np.float64)
+        np.minimum.at(vbase_min, self.active_node_solver_pos, vbase)
+        np.maximum.at(vbase_max, self.active_node_solver_pos, vbase)
+        bad_vbase = np.flatnonzero(np.abs(vbase_max - vbase_min) > 1e-9)
+        if bad_vbase.size:
+            pos = int(bad_vbase[0])
+            raise ValueError(
+                "零阻抗等值母线包含不一致的 AC 电压基值: "
+                f"solver_bus={pos}, min={vbase_min[pos]}, max={vbase_max[pos]}"
+            )
 
     def _prepare_ppc_devices(self, branch, transformer, gen, load, shunt, zero_branch, switch, active_bus):
         """Convert live ppc device rows into compact node positions and specification arrays."""
         v_set_sum = np.zeros(self.N, dtype=np.float64)
         v_set_count = np.zeros(self.N, dtype=np.int32)
+        theta_set_sum = np.zeros(self.N, dtype=np.float64)
+        theta_set_count = np.zeros(self.N, dtype=np.int32)
         if gen.size:
             gen_rows = self._ppc_node_rows(gen[:, GEN_COLS["node"]])
             gen_live = (gen[:, GEN_COLS["run_stat"]] == 1) & active_bus[gen_rows]
@@ -991,19 +1091,26 @@ class ACPowerFlowCalc:
             if np.any(slack_mask):
                 slack_pos = self.ppc_gen_pos[slack_mask]
                 self.node_type[slack_pos] = AC_NODE_TYPE_SLACK
-                self.theta_spec[slack_pos] = self.ppc["bus"][self.active_bus_rows[slack_pos], BUS_COLS["angle"]]
                 self.slack_node = int(slack_pos[-1])
                 np.add.at(v_set_sum, slack_pos, live_gen[slack_mask, GEN_COLS["v_set"]])
                 np.add.at(v_set_count, slack_pos, 1)
+                slack_gen_rows = gen_rows[self.ppc_gen_rows[slack_mask]]
+                np.add.at(
+                    theta_set_sum,
+                    slack_pos,
+                    self.ppc["bus"][slack_gen_rows, BUS_COLS["angle"]],
+                )
+                np.add.at(theta_set_count, slack_pos, 1)
 
-            pv_mask = (controls == CTRL_PV) & (self.node_type[self.ppc_gen_pos] != AC_NODE_TYPE_SLACK)
-            if np.any(pv_mask):
-                pv_pos = self.ppc_gen_pos[pv_mask]
-                pv_v = live_gen[pv_mask, GEN_COLS["v_set"]]
-                self.node_type[pv_pos] = AC_NODE_TYPE_PV
-                np.add.at(self.P_spec, pv_pos, live_gen[pv_mask, GEN_COLS["p_set"]])
-                np.add.at(v_set_sum, pv_pos, pv_v)
+            pv_control_mask = controls == CTRL_PV
+            if np.any(pv_control_mask):
+                pv_pos = self.ppc_gen_pos[pv_control_mask]
+                np.add.at(self.P_spec, pv_pos, live_gen[pv_control_mask, GEN_COLS["p_set"]])
+                np.add.at(v_set_sum, pv_pos, live_gen[pv_control_mask, GEN_COLS["v_set"]])
                 np.add.at(v_set_count, pv_pos, 1)
+                pv_node_mask = self.node_type[pv_pos] != AC_NODE_TYPE_SLACK
+                if np.any(pv_node_mask):
+                    self.node_type[pv_pos[pv_node_mask]] = AC_NODE_TYPE_PV
 
             pq_mask = (controls == CTRL_PQ) | (controls == CTRL_P)
             if np.any(pq_mask):
@@ -1036,17 +1143,22 @@ class ACPowerFlowCalc:
             q_mask = controls == SHUNT_Q
             if np.any(q_mask):
                 np.add.at(self.Q_spec, self.ppc_shunt_pos[q_mask], live_shunt[q_mask, SHUNT_COLS["q_set"]])
-            v_mask = (controls == SHUNT_V) & (self.node_type[self.ppc_shunt_pos] != AC_NODE_TYPE_SLACK)
-            if np.any(v_mask):
-                v_pos = self.ppc_shunt_pos[v_mask]
-                v_set_values = live_shunt[v_mask, SHUNT_COLS["v_set"]]
-                self.node_type[v_pos] = AC_NODE_TYPE_PV
+            v_control_mask = controls == SHUNT_V
+            if np.any(v_control_mask):
+                v_pos = self.ppc_shunt_pos[v_control_mask]
+                v_set_values = live_shunt[v_control_mask, SHUNT_COLS["v_set"]]
                 np.add.at(v_set_sum, v_pos, v_set_values)
                 np.add.at(v_set_count, v_pos, 1)
+                pv_node_mask = self.node_type[v_pos] != AC_NODE_TYPE_SLACK
+                if np.any(pv_node_mask):
+                    self.node_type[v_pos[pv_node_mask]] = AC_NODE_TYPE_PV
 
         v_mask = v_set_count > 0
         if np.any(v_mask):
             self.V_spec[v_mask] = v_set_sum[v_mask] / v_set_count[v_mask]
+        theta_mask = theta_set_count > 0
+        if np.any(theta_mask):
+            self.theta_spec[theta_mask] = theta_set_sum[theta_mask] / theta_set_count[theta_mask]
 
         if load.size:
             load_rows = self._ppc_node_rows(load[:, LOAD_COLS["node"]])
@@ -1212,7 +1324,7 @@ class ACPowerFlowCalc:
             live = (zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] == 1) & active_bus[i_rows] & active_bus[j_rows]
             for row_idx in np.where(live)[0]:
                 a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
-                if not self._is_redundant_slack_zero_edge(a, b):
+                if a != b and not self._is_redundant_slack_zero_edge(a, b):
                     self.zero_edges.append((int(row_idx), 0, a, b))
         if breaker is not None and breaker.size:
             i_rows = self._ppc_node_rows(breaker[:, SWITCH_COLS["i_node"]])
@@ -1225,7 +1337,7 @@ class ACPowerFlowCalc:
             )
             for row_idx in np.where(live)[0]:
                 a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
-                if not self._is_redundant_slack_zero_edge(a, b):
+                if a != b and not self._is_redundant_slack_zero_edge(a, b):
                     self.zero_edges.append((int(row_idx), 2, a, b))
         if switch.size:
             i_rows = self._ppc_node_rows(switch[:, SWITCH_COLS["i_node"]])
@@ -1238,7 +1350,7 @@ class ACPowerFlowCalc:
             )
             for row_idx in np.where(live)[0]:
                 a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
-                if not self._is_redundant_slack_zero_edge(a, b):
+                if a != b and not self._is_redundant_slack_zero_edge(a, b):
                     self.zero_edges.append((int(row_idx), 1, a, b))
         self._prepare_zero_branch_components()
 
@@ -2931,8 +3043,8 @@ class ACPowerFlowCalc:
                 Q_gen = Q_gen + external_q
 
         bus = self.ppc["bus"].copy()
-        bus[self.active_bus_rows, BUS_COLS["voltage"]] = V
-        bus[self.active_bus_rows, BUS_COLS["angle"]] = theta
+        bus[self.active_node_rows, BUS_COLS["voltage"]] = V[self.active_node_solver_pos]
+        bus[self.active_node_rows, BUS_COLS["angle"]] = theta[self.active_node_solver_pos]
         for pos, node in enumerate(self.node_list):
             node.voltage = float(V[pos])
             node.angle = float(theta[pos])

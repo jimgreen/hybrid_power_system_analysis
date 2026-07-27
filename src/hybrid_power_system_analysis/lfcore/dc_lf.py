@@ -510,12 +510,16 @@ class DCPowerFlowCalc:
             else:
                 self._alive_node_lookup = np.array([], dtype=np.int32)
         else:
+            controlled_bus_positions = self._dc_voltage_control_bus_positions(topology)
+            groups = network_topology.build_lf_control_bus_groups(topology, controlled_bus_positions)
+            self._lf_control_bus_groups = groups
             active_bus_pos = np.flatnonzero(topology.bus_alive_mask).astype(np.int32)
+            active_group_pos = np.unique(groups.bus_to_group_pos[active_bus_pos]).astype(np.int32, copy=False)
+            group_to_solver_pos = np.full(groups.group_ids.size, -1, dtype=np.int32)
+            group_to_solver_pos[active_group_pos] = np.arange(active_group_pos.size, dtype=np.int32)
             self._active_bus_pos = active_bus_pos
-            self._bus_pos_to_solver_pos = np.full(topology.bus_alive_mask.size, -1, dtype=np.int32)
-            if active_bus_pos.size:
-                self._bus_pos_to_solver_pos[active_bus_pos] = np.arange(active_bus_pos.size, dtype=np.int32)
-            if active_bus_pos.size:
+            self._bus_pos_to_solver_pos = group_to_solver_pos[groups.bus_to_group_pos]
+            if active_group_pos.size:
                 node_bus_pos = topology.node_to_bus_pos.astype(np.int32, copy=False)
                 node_mask = topology.node_alive_mask & (node_bus_pos >= 0)
                 node_pos = np.flatnonzero(node_mask).astype(np.int32, copy=False)
@@ -524,7 +528,7 @@ class DCPowerFlowCalc:
                 node_pos = node_pos[valid]
                 alive_pos_values = alive_pos_values[valid].astype(np.int32, copy=False)
                 self.alive_node_ids = topology.node_ids[node_pos].astype(np.int32, copy=True)
-                self.N = int(active_bus_pos.size)
+                self.N = int(active_group_pos.size)
                 if self.alive_node_ids.size and np.all(self.alive_node_ids >= 0):
                     self._alive_node_lookup = np.full(int(self.alive_node_ids.max()) + 1, -1, dtype=np.int32)
                     self._alive_node_lookup[self.alive_node_ids.astype(np.intp)] = alive_pos_values
@@ -546,6 +550,51 @@ class DCPowerFlowCalc:
         # Direct ppc result/writeback paths use alive_node_dict and result arrays; constructing
         # SimpleNamespace node facades here is pure cold-start overhead for large ppc cases.
         self.alive_nodes = []
+
+    def _dc_voltage_control_bus_positions(self, topology):
+        """Return topology-bus positions of active DC voltage controls."""
+        controlled_parts = []
+        gen = np.asarray(self.ppc.get("gen", ()), dtype=np.float64)
+        gen_topology = topology.devices.get("gen")
+        if gen.size and gen_topology is not None:
+            controls = gen[:, DC_GEN_COLS["control_type"]].astype(np.int8, copy=False)
+            alive = np.asarray(gen_topology.alive_mask, dtype=bool)
+            mask = alive & (controls == DC_CTRL_V)
+            if np.any(mask):
+                controlled_parts.append(np.asarray(gen_topology.bus_pos, dtype=np.int32)[mask])
+
+        dcdc = np.asarray(self.ppc.get("dcdc", ()), dtype=np.float64)
+        dcdc_topology = topology.devices.get("dcdc")
+        if dcdc.size and dcdc_topology is not None:
+            alive = np.asarray(dcdc_topology.alive_mask, dtype=bool)
+            i_control = dcdc[:, DC_DCDC_COLS["i_control_type"]].astype(np.int8, copy=False)
+            j_control = dcdc[:, DC_DCDC_COLS["j_control_type"]].astype(np.int8, copy=False)
+            i_mask = alive & (i_control == DC_CTRL_V)
+            j_mask = alive & (j_control == DC_CTRL_V)
+            if np.any(i_mask):
+                controlled_parts.append(np.asarray(dcdc_topology.i_bus_pos, dtype=np.int32)[i_mask])
+            if np.any(j_mask):
+                controlled_parts.append(np.asarray(dcdc_topology.j_bus_pos, dtype=np.int32)[j_mask])
+
+        external_nodes = np.asarray(self.ppc.get("_external_voltage_reference_node_ids", ()), dtype=np.int64)
+        if external_nodes.size:
+            node_ids = np.asarray(topology.node_ids, dtype=np.int64)
+            node_pos_by_id = {int(node_id): pos for pos, node_id in enumerate(node_ids)}
+            external_pos = np.asarray(
+                [node_pos_by_id.get(int(node_id), -1) for node_id in external_nodes],
+                dtype=np.int32,
+            )
+            valid = external_pos >= 0
+            if np.any(valid):
+                controlled_parts.append(
+                    topology.node_to_bus_pos[external_pos[valid]].astype(np.int32, copy=False)
+                )
+
+        return (
+            np.concatenate(controlled_parts).astype(np.int32, copy=False)
+            if controlled_parts
+            else np.asarray([], dtype=np.int32)
+        )
 
     def prepare(self):
         """预处理并确保拓扑/PPC 就绪。

@@ -66,6 +66,23 @@ class GridTopologyArrays:
 
 
 @dataclass
+class LFControlBusGroups:
+    """Solver-bus groups for ideal ties that contain repeated voltage controls.
+
+    The regular topology has already contracted closed switches into ``bus_ids``.
+    Load flow only needs one further contraction when an ideal zero-impedance
+    component contains voltage-controlling devices on more than one topology bus.
+    Keeping all other zero branches explicit preserves their existing MNA current
+    variables and result semantics.
+    """
+
+    bus_to_group_pos: np.ndarray
+    group_ids: np.ndarray
+    group_bus_offsets: np.ndarray
+    group_bus_indices: np.ndarray
+
+
+@dataclass
 class TerminalDeviceTopologyInput:
     i_node_pos: np.ndarray
     j_node_pos: np.ndarray
@@ -104,6 +121,107 @@ def _empty_terminal_device(count: int = 0) -> TerminalDeviceTopologyArrays:
 def _empty_single_device(count: int = 0) -> SingleDeviceTopologyArrays:
     values = np.full(int(count), -1, dtype=np.int32)
     return SingleDeviceTopologyArrays(values.copy(), values.copy(), values.copy(), np.zeros(int(count), dtype=bool))
+
+
+def build_lf_control_bus_groups(
+    topology: GridTopologyArrays,
+    controlled_bus_positions,
+    device_keys=("zero_branch", "break"),
+) -> LFControlBusGroups:
+    """Group zero-tied topology buses only when voltage controls would duplicate.
+
+    ``GridTopologyArrays.node_to_bus_pos`` already represents closed-switch
+    contraction. This function consumes that result and inspects live ideal ties.
+    A zero-tie component is contracted for load flow when voltage-controlling
+    devices are attached to at least two distinct topology buses in the component.
+    Multiple devices already on one topology bus need no additional contraction.
+    """
+
+    bus_ids = np.asarray(topology.bus_ids, dtype=np.int32)
+    n_bus = int(bus_ids.size)
+    if n_bus == 0:
+        return LFControlBusGroups(
+            bus_to_group_pos=np.asarray([], dtype=np.int32),
+            group_ids=np.asarray([], dtype=np.int32),
+            group_bus_offsets=np.asarray([0], dtype=np.int32),
+            group_bus_indices=np.asarray([], dtype=np.int32),
+        )
+
+    left_parts = []
+    right_parts = []
+    for key in device_keys:
+        device = topology.devices.get(key)
+        if device is None:
+            continue
+        i_bus = np.asarray(device.i_bus_pos, dtype=np.int32)
+        j_bus = np.asarray(device.j_bus_pos, dtype=np.int32)
+        alive = np.asarray(device.alive_mask, dtype=bool)
+        valid = (
+            alive
+            & (i_bus >= 0)
+            & (j_bus >= 0)
+            & (i_bus < n_bus)
+            & (j_bus < n_bus)
+            & (i_bus != j_bus)
+        )
+        if np.any(valid):
+            left_parts.append(i_bus[valid])
+            right_parts.append(j_bus[valid])
+
+    if not left_parts:
+        identity = np.arange(n_bus, dtype=np.int32)
+        return LFControlBusGroups(
+            bus_to_group_pos=identity,
+            group_ids=bus_ids.copy(),
+            group_bus_offsets=np.arange(n_bus + 1, dtype=np.int32),
+            group_bus_indices=identity.copy(),
+        )
+
+    left = np.concatenate(left_parts).astype(np.int32, copy=False)
+    right = np.concatenate(right_parts).astype(np.int32, copy=False)
+    graph_rows = np.concatenate((left, right))
+    graph_cols = np.concatenate((right, left))
+    graph = coo_matrix(
+        (np.ones(graph_rows.size, dtype=np.int8), (graph_rows, graph_cols)),
+        shape=(n_bus, n_bus),
+    ).tocsr()
+    component_count, component_by_bus = connected_components(graph, directed=False, return_labels=True)
+    component_by_bus = np.asarray(component_by_bus, dtype=np.int32)
+
+    controlled = np.asarray(controlled_bus_positions, dtype=np.int32).reshape(-1)
+    controlled = np.unique(controlled[(controlled >= 0) & (controlled < n_bus)])
+    controls_per_component = np.zeros(int(component_count), dtype=np.int32)
+    if controlled.size:
+        np.add.at(controls_per_component, component_by_bus[controlled], 1)
+    collapse_component = controls_per_component >= 2
+
+    # Non-collapsed buses retain a unique key; selected components share one key.
+    group_key = np.arange(n_bus, dtype=np.int64) + int(component_count)
+    selected = collapse_component[component_by_bus]
+    group_key[selected] = component_by_bus[selected]
+    _keys, raw_group = np.unique(group_key, return_inverse=True)
+    raw_group = np.asarray(raw_group, dtype=np.int32)
+    raw_count = int(_keys.size)
+
+    first_bus_id = np.full(raw_count, np.iinfo(np.int32).max, dtype=np.int32)
+    np.minimum.at(first_bus_id, raw_group, bus_ids)
+    group_order = np.argsort(first_bus_id, kind="stable").astype(np.int32, copy=False)
+    raw_to_group = np.empty(raw_count, dtype=np.int32)
+    raw_to_group[group_order] = np.arange(raw_count, dtype=np.int32)
+    bus_to_group = raw_to_group[raw_group]
+
+    group_counts = np.bincount(bus_to_group, minlength=raw_count).astype(np.int32, copy=False)
+    group_bus_indices = np.argsort(bus_to_group, kind="stable").astype(np.int32, copy=False)
+    group_bus_offsets = np.empty(raw_count + 1, dtype=np.int32)
+    group_bus_offsets[0] = 0
+    group_bus_offsets[1:] = np.cumsum(group_counts, dtype=np.int32)
+    group_ids = first_bus_id[group_order]
+    return LFControlBusGroups(
+        bus_to_group_pos=bus_to_group.astype(np.int32, copy=False),
+        group_ids=group_ids.astype(np.int32, copy=False),
+        group_bus_offsets=group_bus_offsets,
+        group_bus_indices=group_bus_indices,
+    )
 
 
 def _three_terminal_device_arrays(

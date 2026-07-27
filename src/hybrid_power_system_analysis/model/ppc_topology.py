@@ -22,8 +22,17 @@ from model.ac_array_model import (
     build_ac_ppc_from_efile_rows,
     ensure_ac_ppc_gen_columns,
 )
-from model.dc_array_model import BUS_COLS as DC_BUS_COLS
-from model.dc_array_model import build_dc_ppc_from_e_file, build_dc_ppc_from_efile_rows
+from model.dc_array_model import (
+    BRANCH_COLS as DC_BRANCH_COLS,
+    BREAK_COLS as DC_BREAK_COLS,
+    BUS_COLS as DC_BUS_COLS,
+    DCDC_COLS as DC_DCDC_COLS,
+    GEN_COLS as DC_GEN_COLS,
+    SWITCH_COLS as DC_SWITCH_COLS,
+    ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    build_dc_ppc_from_e_file,
+    build_dc_ppc_from_efile_rows,
+)
 from model.hybrid_array_model import (
     DCAC_COLS,
     build_hybrid_ppc_only_from_efile_rows,
@@ -118,6 +127,75 @@ def _ac_topology_signature(ppc: Dict) -> bytes:
     return digest.digest()
 
 
+def _dc_topology_signature(ppc: Dict) -> bytes:
+    digest = hashlib.blake2b(digest_size=16)
+    _update_signature_table(
+        digest,
+        ppc,
+        "gen",
+        [
+            DC_GEN_COLS["idx"],
+            DC_GEN_COLS["node"],
+            DC_GEN_COLS["control_type"],
+            DC_GEN_COLS["run_stat"],
+        ],
+    )
+    _update_signature_table(digest, ppc, "bus", [DC_BUS_COLS["idx"], DC_BUS_COLS["run_stat"]])
+    _update_signature_table(
+        digest,
+        ppc,
+        "branch",
+        [DC_BRANCH_COLS["i_node"], DC_BRANCH_COLS["j_node"], DC_BRANCH_COLS["run_stat"]],
+    )
+    _update_signature_table(
+        digest,
+        ppc,
+        "zero_branch",
+        [
+            DC_ZERO_BRANCH_COLS["i_node"],
+            DC_ZERO_BRANCH_COLS["j_node"],
+            DC_ZERO_BRANCH_COLS["run_stat"],
+        ],
+    )
+    for key, columns in (
+        (
+            "switch",
+            [
+                DC_SWITCH_COLS["i_node"],
+                DC_SWITCH_COLS["j_node"],
+                DC_SWITCH_COLS["status"],
+                DC_SWITCH_COLS["run_stat"],
+            ],
+        ),
+        (
+            "break",
+            [
+                DC_BREAK_COLS["i_node"],
+                DC_BREAK_COLS["j_node"],
+                DC_BREAK_COLS["status"],
+                DC_BREAK_COLS["run_stat"],
+            ],
+        ),
+        (
+            "dcdc",
+            [
+                DC_DCDC_COLS["i_node"],
+                DC_DCDC_COLS["j_node"],
+                DC_DCDC_COLS["i_control_type"],
+                DC_DCDC_COLS["j_control_type"],
+                DC_DCDC_COLS["run_stat"],
+            ],
+        ),
+    ):
+        _update_signature_table(digest, ppc, key, columns)
+    external_refs = np.ascontiguousarray(
+        np.asarray(ppc.get("_external_voltage_reference_node_ids", ()), dtype=np.int64)
+    )
+    digest.update(np.asarray(external_refs.shape, dtype=np.int64).tobytes())
+    digest.update(external_refs.tobytes())
+    return digest.digest()
+
+
 def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
     """Attach AC PPC topology arrays when they are not already present."""
     ensure_ac_ppc_gen_columns(ppc)
@@ -131,10 +209,11 @@ def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
 
 def ensure_dc_ppc_topology(ppc: Dict) -> Dict:
     """Attach DC PPC topology arrays when they are not already present."""
-    topology = ppc.get("_topology_arrays")
-    if topology is None:
-        topology = network_topology.prepare_dc_topology_ppc(ppc)
-        ppc["_topology_arrays"] = topology
+    signature = _dc_topology_signature(ppc)
+    if ppc.get("_topology_arrays") is None or ppc.get("_dc_topology_signature") != signature:
+        ppc.pop("_topology_input", None)
+        ppc["_topology_arrays"] = network_topology.prepare_dc_topology_ppc(ppc)
+        ppc["_dc_topology_signature"] = signature
     return ppc
 
 

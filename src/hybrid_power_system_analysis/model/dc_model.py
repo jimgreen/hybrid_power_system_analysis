@@ -922,7 +922,7 @@ class DCPowerNetwork:
                     str_info += f" {vbase / 1000.0 :.2f}"
                 errors.append(str_info)
 
-            # 2. 电压控制源唯一性（松弛节点或定V发电机）
+            # 2. 电压控制源检查；同一岛允许存在多个定V节点或定V变流器。
             if len(isl.slack_nodes) > 1:
                 str_info = f"岛屿 {isl.idx} 存在多个定V节点:"
                 for node in isl.slack_nodes:
@@ -935,33 +935,23 @@ class DCPowerNetwork:
                     str_info += f" {dcdcs.name}"
                 warns.append(str_info)
 
-            if len(isl.slack_nodes) +  len(isl.v_dcdcs) == 0:
+            if len(isl.slack_nodes) + len(isl.v_dcdcs) == 0:
                 errors.append(f"岛屿 {isl.idx} , 内无电压控制源（定V节点或定V变流器）")
-
-            if len(isl.slack_nodes) > 1:
-                str_info = f"岛屿 {isl.idx} , 内有多个电压控制源（定V节点或定V变流器）:"
-                for node in isl.slack_nodes:
-                    str_info += f" node-{node.name}"
-                errors.append(str_info)
-
 
         # 检查松弛节点与定V发电机的一致性
         for node in self.nodes:
             if node.run_stat != 1:
                 continue
-            if len(node.v_gens)  + len(node.v_dcdcs) <= 1:
+            if len(node.v_gens) + len(node.v_dcdcs) <= 1:
                 continue
 
             if len(node.v_gens) + len(node.v_dcdcs) >= 2:
-                errors.append(
-                    f"松弛节点 {node.idx} 上的定V发电机与定V变流器数量之和超过1，请检查拓扑！")
+                warns.append(
+                    f"定V节点 {node.idx} 上存在多个定V设备，将按共享定压规则参与潮流计算")
 
-            node.v_set = 0.0
-            if len(node.v_gens) >= 1:
-                node.v_set = node.v_gens[0].v_set
-
-            if len(node.v_dcdcs) > 1:
-                node.v_set = node.v_dcdcs[0].v_set
+            v_set_values = [float(gen.v_set) for gen in node.v_gens]
+            v_set_values.extend(float(dcdc.v_set) for dcdc in node.v_dcdcs)
+            node.v_set = sum(v_set_values) / len(v_set_values)
 
             node.is_slack = True
 

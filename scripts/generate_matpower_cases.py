@@ -124,7 +124,14 @@ def build_matpower_projection_from_acppc(acppc: dict) -> Dict[str, object]:
     shunt referred through the tap magnitude.
     """
 
-    base_mva = float(acppc["base"][0])
+    base = acppc.get("base", 1.0)
+    if isinstance(base, dict):
+        base_mva = float(base.get("p_base", 1.0))
+    elif np.isscalar(base):
+        base_mva = float(base)
+    else:
+        base_arr = np.asarray(base, dtype=np.float64).reshape(-1)
+        base_mva = float(base_arr[0]) if base_arr.size else 1.0
     bus0 = np.asarray(acppc["bus"])
     branch0 = np.asarray(acppc["branch"])
     transformer0 = np.asarray(acppc["transformer"])
