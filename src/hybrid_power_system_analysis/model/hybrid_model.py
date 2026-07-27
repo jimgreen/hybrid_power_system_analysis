@@ -10,7 +10,13 @@ for path in (MODEL_DIR,):
 
 from ac_model import ACACConverter, ACAC_CONTROL_TYPES, ACPowerNetwork
 from dc_model import DCPowerNetwork
-from hybrid_array_model import DCAC_CONTROL_PARSE_CODE, build_hybrid_ppc_from_e_file
+from hybrid_array_model import (
+    DCAC_AC_CONTROL_PARSE_CODE,
+    DCAC_DC_CONTROL_PARSE_CODE,
+    dcac_control_pair_from_legacy,
+    dcac_legacy_control_label,
+    build_hybrid_ppc_from_e_file,
+)
 
 class DCACConverter:
     def __init__(
@@ -20,7 +26,8 @@ class DCACConverter:
         dc_node,
         r1,
         r2,
-        control_type,
+        ac_control_type,
+        dc_control_type,
         p_ac_set,
         q_ac_set,
         v_ac_set,
@@ -32,7 +39,8 @@ class DCACConverter:
         self.dc_node = dc_node
         self.r1 = r1
         self.r2 = r2
-        self.control_type = control_type
+        self.ac_control_type = str(ac_control_type or "NONE").upper()
+        self.dc_control_type = str(dc_control_type or "NONE").upper()
         self.p_ac_set = p_ac_set
         self.q_ac_set = q_ac_set
         self.v_ac_set = v_ac_set
@@ -45,6 +53,16 @@ class DCACConverter:
         self.ac_i = None
         self.ac_node_obj = None
         self.dc_node_obj = None
+
+    @property
+    def control_type(self):
+        return dcac_legacy_control_label(self.ac_control_type, self.dc_control_type)
+
+    @control_type.setter
+    def control_type(self, value):
+        ac_control_type, dc_control_type = dcac_control_pair_from_legacy(value)
+        self.ac_control_type = ac_control_type
+        self.dc_control_type = dc_control_type
 
 class HybridIsland:
     def __init__(self, idx: int):
@@ -414,8 +432,19 @@ class HybridPowerNetwork:
                 errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 DC 节点 {conv.dc_node} 不存在")
             if conv.ac_node not in self.ac.node_dict or conv.dc_node not in self.dc.node_dict:
                 continue
-            if str(conv.control_type).upper() not in DCAC_CONTROL_PARSE_CODE:
-                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制模式 {conv.control_type} 不支持")
+            ac_ctrl = str(getattr(conv, "ac_control_type", "NONE")).upper()
+            dc_ctrl = str(getattr(conv, "dc_control_type", "NONE")).upper()
+            if ac_ctrl not in DCAC_AC_CONTROL_PARSE_CODE:
+                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} AC 控制模式 {ac_ctrl} 不支持")
+            if dc_ctrl not in DCAC_DC_CONTROL_PARSE_CODE:
+                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} DC 控制模式 {dc_ctrl} 不支持")
+            try:
+                dcac_legacy_control_label(ac_ctrl, dc_ctrl)
+            except ValueError:
+                errors.append(
+                    f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制组合 "
+                    f"({ac_ctrl}, {dc_ctrl}) 当前程序不支持"
+                )
         return errors
 
     def _check_acac_topo(self) -> List[str]:

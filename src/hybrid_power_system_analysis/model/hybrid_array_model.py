@@ -30,13 +30,57 @@ from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
 DCAC_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2}
-# DCAC 的正式控制码只保留 DCV/ACV/ACP；PH/PQ 是旧 E 文件里的输入别名。
-DCAC_CONTROL_PARSE_CODE = {
-    **DCAC_CONTROL_CODE,
-    "PH": DCAC_CONTROL_CODE["ACV"],
-    "PQ": DCAC_CONTROL_CODE["ACP"],
-}
 DCAC_CONTROL_LABEL = {value: key for key, value in DCAC_CONTROL_CODE.items()}
+DCAC_AC_CONTROL_CODE = {"NONE": 0, "PQ": 1, "PV": 2, "PH": 3}
+DCAC_DC_CONTROL_CODE = {"NONE": 0, "P": 1, "V": 2, "I": 3}
+DCAC_AC_CONTROL_LABEL = {value: key for key, value in DCAC_AC_CONTROL_CODE.items()}
+DCAC_DC_CONTROL_LABEL = {value: key for key, value in DCAC_DC_CONTROL_CODE.items()}
+DCAC_AC_CONTROL_PARSE_CODE = {
+    **DCAC_AC_CONTROL_CODE,
+    "UNSPEC": DCAC_AC_CONTROL_CODE["NONE"],
+    "UNDEFINED": DCAC_AC_CONTROL_CODE["NONE"],
+    "NA": DCAC_AC_CONTROL_CODE["NONE"],
+    "不定": DCAC_AC_CONTROL_CODE["NONE"],
+}
+DCAC_DC_CONTROL_PARSE_CODE = {
+    **DCAC_DC_CONTROL_CODE,
+    "UNSPEC": DCAC_DC_CONTROL_CODE["NONE"],
+    "UNDEFINED": DCAC_DC_CONTROL_CODE["NONE"],
+    "NA": DCAC_DC_CONTROL_CODE["NONE"],
+    "不定": DCAC_DC_CONTROL_CODE["NONE"],
+}
+DCAC_LEGACY_TO_PAIR = {
+    "DCV": ("PQ", "V"),
+    "ACV": ("PH", "NONE"),
+    "ACP": ("PQ", "NONE"),
+    "PH": ("PH", "NONE"),
+    "PQ": ("PQ", "NONE"),
+}
+DCAC_PAIR_TO_LEGACY = {
+    ("PQ", "V"): "DCV",
+    ("PH", "NONE"): "ACV",
+    ("PQ", "NONE"): "ACP",
+}
+
+
+def dcac_control_pair_from_legacy(control_type) -> Tuple[str, str]:
+    label = str(control_type or "ACP").upper()
+    if label not in DCAC_LEGACY_TO_PAIR:
+        raise ValueError(f"未知 DCACConverter 控制模式: {control_type}")
+    return DCAC_LEGACY_TO_PAIR[label]
+
+
+def dcac_legacy_control_label(ac_control_type, dc_control_type) -> str:
+    ac_label = str(ac_control_type or "NONE").upper()
+    dc_label = str(dc_control_type or "NONE").upper()
+    legacy = DCAC_PAIR_TO_LEGACY.get((ac_label, dc_label))
+    if legacy is None:
+        raise ValueError(f"不支持的 DCACConverter 控制组合: ({ac_label}, {dc_label})")
+    return legacy
+
+
+def dcac_combined_control_code(ac_control_type, dc_control_type) -> int:
+    return DCAC_CONTROL_CODE[dcac_legacy_control_label(ac_control_type, dc_control_type)]
 
 DCAC_COLS = {
     "idx": 0,
@@ -44,17 +88,18 @@ DCAC_COLS = {
     "dc_node": 2,
     "r1": 3,
     "r2": 4,
-    "control_type": 5,
-    "p_ac_set": 6,
-    "q_ac_set": 7,
-    "v_ac_set": 8,
-    "v_dc_set": 9,
-    "run_stat": 10,
-    "dc_p": 11,
-    "ac_p": 12,
-    "ac_q": 13,
-    "dc_i": 14,
-    "ac_i": 15,
+    "ac_control_type": 5,
+    "dc_control_type": 6,
+    "p_ac_set": 7,
+    "q_ac_set": 8,
+    "v_ac_set": 9,
+    "v_dc_set": 10,
+    "run_stat": 11,
+    "dc_p": 12,
+    "ac_p": 13,
+    "ac_q": 14,
+    "dc_i": 15,
+    "ac_i": 16,
 }
 def _attr(obj, attr: str, default=""):
     value = getattr(obj, attr, default)
@@ -252,10 +297,12 @@ def _build_dcac(model) -> Tuple[np.ndarray, np.ndarray]:
         out[pos, DCAC_COLS["dc_node"]] = _int_attr(conv, "dc_node")
         out[pos, DCAC_COLS["r1"]] = _float_attr(conv, "r1")
         out[pos, DCAC_COLS["r2"]] = _float_attr(conv, "r2")
-        out[pos, DCAC_COLS["control_type"]] = DCAC_CONTROL_PARSE_CODE.get(
-            str(_attr(conv, "control_type", "DCV")).upper(),
-            0,
-        )
+        ac_ctrl = _attr(conv, "ac_control_type", "")
+        dc_ctrl = _attr(conv, "dc_control_type", "")
+        if not ac_ctrl and not dc_ctrl:
+            ac_ctrl, dc_ctrl = dcac_control_pair_from_legacy(_attr(conv, "control_type", "ACP"))
+        out[pos, DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_PARSE_CODE.get(str(ac_ctrl or "NONE").upper(), 0)
+        out[pos, DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_PARSE_CODE.get(str(dc_ctrl or "NONE").upper(), 0)
         out[pos, DCAC_COLS["p_ac_set"]] = _float_attr(conv, "p_ac_set")
         out[pos, DCAC_COLS["q_ac_set"]] = _float_attr(conv, "q_ac_set")
         out[pos, DCAC_COLS["v_ac_set"]] = _float_attr(conv, "v_ac_set")
@@ -294,8 +341,12 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         dc_node = _int_attr(conv, "dc_node")
         r1 = _float_attr(conv, "r1")
         r2 = _float_attr(conv, "r2")
-        control_type = str(_attr(conv, "control_type", "DCV")).upper()
-        control_code = DCAC_CONTROL_PARSE_CODE.get(control_type, 0)
+        ac_control_type = str(_attr(conv, "ac_control_type", "")).upper()
+        dc_control_type = str(_attr(conv, "dc_control_type", "")).upper()
+        if not ac_control_type and not dc_control_type:
+            ac_control_type, dc_control_type = dcac_control_pair_from_legacy(_attr(conv, "control_type", "ACP"))
+        ac_control_code = DCAC_AC_CONTROL_PARSE_CODE.get(ac_control_type or "NONE", 0)
+        dc_control_code = DCAC_DC_CONTROL_PARSE_CODE.get(dc_control_type or "NONE", 0)
         p_ac_set = _float_attr(conv, "p_ac_set")
         q_ac_set = _float_attr(conv, "q_ac_set")
         v_ac_set = _float_attr(conv, "v_ac_set")
@@ -311,7 +362,8 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         out[pos, DCAC_COLS["dc_node"]] = dc_node
         out[pos, DCAC_COLS["r1"]] = r1
         out[pos, DCAC_COLS["r2"]] = r2
-        out[pos, DCAC_COLS["control_type"]] = control_code
+        out[pos, DCAC_COLS["ac_control_type"]] = ac_control_code
+        out[pos, DCAC_COLS["dc_control_type"]] = dc_control_code
         out[pos, DCAC_COLS["p_ac_set"]] = p_ac_set
         out[pos, DCAC_COLS["q_ac_set"]] = q_ac_set
         out[pos, DCAC_COLS["v_ac_set"]] = v_ac_set
@@ -328,7 +380,8 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
             dc_node,
             r1,
             r2,
-            DCAC_CONTROL_LABEL.get(control_code, "DCV"),
+            DCAC_AC_CONTROL_LABEL.get(ac_control_code, "NONE"),
+            DCAC_DC_CONTROL_LABEL.get(dc_control_code, "NONE"),
             p_ac_set,
             q_ac_set,
             v_ac_set,
@@ -367,7 +420,31 @@ def _build_dcac_from_rows(
     out[:, DCAC_COLS["dc_node"]] = _int_column(table_rows, columns, "dc_node")
     out[:, DCAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
     out[:, DCAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-    out[:, DCAC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", DCAC_CONTROL_PARSE_CODE, "DCV")
+    if "ac_control_type" in columns or "dc_control_type" in columns:
+        out[:, DCAC_COLS["ac_control_type"]] = _code_column(
+            table_rows,
+            columns,
+            "ac_control_type",
+            DCAC_AC_CONTROL_PARSE_CODE,
+            "NONE",
+        )
+        out[:, DCAC_COLS["dc_control_type"]] = _code_column(
+            table_rows,
+            columns,
+            "dc_control_type",
+            DCAC_DC_CONTROL_PARSE_CODE,
+            "NONE",
+        )
+    else:
+        legacy_pairs = [dcac_control_pair_from_legacy(_cell(row, columns.get("control_type"), "ACP")) for row in table_rows]
+        out[:, DCAC_COLS["ac_control_type"]] = np.asarray(
+            [DCAC_AC_CONTROL_PARSE_CODE[ac_ctrl] for ac_ctrl, _dc_ctrl in legacy_pairs],
+            dtype=np.float64,
+        )
+        out[:, DCAC_COLS["dc_control_type"]] = np.asarray(
+            [DCAC_DC_CONTROL_PARSE_CODE[dc_ctrl] for _ac_ctrl, dc_ctrl in legacy_pairs],
+            dtype=np.float64,
+        )
     out[:, DCAC_COLS["p_ac_set"]] = _power_column(table_rows, columns, "p_ac_set", p_base)
     out[:, DCAC_COLS["q_ac_set"]] = _power_column(table_rows, columns, "q_ac_set", p_base)
     out[:, DCAC_COLS["v_ac_set"]] = _voltage_set_column(
@@ -386,13 +463,14 @@ def _build_dcac_from_rows(
         dc_raw_vbase,
         default=0.0,
     )
-    ctrl = out[:, DCAC_COLS["control_type"]].astype(np.int64, copy=False)
-    ac_voltage_ctrl = ctrl == DCAC_CONTROL_CODE["ACV"]
+    ac_ctrl = out[:, DCAC_COLS["ac_control_type"]].astype(np.int64, copy=False)
+    dc_ctrl = out[:, DCAC_COLS["dc_control_type"]].astype(np.int64, copy=False)
+    ac_voltage_ctrl = ac_ctrl == DCAC_AC_CONTROL_CODE["PH"]
     if np.any(ac_voltage_ctrl):
         fallback = _ppc_bus_value_by_node(ac_ppc, out[:, DCAC_COLS["ac_node"]], 2, default=1.0)
         missing = ac_voltage_ctrl & (np.abs(out[:, DCAC_COLS["v_ac_set"]]) <= 1e-12)
         out[missing, DCAC_COLS["v_ac_set"]] = fallback[missing]
-    dc_voltage_ctrl = ctrl == DCAC_CONTROL_CODE["DCV"]
+    dc_voltage_ctrl = dc_ctrl == DCAC_DC_CONTROL_CODE["V"]
     if np.any(dc_voltage_ctrl):
         fallback = _ppc_bus_value_by_node(dc_ppc, out[:, DCAC_COLS["dc_node"]], 2, default=1.0)
         missing = dc_voltage_ctrl & (np.abs(out[:, DCAC_COLS["v_dc_set"]]) <= 1e-12)
@@ -415,14 +493,16 @@ def _build_dcac_from_rows(
     DCACConverter, _ACACConverter = _converter_classes()
     objects = []
     for pos, row in enumerate(out):
-        control_code = int(row[DCAC_COLS["control_type"]])
+        ac_control_code = int(row[DCAC_COLS["ac_control_type"]])
+        dc_control_code = int(row[DCAC_COLS["dc_control_type"]])
         obj = DCACConverter(
             int(row[DCAC_COLS["idx"]]),
             int(row[DCAC_COLS["ac_node"]]),
             int(row[DCAC_COLS["dc_node"]]),
             float(row[DCAC_COLS["r1"]]),
             float(row[DCAC_COLS["r2"]]),
-            DCAC_CONTROL_LABEL.get(control_code, "DCV"),
+            DCAC_AC_CONTROL_LABEL.get(ac_control_code, "NONE"),
+            DCAC_DC_CONTROL_LABEL.get(dc_control_code, "NONE"),
             float(row[DCAC_COLS["p_ac_set"]]),
             float(row[DCAC_COLS["q_ac_set"]]),
             float(row[DCAC_COLS["v_ac_set"]]),
@@ -558,7 +638,8 @@ def build_hybrid_model_from_ppc(ppc: Dict):
                 int(row[DCAC_COLS["dc_node"]]),
                 float(row[DCAC_COLS["r1"]]),
                 float(row[DCAC_COLS["r2"]]),
-                DCAC_CONTROL_LABEL.get(int(row[DCAC_COLS["control_type"]]), "DCV"),
+                DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
+                DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
                 float(row[DCAC_COLS["p_ac_set"]]),
                 float(row[DCAC_COLS["q_ac_set"]]),
                 float(row[DCAC_COLS["v_ac_set"]]),

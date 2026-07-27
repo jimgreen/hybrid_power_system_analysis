@@ -1721,37 +1721,37 @@
 </DCDCConverter>
 
 <DCACConverter>
-@ idx        name ac_node dc_node   r1   r2 control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat
-#   1 c01_inv_dcv       8      23 0.02 0.02          DCV        0        0        0 117.2556        1
-#   2 c01_inv_acv       9      25 0.02 0.02          ACV        0        0 0.823466        0        1
-#   3 c01_inv_acp      10      29 0.02 0.02          ACP      -10        0        0        0        1
-#   4 c02_inv_dcv      18      53 0.02 0.02          DCV        0        0        0 117.2556        1
-#   5 c02_inv_acv      19      55 0.02 0.02          ACV        0        0 0.823466        0        1
-#   6 c02_inv_acp      20      59 0.02 0.02          ACP      -10        0        0        0        1
-#   7 c03_inv_dcv      28      83 0.02 0.02          DCV        0        0        0 117.2556        1
-#   8 c03_inv_acv      29      85 0.02 0.02          ACV        0        0 0.823466        0        1
-#   9 c03_inv_acp      30      89 0.02 0.02          ACP      -10        0        0        0        1
-#  10 c04_inv_dcv      38     113 0.02 0.02          DCV        0        0        0 117.2556        1
-#  11 c04_inv_acv      39     115 0.02 0.02          ACV        0        0 0.823466        0        1
-#  12 c04_inv_acp      40     119 0.02 0.02          ACP      -10        0        0        0        1
-#  13 c05_inv_dcv      48     143 0.02 0.02          DCV        0        0        0 117.2556        1
-#  14 c05_inv_acv      49     145 0.02 0.02          ACV        0        0 0.823466        0        1
-#  15 c05_inv_acp      50     149 0.02 0.02          ACP      -10        0        0        0        1
-#  16 c06_inv_dcv      58     173 0.02 0.02          DCV        0        0        0 117.2556        1
-#  17 c06_inv_acv      59     175 0.02 0.02          ACV        0        0 0.823466        0        1
-#  18 c06_inv_acp      60     179 0.02 0.02          ACP      -10        0        0        0        1
-#  19 c07_inv_dcv      68     203 0.02 0.02          DCV        0        0        0 117.2556        1
-#  20 c07_inv_acv      69     205 0.02 0.02          ACV        0        0 0.823466        0        1
-#  21 c07_inv_acp      70     209 0.02 0.02          ACP      -10        0        0        0        1
-#  22 c08_inv_dcv      78     233 0.02 0.02          DCV        0        0        0 117.2556        1
-#  23 c08_inv_acv      79     235 0.02 0.02          ACV        0        0 0.823466        0        1
-#  24 c08_inv_acp      80     239 0.02 0.02          ACP      -10        0        0        0        1
-#  25 c09_inv_dcv      88     263 0.02 0.02          DCV        0        0        0 117.2556        1
-#  26 c09_inv_acv      89     265 0.02 0.02          ACV        0        0 0.823466        0        1
-#  27 c09_inv_acp      90     269 0.02 0.02          ACP      -10        0        0        0        1
-#  28 c10_inv_dcv      98     293 0.02 0.02          DCV        0        0        0 117.2556        1
-#  29 c10_inv_acv      99     295 0.02 0.02          ACV        0        0 0.823466        0        1
-#  30 c10_inv_acp     100     299 0.02 0.02          ACP      -10        0        0        0        1
+@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat
+# 1 c01_inv_dcv 8 23 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 2 c01_inv_acv 9 25 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 3 c01_inv_acp 10 29 0.02 0.02 PQ NONE -10 0 0 0 1
+# 4 c02_inv_dcv 18 53 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 5 c02_inv_acv 19 55 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 6 c02_inv_acp 20 59 0.02 0.02 PQ NONE -10 0 0 0 1
+# 7 c03_inv_dcv 28 83 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 8 c03_inv_acv 29 85 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 9 c03_inv_acp 30 89 0.02 0.02 PQ NONE -10 0 0 0 1
+# 10 c04_inv_dcv 38 113 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 11 c04_inv_acv 39 115 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 12 c04_inv_acp 40 119 0.02 0.02 PQ NONE -10 0 0 0 1
+# 13 c05_inv_dcv 48 143 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 14 c05_inv_acv 49 145 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 15 c05_inv_acp 50 149 0.02 0.02 PQ NONE -10 0 0 0 1
+# 16 c06_inv_dcv 58 173 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 17 c06_inv_acv 59 175 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 18 c06_inv_acp 60 179 0.02 0.02 PQ NONE -10 0 0 0 1
+# 19 c07_inv_dcv 68 203 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 20 c07_inv_acv 69 205 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 21 c07_inv_acp 70 209 0.02 0.02 PQ NONE -10 0 0 0 1
+# 22 c08_inv_dcv 78 233 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 23 c08_inv_acv 79 235 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 24 c08_inv_acp 80 239 0.02 0.02 PQ NONE -10 0 0 0 1
+# 25 c09_inv_dcv 88 263 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 26 c09_inv_acv 89 265 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 27 c09_inv_acp 90 269 0.02 0.02 PQ NONE -10 0 0 0 1
+# 28 c10_inv_dcv 98 293 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 29 c10_inv_acv 99 295 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 30 c10_inv_acp 100 299 0.02 0.02 PQ NONE -10 0 0 0 1
 </DCACConverter>
 
 <ACACConverter>

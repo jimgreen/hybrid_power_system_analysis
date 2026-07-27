@@ -26,7 +26,10 @@ from model.ac_array_model import (
 )
 from model.hybrid_array_model import (
     DCAC_COLS,
+    DCAC_AC_CONTROL_LABEL,
+    DCAC_DC_CONTROL_LABEL,
     DCAC_CONTROL_LABEL,
+    dcac_combined_control_code,
 )
 from model.dc_array_model import (
     CTRL_V as DC_CTRL_V,
@@ -258,7 +261,15 @@ def _build_se_dcac_converters(ppc: Dict) -> List[SimpleNamespace]:
                 dc_node=int(row[DCAC_COLS["dc_node"]]),
                 r1=float(row[DCAC_COLS["r1"]]),
                 r2=float(row[DCAC_COLS["r2"]]),
-                control_type=DCAC_CONTROL_LABEL.get(int(row[DCAC_COLS["control_type"]]), "DCV"),
+                ac_control_type=DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
+                dc_control_type=DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
+                control_type=DCAC_CONTROL_LABEL.get(
+                    dcac_combined_control_code(
+                        DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
+                        DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
+                    ),
+                    "ACP",
+                ),
                 p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
                 q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
                 v_ac_set=float(row[DCAC_COLS["v_ac_set"]]),

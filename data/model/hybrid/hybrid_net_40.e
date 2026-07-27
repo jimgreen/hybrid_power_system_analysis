@@ -236,10 +236,10 @@
 </DCDCConverter>
 
 <DCACConverter>
-@ idx name ac_node dc_node r1 r2 control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat
-#   1 inv_dcv       8      23 0.02 0.02          DCV        0        0        0 117.2556        1
-#   2 inv_acv       9      25 0.02 0.02          ACV        0        0 0.823466        0        1
-#   3 inv_acp      10      29 0.02 0.02          ACP      -10        0        0        0        1
+@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat
+# 1 inv_dcv 8 23 0.02 0.02 PQ V 0 0 0 117.2556 1
+# 2 inv_acv 9 25 0.02 0.02 PH NONE 0 0 0.823466 0 1
+# 3 inv_acp 10 29 0.02 0.02 PQ NONE -10 0 0 0 1
 </DCACConverter>
 
 <ACACConverter>

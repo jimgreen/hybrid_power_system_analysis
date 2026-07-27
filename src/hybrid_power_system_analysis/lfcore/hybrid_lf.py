@@ -89,8 +89,12 @@ from dc_array_model import (
 from efile_read import _read_efile_rows
 from hybrid_array_model import (
     DCAC_COLS,
+    DCAC_AC_CONTROL_LABEL,
+    DCAC_AC_CONTROL_PARSE_CODE,
+    DCAC_DC_CONTROL_LABEL,
+    DCAC_DC_CONTROL_PARSE_CODE,
     DCAC_CONTROL_LABEL,
-    DCAC_CONTROL_PARSE_CODE,
+    dcac_combined_control_code,
 )
 from model.ppc_topology import (
     build_ac_ppc_with_topology_from_e_file,
@@ -253,6 +257,8 @@ def _ppc_device(static_row, row, name, cols, node_by_idx, *, alive=None):
         "status",
         "run_stat",
         "control_type",
+        "ac_control_type",
+        "dc_control_type",
         "i_control_type",
         "j_control_type",
     }
@@ -335,11 +341,20 @@ class _PpcConverterList:
                 values[attr] = int(raw)
             elif kind == "control":
                 values[attr] = self.label_map.get(int(raw), "")
+            elif kind == "ac_control":
+                values[attr] = DCAC_AC_CONTROL_LABEL.get(int(raw), "")
+            elif kind == "dc_control":
+                values[attr] = DCAC_DC_CONTROL_LABEL.get(int(raw), "")
             elif kind == "none":
                 values[attr] = None
             else:
                 values[attr] = float(raw)
         values["is_alive"] = int(row[self.cols["run_stat"]]) == 1
+        if "ac_control_type" in values and "dc_control_type" in values:
+            values["control_type"] = DCAC_CONTROL_LABEL.get(
+                dcac_combined_control_code(values["ac_control_type"], values["dc_control_type"]),
+                "",
+            )
         return _array_device(row[self.cols["idx"]], name, **values)
 
     def __iter__(self):
@@ -557,7 +572,8 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
                 ("dc_node", "dc_node", "int"),
                 ("r1", "r1", "float"),
                 ("r2", "r2", "float"),
-                ("control_type", "control_type", "control"),
+                ("ac_control_type", "ac_control_type", "ac_control"),
+                ("dc_control_type", "dc_control_type", "dc_control"),
                 ("p_ac_set", "p_ac_set", "float"),
                 ("q_ac_set", "q_ac_set", "float"),
                 ("v_ac_set", "v_ac_set", "float"),
@@ -988,10 +1004,13 @@ class HybridPowerFlowCalc:
                 current_type = ac_node_type_label(self.ac_calc.node_type[ac_pos])
                 raise ValueError(f"DCACConverter[{conv.idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}")
             dc_pos = self.dc_calc.alive_node_dict[conv.dc_node]
-            ctrl_text = str(conv.control_type).upper()
-            if ctrl_text not in DCAC_CONTROL_PARSE_CODE:
-                raise ValueError(f"未知 DCACConverter 控制模式: {conv.control_type}")
-            ctrl = DCAC_CONTROL_LABEL[int(DCAC_CONTROL_PARSE_CODE[ctrl_text])]
+            ac_ctrl = str(getattr(conv, "ac_control_type", "NONE")).upper()
+            dc_ctrl = str(getattr(conv, "dc_control_type", "NONE")).upper()
+            if ac_ctrl not in DCAC_AC_CONTROL_PARSE_CODE:
+                raise ValueError(f"未知 DCACConverter AC 控制模式: {ac_ctrl}")
+            if dc_ctrl not in DCAC_DC_CONTROL_PARSE_CODE:
+                raise ValueError(f"未知 DCACConverter DC 控制模式: {dc_ctrl}")
+            ctrl = DCAC_CONTROL_LABEL[dcac_combined_control_code(ac_ctrl, dc_ctrl)]
             conv.is_alive = True
             self.dcac_converters.append((conv, ac_pos, dc_pos, ctrl))
         self.N_dcac = len(self.dcac_converters)
@@ -1042,9 +1061,12 @@ class HybridPowerFlowCalc:
                 raise ValueError(
                     f"DCACConverter[{idx}] 的 AC 节点必须是 PQ 节点，当前为 {current_type}"
                 )
-            ctrl = int(row[DCAC_COLS["control_type"]])
-            if ctrl not in DCAC_CONTROL_LABEL:
-                raise ValueError(f"未知 DCACConverter 控制模式: {ctrl}")
+            ac_ctrl = int(row[DCAC_COLS["ac_control_type"]])
+            dc_ctrl = int(row[DCAC_COLS["dc_control_type"]])
+            ctrl = dcac_combined_control_code(
+                DCAC_AC_CONTROL_LABEL.get(ac_ctrl, "NONE"),
+                DCAC_DC_CONTROL_LABEL.get(dc_ctrl, "NONE"),
+            )
             rows.append(row_pos)
             ac_pos.append(ac_solver_pos)
             dc_pos.append(dc_solver_pos)

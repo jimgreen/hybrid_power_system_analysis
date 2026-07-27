@@ -26,7 +26,6 @@ from model.dc_array_model import BUS_COLS as DC_BUS_COLS
 from model.dc_array_model import build_dc_ppc_from_e_file, build_dc_ppc_from_efile_rows
 from model.hybrid_array_model import (
     DCAC_COLS,
-    DCAC_CONTROL_CODE,
     build_hybrid_ppc_only_from_efile_rows,
 )
 
@@ -158,9 +157,9 @@ def _attach_hybrid_dc_reference_nodes(ppc: Dict) -> None:
     dcac = ppc.get("dcac")
     if dc_ppc is None or dcac is None or getattr(dcac, "size", 0) == 0:
         return
-    ctrl = dcac[:, DCAC_COLS["control_type"]].astype(int, copy=False)
+    ctrl = dcac[:, DCAC_COLS["dc_control_type"]].astype(int, copy=False)
     run = dcac[:, DCAC_COLS["run_stat"]].astype(int, copy=False) == 1
-    dcv_mask = run & (ctrl == DCAC_CONTROL_CODE["DCV"])
+    dcv_mask = run & (ctrl == 2)
     if ac_ppc is not None and dcv_mask.any():
         ac_bus = ac_ppc.get("bus")
         if ac_bus is not None and getattr(ac_bus, "size", 0):
@@ -213,9 +212,9 @@ def _attach_hybrid_ac_reference_nodes(ppc: Dict) -> None:
     if ac_ppc is None or dc_ppc is None or dcac is None or getattr(dcac, "size", 0) == 0:
         return
     dcac = dcac
-    ctrl = dcac[:, DCAC_COLS["control_type"]].astype(int, copy=False)
+    ctrl = dcac[:, DCAC_COLS["ac_control_type"]].astype(int, copy=False)
     run = dcac[:, DCAC_COLS["run_stat"]].astype(int, copy=False) == 1
-    acv_mask = run & (ctrl == DCAC_CONTROL_CODE["ACV"])
+    acv_mask = run & (ctrl == 3)
     if not acv_mask.any():
         had_external_refs = "_external_angle_reference_node_ids" in ac_ppc or "_external_voltage_reference_pu" in ac_ppc
         ac_ppc.pop("_external_angle_reference_node_ids", None)
