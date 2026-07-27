@@ -369,6 +369,10 @@ class ACPowerFlowCalc:
     求解变量按 ``theta_unknown``、``V_unknown``、零阻抗支路辅助电位
     ``phi_re/phi_im`` 排列。节点 P/Q 平衡、PV/Slack 电压约束、零阻抗
     支路电压相等约束和 phi 参考约束共同组成 Newton 方程组。
+
+    这里的 LF 还承担母线控制语义：同一 AC 母线上多个定压设备时，
+    允许按平均 ``v_set`` 建立等效电压目标，并按既定能力系数分摊
+    有功/无功失衡。SE 侧暂不强制复用这套硬聚合规则。
     """
 
     def __init__(

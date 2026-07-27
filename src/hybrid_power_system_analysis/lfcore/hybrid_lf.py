@@ -704,6 +704,10 @@ class HybridPowerFlowCalc:
     AC、DC 子网和 DC/AC 换流器变量在同一个全局状态向量中求解。
     全局向量按 AC 子系统、DC 子系统、DCAC 变流器、ACAC 变流器顺序拼接；
     换流器方程通过修改 AC/DC 端口节点的功率平衡残差实现耦合。
+
+    Hybrid LF 继承 AC/DC 两侧的控制语义：同一 AC 或 DC 母线上若存在
+    多个定压设备，可在 LF 中做代表控制方程和功率分摊。Hybrid SE 目前
+    仍以子估计器显式状态为主，不强制复制这套硬聚合布局。
     """
 
     def __init__(
