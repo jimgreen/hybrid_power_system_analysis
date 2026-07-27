@@ -980,7 +980,7 @@ class HybridStateEstimationTest(unittest.TestCase):
                         "",
                         "<ACACConverter>",
                         "@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
-                        "# 1 acac_ref 1 2 0.01 0.01 Q Q 0 0 0 0 0 1",
+                        "# 1 acac_ref 1 2 0.01 0.01 PQ PQ 0 0 0 0 0 1",
                         "</ACACConverter>",
                         "",
                     ]
@@ -3936,6 +3936,28 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(0, len(se_result.pseudo_measurements))
         self.assertEqual(0, len(se_result.bad_data))
         self.assertEqual(0, len(se_result.normal_measurements))
+
+    def test_run_full_result_mode_builds_hybrid_seresult_from_measurement_table(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e",
+            meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+            flat_start=True,
+            auto_prepare=False,
+        )
+        se_result = estimator.run(
+            result_mode="full",
+            verbose=False,
+            skip_bad_data=True,
+            final_diagnostics=False,
+        )
+
+        self.assertTrue(se_result.statistics.converged)
+        self.assertEqual(
+            se_result.statistics.measurement_count,
+            len(se_result.pseudo_measurements) + len(se_result.normal_measurements),
+        )
 
     def test_run_array_result_mode_keeps_estimate_arrays_only(self):
         import secore.hybrid_se as hybrid_se_module

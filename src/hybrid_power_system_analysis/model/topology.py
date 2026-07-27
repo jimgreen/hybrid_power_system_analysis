@@ -1252,7 +1252,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from .dc_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
-            CTRL_SLACK,
+            CTRL_NONE,
             CTRL_V,
             DCDC_COLS,
             GEN_COLS,
@@ -1265,7 +1265,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from dc_array_model import (
             BREAK_COLS,
             BRANCH_COLS,
-            CTRL_SLACK,
+            CTRL_NONE,
             CTRL_V,
             DCDC_COLS,
             GEN_COLS,
@@ -1397,14 +1397,14 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             & valid_dcdc
             & valid_i_island
             & (i_control == CTRL_V)
-            & (j_control == CTRL_SLACK)
+            & (j_control == CTRL_NONE)
         )
         j_v_mask = (
             dcdc_run_mask
             & valid_dcdc
             & valid_j_island
             & (j_control == CTRL_V)
-            & (i_control == CTRL_SLACK)
+            & (i_control == CTRL_NONE)
         )
         linked_v_mask = i_v_mask | j_v_mask
         linked_i_alive = linked_v_mask & valid_i_island
@@ -2116,9 +2116,9 @@ def apply_dc_topology_arrays(
             i_node.isl_obj.dcdc_converters.append(conv)
         if not compact and j_node.isl_obj is not None:
             j_node.isl_obj.dcdc_converters.append(conv)
-        if getattr(conv, "i_control_type", "") in ("V", "CTRL_V"):
+        if getattr(conv, "i_control_type", "") == "V":
             v_node = i_node
-        elif getattr(conv, "j_control_type", "") in ("V", "CTRL_V"):
+        elif getattr(conv, "j_control_type", "") == "V":
             v_node = j_node
         else:
             v_node = None
@@ -2656,9 +2656,9 @@ def prepare_dc_topology(network) -> None:
             continue
         i_node.isl_obj.dcdc_converters.append(conv)
         j_node.isl_obj.dcdc_converters.append(conv)
-        if getattr(conv, "i_control_type", "") in ("V", "CTRL_V"):
+        if getattr(conv, "i_control_type", "") == "V":
             node = i_node
-        elif getattr(conv, "j_control_type", "") in ("V", "CTRL_V"):
+        elif getattr(conv, "j_control_type", "") == "V":
             node = j_node
         else:
             node = None

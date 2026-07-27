@@ -79,8 +79,8 @@ from model.dc_array_model import (
     BRANCH_COLS as DC_BRANCH_COLS,
     BUS_COLS as DC_BUS_COLS,
     CTRL_I as DC_CTRL_I,
+    CTRL_NONE as DC_CTRL_NONE,
     CTRL_P as DC_CTRL_P,
-    CTRL_SLACK as DC_CTRL_SLACK,
     CTRL_V as DC_CTRL_V,
     DCDC_COLS as DC_DCDC_COLS,
     GEN_COLS as DC_GEN_COLS,
@@ -843,9 +843,9 @@ class DCPowerFlowCalc:
             self.dcdc_r1 = self.dcdc_r2 = np.array([], dtype=np.float64)
         self.N_dcdc = self.dcdc_idx.size
         self.dcdc_ctrl = self.dcdc_i_ctrl_code
-        valid_dcdc_ctrl = np.asarray([DC_CTRL_P, DC_CTRL_V, DC_CTRL_I, DC_CTRL_SLACK], dtype=np.int8)
-        i_active_ctrl = self.dcdc_i_ctrl_code != DC_CTRL_SLACK
-        j_active_ctrl = self.dcdc_j_ctrl_code != DC_CTRL_SLACK
+        valid_dcdc_ctrl = np.asarray([DC_CTRL_P, DC_CTRL_V, DC_CTRL_I, DC_CTRL_NONE], dtype=np.int8)
+        i_active_ctrl = self.dcdc_i_ctrl_code != DC_CTRL_NONE
+        j_active_ctrl = self.dcdc_j_ctrl_code != DC_CTRL_NONE
         bad_ctrl = (
             ~np.isin(self.dcdc_i_ctrl_code, valid_dcdc_ctrl)
             | ~np.isin(self.dcdc_j_ctrl_code, valid_dcdc_ctrl)
@@ -854,7 +854,7 @@ class DCPowerFlowCalc:
         if np.any(bad_ctrl):
             bad_pos = int(np.flatnonzero(bad_ctrl)[0])
             raise ValueError(
-                "DCDCConverter 控制类型必须且只能一端为 CTRL_P/CTRL_V/CTRL_I，另一端为 SLACK；"
+                "DCDCConverter 控制类型必须且只能一端为 P/V/I，另一端为 NONE；"
                 f"第 {bad_pos + 1} 个活动 DCDC 为 "
                 f"i_control_type={int(self.dcdc_i_ctrl_code[bad_pos])}, "
                 f"j_control_type={int(self.dcdc_j_ctrl_code[bad_pos])}"

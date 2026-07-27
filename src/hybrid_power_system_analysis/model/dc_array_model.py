@@ -45,6 +45,7 @@ CTRL_P = 0
 CTRL_V = 1
 CTRL_I = 2
 CTRL_SLACK = 3
+CTRL_NONE = CTRL_SLACK
 CTRL_CODE = {
     "P": CTRL_P,
     "CTRL_P": CTRL_P,
@@ -56,18 +57,19 @@ CTRL_CODE = {
     "CTRL_SLACK": CTRL_SLACK,
 }
 DCDC_SIDE_CONTROL_CODE = {
-    "CTRL_P": CTRL_P,
-    "CTRL_V": CTRL_V,
-    "CTRL_I": CTRL_I,
-    "SLACK": CTRL_SLACK,
+    "P": CTRL_P,
+    "V": CTRL_V,
+    "I": CTRL_I,
+    "NONE": CTRL_NONE,
 }
 DCDC_SIDE_CONTROL_LABEL = {value: key for key, value in DCDC_SIDE_CONTROL_CODE.items()}
 DCDC_SIDE_CONTROL_PARSE_CODE = {
     **DCDC_SIDE_CONTROL_CODE,
-    "P": CTRL_P,
-    "V": CTRL_V,
-    "I": CTRL_I,
-    "CTRL_SLACK": CTRL_SLACK,
+    "CTRL_P": CTRL_P,
+    "CTRL_V": CTRL_V,
+    "CTRL_I": CTRL_I,
+    "SLACK": CTRL_NONE,
+    "CTRL_SLACK": CTRL_NONE,
 }
 DCDC_LEGACY_CONTROL_CODE = {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I}
 DCDC_LEGACY_CONTROL_LABEL = {value: key for key, value in DCDC_LEGACY_CONTROL_CODE.items()}
@@ -78,12 +80,12 @@ DCDC_LEGACY_CONTROL_PARSE_CODE = {
     "CTRL_I": CTRL_I,
 }
 DCDC_LEGACY_TO_PAIR = {
-    "P": ("CTRL_P", "SLACK"),
-    "CTRL_P": ("CTRL_P", "SLACK"),
-    "V": ("CTRL_V", "SLACK"),
-    "CTRL_V": ("CTRL_V", "SLACK"),
-    "I": ("CTRL_I", "SLACK"),
-    "CTRL_I": ("CTRL_I", "SLACK"),
+    "P": ("P", "NONE"),
+    "CTRL_P": ("P", "NONE"),
+    "V": ("V", "NONE"),
+    "CTRL_V": ("V", "NONE"),
+    "I": ("I", "NONE"),
+    "CTRL_I": ("I", "NONE"),
 }
 
 
@@ -96,18 +98,18 @@ def dcdc_control_pair_from_legacy(control_type) -> Tuple[str, str]:
 
 
 def dcdc_legacy_control_label(i_control_type, j_control_type) -> str:
-    i_code = DCDC_SIDE_CONTROL_PARSE_CODE.get(str(i_control_type or "CTRL_P").upper())
-    j_code = DCDC_SIDE_CONTROL_PARSE_CODE.get(str(j_control_type or "SLACK").upper())
+    i_code = DCDC_SIDE_CONTROL_PARSE_CODE.get(str(i_control_type or "P").upper())
+    j_code = DCDC_SIDE_CONTROL_PARSE_CODE.get(str(j_control_type or "NONE").upper())
     if i_code is None or j_code is None:
         raise ValueError(
             f"未知 DCDCConverter 端控制组合: ({i_control_type}, {j_control_type})"
         )
-    i_active = i_code != CTRL_SLACK
-    j_active = j_code != CTRL_SLACK
+    i_active = i_code != CTRL_NONE
+    j_active = j_code != CTRL_NONE
     if i_active == j_active:
         raise ValueError(
-            "DCDCConverter 控制类型必须且只能一端为 CTRL_P/CTRL_V/CTRL_I，"
-            f"另一端为 SLACK: ({i_control_type}, {j_control_type})"
+            "DCDCConverter 控制类型必须且只能一端为 P/V/I，"
+            f"另一端为 NONE: ({i_control_type}, {j_control_type})"
         )
     return DCDC_LEGACY_CONTROL_LABEL[i_code if i_active else j_code]
 
@@ -227,15 +229,15 @@ def _build_switch_like_from_rows(
 
 
 def _validate_dcdc_dual_control(i_control: np.ndarray, j_control: np.ndarray) -> None:
-    valid_codes = np.asarray([CTRL_P, CTRL_V, CTRL_I, CTRL_SLACK], dtype=np.int64)
+    valid_codes = np.asarray([CTRL_P, CTRL_V, CTRL_I, CTRL_NONE], dtype=np.int64)
     bad = ~np.isin(i_control, valid_codes) | ~np.isin(j_control, valid_codes)
-    i_active = i_control != CTRL_SLACK
-    j_active = j_control != CTRL_SLACK
+    i_active = i_control != CTRL_NONE
+    j_active = j_control != CTRL_NONE
     bad |= i_active == j_active
     if np.any(bad):
         pos = int(np.flatnonzero(bad)[0])
         raise ValueError(
-            "DCDCConverter 控制类型必须且只能一端为 CTRL_P/CTRL_V/CTRL_I，另一端为 SLACK；"
+            "DCDCConverter 控制类型必须且只能一端为 P/V/I，另一端为 NONE；"
             f"第 {pos + 1} 行为 i_control_type={int(i_control[pos])}, j_control_type={int(j_control[pos])}"
         )
 
@@ -249,14 +251,14 @@ def _dcdc_control_columns_from_rows(table_rows, columns) -> Tuple[np.ndarray, np
             columns,
             "i_control_type",
             DCDC_SIDE_CONTROL_PARSE_CODE,
-            "CTRL_P",
+            "P",
         ).astype(np.int64, copy=False)
         j_control = _code_column(
             table_rows,
             columns,
             "j_control_type",
             DCDC_SIDE_CONTROL_PARSE_CODE,
-            "SLACK",
+            "NONE",
         ).astype(np.int64, copy=False)
     elif has_i_control:
         i_control = _code_column(
@@ -264,17 +266,17 @@ def _dcdc_control_columns_from_rows(table_rows, columns) -> Tuple[np.ndarray, np
             columns,
             "i_control_type",
             DCDC_SIDE_CONTROL_PARSE_CODE,
-            "CTRL_P",
+            "P",
         ).astype(np.int64, copy=False)
-        j_control = np.full(len(table_rows), CTRL_SLACK, dtype=np.int64)
+        j_control = np.full(len(table_rows), CTRL_NONE, dtype=np.int64)
     elif has_j_control:
-        i_control = np.full(len(table_rows), CTRL_SLACK, dtype=np.int64)
+        i_control = np.full(len(table_rows), CTRL_NONE, dtype=np.int64)
         j_control = _code_column(
             table_rows,
             columns,
             "j_control_type",
             DCDC_SIDE_CONTROL_PARSE_CODE,
-            "CTRL_P",
+            "P",
         ).astype(np.int64, copy=False)
     else:
         i_control = _code_column(
@@ -284,7 +286,7 @@ def _dcdc_control_columns_from_rows(table_rows, columns) -> Tuple[np.ndarray, np
             DCDC_LEGACY_CONTROL_PARSE_CODE,
             "P",
         ).astype(np.int64, copy=False)
-        j_control = np.full(len(table_rows), CTRL_SLACK, dtype=np.int64)
+        j_control = np.full(len(table_rows), CTRL_NONE, dtype=np.int64)
     _validate_dcdc_dual_control(i_control, j_control)
     return i_control.astype(np.float64, copy=False), j_control.astype(np.float64, copy=False)
 
@@ -439,7 +441,7 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "switch_cols": SWITCH_COLS,
         "break_cols": BREAK_COLS,
         "dcdc_cols": DCDC_COLS,
-        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I, "SLACK": CTRL_SLACK},
+        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I, "SLACK": CTRL_SLACK, "NONE": CTRL_NONE},
         "bus_name": bus_names,
         "branch_name": branch_names,
         "load_name": load_names,
@@ -646,18 +648,18 @@ def build_dc_ppc_from_network(network) -> Dict:
         if i_control in (None, "") and j_control in (None, ""):
             i_control, j_control = dcdc_control_pair_from_legacy(_value(conv, "control_type", "P"))
         elif i_control in (None, ""):
-            i_control = "SLACK"
+            i_control = "NONE"
         elif j_control in (None, ""):
-            j_control = "SLACK"
+            j_control = "NONE"
         dcdc[row, DCDC_COLS["i_control_type"]] = _code_value(
             i_control,
             DCDC_SIDE_CONTROL_PARSE_CODE,
-            "CTRL_P",
+            "P",
         )
         dcdc[row, DCDC_COLS["j_control_type"]] = _code_value(
             j_control,
             DCDC_SIDE_CONTROL_PARSE_CODE,
-            "SLACK",
+            "NONE",
         )
     if dcdc.size:
         _validate_dcdc_dual_control(
@@ -691,7 +693,7 @@ def build_dc_ppc_from_network(network) -> Dict:
         "switch_cols": SWITCH_COLS,
         "break_cols": BREAK_COLS,
         "dcdc_cols": DCDC_COLS,
-        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I, "SLACK": CTRL_SLACK},
+        "ctrl": {"P": CTRL_P, "V": CTRL_V, "I": CTRL_I, "SLACK": CTRL_SLACK, "NONE": CTRL_NONE},
     }
     ppc.update(
         bus_name=_name_array(nodes, "bus"),
@@ -861,8 +863,8 @@ def build_dc_network_from_ppc(ppc: Dict):
             int(row[DCDC_COLS["j_node"]]),
             float(row[DCDC_COLS["r1"]]),
             float(row[DCDC_COLS["r2"]]),
-            DCDC_SIDE_CONTROL_LABEL.get(int(row[DCDC_COLS["i_control_type"]]), "CTRL_P"),
-            DCDC_SIDE_CONTROL_LABEL.get(int(row[DCDC_COLS["j_control_type"]]), "SLACK"),
+            DCDC_SIDE_CONTROL_LABEL.get(int(row[DCDC_COLS["i_control_type"]]), "P"),
+            DCDC_SIDE_CONTROL_LABEL.get(int(row[DCDC_COLS["j_control_type"]]), "NONE"),
             float(row[DCDC_COLS["p_set"]]),
             float(row[DCDC_COLS["i_set"]]),
             float(row[DCDC_COLS["v_set"]]),

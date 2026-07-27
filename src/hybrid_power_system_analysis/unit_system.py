@@ -47,6 +47,13 @@ _I_UNIT_TO_SCALE = {
     "A": 1000.0,
     "kA": 1.0,
 }
+_DCDC_TERMINAL_CONTROL_ALIASES = {
+    "CTRL_P": "P",
+    "CTRL_V": "V",
+    "CTRL_I": "I",
+    "SLACK": "NONE",
+    "CTRL_SLACK": "NONE",
+}
 
 
 def _unit_scale(
@@ -304,12 +311,14 @@ def normalize_model_named_units(model) -> float:
         j_ctrl = str(getattr(conv, "j_control_type", "") or "").upper()
         if not i_ctrl and not j_ctrl:
             i_ctrl = str(getattr(conv, "control_type", "P") or "P").upper()
-            j_ctrl = "SLACK"
+            j_ctrl = "NONE"
         elif not i_ctrl:
-            i_ctrl = "SLACK"
+            i_ctrl = "NONE"
         elif not j_ctrl:
-            j_ctrl = "SLACK"
-        v_node = j_node if j_ctrl in ("V", "CTRL_V") and i_ctrl in ("SLACK", "CTRL_SLACK") else i_node
+            j_ctrl = "NONE"
+        i_ctrl = _DCDC_TERMINAL_CONTROL_ALIASES.get(i_ctrl, i_ctrl)
+        j_ctrl = _DCDC_TERMINAL_CONTROL_ALIASES.get(j_ctrl, j_ctrl)
+        v_node = j_node if j_ctrl == "V" and i_ctrl == "NONE" else i_node
         _scale_voltage_attr(conv, "v_set", v_node, settings)
         i_scale_base = dc_current_scales.get(conv.i_node)
         if i_scale_base is not None:

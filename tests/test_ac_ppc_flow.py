@@ -563,6 +563,7 @@ class ACPPCFlowTest(unittest.TestCase):
     def test_ac_ppc_matpower_export_maps_acac_ports_to_gen_or_load(self):
         from ac_array_model import (
             ACAC_COLS,
+            ACAC_SIDE_CONTROL_CODE,
             BUS_COLS,
             build_matpower_ppc_from_ac_ppc,
         )
@@ -577,8 +578,8 @@ class ACPPCFlowTest(unittest.TestCase):
         acac[0, ACAC_COLS["idx"]] = 1
         acac[0, ACAC_COLS["i_node"]] = 1
         acac[0, ACAC_COLS["j_node"]] = 2
-        acac[0, ACAC_COLS["i_control_type"]] = 1
-        acac[0, ACAC_COLS["j_control_type"]] = 0
+        acac[0, ACAC_COLS["i_control_type"]] = ACAC_SIDE_CONTROL_CODE["PV"]
+        acac[0, ACAC_COLS["j_control_type"]] = ACAC_SIDE_CONTROL_CODE["PQ"]
         acac[0, ACAC_COLS["i_v_set"]] = 1.04
         acac[0, ACAC_COLS["run_stat"]] = 1.0
         acac[0, ACAC_COLS["i_p"]] = -0.30

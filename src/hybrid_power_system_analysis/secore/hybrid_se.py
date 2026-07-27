@@ -161,7 +161,13 @@ from secore.se_math import (
     targeted_redundancy_count,
     unanchored_angle_state_indices,
 )
-from secore.se_result import SEResult, build_seresult_summary, normalize_seresult_result_mode
+from secore.se_result import (
+    SEResult,
+    build_seresult_full_from_table,
+    build_seresult_summary,
+    build_seresult_summary_from_table,
+    normalize_seresult_result_mode,
+)
 from secore.state_metadata import StateMeta, state_labels_from_metadata, state_meta_at
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
@@ -303,11 +309,11 @@ def _build_se_acac_converters(ppc: Dict) -> List[SimpleNamespace]:
                 j_node=int(row[ACAC_COLS["j_node"]]),
                 r1=float(row[ACAC_COLS["r1"]]),
                 r2=float(row[ACAC_COLS["r2"]]),
-                i_control_type=ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
-                j_control_type=ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
+                i_control_type=ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "PQ"),
+                j_control_type=ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "PQ"),
                 control_type=acac_legacy_control_label(
-                    ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
-                    ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
+                    ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "PQ"),
+                    ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "PQ"),
                 ),
                 p_set=float(row[ACAC_COLS["p_set"]]),
                 i_q_set=float(row[ACAC_COLS["i_q_set"]]),
@@ -7068,17 +7074,17 @@ class HybridStateEstimator:
             if normalized_residual is None:
                 normalized_residual = computed_normalized
         if mode == "summary":
-            self.se_result = build_seresult_summary(
+            self.se_result = build_seresult_summary_from_table(
                 result,
                 bad_items=bad_items,
-                all_measurements=self.measurements,
+                all_measurement_table=getattr(self.measurements, "table", None),
             )
             return self.se_result
-        self.se_result = SEResult.from_estimate_result(
+        self.se_result = build_seresult_full_from_table(
             result,
             bad_items=bad_items,
             normalized_residual=normalized_residual,
-            all_measurements=self.measurements,
+            all_measurement_table=getattr(self.measurements, "table", None),
         )
         return self.se_result
 

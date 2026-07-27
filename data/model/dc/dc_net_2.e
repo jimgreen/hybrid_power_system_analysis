@@ -55,5 +55,5 @@
 
 <DCDCConverter>
 @ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
-# 1 conv_1_2_3 5 4 0.05 0.05 CTRL_V SLACK 0 0 110 1
+# 1 conv_1_2_3 5 4 0.05 0.05 V NONE 0 0 110 1
 </DCDCConverter>

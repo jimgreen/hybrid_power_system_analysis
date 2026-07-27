@@ -8,7 +8,12 @@ for path in (MODEL_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_model import ACACConverter, ACAC_SIDE_CONTROL_TYPES, ACPowerNetwork
+from ac_model import (
+    ACACConverter,
+    ACAC_SIDE_CONTROL_TYPES,
+    ACPowerNetwork,
+    acac_legacy_control_label,
+)
 from dc_model import DCPowerNetwork
 from hybrid_array_model import (
     DCAC_AC_CONTROL_PARSE_CODE,
@@ -465,10 +470,18 @@ class HybridPowerNetwork:
                 continue
             if conv.i_node == conv.j_node:
                 errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 两端不能连接同一个 AC 节点")
-            i_ctrl = str(getattr(conv, "i_control_type", "Q")).upper()
-            j_ctrl = str(getattr(conv, "j_control_type", "Q")).upper()
+            i_ctrl = str(getattr(conv, "i_control_type", "PQ")).upper()
+            j_ctrl = str(getattr(conv, "j_control_type", "PQ")).upper()
             if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} i_control_type {i_ctrl} 不支持")
             if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} j_control_type {j_ctrl} 不支持")
+            if i_ctrl in ACAC_SIDE_CONTROL_TYPES and j_ctrl in ACAC_SIDE_CONTROL_TYPES:
+                try:
+                    acac_legacy_control_label(i_ctrl, j_ctrl)
+                except ValueError:
+                    errors.append(
+                        f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制组合 "
+                        f"({i_ctrl}, {j_ctrl}) 当前程序不支持"
+                    )
         return errors

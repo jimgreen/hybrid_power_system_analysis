@@ -116,10 +116,10 @@
 
 <DCDCConverter>
 @ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
-# 1 conv_1 5 6 0.05 0.05 CTRL_P SLACK 200 0 0 1
-# 2 conv_2 9 10 0.1 0.1 CTRL_P SLACK 100 0 0 1
-# 3 conv_3 13 14 0.075 0.075 CTRL_I SLACK 0 0.0015 0 1
-# 4 conv_4 17 18 0.06 0.06 CTRL_P SLACK 150 0 0 1
-# 5 conv_5 19 20 0.09 0.09 CTRL_I SLACK 0 0.001 0 1
-# 6 conv_6 1 16 0.125 0.125 CTRL_P SLACK 100 0 0 1
+# 1 conv_1 5 6 0.05 0.05 P NONE 200 0 0 1
+# 2 conv_2 9 10 0.1 0.1 P NONE 100 0 0 1
+# 3 conv_3 13 14 0.075 0.075 I NONE 0 0.0015 0 1
+# 4 conv_4 17 18 0.06 0.06 P NONE 150 0 0 1
+# 5 conv_5 19 20 0.09 0.09 I NONE 0 0.001 0 1
+# 6 conv_6 1 16 0.125 0.125 P NONE 100 0 0 1
 </DCDCConverter>

@@ -968,6 +968,29 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIs(network.ac.islands[0].hybrid_isl_obj, island)
         self.assertTrue(all(dc_isl.hybrid_isl_obj is island for dc_isl in network.dc.islands))
 
+    def test_acac_terminal_controls_use_common_ac_enum(self):
+        from model.ac_model import ACACConverter, ACAC_SIDE_CONTROL_TYPES
+
+        self.assertEqual({"PQ", "PV", "PH", "NONE"}, ACAC_SIDE_CONTROL_TYPES)
+
+        converter = ACACConverter(
+            1,
+            4,
+            5,
+            0.01,
+            0.01,
+            "Q",
+            "V",
+            5.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        )
+        self.assertEqual("PQ", converter.i_control_type)
+        self.assertEqual("PV", converter.j_control_type)
+        self.assertEqual("PQV", converter.control_type)
+
     def test_acac_converter_is_solved_inside_hybrid_newton_system(self):
         import hybrid_net_flow
 
@@ -979,7 +1002,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
 <ACACConverter>
 @ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat i_p i_q j_p j_q i_i j_i
-# 1 acac_4_5 4 5 0.01 0.01 Q Q 5.0 0.0 0.0 0.0 0.0 1 0.0 0.0 0.0 0.0 0.0 0.0
+# 1 acac_4_5 4 5 0.01 0.01 PQ PQ 5.0 0.0 0.0 0.0 0.0 1 0.0 0.0 0.0 0.0 0.0 0.0
 </ACACConverter>
 """
             case_path.write_text(source_text + acac_block, encoding="utf-8")
@@ -997,6 +1020,8 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(result.global_jacobian_shape[0], result.global_jacobian_shape[1])
 
         conv = result.network.acac_converters[0]
+        self.assertEqual("PQ", conv.i_control_type)
+        self.assertEqual("PQ", conv.j_control_type)
         self.assertAlmostEqual(conv.i_p, 0.05, places=8)
         self.assertAlmostEqual(conv.i_q, 0.0, places=8)
         self.assertAlmostEqual(conv.j_q, 0.0, places=8)

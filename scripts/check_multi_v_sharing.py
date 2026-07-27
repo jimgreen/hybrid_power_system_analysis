@@ -23,12 +23,16 @@ from hybrid_power_system_analysis.model.ac_array_model import (
 )
 from hybrid_power_system_analysis.model.dc_array_model import (
     BUS_COLS as DC_BUS_COLS,
-    CTRL_SLACK as DC_CTRL_SLACK,
+    CTRL_NONE as DC_CTRL_NONE,
     CTRL_V as DC_CTRL_V,
     DCDC_COLS as DC_DCDC_COLS,
     GEN_COLS as DC_GEN_COLS,
 )
-from hybrid_power_system_analysis.model.hybrid_array_model import DCAC_COLS, DCAC_CONTROL_CODE
+from hybrid_power_system_analysis.model.hybrid_array_model import (
+    DCAC_AC_CONTROL_CODE,
+    DCAC_COLS,
+    DCAC_DC_CONTROL_CODE,
+)
 
 
 def append_row(table: np.ndarray, row: np.ndarray) -> np.ndarray:
@@ -170,7 +174,8 @@ def run_hybrid_dual_dcac_acv_case(root: Path) -> bool:
 
     row = 0
     ac_node = int(ppc["dcac"][row, DCAC_COLS["ac_node"]])
-    ppc["dcac"][row, DCAC_COLS["control_type"]] = DCAC_CONTROL_CODE["ACV"]
+    ppc["dcac"][row, DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_CODE["PH"]
+    ppc["dcac"][row, DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_CODE["NONE"]
     ppc["dcac"][row, DCAC_COLS["v_ac_set"]] = 0.99
     ppc["dcac"][row, DCAC_COLS["q_ac_set"]] = 0.0
 
@@ -263,7 +268,7 @@ def run_experimental_dc_dcdc_v_case(root: Path) -> bool:
     row = 0
     node = int(dcdc[row, DC_DCDC_COLS["i_node"]])
     dcdc[row, DC_DCDC_COLS["i_control_type"]] = DC_CTRL_V
-    dcdc[row, DC_DCDC_COLS["j_control_type"]] = DC_CTRL_SLACK
+    dcdc[row, DC_DCDC_COLS["j_control_type"]] = DC_CTRL_NONE
     dcdc[row, DC_DCDC_COLS["v_set"]] = 0.99
 
     new_row = dcdc[row].copy()

@@ -316,8 +316,8 @@ def _ppc_device(static_row, row, name, cols, node_by_idx, *, table_key=None, ali
     status = int(values.get("status", 1))
     values["is_alive"] = (run_stat == 1 and status == 1) if alive is None else bool(alive)
     if table_key == "dcdc":
-        values["i_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["i_control_type"], "CTRL_P")
-        values["j_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["j_control_type"], "SLACK")
+        values["i_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["i_control_type"], "P")
+        values["j_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["j_control_type"], "NONE")
         values["control_type"] = dcdc_legacy_control_label(
             values["i_control_type"],
             values["j_control_type"],
@@ -1209,8 +1209,8 @@ class HybridPowerFlowCalc:
             if self.ac_calc.node_type[j_pos] != AC_NODE_TYPE_PQ:
                 current_type = ac_node_type_label(self.ac_calc.node_type[j_pos])
                 raise ValueError(f"ACACConverter[{conv.idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}")
-            i_ctrl = str(getattr(conv, "i_control_type", "Q")).upper()
-            j_ctrl = str(getattr(conv, "j_control_type", "Q")).upper()
+            i_ctrl = str(getattr(conv, "i_control_type", "PQ")).upper()
+            j_ctrl = str(getattr(conv, "j_control_type", "PQ")).upper()
             if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 raise ValueError(f"未知 ACACConverter i_control_type: {i_ctrl}")
             if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
@@ -1252,8 +1252,8 @@ class HybridPowerFlowCalc:
                     f"ACACConverter[{idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}"
                 )
             ctrl = acac_combined_control_code(
-                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
-                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
+                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "PQ"),
+                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "PQ"),
             )
             rows.append(row_pos)
             i_pos.append(i_solver_pos)
@@ -1537,8 +1537,8 @@ class HybridPowerFlowCalc:
             self.acac_eq_ctrl_2 = self.acac_eq_loss + 2
             self.acac_eq_ctrl_3 = self.acac_eq_loss + 3
 
-            # ACAC 损耗方程依赖两端 P/Q 和电压；四类控制模式通过布尔掩码
-            # 选择 i/j 侧是定 Q 还是定 V。
+            # ACAC 损耗方程依赖两端 P/Q 和电压；当前支持的 PQ/PV 端控制组合
+            # 通过布尔掩码选择 i/j 侧使用定 Q 或定 V 方程。
             self.acac_loss_rows = np.repeat(self.acac_eq_loss, 6)
             self.acac_loss_cols = np.empty(self.N_acac * 6, dtype=np.int32)
             self.acac_loss_cols[0::6] = self.acac_i_p_col

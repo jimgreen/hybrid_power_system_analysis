@@ -252,14 +252,38 @@ class ACThreeWindingTransformer:
         self.k_node_obj = None
 
 
-ACAC_SIDE_CONTROL_TYPES = {"Q", "V"}
+ACAC_SIDE_CONTROL_TYPES = {"PQ", "PV", "PH", "NONE"}
+_ACAC_SIDE_CONTROL_ALIASES = {
+    "PQ": "PQ",
+    "CTRL_PQ": "PQ",
+    "Q": "PQ",
+    "PV": "PV",
+    "CTRL_PV": "PV",
+    "V": "PV",
+    "PH": "PH",
+    "CTRL_PH": "PH",
+    "NONE": "NONE",
+    "CTRL_NONE": "NONE",
+    "UNSPEC": "NONE",
+    "UNDEFINED": "NONE",
+    "NA": "NONE",
+    "不定": "NONE",
+}
 ACAC_LEGACY_TO_PAIR = {
-    "PQQ": ("Q", "Q"),
-    "PVQ": ("V", "Q"),
-    "PQV": ("Q", "V"),
-    "PVV": ("V", "V"),
+    "PQQ": ("PQ", "PQ"),
+    "PVQ": ("PV", "PQ"),
+    "PQV": ("PQ", "PV"),
+    "PVV": ("PV", "PV"),
 }
 ACAC_PAIR_TO_LEGACY = {value: key for key, value in ACAC_LEGACY_TO_PAIR.items()}
+
+
+def _normalize_acac_side_control(control_type, default="PQ"):
+    label = str(control_type or default).upper()
+    normalized = _ACAC_SIDE_CONTROL_ALIASES.get(label)
+    if normalized is None:
+        raise ValueError(f"未知 ACACConverter 交流端控制类型: {control_type}")
+    return normalized
 
 
 def acac_control_pair_from_legacy(control_type):
@@ -270,8 +294,8 @@ def acac_control_pair_from_legacy(control_type):
 
 
 def acac_legacy_control_label(i_control_type, j_control_type):
-    i_label = str(i_control_type or "Q").upper()
-    j_label = str(j_control_type or "Q").upper()
+    i_label = _normalize_acac_side_control(i_control_type)
+    j_label = _normalize_acac_side_control(j_control_type)
     legacy = ACAC_PAIR_TO_LEGACY.get((i_label, j_label))
     if legacy is None:
         raise ValueError(f"不支持的 ACACConverter 控制组合: ({i_label}, {j_label})")
@@ -300,8 +324,8 @@ class ACACConverter:
         self.j_node = j_node
         self.r1 = r1
         self.r2 = r2
-        self.i_control_type = str(i_control_type or "Q").upper()
-        self.j_control_type = str(j_control_type or "Q").upper()
+        self.i_control_type = _normalize_acac_side_control(i_control_type)
+        self.j_control_type = _normalize_acac_side_control(j_control_type)
         self.p_set = p_set
         self.i_q_set = i_q_set
         self.j_q_set = j_q_set
@@ -528,8 +552,8 @@ _AC_ROW_DEFAULT_ATTRS = {
         "j_node": 0,
         "r1": 0.0,
         "r2": 0.0,
-        "i_control_type": "Q",
-        "j_control_type": "Q",
+        "i_control_type": "PQ",
+        "j_control_type": "PQ",
         "p_set": 0.0,
         "i_q_set": 0.0,
         "j_q_set": 0.0,
@@ -615,9 +639,16 @@ def _coerce_ac_rows(rows, table_name):
                 _normalize_three_winding_row_values(row.__dict__, row.__dict__)
             elif table_name == "ACACConverter":
                 if not hasattr(row, "i_control_type") or not hasattr(row, "j_control_type"):
-                    i_ctrl, j_ctrl = acac_control_pair_from_legacy(getattr(row, "control_type", "PQQ"))
-                    row.i_control_type = str(getattr(row, "i_control_type", i_ctrl)).upper()
-                    row.j_control_type = str(getattr(row, "j_control_type", j_ctrl)).upper()
+                    legacy_i_ctrl, legacy_j_ctrl = acac_control_pair_from_legacy(
+                        getattr(row, "control_type", "PQQ")
+                    )
+                    i_ctrl = getattr(row, "i_control_type", legacy_i_ctrl)
+                    j_ctrl = getattr(row, "j_control_type", legacy_j_ctrl)
+                else:
+                    i_ctrl = row.i_control_type
+                    j_ctrl = row.j_control_type
+                row.i_control_type = _normalize_acac_side_control(i_ctrl)
+                row.j_control_type = _normalize_acac_side_control(j_ctrl)
             output.append(row)
             continue
         row_values = getattr(row, "__dict__", {})
@@ -642,8 +673,12 @@ def _coerce_ac_rows(rows, table_name):
                 i_ctrl, j_ctrl = acac_control_pair_from_legacy(values.get("control_type", "PQQ"))
                 values.setdefault("i_control_type", i_ctrl)
                 values.setdefault("j_control_type", j_ctrl)
-            values["i_control_type"] = str(values.get("i_control_type", "Q")).upper()
-            values["j_control_type"] = str(values.get("j_control_type", "Q")).upper()
+            values["i_control_type"] = _normalize_acac_side_control(
+                values.get("i_control_type", "PQ")
+            )
+            values["j_control_type"] = _normalize_acac_side_control(
+                values.get("j_control_type", "PQ")
+            )
         output.append(obj)
     return output
 
@@ -1309,12 +1344,20 @@ class ACPowerNetwork:
             check_node(conv.j_node, 'ACACConverter', conv)
             if conv.i_node == conv.j_node:
                 errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 两端不能连接同一个 AC 节点")
-            i_ctrl = str(getattr(conv, "i_control_type", "Q")).upper()
-            j_ctrl = str(getattr(conv, "j_control_type", "Q")).upper()
+            i_ctrl = str(getattr(conv, "i_control_type", "PQ")).upper()
+            j_ctrl = str(getattr(conv, "j_control_type", "PQ")).upper()
             if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} i_control_type {i_ctrl} 不支持")
             if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
                 errors.append(f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} j_control_type {j_ctrl} 不支持")
+            if i_ctrl in ACAC_SIDE_CONTROL_TYPES and j_ctrl in ACAC_SIDE_CONTROL_TYPES:
+                try:
+                    acac_legacy_control_label(i_ctrl, j_ctrl)
+                except ValueError:
+                    errors.append(
+                        f"ACACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制组合 "
+                        f"({i_ctrl}, {j_ctrl}) 当前程序不支持"
+                    )
 
         # 检查节点悬空
         for node in self.nodes:
