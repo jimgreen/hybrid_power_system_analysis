@@ -272,6 +272,79 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(MEAS_STATUS_INVALID, int(status[0]))
         self.assertTrue(bool(table.valid[1]))
 
+    def test_disable_ac_current_measurements_keeps_break_and_zero_branch_flows(self):
+        from model.meas_model import (
+            MEAS_STATUS_INVALID,
+            MEAS_STATUS_NORMAL,
+            TableBackedMeasurementList,
+            measurement_table_from_measurements,
+            measurement_table_status_code,
+        )
+        from model.meas_type import MEAS_TYPE_CODES
+        from secore.hybrid_se import HybridStateEstimator, Measurement
+
+        rows = [
+            Measurement(
+                1, "branch_i", "ACBranch", "line_1", "I_FROM", 1.0, True, 1.0,
+                meas_type_code=MEAS_TYPE_CODES["I_FROM"],
+            ),
+            Measurement(
+                2, "break_i", "ACBreak", "break_1", "I_FROM", 1.0, True, 1.0,
+                meas_type_code=MEAS_TYPE_CODES["I_FROM"],
+            ),
+            Measurement(
+                3, "zero_i", "ACZeroBranch", "zero_1", "I_TO", 1.0, True, 1.0,
+                meas_type_code=MEAS_TYPE_CODES["I_TO"],
+            ),
+            Measurement(
+                4, "gen_i", "ACGenerator", "gen_1", "I_GEN", 1.0, True, 1.0,
+                meas_type_code=MEAS_TYPE_CODES["I_GEN"],
+            ),
+        ]
+        table = measurement_table_from_measurements(rows)
+        estimator = HybridStateEstimator.__new__(HybridStateEstimator)
+        estimator.measurements = TableBackedMeasurementList(table)
+
+        estimator._disable_ac_current_measurements()
+
+        status = measurement_table_status_code(table)
+        self.assertFalse(bool(table.valid[0]))
+        self.assertEqual(MEAS_STATUS_INVALID, int(status[0]))
+        self.assertTrue(bool(table.valid[1]))
+        self.assertEqual(MEAS_STATUS_NORMAL, int(status[1]))
+        self.assertTrue(bool(table.valid[2]))
+        self.assertEqual(MEAS_STATUS_NORMAL, int(status[2]))
+        self.assertFalse(bool(table.valid[3]))
+        self.assertEqual(MEAS_STATUS_INVALID, int(status[3]))
+
+    def test_hybrid_prepare_keeps_ac_break_current_measurements_active(self):
+        from model.meas_array_model import build_meas_ppc_from_e_file
+        from secore.hybrid_se import HybridStateEstimator
+
+        meas_file = ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas"
+        source = build_meas_ppc_from_e_file(meas_file, include_strings=True, include_matrix=False)
+        expected_idx = {
+            int(idx)
+            for idx, device_type, meas_type, valid in zip(
+                source["idx_array"],
+                source["device_type"],
+                source["meas_type"],
+                source["valid_array"],
+            )
+            if bool(valid) and str(device_type) == "ACBreak" and str(meas_type) in {"I_FROM", "I_TO"}
+        }
+        self.assertTrue(expected_idx)
+
+        estimator = HybridStateEstimator(
+            e_file=ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e",
+            meas_file=meas_file,
+            flat_start=True,
+        )
+        estimator.prepare()
+        active_idx = set(map(int, estimator.active_measurements.table.idx))
+
+        self.assertTrue(expected_idx.issubset(active_idx))
+
     def test_disable_unavailable_measurements_updates_table_without_iterating_measurements(self):
         from model.meas_model import (
             MEAS_STATUS_INVALID,

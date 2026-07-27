@@ -3408,6 +3408,14 @@ class ACStateEstimator:
                 dtype=np.int16,
             ),
         )
+        ideal_edge_current_mask = np.isin(
+            device_type_code_array,
+            np.asarray((DEVICE_TYPE_ACZeroBranch, DEVICE_TYPE_ACBreak), dtype=np.int16),
+        ) & np.isin(
+            meas_type_code_array,
+            np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO), dtype=np.int16),
+        )
+        ac_current_mask &= ~ideal_edge_current_mask
         if ac_current_mask.any():
             valid_array[ac_current_mask] = False
             status_array[ac_current_mask] = MEAS_STATUS_INVALID

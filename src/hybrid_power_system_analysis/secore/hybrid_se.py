@@ -1718,7 +1718,7 @@ class HybridStateEstimator:
         )
 
     def _disable_ac_current_measurements(self) -> None:
-        """Mark all AC-side current measurements unavailable before active measurement setup."""
+        """Disable unsupported AC currents while retaining ideal-edge flow measurements."""
         table = getattr(self.measurements, "table", None)
         if table is None:
             warnings.warn(
@@ -1739,8 +1739,6 @@ class HybridStateEstimator:
                 DEVICE_TYPE_ACBranch,
                 DEVICE_TYPE_ACTransformer,
                 DEVICE_TYPE_ACThreeWindingTransformer,
-                DEVICE_TYPE_ACZeroBranch,
-                DEVICE_TYPE_ACBreak,
                 DEVICE_TYPE_ACACConverter,
             ),
             dtype=np.int16,
