@@ -59,11 +59,13 @@ except ImportError:  # pragma: no cover - package import path
     )
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
-from ac_model import ACAC_CONTROL_TYPES
+from ac_model import ACAC_SIDE_CONTROL_TYPES
 from hybrid_model import HybridPowerNetwork
 from ac_array_model import (
     ACAC_COLS,
-    ACAC_CONTROL_LABEL,
+    ACAC_SIDE_CONTROL_LABEL,
+    acac_combined_control_code,
+    acac_legacy_control_label,
     BRANCH_COLS as AC_BRANCH_COLS,
     BREAK_COLS as AC_BREAK_COLS,
     BUS_COLS as AC_BUS_COLS,
@@ -81,10 +83,12 @@ from dc_array_model import (
     BREAK_COLS as DC_BREAK_COLS,
     BUS_COLS as DC_BUS_COLS,
     DCDC_COLS as DC_DCDC_COLS,
+    DCDC_SIDE_CONTROL_LABEL,
     GEN_COLS as DC_GEN_COLS,
     LOAD_COLS as DC_LOAD_COLS,
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    dcdc_legacy_control_label,
 )
 from efile_read import _read_efile_rows
 from hybrid_array_model import (
@@ -93,8 +97,8 @@ from hybrid_array_model import (
     DCAC_AC_CONTROL_PARSE_CODE,
     DCAC_DC_CONTROL_LABEL,
     DCAC_DC_CONTROL_PARSE_CODE,
-    DCAC_CONTROL_LABEL,
     dcac_combined_control_code,
+    dcac_legacy_control_label,
 )
 from model.ppc_topology import (
     build_ac_ppc_with_topology_from_e_file,
@@ -239,7 +243,15 @@ class _PpcDeviceList:
             row = result_table[pos] if pos < len(result_table) else source_row
             name = None if names is None or pos >= len(names) else names[pos]
             alive = None if alive_mask is None or pos >= alive_mask.size else bool(alive_mask[pos])
-            yield _ppc_device(source_row, row, name, self.cols, node_by_idx, alive=alive)
+            yield _ppc_device(
+                source_row,
+                row,
+                name,
+                self.cols,
+                node_by_idx,
+                table_key=self.table_key,
+                alive=alive,
+            )
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -247,7 +259,7 @@ class _PpcDeviceList:
         return list(self)[int(index)]
 
 
-def _ppc_device(static_row, row, name, cols, node_by_idx, *, alive=None):
+def _ppc_device(static_row, row, name, cols, node_by_idx, *, table_key=None, alive=None):
     int_fields = {
         "idx",
         "node",
@@ -303,6 +315,13 @@ def _ppc_device(static_row, row, name, cols, node_by_idx, *, alive=None):
     run_stat = int(values.get("run_stat", 1))
     status = int(values.get("status", 1))
     values["is_alive"] = (run_stat == 1 and status == 1) if alive is None else bool(alive)
+    if table_key == "dcdc":
+        values["i_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["i_control_type"], "CTRL_P")
+        values["j_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["j_control_type"], "SLACK")
+        values["control_type"] = dcdc_legacy_control_label(
+            values["i_control_type"],
+            values["j_control_type"],
+        )
     return _array_device(values.pop("idx", 0), name, **values)
 
 
@@ -341,6 +360,8 @@ class _PpcConverterList:
                 values[attr] = int(raw)
             elif kind == "control":
                 values[attr] = self.label_map.get(int(raw), "")
+            elif kind == "acac_side":
+                values[attr] = ACAC_SIDE_CONTROL_LABEL.get(int(raw), "")
             elif kind == "ac_control":
                 values[attr] = DCAC_AC_CONTROL_LABEL.get(int(raw), "")
             elif kind == "dc_control":
@@ -351,10 +372,9 @@ class _PpcConverterList:
                 values[attr] = float(raw)
         values["is_alive"] = int(row[self.cols["run_stat"]]) == 1
         if "ac_control_type" in values and "dc_control_type" in values:
-            values["control_type"] = DCAC_CONTROL_LABEL.get(
-                dcac_combined_control_code(values["ac_control_type"], values["dc_control_type"]),
-                "",
-            )
+            values["control_type"] = dcac_legacy_control_label(values["ac_control_type"], values["dc_control_type"])
+        if "i_control_type" in values and "j_control_type" in values:
+            values["control_type"] = acac_legacy_control_label(values["i_control_type"], values["j_control_type"])
         return _array_device(row[self.cols["idx"]], name, **values)
 
     def __iter__(self):
@@ -397,13 +417,14 @@ def _lightweight_ac_network(ac_ppc):
         "acac",
         "acac_name",
         ACAC_COLS,
-        ACAC_CONTROL_LABEL,
+        None,
         (
             ("i_node", "i_node", "int"),
             ("j_node", "j_node", "int"),
             ("r1", "r1", "float"),
             ("r2", "r2", "float"),
-            ("control_type", "control_type", "control"),
+            ("i_control_type", "i_control_type", "acac_side"),
+            ("j_control_type", "j_control_type", "acac_side"),
             ("p_set", "p_set", "float"),
             ("i_q_set", "i_q_set", "float"),
             ("j_q_set", "j_q_set", "float"),
@@ -566,7 +587,7 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
             "dcac",
             "dcac_name",
             DCAC_COLS,
-            DCAC_CONTROL_LABEL,
+            None,
             (
                 ("ac_node", "ac_node", "int"),
                 ("dc_node", "dc_node", "int"),
@@ -593,13 +614,14 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
             "acac",
             "acac_name",
             ACAC_COLS,
-            ACAC_CONTROL_LABEL,
+            None,
             (
                 ("i_node", "i_node", "int"),
                 ("j_node", "j_node", "int"),
                 ("r1", "r1", "float"),
                 ("r2", "r2", "float"),
-                ("control_type", "control_type", "control"),
+                ("i_control_type", "i_control_type", "acac_side"),
+                ("j_control_type", "j_control_type", "acac_side"),
                 ("p_set", "p_set", "float"),
                 ("i_q_set", "i_q_set", "float"),
                 ("j_q_set", "j_q_set", "float"),
@@ -1010,7 +1032,7 @@ class HybridPowerFlowCalc:
                 raise ValueError(f"未知 DCACConverter AC 控制模式: {ac_ctrl}")
             if dc_ctrl not in DCAC_DC_CONTROL_PARSE_CODE:
                 raise ValueError(f"未知 DCACConverter DC 控制模式: {dc_ctrl}")
-            ctrl = DCAC_CONTROL_LABEL[dcac_combined_control_code(ac_ctrl, dc_ctrl)]
+            ctrl = dcac_legacy_control_label(ac_ctrl, dc_ctrl)
             conv.is_alive = True
             self.dcac_converters.append((conv, ac_pos, dc_pos, ctrl))
         self.N_dcac = len(self.dcac_converters)
@@ -1187,9 +1209,13 @@ class HybridPowerFlowCalc:
             if self.ac_calc.node_type[j_pos] != AC_NODE_TYPE_PQ:
                 current_type = ac_node_type_label(self.ac_calc.node_type[j_pos])
                 raise ValueError(f"ACACConverter[{conv.idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}")
-            ctrl = str(conv.control_type).upper()
-            if ctrl not in ACAC_CONTROL_TYPES:
-                raise ValueError(f"未知 ACACConverter 控制模式: {conv.control_type}")
+            i_ctrl = str(getattr(conv, "i_control_type", "Q")).upper()
+            j_ctrl = str(getattr(conv, "j_control_type", "Q")).upper()
+            if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
+                raise ValueError(f"未知 ACACConverter i_control_type: {i_ctrl}")
+            if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
+                raise ValueError(f"未知 ACACConverter j_control_type: {j_ctrl}")
+            ctrl = acac_legacy_control_label(i_ctrl, j_ctrl)
             conv.is_alive = True
             self.acac_converters.append((conv, i_pos, j_pos, ctrl))
         self.N_acac = len(self.acac_converters)
@@ -1225,9 +1251,10 @@ class HybridPowerFlowCalc:
                 raise ValueError(
                     f"ACACConverter[{idx}] 的 j 侧 AC 节点必须是 PQ 节点，当前为 {current_type}"
                 )
-            ctrl = int(row[ACAC_COLS["control_type"]])
-            if ctrl not in ACAC_CONTROL_LABEL:
-                raise ValueError(f"未知 ACACConverter 控制模式: {ctrl}")
+            ctrl = acac_combined_control_code(
+                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
+                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
+            )
             rows.append(row_pos)
             i_pos.append(i_solver_pos)
             j_pos.append(j_solver_pos)
@@ -1709,10 +1736,12 @@ class HybridPowerFlowCalc:
         if not self.acac_converters:
             self._clear_acac_arrays()
             return
-        ctrl_map = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
         self.acac_i_pos = np.asarray([item[1] for item in self.acac_converters], dtype=np.int32)
         self.acac_j_pos = np.asarray([item[2] for item in self.acac_converters], dtype=np.int32)
-        self.acac_ctrl_code = np.asarray([ctrl_map[item[3]] for item in self.acac_converters], dtype=np.int8)
+        self.acac_ctrl_code = np.asarray(
+            [acac_combined_control_code(item[0].i_control_type, item[0].j_control_type) for item in self.acac_converters],
+            dtype=np.int8,
+        )
         convs = [item[0] for item in self.acac_converters]
         self.acac_devices = convs
         self.acac_r1 = np.asarray([conv.r1 for conv in convs], dtype=np.float64)
@@ -2960,7 +2989,8 @@ def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int) -> None:
     print("\n5. DC/DC 变流器:")
     for conv in result.dc_network.dcdc_converters:
         print(
-            f"   DCDC {conv.idx} {conv.i_node}->{conv.j_node}: "
+            f"   DCDC {conv.idx} {conv.i_node}->{conv.j_node} "
+            f"控制:i={conv.i_control_type},j={conv.j_control_type}: "
             f"Pi={conv.i_p:.6f} pu, Pj={conv.j_p:.6f} pu, loss={conv.i_p + conv.j_p:.6f} pu"
         )
 

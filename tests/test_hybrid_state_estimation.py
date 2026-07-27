@@ -979,8 +979,8 @@ class HybridStateEstimationTest(unittest.TestCase):
                         "</ACGenerator>",
                         "",
                         "<ACACConverter>",
-                        "@ idx name i_node j_node r1 r2 control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
-                        "# 1 acac_ref 1 2 0.01 0.01 PQQ 0 0 0 0 0 1",
+                        "@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
+                        "# 1 acac_ref 1 2 0.01 0.01 Q Q 0 0 0 0 0 1",
                         "</ACACConverter>",
                         "",
                     ]

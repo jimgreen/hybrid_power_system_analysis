@@ -13,6 +13,33 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 
 class DCLargeCaseGenerationTest(unittest.TestCase):
+    def test_dcdc_converter_uses_side_controls_as_primary_fields(self):
+        from dc_model import DCDCConverter
+
+        converter = DCDCConverter(
+            1,
+            10,
+            20,
+            0.01,
+            0.02,
+            "SLACK",
+            "V",
+            0.0,
+            0.0,
+            100.0,
+        )
+
+        self.assertEqual("SLACK", converter.i_control_type)
+        self.assertEqual("CTRL_V", converter.j_control_type)
+        self.assertEqual("V", converter.control_type)
+
+        converter.control_type = "I"
+        self.assertEqual("CTRL_I", converter.i_control_type)
+        self.assertEqual("SLACK", converter.j_control_type)
+
+        with self.assertRaises(TypeError):
+            DCDCConverter(1, 10, 20, 0.01, 0.02, control_type="P")
+
     def test_dcdc_dual_control_columns_parse_new_and_legacy_headers(self):
         from model.dc_array_model import CTRL_P, CTRL_SLACK, CTRL_V, DCDC_COLS, build_dc_ppc_from_e_file
 

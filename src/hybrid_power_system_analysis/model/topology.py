@@ -2116,7 +2116,7 @@ def apply_dc_topology_arrays(
             i_node.isl_obj.dcdc_converters.append(conv)
         if not compact and j_node.isl_obj is not None:
             j_node.isl_obj.dcdc_converters.append(conv)
-        if getattr(conv, "i_control_type", getattr(conv, "control_type", "")) in ("V", "CTRL_V"):
+        if getattr(conv, "i_control_type", "") in ("V", "CTRL_V"):
             v_node = i_node
         elif getattr(conv, "j_control_type", "") in ("V", "CTRL_V"):
             v_node = j_node
@@ -2656,7 +2656,7 @@ def prepare_dc_topology(network) -> None:
             continue
         i_node.isl_obj.dcdc_converters.append(conv)
         j_node.isl_obj.dcdc_converters.append(conv)
-        if getattr(conv, "i_control_type", getattr(conv, "control_type", "")) in ("V", "CTRL_V"):
+        if getattr(conv, "i_control_type", "") in ("V", "CTRL_V"):
             node = i_node
         elif getattr(conv, "j_control_type", "") in ("V", "CTRL_V"):
             node = j_node

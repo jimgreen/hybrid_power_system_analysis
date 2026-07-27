@@ -125,6 +125,62 @@ class DCSwitch:
 class DCBreak(DCSwitch):
     pass
 
+
+DCDC_SIDE_CONTROL_TYPES = {"CTRL_P", "CTRL_V", "CTRL_I", "SLACK"}
+_DCDC_SIDE_CONTROL_ALIASES = {
+    "P": "CTRL_P",
+    "CTRL_P": "CTRL_P",
+    "V": "CTRL_V",
+    "CTRL_V": "CTRL_V",
+    "I": "CTRL_I",
+    "CTRL_I": "CTRL_I",
+    "SLACK": "SLACK",
+    "CTRL_SLACK": "SLACK",
+}
+_DCDC_LEGACY_TO_SIDE = {
+    "P": "CTRL_P",
+    "CTRL_P": "CTRL_P",
+    "V": "CTRL_V",
+    "CTRL_V": "CTRL_V",
+    "I": "CTRL_I",
+    "CTRL_I": "CTRL_I",
+}
+_DCDC_SIDE_TO_LEGACY = {
+    "CTRL_P": "P",
+    "CTRL_V": "V",
+    "CTRL_I": "I",
+}
+
+
+def _normalize_dcdc_side_control(control_type, default):
+    label = str(control_type or default).upper()
+    normalized = _DCDC_SIDE_CONTROL_ALIASES.get(label)
+    if normalized is None:
+        raise ValueError(f"未知 DCDCConverter 端控制类型: {control_type}")
+    return normalized
+
+
+def dcdc_control_pair_from_legacy(control_type):
+    label = str(control_type or "P").upper()
+    active_control = _DCDC_LEGACY_TO_SIDE.get(label)
+    if active_control is None:
+        raise ValueError(f"未知 DCDCConverter 兼容控制模式: {control_type}")
+    return active_control, "SLACK"
+
+
+def dcdc_legacy_control_label(i_control_type, j_control_type):
+    i_label = _normalize_dcdc_side_control(i_control_type, "CTRL_P")
+    j_label = _normalize_dcdc_side_control(j_control_type, "SLACK")
+    i_active = i_label != "SLACK"
+    j_active = j_label != "SLACK"
+    if i_active == j_active:
+        raise ValueError(
+            "DCDCConverter 控制类型必须且只能一端为 CTRL_P/CTRL_V/CTRL_I，"
+            f"另一端为 SLACK: ({i_label}, {j_label})"
+        )
+    return _DCDC_SIDE_TO_LEGACY[i_label if i_active else j_label]
+
+
 class DCDCConverter:
     def __init__(
         self,
@@ -133,23 +189,21 @@ class DCDCConverter:
         j_node,
         r1,
         r2,
-        control_type="CTRL_P",
+        i_control_type="CTRL_P",
+        j_control_type="SLACK",
         p_set=0.0,
         i_set=0.0,
         v_set=1.0,
         run_stat=1,
-        *,
-        i_control_type=None,
-        j_control_type=None,
     ):
         self.idx = idx
         self.i_node = i_node
         self.j_node = j_node
         self.r1 = r1
         self.r2 = r2
-        self.i_control_type = str(i_control_type if i_control_type is not None else control_type).upper()
-        self.j_control_type = str(j_control_type if j_control_type is not None else "SLACK").upper()
-        self.control_type = self.i_control_type if self.i_control_type != "SLACK" else self.j_control_type
+        self.i_control_type = _normalize_dcdc_side_control(i_control_type, "CTRL_P")
+        self.j_control_type = _normalize_dcdc_side_control(j_control_type, "SLACK")
+        dcdc_legacy_control_label(self.i_control_type, self.j_control_type)
         self.p_set = p_set
         self.i_set = i_set
         self.v_set = v_set
@@ -160,6 +214,14 @@ class DCDCConverter:
         self.j_c = None
         self.i_node_obj = None
         self.j_node_obj = None
+
+    @property
+    def control_type(self):
+        return dcdc_legacy_control_label(self.i_control_type, self.j_control_type)
+
+    @control_type.setter
+    def control_type(self, value):
+        self.i_control_type, self.j_control_type = dcdc_control_pair_from_legacy(value)
 
 
 
@@ -276,7 +338,6 @@ _DC_ROW_DEFAULT_ATTRS = {
         "j_node": 0,
         "r1": 0.0,
         "r2": 0.0,
-        "control_type": "",
         "i_control_type": "",
         "j_control_type": "SLACK",
         "p_set": 0.0,
@@ -317,15 +378,23 @@ def _coerce_dc_rows(rows, table_name):
 
 
 def _normalize_dcdc_converter_controls(obj):
-    i_ctrl = getattr(obj, "i_control_type", "")
-    j_ctrl = getattr(obj, "j_control_type", "")
-    if not i_ctrl:
-        i_ctrl = getattr(obj, "control_type", "CTRL_P") or "CTRL_P"
-    if not j_ctrl:
+    values = obj.__dict__
+    i_ctrl = values.get("i_control_type")
+    j_ctrl = values.get("j_control_type")
+    legacy_control = values.pop("control_type", None)
+
+    if legacy_control not in (None, ""):
+        legacy_i_ctrl, legacy_j_ctrl = dcdc_control_pair_from_legacy(legacy_control)
+        i_ctrl = i_ctrl or legacy_i_ctrl
+        j_ctrl = j_ctrl or legacy_j_ctrl
+    elif i_ctrl in (None, "") and j_ctrl not in (None, ""):
+        i_ctrl = "SLACK"
+    elif j_ctrl in (None, "") and i_ctrl not in (None, ""):
         j_ctrl = "SLACK"
-    obj.i_control_type = str(i_ctrl).upper()
-    obj.j_control_type = str(j_ctrl).upper()
-    obj.control_type = obj.i_control_type if obj.i_control_type != "SLACK" else obj.j_control_type
+
+    obj.i_control_type = _normalize_dcdc_side_control(i_ctrl, "CTRL_P")
+    obj.j_control_type = _normalize_dcdc_side_control(j_ctrl, "SLACK")
+    dcdc_legacy_control_label(obj.i_control_type, obj.j_control_type)
 
 
 class DCPowerNetwork:
@@ -397,14 +466,12 @@ class DCPowerNetwork:
         j_node,
         r1,
         r2,
-        control_type="CTRL_P",
+        i_control_type="CTRL_P",
+        j_control_type="SLACK",
         p_set=0.0,
         i_set=0.0,
         v_set=1.0,
         run_stat=1,
-        *,
-        i_control_type=None,
-        j_control_type=None,
     ):
         dc = DCDCConverter(
             idx,
@@ -412,13 +479,12 @@ class DCPowerNetwork:
             j_node,
             r1,
             r2,
-            control_type,
+            i_control_type,
+            j_control_type,
             p_set,
             i_set,
             v_set,
             run_stat,
-            i_control_type=i_control_type,
-            j_control_type=j_control_type,
         )
         self.dcdc_converters.append(dc)
         return dc

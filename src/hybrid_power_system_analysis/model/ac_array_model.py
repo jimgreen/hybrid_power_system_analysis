@@ -219,27 +219,61 @@ SWITCH_COLS = {
     "current": 7,
 }
 BREAK_COLS = SWITCH_COLS
-ACAC_CONTROL_CODE = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
-ACAC_CONTROL_LABEL = {value: key for key, value in ACAC_CONTROL_CODE.items()}
+ACAC_LEGACY_CONTROL_CODE = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
+ACAC_LEGACY_CONTROL_LABEL = {value: key for key, value in ACAC_LEGACY_CONTROL_CODE.items()}
+ACAC_SIDE_CONTROL_CODE = {"Q": 0, "V": 1}
+ACAC_SIDE_CONTROL_LABEL = {value: key for key, value in ACAC_SIDE_CONTROL_CODE.items()}
+ACAC_LEGACY_TO_PAIR = {
+    "PQQ": ("Q", "Q"),
+    "PVQ": ("V", "Q"),
+    "PQV": ("Q", "V"),
+    "PVV": ("V", "V"),
+}
+ACAC_PAIR_TO_LEGACY = {value: key for key, value in ACAC_LEGACY_TO_PAIR.items()}
+
+
+def acac_control_pair_from_legacy(control_type):
+    label = str(control_type or "PQQ").upper()
+    if label not in ACAC_LEGACY_TO_PAIR:
+        raise ValueError(f"未知 ACACConverter 控制模式: {control_type}")
+    return ACAC_LEGACY_TO_PAIR[label]
+
+
+def acac_legacy_control_label(i_control_type, j_control_type):
+    i_label = str(i_control_type or "Q").upper()
+    j_label = str(j_control_type or "Q").upper()
+    legacy = ACAC_PAIR_TO_LEGACY.get((i_label, j_label))
+    if legacy is None:
+        raise ValueError(f"不支持的 ACACConverter 控制组合: ({i_label}, {j_label})")
+    return legacy
+
+
+def acac_legacy_control_code(i_control_type, j_control_type):
+    return ACAC_LEGACY_CONTROL_CODE[acac_legacy_control_label(i_control_type, j_control_type)]
+
+
+def acac_combined_control_code(i_control_type, j_control_type):
+    return acac_legacy_control_code(i_control_type, j_control_type)
 ACAC_COLS = {
     "idx": 0,
     "i_node": 1,
     "j_node": 2,
     "r1": 3,
     "r2": 4,
-    "control_type": 5,
-    "p_set": 6,
-    "i_q_set": 7,
-    "j_q_set": 8,
-    "i_v_set": 9,
-    "j_v_set": 10,
-    "run_stat": 11,
-    "i_p": 12,
-    "i_q": 13,
-    "j_p": 14,
-    "j_q": 15,
-    "i_i": 16,
-    "j_i": 17,
+    "i_control_type": 5,
+    "j_control_type": 6,
+    "p_set": 7,
+    "i_q_set": 8,
+    "j_q_set": 9,
+    "i_v_set": 10,
+    "j_v_set": 11,
+    "run_stat": 12,
+    "i_p": 13,
+    "i_q": 14,
+    "j_p": 15,
+    "j_q": 16,
+    "i_i": 17,
+    "j_i": 18,
 }
 
 MP_BUS_I = 0
@@ -389,7 +423,19 @@ def _build_acac_from_rows(
     out[:, ACAC_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
     out[:, ACAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
     out[:, ACAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-    out[:, ACAC_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", ACAC_CONTROL_CODE, "PQQ")
+    if "i_control_type" in columns or "j_control_type" in columns:
+        out[:, ACAC_COLS["i_control_type"]] = _code_column(table_rows, columns, "i_control_type", ACAC_SIDE_CONTROL_CODE, "Q")
+        out[:, ACAC_COLS["j_control_type"]] = _code_column(table_rows, columns, "j_control_type", ACAC_SIDE_CONTROL_CODE, "Q")
+    else:
+        pairs = [acac_control_pair_from_legacy(_cell(row, columns.get("control_type"), "PQQ")) for row in table_rows]
+        out[:, ACAC_COLS["i_control_type"]] = np.asarray(
+            [ACAC_SIDE_CONTROL_CODE[i_ctrl] for i_ctrl, _j_ctrl in pairs],
+            dtype=np.float64,
+        )
+        out[:, ACAC_COLS["j_control_type"]] = np.asarray(
+            [ACAC_SIDE_CONTROL_CODE[j_ctrl] for _i_ctrl, j_ctrl in pairs],
+            dtype=np.float64,
+        )
     out[:, ACAC_COLS["p_set"]] = _float_column(table_rows, columns, "p_set") / p_base
     out[:, ACAC_COLS["i_q_set"]] = _float_column(table_rows, columns, "i_q_set") / p_base
     out[:, ACAC_COLS["j_q_set"]] = _float_column(table_rows, columns, "j_q_set") / p_base
@@ -1174,9 +1220,8 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         qd[comp] += q * base_mva
 
     for row in _active_rows(acac0, ACAC_COLS["run_stat"]):
-        control_label = ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ")
-        i_control = control_label[1] if len(control_label) > 1 else "Q"
-        j_control = control_label[2] if len(control_label) > 2 else "Q"
+        i_control = ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q")
+        j_control = ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q")
         i_p = float(row[ACAC_COLS["i_p"]])
         i_q = float(row[ACAC_COLS["i_q"]])
         j_p = float(row[ACAC_COLS["j_p"]])
@@ -1693,7 +1738,12 @@ def build_ac_ppc_from_network(network) -> Dict:
         acac[row, ACAC_COLS["j_node"]] = _int_value(dev, "j_node")
         acac[row, ACAC_COLS["r1"]] = _float_value(dev, "r1")
         acac[row, ACAC_COLS["r2"]] = _float_value(dev, "r2")
-        acac[row, ACAC_COLS["control_type"]] = _code_value(_value(dev, "control_type", "PQQ"), ACAC_CONTROL_CODE, "PQQ")
+        i_ctrl = _value(dev, "i_control_type", None)
+        j_ctrl = _value(dev, "j_control_type", None)
+        if i_ctrl in (None, "") or j_ctrl in (None, ""):
+            i_ctrl, j_ctrl = acac_control_pair_from_legacy(_value(dev, "control_type", "PQQ"))
+        acac[row, ACAC_COLS["i_control_type"]] = _code_value(i_ctrl, ACAC_SIDE_CONTROL_CODE, "Q")
+        acac[row, ACAC_COLS["j_control_type"]] = _code_value(j_ctrl, ACAC_SIDE_CONTROL_CODE, "Q")
         acac[row, ACAC_COLS["p_set"]] = _float_value(dev, "p_set")
         acac[row, ACAC_COLS["i_q_set"]] = _float_value(dev, "i_q_set")
         acac[row, ACAC_COLS["j_q_set"]] = _float_value(dev, "j_q_set")
@@ -1988,7 +2038,8 @@ def build_ac_network_from_ppc(ppc: Dict):
             int(row[ACAC_COLS["j_node"]]),
             float(row[ACAC_COLS["r1"]]),
             float(row[ACAC_COLS["r2"]]),
-            ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
+            ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
+            ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
             float(row[ACAC_COLS["p_set"]]),
             float(row[ACAC_COLS["i_q_set"]]),
             float(row[ACAC_COLS["j_q_set"]]),

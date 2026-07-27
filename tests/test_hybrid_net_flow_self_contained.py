@@ -978,8 +978,8 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             acac_block = """
 
 <ACACConverter>
-@ idx name     i_node j_node r1   r2   control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat i_p  i_q  j_p  j_q  i_i  j_i
-# 1   acac_4_5 4      5      0.01 0.01 PQQ          5.0   0.0     0.0     0.0     0.0     1        0.0  0.0 0.0 0.0 0.0 0.0
+@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat i_p i_q j_p j_q i_i j_i
+# 1 acac_4_5 4 5 0.01 0.01 Q Q 5.0 0.0 0.0 0.0 0.0 1 0.0 0.0 0.0 0.0 0.0 0.0
 </ACACConverter>
 """
             case_path.write_text(source_text + acac_block, encoding="utf-8")

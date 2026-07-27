@@ -22,14 +22,14 @@ from efile_read import _read_efile_rows
 from hybrid_lf import HybridPowerNetwork
 from model.ac_array_model import (
     ACAC_COLS,
-    ACAC_CONTROL_LABEL,
+    ACAC_SIDE_CONTROL_LABEL,
+    acac_legacy_control_label,
 )
 from model.hybrid_array_model import (
     DCAC_COLS,
     DCAC_AC_CONTROL_LABEL,
     DCAC_DC_CONTROL_LABEL,
-    DCAC_CONTROL_LABEL,
-    dcac_combined_control_code,
+    dcac_legacy_control_label,
 )
 from model.dc_array_model import (
     CTRL_V as DC_CTRL_V,
@@ -263,12 +263,9 @@ def _build_se_dcac_converters(ppc: Dict) -> List[SimpleNamespace]:
                 r2=float(row[DCAC_COLS["r2"]]),
                 ac_control_type=DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
                 dc_control_type=DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
-                control_type=DCAC_CONTROL_LABEL.get(
-                    dcac_combined_control_code(
-                        DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
-                        DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
-                    ),
-                    "ACP",
+                control_type=dcac_legacy_control_label(
+                    DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
+                    DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
                 ),
                 p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
                 q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
@@ -306,7 +303,12 @@ def _build_se_acac_converters(ppc: Dict) -> List[SimpleNamespace]:
                 j_node=int(row[ACAC_COLS["j_node"]]),
                 r1=float(row[ACAC_COLS["r1"]]),
                 r2=float(row[ACAC_COLS["r2"]]),
-                control_type=ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
+                i_control_type=ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
+                j_control_type=ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
+                control_type=acac_legacy_control_label(
+                    ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
+                    ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
+                ),
                 p_set=float(row[ACAC_COLS["p_set"]]),
                 i_q_set=float(row[ACAC_COLS["i_q_set"]]),
                 j_q_set=float(row[ACAC_COLS["j_q_set"]]),

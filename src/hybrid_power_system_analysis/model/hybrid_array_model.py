@@ -12,7 +12,7 @@ for path in (MODEL_DIR, ROOT_DIR):
 
 from ac_array_model import (
     ACAC_COLS,
-    ACAC_CONTROL_LABEL,
+    ACAC_SIDE_CONTROL_LABEL,
     BUS_COLS as AC_BUS_COLS,
     _build_ac_ppc_from_model,
     build_ac_network_from_ppc as _build_ac_network_from_ppc,
@@ -29,8 +29,8 @@ from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
-DCAC_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2}
-DCAC_CONTROL_LABEL = {value: key for key, value in DCAC_CONTROL_CODE.items()}
+DCAC_LEGACY_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2}
+DCAC_LEGACY_CONTROL_LABEL = {value: key for key, value in DCAC_LEGACY_CONTROL_CODE.items()}
 DCAC_AC_CONTROL_CODE = {"NONE": 0, "PQ": 1, "PV": 2, "PH": 3}
 DCAC_DC_CONTROL_CODE = {"NONE": 0, "P": 1, "V": 2, "I": 3}
 DCAC_AC_CONTROL_LABEL = {value: key for key, value in DCAC_AC_CONTROL_CODE.items()}
@@ -79,8 +79,12 @@ def dcac_legacy_control_label(ac_control_type, dc_control_type) -> str:
     return legacy
 
 
+def dcac_legacy_control_code(ac_control_type, dc_control_type) -> int:
+    return DCAC_LEGACY_CONTROL_CODE[dcac_legacy_control_label(ac_control_type, dc_control_type)]
+
+
 def dcac_combined_control_code(ac_control_type, dc_control_type) -> int:
-    return DCAC_CONTROL_CODE[dcac_legacy_control_label(ac_control_type, dc_control_type)]
+    return dcac_legacy_control_code(ac_control_type, dc_control_type)
 
 DCAC_COLS = {
     "idx": 0,
@@ -666,7 +670,8 @@ def build_hybrid_model_from_ppc(ppc: Dict):
                 int(row[ACAC_COLS["j_node"]]),
                 float(row[ACAC_COLS["r1"]]),
                 float(row[ACAC_COLS["r2"]]),
-                ACAC_CONTROL_LABEL.get(int(row[ACAC_COLS["control_type"]]), "PQQ"),
+                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "Q"),
+                ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "Q"),
                 float(row[ACAC_COLS["p_set"]]),
                 float(row[ACAC_COLS["i_q_set"]]),
                 float(row[ACAC_COLS["j_q_set"]]),

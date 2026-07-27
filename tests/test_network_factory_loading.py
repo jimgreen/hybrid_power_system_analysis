@@ -717,7 +717,22 @@ class NetworkFactoryLoadingTest(unittest.TestCase):
             DCSwitch=[SimpleNamespace(idx=5, name="sw5", i_node=1, j_node=1, status=1, run_stat=1)],
             DCBreak=[SimpleNamespace(idx=6, name="brk6", i_node=1, j_node=1, status=1, run_stat=1)],
             DCZeroBranch=[SimpleNamespace(idx=7, name="zbr7", i_node=1, j_node=1, run_stat=1)],
-            DCDCConverter=[SimpleNamespace(idx=8, name="dcdc8", i_node=1, j_node=1, r1=0.01, r2=0.01, control_type="P", p_set=0.0, i_set=0.0, v_set=1.0, run_stat=1)],
+            DCDCConverter=[
+                SimpleNamespace(
+                    idx=8,
+                    name="dcdc8",
+                    i_node=1,
+                    j_node=1,
+                    r1=0.01,
+                    r2=0.01,
+                    i_control_type="CTRL_P",
+                    j_control_type="SLACK",
+                    p_set=0.0,
+                    i_set=0.0,
+                    v_set=1.0,
+                    run_stat=1,
+                )
+            ],
         )
 
         network = dc_model.DCPowerNetwork()
