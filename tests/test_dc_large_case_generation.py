@@ -507,6 +507,28 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "V_FROM"))
         self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "I_FROM"))
 
+    def test_update_meas_hybrid_snapshot_reconstructs_contracted_ideal_edge_flows(self):
+        import update_meas_from_lf
+
+        snapshot, _info = update_meas_from_lf.solve_hybrid(
+            ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
+        )
+        ac_switch = next(dev for dev in snapshot.ac.switches if dev.name == "sw_load1_ac")
+        dc_switch = next(dev for dev in snapshot.dc.switches if dev.name == "sw_wt02_dc")
+
+        self.assertGreater(abs(ac_switch.current), 1e-6)
+        self.assertGreater(abs(dc_switch.current), 1e-6)
+        self.assertAlmostEqual(
+            abs(complex(ac_switch.p, ac_switch.q)) / ac_switch.i_node_obj.voltage,
+            ac_switch.current,
+            places=8,
+        )
+        self.assertAlmostEqual(
+            dc_switch.p / dc_switch.i_node_obj.voltage,
+            dc_switch.current,
+            places=8,
+        )
+
     def test_run_reuses_combined_dc_newton_system_builder(self):
         from lfcore.dc_lf import DCPowerFlowCalc
         from model.dc_model import DCPowerNetwork

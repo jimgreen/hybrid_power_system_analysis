@@ -17,6 +17,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import lsqr
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT_DIR / "src" / "hybrid_power_system_analysis"
 MODEL_DIR = SRC_DIR / "model"
@@ -431,6 +435,192 @@ class Snapshot:
         return None
 
 
+def _device_is_live(device, *, check_status: bool = False) -> bool:
+    if int(getattr(device, "run_stat", 1)) != 1:
+        return False
+    if check_status and int(getattr(device, "status", 1)) != 1:
+        return False
+    return bool(getattr(device, "is_alive", True))
+
+
+def _active_ideal_edges(grid) -> List[Tuple[str, int, object, object]]:
+    edges: List[Tuple[str, int, object, object]] = []
+    for table_key, devices, check_status in (
+        ("zero_branch", getattr(grid, "zero_branches", ()), False),
+        ("switch", getattr(grid, "switches", ()), True),
+        ("break", getattr(grid, "breakers", ()), True),
+    ):
+        cols = getattr(devices, "cols", None)
+        edges.extend(
+            (table_key, row_pos, cols, dev)
+            for row_pos, dev in enumerate(devices)
+            if _device_is_live(dev, check_status=check_status)
+        )
+    return edges
+
+
+def _solve_ideal_edge_balance(nodes, edges, imbalance: np.ndarray):
+    node_ids = [int(node.idx) for node in nodes]
+    node_pos = {node_id: pos for pos, node_id in enumerate(node_ids)}
+    active_edges = [
+        edge_ref
+        for edge_ref in edges
+        if int(getattr(edge_ref[3], "i_node", -1)) in node_pos
+        and int(getattr(edge_ref[3], "j_node", -1)) in node_pos
+    ]
+    if not active_edges:
+        residual = float(np.max(np.abs(imbalance))) if imbalance.size else 0.0
+        return active_edges, np.zeros(0, dtype=imbalance.dtype), residual
+
+    edge_count = len(active_edges)
+    rows = np.empty(2 * edge_count, dtype=np.int32)
+    cols = np.repeat(np.arange(edge_count, dtype=np.int32), 2)
+    data = np.tile(np.array([1.0, -1.0]), edge_count)
+    for edge_pos, edge_ref in enumerate(active_edges):
+        edge = edge_ref[3]
+        rows[2 * edge_pos] = node_pos[int(edge.i_node)]
+        rows[2 * edge_pos + 1] = node_pos[int(edge.j_node)]
+    incidence = coo_matrix((data, (rows, cols)), shape=(len(node_ids), edge_count)).tocsr()
+    solve_options = {
+        "atol": 1e-13,
+        "btol": 1e-13,
+        "iter_lim": max(20, 4 * edge_count),
+    }
+    if np.iscomplexobj(imbalance):
+        edge_flow = lsqr(incidence, -imbalance.real, **solve_options)[0]
+        edge_flow = edge_flow + 1j * lsqr(incidence, -imbalance.imag, **solve_options)[0]
+    else:
+        edge_flow = lsqr(incidence, -imbalance, **solve_options)[0]
+    residual = imbalance + incidence.dot(edge_flow)
+    max_residual = float(np.max(np.abs(residual))) if residual.size else 0.0
+    return active_edges, edge_flow, max_residual
+
+
+def _store_ideal_edge_result(grid, edge_ref, **values) -> None:
+    table_key, row_pos, cols, device = edge_ref
+    for name, value in values.items():
+        setattr(device, name, float(value))
+    result = getattr(grid, "result", None)
+    if not isinstance(result, dict) or cols is None:
+        return
+    table = result.get(table_key)
+    if table is None or row_pos >= len(table):
+        return
+    for name, value in values.items():
+        col = cols.get(name)
+        if col is not None:
+            table[row_pos, col] = float(value)
+
+
+def _reconstruct_ac_ideal_edge_flows(ac_grid, dcac_converters=(), acac_converters=()) -> float:
+    nodes = list(getattr(ac_grid, "nodes", ()))
+    node_pos = {int(node.idx): pos for pos, node in enumerate(nodes)}
+    node_by_idx = {int(node.idx): node for node in nodes}
+    imbalance = np.zeros(len(nodes), dtype=np.complex128)
+
+    def add(node_idx, power) -> None:
+        pos = node_pos.get(int(node_idx))
+        if pos is not None:
+            imbalance[pos] += complex(power)
+
+    for device in getattr(ac_grid, "branches", ()):
+        if _device_is_live(device):
+            add(device.i_node, complex(device.i_p, device.i_q))
+            add(device.j_node, complex(device.j_p, device.j_q))
+    for device in getattr(ac_grid, "transformers", ()):
+        if _device_is_live(device):
+            add(device.i_node, complex(device.i_p, device.i_q))
+            add(device.j_node, complex(device.j_p, device.j_q))
+    for device in getattr(ac_grid, "three_winding_transformers", ()):
+        if _device_is_live(device):
+            for side in ("i", "j", "k"):
+                add(
+                    getattr(device, f"{side}_node"),
+                    complex(getattr(device, f"{side}_p"), getattr(device, f"{side}_q")),
+                )
+    for device in getattr(ac_grid, "generators", ()):
+        if _device_is_live(device):
+            add(device.node, -complex(device.p, device.q))
+    for device in getattr(ac_grid, "loads", ()):
+        if _device_is_live(device):
+            add(device.node, complex(device.p, device.q))
+    for device in getattr(ac_grid, "shunt_compensators", ()):
+        if _device_is_live(device):
+            add(device.node, complex(device.p, device.q))
+    for device in dcac_converters:
+        if _device_is_live(device):
+            add(device.ac_node, complex(device.ac_p, device.ac_q))
+    for device in acac_converters:
+        if _device_is_live(device):
+            add(device.i_node, complex(device.i_p, device.i_q))
+            add(device.j_node, complex(device.j_p, device.j_q))
+
+    edges, edge_power, max_residual = _solve_ideal_edge_balance(
+        nodes,
+        _active_ideal_edges(ac_grid),
+        imbalance,
+    )
+    for edge_ref, power in zip(edges, edge_power):
+        device = edge_ref[3]
+        node = getattr(device, "i_node_obj", None) or node_by_idx[int(device.i_node)]
+        voltage = abs(float(getattr(node, "voltage", 0.0)))
+        _store_ideal_edge_result(
+            ac_grid,
+            edge_ref,
+            p=power.real,
+            q=power.imag,
+            current=abs(power) / voltage if voltage > 1e-12 else 0.0,
+        )
+    return max_residual
+
+
+def _reconstruct_dc_ideal_edge_flows(dc_grid, dcac_converters=()) -> float:
+    nodes = list(getattr(dc_grid, "nodes", ()))
+    node_pos = {int(node.idx): pos for pos, node in enumerate(nodes)}
+    node_by_idx = {int(node.idx): node for node in nodes}
+    imbalance = np.zeros(len(nodes), dtype=np.float64)
+
+    def add(node_idx, power) -> None:
+        pos = node_pos.get(int(node_idx))
+        if pos is not None:
+            imbalance[pos] += float(power)
+
+    for device in getattr(dc_grid, "branches", ()):
+        if _device_is_live(device):
+            add(device.i_node, device.i_p)
+            add(device.j_node, device.j_p)
+    for device in getattr(dc_grid, "generators", ()):
+        if _device_is_live(device):
+            add(device.node, -device.p)
+    for device in getattr(dc_grid, "loads", ()):
+        if _device_is_live(device):
+            add(device.node, device.p)
+    for device in getattr(dc_grid, "dcdc_converters", ()):
+        if _device_is_live(device):
+            add(device.i_node, device.i_p)
+            add(device.j_node, device.j_p)
+    for device in dcac_converters:
+        if _device_is_live(device):
+            add(device.dc_node, device.dc_p)
+
+    edges, edge_power, max_residual = _solve_ideal_edge_balance(
+        nodes,
+        _active_ideal_edges(dc_grid),
+        imbalance,
+    )
+    for edge_ref, power in zip(edges, edge_power):
+        device = edge_ref[3]
+        node = getattr(device, "i_node_obj", None) or node_by_idx[int(device.i_node)]
+        voltage = float(getattr(node, "voltage", 0.0))
+        _store_ideal_edge_result(
+            dc_grid,
+            edge_ref,
+            p=power,
+            current=float(power) / voltage if abs(voltage) > 1e-12 else 0.0,
+        )
+    return max_residual
+
+
 def solve_ac(e_file: Path) -> Tuple[Snapshot, str]:
     network = ACPowerNetwork()
     network.read_from_file(e_file)
@@ -440,7 +630,11 @@ def solve_ac(e_file: Path) -> Tuple[Snapshot, str]:
         rc = calc.run()
     if rc != 0 or not calc.converged:
         raise RuntimeError(f"AC load flow failed for {e_file}: rc={rc}, iter={calc.iterations}, normF={calc.normF:.3e}")
-    return Snapshot(network, ac_grid=network), f"iter={calc.iterations}, normF={calc.normF:.3e}"
+    ideal_residual = _reconstruct_ac_ideal_edge_flows(network)
+    return (
+        Snapshot(network, ac_grid=network),
+        f"iter={calc.iterations}, normF={calc.normF:.3e}, ideal_kcl={ideal_residual:.3e}",
+    )
 
 
 def solve_dc(e_file: Path) -> Tuple[Snapshot, str]:
@@ -452,7 +646,11 @@ def solve_dc(e_file: Path) -> Tuple[Snapshot, str]:
         rc = calc.run()
     if rc != 0 or not calc.converged:
         raise RuntimeError(f"DC load flow failed for {e_file}: rc={rc}, iter={calc.iterations}, normF={calc.normF:.3e}")
-    return Snapshot(network, dc_grid=network), f"iter={calc.iterations}, normF={calc.normF:.3e}"
+    ideal_residual = _reconstruct_dc_ideal_edge_flows(network)
+    return (
+        Snapshot(network, dc_grid=network),
+        f"iter={calc.iterations}, normF={calc.normF:.3e}, ideal_kcl={ideal_residual:.3e}",
+    )
 
 
 def solve_hybrid(e_file: Path) -> Tuple[Snapshot, str]:
@@ -465,6 +663,15 @@ def solve_hybrid(e_file: Path) -> Tuple[Snapshot, str]:
             f"Hybrid load flow failed for {e_file}: rc={rc}, "
             f"iter={calc.iterations}, normF={calc.normF:.3e}"
         )
+    ac_ideal_residual = _reconstruct_ac_ideal_edge_flows(
+        network.ac,
+        network.dcac_converters,
+        network.acac_converters,
+    )
+    dc_ideal_residual = _reconstruct_dc_ideal_edge_flows(
+        network.dc,
+        network.dcac_converters,
+    )
     return (
         Snapshot(
             network,
@@ -473,7 +680,10 @@ def solve_hybrid(e_file: Path) -> Tuple[Snapshot, str]:
             dcac_converters=network.dcac_converters,
             acac_converters=network.acac_converters,
         ),
-        f"iter={calc.iterations}, normF={calc.normF:.3e}",
+        (
+            f"iter={calc.iterations}, normF={calc.normF:.3e}, "
+            f"ideal_kcl_ac={ac_ideal_residual:.3e}, ideal_kcl_dc={dc_ideal_residual:.3e}"
+        ),
     )
 
 
