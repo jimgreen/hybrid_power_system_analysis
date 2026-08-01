@@ -35,7 +35,295 @@ def _build_auto_ph_ppc(node_ids, branches, generators):
     return build_ac_ppc_from_efile_rows(Path("auto_ph.e"), rows)
 
 
+def _build_ac_island_ppc(
+    *,
+    breaker_status=0,
+    downstream_node_run_stat=1,
+    include_real_bus=True,
+    real_bus_node=1,
+):
+    from model.ac_array_model import build_ac_ppc_from_efile_rows
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "rooted_ac", 100, "V", "kW", "A"]]),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [
+                [1, "main_bus", 380, 380, 0, 1],
+                [2, "source_branch", 380, 380, 0, downstream_node_run_stat],
+            ],
+        ),
+        "ACBreak": _table(
+            "idx name i_node j_node status run_stat",
+            [[1, "source_breaker", 1, 2, breaker_status, 1]],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha run_stat",
+            [
+                [1, "main_slack", 1, "PH", 0, 0, 380, 1, 1],
+                [2, "isolated_slack", 2, "PH", 0, 0, 380, 1, 1],
+            ],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [[1, "main_load", 1, 10, 1, 0, 0, 2, 1, 0, 0, 1]],
+        ),
+    }
+    if include_real_bus:
+        rows["ACRealBs"] = _table(
+            "idx name node run_stat",
+            [[1, "declared_real_bus", real_bus_node, 1]],
+        )
+    return build_ac_ppc_from_efile_rows(Path("ac_island.e"), rows)
+
+
+def _build_dc_island_ppc(*, breaker_status=0, real_bus_node=1):
+    from model.dc_array_model import build_dc_ppc_from_efile_rows
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "rooted_dc", 100, "V", "kW", "A"]]),
+        "DCNode": _table(
+            "idx name vbase voltage run_stat",
+            [
+                [1, "main_bus", 750, 750, 1],
+                [2, "converter_grid_side", 750, 750, 1],
+                [3, "converter_source_side", 400, 400, 1],
+                [4, "source_node", 400, 400, 1],
+            ],
+        ),
+        "DCRealBs": _table(
+            "idx name node run_stat",
+            [[1, "declared_main_bus", 1, 1]],
+        ),
+        "DCBreak": _table(
+            "idx name i_node j_node status run_stat",
+            [[1, "source_breaker", 1, 2, breaker_status, 1]],
+        ),
+        "DCBranch": _table(
+            "idx name i_node j_node r run_stat",
+            [[1, "source_line", 3, 4, 0.01, 1]],
+        ),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set i_set run_stat",
+            [
+                [1, "main_voltage_source", 1, "V", 750, 0, 0, 1],
+                [2, "isolated_power_source", 4, "P", 400, 10, 0, 1],
+            ],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat",
+            [[1, "main_load", 1, 10, 1, 0, 0, 1]],
+        ),
+        "DCDCConverter": _table(
+            "idx name i_node j_node i_control_type j_control_type p_set i_set v_set run_stat r1 r2",
+            [[1, "source_converter", 3, 2, "V", "NONE", 0, 0, 400, 1, 0, 0]],
+        ),
+    }
+    rows["DCRealBs"]["rows"][0][2] = real_bus_node
+    return build_dc_ppc_from_efile_rows(Path("dc_island.e"), rows)
+
+
+def _build_hybrid_island_ppc(*, dc_breaker_status=1):
+    from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "rooted_hybrid", 100, "V", "kW", "A"]]),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [
+                [1, "ac_main_bus", 380, 380, 0, 1],
+                [2, "converter_ac_terminal", 380, 380, 0, 1],
+            ],
+        ),
+        "ACRealBs": _table("idx name node run_stat", [[1, "ac_root", 1, 1]]),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha run_stat",
+            [
+                [1, "ac_main_slack", 1, "PH", 0, 0, 380, 1, 1],
+                [2, "converter_side_source", 2, "PQ", 5, 0, 380, 1, 1],
+            ],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [[1, "ac_main_load", 1, 10, 1, 0, 0, 2, 1, 0, 0, 1]],
+        ),
+        "DCNode": _table(
+            "idx name vbase voltage run_stat",
+            [
+                [1, "dc_main_bus", 750, 750, 1],
+                [2, "converter_dc_terminal", 750, 750, 1],
+            ],
+        ),
+        "DCRealBs": _table("idx name node run_stat", [[1, "dc_root", 1, 1]]),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set i_set run_stat",
+            [[1, "dc_main_voltage_source", 1, "V", 750, 0, 0, 1]],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat",
+            [[1, "dc_main_load", 1, 10, 1, 0, 0, 1]],
+        ),
+        "DCBreak": _table(
+            "idx name i_node j_node status run_stat",
+            [[1, "converter_breaker", 1, 2, dc_breaker_status, 1]],
+        ),
+        "DCACConverter": _table(
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "grid_converter", 2, 2, "PH", "NONE", 0, 0, 380, 750, 1, 0, 0]],
+        ),
+    }
+    return build_hybrid_ppc_with_topology_from_efile_rows(Path("hybrid_island.e"), rows)
+
+
 class TopologyHelperTest(unittest.TestCase):
+    def test_ac_single_balance_source_without_other_generation_or_load_is_dead(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        arrays = prepare_ac_topology_ppc(_build_ac_island_ppc(breaker_status=0))
+
+        self.assertEqual([True, False], arrays.island_alive_mask.tolist())
+        self.assertEqual([True, False], arrays.devices["gen"].alive_mask.tolist())
+        self.assertEqual([True, False], arrays.node_alive_mask.tolist())
+
+    def test_ac_real_bus_metadata_does_not_select_which_island_is_alive(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        root_on_loaded_island = prepare_ac_topology_ppc(
+            _build_ac_island_ppc(breaker_status=0, real_bus_node=1)
+        )
+        root_on_source_only_island = prepare_ac_topology_ppc(
+            _build_ac_island_ppc(breaker_status=0, real_bus_node=2)
+        )
+        no_real_bus = prepare_ac_topology_ppc(
+            _build_ac_island_ppc(breaker_status=0, include_real_bus=False)
+        )
+
+        expected = [True, False]
+        self.assertEqual(expected, root_on_loaded_island.island_alive_mask.tolist())
+        self.assertEqual(expected, root_on_source_only_island.island_alive_mask.tolist())
+        self.assertEqual(expected, no_real_bus.island_alive_mask.tolist())
+
+    def test_ac_closed_breaker_restores_source_branch_to_loaded_island(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        arrays = prepare_ac_topology_ppc(_build_ac_island_ppc(breaker_status=1))
+
+        self.assertEqual([True], arrays.island_alive_mask.tolist())
+        self.assertEqual([True, True], arrays.devices["gen"].alive_mask.tolist())
+
+    def test_ac_island_viability_honors_node_run_state(self):
+        from model.topology import prepare_ac_topology_ppc
+
+        arrays = prepare_ac_topology_ppc(
+            _build_ac_island_ppc(breaker_status=1, downstream_node_run_stat=0)
+        )
+
+        self.assertEqual([True], arrays.island_alive_mask.tolist())
+        self.assertEqual([True, False], arrays.devices["gen"].alive_mask.tolist())
+        self.assertEqual([True, False], arrays.node_alive_mask.tolist())
+
+    def test_dc_converter_reference_without_balance_source_or_load_is_dead(self):
+        from model.topology import prepare_dc_topology_ppc
+
+        open_arrays = prepare_dc_topology_ppc(_build_dc_island_ppc(breaker_status=0))
+        closed_arrays = prepare_dc_topology_ppc(_build_dc_island_ppc(breaker_status=1))
+
+        self.assertEqual([True, False, False], open_arrays.island_alive_mask.tolist())
+        self.assertEqual([True, False], open_arrays.devices["gen"].alive_mask.tolist())
+        self.assertEqual([False], open_arrays.devices["dcdc"].alive_mask.tolist())
+        self.assertEqual([True, True], closed_arrays.island_alive_mask.tolist())
+        self.assertEqual([True, True], closed_arrays.devices["gen"].alive_mask.tolist())
+        self.assertEqual([True], closed_arrays.devices["dcdc"].alive_mask.tolist())
+
+    def test_ac_object_topology_applies_device_composition_viability(self):
+        from model.ac_array_model import build_ac_network_from_ppc
+        from model.topology import prepare_ac_topology
+
+        network = build_ac_network_from_ppc(_build_ac_island_ppc(breaker_status=0))
+        prepare_ac_topology(network)
+
+        self.assertEqual([True, False], [island.is_alive for island in network.islands])
+        self.assertEqual([True, False], [gen.is_alive for gen in network.generators])
+
+    def test_dc_object_topology_applies_device_composition_through_dcdc(self):
+        from model.dc_array_model import build_dc_network_from_ppc
+        from model.topology import prepare_dc_topology
+
+        network = build_dc_network_from_ppc(_build_dc_island_ppc(breaker_status=0))
+        prepare_dc_topology(network)
+
+        connected = build_dc_network_from_ppc(_build_dc_island_ppc(breaker_status=1))
+        prepare_dc_topology(connected)
+
+        self.assertEqual([True, False, False], [island.is_alive for island in network.islands])
+        self.assertEqual([True, False], [gen.is_alive for gen in network.generators])
+        self.assertFalse(network.dcdc_converters[0].is_alive)
+        self.assertEqual([True, True], [island.is_alive for island in connected.islands])
+        self.assertTrue(connected.dcdc_converters[0].is_alive)
+
+    def test_hybrid_device_composition_propagates_across_running_dcac(self):
+        connected = _build_hybrid_island_ppc(dc_breaker_status=1)
+        isolated = _build_hybrid_island_ppc(dc_breaker_status=0)
+
+        connected_ac = connected["ac"]["_topology_arrays"]
+        connected_dc = connected["dc"]["_topology_arrays"]
+        isolated_ac = isolated["ac"]["_topology_arrays"]
+        isolated_dc = isolated["dc"]["_topology_arrays"]
+
+        self.assertEqual([True, True], connected_ac.island_alive_mask.tolist())
+        self.assertEqual([True], connected_dc.island_alive_mask.tolist())
+        self.assertEqual([True, False], isolated_ac.island_alive_mask.tolist())
+        self.assertEqual([True, False], isolated_dc.island_alive_mask.tolist())
+
+    def test_hybrid_object_topology_uses_combined_ac_dc_device_composition(self):
+        from model.ac_array_model import build_ac_network_from_ppc
+        from model.dc_array_model import build_dc_network_from_ppc
+        from model.hybrid_array_model import build_hybrid_model_from_ppc
+
+        def build_network(dc_breaker_status):
+            ppc = _build_hybrid_island_ppc(dc_breaker_status=dc_breaker_status)
+            object_ppc = dict(ppc)
+            object_ppc["ac_network"] = build_ac_network_from_ppc(ppc["ac"])
+            object_ppc["dc_network"] = build_dc_network_from_ppc(ppc["dc"])
+            return build_hybrid_model_from_ppc(object_ppc)
+
+        connected = build_network(1)
+        connected.topo()
+        isolated = build_network(0)
+        isolated.topo()
+
+        self.assertEqual([True, True], [island.is_alive for island in connected.ac.islands])
+        self.assertEqual([True], [island.is_alive for island in connected.dc.islands])
+        self.assertTrue(connected.dcac_converters[0].is_alive)
+        self.assertEqual([True, False], [island.is_alive for island in isolated.ac.islands])
+        self.assertEqual([True, False], [island.is_alive for island in isolated.dc.islands])
+        self.assertFalse(isolated.dcac_converters[0].is_alive)
+
+    def test_hybrid_topology_rebuilds_local_references_when_dcac_state_changes(self):
+        from model.ac_array_model import CTRL_SLACK, GEN_COLS
+        from model.hybrid_array_model import (
+            DCAC_AC_CONTROL_CODE,
+            DCAC_COLS,
+            DCAC_DC_CONTROL_CODE,
+        )
+        from model.ppc_topology import ensure_hybrid_ppc_topology
+
+        ppc = _build_hybrid_island_ppc(dc_breaker_status=1)
+        ppc["ac"]["gen"][1, GEN_COLS["control_type"]] = CTRL_SLACK
+        ppc["dcac"][0, DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_CODE["PQ"]
+        ppc["dcac"][0, DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_CODE["NONE"]
+        ppc["dcac"][0, DCAC_COLS["run_stat"]] = 0
+        ensure_hybrid_ppc_topology(ppc)
+
+        self.assertEqual([True, False], ppc["ac"]["_topology_arrays"].island_alive_mask.tolist())
+
+        ppc["dcac"][0, DCAC_COLS["run_stat"]] = 1
+        ensure_hybrid_ppc_topology(ppc)
+        ac_topology = ppc["ac"]["_topology_arrays"]
+
+        self.assertEqual([True, True], ac_topology.island_alive_mask.tolist())
+        self.assertGreaterEqual(int(ac_topology.island_reference_bus_pos[1]), 0)
+
     def test_ac_ppc_topology_auto_selects_one_capacity_ranked_pv_per_island(self):
         from model.topology import prepare_ac_topology_ppc
 
@@ -62,6 +350,30 @@ class TopologyHelperTest(unittest.TestCase):
             arrays.island_reference_bus_pos.tolist(),
         )
 
+    def test_ac_object_topology_uses_auto_selected_pv_as_balance_generator(self):
+        from model.ac_array_model import build_ac_network_from_ppc
+        from model.topology import prepare_ac_topology
+
+        ppc = _build_auto_ph_ppc(
+            node_ids=[1, 2, 3, 4],
+            branches=[(1, 2), (3, 4)],
+            generators=[
+                (1, 1, "PV", 90, 1.0, 80),
+                (2, 2, "PV", 10, 1.0, 100),
+                (3, 3, "PV", 40, 1.0, np.nan),
+                (4, 4, "PV", 30, 5.0, np.nan),
+            ],
+        )
+        network = build_ac_network_from_ppc(ppc)
+
+        prepare_ac_topology(network)
+
+        self.assertEqual([True, True], [island.is_alive for island in network.islands])
+        self.assertEqual(
+            [2, 3],
+            [gen.idx for gen in network._auto_slack_generators],
+        )
+
     def test_ac_ppc_topology_auto_slack_falls_back_to_alpha_then_smallest_idx(self):
         from model.topology import prepare_ac_topology_ppc
 
@@ -81,7 +393,7 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertEqual([True], arrays.island_alive_mask.tolist())
         self.assertEqual(int(arrays.node_to_bus_pos[2]), int(arrays.island_reference_bus_pos[0]))
 
-    def test_ac_ppc_topology_keeps_explicit_and_external_references_ahead_of_auto_slack(self):
+    def test_ac_ppc_topology_external_reference_does_not_replace_balance_generator(self):
         from model.topology import prepare_ac_topology_ppc
 
         explicit = _build_auto_ph_ppc(
@@ -108,7 +420,8 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertEqual([], explicit["_auto_slack_gen_rows"].tolist())
         self.assertEqual(int(explicit_arrays.node_to_bus_pos[0]), int(explicit_arrays.island_reference_bus_pos[0]))
         self.assertEqual([], external["_auto_slack_gen_rows"].tolist())
-        self.assertEqual(int(external_arrays.node_to_bus_pos[0]), int(external_arrays.island_reference_bus_pos[0]))
+        self.assertEqual([False], external_arrays.island_alive_mask.tolist())
+        self.assertEqual([-1], external_arrays.island_reference_bus_pos.tolist())
 
     def test_ac_ppc_topology_leaves_island_dead_when_no_online_pv_exists(self):
         from model.topology import prepare_ac_topology_ppc
@@ -148,7 +461,8 @@ class TopologyHelperTest(unittest.TestCase):
 
         ppc["gen"][1, GEN_COLS["run_stat"]] = 0
         ensure_ac_ppc_topology(ppc)
-        self.assertEqual([0], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([False], ppc["_topology_arrays"].island_alive_mask.tolist())
 
     def test_ac_ppc_topology_refreshes_auto_slack_when_islands_merge(self):
         from model.ac_array_model import BRANCH_COLS
@@ -167,13 +481,15 @@ class TopologyHelperTest(unittest.TestCase):
 
         ensure_ac_ppc_topology(ppc)
         self.assertEqual(2, len(ppc["_topology_arrays"].island_ids))
-        self.assertEqual([0, 1], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([False, False], ppc["_topology_arrays"].island_alive_mask.tolist())
 
         ppc["branch"][0, BRANCH_COLS["run_stat"]] = 1
         ensure_ac_ppc_topology(ppc)
 
         self.assertEqual(1, len(ppc["_topology_arrays"].island_ids))
         self.assertEqual([0], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([True], ppc["_topology_arrays"].island_alive_mask.tolist())
 
     def test_parent_index_uses_dense_storage_for_contiguous_ids(self):
         from model.topology import _make_parent_index, _parent_contains, _union_parent, _find_parent

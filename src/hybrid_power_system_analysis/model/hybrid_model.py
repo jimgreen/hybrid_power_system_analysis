@@ -132,13 +132,50 @@ class HybridPowerNetwork:
         return len(self.ac.nodes) + len(self.dc.nodes)
 
     def topo(self):
-        if self.ac.nodes:
-            self.ac.topo()
-        if self.dc.nodes:
-            self.dc.topo()
+        grids = [grid for grid in (self.ac, self.dc) if grid.nodes]
+        previous_defer = {
+            id(grid): getattr(grid, "_defer_operational_island_filter", None)
+            for grid in grids
+        }
+        try:
+            for grid in grids:
+                grid._defer_operational_island_filter = True
+                grid.topo()
+        finally:
+            for grid in grids:
+                previous = previous_defer[id(grid)]
+                if previous is None:
+                    grid.__dict__.pop("_defer_operational_island_filter", None)
+                else:
+                    grid._defer_operational_island_filter = previous
+
+        ac_operational, dc_operational = self._build_hybrid_topo(
+            evaluate_operational=True,
+        )
+        overrides = ((self.ac, ac_operational), (self.dc, dc_operational))
+        previous_overrides = {
+            id(grid): getattr(grid, "_operational_island_ids_override", None)
+            for grid, _island_ids in overrides
+            if grid.nodes
+        }
+        try:
+            for grid, island_ids in overrides:
+                if not grid.nodes:
+                    continue
+                grid._operational_island_ids_override = island_ids
+                grid.topo()
+        finally:
+            for grid, _island_ids in overrides:
+                if not grid.nodes:
+                    continue
+                previous = previous_overrides[id(grid)]
+                if previous is None:
+                    grid.__dict__.pop("_operational_island_ids_override", None)
+                else:
+                    grid._operational_island_ids_override = previous
         self._build_hybrid_topo()
 
-    def _build_hybrid_topo(self):
+    def _build_hybrid_topo(self, evaluate_operational: bool = False):
         ac_islands = self.ac.islands
         dc_islands = self.dc.islands
         n_ac_islands = len(ac_islands)
@@ -186,14 +223,19 @@ class HybridPowerNetwork:
             conv.dc_node_obj = dc_node
             conv.ac_isl_obj = None if ac_node is None else ac_node.isl_obj
             conv.dc_isl_obj = None if dc_node is None else dc_node.isl_obj
-            conv.is_alive = (
+            physical_alive = (
                 conv.run_stat == 1
                 and ac_node is not None
                 and dc_node is not None
-                and ac_node.is_alive
-                and dc_node.is_alive
+                and getattr(ac_node, "run_stat", 0) == 1
+                and getattr(dc_node, "run_stat", 0) == 1
+                and conv.ac_isl_obj is not None
+                and conv.dc_isl_obj is not None
             )
-            if conv.is_alive:
+            conv.is_alive = physical_alive and (
+                evaluate_operational or (ac_node.is_alive and dc_node.is_alive)
+            )
+            if physical_alive:
                 union(conv.ac_isl_obj, conv.dc_isl_obj)
 
         for conv in self.acac_converters:
@@ -203,22 +245,41 @@ class HybridPowerNetwork:
             conv.j_node_obj = j_node
             conv.i_isl_obj = None if i_node is None else i_node.isl_obj
             conv.j_isl_obj = None if j_node is None else j_node.isl_obj
-            conv.is_alive = (
+            physical_alive = (
                 conv.run_stat == 1
                 and i_node is not None
                 and j_node is not None
-                and i_node.is_alive
-                and j_node.is_alive
+                and getattr(i_node, "run_stat", 0) == 1
+                and getattr(j_node, "run_stat", 0) == 1
+                and conv.i_isl_obj is not None
+                and conv.j_isl_obj is not None
             )
-            if conv.is_alive:
+            conv.is_alive = physical_alive and (
+                evaluate_operational or (i_node.is_alive and j_node.is_alive)
+            )
+            if physical_alive:
                 union(conv.i_isl_obj, conv.j_isl_obj)
 
         for conv in self.dc.dcdc_converters:
-            if not getattr(conv, "is_alive", False):
+            i_node = getattr(conv, "i_node_obj", None)
+            j_node = getattr(conv, "j_node_obj", None)
+            physical_alive = (
+                getattr(conv, "run_stat", 0) == 1
+                and i_node is not None
+                and j_node is not None
+                and getattr(i_node, "run_stat", 0) == 1
+                and getattr(j_node, "run_stat", 0) == 1
+                and i_node.isl_obj is not None
+                and j_node.isl_obj is not None
+            )
+            conv.is_alive = physical_alive and (
+                evaluate_operational or (i_node.is_alive and j_node.is_alive)
+            )
+            if not physical_alive:
                 continue
             union(
-                None if getattr(conv, "i_node_obj", None) is None else conv.i_node_obj.isl_obj,
-                None if getattr(conv, "j_node_obj", None) is None else conv.j_node_obj.isl_obj,
+                i_node.isl_obj,
+                j_node.isl_obj,
             )
 
         grouped = {}
@@ -268,6 +329,90 @@ class HybridPowerNetwork:
                 continue
             hybrid_island = island_by_root[find(i_island._hybrid_pos)]
             hybrid_island.add_acac_converter(conv)
+
+        if evaluate_operational:
+            return self._evaluate_hybrid_operational_islands()
+        return set(), set()
+
+    def _evaluate_hybrid_operational_islands(self):
+        ac_operational = set()
+        dc_operational = set()
+        ac_auto_balance_ids = {
+            id(gen) for gen in getattr(self.ac, "_auto_slack_generators", ())
+        }
+        for hybrid_island in self.hybrid_islands:
+            has_reference = any(
+                island.is_alive
+                for island in (*hybrid_island.ac_islands, *hybrid_island.dc_islands)
+            )
+            generator_count = 0
+            balance_count = 0
+            load_count = 0
+
+            for gen in self.ac.generators:
+                node = getattr(gen, "node_obj", None)
+                if (
+                    getattr(gen, "run_stat", 0) != 1
+                    or node is None
+                    or getattr(node, "run_stat", 0) != 1
+                    or node.isl_obj is None
+                    or node.isl_obj.hybrid_isl_obj is not hybrid_island
+                ):
+                    continue
+                generator_count += 1
+                if (
+                    str(getattr(gen, "control_type", "")).upper()
+                    in {"V", "SLACK", "PH"}
+                    or id(gen) in ac_auto_balance_ids
+                ):
+                    balance_count += 1
+
+            for gen in self.dc.generators:
+                node = getattr(gen, "node_obj", None)
+                if (
+                    getattr(gen, "run_stat", 0) != 1
+                    or node is None
+                    or getattr(node, "run_stat", 0) != 1
+                    or node.isl_obj is None
+                    or node.isl_obj.hybrid_isl_obj is not hybrid_island
+                ):
+                    continue
+                generator_count += 1
+                if str(getattr(gen, "control_type", "")).upper() == "V":
+                    balance_count += 1
+
+            for loads, node_dict in (
+                (self.ac.loads, self.ac.node_dict),
+                (self.dc.loads, self.dc.node_dict),
+            ):
+                for load in loads:
+                    node = getattr(load, "node_obj", None) or node_dict.get(int(load.node))
+                    if (
+                        getattr(load, "run_stat", 0) == 1
+                        and node is not None
+                        and getattr(node, "run_stat", 0) == 1
+                        and node.isl_obj is not None
+                        and node.isl_obj.hybrid_isl_obj is hybrid_island
+                    ):
+                        load_count += 1
+
+            source_only = (
+                balance_count == 1 and generator_count == 1 and load_count == 0
+            )
+            hybrid_island.is_alive = (
+                has_reference and balance_count > 0 and not source_only
+            )
+            if hybrid_island.is_alive:
+                ac_operational.update(island.idx for island in hybrid_island.ac_islands)
+                dc_operational.update(island.idx for island in hybrid_island.dc_islands)
+            for conv in (
+                *hybrid_island.dcac_converters,
+                *hybrid_island.dcdc_converters,
+                *hybrid_island.acac_converters,
+            ):
+                conv.is_alive = bool(conv.is_alive and hybrid_island.is_alive)
+
+        return ac_operational, dc_operational
 
     def print_hybrid_isl_info(self):
         for island in self.hybrid_islands:

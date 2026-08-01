@@ -13,7 +13,9 @@ from model.ac_array_model import (
     BRANCH_COLS as AC_BRANCH_COLS,
     BREAK_COLS as AC_BREAK_COLS,
     BUS_COLS as AC_BUS_COLS,
+    CTRL_SLACK as AC_CTRL_SLACK,
     GEN_COLS as AC_GEN_COLS,
+    LOAD_COLS as AC_LOAD_COLS,
     SWITCH_COLS as AC_SWITCH_COLS,
     THREE_WINDING_TRANSFORMER_COLS as AC_THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
@@ -27,7 +29,9 @@ from model.dc_array_model import (
     BREAK_COLS as DC_BREAK_COLS,
     BUS_COLS as DC_BUS_COLS,
     DCDC_COLS as DC_DCDC_COLS,
+    CTRL_V as DC_CTRL_V,
     GEN_COLS as DC_GEN_COLS,
+    LOAD_COLS as DC_LOAD_COLS,
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
     build_dc_ppc_from_e_file,
@@ -65,6 +69,12 @@ def _ac_topology_signature(ppc: Dict) -> bytes:
         ],
     )
     _update_signature_table(digest, ppc, "bus", [AC_BUS_COLS["idx"], AC_BUS_COLS["run_stat"]])
+    _update_signature_table(
+        digest,
+        ppc,
+        "load",
+        [AC_LOAD_COLS["node"], AC_LOAD_COLS["run_stat"]],
+    )
     _update_signature_table(
         digest,
         ppc,
@@ -124,6 +134,7 @@ def _ac_topology_signature(ppc: Dict) -> bytes:
     )
     digest.update(np.asarray(external_refs.shape, dtype=np.int64).tobytes())
     digest.update(external_refs.tobytes())
+    digest.update(bytes((bool(ppc.get("_defer_operational_island_filter", False)),)))
     return digest.digest()
 
 
@@ -141,6 +152,12 @@ def _dc_topology_signature(ppc: Dict) -> bytes:
         ],
     )
     _update_signature_table(digest, ppc, "bus", [DC_BUS_COLS["idx"], DC_BUS_COLS["run_stat"]])
+    _update_signature_table(
+        digest,
+        ppc,
+        "load",
+        [DC_LOAD_COLS["node"], DC_LOAD_COLS["run_stat"]],
+    )
     _update_signature_table(
         digest,
         ppc,
@@ -193,6 +210,24 @@ def _dc_topology_signature(ppc: Dict) -> bytes:
     )
     digest.update(np.asarray(external_refs.shape, dtype=np.int64).tobytes())
     digest.update(external_refs.tobytes())
+    digest.update(bytes((bool(ppc.get("_defer_operational_island_filter", False)),)))
+    return digest.digest()
+
+
+def _hybrid_converter_topology_signature(ppc: Dict) -> bytes:
+    digest = hashlib.blake2b(digest_size=16)
+    _update_signature_table(
+        digest,
+        ppc,
+        "dcac",
+        [
+            DCAC_COLS["ac_node"],
+            DCAC_COLS["dc_node"],
+            DCAC_COLS["ac_control_type"],
+            DCAC_COLS["dc_control_type"],
+            DCAC_COLS["run_stat"],
+        ],
+    )
     return digest.digest()
 
 
@@ -219,15 +254,145 @@ def ensure_dc_ppc_topology(ppc: Dict) -> Dict:
 
 def ensure_hybrid_ppc_topology(ppc: Dict) -> Dict:
     """Attach AC/DC topology arrays to a hybrid PPC dictionary."""
+    ac_ppc = ppc.get("ac")
     dc_ppc = ppc.get("dc")
+    hybrid_signature = _hybrid_converter_topology_signature(ppc)
+    if ppc.get("_hybrid_converter_topology_signature") != hybrid_signature:
+        if ac_ppc is not None:
+            ac_ppc.pop("_topology_arrays", None)
+        if dc_ppc is not None:
+            dc_ppc.pop("_topology_arrays", None)
+        ppc["_hybrid_converter_topology_signature"] = hybrid_signature
+    if ac_ppc is not None:
+        ac_ppc["_defer_operational_island_filter"] = True
+    if dc_ppc is not None:
+        dc_ppc["_defer_operational_island_filter"] = True
     if dc_ppc is not None:
         _attach_hybrid_dc_reference_nodes(ppc)
         ensure_dc_ppc_topology(dc_ppc)
-    ac_ppc = ppc.get("ac")
     if ac_ppc is not None:
         _attach_hybrid_ac_reference_nodes(ppc)
         ensure_ac_ppc_topology(ac_ppc)
+    _apply_hybrid_operational_island_filter(ppc)
     return ppc
+
+
+def _apply_hybrid_operational_island_filter(ppc: Dict) -> None:
+    ac_ppc = ppc.get("ac")
+    dc_ppc = ppc.get("dc")
+    ac_topology = None if ac_ppc is None else ac_ppc.get("_topology_arrays")
+    dc_topology = None if dc_ppc is None else dc_ppc.get("_topology_arrays")
+    if ac_topology is None and dc_topology is None:
+        return
+
+    ac_input = None if ac_ppc is None else ac_ppc.get("_topology_input")
+    dc_input = None if dc_ppc is None else dc_ppc.get("_topology_input")
+    ac_linked = ()
+    dc_linked = ()
+    if ac_input is not None:
+        ac_linked = (ac_input.terminals.get("acac"),)
+    if dc_input is not None:
+        dc_linked = (dc_input.terminals.get("dcdc"),)
+
+    dcac = np.asarray(ppc.get("dcac", ()), dtype=np.float64)
+    if dcac.size:
+        dcac_ac_nodes = dcac[:, DCAC_COLS["ac_node"]]
+        dcac_dc_nodes = dcac[:, DCAC_COLS["dc_node"]]
+        dcac_run = dcac[:, DCAC_COLS["run_stat"]].astype(np.int64, copy=False) == 1
+    else:
+        dcac_ac_nodes = np.empty(0, dtype=np.int64)
+        dcac_dc_nodes = np.empty(0, dtype=np.int64)
+        dcac_run = np.empty(0, dtype=bool)
+
+    ac_gen_rows = np.empty(0, dtype=np.int32)
+    ac_gen_islands = np.empty(0, dtype=np.int32)
+    ac_load_islands = np.empty(0, dtype=np.int32)
+    ac_balance_islands = np.empty(0, dtype=np.int32)
+    if ac_topology is not None and ac_input is not None:
+        ac_gen_rows, ac_gen_islands = network_topology._online_single_device_rows_and_islands(
+            ac_topology,
+            ac_input.singles.get("gen"),
+        )
+        _ac_load_rows, ac_load_islands = network_topology._online_single_device_rows_and_islands(
+            ac_topology,
+            ac_input.singles.get("load"),
+        )
+        if ac_gen_rows.size:
+            ac_gen = np.asarray(ac_ppc["gen"], dtype=np.float64)
+            balance_rows = (
+                ac_gen[ac_gen_rows, AC_GEN_COLS["control_type"]].astype(
+                    np.int64,
+                    copy=False,
+                )
+                == AC_CTRL_SLACK
+            )
+            auto_slack_rows = np.asarray(
+                ac_ppc.get("_auto_slack_gen_rows", ()),
+                dtype=np.int32,
+            )
+            if auto_slack_rows.size:
+                balance_rows |= np.isin(ac_gen_rows, auto_slack_rows)
+            ac_balance_islands = ac_gen_islands[balance_rows]
+
+    dc_gen_rows = np.empty(0, dtype=np.int32)
+    dc_gen_islands = np.empty(0, dtype=np.int32)
+    dc_load_islands = np.empty(0, dtype=np.int32)
+    dc_balance_islands = np.empty(0, dtype=np.int32)
+    if dc_topology is not None and dc_input is not None:
+        dc_gen_rows, dc_gen_islands = network_topology._online_single_device_rows_and_islands(
+            dc_topology,
+            dc_input.singles.get("gen"),
+        )
+        _dc_load_rows, dc_load_islands = network_topology._online_single_device_rows_and_islands(
+            dc_topology,
+            dc_input.singles.get("load"),
+        )
+        if dc_gen_rows.size:
+            dc_gen = np.asarray(dc_ppc["gen"], dtype=np.float64)
+            balance_rows = (
+                dc_gen[dc_gen_rows, DC_GEN_COLS["control_type"]].astype(
+                    np.int64,
+                    copy=False,
+                )
+                == DC_CTRL_V
+            )
+            dc_balance_islands = dc_gen_islands[balance_rows]
+
+    ac_operational, dc_operational = network_topology.hybrid_operational_island_masks(
+        ac_topology,
+        dc_topology,
+        ac_balance_generator_islands=ac_balance_islands,
+        ac_generator_islands=ac_gen_islands,
+        ac_load_islands=ac_load_islands,
+        dc_balance_generator_islands=dc_balance_islands,
+        dc_generator_islands=dc_gen_islands,
+        dc_load_islands=dc_load_islands,
+        ac_linked_terminals=ac_linked,
+        dc_linked_terminals=dc_linked,
+        dcac_ac_node_ids=dcac_ac_nodes,
+        dcac_dc_node_ids=dcac_dc_nodes,
+        dcac_run_mask=dcac_run,
+    )
+    if ac_topology is not None:
+        network_topology.apply_operational_island_filter(
+            ac_topology,
+            ac_operational,
+            ac_input,
+        )
+        auto_slack_rows = np.asarray(ac_ppc.get("_auto_slack_gen_rows", ()), dtype=np.int32)
+        gen_topology = ac_topology.devices.get("gen")
+        if auto_slack_rows.size and gen_topology is not None:
+            valid = (auto_slack_rows >= 0) & (auto_slack_rows < gen_topology.alive_mask.size)
+            auto_slack_rows = auto_slack_rows[valid]
+            ac_ppc["_auto_slack_gen_rows"] = auto_slack_rows[
+                gen_topology.alive_mask[auto_slack_rows]
+            ]
+    if dc_topology is not None:
+        network_topology.apply_operational_island_filter(
+            dc_topology,
+            dc_operational,
+            dc_input,
+        )
 
 
 def _attach_hybrid_dc_reference_nodes(ppc: Dict) -> None:

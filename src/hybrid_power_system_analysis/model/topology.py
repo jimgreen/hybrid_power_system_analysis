@@ -822,6 +822,297 @@ def _mark_reference_bus(reference: np.ndarray, island_pos: int, bus_pos: int, bu
         reference[island_pos] = int(bus_pos)
 
 
+def _online_single_device_rows_and_islands(
+    topology: GridTopologyArrays,
+    device_input: Optional[SingleDeviceTopologyInput],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return row positions and electrical islands for online single-node devices."""
+
+    if device_input is None:
+        return _EMPTY_INT, _EMPTY_INT
+    node_pos = np.asarray(device_input.node_pos, dtype=np.int32).reshape(-1)
+    run_mask = np.asarray(device_input.run_mask, dtype=bool).reshape(-1)
+    count = min(node_pos.size, run_mask.size)
+    if count == 0:
+        return _EMPTY_INT, _EMPTY_INT
+
+    node_pos = node_pos[:count]
+    valid = run_mask[:count] & (node_pos >= 0) & (node_pos < topology.node_ids.size)
+    if np.any(valid):
+        rows = np.flatnonzero(valid)
+        valid[rows] &= topology.node_run_mask[node_pos[rows]]
+    island_pos = np.full(count, -1, dtype=np.int32)
+    if np.any(valid):
+        rows = np.flatnonzero(valid)
+        island_pos[rows] = topology.node_to_island_pos[node_pos[rows]]
+        valid[rows] &= island_pos[rows] >= 0
+    rows = np.flatnonzero(valid).astype(np.int32, copy=False)
+    return rows, island_pos[rows]
+
+
+def _append_terminal_island_links(
+    topology: Optional[GridTopologyArrays],
+    terminals: Sequence[Optional[TerminalDeviceTopologyInput]],
+    offset: int,
+    left_parts,
+    right_parts,
+) -> None:
+    if topology is None:
+        return
+    node_count = int(topology.node_ids.size)
+    for terminal in terminals:
+        if terminal is None:
+            continue
+        i_node_pos = np.asarray(terminal.i_node_pos, dtype=np.int32).reshape(-1)
+        j_node_pos = np.asarray(terminal.j_node_pos, dtype=np.int32).reshape(-1)
+        run_mask = np.asarray(terminal.run_mask, dtype=bool).reshape(-1)
+        count = min(i_node_pos.size, j_node_pos.size, run_mask.size)
+        if count == 0:
+            continue
+        i_node_pos = i_node_pos[:count]
+        j_node_pos = j_node_pos[:count]
+        valid = (
+            run_mask[:count]
+            & (i_node_pos >= 0)
+            & (j_node_pos >= 0)
+            & (i_node_pos < node_count)
+            & (j_node_pos < node_count)
+        )
+        if np.any(valid):
+            rows = np.flatnonzero(valid)
+            valid[rows] &= (
+                topology.node_run_mask[i_node_pos[rows]]
+                & topology.node_run_mask[j_node_pos[rows]]
+            )
+        if not np.any(valid):
+            continue
+        i_islands = topology.node_to_island_pos[i_node_pos[valid]]
+        j_islands = topology.node_to_island_pos[j_node_pos[valid]]
+        valid_islands = (i_islands >= 0) & (j_islands >= 0) & (i_islands != j_islands)
+        if np.any(valid_islands):
+            left_parts.append(i_islands[valid_islands] + int(offset))
+            right_parts.append(j_islands[valid_islands] + int(offset))
+
+
+def hybrid_operational_island_masks(
+    ac_topology: Optional[GridTopologyArrays],
+    dc_topology: Optional[GridTopologyArrays],
+    *,
+    ac_balance_generator_islands=(),
+    ac_generator_islands=(),
+    ac_load_islands=(),
+    dc_balance_generator_islands=(),
+    dc_generator_islands=(),
+    dc_load_islands=(),
+    ac_linked_terminals: Sequence[Optional[TerminalDeviceTopologyInput]] = (),
+    dc_linked_terminals: Sequence[Optional[TerminalDeviceTopologyInput]] = (),
+    dcac_ac_node_ids=(),
+    dcac_dc_node_ids=(),
+    dcac_run_mask=(),
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Judge physical components by references and online device composition.
+
+    Electrical islands are first linked through running AC/AC, DC/DC, and
+    DC/AC converters. A resulting physical component is operational only when
+    it has a load-flow reference and at least one real balance generator. A
+    component containing exactly one balance generator and no other online
+    generator or load is intentionally treated as a dead island.
+    """
+
+    ac_count = 0 if ac_topology is None else int(ac_topology.island_ids.size)
+    dc_count = 0 if dc_topology is None else int(dc_topology.island_ids.size)
+    total_count = ac_count + dc_count
+    if total_count == 0:
+        return np.zeros(ac_count, dtype=bool), np.zeros(dc_count, dtype=bool)
+
+    left_parts = []
+    right_parts = []
+    _append_terminal_island_links(ac_topology, ac_linked_terminals, 0, left_parts, right_parts)
+    _append_terminal_island_links(dc_topology, dc_linked_terminals, ac_count, left_parts, right_parts)
+
+    if ac_topology is not None and dc_topology is not None:
+        ac_node_ids = np.asarray(dcac_ac_node_ids, dtype=np.int64).reshape(-1)
+        dc_node_ids = np.asarray(dcac_dc_node_ids, dtype=np.int64).reshape(-1)
+        run_mask = np.asarray(dcac_run_mask, dtype=bool).reshape(-1)
+        count = min(ac_node_ids.size, dc_node_ids.size, run_mask.size)
+        if count:
+            ac_node_pos = _map_node_positions(
+                ac_node_ids[:count],
+                _make_node_pos_lookup(ac_topology.node_ids),
+            )
+            dc_node_pos = _map_node_positions(
+                dc_node_ids[:count],
+                _make_node_pos_lookup(dc_topology.node_ids),
+            )
+            valid = (
+                run_mask[:count]
+                & (ac_node_pos >= 0)
+                & (dc_node_pos >= 0)
+                & (ac_node_pos < ac_topology.node_ids.size)
+                & (dc_node_pos < dc_topology.node_ids.size)
+            )
+            if np.any(valid):
+                rows = np.flatnonzero(valid)
+                valid[rows] &= (
+                    ac_topology.node_run_mask[ac_node_pos[rows]]
+                    & dc_topology.node_run_mask[dc_node_pos[rows]]
+                )
+            if np.any(valid):
+                ac_islands = ac_topology.node_to_island_pos[ac_node_pos[valid]]
+                dc_islands = dc_topology.node_to_island_pos[dc_node_pos[valid]]
+                valid_islands = (ac_islands >= 0) & (dc_islands >= 0)
+                if np.any(valid_islands):
+                    left_parts.append(ac_islands[valid_islands])
+                    right_parts.append(dc_islands[valid_islands] + ac_count)
+
+    if left_parts:
+        left = np.concatenate(left_parts).astype(np.int32, copy=False)
+        right = np.concatenate(right_parts).astype(np.int32, copy=False)
+    else:
+        left = _EMPTY_INT
+        right = _EMPTY_INT
+    graph = coo_matrix(
+        (np.ones(left.size, dtype=np.int8), (left, right)),
+        shape=(total_count, total_count),
+    ).tocsr()
+    component_count, component_by_island = connected_components(
+        graph,
+        directed=False,
+        return_labels=True,
+    )
+
+    def component_counts(island_positions, island_count, offset):
+        positions = np.asarray(island_positions, dtype=np.int64).reshape(-1)
+        valid = (positions >= 0) & (positions < int(island_count))
+        if not np.any(valid):
+            return np.zeros(component_count, dtype=np.int64)
+        components = component_by_island[positions[valid] + int(offset)]
+        return np.bincount(components, minlength=component_count).astype(np.int64, copy=False)
+
+    reference_count = np.zeros(component_count, dtype=np.int64)
+    if ac_topology is not None and ac_count:
+        ac_references = np.asarray(ac_topology.island_reference_bus_pos, dtype=np.int32) >= 0
+        reference_count += np.bincount(
+            component_by_island[:ac_count],
+            weights=ac_references.astype(np.int8),
+            minlength=component_count,
+        ).astype(np.int64, copy=False)
+    if dc_topology is not None and dc_count:
+        dc_references = np.asarray(dc_topology.island_reference_bus_pos, dtype=np.int32) >= 0
+        reference_count += np.bincount(
+            component_by_island[ac_count:],
+            weights=dc_references.astype(np.int8),
+            minlength=component_count,
+        ).astype(np.int64, copy=False)
+
+    balance_count = component_counts(ac_balance_generator_islands, ac_count, 0)
+    balance_count += component_counts(dc_balance_generator_islands, dc_count, ac_count)
+    generator_count = component_counts(ac_generator_islands, ac_count, 0)
+    generator_count += component_counts(dc_generator_islands, dc_count, ac_count)
+    load_count = component_counts(ac_load_islands, ac_count, 0)
+    load_count += component_counts(dc_load_islands, dc_count, ac_count)
+
+    component_alive = (reference_count > 0) & (balance_count > 0)
+    source_only = (balance_count == 1) & (generator_count == 1) & (load_count == 0)
+    component_alive &= ~source_only
+    island_alive = component_alive[component_by_island]
+    return island_alive[:ac_count], island_alive[ac_count:]
+
+
+def apply_operational_island_filter(
+    topology: GridTopologyArrays,
+    operational_islands,
+    topology_input: Optional[GridTopologyInput] = None,
+) -> None:
+    """Apply a composition-based operational mask and refresh device states."""
+
+    operational = np.asarray(operational_islands, dtype=bool).reshape(-1)
+    if operational.size != topology.island_alive_mask.size:
+        raise ValueError("Operational-island mask does not match topology island count")
+    topology.island_alive_mask[:] = operational
+    topology.island_reference_bus_pos[~operational] = -1
+
+    topology.bus_alive_mask[:] = False
+    valid_bus = topology.bus_to_island_pos >= 0
+    if np.any(valid_bus):
+        topology.bus_alive_mask[valid_bus] = operational[topology.bus_to_island_pos[valid_bus]]
+
+    topology.node_alive_mask[:] = False
+    valid_node = topology.node_to_island_pos >= 0
+    if np.any(valid_node):
+        topology.node_alive_mask[valid_node] = (
+            topology.node_run_mask[valid_node]
+            & operational[topology.node_to_island_pos[valid_node]]
+        )
+
+    terminals = {} if topology_input is None else topology_input.terminals
+    singles = {} if topology_input is None else topology_input.singles
+    for key, device in topology.devices.items():
+        if isinstance(device, SingleDeviceTopologyArrays):
+            raw = singles.get(key)
+            run_mask = (
+                np.asarray(raw.run_mask, dtype=bool)
+                if _compatible_single_input(raw, device.alive_mask.size)
+                else np.asarray(device.alive_mask, dtype=bool).copy()
+            )
+            valid = (device.node_pos >= 0) & (device.node_pos < topology.node_ids.size)
+            device.alive_mask[:] = False
+            if np.any(valid):
+                device.alive_mask[valid] = (
+                    run_mask[valid]
+                    & topology.node_alive_mask[device.node_pos[valid]]
+                )
+        elif isinstance(device, TerminalDeviceTopologyArrays):
+            raw = terminals.get(key)
+            run_mask = (
+                np.asarray(raw.run_mask, dtype=bool)
+                if _compatible_terminal_input(raw, device.alive_mask.size)
+                else np.asarray(device.alive_mask, dtype=bool).copy()
+            )
+            valid = (
+                (device.i_node_pos >= 0)
+                & (device.j_node_pos >= 0)
+                & (device.i_node_pos < topology.node_ids.size)
+                & (device.j_node_pos < topology.node_ids.size)
+            )
+            device.alive_mask[:] = False
+            if np.any(valid):
+                device.alive_mask[valid] = (
+                    run_mask[valid]
+                    & topology.node_alive_mask[device.i_node_pos[valid]]
+                    & topology.node_alive_mask[device.j_node_pos[valid]]
+                )
+        elif isinstance(device, ThreeTerminalDeviceTopologyArrays):
+            raw_ij = terminals.get("three_winding_transformer_ij")
+            raw_ik = terminals.get("three_winding_transformer_ik")
+            if (
+                _compatible_terminal_input(raw_ij, device.alive_mask.size)
+                and _compatible_terminal_input(raw_ik, device.alive_mask.size)
+            ):
+                run_mask = np.asarray(raw_ij.run_mask, dtype=bool) & np.asarray(
+                    raw_ik.run_mask,
+                    dtype=bool,
+                )
+            else:
+                run_mask = np.asarray(device.alive_mask, dtype=bool).copy()
+            valid = (
+                (device.i_node_pos >= 0)
+                & (device.j_node_pos >= 0)
+                & (device.k_node_pos >= 0)
+                & (device.i_node_pos < topology.node_ids.size)
+                & (device.j_node_pos < topology.node_ids.size)
+                & (device.k_node_pos < topology.node_ids.size)
+            )
+            device.alive_mask[:] = False
+            if np.any(valid):
+                device.alive_mask[valid] = (
+                    run_mask[valid]
+                    & topology.node_alive_mask[device.i_node_pos[valid]]
+                    & topology.node_alive_mask[device.j_node_pos[valid]]
+                    & topology.node_alive_mask[device.k_node_pos[valid]]
+                )
+
+
 def _select_ac_auto_slack_gen_rows(
     gen: np.ndarray,
     gen_islands: np.ndarray,
@@ -1277,6 +1568,39 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             precomputed=singles.get("shunt"),
         ),
     }
+    if not bool(ppc.get("_defer_operational_island_filter", False)):
+        online_gen_rows, online_gen_islands = _online_single_device_rows_and_islands(
+            topology,
+            singles.get("gen"),
+        )
+        _online_load_rows, online_load_islands = _online_single_device_rows_and_islands(
+            topology,
+            singles.get("load"),
+        )
+        balance_rows = np.zeros(gen_count, dtype=bool)
+        if gen_count:
+            balance_rows |= gen[:, GEN_COLS["control_type"]].astype(
+                np.int64,
+                copy=False,
+            ) == CTRL_SLACK
+        valid_auto = auto_slack_gen_rows[
+            (auto_slack_gen_rows >= 0) & (auto_slack_gen_rows < gen_count)
+        ]
+        balance_rows[valid_auto] = True
+        online_balance_islands = online_gen_islands[balance_rows[online_gen_rows]]
+        operational, _unused_dc = hybrid_operational_island_masks(
+            topology,
+            None,
+            ac_balance_generator_islands=online_balance_islands,
+            ac_generator_islands=online_gen_islands,
+            ac_load_islands=online_load_islands,
+            ac_linked_terminals=(terminals.get("acac"),),
+        )
+        apply_operational_island_filter(topology, operational, topology_input)
+        gen_topology = topology.devices.get("gen")
+        if valid_auto.size and gen_topology is not None:
+            valid_auto = valid_auto[gen_topology.alive_mask[valid_auto]]
+        ppc["_auto_slack_gen_rows"] = valid_auto
     return topology
 
 
@@ -1611,6 +1935,32 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         "gen": _single_device_arrays(gen, GEN_COLS["node"], GEN_COLS["run_stat"], node_lookup, topology, precomputed=singles.get("gen")),
         "load": _single_device_arrays(load, LOAD_COLS["node"], LOAD_COLS["run_stat"], node_lookup, topology, precomputed=singles.get("load")),
     }
+    if not bool(ppc.get("_defer_operational_island_filter", False)):
+        online_gen_rows, online_gen_islands = _online_single_device_rows_and_islands(
+            topology,
+            singles.get("gen"),
+        )
+        _online_load_rows, online_load_islands = _online_single_device_rows_and_islands(
+            topology,
+            singles.get("load"),
+        )
+        if online_gen_rows.size:
+            balance_mask = (
+                gen[online_gen_rows, GEN_COLS["control_type"]].astype(np.int64, copy=False)
+                == CTRL_V
+            )
+            online_balance_islands = online_gen_islands[balance_mask]
+        else:
+            online_balance_islands = _EMPTY_INT
+        _unused_ac, operational = hybrid_operational_island_masks(
+            None,
+            topology,
+            dc_balance_generator_islands=online_balance_islands,
+            dc_generator_islands=online_gen_islands,
+            dc_load_islands=online_load_islands,
+            dc_linked_terminals=(terminals.get("dcdc"),),
+        )
+        apply_operational_island_filter(topology, operational, topology_input)
     return topology
 
 
@@ -1680,6 +2030,168 @@ def _sorted_by_idx(values):
             return sorted(values, key=lambda entry: entry.idx)
         previous = current
     return values
+
+
+def _select_object_ac_auto_slack_generators(islands):
+    selected = []
+    for island in islands:
+        if island.is_alive:
+            continue
+        candidates = [
+            gen
+            for gen in island.gens
+            if getattr(gen, "run_stat", 0) == 1
+            and str(getattr(gen, "control_type", "")).upper() == "PV"
+            and getattr(gen, "node_obj", None) is not None
+            and getattr(gen.node_obj, "run_stat", 0) == 1
+        ]
+        if not candidates:
+            continue
+
+        finite_capacity = []
+        for gen in candidates:
+            try:
+                capacity = float(getattr(gen, "p_max", np.nan))
+            except (TypeError, ValueError):
+                capacity = np.nan
+            if np.isfinite(capacity):
+                finite_capacity.append((gen, capacity))
+
+        if finite_capacity:
+            ranked = finite_capacity
+        else:
+            ranked = []
+            for gen in candidates:
+                try:
+                    capacity = abs(float(getattr(gen, "p_set", 0.0)))
+                except (TypeError, ValueError):
+                    capacity = -np.inf
+                if not np.isfinite(capacity):
+                    capacity = -np.inf
+                ranked.append((gen, capacity))
+
+        def rank(item):
+            gen, capacity = item
+            try:
+                alpha = float(getattr(gen, "alpha", 0.0))
+            except (TypeError, ValueError):
+                alpha = 0.0
+            if not np.isfinite(alpha):
+                alpha = 0.0
+            return (-capacity, -alpha, int(getattr(gen, "idx", 0)))
+
+        gen = min(ranked, key=rank)[0]
+        island.is_alive = True
+        slack_bus = gen.node_obj.bus_obj or gen.node_obj
+        if slack_bus not in island.slack_nodes:
+            island.slack_nodes.append(slack_bus)
+        selected.append(gen)
+    return selected
+
+
+def _object_operational_island_ids(
+    islands,
+    node_dict,
+    generators,
+    loads,
+    linked_devices,
+    balance_control_types,
+    additional_balance_generators=(),
+):
+    """Apply the same device-composition rule to object topology islands."""
+
+    islands = list(islands)
+    island_count = len(islands)
+    if island_count == 0:
+        return set()
+    island_pos_by_id = {int(island.idx): pos for pos, island in enumerate(islands)}
+
+    left = []
+    right = []
+    for dev in linked_devices:
+        if getattr(dev, "run_stat", 0) != 1:
+            continue
+        i_node = node_dict.get(int(dev.i_node))
+        j_node = node_dict.get(int(dev.j_node))
+        if (
+            i_node is None
+            or j_node is None
+            or getattr(i_node, "run_stat", 0) != 1
+            or getattr(j_node, "run_stat", 0) != 1
+            or i_node.isl_obj is None
+            or j_node.isl_obj is None
+        ):
+            continue
+        i_pos = island_pos_by_id.get(int(i_node.isl_obj.idx))
+        j_pos = island_pos_by_id.get(int(j_node.isl_obj.idx))
+        if i_pos is not None and j_pos is not None and i_pos != j_pos:
+            left.append(i_pos)
+            right.append(j_pos)
+
+    graph = coo_matrix(
+        (
+            np.ones(len(left), dtype=np.int8),
+            (np.asarray(left, dtype=np.int32), np.asarray(right, dtype=np.int32)),
+        ),
+        shape=(island_count, island_count),
+    ).tocsr()
+    component_count, component_by_island = connected_components(
+        graph,
+        directed=False,
+        return_labels=True,
+    )
+    reference_count = np.bincount(
+        component_by_island,
+        weights=np.asarray([bool(island.is_alive) for island in islands], dtype=np.int8),
+        minlength=component_count,
+    ).astype(np.int64, copy=False)
+    generator_count = np.zeros(component_count, dtype=np.int64)
+    balance_count = np.zeros(component_count, dtype=np.int64)
+    load_count = np.zeros(component_count, dtype=np.int64)
+    additional_balance_ids = {id(gen) for gen in additional_balance_generators}
+
+    for gen in generators:
+        node = node_dict.get(int(gen.node))
+        if (
+            getattr(gen, "run_stat", 0) != 1
+            or node is None
+            or getattr(node, "run_stat", 0) != 1
+            or node.isl_obj is None
+        ):
+            continue
+        island_pos = island_pos_by_id.get(int(node.isl_obj.idx))
+        if island_pos is None:
+            continue
+        component = int(component_by_island[island_pos])
+        generator_count[component] += 1
+        if (
+            str(getattr(gen, "control_type", "")).upper() in balance_control_types
+            or id(gen) in additional_balance_ids
+        ):
+            balance_count[component] += 1
+
+    for load in loads:
+        node = node_dict.get(int(load.node))
+        if (
+            getattr(load, "run_stat", 0) != 1
+            or node is None
+            or getattr(node, "run_stat", 0) != 1
+            or node.isl_obj is None
+        ):
+            continue
+        island_pos = island_pos_by_id.get(int(node.isl_obj.idx))
+        if island_pos is not None:
+            load_count[int(component_by_island[island_pos])] += 1
+
+    component_alive = (reference_count > 0) & (balance_count > 0)
+    component_alive &= ~(
+        (balance_count == 1) & (generator_count == 1) & (load_count == 0)
+    )
+    return {
+        int(islands[pos].idx)
+        for pos in range(island_count)
+        if component_alive[int(component_by_island[pos])]
+    }
 
 
 def _topology_device_mask(topology: GridTopologyArrays, key: str, count: int) -> np.ndarray:
@@ -2509,6 +3021,27 @@ def prepare_ac_topology(network) -> None:
                 gen.node_obj.bus_obj.v_gens.append(gen)
             island.v_gens.append(gen)
 
+    network._auto_slack_generators = _select_object_ac_auto_slack_generators(
+        network.islands,
+    )
+    operational_override = getattr(network, "_operational_island_ids_override", None)
+    if operational_override is not None:
+        operational_islands = {int(island_id) for island_id in operational_override}
+        for island in network.islands:
+            island.is_alive = island.idx in operational_islands
+    elif not bool(getattr(network, "_defer_operational_island_filter", False)):
+        operational_islands = _object_operational_island_ids(
+            network.islands,
+            node_dict,
+            generators,
+            loads,
+            acac_converters,
+            {"V", "SLACK", "PH"},
+            network._auto_slack_generators,
+        )
+        for island in network.islands:
+            island.is_alive = island.idx in operational_islands
+
     for bus in buses:
         bus.is_alive = bus.run_stat == 1 and bus.isl_obj is not None and bus.isl_obj.is_alive
     for node in nodes:
@@ -2857,6 +3390,23 @@ def prepare_dc_topology(network) -> None:
 
     for island in network.islands:
         island.is_alive = len(island.slack_nodes) + len(island.v_dcdcs) >= 1
+
+    operational_override = getattr(network, "_operational_island_ids_override", None)
+    if operational_override is not None:
+        operational_islands = {int(island_id) for island_id in operational_override}
+        for island in network.islands:
+            island.is_alive = island.idx in operational_islands
+    elif not bool(getattr(network, "_defer_operational_island_filter", False)):
+        operational_islands = _object_operational_island_ids(
+            network.islands,
+            node_dict,
+            generators,
+            loads,
+            dcdc_converters,
+            {"V"},
+        )
+        for island in network.islands:
+            island.is_alive = island.idx in operational_islands
 
     for bus in buses:
         bus.is_alive = bus.run_stat == 1 and bus.isl_obj is not None and bus.isl_obj.is_alive

@@ -64,9 +64,9 @@ class ACPPCFlowTest(unittest.TestCase):
         self.assertEqual(0, calc.run())
         self.assertTrue(calc.converged)
 
-    def test_external_angle_reference_does_not_promote_an_additional_pv_slack(self):
+    def test_external_angle_reference_without_balance_generator_is_not_operational(self):
         from ac_array_model import CTRL_PV, GEN_COLS, build_ac_ppc_from_e_file
-        from ac_lf import AC_NODE_TYPE_SLACK, ACPowerFlowCalc
+        from ac_lf import ACPowerFlowCalc
         from model.ppc_topology import ensure_ac_ppc_topology
 
         ppc = build_ac_ppc_from_e_file(ROOT_DIR / "data" / "model" / "ac" / "ac_net_10.e")
@@ -76,12 +76,11 @@ class ACPPCFlowTest(unittest.TestCase):
 
         ensure_ac_ppc_topology(ppc)
         self.assertEqual([], ppc["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([False], ppc["_topology_arrays"].island_alive_mask.tolist())
 
         calc = ACPowerFlowCalc(ppc, verbose=False)
-        calc.prepare()
-
-        self.assertEqual(0, int(np.count_nonzero(calc.node_type == AC_NODE_TYPE_SLACK)))
-        self.assertEqual(-1, calc.slack_node)
+        with self.assertRaisesRegex(RuntimeError, "no surviving topology island|无带平衡节点"):
+            calc.prepare()
 
     def test_automatic_ph_only_absorbs_residual_power_for_its_generator_row(self):
         from ac_array_model import GEN_COLS, build_ac_ppc_from_efile_rows
