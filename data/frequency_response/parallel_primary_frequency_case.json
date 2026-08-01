@@ -1,0 +1,62 @@
+{
+  "system": {
+    "f_nom_hz": 50.0,
+    "s_base_mw": 10.0,
+    "inertia_s": 4.0,
+    "damping_mw_per_hz": 1.0
+  },
+  "simulation": {
+    "duration_s": 60.0,
+    "dt_s": 0.02
+  },
+  "disturbance": {
+    "start_s": 1.0,
+    "deficit_mw": 2.0
+  },
+  "diesels": [
+    {
+      "name": "diesel_slow",
+      "reserve_mw": 1.2,
+      "droop_mw_per_hz": 0.55,
+      "time_constant_s": 3.0,
+      "ramp_mw_per_s": 0.25,
+      "deadband_hz": 0.03
+    },
+    {
+      "name": "diesel_fast",
+      "reserve_mw": 0.8,
+      "droop_mw_per_hz": 0.45,
+      "time_constant_s": 1.2,
+      "ramp_mw_per_s": 0.55,
+      "deadband_hz": 0.03
+    }
+  ],
+  "storages": [
+    {
+      "name": "bess_1",
+      "discharge_limit_mw": 1.5,
+      "charge_limit_mw": 1.0,
+      "droop_mw_per_hz": 1.0,
+      "inertia_mw_s_per_hz": 0.25,
+      "response_time_s": 0.08,
+      "energy_mwh": 3.0,
+      "initial_soc": 0.8,
+      "min_soc": 0.2,
+      "max_soc": 0.95,
+      "deadband_hz": 0.01
+    },
+    {
+      "name": "bess_2",
+      "discharge_limit_mw": 0.8,
+      "charge_limit_mw": 0.8,
+      "droop_mw_per_hz": 0.7,
+      "inertia_mw_s_per_hz": 0.15,
+      "response_time_s": 0.15,
+      "energy_mwh": 1.5,
+      "initial_soc": 0.65,
+      "min_soc": 0.25,
+      "max_soc": 0.9,
+      "deadband_hz": 0.01
+    }
+  ]
+}

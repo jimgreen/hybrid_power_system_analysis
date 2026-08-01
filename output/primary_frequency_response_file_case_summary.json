@@ -1,0 +1,18 @@
+{
+  "input_file": "data\\frequency_response\\parallel_primary_frequency_case.json",
+  "curve_output_file": "output\\primary_frequency_response_file_case.csv",
+  "nadir_hz": 49.371731594400146,
+  "nadir_time_s": 3.02,
+  "final_frequency_hz": 49.44675675675023,
+  "final_delta_frequency_hz": -0.5532432432497671,
+  "max_diesel_power_mw": 0.523243243230368,
+  "max_storage_power_mw": 1.0553907911147875,
+  "diesel_unit_names": [
+    "diesel_slow",
+    "diesel_fast"
+  ],
+  "storage_unit_names": [
+    "bess_1",
+    "bess_2"
+  ]
+}
