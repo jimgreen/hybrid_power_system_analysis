@@ -131,7 +131,57 @@ class HybridPowerNetwork:
     def total_nodes(self) -> int:
         return len(self.ac.nodes) + len(self.dc.nodes)
 
+    def _physical_ac_angle_reference_node_ids(self):
+        ac_nodes = {int(node.idx): node for node in self.ac.nodes}
+        dc_nodes = {int(node.idx): node for node in self.dc.nodes}
+        reference_ids = set()
+        for conv in self.dcac_converters:
+            ac_node = ac_nodes.get(int(conv.ac_node))
+            dc_node = dc_nodes.get(int(conv.dc_node))
+            if (
+                conv.run_stat == 1
+                and ac_node is not None
+                and dc_node is not None
+                and ac_node.run_stat == 1
+                and dc_node.run_stat == 1
+                and str(conv.ac_control_type).upper() == "PH"
+            ):
+                reference_ids.add(int(ac_node.idx))
+        for conv in self.acac_converters:
+            i_node = ac_nodes.get(int(conv.i_node))
+            j_node = ac_nodes.get(int(conv.j_node))
+            if (
+                conv.run_stat != 1
+                or i_node is None
+                or j_node is None
+                or i_node.run_stat != 1
+                or j_node.run_stat != 1
+            ):
+                continue
+            if str(conv.i_control_type).upper() == "PH":
+                reference_ids.add(int(i_node.idx))
+            if str(conv.j_control_type).upper() == "PH":
+                reference_ids.add(int(j_node.idx))
+        return reference_ids
+
     def topo(self):
+        previous_references = getattr(
+            self.ac,
+            "_hybrid_angle_reference_node_ids",
+            None,
+        )
+        self.ac._hybrid_angle_reference_node_ids = (
+            self._physical_ac_angle_reference_node_ids()
+        )
+        try:
+            self._topo_with_hybrid_references()
+        finally:
+            if previous_references is None:
+                self.ac.__dict__.pop("_hybrid_angle_reference_node_ids", None)
+            else:
+                self.ac._hybrid_angle_reference_node_ids = previous_references
+
+    def _topo_with_hybrid_references(self):
         grids = [grid for grid in (self.ac, self.dc) if grid.nodes]
         previous_defer = {
             id(grid): getattr(grid, "_defer_operational_island_filter", None)

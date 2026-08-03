@@ -3113,6 +3113,15 @@ def prepare_ac_topology(network) -> None:
                 gen.node_obj.bus_obj.v_gens.append(gen)
             island.v_gens.append(gen)
 
+    for node_id in getattr(network, "_hybrid_angle_reference_node_ids", ()):
+        node = node_dict.get(int(node_id))
+        if (
+            node is not None
+            and node.run_stat == 1
+            and node.isl_obj is not None
+        ):
+            node.isl_obj.is_alive = True
+
     network._auto_slack_generators = _select_object_ac_auto_slack_generators(
         network.islands,
     )
