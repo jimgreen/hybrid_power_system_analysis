@@ -1070,10 +1070,8 @@ class HybridPowerFlowCalc:
             result_mode="array",
             verbose=self.verbose,
         )
-        if hasattr(self.network, "_dc_ppc"):
-            calc._network_writeback = (
-                None if getattr(self.network.dc, "_lf_lightweight", False) else self.network.dc
-            )
+        if not getattr(self.network.dc, "_lf_lightweight", False):
+            calc._network_writeback = self.network.dc
         return calc
 
     def _clear_converter_outputs(self):

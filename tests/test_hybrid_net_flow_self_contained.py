@@ -364,6 +364,28 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsNotNone(calc.lf_result)
         _assert_dc_objects_match_array_result(self, dc_network, calc.result["dc"])
 
+    def test_general_full_hybrid_writes_dc_objects_when_only_dc_object_owns_ppc(self):
+        from dc_array_model import build_dc_ppc_from_network
+        from hybrid_model import HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        dc_network = _live_dc_object_network()
+        dc_network.ppc = build_dc_ppc_from_network(dc_network)
+        network = HybridPowerNetwork(_live_ac_object_network(), dc_network, [], [])
+        self.assertFalse(hasattr(network, "_dc_ppc"))
+        calc = HybridPowerFlowCalc(
+            network,
+            result_mode="full",
+            linear_solver="scipy",
+            verbose=False,
+        )
+        _pollute_dc_object_results(dc_network)
+
+        self.assertEqual(0, calc.run())
+
+        self.assertIsNotNone(calc.lf_result)
+        _assert_dc_objects_match_array_result(self, dc_network, calc.result["dc"])
+
     def test_live_full_object_sides_do_not_build_unused_skipped_ppc_snapshots(self):
         from unittest import mock
 
