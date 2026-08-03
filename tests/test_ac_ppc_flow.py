@@ -119,7 +119,89 @@ def _mixed_live_dead_ac_ppc(stale=99.0):
     return ppc, dynamic_columns
 
 
+def _ac_ppc_with_active_and_inactive_acac(stale=99.0):
+    from ac_array_model import ACAC_COLS
+    from hybrid_array_model import build_hybrid_ppc_from_e_file
+    from model.ppc_topology import ensure_ac_ppc_topology
+
+    _, hybrid_ppc = build_hybrid_ppc_from_e_file(
+        ROOT_DIR / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+    )
+    ppc = hybrid_ppc["ac"]
+    active = ppc["acac"][0].copy()
+    inactive = active.copy()
+    inactive[ACAC_COLS["idx"]] = 2
+    inactive[ACAC_COLS["run_stat"]] = 0
+    dynamic_columns = tuple(
+        ACAC_COLS[name] for name in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i")
+    )
+    active[list(dynamic_columns)] = stale
+    inactive[list(dynamic_columns)] = stale
+    ppc["acac"] = np.vstack((active, inactive))
+    ppc["acac_name"] = np.asarray(["active-acac", "inactive-acac"], dtype=object)
+    ensure_ac_ppc_topology(ppc)
+    return ppc, dynamic_columns
+
+
 class ACPPCFlowTest(unittest.TestCase):
+    def test_acac_delegation_owns_working_table_and_zeroes_inactive_results(self):
+        from ac_array_model import ACAC_COLS
+        from ac_lf import ACPowerFlowCalc
+
+        expected_active = None
+        for result_mode in ("array", "summary", "full", "none"):
+            with self.subTest(result_mode=result_mode):
+                ppc, dynamic_columns = _ac_ppc_with_active_and_inactive_acac()
+                source = ppc["acac"].copy()
+                calc = ACPowerFlowCalc(ppc, result_mode=result_mode, verbose=False)
+
+                self.assertEqual(0, calc.run())
+                self.assertTrue(calc.converged)
+                np.testing.assert_array_equal(ppc["acac"], source)
+
+                delegated = calc._delegated_hybrid_calc
+                self.assertIsNot(delegated.network.ppc["acac"], ppc["acac"])
+                self.assertIs(
+                    delegated.network.ppc["ac"]["acac"],
+                    delegated.network.ppc["acac"],
+                )
+                self.assertEqual([0], delegated.acac_row_pos.tolist())
+
+                if result_mode == "none":
+                    self.assertEqual({}, calc.result)
+                    continue
+
+                result = calc.result["acac"]
+                self.assertEqual(source.shape, result.shape)
+                static_columns = [
+                    column
+                    for column in range(source.shape[1])
+                    if column not in dynamic_columns
+                ]
+                np.testing.assert_array_equal(
+                    result[:, static_columns],
+                    source[:, static_columns],
+                )
+                np.testing.assert_array_equal(
+                    result[1, list(dynamic_columns)],
+                    np.zeros(len(dynamic_columns)),
+                )
+                self.assertEqual(1, int(result[0, ACAC_COLS["run_stat"]]))
+                self.assertEqual(0, int(result[1, ACAC_COLS["run_stat"]]))
+
+                active_result = result[0, list(dynamic_columns)]
+                self.assertTrue(np.any(np.abs(active_result) > 1e-12))
+                self.assertFalse(np.all(active_result == 99.0))
+                if expected_active is None:
+                    expected_active = active_result.copy()
+                else:
+                    np.testing.assert_allclose(
+                        active_result,
+                        expected_active,
+                        rtol=1e-9,
+                        atol=1e-9,
+                    )
+
     def test_ac_ppc_writeback_zeroes_inactive_island_dynamic_rows(self):
         from ac_array_model import BUS_COLS
         from ac_lf import ACPowerFlowCalc

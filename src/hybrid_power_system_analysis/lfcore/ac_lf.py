@@ -2548,7 +2548,13 @@ class ACPowerFlowCalc:
         )
 
         base = self.ppc["base"]
-        ac_network = _lightweight_ac_network(self.ppc)
+        source_acac = self.ppc.get("acac")
+        if source_acac is None:
+            source_acac = np.zeros((0, len(ACAC_COLS)), dtype=np.float64)
+        working_acac = np.asarray(source_acac, dtype=np.float64).copy()
+        ac_ppc = dict(self.ppc)
+        ac_ppc["acac"] = working_acac
+        ac_network = _lightweight_ac_network(ac_ppc)
         dc_network = _lightweight_dc_network()
         network = _LightweightHybridNetwork(
             _lf_lightweight=True,
@@ -2562,26 +2568,27 @@ class ACPowerFlowCalc:
             "format": "hybrid_ppc_v1",
             "source": self.ppc.get("source", "<ac_ppc>"),
             "base": base,
-            "ac": self.ppc,
+            "ac": ac_ppc,
             "dc": None,
             "dcac": np.zeros((0, len(DCAC_COLS)), dtype=np.float64),
             "dcac_name": np.asarray([], dtype=object),
-            "acac": self.ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)),
+            "acac": working_acac,
             "acac_name": self.ppc.get("acac_name", np.asarray([], dtype=object)),
         }
-        network._ac_ppc = self.ppc
+        network._ac_ppc = ac_ppc
         network.p_base = float(base["p_base"])
         network.u_scale = float(base["u_scale"])
         network.p_scale = float(base["p_scale"])
         network.i_scale = float(base["i_scale"])
         network.p_base_kW = float(base["p_base_kW"])
 
+        hybrid_result_mode = "array" if self.result_mode == "summary" else self.result_mode
         calc = HybridPowerFlowCalc(
             network,
             parameters=self.params,
             keep_node_objects=False,
             linear_solver=self.linear_solver,
-            result_mode=self.result_mode,
+            result_mode=hybrid_result_mode,
             verbose=self.verbose,
         )
         rc = calc.run()
@@ -2603,17 +2610,21 @@ class ACPowerFlowCalc:
                 if hasattr(calc.ac_calc, attr):
                     setattr(self, attr, getattr(calc.ac_calc, attr))
         ac_result = calc.result.get("ac", {}) if isinstance(calc.result, dict) else {}
-        self.result = dict(ac_result)
-        acac_table = self.ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)).copy()
+        if self.result_mode == "summary":
+            self.result = calc._ac_array_summary(ac_result) or {}
+        else:
+            self.result = dict(ac_result)
+        acac_table = np.asarray(source_acac, dtype=np.float64).copy()
+        acac_result_columns = [
+            ACAC_COLS[name]
+            for name in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i")
+        ]
+        if acac_table.size:
+            acac_table[:, acac_result_columns] = 0.0
         acac_result = calc.result.get("acac") if isinstance(calc.result, dict) else None
         if acac_result is not None and getattr(calc, "acac_row_pos", np.array([], dtype=np.int32)).size:
             rows = calc.acac_row_pos
-            acac_table[rows, ACAC_COLS["i_p"]] = acac_result[:, 0]
-            acac_table[rows, ACAC_COLS["i_q"]] = acac_result[:, 1]
-            acac_table[rows, ACAC_COLS["j_p"]] = acac_result[:, 2]
-            acac_table[rows, ACAC_COLS["j_q"]] = acac_result[:, 3]
-            acac_table[rows, ACAC_COLS["i_i"]] = acac_result[:, 4]
-            acac_table[rows, ACAC_COLS["j_i"]] = acac_result[:, 5]
+            acac_table[np.ix_(rows, acac_result_columns)] = acac_result
         if self.result_mode != "none":
             self.result["acac"] = acac_table
         if self._network_writeback is not None and self.result_mode not in ("none", "summary"):
