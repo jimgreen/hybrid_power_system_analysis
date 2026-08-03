@@ -175,6 +175,39 @@ class HybridPowerNetwork:
                     grid._operational_island_ids_override = previous
         self._build_hybrid_topo()
 
+    def _local_reference_island_ids(self):
+        ac_ids = {id(island) for island in self.ac.islands if island.is_alive}
+        dc_ids = {id(island) for island in self.dc.islands if island.is_alive}
+        for conv in self.dcac_converters:
+            ac_node = self.ac.node_dict.get(conv.ac_node)
+            dc_node = self.dc.node_dict.get(conv.dc_node)
+            if (
+                conv.run_stat != 1
+                or ac_node is None
+                or dc_node is None
+                or ac_node.run_stat != 1
+                or dc_node.run_stat != 1
+                or ac_node.isl_obj is None
+                or dc_node.isl_obj is None
+            ):
+                continue
+            if str(conv.ac_control_type).upper() == "PH":
+                ac_ids.add(id(ac_node.isl_obj))
+            if str(conv.dc_control_type).upper() == "V":
+                dc_ids.add(id(dc_node.isl_obj))
+        for conv in self.acac_converters:
+            i_node = self.ac.node_dict.get(conv.i_node)
+            j_node = self.ac.node_dict.get(conv.j_node)
+            if conv.run_stat != 1 or i_node is None or j_node is None:
+                continue
+            if i_node.run_stat != 1 or j_node.run_stat != 1:
+                continue
+            if i_node.isl_obj is not None and str(conv.i_control_type).upper() == "PH":
+                ac_ids.add(id(i_node.isl_obj))
+            if j_node.isl_obj is not None and str(conv.j_control_type).upper() == "PH":
+                ac_ids.add(id(j_node.isl_obj))
+        return ac_ids, dc_ids
+
     def _build_hybrid_topo(self, evaluate_operational: bool = False):
         ac_islands = self.ac.islands
         dc_islands = self.dc.islands
@@ -216,6 +249,23 @@ class HybridPowerNetwork:
             if left_root != right_root:
                 parent[right_root] = left_root
 
+        ac_local_ids, dc_local_ids = self._local_reference_island_ids()
+
+        def eligible_link(
+            physical_alive,
+            left_island,
+            right_island,
+            left_ids,
+            right_ids,
+            left_node,
+            right_node,
+        ):
+            if not physical_alive:
+                return False
+            if evaluate_operational:
+                return id(left_island) in left_ids and id(right_island) in right_ids
+            return bool(left_node.is_alive and right_node.is_alive)
+
         for conv in self.dcac_converters:
             ac_node = self.ac.node_dict.get(conv.ac_node)
             dc_node = self.dc.node_dict.get(conv.dc_node)
@@ -232,10 +282,17 @@ class HybridPowerNetwork:
                 and conv.ac_isl_obj is not None
                 and conv.dc_isl_obj is not None
             )
-            conv.is_alive = physical_alive and (
-                evaluate_operational or (ac_node.is_alive and dc_node.is_alive)
+            link_alive = eligible_link(
+                physical_alive,
+                conv.ac_isl_obj,
+                conv.dc_isl_obj,
+                ac_local_ids,
+                dc_local_ids,
+                ac_node,
+                dc_node,
             )
-            if physical_alive:
+            conv.is_alive = link_alive
+            if link_alive:
                 union(conv.ac_isl_obj, conv.dc_isl_obj)
 
         for conv in self.acac_converters:
@@ -254,10 +311,17 @@ class HybridPowerNetwork:
                 and conv.i_isl_obj is not None
                 and conv.j_isl_obj is not None
             )
-            conv.is_alive = physical_alive and (
-                evaluate_operational or (i_node.is_alive and j_node.is_alive)
+            link_alive = eligible_link(
+                physical_alive,
+                conv.i_isl_obj,
+                conv.j_isl_obj,
+                ac_local_ids,
+                ac_local_ids,
+                i_node,
+                j_node,
             )
-            if physical_alive:
+            conv.is_alive = link_alive
+            if link_alive:
                 union(conv.i_isl_obj, conv.j_isl_obj)
 
         for conv in self.dc.dcdc_converters:
@@ -272,15 +336,18 @@ class HybridPowerNetwork:
                 and i_node.isl_obj is not None
                 and j_node.isl_obj is not None
             )
-            conv.is_alive = physical_alive and (
-                evaluate_operational or (i_node.is_alive and j_node.is_alive)
+            link_alive = eligible_link(
+                physical_alive,
+                None if i_node is None else i_node.isl_obj,
+                None if j_node is None else j_node.isl_obj,
+                dc_local_ids,
+                dc_local_ids,
+                i_node,
+                j_node,
             )
-            if not physical_alive:
-                continue
-            union(
-                i_node.isl_obj,
-                j_node.isl_obj,
-            )
+            conv.is_alive = link_alive
+            if link_alive:
+                union(i_node.isl_obj, j_node.isl_obj)
 
         grouped = {}
         for island in ac_islands:
@@ -331,10 +398,10 @@ class HybridPowerNetwork:
             hybrid_island.add_acac_converter(conv)
 
         if evaluate_operational:
-            return self._evaluate_hybrid_operational_islands()
+            return self._evaluate_hybrid_operational_islands(ac_local_ids, dc_local_ids)
         return set(), set()
 
-    def _evaluate_hybrid_operational_islands(self):
+    def _evaluate_hybrid_operational_islands(self, ac_local_ids, dc_local_ids):
         ac_operational = set()
         dc_operational = set()
         ac_auto_balance_ids = {
@@ -342,8 +409,9 @@ class HybridPowerNetwork:
         }
         for hybrid_island in self.hybrid_islands:
             has_reference = any(
-                island.is_alive
-                for island in (*hybrid_island.ac_islands, *hybrid_island.dc_islands)
+                id(island) in ac_local_ids for island in hybrid_island.ac_islands
+            ) or any(
+                id(island) in dc_local_ids for island in hybrid_island.dc_islands
             )
             generator_count = 0
             balance_count = 0

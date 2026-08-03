@@ -38,7 +38,9 @@ from model.dc_array_model import (
     build_dc_ppc_from_efile_rows,
 )
 from model.hybrid_array_model import (
+    DCAC_AC_CONTROL_CODE,
     DCAC_COLS,
+    DCAC_DC_CONTROL_CODE,
     build_hybrid_ppc_only_from_efile_rows,
 )
 
@@ -395,25 +397,41 @@ def _apply_hybrid_operational_island_filter(ppc: Dict) -> None:
         )
 
 
+def _running_node_ids(ppc, cols):
+    table = None if ppc is None else np.asarray(ppc.get("bus", ()), dtype=np.float64)
+    if table is None or not table.size:
+        return np.empty(0, dtype=np.int64)
+    running = table[:, cols["run_stat"]].astype(np.int64, copy=False) == 1
+    return table[running, cols["idx"]].astype(np.int64, copy=False)
+
+
 def _attach_hybrid_dc_reference_nodes(ppc: Dict) -> None:
     ac_ppc = ppc.get("ac")
     dc_ppc = ppc.get("dc")
     dcac = ppc.get("dcac")
-    if dc_ppc is None or dcac is None or getattr(dcac, "size", 0) == 0:
+    if (
+        ac_ppc is None
+        or dc_ppc is None
+        or dcac is None
+        or getattr(dcac, "size", 0) == 0
+    ):
         return
-    ctrl = dcac[:, DCAC_COLS["dc_control_type"]].astype(int, copy=False)
-    run = dcac[:, DCAC_COLS["run_stat"]].astype(int, copy=False) == 1
-    dcv_mask = run & (ctrl == 2)
-    if ac_ppc is not None and dcv_mask.any():
-        ac_bus = ac_ppc.get("bus")
-        if ac_bus is not None and getattr(ac_bus, "size", 0):
-            active_ac_ids = ac_bus[
-                ac_bus[:, AC_BUS_COLS["run_stat"]].astype(int, copy=False) == 1,
-                AC_BUS_COLS["idx"],
-            ].astype(int, copy=False)
-            dcv_mask &= np.isin(dcac[:, DCAC_COLS["ac_node"]].astype(int, copy=False), active_ac_ids)
+    dcac = np.asarray(dcac, dtype=np.float64)
+    ctrl = dcac[:, DCAC_COLS["dc_control_type"]].astype(np.int64, copy=False)
+    run = dcac[:, DCAC_COLS["run_stat"]].astype(np.int64, copy=False) == 1
+    active_ac_ids = _running_node_ids(ac_ppc, AC_BUS_COLS)
+    active_dc_ids = _running_node_ids(dc_ppc, DC_BUS_COLS)
+    dcv_mask = (
+        run
+        & (ctrl == DCAC_DC_CONTROL_CODE["V"])
+        & np.isin(dcac[:, DCAC_COLS["ac_node"]].astype(int), active_ac_ids)
+        & np.isin(dcac[:, DCAC_COLS["dc_node"]].astype(int), active_dc_ids)
+    )
     if not dcv_mask.any():
-        had_external_refs = "_external_voltage_reference_node_ids" in dc_ppc or "_external_voltage_reference_pu" in dc_ppc
+        had_external_refs = (
+            "_external_voltage_reference_node_ids" in dc_ppc
+            or "_external_voltage_reference_pu" in dc_ppc
+        )
         dc_ppc.pop("_external_voltage_reference_node_ids", None)
         dc_ppc.pop("_external_voltage_reference_pu", None)
         if had_external_refs:
@@ -421,85 +439,92 @@ def _attach_hybrid_dc_reference_nodes(ppc: Dict) -> None:
         return
 
     ref_nodes, unique_pos = np.unique(
-        dcac[dcv_mask, DCAC_COLS["dc_node"]].astype(int, copy=False),
+        dcac[dcv_mask, DCAC_COLS["dc_node"]].astype(np.int64, copy=False),
         return_index=True,
     )
-    if ref_nodes.size:
-        ref_values = dcac[dcv_mask, DCAC_COLS["v_dc_set"]][unique_pos].astype(
-            float,
-            copy=False,
-        )
-        old_nodes = np.asarray(dc_ppc.get("_external_voltage_reference_node_ids", []), dtype=int)
-        old_values = np.asarray(dc_ppc.get("_external_voltage_reference_pu", []), dtype=float)
-        changed = (
-            old_nodes.shape != ref_nodes.shape
-            or old_values.shape != ref_values.shape
-            or not np.array_equal(old_nodes, ref_nodes)
-            or not np.allclose(old_values, ref_values)
-        )
-        dc_ppc["_external_voltage_reference_node_ids"] = ref_nodes.astype(int, copy=False)
-        dc_ppc["_external_voltage_reference_pu"] = ref_values
-        if changed:
-            dc_ppc.pop("_topology_arrays", None)
-    else:
-        had_external_refs = "_external_voltage_reference_node_ids" in dc_ppc or "_external_voltage_reference_pu" in dc_ppc
-        dc_ppc.pop("_external_voltage_reference_node_ids", None)
-        dc_ppc.pop("_external_voltage_reference_pu", None)
-        if had_external_refs:
-            dc_ppc.pop("_topology_arrays", None)
+    ref_values = dcac[dcv_mask, DCAC_COLS["v_dc_set"]][unique_pos].astype(
+        np.float64,
+        copy=False,
+    )
+    old_nodes = np.asarray(
+        dc_ppc.get("_external_voltage_reference_node_ids", []),
+        dtype=np.int64,
+    )
+    old_values = np.asarray(
+        dc_ppc.get("_external_voltage_reference_pu", []),
+        dtype=np.float64,
+    )
+    changed = (
+        old_nodes.shape != ref_nodes.shape
+        or old_values.shape != ref_values.shape
+        or not np.array_equal(old_nodes, ref_nodes)
+        or not np.allclose(old_values, ref_values)
+    )
+    dc_ppc["_external_voltage_reference_node_ids"] = ref_nodes
+    dc_ppc["_external_voltage_reference_pu"] = ref_values
+    if changed:
+        dc_ppc.pop("_topology_arrays", None)
 
 
 def _attach_hybrid_ac_reference_nodes(ppc: Dict) -> None:
     ac_ppc = ppc.get("ac")
     dc_ppc = ppc.get("dc")
     dcac = ppc.get("dcac")
-    if ac_ppc is None or dc_ppc is None or dcac is None or getattr(dcac, "size", 0) == 0:
+    if (
+        ac_ppc is None
+        or dc_ppc is None
+        or dcac is None
+        or getattr(dcac, "size", 0) == 0
+    ):
         return
-    dcac = dcac
-    ctrl = dcac[:, DCAC_COLS["ac_control_type"]].astype(int, copy=False)
-    run = dcac[:, DCAC_COLS["run_stat"]].astype(int, copy=False) == 1
-    acv_mask = run & (ctrl == 3)
+    dcac = np.asarray(dcac, dtype=np.float64)
+    ctrl = dcac[:, DCAC_COLS["ac_control_type"]].astype(np.int64, copy=False)
+    run = dcac[:, DCAC_COLS["run_stat"]].astype(np.int64, copy=False) == 1
+    active_ac_ids = _running_node_ids(ac_ppc, AC_BUS_COLS)
+    active_dc_ids = _running_node_ids(dc_ppc, DC_BUS_COLS)
+    acv_mask = (
+        run
+        & (ctrl == DCAC_AC_CONTROL_CODE["PH"])
+        & np.isin(dcac[:, DCAC_COLS["ac_node"]].astype(int), active_ac_ids)
+        & np.isin(dcac[:, DCAC_COLS["dc_node"]].astype(int), active_dc_ids)
+    )
     if not acv_mask.any():
-        had_external_refs = "_external_angle_reference_node_ids" in ac_ppc or "_external_voltage_reference_pu" in ac_ppc
+        had_external_refs = (
+            "_external_angle_reference_node_ids" in ac_ppc
+            or "_external_voltage_reference_pu" in ac_ppc
+        )
         ac_ppc.pop("_external_angle_reference_node_ids", None)
         ac_ppc.pop("_external_voltage_reference_pu", None)
         if had_external_refs:
             ac_ppc.pop("_topology_arrays", None)
         return
-
-    dc_topology = dc_ppc.get("_topology_arrays")
-    if dc_topology is not None:
-        dc_bus = dc_ppc.get("bus")
-        alive_dc_ids = dc_bus[dc_topology.node_alive_mask, DC_BUS_COLS["idx"]].astype(int, copy=False)
-        acv_mask &= np.isin(dcac[:, DCAC_COLS["dc_node"]].astype(int, copy=False), alive_dc_ids)
 
     ref_nodes, unique_pos = np.unique(
-        dcac[acv_mask, DCAC_COLS["ac_node"]].astype(int, copy=False),
+        dcac[acv_mask, DCAC_COLS["ac_node"]].astype(np.int64, copy=False),
         return_index=True,
     )
-    if ref_nodes.size:
-        ref_values = dcac[acv_mask, DCAC_COLS["v_ac_set"]][unique_pos].astype(
-            float,
-            copy=False,
-        )
-        old_nodes = np.asarray(ac_ppc.get("_external_angle_reference_node_ids", []), dtype=int)
-        old_values = np.asarray(ac_ppc.get("_external_voltage_reference_pu", []), dtype=float)
-        changed = (
-            old_nodes.shape != ref_nodes.shape
-            or old_values.shape != ref_values.shape
-            or not np.array_equal(old_nodes, ref_nodes)
-            or not np.allclose(old_values, ref_values)
-        )
-        ac_ppc["_external_angle_reference_node_ids"] = ref_nodes.astype(int, copy=False)
-        ac_ppc["_external_voltage_reference_pu"] = ref_values
-        if changed:
-            ac_ppc.pop("_topology_arrays", None)
-    else:
-        had_external_refs = "_external_angle_reference_node_ids" in ac_ppc or "_external_voltage_reference_pu" in ac_ppc
-        ac_ppc.pop("_external_angle_reference_node_ids", None)
-        ac_ppc.pop("_external_voltage_reference_pu", None)
-        if had_external_refs:
-            ac_ppc.pop("_topology_arrays", None)
+    ref_values = dcac[acv_mask, DCAC_COLS["v_ac_set"]][unique_pos].astype(
+        np.float64,
+        copy=False,
+    )
+    old_nodes = np.asarray(
+        ac_ppc.get("_external_angle_reference_node_ids", []),
+        dtype=np.int64,
+    )
+    old_values = np.asarray(
+        ac_ppc.get("_external_voltage_reference_pu", []),
+        dtype=np.float64,
+    )
+    changed = (
+        old_nodes.shape != ref_nodes.shape
+        or old_values.shape != ref_values.shape
+        or not np.array_equal(old_nodes, ref_nodes)
+        or not np.allclose(old_values, ref_values)
+    )
+    ac_ppc["_external_angle_reference_node_ids"] = ref_nodes
+    ac_ppc["_external_voltage_reference_pu"] = ref_values
+    if changed:
+        ac_ppc.pop("_topology_arrays", None)
 
 
 def build_ac_ppc_with_topology_from_e_file(file_path) -> Dict:

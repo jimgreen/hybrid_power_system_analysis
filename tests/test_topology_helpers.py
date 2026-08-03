@@ -123,7 +123,13 @@ def _build_dc_island_ppc(*, breaker_status=0, real_bus_node=1):
     return build_dc_ppc_from_efile_rows(Path("dc_island.e"), rows)
 
 
-def _build_hybrid_island_ppc(*, dc_breaker_status=1):
+def _build_hybrid_island_ppc(
+    *,
+    dc_breaker_status=1,
+    connect_ac_terminal=False,
+    ac_control_type="PH",
+    dc_control_type="NONE",
+):
     from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
 
     rows = {
@@ -169,10 +175,83 @@ def _build_hybrid_island_ppc(*, dc_breaker_status=1):
         ),
         "DCACConverter": _table(
             "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
-            [[1, "grid_converter", 2, 2, "PH", "NONE", 0, 0, 380, 750, 1, 0, 0]],
+            [
+                [
+                    1,
+                    "grid_converter",
+                    2,
+                    2,
+                    ac_control_type,
+                    dc_control_type,
+                    0,
+                    0,
+                    380,
+                    750,
+                    1,
+                    0,
+                    0,
+                ]
+            ],
         ),
     }
+    if connect_ac_terminal:
+        rows["ACBranch"] = _table(
+            "idx name i_node j_node r x b run_stat",
+            [[1, "converter_ac_tie", 1, 2, 0.01, 0.1, 0.0, 1]],
+        )
     return build_hybrid_ppc_with_topology_from_efile_rows(Path("hybrid_island.e"), rows)
+
+
+def _build_acac_source_to_unreferenced_load_ppc():
+    from model.ac_array_model import build_ac_ppc_from_efile_rows
+    from model.ppc_topology import ensure_ac_ppc_topology
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "acac_local_ref", 100, "V", "kW", "A"]]),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[1, "source-node", 380, 380, 0, 1], [2, "load-node", 380, 380, 0, 1]],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha run_stat",
+            [[1, "source-only-slack", 1, "PH", 0, 0, 380, 1, 1]],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [[1, "unreferenced-load", 2, 10, 1, 0, 0, 2, 1, 0, 0, 1]],
+        ),
+        "ACACConverter": _table(
+            "idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
+            [[1, "pq-link", 1, 2, 0, 0, "PQ", "PQ", 0, 0, 0, 380, 380, 1]],
+        ),
+    }
+    return ensure_ac_ppc_topology(build_ac_ppc_from_efile_rows(Path("acac_local_ref.e"), rows))
+
+
+def _build_dcdc_source_to_unreferenced_load_ppc():
+    from model.dc_array_model import build_dc_ppc_from_efile_rows
+    from model.ppc_topology import ensure_dc_ppc_topology
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "dcdc_local_ref", 100, "V", "kW", "A"]]),
+        "DCNode": _table(
+            "idx name vbase voltage run_stat",
+            [[1, "source-node", 750, 750, 1], [2, "load-node", 750, 750, 1]],
+        ),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set i_set run_stat",
+            [[1, "source-only-voltage", 1, "V", 750, 0, 0, 1]],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat",
+            [[1, "unreferenced-load", 2, 10, 1, 0, 0, 1]],
+        ),
+        "DCDCConverter": _table(
+            "idx name i_node j_node i_control_type j_control_type p_set i_set v_set run_stat r1 r2",
+            [[1, "none-link", 1, 2, "P", "NONE", 0, 0, 750, 1, 0, 0]],
+        ),
+    }
+    return ensure_dc_ppc_topology(build_dc_ppc_from_efile_rows(Path("dcdc_local_ref.e"), rows))
 
 
 class TopologyHelperTest(unittest.TestCase):
@@ -260,6 +339,80 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertFalse(network.dcdc_converters[0].is_alive)
         self.assertEqual([True, True], [island.is_alive for island in connected.islands])
         self.assertTrue(connected.dcdc_converters[0].is_alive)
+
+    def test_hybrid_pq_none_converter_cannot_keep_dangling_dc_terminal_alive(self):
+        ppc = _build_hybrid_island_ppc(
+            dc_breaker_status=0,
+            connect_ac_terminal=True,
+            ac_control_type="PQ",
+            dc_control_type="NONE",
+        )
+
+        self.assertEqual([True], ppc["ac"]["_topology_arrays"].island_alive_mask.tolist())
+        self.assertEqual([True, False], ppc["dc"]["_topology_arrays"].island_alive_mask.tolist())
+        self.assertFalse(ppc["dc"]["_topology_arrays"].node_alive_mask[1])
+
+    def test_hybrid_pq_none_converter_cannot_keep_dangling_ac_terminal_alive(self):
+        ppc = _build_hybrid_island_ppc(
+            dc_breaker_status=1,
+            connect_ac_terminal=False,
+            ac_control_type="PQ",
+            dc_control_type="NONE",
+        )
+
+        self.assertEqual([True, False], ppc["ac"]["_topology_arrays"].island_alive_mask.tolist())
+        self.assertEqual([True], ppc["dc"]["_topology_arrays"].island_alive_mask.tolist())
+
+    def test_hybrid_converter_remains_connected_when_both_endpoint_islands_have_local_references(self):
+        ppc = _build_hybrid_island_ppc(
+            dc_breaker_status=1,
+            connect_ac_terminal=False,
+            ac_control_type="PH",
+            dc_control_type="NONE",
+        )
+
+        self.assertEqual([True, True], ppc["ac"]["_topology_arrays"].island_alive_mask.tolist())
+        self.assertEqual([True], ppc["dc"]["_topology_arrays"].island_alive_mask.tolist())
+
+    def test_acac_does_not_count_load_from_unreferenced_endpoint(self):
+        ppc = _build_acac_source_to_unreferenced_load_ppc()
+        arrays = ppc["_topology_arrays"]
+        self.assertEqual([False, False], arrays.island_alive_mask.tolist())
+        self.assertEqual([False], arrays.devices["acac"].alive_mask.tolist())
+
+    def test_dcdc_does_not_count_load_from_unreferenced_endpoint(self):
+        ppc = _build_dcdc_source_to_unreferenced_load_ppc()
+        arrays = ppc["_topology_arrays"]
+        self.assertEqual([False, False], arrays.island_alive_mask.tolist())
+        self.assertEqual([False], arrays.devices["dcdc"].alive_mask.tolist())
+
+    def test_hybrid_object_topology_matches_ppc_local_reference_filter(self):
+        from model.ac_array_model import build_ac_network_from_ppc
+        from model.dc_array_model import build_dc_network_from_ppc
+        from model.hybrid_array_model import build_hybrid_model_from_ppc
+
+        ppc = _build_hybrid_island_ppc(
+            dc_breaker_status=0,
+            connect_ac_terminal=True,
+            ac_control_type="PQ",
+            dc_control_type="NONE",
+        )
+        object_ppc = dict(ppc)
+        object_ppc["ac_network"] = build_ac_network_from_ppc(ppc["ac"])
+        object_ppc["dc_network"] = build_dc_network_from_ppc(ppc["dc"])
+        network = build_hybrid_model_from_ppc(object_ppc)
+
+        network.topo()
+
+        self.assertEqual(
+            ppc["ac"]["_topology_arrays"].island_alive_mask.tolist(),
+            [island.is_alive for island in network.ac.islands],
+        )
+        self.assertEqual(
+            ppc["dc"]["_topology_arrays"].island_alive_mask.tolist(),
+            [island.is_alive for island in network.dc.islands],
+        )
+        self.assertFalse(network.dcac_converters[0].is_alive)
 
     def test_hybrid_device_composition_propagates_across_running_dcac(self):
         connected = _build_hybrid_island_ppc(dc_breaker_status=1)

@@ -850,8 +850,15 @@ def _online_single_device_rows_and_islands(
     return rows, island_pos[rows]
 
 
+def _local_reference_island_mask(topology: Optional[GridTopologyArrays]) -> np.ndarray:
+    if topology is None:
+        return np.zeros(0, dtype=bool)
+    return np.asarray(topology.island_reference_bus_pos, dtype=np.int32) >= 0
+
+
 def _append_terminal_island_links(
     topology: Optional[GridTopologyArrays],
+    local_reference_mask: np.ndarray,
     terminals: Sequence[Optional[TerminalDeviceTopologyInput]],
     offset: int,
     left_parts,
@@ -888,7 +895,13 @@ def _append_terminal_island_links(
             continue
         i_islands = topology.node_to_island_pos[i_node_pos[valid]]
         j_islands = topology.node_to_island_pos[j_node_pos[valid]]
-        valid_islands = (i_islands >= 0) & (j_islands >= 0) & (i_islands != j_islands)
+        valid_islands = (
+            (i_islands >= 0)
+            & (j_islands >= 0)
+            & (i_islands != j_islands)
+            & local_reference_mask[i_islands]
+            & local_reference_mask[j_islands]
+        )
         if np.any(valid_islands):
             left_parts.append(i_islands[valid_islands] + int(offset))
             right_parts.append(j_islands[valid_islands] + int(offset))
@@ -910,14 +923,7 @@ def hybrid_operational_island_masks(
     dcac_dc_node_ids=(),
     dcac_run_mask=(),
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Judge physical components by references and online device composition.
-
-    Electrical islands are first linked through running AC/AC, DC/DC, and
-    DC/AC converters. A resulting physical component is operational only when
-    it has a load-flow reference and at least one real balance generator. A
-    component containing exactly one balance generator and no other online
-    generator or load is intentionally treated as a dead island.
-    """
+    """Judge hybrid components after every endpoint has a local reference."""
 
     ac_count = 0 if ac_topology is None else int(ac_topology.island_ids.size)
     dc_count = 0 if dc_topology is None else int(dc_topology.island_ids.size)
@@ -925,10 +931,28 @@ def hybrid_operational_island_masks(
     if total_count == 0:
         return np.zeros(ac_count, dtype=bool), np.zeros(dc_count, dtype=bool)
 
+    ac_local = _local_reference_island_mask(ac_topology)
+    dc_local = _local_reference_island_mask(dc_topology)
+    local_eligible = np.concatenate((ac_local, dc_local))
+
     left_parts = []
     right_parts = []
-    _append_terminal_island_links(ac_topology, ac_linked_terminals, 0, left_parts, right_parts)
-    _append_terminal_island_links(dc_topology, dc_linked_terminals, ac_count, left_parts, right_parts)
+    _append_terminal_island_links(
+        ac_topology,
+        ac_local,
+        ac_linked_terminals,
+        0,
+        left_parts,
+        right_parts,
+    )
+    _append_terminal_island_links(
+        dc_topology,
+        dc_local,
+        dc_linked_terminals,
+        ac_count,
+        left_parts,
+        right_parts,
+    )
 
     if ac_topology is not None and dc_topology is not None:
         ac_node_ids = np.asarray(dcac_ac_node_ids, dtype=np.int64).reshape(-1)
@@ -960,7 +984,12 @@ def hybrid_operational_island_masks(
             if np.any(valid):
                 ac_islands = ac_topology.node_to_island_pos[ac_node_pos[valid]]
                 dc_islands = dc_topology.node_to_island_pos[dc_node_pos[valid]]
-                valid_islands = (ac_islands >= 0) & (dc_islands >= 0)
+                valid_islands = (
+                    (ac_islands >= 0)
+                    & (dc_islands >= 0)
+                    & ac_local[ac_islands]
+                    & dc_local[dc_islands]
+                )
                 if np.any(valid_islands):
                     left_parts.append(ac_islands[valid_islands])
                     right_parts.append(dc_islands[valid_islands] + ac_count)
@@ -981,41 +1010,51 @@ def hybrid_operational_island_masks(
         return_labels=True,
     )
 
-    def component_counts(island_positions, island_count, offset):
+    def component_counts(island_positions, island_count, offset, local_mask):
         positions = np.asarray(island_positions, dtype=np.int64).reshape(-1)
         valid = (positions >= 0) & (positions < int(island_count))
+        if np.any(valid):
+            valid_rows = np.flatnonzero(valid)
+            valid[valid_rows] &= local_mask[positions[valid_rows]]
         if not np.any(valid):
             return np.zeros(component_count, dtype=np.int64)
         components = component_by_island[positions[valid] + int(offset)]
-        return np.bincount(components, minlength=component_count).astype(np.int64, copy=False)
+        return np.bincount(components, minlength=component_count).astype(
+            np.int64,
+            copy=False,
+        )
 
-    reference_count = np.zeros(component_count, dtype=np.int64)
-    if ac_topology is not None and ac_count:
-        ac_references = np.asarray(ac_topology.island_reference_bus_pos, dtype=np.int32) >= 0
-        reference_count += np.bincount(
-            component_by_island[:ac_count],
-            weights=ac_references.astype(np.int8),
-            minlength=component_count,
-        ).astype(np.int64, copy=False)
-    if dc_topology is not None and dc_count:
-        dc_references = np.asarray(dc_topology.island_reference_bus_pos, dtype=np.int32) >= 0
-        reference_count += np.bincount(
-            component_by_island[ac_count:],
-            weights=dc_references.astype(np.int8),
-            minlength=component_count,
-        ).astype(np.int64, copy=False)
-
-    balance_count = component_counts(ac_balance_generator_islands, ac_count, 0)
-    balance_count += component_counts(dc_balance_generator_islands, dc_count, ac_count)
-    generator_count = component_counts(ac_generator_islands, ac_count, 0)
-    generator_count += component_counts(dc_generator_islands, dc_count, ac_count)
-    load_count = component_counts(ac_load_islands, ac_count, 0)
-    load_count += component_counts(dc_load_islands, dc_count, ac_count)
+    reference_count = np.bincount(
+        component_by_island,
+        weights=local_eligible.astype(np.int8),
+        minlength=component_count,
+    ).astype(np.int64, copy=False)
+    balance_count = component_counts(
+        ac_balance_generator_islands,
+        ac_count,
+        0,
+        ac_local,
+    )
+    balance_count += component_counts(
+        dc_balance_generator_islands,
+        dc_count,
+        ac_count,
+        dc_local,
+    )
+    generator_count = component_counts(ac_generator_islands, ac_count, 0, ac_local)
+    generator_count += component_counts(
+        dc_generator_islands,
+        dc_count,
+        ac_count,
+        dc_local,
+    )
+    load_count = component_counts(ac_load_islands, ac_count, 0, ac_local)
+    load_count += component_counts(dc_load_islands, dc_count, ac_count, dc_local)
 
     component_alive = (reference_count > 0) & (balance_count > 0)
     source_only = (balance_count == 1) & (generator_count == 1) & (load_count == 0)
     component_alive &= ~source_only
-    island_alive = component_alive[component_by_island]
+    island_alive = local_eligible & component_alive[component_by_island]
     return island_alive[:ac_count], island_alive[ac_count:]
 
 
