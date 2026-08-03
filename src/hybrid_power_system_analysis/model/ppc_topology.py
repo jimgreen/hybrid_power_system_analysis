@@ -276,10 +276,7 @@ def _hybrid_converter_topology_signature(ppc: Dict) -> bytes:
     return digest.digest()
 
 
-def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
-    """Attach AC PPC topology arrays when they are not already present."""
-    ensure_ac_ppc_gen_columns(ppc)
-    signature = _ac_topology_signature(ppc)
+def _ensure_ac_ppc_topology_with_signature(ppc: Dict, signature: bytes) -> Dict:
     if ppc.get("_topology_arrays") is None or ppc.get("_ac_topology_signature") != signature:
         ppc.pop("_topology_input", None)
         ppc["_topology_arrays"] = network_topology.prepare_ac_topology_ppc(ppc)
@@ -287,9 +284,13 @@ def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
     return ppc
 
 
-def ensure_dc_ppc_topology(ppc: Dict) -> Dict:
-    """Attach DC PPC topology arrays when they are not already present."""
-    signature = _dc_topology_signature(ppc)
+def ensure_ac_ppc_topology(ppc: Dict) -> Dict:
+    """Attach AC PPC topology arrays when they are not already present."""
+    ensure_ac_ppc_gen_columns(ppc)
+    return _ensure_ac_ppc_topology_with_signature(ppc, _ac_topology_signature(ppc))
+
+
+def _ensure_dc_ppc_topology_with_signature(ppc: Dict, signature: bytes) -> Dict:
     if ppc.get("_topology_arrays") is None or ppc.get("_dc_topology_signature") != signature:
         ppc.pop("_topology_input", None)
         ppc["_topology_arrays"] = network_topology.prepare_dc_topology_ppc(ppc)
@@ -297,27 +298,49 @@ def ensure_dc_ppc_topology(ppc: Dict) -> Dict:
     return ppc
 
 
+def ensure_dc_ppc_topology(ppc: Dict) -> Dict:
+    """Attach DC PPC topology arrays when they are not already present."""
+    return _ensure_dc_ppc_topology_with_signature(ppc, _dc_topology_signature(ppc))
+
+
 def ensure_hybrid_ppc_topology(ppc: Dict) -> Dict:
     """Attach AC/DC topology arrays to a hybrid PPC dictionary."""
     ac_ppc = ppc.get("ac")
     dc_ppc = ppc.get("dc")
     hybrid_signature = _hybrid_converter_topology_signature(ppc)
-    if ppc.get("_hybrid_converter_topology_signature") != hybrid_signature:
-        if ac_ppc is not None:
-            ac_ppc.pop("_topology_arrays", None)
-        if dc_ppc is not None:
-            dc_ppc.pop("_topology_arrays", None)
+    rebuild_both = ppc.get("_hybrid_converter_topology_signature") != hybrid_signature
+    if rebuild_both:
         ppc["_hybrid_converter_topology_signature"] = hybrid_signature
     if ac_ppc is not None:
         ac_ppc["_defer_operational_island_filter"] = True
+        ensure_ac_ppc_gen_columns(ac_ppc)
     if dc_ppc is not None:
         dc_ppc["_defer_operational_island_filter"] = True
     if dc_ppc is not None:
         _attach_hybrid_dc_reference_nodes(ppc)
-        ensure_dc_ppc_topology(dc_ppc)
     if ac_ppc is not None:
         _attach_hybrid_ac_reference_nodes(ppc)
-        ensure_ac_ppc_topology(ac_ppc)
+    if ac_ppc is not None:
+        ac_signature = _ac_topology_signature(ac_ppc)
+        rebuild_both = rebuild_both or (
+            ac_ppc.get("_topology_arrays") is None
+            or ac_ppc.get("_ac_topology_signature") != ac_signature
+        )
+    if dc_ppc is not None:
+        dc_signature = _dc_topology_signature(dc_ppc)
+        rebuild_both = rebuild_both or (
+            dc_ppc.get("_topology_arrays") is None
+            or dc_ppc.get("_dc_topology_signature") != dc_signature
+        )
+    if rebuild_both:
+        if ac_ppc is not None:
+            ac_ppc.pop("_topology_arrays", None)
+        if dc_ppc is not None:
+            dc_ppc.pop("_topology_arrays", None)
+    if dc_ppc is not None:
+        _ensure_dc_ppc_topology_with_signature(dc_ppc, dc_signature)
+    if ac_ppc is not None:
+        _ensure_ac_ppc_topology_with_signature(ac_ppc, ac_signature)
     _apply_hybrid_operational_island_filter(ppc)
     return ppc
 

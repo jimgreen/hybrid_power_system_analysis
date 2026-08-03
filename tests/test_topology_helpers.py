@@ -847,6 +847,50 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertEqual([True, True], ac_topology.island_alive_mask.tolist())
         self.assertGreaterEqual(int(ac_topology.island_reference_bus_pos[1]), 0)
 
+    def test_hybrid_topology_rebuilds_both_sides_when_one_side_recovers_component(self):
+        from model.ac_array_model import GEN_COLS
+        from model.dc_array_model import LOAD_COLS
+        from model.ppc_topology import ensure_hybrid_ppc_topology
+
+        ppc = _build_hybrid_island_ppc(dc_breaker_status=1)
+        ppc["ac"]["gen"][1, GEN_COLS["run_stat"]] = 0
+        ensure_hybrid_ppc_topology(ppc)
+        self.assertEqual(
+            [True, True],
+            ppc["ac"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+        self.assertEqual(
+            [True],
+            ppc["dc"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+
+        ppc["dc"]["load"][0, LOAD_COLS["run_stat"]] = 0
+        ensure_hybrid_ppc_topology(ppc)
+        self.assertEqual(
+            [True, False],
+            ppc["ac"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+        self.assertEqual(
+            [False],
+            ppc["dc"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+
+        ppc["dc"]["load"][0, LOAD_COLS["run_stat"]] = 1
+        ensure_hybrid_ppc_topology(ppc)
+
+        self.assertEqual(
+            [True, True],
+            ppc["ac"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+        self.assertEqual(
+            [True],
+            ppc["dc"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+        self.assertGreaterEqual(
+            int(ppc["ac"]["_topology_arrays"].island_reference_bus_pos[1]),
+            0,
+        )
+
     def test_ac_ppc_topology_auto_selects_one_capacity_ranked_pv_per_island(self):
         from model.topology import prepare_ac_topology_ppc
 
