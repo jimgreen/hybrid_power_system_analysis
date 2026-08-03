@@ -353,6 +353,42 @@ def _build_dcac_v_with_dcdc_hybrid_ppc():
     return build_hybrid_ppc_with_topology_from_efile_rows(Path("dcac_v_dcdc.e"), rows)
 
 
+def _build_dc_balance_to_ac_ph_hybrid_ppc():
+    from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+
+    rows = {
+        "Model": _table(
+            "path name p_base u_unit p_unit i_unit",
+            [["test", "dc_balance_ac_ph", 100, "V", "kW", "A"]],
+        ),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[1, "ac-load-node", 380, 380, 0, 1]],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [[1, "ac-load", 1, 10, 1, 0, 0, 2, 1, 0, 0, 1]],
+        ),
+        "DCNode": _table(
+            "idx name vbase voltage run_stat",
+            [[1, "dc-balance-node", 750, 750, 1]],
+        ),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set i_set run_stat",
+            [[1, "dc-balance-source", 1, "V", 750, 0, 0, 1]],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat",
+            [[1, "dc-load", 1, 10, 1, 0, 0, 1]],
+        ),
+        "DCACConverter": _table(
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "ph-none-link", 1, 1, "PH", "NONE", 0, 0, 380, 750, 1, 0, 0]],
+        ),
+    }
+    return build_hybrid_ppc_with_topology_from_efile_rows(Path("dc_balance_ac_ph.e"), rows)
+
+
 def _build_dcdc_source_to_unreferenced_load_ppc():
     from model.dc_array_model import build_dc_ppc_from_efile_rows
     from model.ppc_topology import ensure_dc_ppc_topology
@@ -587,12 +623,64 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertEqual([0], ppc["ac"]["_auto_slack_gen_rows"].tolist())
         self.assertEqual([True], ppc["ac"]["_topology_arrays"].island_alive_mask.tolist())
 
+    def test_dcac_ph_reference_remains_visible_to_hybrid_ac_solver_preparation(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+        from model.ac_array_model import build_ac_network_from_ppc
+        from model.dc_array_model import build_dc_network_from_ppc
+        from model.hybrid_array_model import build_hybrid_model_from_ppc
+
+        ppc = _build_dc_balance_to_ac_ph_hybrid_ppc()
+        self.assertEqual(
+            [True],
+            ppc["ac"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+        self.assertEqual(
+            [True],
+            ppc["dc"]["_topology_arrays"].island_alive_mask.tolist(),
+        )
+        object_ppc = dict(ppc)
+        object_ppc["ac_network"] = build_ac_network_from_ppc(ppc["ac"])
+        object_ppc["dc_network"] = build_dc_network_from_ppc(ppc["dc"])
+        network = build_hybrid_model_from_ppc(object_ppc)
+        network.topo()
+
+        calc = HybridPowerFlowCalc(
+            network,
+            verbose=False,
+            result_mode="none",
+            linear_solver="scipy",
+        )
+        calc.prepare()
+        np.testing.assert_array_equal(
+            np.asarray([1], dtype=np.int64),
+            ppc["ac"].get(
+                "_external_angle_reference_node_ids",
+                np.empty(0, dtype=np.int64),
+            ),
+        )
+
     def test_removing_last_dcac_v_reference_cannot_keep_dcdc_component_alive(self):
+        from lfcore.dc_lf import DCPowerFlowCalc
         from model.hybrid_array_model import DCAC_COLS
         from model.ppc_topology import ensure_hybrid_ppc_topology
 
         ppc = _build_dcac_v_with_dcdc_hybrid_ppc()
         self.assertEqual([True, True], ppc["dc"]["_topology_arrays"].island_alive_mask.tolist())
+        np.testing.assert_array_equal(
+            np.asarray([2], dtype=np.int64),
+            ppc["dc"].get(
+                "_external_voltage_reference_node_ids",
+                np.empty(0, dtype=np.int64),
+            ),
+        )
+        dc_calc = DCPowerFlowCalc(ppc["dc"], result_mode="none")
+        np.testing.assert_array_equal(
+            np.asarray([0, 1], dtype=np.int32),
+            dc_calc._dc_voltage_control_bus_positions(
+                ppc["dc"]["_topology_arrays"],
+            ),
+        )
+        dc_calc.prepare()
         previous_topology = ppc["dc"]["_topology_arrays"]
         ppc["dcac"] = np.empty((0, len(DCAC_COLS)), dtype=np.float64)
 
@@ -617,29 +705,46 @@ class TopologyHelperTest(unittest.TestCase):
             ac_control_type="PH",
             dc_control_type="V",
         )
-        ppc["ac"]["_external_angle_reference_node_ids"] = np.asarray([1], dtype=np.int64)
-        ppc["ac"]["_external_voltage_reference_pu"] = np.asarray([0.97], dtype=np.float64)
-        ppc["dc"]["_external_voltage_reference_node_ids"] = np.asarray([1], dtype=np.int64)
-        ppc["dc"]["_external_voltage_reference_pu"] = np.asarray([1.02], dtype=np.float64)
+        ppc["ac"]["_external_angle_reference_node_ids"] = np.asarray([2, 1], dtype=np.int64)
+        ppc["ac"]["_external_voltage_reference_pu"] = np.asarray([0.97, 0.96], dtype=np.float64)
+        ppc["dc"]["_external_voltage_reference_node_ids"] = np.asarray([2, 1], dtype=np.int64)
+        ppc["dc"]["_external_voltage_reference_pu"] = np.asarray([1.02, 1.01], dtype=np.float64)
+        ensure_hybrid_ppc_topology(ppc)
+        np.testing.assert_array_equal(
+            np.asarray([1, 2], dtype=np.int64),
+            ppc["ac"]["_external_angle_reference_node_ids"],
+        )
+        np.testing.assert_allclose(
+            np.asarray([0.96, 0.97], dtype=np.float64),
+            ppc["ac"]["_external_voltage_reference_pu"],
+        )
+        np.testing.assert_array_equal(
+            np.asarray([1, 2], dtype=np.int64),
+            ppc["dc"]["_external_voltage_reference_node_ids"],
+        )
+        np.testing.assert_allclose(
+            np.asarray([1.01, 1.02], dtype=np.float64),
+            ppc["dc"]["_external_voltage_reference_pu"],
+        )
         ensure_hybrid_ppc_topology(ppc)
         ppc["dcac"] = np.empty((0, len(DCAC_COLS)), dtype=np.float64)
 
         ensure_hybrid_ppc_topology(ppc)
 
         np.testing.assert_array_equal(
-            np.asarray([1], dtype=np.int64),
+            np.asarray([2, 1], dtype=np.int64),
             ppc["ac"]["_external_angle_reference_node_ids"],
         )
         np.testing.assert_allclose(
-            np.asarray([0.97], dtype=np.float64),
+            np.asarray([0.97, 0.96], dtype=np.float64),
             ppc["ac"]["_external_voltage_reference_pu"],
         )
         np.testing.assert_array_equal(
-            np.asarray([1], dtype=np.int64),
+            np.asarray([2, 1], dtype=np.int64),
             ppc["dc"]["_external_voltage_reference_node_ids"],
         )
         np.testing.assert_allclose(
-            np.asarray([1.02], dtype=np.float64),
+            np.asarray([1.02, 1.01], dtype=np.float64),
             ppc["dc"]["_external_voltage_reference_pu"],
         )
         self.assertNotIn("_hybrid_dcac_angle_reference_node_ids", ppc["ac"])

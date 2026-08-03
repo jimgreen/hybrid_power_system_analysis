@@ -45,6 +45,10 @@ from model.hybrid_array_model import (
 )
 
 
+_HYBRID_DCAC_AC_REFERENCE_STATE_KEY = "_hybrid_dcac_ac_reference_state"
+_HYBRID_DCAC_DC_REFERENCE_STATE_KEY = "_hybrid_dcac_dc_reference_state"
+
+
 def _update_signature_table(digest, ppc: Dict, key: str, columns) -> None:
     table = np.asarray(ppc.get(key, ()), dtype=np.float64)
     digest.update(key.encode("ascii"))
@@ -444,10 +448,71 @@ def _running_node_ids(ppc, cols):
     return table[running, cols["idx"]].astype(np.int64, copy=False)
 
 
-def _update_hybrid_reference_metadata(
+def _reference_view(child_ppc: Dict, node_key: str, value_key: str):
+    return {
+        "node_present": node_key in child_ppc,
+        "value_present": value_key in child_ppc,
+        "nodes": np.asarray(child_ppc.get(node_key, ()), dtype=np.int64)
+        .reshape(-1)
+        .copy(),
+        "values": np.asarray(child_ppc.get(value_key, ()), dtype=np.float64)
+        .reshape(-1)
+        .copy(),
+    }
+
+
+def _reference_views_equal(left, right) -> bool:
+    if left is None or right is None:
+        return False
+    return (
+        left["node_present"] == right["node_present"]
+        and left["value_present"] == right["value_present"]
+        and np.array_equal(left["nodes"], right["nodes"])
+        and np.array_equal(left["values"], right["values"], equal_nan=True)
+    )
+
+
+def _write_reference_view(
     child_ppc: Dict,
     node_key: str,
     value_key: str,
+    view,
+) -> None:
+    if view["node_present"]:
+        child_ppc[node_key] = view["nodes"].copy()
+    else:
+        child_ppc.pop(node_key, None)
+    if view["value_present"]:
+        child_ppc[value_key] = view["values"].copy()
+    else:
+        child_ppc.pop(value_key, None)
+
+
+def _merge_reference_view(caller_view, hybrid_nodes, hybrid_values):
+    caller_nodes = caller_view["nodes"]
+    caller_values = np.full(caller_nodes.size, np.nan, dtype=np.float64)
+    caller_value_count = min(caller_nodes.size, caller_view["values"].size)
+    if caller_value_count:
+        caller_values[:caller_value_count] = caller_view["values"][:caller_value_count]
+
+    nodes = np.concatenate((caller_nodes, hybrid_nodes))
+    values = np.concatenate((caller_values, hybrid_values))
+    unique_nodes, first_positions = np.unique(nodes, return_index=True)
+    return {
+        "node_present": True,
+        "value_present": True,
+        "nodes": unique_nodes,
+        "values": values[first_positions],
+    }
+
+
+def _sync_hybrid_reference_metadata(
+    child_ppc: Dict,
+    external_node_key: str,
+    external_value_key: str,
+    hybrid_node_key: str,
+    hybrid_value_key: str,
+    state_key: str,
     ref_nodes,
     ref_values,
 ) -> None:
@@ -456,24 +521,67 @@ def _update_hybrid_reference_metadata(
     if ref_nodes.size != ref_values.size:
         raise ValueError("Hybrid reference nodes and values must stay aligned")
 
-    old_nodes = np.asarray(child_ppc.get(node_key, ()), dtype=np.int64).reshape(-1)
-    old_values = np.asarray(child_ppc.get(value_key, ()), dtype=np.float64).reshape(-1)
-    had_metadata = node_key in child_ppc or value_key in child_ppc
-    if ref_nodes.size:
-        changed = (
-            not had_metadata
-            or old_nodes.shape != ref_nodes.shape
-            or old_values.shape != ref_values.shape
-            or not np.array_equal(old_nodes, ref_nodes)
-            or not np.allclose(old_values, ref_values, equal_nan=True)
-        )
-        child_ppc[node_key] = ref_nodes
-        child_ppc[value_key] = ref_values
+    current_external = _reference_view(
+        child_ppc,
+        external_node_key,
+        external_value_key,
+    )
+    state = child_ppc.get(state_key)
+    if isinstance(state, dict) and _reference_views_equal(
+        current_external,
+        state.get("effective"),
+    ):
+        caller_view = state["caller"]
     else:
-        changed = had_metadata
-        child_ppc.pop(node_key, None)
-        child_ppc.pop(value_key, None)
-    if changed:
+        caller_view = current_external
+
+    old_hybrid = _reference_view(child_ppc, hybrid_node_key, hybrid_value_key)
+    if ref_nodes.size:
+        hybrid_view = {
+            "node_present": True,
+            "value_present": True,
+            "nodes": ref_nodes.copy(),
+            "values": ref_values.copy(),
+        }
+        effective_view = _merge_reference_view(
+            caller_view,
+            ref_nodes,
+            ref_values,
+        )
+    else:
+        hybrid_view = {
+            "node_present": False,
+            "value_present": False,
+            "nodes": np.empty(0, dtype=np.int64),
+            "values": np.empty(0, dtype=np.float64),
+        }
+        effective_view = caller_view
+
+    hybrid_changed = not _reference_views_equal(old_hybrid, hybrid_view)
+    effective_changed = not _reference_views_equal(current_external, effective_view)
+    _write_reference_view(
+        child_ppc,
+        hybrid_node_key,
+        hybrid_value_key,
+        hybrid_view,
+    )
+    _write_reference_view(
+        child_ppc,
+        external_node_key,
+        external_value_key,
+        effective_view,
+    )
+    child_ppc[state_key] = {
+        "caller": {
+            key: value.copy() if isinstance(value, np.ndarray) else value
+            for key, value in caller_view.items()
+        },
+        "effective": {
+            key: value.copy() if isinstance(value, np.ndarray) else value
+            for key, value in effective_view.items()
+        },
+    }
+    if hybrid_changed or effective_changed:
         child_ppc.pop("_topology_arrays", None)
 
 
@@ -514,10 +622,13 @@ def _attach_hybrid_dc_reference_nodes(ppc: Dict) -> None:
                 dcv_mask,
                 DCAC_COLS["v_dc_set"],
             ][unique_pos].astype(np.float64, copy=False)
-    _update_hybrid_reference_metadata(
+    _sync_hybrid_reference_metadata(
         dc_ppc,
+        "_external_voltage_reference_node_ids",
+        "_external_voltage_reference_pu",
         network_topology.HYBRID_DCAC_DC_REFERENCE_NODE_IDS_KEY,
         network_topology.HYBRID_DCAC_DC_REFERENCE_VALUES_KEY,
+        _HYBRID_DCAC_DC_REFERENCE_STATE_KEY,
         ref_nodes,
         ref_values,
     )
@@ -560,10 +671,13 @@ def _attach_hybrid_ac_reference_nodes(ppc: Dict) -> None:
                 acv_mask,
                 DCAC_COLS["v_ac_set"],
             ][unique_pos].astype(np.float64, copy=False)
-    _update_hybrid_reference_metadata(
+    _sync_hybrid_reference_metadata(
         ac_ppc,
+        "_external_angle_reference_node_ids",
+        "_external_voltage_reference_pu",
         network_topology.HYBRID_DCAC_AC_REFERENCE_NODE_IDS_KEY,
         network_topology.HYBRID_DCAC_AC_REFERENCE_VALUES_KEY,
+        _HYBRID_DCAC_AC_REFERENCE_STATE_KEY,
         ref_nodes,
         ref_values,
     )
