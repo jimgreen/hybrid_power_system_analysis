@@ -109,6 +109,7 @@ from model.ppc_topology import (
     build_dc_ppc_with_topology_from_efile_rows,
     build_hybrid_ppc_with_topology_from_efile_rows,
     ensure_ac_ppc_topology,
+    ensure_hybrid_ppc_topology,
 )
 
 
@@ -120,6 +121,113 @@ def _node_count(network_part) -> int:
         return len(getattr(network_part, "nodes", []))
     except TypeError:
         return 0
+
+
+def _ppc_has_operational_nodes(ppc, network_part) -> bool:
+    topology = ppc.get("_topology_arrays") if isinstance(ppc, dict) else None
+    node_alive = getattr(topology, "node_alive_mask", None)
+    if node_alive is not None:
+        return bool(np.any(np.asarray(node_alive, dtype=bool)))
+    return _node_count(network_part) > 0
+
+
+def _zero_table_columns(ppc, key, columns):
+    source = None if ppc is None else ppc.get(key)
+    if source is None:
+        width = max(columns) + 1 if columns else 0
+        return np.zeros((0, width), dtype=np.float64)
+    source = np.asarray(source, dtype=np.float64)
+    if source.ndim != 2:
+        width = max(columns) + 1 if columns else 0
+        source = np.zeros((0, width), dtype=np.float64)
+    result = source.copy()
+    if result.size and columns:
+        result[:, list(columns)] = 0.0
+    return result
+
+
+_AC_ZERO_RESULT_COLUMNS = {
+    "bus": (AC_BUS_COLS["voltage"], AC_BUS_COLS["angle"]),
+    "gen": (AC_GEN_COLS["p"], AC_GEN_COLS["q"], AC_GEN_COLS["current"]),
+    "load": (AC_LOAD_COLS["p"], AC_LOAD_COLS["q"], AC_LOAD_COLS["current"]),
+    "shunt": (AC_SHUNT_COLS["p"], AC_SHUNT_COLS["q"], AC_SHUNT_COLS["current"]),
+    "branch": tuple(AC_BRANCH_COLS[name] for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")),
+    "transformer": tuple(
+        AC_TRANSFORMER_COLS[name] for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")
+    ),
+    "three_winding_transformer": tuple(
+        AC_THREE_WINDING_TRANSFORMER_COLS[name]
+        for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c")
+    ),
+    "zero_branch": tuple(AC_ZERO_BRANCH_COLS[name] for name in ("p", "q", "current")),
+    "switch": tuple(AC_SWITCH_COLS[name] for name in ("p", "q", "current")),
+    "break": tuple(AC_BREAK_COLS[name] for name in ("p", "q", "current")),
+    "acac": tuple(ACAC_COLS[name] for name in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i")),
+}
+
+_DC_ZERO_RESULT_COLUMNS = {
+    "bus": (DC_BUS_COLS["voltage"],),
+    "branch": tuple(DC_BRANCH_COLS[name] for name in ("i_p", "j_p", "current")),
+    "load": tuple(DC_LOAD_COLS[name] for name in ("p", "current")),
+    "gen": tuple(DC_GEN_COLS[name] for name in ("p", "current")),
+    "zero_branch": tuple(DC_ZERO_BRANCH_COLS[name] for name in ("p", "current")),
+    "switch": tuple(DC_SWITCH_COLS[name] for name in ("p", "current")),
+    "break": tuple(DC_BREAK_COLS[name] for name in ("p", "current")),
+    "dcdc": tuple(DC_DCDC_COLS[name] for name in ("i_p", "j_p", "i_c", "j_c")),
+}
+
+
+def _zero_subgrid_result(ppc, column_map):
+    if not isinstance(ppc, dict):
+        return None
+    return {
+        key: _zero_table_columns(ppc, key, columns)
+        for key, columns in column_map.items()
+    }
+
+
+_AC_SKIPPED_OBJECT_ATTRS = {
+    "nodes": ("voltage", "angle"),
+    "generators": ("p", "q", "current"),
+    "loads": ("p", "q", "current"),
+    "shunt_compensators": ("p", "q", "current"),
+    "branches": ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c"),
+    "transformers": ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c"),
+    "three_winding_transformers": (
+        "i_p",
+        "i_q",
+        "i_c",
+        "j_p",
+        "j_q",
+        "j_c",
+        "k_p",
+        "k_q",
+        "k_c",
+    ),
+    "zero_branches": ("p", "q", "current"),
+    "switches": ("p", "q", "current"),
+    "breakers": ("p", "q", "current"),
+}
+
+_DC_SKIPPED_OBJECT_ATTRS = {
+    "nodes": ("voltage",),
+    "generators": ("p", "current"),
+    "loads": ("p", "current"),
+    "branches": ("i_p", "j_p", "current"),
+    "zero_branches": ("p", "current"),
+    "switches": ("p", "current"),
+    "breakers": ("p", "current"),
+    "dcdc_converters": ("i_p", "j_p", "i_c", "j_c"),
+}
+
+
+def _zero_skipped_object_side(network_part, attribute_map):
+    for collection_name, attributes in attribute_map.items():
+        for device in getattr(network_part, collection_name, ()):
+            if hasattr(device, "is_alive"):
+                device.is_alive = False
+            for attribute in attributes:
+                setattr(device, attribute, 0.0)
 
 
 def _default_hybrid_linear_solver(has_dc: bool) -> str:
@@ -776,8 +884,15 @@ class HybridPowerFlowCalc:
         self.verbose = verbose
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
-        self.has_ac = _node_count(network.ac) > 0
-        self.has_dc = _node_count(network.dc) > 0
+        hybrid_ppc = getattr(network, "ppc", None)
+        if isinstance(hybrid_ppc, dict) and ("ac" in hybrid_ppc or "dc" in hybrid_ppc):
+            ensure_hybrid_ppc_topology(hybrid_ppc)
+        self._ac_ppc = getattr(network, "_ac_ppc", None) or getattr(network.ac, "ppc", None)
+        self._dc_ppc = getattr(network, "_dc_ppc", None) or getattr(network.dc, "ppc", None)
+        self.has_ac = _ppc_has_operational_nodes(self._ac_ppc, network.ac)
+        self.has_dc = _ppc_has_operational_nodes(self._dc_ppc, network.dc)
+        self._skipped_ac_result = _zero_subgrid_result(self._ac_ppc, _AC_ZERO_RESULT_COLUMNS)
+        self._skipped_dc_result = _zero_subgrid_result(self._dc_ppc, _DC_ZERO_RESULT_COLUMNS)
         # Hybrid 含 DC 网络时，PyKLU 在部分非对称/耦合矩阵上会失败；未显式指定时
         # 默认走 UMFPACK，若本机未安装则由 solver_common 回退到 SciPy/SuperLU。
         solver_name = str(linear_solver).strip().lower() if linear_solver is not None else ""
@@ -813,6 +928,7 @@ class HybridPowerFlowCalc:
             getattr(network, "_lf_lightweight", False)
             and isinstance(getattr(network, "ppc", None), dict)
         )
+        self._clear_converter_outputs()
         needs_ac_node_lookup = (
             not self._converter_ppc_mode
             and bool(getattr(network, "dcac_converters", []) or getattr(network, "acac_converters", []))
@@ -886,7 +1002,7 @@ class HybridPowerFlowCalc:
     def _build_ac_subcalc(self):
         if not self.has_ac:
             return None
-        source = self.network._ac_ppc if hasattr(self.network, "_ac_ppc") else self.network.ac
+        source = self._ac_ppc if self._ac_ppc is not None else self.network.ac
         return ACPowerFlowCalc(
             source,
             parameters=self.params,
@@ -899,7 +1015,7 @@ class HybridPowerFlowCalc:
     def _build_dc_subcalc(self):
         if not self.has_dc:
             return None
-        source = self.network._dc_ppc if hasattr(self.network, "_dc_ppc") else self.network.dc
+        source = self._dc_ppc if self._dc_ppc is not None else self.network.dc
         calc = DCPowerFlowCalc(
             source,
             parameters=self.params,
@@ -909,9 +1025,28 @@ class HybridPowerFlowCalc:
             verbose=self.verbose,
         )
         if hasattr(self.network, "_dc_ppc"):
-            dc_writeback_network = None if getattr(self.network.dc, "_lf_lightweight", False) else self.network.dc
-            calc._network_writeback = dc_writeback_network
+            calc._network_writeback = (
+                None if getattr(self.network.dc, "_lf_lightweight", False) else self.network.dc
+            )
         return calc
+
+    def _clear_converter_outputs(self):
+        ppc = getattr(self.network, "ppc", {}) or {}
+        dcac = ppc.get("dcac")
+        if dcac is not None and getattr(dcac, "size", 0):
+            dcac[:, [DCAC_COLS[name] for name in ("dc_p", "ac_p", "ac_q", "dc_i", "ac_i")]] = 0.0
+        acac = ppc.get("acac")
+        if acac is not None and getattr(acac, "size", 0):
+            acac[:, [ACAC_COLS[name] for name in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i")]] = 0.0
+        if not self._converter_ppc_mode:
+            for conv in getattr(self.network, "dcac_converters", ()):
+                conv.is_alive = False
+                for name in ("dc_p", "ac_p", "ac_q", "dc_i", "ac_i"):
+                    setattr(conv, name, 0.0)
+            for conv in getattr(self.network, "acac_converters", ()):
+                conv.is_alive = False
+                for name in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i", "i_c", "j_c"):
+                    setattr(conv, name, 0.0)
 
     def _sync_sub_result_modes(self) -> None:
         if self.ac_calc is not None:
@@ -994,7 +1129,12 @@ class HybridPowerFlowCalc:
         self._prepare_dcac_converters()
         self._prepare_acac_converters()
         if not parts:
-            raise RuntimeError("E 文件中没有 ACNode 或 DCNode，无法进行交直流潮流计算")
+            self.x = np.empty(0, dtype=np.float64)
+            self.total_vars = 0
+            self.total_eq = 0
+            self.last_jacobian_shape = (0, 0)
+            self._residual_work = np.empty(0, dtype=np.float64)
+            return self.x
         # 全局变量布局：
         # [AC 内部变量][DC 内部变量][每台 DCAC: Pdc, Pac, Qac][每台 ACAC: Pi, Qi, Pj, Qj]
         self.dcac_start = self.ac_size + self.dc_size
@@ -2534,16 +2674,19 @@ class HybridPowerFlowCalc:
         }
 
     def _sync_single_subsolver_result(self, kind):
-        ac_result = self.ac_calc.result if kind == "ac" else None
-        dc_result = self.dc_calc.result if kind == "dc" else None
+        ac_result = self.ac_calc.result if kind == "ac" else self._skipped_ac_result
+        dc_result = self.dc_calc.result if kind == "dc" else self._skipped_dc_result
         if kind == "ac":
             self._write_ac_ppc_result_to_network()
         elif kind == "dc":
             self._write_dc_ppc_result_to_network()
+        self._write_skipped_results_to_network()
 
         if self.result_mode == "full":
             self._set_array_result(ac_result, dc_result)
-            self.lf_result = None if getattr(self, "skip_lf_result", False) else self._build_lf_result()
+            self.lf_result = (
+                None if getattr(self, "skip_lf_result", False) else self._build_lf_result()
+            )
         elif self.result_mode == "array":
             self._set_array_result(ac_result, dc_result)
             self.lf_result = None
@@ -2557,6 +2700,39 @@ class HybridPowerFlowCalc:
         else:
             self.result = {}
             self.lf_result = None
+
+    def _write_skipped_results_to_network(self):
+        if self.ac_calc is None:
+            if self._skipped_ac_result is not None:
+                self.network.ac.result = self._skipped_ac_result
+            if not getattr(self.network.ac, "_lf_lightweight", False):
+                _zero_skipped_object_side(self.network.ac, _AC_SKIPPED_OBJECT_ATTRS)
+        if self.dc_calc is None:
+            if self._skipped_dc_result is not None:
+                self.network.dc.result = self._skipped_dc_result
+            if not getattr(self.network.dc, "_lf_lightweight", False):
+                _zero_skipped_object_side(self.network.dc, _DC_SKIPPED_OBJECT_ATTRS)
+
+    def _finish_empty_system(self) -> int:
+        self.converged = True
+        self.iterations = 0
+        self.normF = 0.0
+        self.failure_reason = ""
+        self._write_skipped_results_to_network()
+        if self.result_mode == "none":
+            self.result = {}
+            self.lf_result = None
+        elif self.result_mode == "summary":
+            self.result = {
+                "ac": self._ac_array_summary(self._skipped_ac_result),
+                "dc": self._dc_array_summary(self._skipped_dc_result),
+                "hybrid": self._hybrid_summary(),
+            }
+            self.lf_result = None
+        else:
+            self._set_array_result(self._skipped_ac_result, self._skipped_dc_result)
+            self.lf_result = None if self.result_mode == "array" else self._build_lf_result()
+        return 0
 
     def _run_single_subsolver(self, kind, subcalc, eq_count, var_count):
         subcalc.verbose = self.verbose
@@ -2579,6 +2755,13 @@ class HybridPowerFlowCalc:
             self._sync_sub_result_modes()
         if self.x.size == 0:
             self.prepare()
+        if (
+            self.total_vars == 0
+            and self.total_eq == 0
+            and self.ac_calc is None
+            and self.dc_calc is None
+        ):
+            return self._finish_empty_system()
         return self._run_newton_raphson()
 
     def _run_newton_raphson(self) -> int:

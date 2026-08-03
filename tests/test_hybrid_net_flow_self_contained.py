@@ -61,7 +61,230 @@ def _run_hybrid_lf(file_name, **kwargs):
     return calc.lf_result
 
 
+def _table(header, rows):
+    return {"header_list": header.split(), "rows": rows}
+
+
+def _independent_hybrid_rows(*, ac_run=1, dc_run=1, stale=0.0, include_converter=False):
+    rows = {
+        "Model": _table(
+            "path name p_base u_unit p_unit i_unit",
+            [["test", "independent", 100, "V", "kW", "A"]],
+        ),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[1, "ac-bus", 380, stale, stale, ac_run]],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha run_stat p q current",
+            [[1, "ac-source", 1, "PH", 0, 0, 380, 1, 1, stale, stale, stale]],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat p q current",
+            [[1, "ac-load", 1, 10, 1, 0, 0, 2, 1, 0, 0, 1, stale, stale, stale]],
+        ),
+        "DCNode": _table(
+            "idx name vbase voltage run_stat",
+            [[1, "dc-bus", 750, stale, dc_run]],
+        ),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set i_set run_stat p current",
+            [[1, "dc-source", 1, "V", 750, 0, 0, 1, stale, stale]],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat p current",
+            [[1, "dc-load", 1, 10, 1, 0, 0, 1, stale, stale]],
+        ),
+    }
+    if include_converter:
+        rows["DCACConverter"] = _table(
+            "idx name ac_node dc_node r1 r2 ac_control_type dc_control_type "
+            "p_ac_set q_ac_set v_ac_set v_dc_set run_stat dc_p ac_p ac_q dc_i ac_i",
+            [
+                [
+                    1,
+                    "inactive-converter",
+                    1,
+                    1,
+                    0,
+                    0,
+                    "PQ",
+                    "NONE",
+                    0,
+                    0,
+                    380,
+                    750,
+                    1,
+                    stale,
+                    stale,
+                    stale,
+                    stale,
+                    stale,
+                ]
+            ],
+        )
+    return rows
+
+
 class HybridNetFlowSelfContainedTest(unittest.TestCase):
+    def test_hybrid_solver_skips_dead_dc_and_solves_live_ac(self):
+        import numpy as np
+        from ac_array_model import BUS_COLS as AC_BUS_COLS
+        from dc_array_model import BUS_COLS as DC_BUS_COLS, GEN_COLS as DC_GEN_COLS
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _build_lf_network_from_hybrid_rows
+
+        network = _build_lf_network_from_hybrid_rows(
+            Path("dead_dc.e"),
+            _independent_hybrid_rows(ac_run=1, dc_run=0, stale=99.0),
+        )
+        calc = HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+        rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertIsNotNone(calc.ac_calc)
+        self.assertIsNone(calc.dc_calc)
+        self.assertEqual(1, calc.result["dc"]["bus"].shape[0])
+        self.assertEqual(1, calc.result["dc"]["gen"].shape[0])
+        self.assertTrue(np.all(calc.result["dc"]["bus"][:, DC_BUS_COLS["voltage"]] == 0.0))
+        self.assertTrue(
+            np.all(
+                calc.result["dc"]["gen"]
+                [:, [DC_GEN_COLS["p"], DC_GEN_COLS["current"]]]
+                == 0.0
+            )
+        )
+        self.assertEqual(0, int(calc.result["dc"]["bus"][0, DC_BUS_COLS["run_stat"]]))
+        self.assertEqual(1, int(calc.result["dc"]["gen"][0, DC_GEN_COLS["run_stat"]]))
+        self.assertGreater(float(calc.result["ac"]["bus"][0, AC_BUS_COLS["voltage"]]), 0.0)
+
+    def test_hybrid_solver_skips_dead_ac_and_solves_live_dc(self):
+        import numpy as np
+        from ac_array_model import BUS_COLS as AC_BUS_COLS, GEN_COLS as AC_GEN_COLS
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _build_lf_network_from_hybrid_rows
+
+        network = _build_lf_network_from_hybrid_rows(
+            Path("dead_ac.e"),
+            _independent_hybrid_rows(ac_run=0, dc_run=1, stale=99.0),
+        )
+        calc = HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+        rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertIsNone(calc.ac_calc)
+        self.assertIsNotNone(calc.dc_calc)
+        self.assertTrue(
+            np.all(
+                calc.result["ac"]["bus"]
+                [:, [AC_BUS_COLS["voltage"], AC_BUS_COLS["angle"]]]
+                == 0.0
+            )
+        )
+        self.assertTrue(
+            np.all(
+                calc.result["ac"]["gen"]
+                [:, [AC_GEN_COLS["p"], AC_GEN_COLS["q"], AC_GEN_COLS["current"]]]
+                == 0.0
+            )
+        )
+        self.assertEqual(1, int(calc.result["ac"]["gen"][0, AC_GEN_COLS["run_stat"]]))
+
+    def test_hybrid_solver_returns_successful_zero_result_when_both_sides_are_dead(self):
+        import numpy as np
+        from ac_array_model import BUS_COLS as AC_BUS_COLS
+        from dc_array_model import BUS_COLS as DC_BUS_COLS
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _build_lf_network_from_hybrid_rows
+
+        network = _build_lf_network_from_hybrid_rows(
+            Path("all_dead.e"),
+            _independent_hybrid_rows(ac_run=0, dc_run=0, stale=99.0),
+        )
+        calc = HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+        rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual(0, calc.iterations)
+        self.assertEqual(0.0, calc.normF)
+        self.assertEqual((0, 0), calc.last_jacobian_shape)
+        self.assertEqual(0, calc.x.size)
+        self.assertTrue(
+            np.all(
+                calc.result["ac"]["bus"]
+                [:, [AC_BUS_COLS["voltage"], AC_BUS_COLS["angle"]]]
+                == 0.0
+            )
+        )
+        self.assertTrue(
+            np.all(calc.result["dc"]["bus"][:, DC_BUS_COLS["voltage"]] == 0.0)
+        )
+
+    def test_hybrid_solver_does_not_convert_active_numerical_failure_into_empty_success(self):
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _build_lf_network_from_hybrid_rows
+
+        network = _build_lf_network_from_hybrid_rows(
+            Path("live_ac.e"),
+            _independent_hybrid_rows(ac_run=1, dc_run=0),
+        )
+        calc = HybridPowerFlowCalc(network, result_mode="none", verbose=False)
+        calc.prepare()
+
+        def fail_active_ac():
+            calc.ac_calc.converged = False
+            calc.ac_calc.iterations = 1
+            calc.ac_calc.normF = 1.0
+            return -1
+
+        calc.ac_calc._run_newton_raphson = fail_active_ac
+        self.assertEqual(-1, calc.run())
+        self.assertFalse(calc.converged)
+
+    def test_inactive_dcac_converter_does_not_retain_stale_outputs(self):
+        from hybrid_array_model import DCAC_COLS
+        from lfcore.hybrid_lf import HybridPowerFlowCalc, _build_lf_network_from_hybrid_rows
+
+        network = _build_lf_network_from_hybrid_rows(
+            Path("inactive_converter.e"),
+            _independent_hybrid_rows(
+                ac_run=0,
+                dc_run=0,
+                stale=99.0,
+                include_converter=True,
+            ),
+        )
+        calc = HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+
+        self.assertEqual(0, calc.run())
+        converter = network.ppc["dcac"][0]
+        self.assertEqual(1, int(converter[DCAC_COLS["run_stat"]]))
+        self.assertEqual(
+            [0.0] * 5,
+            [
+                float(converter[DCAC_COLS[name]])
+                for name in ("dc_p", "ac_p", "ac_q", "dc_i", "ac_i")
+            ],
+        )
+
+    def test_skipped_lightweight_sides_do_not_materialize_object_facades(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf._build_lf_network_from_hybrid_rows(
+            Path("all_dead_array_only.e"),
+            _independent_hybrid_rows(ac_run=0, dc_run=0, stale=99.0),
+        )
+        original_array_device = hybrid_lf._array_device
+
+        def reject_object_materialization(*_args, **_kwargs):
+            raise AssertionError("skipped lightweight sides should stay PPC-backed")
+
+        hybrid_lf._array_device = reject_object_materialization
+        try:
+            calc = hybrid_lf.HybridPowerFlowCalc(network, result_mode="array", verbose=False)
+            self.assertEqual(0, calc.run())
+        finally:
+            hybrid_lf._array_device = original_array_device
+
     def test_hybrid_net_flow_does_not_import_network_classes(self):
         import hybrid_net_flow
 
@@ -825,7 +1048,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(["core"], calls)
         self.assertTrue(calc.converged)
         self.assertIs(calc.result["dc"], calc.dc_calc.result)
-        self.assertIsNone(calc.result["ac"])
+        self.assertEqual(0, calc.result["ac"]["bus"].shape[0])
 
     def test_hybrid_run_lets_run_prepare_once(self):
         import lfcore.hybrid_lf as hybrid_lf
