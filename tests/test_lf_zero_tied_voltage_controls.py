@@ -414,6 +414,12 @@ def test_hybrid_lf_skips_floating_dc_island_and_solves_referenced_side():
     assert dc_bus_by_idx[2][DC_BUS_COLS["run_stat"]] == 1
     assert dc_bus_by_idx[2][DC_BUS_COLS["voltage"]] == 0.0
 
+    topology = calc.dc_calc._ppc_topology
+    node_rows = calc.dc_calc.ppc["bus"][:, DC_BUS_COLS["idx"]].astype(int)
+    node_2_row = int(np.flatnonzero(node_rows == 2)[0])
+    assert not topology.node_alive_mask[node_2_row]
+    assert not topology.devices["dcdc"].alive_mask[0]
+
     dcdc = calc.result["dc"]["dcdc"]
     assert dcdc.shape[0] == 1
     assert dcdc[0, DCDC_COLS["run_stat"]] == 1

@@ -77,6 +77,7 @@ from ac_array_model import (
     THREE_WINDING_TRANSFORMER_COLS as AC_THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
     ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
+    build_ac_ppc_from_network,
     build_ac_ppc_from_mat_file,
 )
 from dc_array_model import (
@@ -89,6 +90,7 @@ from dc_array_model import (
     LOAD_COLS as DC_LOAD_COLS,
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    build_dc_ppc_from_network,
     dcdc_legacy_control_label,
 )
 from efile_read import _read_efile_rows
@@ -128,6 +130,10 @@ def _ppc_has_operational_nodes(ppc, network_part) -> bool:
     node_alive = getattr(topology, "node_alive_mask", None)
     if node_alive is not None:
         return bool(np.any(np.asarray(node_alive, dtype=bool)))
+    nodes = getattr(network_part, "nodes", ())
+    alive_states = [getattr(node, "is_alive", None) for node in nodes]
+    if any(state is not None for state in alive_states):
+        return any(bool(state) for state in alive_states)
     return _node_count(network_part) > 0
 
 
@@ -903,16 +909,26 @@ class HybridPowerFlowCalc:
         hybrid_ppc = getattr(network, "ppc", None)
         if isinstance(hybrid_ppc, dict) and ("ac" in hybrid_ppc or "dc" in hybrid_ppc):
             ensure_hybrid_ppc_topology(hybrid_ppc)
+        elif not getattr(network, "_lf_lightweight", False):
+            topo = getattr(network, "topo", None)
+            if callable(topo):
+                topo()
         self._ac_ppc = getattr(network, "_ac_ppc", None) or getattr(network.ac, "ppc", None)
         self._dc_ppc = getattr(network, "_dc_ppc", None) or getattr(network.dc, "ppc", None)
         self.has_ac = _ppc_has_operational_nodes(self._ac_ppc, network.ac)
         self.has_dc = _ppc_has_operational_nodes(self._dc_ppc, network.dc)
+        ac_result_source = self._ac_ppc
+        if ac_result_source is None and not getattr(network.ac, "_lf_lightweight", False):
+            ac_result_source = build_ac_ppc_from_network(network.ac)
+        dc_result_source = self._dc_ppc
+        if dc_result_source is None and not getattr(network.dc, "_lf_lightweight", False):
+            dc_result_source = build_dc_ppc_from_network(network.dc)
         self._skipped_ac_result = _zero_subgrid_result(
-            self._ac_ppc,
+            ac_result_source,
             _AC_ZERO_RESULT_TABLE_SPECS,
         )
         self._skipped_dc_result = _zero_subgrid_result(
-            self._dc_ppc,
+            dc_result_source,
             _DC_ZERO_RESULT_TABLE_SPECS,
         )
         # Hybrid 含 DC 网络时，PyKLU 在部分非对称/耦合矩阵上会失败；未显式指定时
@@ -2950,6 +2966,7 @@ class HybridPowerFlowCalc:
         """Copy array-mode AC results back to the hybrid AC object facade."""
         from ac_array_model import (
             BRANCH_COLS,
+            BREAK_COLS,
             BUS_COLS,
             GEN_COLS,
             LOAD_COLS,
@@ -2973,33 +2990,82 @@ class HybridPowerFlowCalc:
             by_idx = {int(dev.idx): dev for dev in devices}
             return ((by_idx.get(int(row[idx_col])), row) for row in rows)
 
+        topology = getattr(self.ac_calc, "_ppc_topology", None)
+
+        def alive_by_idx(table_name, topology_key, columns):
+            source_rows = np.asarray(
+                self.ac_calc.ppc.get(
+                    table_name,
+                    np.zeros((0, max(columns.values()) + 1), dtype=np.float64),
+                ),
+                dtype=np.float64,
+            )
+            if topology is None:
+                return {}
+            if topology_key is None:
+                alive_mask = np.asarray(topology.node_alive_mask, dtype=bool)
+            else:
+                device_topology = topology.devices.get(topology_key)
+                if device_topology is None:
+                    return {}
+                alive_mask = np.asarray(device_topology.alive_mask, dtype=bool)
+            if len(source_rows) != len(alive_mask):
+                return {}
+            return {
+                int(row[columns["idx"]]): bool(alive)
+                for row, alive in zip(source_rows, alive_mask)
+            }
+
+        node_alive_by_idx = alive_by_idx("bus", None, BUS_COLS)
+        gen_alive_by_idx = alive_by_idx("gen", "gen", GEN_COLS)
+        load_alive_by_idx = alive_by_idx("load", "load", LOAD_COLS)
+        shunt_alive_by_idx = alive_by_idx("shunt", "shunt", SHUNT_COLS)
+        branch_alive_by_idx = alive_by_idx("branch", "branch", BRANCH_COLS)
+        transformer_alive_by_idx = alive_by_idx(
+            "transformer",
+            "transformer",
+            TRANSFORMER_COLS,
+        )
+        three_alive_by_idx = alive_by_idx(
+            "three_winding_transformer",
+            "three_winding_transformer",
+            THREE_WINDING_TRANSFORMER_COLS,
+        )
+        zero_branch_alive_by_idx = alive_by_idx(
+            "zero_branch",
+            "zero_branch",
+            ZERO_BRANCH_COLS,
+        )
+        switch_alive_by_idx = alive_by_idx("switch", "switch", SWITCH_COLS)
+        breaker_alive_by_idx = alive_by_idx("break", "break", BREAK_COLS)
+
         for node, row in iter_aligned(self.network.ac.nodes, result["bus"], BUS_COLS["idx"]):
             if node is not None:
                 node.voltage = float(row[BUS_COLS["voltage"]])
                 node.angle = float(row[BUS_COLS["angle"]])
                 node.isl = int(row[BUS_COLS["isl"]])
-                node.is_alive = int(row[BUS_COLS["run_stat"]]) == 1
+                node.is_alive = node_alive_by_idx.get(int(row[BUS_COLS["idx"]]), False)
 
         for gen, row in iter_aligned(self.network.ac.generators, result["gen"], GEN_COLS["idx"]):
             if gen is not None:
                 gen.p = float(row[GEN_COLS["p"]])
                 gen.q = float(row[GEN_COLS["q"]])
                 gen.current = float(row[GEN_COLS["current"]])
-                gen.is_alive = int(row[GEN_COLS["run_stat"]]) == 1
+                gen.is_alive = gen_alive_by_idx.get(int(row[GEN_COLS["idx"]]), False)
 
         for load, row in iter_aligned(self.network.ac.loads, result["load"], LOAD_COLS["idx"]):
             if load is not None:
                 load.p = float(row[LOAD_COLS["p"]])
                 load.q = float(row[LOAD_COLS["q"]])
                 load.current = float(row[LOAD_COLS["current"]])
-                load.is_alive = int(row[LOAD_COLS["run_stat"]]) == 1
+                load.is_alive = load_alive_by_idx.get(int(row[LOAD_COLS["idx"]]), False)
 
         for shunt, row in iter_aligned(self.network.ac.shunt_compensators, result["shunt"], SHUNT_COLS["idx"]):
             if shunt is not None:
                 shunt.p = float(row[SHUNT_COLS["p"]])
                 shunt.q = float(row[SHUNT_COLS["q"]])
                 shunt.current = float(row[SHUNT_COLS["current"]])
-                shunt.is_alive = int(row[SHUNT_COLS["run_stat"]]) == 1
+                shunt.is_alive = shunt_alive_by_idx.get(int(row[SHUNT_COLS["idx"]]), False)
 
         for branch, row in iter_aligned(self.network.ac.branches, result["branch"], BRANCH_COLS["idx"]):
             if branch is not None:
@@ -3009,7 +3075,7 @@ class HybridPowerFlowCalc:
                 branch.j_p = float(row[BRANCH_COLS["j_p"]])
                 branch.j_q = float(row[BRANCH_COLS["j_q"]])
                 branch.j_c = float(row[BRANCH_COLS["j_c"]])
-                branch.is_alive = int(row[BRANCH_COLS["run_stat"]]) == 1
+                branch.is_alive = branch_alive_by_idx.get(int(row[BRANCH_COLS["idx"]]), False)
 
         for transformer, row in iter_aligned(
             self.network.ac.transformers,
@@ -3023,23 +3089,10 @@ class HybridPowerFlowCalc:
                 transformer.j_p = float(row[TRANSFORMER_COLS["j_p"]])
                 transformer.j_q = float(row[TRANSFORMER_COLS["j_q"]])
                 transformer.j_c = float(row[TRANSFORMER_COLS["j_c"]])
-                transformer.is_alive = int(row[TRANSFORMER_COLS["run_stat"]]) == 1
-
-        three_alive_by_idx = {}
-        topology = getattr(self.ac_calc, "_ppc_topology", None)
-        topology_device = None if topology is None else topology.devices.get("three_winding_transformer")
-        source_three_rows = np.asarray(
-            self.ac_calc.ppc.get(
-                "three_winding_transformer",
-                np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS)), dtype=np.float64),
-            ),
-            dtype=np.float64,
-        )
-        if topology_device is not None and len(topology_device.alive_mask) == len(source_three_rows):
-            three_alive_by_idx = {
-                int(row[THREE_WINDING_TRANSFORMER_COLS["idx"]]): bool(alive)
-                for row, alive in zip(source_three_rows, topology_device.alive_mask)
-            }
+                transformer.is_alive = transformer_alive_by_idx.get(
+                    int(row[TRANSFORMER_COLS["idx"]]),
+                    False,
+                )
         for transformer, row in iter_aligned(
             getattr(self.network.ac, "three_winding_transformers", ()),
             result.get(
@@ -3053,7 +3106,7 @@ class HybridPowerFlowCalc:
                     setattr(transformer, attr, float(row[THREE_WINDING_TRANSFORMER_COLS[attr]]))
                 transformer.is_alive = three_alive_by_idx.get(
                     int(row[THREE_WINDING_TRANSFORMER_COLS["idx"]]),
-                    int(row[THREE_WINDING_TRANSFORMER_COLS["run_stat"]]) == 1,
+                    False,
                 )
 
         for zero_branch, row in iter_aligned(self.network.ac.zero_branches, result["zero_branch"], ZERO_BRANCH_COLS["idx"]):
@@ -3061,21 +3114,24 @@ class HybridPowerFlowCalc:
                 zero_branch.p = float(row[ZERO_BRANCH_COLS["p"]])
                 zero_branch.q = float(row[ZERO_BRANCH_COLS["q"]])
                 zero_branch.current = float(row[ZERO_BRANCH_COLS["current"]])
-                zero_branch.is_alive = int(row[ZERO_BRANCH_COLS["run_stat"]]) == 1
+                zero_branch.is_alive = zero_branch_alive_by_idx.get(
+                    int(row[ZERO_BRANCH_COLS["idx"]]),
+                    False,
+                )
 
         for switch, row in iter_aligned(self.network.ac.switches, result["switch"], SWITCH_COLS["idx"]):
             if switch is not None:
                 switch.p = float(row[SWITCH_COLS["p"]])
                 switch.q = float(row[SWITCH_COLS["q"]])
                 switch.current = float(row[SWITCH_COLS["current"]])
-                switch.is_alive = int(row[SWITCH_COLS["run_stat"]]) == 1 and int(row[SWITCH_COLS["status"]]) == 1
+                switch.is_alive = switch_alive_by_idx.get(int(row[SWITCH_COLS["idx"]]), False)
 
-        for breaker, row in iter_aligned(self.network.ac.breakers, result["break"], SWITCH_COLS["idx"]):
+        for breaker, row in iter_aligned(self.network.ac.breakers, result["break"], BREAK_COLS["idx"]):
             if breaker is not None:
-                breaker.p = float(row[SWITCH_COLS["p"]])
-                breaker.q = float(row[SWITCH_COLS["q"]])
-                breaker.current = float(row[SWITCH_COLS["current"]])
-                breaker.is_alive = int(row[SWITCH_COLS["run_stat"]]) == 1 and int(row[SWITCH_COLS["status"]]) == 1
+                breaker.p = float(row[BREAK_COLS["p"]])
+                breaker.q = float(row[BREAK_COLS["q"]])
+                breaker.current = float(row[BREAK_COLS["current"]])
+                breaker.is_alive = breaker_alive_by_idx.get(int(row[BREAK_COLS["idx"]]), False)
 
     def _write_back_ppc(self):
         """Compatibility helper matching AC/DC naming.

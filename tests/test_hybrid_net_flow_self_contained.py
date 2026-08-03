@@ -156,7 +156,266 @@ def _retire_dc_ppc_with_stale_outputs(ppc, stale=99.0):
     return {key: ppc[key].copy() for key in dynamic_columns}, dynamic_columns
 
 
+def _name(device, value):
+    device.name = value
+    return device
+
+
+def _live_ac_object_network():
+    from ac_model import ACPowerNetwork
+
+    network = ACPowerNetwork()
+    _name(network.add_node(10, 1.0, voltage=1.0, angle=0.0), "ac-live-source")
+    _name(network.add_node(20, 1.0, voltage=1.0, angle=0.0), "ac-live-load")
+    _name(network.add_branch(501, 10, 20, 0.01, 0.05, 0.0), "ac-live-line")
+    _name(network.add_generator(101, 10, "PH", 0.0, 0.0, 1.0, alpha=1.0), "ac-live-gen")
+    _name(
+        network.add_load(301, 20, 0.1, 1.0, 0.0, 0.0, 0.02, 1.0, 0.0, 0.0),
+        "ac-live-load-device",
+    )
+    return network
+
+
+def _live_dc_object_network():
+    from dc_model import DCPowerNetwork
+
+    network = DCPowerNetwork()
+    _name(network.add_node(110, 1.0, voltage=1.0), "dc-live-bus")
+    _name(network.add_generator(701, 110, "V", 0.0, 1.0, 0.0), "dc-live-gen")
+    _name(network.add_load(801, 110, 0.1, 1.0, 0.0, 0.0), "dc-live-load")
+    return network
+
+
+def _dead_ac_object_network(stale=99.0):
+    from ac_model import ACPowerNetwork
+
+    network = ACPowerNetwork()
+    for idx in (30, 40):
+        node = _name(
+            network.add_node(idx, 1.0, voltage=stale, angle=stale, run_stat=0),
+            f"ac-dead-node-{idx}",
+        )
+        node.is_alive = True
+    generator = _name(
+        network.add_generator(1101, 30, "PH", 0.0, 0.0, 1.0, alpha=1.0),
+        "ac-dead-gen",
+    )
+    generator.p = generator.q = generator.current = stale
+    switch = _name(network.add_switch(1901, 30, 40, status=0), "ac-dead-switch")
+    switch.p = switch.q = switch.current = stale
+    return network
+
+
+def _dead_dc_object_network(stale=99.0):
+    from dc_model import DCPowerNetwork
+
+    network = DCPowerNetwork()
+    for idx in (130, 140):
+        node = _name(
+            network.add_node(idx, 1.0, voltage=stale, run_stat=0),
+            f"dc-dead-node-{idx}",
+        )
+        node.is_alive = True
+    generator = _name(network.add_generator(1701, 130, "V", 0.0, 1.0, 0.0), "dc-dead-gen")
+    generator.p = generator.current = stale
+    switch = _name(network.add_switch(2901, 130, 140, status=0), "dc-dead-switch")
+    switch.p = switch.current = stale
+    return network
+
+
+def _mixed_alive_dead_ac_object_network(stale=99.0):
+    from ac_model import ACShuntCompensator
+
+    network = _live_ac_object_network()
+    for idx in (30, 40, 50):
+        _name(
+            network.add_node(idx, 1.0, voltage=stale, angle=stale),
+            f"ac-dead-island-node-{idx}",
+        )
+
+    generator = _name(
+        network.add_generator(1101, 30, "PQ", 0.0, 0.0, 1.0, alpha=1.0),
+        "ac-dead-island-gen",
+    )
+    load = _name(
+        network.add_load(1201, 40, 0.1, 1.0, 0.0, 0.0, 0.02, 1.0, 0.0, 0.0),
+        "ac-dead-island-load",
+    )
+    shunt = _name(ACShuntCompensator(1301, 30, run_stat=1), "ac-dead-island-shunt")
+    network.shunt_compensators.append(shunt)
+    branch = _name(network.add_branch(1501, 30, 40, 0.01, 0.05, 0.0), "ac-dead-island-branch")
+    transformer = _name(
+        network.add_transformer(1601, 30, 40, 0.01, 0.05, 1.0, 0.0),
+        "ac-dead-island-transformer",
+    )
+    three_winding = _name(
+        network.add_three_winding_transformer(
+            1701,
+            30,
+            40,
+            50,
+            0.01,
+            0.05,
+            0.01,
+            0.05,
+            0.01,
+            0.05,
+        ),
+        "ac-dead-island-three-winding",
+    )
+    zero_branch = _name(network.add_zero_branch(1801, 30, 40), "ac-dead-island-zero")
+    switch = _name(network.add_switch(1901, 30, 40, status=1), "ac-dead-island-switch")
+    breaker = _name(network.add_break(2001, 30, 40, status=1), "ac-dead-island-breaker")
+
+    for device in (generator, load, shunt):
+        device.p = device.q = device.current = stale
+    for device in (branch, transformer):
+        for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c"):
+            setattr(device, attr, stale)
+    for attr in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c"):
+        setattr(three_winding, attr, stale)
+    for device in (zero_branch, switch, breaker):
+        device.p = device.q = device.current = stale
+    return network
+
+
 class HybridNetFlowSelfContainedTest(unittest.TestCase):
+    def test_no_ppc_full_object_skips_each_dead_side_and_solves_the_other(self):
+        from ac_array_model import BUS_COLS as AC_BUS_COLS
+        from dc_array_model import BUS_COLS as DC_BUS_COLS
+        from hybrid_model import HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        cases = (
+            ("ac", _dead_ac_object_network, _live_dc_object_network),
+            ("dc", _dead_dc_object_network, _live_ac_object_network),
+        )
+        for dead_side, dead_factory, live_factory in cases:
+            with self.subTest(dead_side=dead_side):
+                if dead_side == "ac":
+                    network = HybridPowerNetwork(dead_factory(), live_factory(), [], [])
+                else:
+                    network = HybridPowerNetwork(live_factory(), dead_factory(), [], [])
+                self.assertFalse(hasattr(network, "ppc"))
+
+                calc = HybridPowerFlowCalc(network, result_mode="array", linear_solver="scipy", verbose=False)
+                rc = calc.run()
+
+                self.assertEqual(0, rc)
+                self.assertTrue(calc.converged)
+                self.assertIsNone(getattr(calc, f"{dead_side}_calc"))
+                live_side = "dc" if dead_side == "ac" else "ac"
+                self.assertIsNotNone(getattr(calc, f"{live_side}_calc"))
+                skipped = calc.result[dead_side]
+                self.assertIsNotNone(skipped)
+                bus_cols = AC_BUS_COLS if dead_side == "ac" else DC_BUS_COLS
+                dynamic_columns = [bus_cols["voltage"]]
+                if dead_side == "ac":
+                    dynamic_columns.append(bus_cols["angle"])
+                self.assertTrue((skipped["bus"][:, dynamic_columns] == 0.0).all())
+                self.assertTrue((skipped["bus"][:, bus_cols["run_stat"]] == 0.0).all())
+                dead_network = getattr(network, dead_side)
+                self.assertTrue(all(node.run_stat == 0 and not node.is_alive for node in dead_network.nodes))
+                self.assertTrue(all(node.voltage == 0.0 for node in dead_network.nodes))
+                self.assertEqual(0, dead_network.switches[0].status)
+
+    def test_no_ppc_full_object_returns_empty_success_when_both_sides_are_dead(self):
+        from ac_array_model import BUS_COLS as AC_BUS_COLS, SWITCH_COLS as AC_SWITCH_COLS
+        from dc_array_model import BUS_COLS as DC_BUS_COLS, SWITCH_COLS as DC_SWITCH_COLS
+        from hybrid_model import HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        network = HybridPowerNetwork(_dead_ac_object_network(), _dead_dc_object_network(), [], [])
+        self.assertFalse(hasattr(network, "ppc"))
+        calc = HybridPowerFlowCalc(network, result_mode="array", linear_solver="scipy", verbose=False)
+
+        rc = calc.run()
+
+        self.assertEqual(0, rc)
+        self.assertTrue(calc.converged)
+        self.assertEqual(0, calc.iterations)
+        self.assertEqual(0.0, calc.normF)
+        self.assertEqual((0, 0), calc.last_jacobian_shape)
+        self.assertIsNone(calc.ac_calc)
+        self.assertIsNone(calc.dc_calc)
+        self.assertTrue((calc.result["ac"]["bus"][:, AC_BUS_COLS["voltage"]] == 0.0).all())
+        self.assertTrue((calc.result["dc"]["bus"][:, DC_BUS_COLS["voltage"]] == 0.0).all())
+        self.assertEqual(0, int(calc.result["ac"]["switch"][0, AC_SWITCH_COLS["status"]]))
+        self.assertEqual(0, int(calc.result["dc"]["switch"][0, DC_SWITCH_COLS["status"]]))
+
+    def test_ac_full_object_writeback_uses_topology_alive_masks_by_sparse_idx(self):
+        from ac_array_model import (
+            BRANCH_COLS,
+            BREAK_COLS,
+            BUS_COLS,
+            GEN_COLS,
+            LOAD_COLS,
+            SHUNT_COLS,
+            SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS,
+            TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS,
+        )
+        from dc_model import DCPowerNetwork
+        from hybrid_model import HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        mappings = (
+            ("nodes", "bus", None, BUS_COLS),
+            ("generators", "gen", "gen", GEN_COLS),
+            ("loads", "load", "load", LOAD_COLS),
+            ("shunt_compensators", "shunt", "shunt", SHUNT_COLS),
+            ("branches", "branch", "branch", BRANCH_COLS),
+            ("transformers", "transformer", "transformer", TRANSFORMER_COLS),
+            (
+                "three_winding_transformers",
+                "three_winding_transformer",
+                "three_winding_transformer",
+                THREE_WINDING_TRANSFORMER_COLS,
+            ),
+            ("zero_branches", "zero_branch", "zero_branch", ZERO_BRANCH_COLS),
+            ("switches", "switch", "switch", SWITCH_COLS),
+            ("breakers", "break", "break", BREAK_COLS),
+        )
+
+        for mode in ("full", "array"):
+            with self.subTest(mode=mode):
+                ac_network = _mixed_alive_dead_ac_object_network()
+                network = HybridPowerNetwork(ac_network, DCPowerNetwork(), [], [])
+                calc = HybridPowerFlowCalc(
+                    network,
+                    result_mode=mode,
+                    linear_solver="scipy",
+                    verbose=False,
+                )
+
+                self.assertEqual(0, calc.run())
+                topology = calc.ac_calc._ppc_topology
+                for collection_name, table_name, topology_key, columns in mappings:
+                    rows = calc.ac_calc.ppc[table_name]
+                    alive_mask = (
+                        topology.node_alive_mask
+                        if topology_key is None
+                        else topology.devices[topology_key].alive_mask
+                    )
+                    expected_by_idx = {
+                        int(row[columns["idx"]]): bool(alive)
+                        for row, alive in zip(rows, alive_mask)
+                    }
+                    actual_by_idx = {
+                        int(device.idx): bool(device.is_alive)
+                        for device in getattr(ac_network, collection_name)
+                    }
+                    self.assertEqual(expected_by_idx, actual_by_idx, (mode, collection_name))
+
+                self.assertTrue(ac_network.branch_dict[501].is_alive)
+                self.assertFalse(ac_network.branch_dict[1501].is_alive)
+                self.assertEqual(1, ac_network.branch_dict[1501].run_stat)
+                self.assertEqual(1, ac_network.switch_dict[1901].status)
+                self.assertEqual(1, ac_network.break_dict[2001].status)
+                self.assertEqual(0.0, ac_network.branch_dict[1501].i_p)
+                self.assertEqual(0.0, ac_network.branch_dict[1501].j_p)
+
     def test_hybrid_solver_skips_dead_dc_and_solves_live_ac(self):
         import numpy as np
         from ac_array_model import BUS_COLS as AC_BUS_COLS
