@@ -2780,18 +2780,24 @@ class HybridPowerFlowCalc:
             self.lf_result = None if self.result_mode == "array" else self._build_lf_result()
         return 0
 
+    @staticmethod
+    def _call_subsolver_without_object_writeback(subcalc, callback):
+        network_writeback = getattr(subcalc, "_network_writeback", None)
+        subcalc._network_writeback = None
+        try:
+            return callback()
+        finally:
+            subcalc._network_writeback = network_writeback
+
     def _run_single_subsolver(self, kind, subcalc, eq_count, var_count):
         subcalc.verbose = self.verbose
         subcalc.result_mode = "array"
         subcalc.keep_node_objects = False
         subcalc.skip_lf_result = True
-        network_writeback = getattr(subcalc, "_network_writeback", None)
-        if self.result_mode != "full":
-            subcalc._network_writeback = None
-        try:
-            rc = subcalc._run_newton_raphson()
-        finally:
-            subcalc._network_writeback = network_writeback
+        rc = self._call_subsolver_without_object_writeback(
+            subcalc,
+            subcalc._run_newton_raphson,
+        )
         self.x = subcalc.x
         self.converged = bool(subcalc.converged)
         self.iterations = int(subcalc.iterations)
@@ -3186,7 +3192,10 @@ class HybridPowerFlowCalc:
             self.ac_calc.result_mode = "array"
             self.ac_calc.keep_node_objects = False
             self.ac_calc.skip_lf_result = True
-            self.ac_calc._write_back()
+            self._call_subsolver_without_object_writeback(
+                self.ac_calc,
+                self.ac_calc._write_back,
+            )
             ac_result = self.ac_calc.result
         if self.dc_calc is not None:
             self.dc_calc.x = dc_x
@@ -3195,7 +3204,10 @@ class HybridPowerFlowCalc:
             self.dc_calc.result_mode = "array"
             self.dc_calc.keep_node_objects = False
             self.dc_calc.skip_lf_result = True
-            self.dc_calc._write_back()
+            self._call_subsolver_without_object_writeback(
+                self.dc_calc,
+                self.dc_calc._write_back,
+            )
             dc_result = self.dc_calc.result
 
         self._write_skipped_results_to_network()

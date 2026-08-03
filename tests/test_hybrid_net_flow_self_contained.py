@@ -438,6 +438,17 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
                     dead_network = getattr(network, dead_side)
                     pollute(active_network)
 
+                    subsolver_writebacks = []
+                    if side == "ac":
+                        original_subsolver_writeback = calc.ac_calc._write_ppc_result_to_network
+
+                        def counted_subsolver_writeback():
+                            if calc.ac_calc._network_writeback is not None:
+                                subsolver_writebacks.append("ac")
+                            return original_subsolver_writeback()
+
+                        calc.ac_calc._write_ppc_result_to_network = counted_subsolver_writeback
+
                     if mode != "full":
                         def reject_active_object_writeback():
                             raise AssertionError(f"{side} object writeback is full-mode only")
@@ -446,6 +457,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
                     self.assertEqual(0, calc.run())
                     self.assertTrue(getattr(calc, f"_single_{side}_newton_block"))
+                    self.assertEqual([], subsolver_writebacks)
                     self.assertIsNotNone(dead_network.result)
                     self.assertTrue(all(node.voltage == 0.0 for node in dead_network.nodes))
                     self.assertTrue(all(node.run_stat == 0 for node in dead_network.nodes))
@@ -458,6 +470,48 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
                         self.assertTrue(all(node.voltage == 99.0 for node in active_network.nodes))
                         self.assertTrue(all(not node.is_alive for node in active_network.nodes))
                         self.assertIsNone(calc.lf_result)
+
+    def test_general_full_object_writeback_respects_result_mode(self):
+        from hybrid_model import HybridPowerNetwork
+        from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+        for mode in ("none", "summary", "array", "full"):
+            with self.subTest(mode=mode):
+                ac_network = _live_ac_object_network()
+                dc_network = _live_dc_object_network()
+                network = HybridPowerNetwork(ac_network, dc_network, [], [])
+                calc = HybridPowerFlowCalc(
+                    network,
+                    result_mode=mode,
+                    linear_solver="scipy",
+                    verbose=False,
+                )
+                _pollute_ac_object_results(ac_network)
+                _pollute_dc_object_results(dc_network)
+
+                subsolver_writebacks = []
+                original_subsolver_writeback = calc.ac_calc._write_ppc_result_to_network
+
+                def counted_subsolver_writeback():
+                    if calc.ac_calc._network_writeback is not None:
+                        subsolver_writebacks.append("ac")
+                    return original_subsolver_writeback()
+
+                calc.ac_calc._write_ppc_result_to_network = counted_subsolver_writeback
+
+                self.assertEqual(0, calc.run())
+
+                self.assertFalse(calc._single_ac_newton_block)
+                self.assertFalse(calc._single_dc_newton_block)
+                self.assertEqual([], subsolver_writebacks)
+                if mode == "full":
+                    _assert_ac_objects_match_array_result(self, ac_network, calc.result["ac"])
+                    _assert_dc_objects_match_array_result(self, dc_network, calc.result["dc"])
+                    self.assertIsNotNone(calc.lf_result)
+                else:
+                    self.assertTrue(all(node.voltage == 99.0 for node in ac_network.nodes))
+                    self.assertTrue(all(node.voltage == 99.0 for node in dc_network.nodes))
+                    self.assertIsNone(calc.lf_result)
 
     def test_general_full_hybrid_writes_dc_array_results_back_to_full_objects(self):
         from hybrid_model import HybridPowerNetwork
