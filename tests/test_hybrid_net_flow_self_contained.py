@@ -126,6 +126,36 @@ def _independent_hybrid_rows(*, ac_run=1, dc_run=1, stale=0.0, include_converter
     return rows
 
 
+def _retire_dc_ppc_with_stale_outputs(ppc, stale=99.0):
+    from dc_array_model import (
+        BRANCH_COLS,
+        BREAK_COLS,
+        BUS_COLS,
+        DCDC_COLS,
+        GEN_COLS,
+        LOAD_COLS,
+        SWITCH_COLS,
+        ZERO_BRANCH_COLS,
+    )
+
+    dynamic_columns = {
+        "bus": (BUS_COLS["voltage"],),
+        "branch": tuple(BRANCH_COLS[name] for name in ("i_p", "j_p", "current")),
+        "load": tuple(LOAD_COLS[name] for name in ("p", "current")),
+        "gen": tuple(GEN_COLS[name] for name in ("p", "current")),
+        "zero_branch": tuple(ZERO_BRANCH_COLS[name] for name in ("p", "current")),
+        "switch": tuple(SWITCH_COLS[name] for name in ("p", "current")),
+        "break": tuple(BREAK_COLS[name] for name in ("p", "current")),
+        "dcdc": tuple(DCDC_COLS[name] for name in ("i_p", "j_p", "i_c", "j_c")),
+    }
+    ppc["bus"][:, BUS_COLS["run_stat"]] = 0.0
+    for key, columns in dynamic_columns.items():
+        table = ppc.get(key)
+        if table is not None and table.size:
+            table[:, list(columns)] = stale
+    return {key: ppc[key].copy() for key in dynamic_columns}, dynamic_columns
+
+
 class HybridNetFlowSelfContainedTest(unittest.TestCase):
     def test_hybrid_solver_skips_dead_dc_and_solves_live_ac(self):
         import numpy as np
@@ -284,6 +314,212 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             self.assertEqual(0, calc.run())
         finally:
             hybrid_lf._array_device = original_array_device
+
+    def test_general_hybrid_writeback_installs_dead_dc_results_for_every_mode(self):
+        import numpy as np
+        from dc_array_model import BUS_COLS, GEN_COLS, SWITCH_COLS
+        import lfcore.hybrid_lf as hybrid_lf
+
+        for mode in ("none", "summary", "array", "full"):
+            with self.subTest(mode=mode):
+                network = hybrid_lf._read_lf_network_from_file(
+                    ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+                )
+                source, dynamic_columns = _retire_dc_ppc_with_stale_outputs(network._dc_ppc)
+                calc = hybrid_lf.HybridPowerFlowCalc(
+                    network,
+                    result_mode=mode,
+                    verbose=False,
+                )
+
+                self.assertEqual(0, calc.run())
+                self.assertTrue(calc.converged)
+                self.assertIsNotNone(calc.ac_calc)
+                self.assertIsNone(calc.dc_calc)
+                self.assertEqual(1, calc.N_acac)
+                self.assertFalse(calc._single_ac_newton_block)
+                self.assertIsNotNone(network.dc.result)
+
+                for key, columns in dynamic_columns.items():
+                    actual = network.dc.result[key]
+                    expected_source = source[key]
+                    self.assertEqual(expected_source.shape, actual.shape, (mode, key))
+                    self.assertTrue(np.all(actual[:, list(columns)] == 0.0), (mode, key))
+                    static_columns = [
+                        column
+                        for column in range(actual.shape[1])
+                        if column not in columns
+                    ]
+                    np.testing.assert_array_equal(
+                        actual[:, static_columns],
+                        expected_source[:, static_columns],
+                        err_msg=f"{mode} {key} static columns changed",
+                    )
+
+                self.assertEqual(
+                    0,
+                    int(network.dc.result["bus"][0, BUS_COLS["run_stat"]]),
+                )
+                self.assertEqual(
+                    float(source["gen"][0, GEN_COLS["v_set"]]),
+                    float(network.dc.result["gen"][0, GEN_COLS["v_set"]]),
+                )
+                self.assertEqual(
+                    int(source["gen"][0, GEN_COLS["run_stat"]]),
+                    int(network.dc.result["gen"][0, GEN_COLS["run_stat"]]),
+                )
+                self.assertEqual(
+                    int(source["switch"][0, SWITCH_COLS["status"]]),
+                    int(network.dc.result["switch"][0, SWITCH_COLS["status"]]),
+                )
+
+                if mode == "none":
+                    self.assertEqual({}, calc.result)
+                    self.assertIsNone(calc.lf_result)
+                elif mode == "summary":
+                    self.assertTrue(np.all(calc.result["dc"]["voltage"] == 0.0))
+                    self.assertIsNone(calc.lf_result)
+                else:
+                    self.assertIs(calc.result["dc"], network.dc.result)
+                    if mode == "array":
+                        self.assertIsNone(calc.lf_result)
+                    else:
+                        self.assertIsNotNone(calc.lf_result)
+
+    def test_general_hybrid_none_writeback_zeros_dead_dc_full_objects(self):
+        from dc_array_model import BUS_COLS
+        import lfcore.hybrid_lf as hybrid_lf
+
+        network = hybrid_lf.HybridPowerNetwork.read_from_file(
+            ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+        )
+        _retire_dc_ppc_with_stale_outputs(network._dc_ppc)
+        for node in network.dc.nodes:
+            node.run_stat = 0
+            node.voltage = 99.0
+        for generator in network.dc.generators:
+            generator.p = 99.0
+            generator.current = 99.0
+
+        calc = hybrid_lf.HybridPowerFlowCalc(network, result_mode="none", verbose=False)
+
+        self.assertEqual(0, calc.run())
+        self.assertTrue(calc.converged)
+        self.assertIsNone(calc.dc_calc)
+        self.assertTrue(calc._single_ac_newton_block)
+        self.assertEqual({}, calc.result)
+        self.assertIsNotNone(network.dc.result)
+        self.assertTrue(
+            all(node.voltage == 0.0 and node.run_stat == 0 for node in network.dc.nodes)
+        )
+        self.assertTrue(
+            all(generator.p == 0.0 and generator.current == 0.0 for generator in network.dc.generators)
+        )
+        self.assertTrue(
+            all(
+                row[BUS_COLS["voltage"]] == 0.0
+                and int(row[BUS_COLS["run_stat"]]) == 0
+                for row in network.dc.result["bus"]
+            )
+        )
+
+    def test_skipped_result_synthesizes_canonical_empty_table_widths(self):
+        import numpy as np
+        from ac_array_model import (
+            ACAC_COLS,
+            BRANCH_COLS as AC_BRANCH_COLS,
+            BREAK_COLS as AC_BREAK_COLS,
+            BUS_COLS as AC_BUS_COLS,
+            GEN_COLS as AC_GEN_COLS,
+            LOAD_COLS as AC_LOAD_COLS,
+            SHUNT_COLS as AC_SHUNT_COLS,
+            SWITCH_COLS as AC_SWITCH_COLS,
+            THREE_WINDING_TRANSFORMER_COLS as AC_THREE_COLS,
+            TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
+            ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
+        )
+        from dc_array_model import (
+            BRANCH_COLS as DC_BRANCH_COLS,
+            BREAK_COLS as DC_BREAK_COLS,
+            BUS_COLS as DC_BUS_COLS,
+            DCDC_COLS,
+            GEN_COLS as DC_GEN_COLS,
+            LOAD_COLS as DC_LOAD_COLS,
+            SWITCH_COLS as DC_SWITCH_COLS,
+            ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+        )
+        import lfcore.hybrid_lf as hybrid_lf
+
+        ac_columns = {
+            "bus": AC_BUS_COLS,
+            "gen": AC_GEN_COLS,
+            "load": AC_LOAD_COLS,
+            "shunt": AC_SHUNT_COLS,
+            "branch": AC_BRANCH_COLS,
+            "transformer": AC_TRANSFORMER_COLS,
+            "three_winding_transformer": AC_THREE_COLS,
+            "zero_branch": AC_ZERO_BRANCH_COLS,
+            "switch": AC_SWITCH_COLS,
+            "break": AC_BREAK_COLS,
+            "acac": ACAC_COLS,
+        }
+        dc_columns = {
+            "bus": DC_BUS_COLS,
+            "branch": DC_BRANCH_COLS,
+            "load": DC_LOAD_COLS,
+            "gen": DC_GEN_COLS,
+            "zero_branch": DC_ZERO_BRANCH_COLS,
+            "switch": DC_SWITCH_COLS,
+            "break": DC_BREAK_COLS,
+            "dcdc": DCDC_COLS,
+        }
+
+        ac_result = hybrid_lf._zero_subgrid_result(
+            {},
+            hybrid_lf._AC_ZERO_RESULT_TABLE_SPECS,
+        )
+        dc_result = hybrid_lf._zero_subgrid_result(
+            {},
+            hybrid_lf._DC_ZERO_RESULT_TABLE_SPECS,
+        )
+
+        for key, columns in ac_columns.items():
+            self.assertEqual((0, max(columns.values()) + 1), ac_result[key].shape, key)
+        for key, columns in dc_columns.items():
+            self.assertEqual((0, max(columns.values()) + 1), dc_result[key].shape, key)
+        self.assertGreater(
+            ac_result["gen"].shape[1],
+            AC_GEN_COLS["p_max"],
+        )
+
+        invalid_ac = hybrid_lf._zero_subgrid_result(
+            {"gen": np.arange(3, dtype=np.float64)},
+            hybrid_lf._AC_ZERO_RESULT_TABLE_SPECS,
+        )
+        self.assertEqual((0, max(AC_GEN_COLS.values()) + 1), invalid_ac["gen"].shape)
+
+    def test_skipped_result_zeros_only_existing_columns_in_narrow_source_table(self):
+        import numpy as np
+        from ac_array_model import GEN_COLS
+        import lfcore.hybrid_lf as hybrid_lf
+
+        source = np.arange(1.0, 11.0, dtype=np.float64).reshape(1, 10)
+        ppc = {"gen": source.copy()}
+        try:
+            result = hybrid_lf._zero_table_columns(
+                ppc,
+                "gen",
+                hybrid_lf._AC_ZERO_RESULT_TABLE_SPECS["gen"],
+            )
+        except IndexError as exc:
+            self.fail(f"narrow source tables must not raise IndexError: {exc}")
+
+        expected = source.copy()
+        expected[:, [GEN_COLS["p"], GEN_COLS["q"]]] = 0.0
+        np.testing.assert_array_equal(expected, result)
+        self.assertEqual(source.shape, result.shape)
+        self.assertEqual(source[0, GEN_COLS["p_set"]], result[0, GEN_COLS["p_set"]])
+        self.assertEqual(source[0, GEN_COLS["run_stat"]], result[0, GEN_COLS["run_stat"]])
 
     def test_hybrid_net_flow_does_not_import_network_classes(self):
         import hybrid_net_flow

@@ -131,58 +131,74 @@ def _ppc_has_operational_nodes(ppc, network_part) -> bool:
     return _node_count(network_part) > 0
 
 
-def _zero_table_columns(ppc, key, columns):
+def _zero_result_table_spec(columns, dynamic_names):
+    return (
+        max(columns.values()) + 1 if columns else 0,
+        tuple(columns[name] for name in dynamic_names),
+    )
+
+
+def _zero_table_columns(ppc, key, table_spec):
+    canonical_width, columns = table_spec
     source = None if ppc is None else ppc.get(key)
     if source is None:
-        width = max(columns) + 1 if columns else 0
-        return np.zeros((0, width), dtype=np.float64)
+        return np.zeros((0, canonical_width), dtype=np.float64)
     source = np.asarray(source, dtype=np.float64)
     if source.ndim != 2:
-        width = max(columns) + 1 if columns else 0
-        source = np.zeros((0, width), dtype=np.float64)
+        return np.zeros((0, canonical_width), dtype=np.float64)
     result = source.copy()
     if result.size and columns:
-        result[:, list(columns)] = 0.0
+        existing_columns = [
+            column
+            for column in columns
+            if 0 <= column < result.shape[1]
+        ]
+        if existing_columns:
+            result[:, existing_columns] = 0.0
     return result
 
 
-_AC_ZERO_RESULT_COLUMNS = {
-    "bus": (AC_BUS_COLS["voltage"], AC_BUS_COLS["angle"]),
-    "gen": (AC_GEN_COLS["p"], AC_GEN_COLS["q"], AC_GEN_COLS["current"]),
-    "load": (AC_LOAD_COLS["p"], AC_LOAD_COLS["q"], AC_LOAD_COLS["current"]),
-    "shunt": (AC_SHUNT_COLS["p"], AC_SHUNT_COLS["q"], AC_SHUNT_COLS["current"]),
-    "branch": tuple(AC_BRANCH_COLS[name] for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")),
-    "transformer": tuple(
-        AC_TRANSFORMER_COLS[name] for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")
+_AC_ZERO_RESULT_TABLE_SPECS = {
+    "bus": _zero_result_table_spec(AC_BUS_COLS, ("voltage", "angle")),
+    "gen": _zero_result_table_spec(AC_GEN_COLS, ("p", "q", "current")),
+    "load": _zero_result_table_spec(AC_LOAD_COLS, ("p", "q", "current")),
+    "shunt": _zero_result_table_spec(AC_SHUNT_COLS, ("p", "q", "current")),
+    "branch": _zero_result_table_spec(
+        AC_BRANCH_COLS,
+        ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c"),
     ),
-    "three_winding_transformer": tuple(
-        AC_THREE_WINDING_TRANSFORMER_COLS[name]
-        for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c")
+    "transformer": _zero_result_table_spec(
+        AC_TRANSFORMER_COLS,
+        ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c"),
     ),
-    "zero_branch": tuple(AC_ZERO_BRANCH_COLS[name] for name in ("p", "q", "current")),
-    "switch": tuple(AC_SWITCH_COLS[name] for name in ("p", "q", "current")),
-    "break": tuple(AC_BREAK_COLS[name] for name in ("p", "q", "current")),
-    "acac": tuple(ACAC_COLS[name] for name in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i")),
+    "three_winding_transformer": _zero_result_table_spec(
+        AC_THREE_WINDING_TRANSFORMER_COLS,
+        ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c"),
+    ),
+    "zero_branch": _zero_result_table_spec(AC_ZERO_BRANCH_COLS, ("p", "q", "current")),
+    "switch": _zero_result_table_spec(AC_SWITCH_COLS, ("p", "q", "current")),
+    "break": _zero_result_table_spec(AC_BREAK_COLS, ("p", "q", "current")),
+    "acac": _zero_result_table_spec(ACAC_COLS, ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i")),
 }
 
-_DC_ZERO_RESULT_COLUMNS = {
-    "bus": (DC_BUS_COLS["voltage"],),
-    "branch": tuple(DC_BRANCH_COLS[name] for name in ("i_p", "j_p", "current")),
-    "load": tuple(DC_LOAD_COLS[name] for name in ("p", "current")),
-    "gen": tuple(DC_GEN_COLS[name] for name in ("p", "current")),
-    "zero_branch": tuple(DC_ZERO_BRANCH_COLS[name] for name in ("p", "current")),
-    "switch": tuple(DC_SWITCH_COLS[name] for name in ("p", "current")),
-    "break": tuple(DC_BREAK_COLS[name] for name in ("p", "current")),
-    "dcdc": tuple(DC_DCDC_COLS[name] for name in ("i_p", "j_p", "i_c", "j_c")),
+_DC_ZERO_RESULT_TABLE_SPECS = {
+    "bus": _zero_result_table_spec(DC_BUS_COLS, ("voltage",)),
+    "branch": _zero_result_table_spec(DC_BRANCH_COLS, ("i_p", "j_p", "current")),
+    "load": _zero_result_table_spec(DC_LOAD_COLS, ("p", "current")),
+    "gen": _zero_result_table_spec(DC_GEN_COLS, ("p", "current")),
+    "zero_branch": _zero_result_table_spec(DC_ZERO_BRANCH_COLS, ("p", "current")),
+    "switch": _zero_result_table_spec(DC_SWITCH_COLS, ("p", "current")),
+    "break": _zero_result_table_spec(DC_BREAK_COLS, ("p", "current")),
+    "dcdc": _zero_result_table_spec(DC_DCDC_COLS, ("i_p", "j_p", "i_c", "j_c")),
 }
 
 
-def _zero_subgrid_result(ppc, column_map):
+def _zero_subgrid_result(ppc, table_specs):
     if not isinstance(ppc, dict):
         return None
     return {
-        key: _zero_table_columns(ppc, key, columns)
-        for key, columns in column_map.items()
+        key: _zero_table_columns(ppc, key, table_spec)
+        for key, table_spec in table_specs.items()
     }
 
 
@@ -891,8 +907,14 @@ class HybridPowerFlowCalc:
         self._dc_ppc = getattr(network, "_dc_ppc", None) or getattr(network.dc, "ppc", None)
         self.has_ac = _ppc_has_operational_nodes(self._ac_ppc, network.ac)
         self.has_dc = _ppc_has_operational_nodes(self._dc_ppc, network.dc)
-        self._skipped_ac_result = _zero_subgrid_result(self._ac_ppc, _AC_ZERO_RESULT_COLUMNS)
-        self._skipped_dc_result = _zero_subgrid_result(self._dc_ppc, _DC_ZERO_RESULT_COLUMNS)
+        self._skipped_ac_result = _zero_subgrid_result(
+            self._ac_ppc,
+            _AC_ZERO_RESULT_TABLE_SPECS,
+        )
+        self._skipped_dc_result = _zero_subgrid_result(
+            self._dc_ppc,
+            _DC_ZERO_RESULT_TABLE_SPECS,
+        )
         # Hybrid 含 DC 网络时，PyKLU 在部分非对称/耦合矩阵上会失败；未显式指定时
         # 默认走 UMFPACK，若本机未安装则由 solver_common 回退到 SciPy/SuperLU。
         solver_name = str(linear_solver).strip().lower() if linear_solver is not None else ""
@@ -3080,8 +3102,8 @@ class HybridPowerFlowCalc:
         """Write final global state back into AC, DC and converter model objects."""
         x = self.x
         ac_x, dc_x, dcac_x, acac_x = self._split_x(x)
-        ac_result = None
-        dc_result = None
+        ac_result = self._skipped_ac_result
+        dc_result = self._skipped_dc_result
         if self.ac_calc is not None:
             self._set_ac_converter_power_injections(dcac_x, acac_x)
             self.ac_calc.x = ac_x
@@ -3101,6 +3123,8 @@ class HybridPowerFlowCalc:
             self.dc_calc.skip_lf_result = True
             self.dc_calc._write_back()
             dc_result = self.dc_calc.result
+
+        self._write_skipped_results_to_network()
 
         dcac_result = np.zeros((self.N_dcac, 5), dtype=np.float64)
         acac_result = np.zeros((self.N_acac, 6), dtype=np.float64)
