@@ -918,10 +918,18 @@ class HybridPowerFlowCalc:
         self.has_ac = _ppc_has_operational_nodes(self._ac_ppc, network.ac)
         self.has_dc = _ppc_has_operational_nodes(self._dc_ppc, network.dc)
         ac_result_source = self._ac_ppc
-        if ac_result_source is None and not getattr(network.ac, "_lf_lightweight", False):
+        if (
+            ac_result_source is None
+            and not self.has_ac
+            and not getattr(network.ac, "_lf_lightweight", False)
+        ):
             ac_result_source = build_ac_ppc_from_network(network.ac)
         dc_result_source = self._dc_ppc
-        if dc_result_source is None and not getattr(network.dc, "_lf_lightweight", False):
+        if (
+            dc_result_source is None
+            and not self.has_dc
+            and not getattr(network.dc, "_lf_lightweight", False)
+        ):
             dc_result_source = build_dc_ppc_from_network(network.dc)
         self._skipped_ac_result = _zero_subgrid_result(
             ac_result_source,
@@ -2959,8 +2967,12 @@ class HybridPowerFlowCalc:
 
     def _write_dc_ppc_result_to_network(self) -> None:
         result = self.dc_calc.result if self.dc_calc is not None else None
-        if result and getattr(self.network.dc, "_lf_lightweight", False):
+        if not result:
+            return
+        if getattr(self.network.dc, "_lf_lightweight", False):
             self.network.dc.result = result
+            return
+        self.dc_calc._write_ppc_result_to_network()
 
     def _write_ac_ppc_result_to_network(self) -> None:
         """Copy array-mode AC results back to the hybrid AC object facade."""
