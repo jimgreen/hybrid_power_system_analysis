@@ -3043,6 +3043,8 @@ class ACPowerFlowCalc:
                 Q_gen = Q_gen + external_q
 
         bus = self.ppc["bus"].copy()
+        if bus.size:
+            bus[:, [BUS_COLS["voltage"], BUS_COLS["angle"]]] = 0.0
         bus[self.active_node_rows, BUS_COLS["voltage"]] = V[self.active_node_solver_pos]
         bus[self.active_node_rows, BUS_COLS["angle"]] = theta[self.active_node_solver_pos]
         for pos, node in enumerate(self.node_list):
@@ -3050,6 +3052,8 @@ class ACPowerFlowCalc:
             node.angle = float(theta[pos])
 
         gen = self.ppc["gen"].copy()
+        if gen.size:
+            gen[:, [GEN_COLS["p"], GEN_COLS["q"], GEN_COLS["current"]]] = 0.0
         if self.ppc_gen_rows.size:
             live_gen = gen[self.ppc_gen_rows]
             controls = self.ppc_gen_control
@@ -3114,6 +3118,8 @@ class ACPowerFlowCalc:
             gen[self.ppc_gen_rows, GEN_COLS["current"]] = gen_current
 
         load = self.ppc["load"].copy()
+        if load.size:
+            load[:, [LOAD_COLS["p"], LOAD_COLS["q"], LOAD_COLS["current"]]] = 0.0
         if self.ppc_load_rows.size:
             vm = V[self.ppc_load_pos]
             load_p = self.load_pv0 + self.load_pv1 * vm + self.load_pv2 * vm ** 2
@@ -3129,6 +3135,8 @@ class ACPowerFlowCalc:
             load[self.ppc_load_rows, LOAD_COLS["current"]] = load_current
 
         shunt = self.ppc["shunt"].copy()
+        if shunt.size:
+            shunt[:, [SHUNT_COLS["p"], SHUNT_COLS["q"], SHUNT_COLS["current"]]] = 0.0
         if self.ppc_shunt_rows.size:
             rows = self.ppc_shunt_rows
             vm = V[self.ppc_shunt_pos]
@@ -3154,6 +3162,15 @@ class ACPowerFlowCalc:
             shunt[rows, SHUNT_COLS["current"]] = current
 
         branch = self.ppc["branch"].copy()
+        if branch.size:
+            branch[:, [
+                BRANCH_COLS["i_p"],
+                BRANCH_COLS["i_q"],
+                BRANCH_COLS["i_c"],
+                BRANCH_COLS["j_p"],
+                BRANCH_COLS["j_q"],
+                BRANCH_COLS["j_c"],
+            ]] = 0.0
         if self.ppc_branch_rows.size:
             Vi = Vc[self.branch_i]
             Vj = Vc[self.branch_j]
@@ -3170,6 +3187,15 @@ class ACPowerFlowCalc:
             branch[rows, BRANCH_COLS["j_c"]] = np.abs(I_ji)
 
         transformer = self.ppc["transformer"].copy()
+        if transformer.size:
+            transformer[:, [
+                TRANSFORMER_COLS["i_p"],
+                TRANSFORMER_COLS["i_q"],
+                TRANSFORMER_COLS["i_c"],
+                TRANSFORMER_COLS["j_p"],
+                TRANSFORMER_COLS["j_q"],
+                TRANSFORMER_COLS["j_c"],
+            ]] = 0.0
         if self.ppc_transformer_rows.size:
             Vi = Vc[self.transformer_i]
             Vj = Vc[self.transformer_j]
@@ -3222,6 +3248,16 @@ class ACPowerFlowCalc:
         zero_branch = self.ppc["zero_branch"].copy()
         switch = self.ppc["switch"].copy()
         breaker = self.ppc.get("break", np.zeros((0, len(SWITCH_COLS)))).copy()
+        if zero_branch.size:
+            zero_branch[:, [
+                ZERO_BRANCH_COLS["p"],
+                ZERO_BRANCH_COLS["q"],
+                ZERO_BRANCH_COLS["current"],
+            ]] = 0.0
+        if switch.size:
+            switch[:, [SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]]] = 0.0
+        if breaker.size:
+            breaker[:, [SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]]] = 0.0
         for dev_idx, dev_type, a, current in zip(self.zero_idx, self.zero_type, self.zero_a, I_ab):
             s_from = Vc[a] * np.conj(current)
             if dev_type == 0:

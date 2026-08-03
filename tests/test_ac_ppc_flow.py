@@ -17,7 +17,181 @@ sys.path.insert(0, str(ROOT_DIR / "model"))
 sys.path.insert(0, str(ROOT_DIR / "lfcore"))
 
 
+def _table(header, rows):
+    return {"header_list": header.split(), "rows": rows}
+
+
+def _mixed_live_dead_ac_ppc(stale=99.0):
+    from ac_array_model import (
+        BRANCH_COLS,
+        BREAK_COLS,
+        BUS_COLS,
+        GEN_COLS,
+        LOAD_COLS,
+        SHUNT_COLS,
+        SWITCH_COLS,
+        THREE_WINDING_TRANSFORMER_COLS,
+        TRANSFORMER_COLS,
+        ZERO_BRANCH_COLS,
+        build_ac_ppc_from_efile_rows,
+    )
+    from model.ppc_topology import ensure_ac_ppc_topology
+
+    rows = {
+        "Model": _table(
+            "path name p_base u_unit p_unit i_unit",
+            [["test", "mixed_live_dead", 100, "V", "kW", "A"]],
+        ),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[idx, f"bus_{idx}", 380, 380, 0, 1] for idx in range(1, 8)],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha p_max run_stat",
+            [
+                [1, "live_source", 1, "PH", 0, 0, 380, 1, 100, 1],
+                [2, "dead_generator", 3, "PQ", 5, 1, 0, 1, 20, 1],
+            ],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [
+                [1, "live_load", 2, 10, 1, 0, 0, 2, 1, 0, 0, 1],
+                [2, "dead_load", 4, 5, 1, 0, 0, 1, 1, 0, 0, 1],
+            ],
+        ),
+        "ACShuntCompensator": _table(
+            "idx name node control_type q_set g_set b_set v_set run_stat",
+            [[1, "dead_shunt", 5, "Q", 2, 0, 0, 0, 1]],
+        ),
+        "ACBranch": _table(
+            "idx name i_node j_node r x b run_stat",
+            [
+                [1, "live_branch", 1, 2, 0.01, 0.1, 0, 1],
+                [2, "dead_branch", 3, 4, 0.02, 0.2, 0, 1],
+            ],
+        ),
+        "ACTransformer": _table(
+            "idx name i_node j_node r x gt bt tap shift run_stat",
+            [[1, "dead_transformer", 4, 5, 0.01, 0.1, 0, 0, 1, 0, 1]],
+        ),
+        "ACThreeWindingTransformer": _table(
+            "idx name i_node j_node k_node i_r i_x j_r j_x k_r k_x gt bt "
+            "i_tap i_shift j_tap j_shift k_tap k_shift run_stat",
+            [[1, "dead_three", 3, 4, 5, 0.01, 0.1, 0.01, 0.1, 0.01, 0.1, 0, 0, 1, 0, 1, 0, 1, 0, 1]],
+        ),
+        "ACZeroBranch": _table(
+            "idx name i_node j_node run_stat",
+            [[1, "dead_zero", 5, 6, 1]],
+        ),
+        "ACSwitch": _table(
+            "idx name i_node j_node status run_stat",
+            [[1, "dead_switch", 6, 7, 1, 1]],
+        ),
+        "ACBreak": _table(
+            "idx name i_node j_node status run_stat",
+            [[1, "dead_break", 3, 7, 1, 1]],
+        ),
+    }
+    ppc = ensure_ac_ppc_topology(
+        build_ac_ppc_from_efile_rows(Path("mixed_live_dead.e"), rows)
+    )
+    dynamic_columns = {
+        "bus": (BUS_COLS["voltage"], BUS_COLS["angle"]),
+        "gen": (GEN_COLS["p"], GEN_COLS["q"], GEN_COLS["current"]),
+        "load": (LOAD_COLS["p"], LOAD_COLS["q"], LOAD_COLS["current"]),
+        "shunt": (SHUNT_COLS["p"], SHUNT_COLS["q"], SHUNT_COLS["current"]),
+        "branch": tuple(BRANCH_COLS[name] for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")),
+        "transformer": tuple(
+            TRANSFORMER_COLS[name] for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")
+        ),
+        "three_winding_transformer": tuple(
+            THREE_WINDING_TRANSFORMER_COLS[name]
+            for name in ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c")
+        ),
+        "zero_branch": (ZERO_BRANCH_COLS["p"], ZERO_BRANCH_COLS["q"], ZERO_BRANCH_COLS["current"]),
+        "switch": (SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]),
+        "break": (BREAK_COLS["p"], BREAK_COLS["q"], BREAK_COLS["current"]),
+    }
+    for key, columns in dynamic_columns.items():
+        if ppc[key].size:
+            ppc[key][:, list(columns)] = stale
+    return ppc, dynamic_columns
+
+
 class ACPPCFlowTest(unittest.TestCase):
+    def test_ac_ppc_writeback_zeroes_inactive_island_dynamic_rows(self):
+        from ac_array_model import BUS_COLS
+        from ac_lf import ACPowerFlowCalc
+
+        ppc, dynamic_columns = _mixed_live_dead_ac_ppc()
+        source = {key: ppc[key].copy() for key in dynamic_columns}
+        topology = ppc["_topology_arrays"]
+
+        self.assertEqual(
+            [True, True, False, False, False, False, False],
+            topology.node_alive_mask.tolist(),
+        )
+        calc = ACPowerFlowCalc(ppc, result_mode="array", verbose=False)
+
+        self.assertEqual(0, calc.run())
+        self.assertTrue(calc.converged)
+        self.assertGreater(calc.result["bus"][0, BUS_COLS["voltage"]], 0.0)
+
+        for key, columns in dynamic_columns.items():
+            with self.subTest(table=key):
+                alive_mask = (
+                    topology.node_alive_mask
+                    if key == "bus"
+                    else topology.devices[key].alive_mask
+                )
+                inactive_rows = np.flatnonzero(~np.asarray(alive_mask, dtype=bool))
+                self.assertGreater(inactive_rows.size, 0)
+                np.testing.assert_array_equal(
+                    calc.result[key][np.ix_(inactive_rows, columns)],
+                    np.zeros((inactive_rows.size, len(columns))),
+                )
+                static_columns = [
+                    column
+                    for column in range(source[key].shape[1])
+                    if column not in columns
+                ]
+                np.testing.assert_array_equal(
+                    calc.result[key][:, static_columns],
+                    source[key][:, static_columns],
+                )
+                np.testing.assert_array_equal(ppc[key], source[key])
+
+    def test_ac_object_writeback_receives_zero_inactive_results(self):
+        from ac_array_model import build_ac_network_from_ppc
+        from ac_lf import ACPowerFlowCalc
+
+        ppc, _dynamic_columns = _mixed_live_dead_ac_ppc()
+        network = build_ac_network_from_ppc(ppc)
+        calc = ACPowerFlowCalc(network, result_mode="array", verbose=False)
+
+        self.assertEqual(0, calc.run())
+        self.assertTrue(calc.converged)
+
+        dead_node = next(node for node in network.nodes if node.idx == 3)
+        dead_generator = next(device for device in network.generators if device.idx == 2)
+        dead_load = next(device for device in network.loads if device.idx == 2)
+        dead_branch = next(device for device in network.branches if device.idx == 2)
+        self.assertEqual((0.0, 0.0), (dead_node.voltage, dead_node.angle))
+        self.assertEqual((0.0, 0.0, 0.0), (dead_generator.p, dead_generator.q, dead_generator.current))
+        self.assertEqual((0.0, 0.0, 0.0), (dead_load.p, dead_load.q, dead_load.current))
+        self.assertEqual(
+            (0.0,) * 6,
+            (
+                dead_branch.i_p,
+                dead_branch.i_q,
+                dead_branch.i_c,
+                dead_branch.j_p,
+                dead_branch.j_q,
+                dead_branch.j_c,
+            ),
+        )
+
     def test_ppc_flow_applies_automatic_ph_reference_to_each_island(self):
         from ac_array_model import build_ac_ppc_from_efile_rows
         from ac_lf import AC_NODE_TYPE_SLACK, ACPowerFlowCalc
