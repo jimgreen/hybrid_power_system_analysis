@@ -25,6 +25,7 @@ from dc_array_model import (
     build_dc_ppc_from_efile_rows,
 )
 from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
+from model.effective_state import propagate_composite_run_states
 from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
@@ -530,17 +531,18 @@ def build_hybrid_ppc_from_e_file(file_path):
 
 
 def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
-    ac_ppc = build_ac_ppc_from_efile_rows(file_path, rows)
-    dc_ppc = build_dc_ppc_from_efile_rows(file_path, rows)
+    effective_rows, overrides = propagate_composite_run_states(rows)
+    ac_ppc = build_ac_ppc_from_efile_rows(file_path, effective_rows)
+    dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows)
     ac_ppc["source"] = str(file_path)
     dc_ppc["source"] = str(file_path)
     vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
     dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(
-        rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
+        effective_rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
     )
     acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
     acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
-    return {
+    ppc = {
         "format": "hybrid_ppc_v1",
         "source": str(file_path),
         "base": ac_ppc["base"],
@@ -553,11 +555,16 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
     }
+    ppc["_effective_run_state_overrides"] = overrides
+    ac_ppc["_effective_run_state_overrides"] = overrides
+    dc_ppc["_effective_run_state_overrides"] = overrides
+    return ppc
 
 
 def build_hybrid_ppc_from_efile_rows(file_path, rows):
-    ac_ppc = build_ac_ppc_from_efile_rows(file_path, rows)
-    dc_ppc = build_dc_ppc_from_efile_rows(file_path, rows)
+    effective_rows, overrides = propagate_composite_run_states(rows)
+    ac_ppc = build_ac_ppc_from_efile_rows(file_path, effective_rows)
+    dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows)
     ac_network = _build_ac_network_from_ppc(ac_ppc)
     dc_network = _build_dc_network_from_ppc(dc_ppc)
     ac_ppc["source"] = str(file_path)
@@ -565,7 +572,12 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
     ac_network.ppc = ac_ppc
     dc_network.ppc = dc_ppc
     vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
-    dcac, dcac_name, dcac_objects = _build_dcac_from_rows(rows, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
+    dcac, dcac_name, dcac_objects = _build_dcac_from_rows(
+        effective_rows,
+        ac_ppc,
+        dc_ppc,
+        vbase_maps=vbase_maps,
+    )
     acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
     acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
     acac_objects = list(getattr(ac_network, "acac_converters", []))
@@ -585,7 +597,10 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
         "acac_objects": acac_objects,
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
+        "_effective_run_state_overrides": overrides,
     }
+    ac_ppc["_effective_run_state_overrides"] = overrides
+    dc_ppc["_effective_run_state_overrides"] = overrides
     network = build_hybrid_model_from_ppc(ppc)
     return network, ppc
 

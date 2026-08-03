@@ -15,6 +15,7 @@ for path in (MODEL_DIR, ROOT_DIR):
         sys.path.insert(0, str(path))
 
 from topology import build_dc_topology_input_ppc
+from model.effective_state import propagate_composite_run_states
 from model.array_common import (
     _assign_current_if_present,
     _assign_power_if_present,
@@ -458,16 +459,16 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
 def build_dc_ppc_from_e_file(file_path) -> Dict:
     """Build a DC ppc from an E file through the shared model factory."""
     source = resolve_project_file(file_path).resolve()
-    ppc = _build_dc_ppc_from_rows_dict(_read_efile_rows(source), source)
-    ppc["source"] = str(source)
-    return ppc
+    return build_dc_ppc_from_efile_rows(source, _read_efile_rows(source))
 
 
 def build_dc_ppc_from_efile_rows(file_path, rows) -> Dict:
     """Build DC ppc from E rows that are already loaded in memory."""
     source = resolve_project_file(file_path).resolve()
-    ppc = _build_dc_ppc_from_rows_dict(rows, source)
+    effective_rows, overrides = propagate_composite_run_states(rows)
+    ppc = _build_dc_ppc_from_rows_dict(effective_rows, source)
     ppc["source"] = str(source)
+    ppc["_effective_run_state_overrides"] = overrides
     return ppc
 
 

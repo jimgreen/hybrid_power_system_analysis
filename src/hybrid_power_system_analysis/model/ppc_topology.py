@@ -20,7 +20,6 @@ from model.ac_array_model import (
     THREE_WINDING_TRANSFORMER_COLS as AC_THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS as AC_TRANSFORMER_COLS,
     ZERO_BRANCH_COLS as AC_ZERO_BRANCH_COLS,
-    build_ac_ppc_from_e_file,
     build_ac_ppc_from_efile_rows,
     ensure_ac_ppc_gen_columns,
 )
@@ -34,7 +33,6 @@ from model.dc_array_model import (
     LOAD_COLS as DC_LOAD_COLS,
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
-    build_dc_ppc_from_e_file,
     build_dc_ppc_from_efile_rows,
 )
 from model.hybrid_array_model import (
@@ -709,9 +707,7 @@ def _attach_hybrid_ac_reference_nodes(ppc: Dict) -> None:
 def build_ac_ppc_with_topology_from_e_file(file_path) -> Dict:
     """Read an AC E file once into PPC and attach topology arrays."""
     source = Path(file_path).resolve()
-    ppc = build_ac_ppc_from_e_file(source)
-    ppc["source"] = str(source)
-    return ensure_ac_ppc_topology(ppc)
+    return build_ac_ppc_with_topology_from_efile_rows(source, _read_efile_rows(source))
 
 
 def build_ac_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
@@ -725,9 +721,7 @@ def build_ac_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
 def build_dc_ppc_with_topology_from_e_file(file_path) -> Dict:
     """Read a DC E file once into PPC and attach topology arrays."""
     source = Path(file_path).resolve()
-    ppc = build_dc_ppc_from_e_file(source)
-    ppc["source"] = str(source)
-    return ensure_dc_ppc_topology(ppc)
+    return build_dc_ppc_with_topology_from_efile_rows(source, _read_efile_rows(source))
 
 
 def build_dc_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
