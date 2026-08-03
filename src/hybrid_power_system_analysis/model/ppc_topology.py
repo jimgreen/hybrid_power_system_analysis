@@ -127,7 +127,13 @@ def _ac_topology_signature(ppc: Dict) -> bytes:
         ),
         (
             "acac",
-            [AC_ACAC_COLS["i_node"], AC_ACAC_COLS["j_node"], AC_ACAC_COLS["run_stat"]],
+            [
+                AC_ACAC_COLS["i_node"],
+                AC_ACAC_COLS["j_node"],
+                AC_ACAC_COLS["i_control_type"],
+                AC_ACAC_COLS["j_control_type"],
+                AC_ACAC_COLS["run_stat"],
+            ],
         ),
     ):
         _update_signature_table(digest, ppc, key, columns)

@@ -1311,6 +1311,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from .ac_array_model import (
             BREAK_COLS,
             ACAC_COLS,
+            ACAC_SIDE_CONTROL_CODE,
             BRANCH_COLS,
             CTRL_PV,
             CTRL_SLACK,
@@ -1328,6 +1329,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         from ac_array_model import (
             BREAK_COLS,
             ACAC_COLS,
+            ACAC_SIDE_CONTROL_CODE,
             BRANCH_COLS,
             CTRL_PV,
             CTRL_SLACK,
@@ -1461,6 +1463,57 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         topology.island_alive_mask[gen_islands[slack_mask]] = True
         for island_pos, bus_pos in zip(gen_islands[slack_mask], gen_buses[slack_mask]):
             _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
+
+    acac_input = terminals.get("acac")
+    acac_count = acac.shape[0] if acac.size else 0
+    if _compatible_terminal_input(acac_input, acac_count):
+        acac_i_nodes = acac_input.i_node_pos
+        acac_j_nodes = acac_input.j_node_pos
+        acac_run_mask = acac_input.run_mask
+    elif acac.size:
+        acac_i_nodes = _map_node_positions(acac[:, ACAC_COLS["i_node"]], node_lookup)
+        acac_j_nodes = _map_node_positions(acac[:, ACAC_COLS["j_node"]], node_lookup)
+        acac_run_mask = acac[:, ACAC_COLS["run_stat"]].astype(np.int64, copy=False) == 1
+    else:
+        acac_i_nodes = _EMPTY_INT
+        acac_j_nodes = _EMPTY_INT
+        acac_run_mask = _EMPTY_BOOL
+    if acac_count:
+        valid_acac = (
+            acac_run_mask
+            & (acac_i_nodes >= 0)
+            & (acac_j_nodes >= 0)
+            & (acac_i_nodes < topology.node_ids.size)
+            & (acac_j_nodes < topology.node_ids.size)
+        )
+        if np.any(valid_acac):
+            valid_rows = np.flatnonzero(valid_acac)
+            valid_acac[valid_rows] &= (
+                topology.node_run_mask[acac_i_nodes[valid_rows]]
+                & topology.node_run_mask[acac_j_nodes[valid_rows]]
+            )
+        for node_positions, control_col in (
+            (acac_i_nodes, ACAC_COLS["i_control_type"]),
+            (acac_j_nodes, ACAC_COLS["j_control_type"]),
+        ):
+            ph_mask = valid_acac & (
+                acac[:, control_col].astype(np.int64, copy=False)
+                == ACAC_SIDE_CONTROL_CODE["PH"]
+            )
+            if not np.any(ph_mask):
+                continue
+            ref_node_pos = node_positions[ph_mask]
+            ref_islands = topology.node_to_island_pos[ref_node_pos]
+            ref_buses = topology.node_to_bus_pos[ref_node_pos]
+            valid_ref = (ref_islands >= 0) & (ref_buses >= 0)
+            topology.island_alive_mask[ref_islands[valid_ref]] = True
+            for island_pos, bus_pos in zip(ref_islands[valid_ref], ref_buses[valid_ref]):
+                _mark_reference_bus(
+                    topology.island_reference_bus_pos,
+                    int(island_pos),
+                    int(bus_pos),
+                    topology.bus_ids,
+                )
 
     external_ref_nodes = np.asarray(ppc.get("_external_angle_reference_node_ids", _EMPTY_INT), dtype=np.int64)
     if external_ref_nodes.size:

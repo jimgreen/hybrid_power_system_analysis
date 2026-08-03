@@ -228,6 +228,34 @@ def _build_acac_source_to_unreferenced_load_ppc():
     return ensure_ac_ppc_topology(build_ac_ppc_from_efile_rows(Path("acac_local_ref.e"), rows))
 
 
+def _build_acac_ph_reference_hybrid_ppc():
+    from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "acac_ph_ref", 100, "V", "kW", "A"]]),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[1, "slack-node", 380, 380, 0, 1], [2, "ph-node", 380, 380, 0, 1]],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha run_stat",
+            [[1, "slack-source", 1, "PH", 0, 0, 380, 1, 1]],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [
+                [1, "slack-side-load", 1, 10, 1, 0, 0, 2, 1, 0, 0, 1],
+                [2, "ph-side-load", 2, 10, 1, 0, 0, 2, 1, 0, 0, 1],
+            ],
+        ),
+        "ACACConverter": _table(
+            "idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
+            [[1, "pq-ph-link", 1, 2, 0, 0, "PQ", "PH", 0, 0, 0, 380, 380, 1]],
+        ),
+    }
+    return build_hybrid_ppc_with_topology_from_efile_rows(Path("acac_ph_ref.e"), rows)
+
+
 def _build_dcdc_source_to_unreferenced_load_ppc():
     from model.dc_array_model import build_dc_ppc_from_efile_rows
     from model.ppc_topology import ensure_dc_ppc_topology
@@ -379,6 +407,29 @@ class TopologyHelperTest(unittest.TestCase):
         arrays = ppc["_topology_arrays"]
         self.assertEqual([False, False], arrays.island_alive_mask.tolist())
         self.assertEqual([False], arrays.devices["acac"].alive_mask.tolist())
+
+    def test_acac_ph_endpoint_reference_has_ppc_object_parity(self):
+        from model.ac_array_model import build_ac_network_from_ppc
+        from model.dc_array_model import build_dc_network_from_ppc
+        from model.hybrid_array_model import build_hybrid_model_from_ppc
+
+        ppc = _build_acac_ph_reference_hybrid_ppc()
+        object_ppc = dict(ppc)
+        object_ppc["ac_network"] = build_ac_network_from_ppc(ppc["ac"])
+        object_ppc["dc_network"] = build_dc_network_from_ppc(ppc["dc"])
+        network = build_hybrid_model_from_ppc(object_ppc)
+
+        network.topo()
+
+        ppc_alive = ppc["ac"]["_topology_arrays"].island_alive_mask.tolist()
+        object_alive = [island.is_alive for island in network.ac.islands]
+        self.assertEqual([True, True], object_alive)
+        self.assertEqual(object_alive, ppc_alive)
+        self.assertEqual(
+            [True],
+            ppc["ac"]["_topology_arrays"].devices["acac"].alive_mask.tolist(),
+        )
+        self.assertTrue(network.acac_converters[0].is_alive)
 
     def test_dcdc_does_not_count_load_from_unreferenced_endpoint(self):
         ppc = _build_dcdc_source_to_unreferenced_load_ppc()
