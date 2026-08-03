@@ -388,7 +388,8 @@ def test_hybrid_lf_unifies_zero_tied_acac_pv_controls():
     assert np.isclose(calc.result["acac"][0, 1], calc.result["acac"][1, 1], atol=1e-9)
 
 
-def test_hybrid_lf_reports_floating_dc_voltage_before_linear_solve():
+def test_hybrid_lf_skips_floating_dc_island_and_solves_referenced_side():
+    from dc_array_model import BUS_COLS as DC_BUS_COLS, DCDC_COLS
     from hybrid_lf import HybridPowerFlowCalc
 
     network = _hybrid_zero_tied_ph_with_fixed_pq_converter_network(include_floating_dc=True)
@@ -396,13 +397,30 @@ def test_hybrid_lf_reports_floating_dc_voltage_before_linear_solve():
         network,
         linear_solver="scipy",
         result_mode="array",
-        max_iter=3,
+        max_iter=30,
         verbose=False,
     )
 
-    assert calc.run() == -1
-    assert "V_DC(node 2)" in calc.failure_reason
+    assert calc.run() == 0
+    assert calc.failure_reason == ""
     assert np.all(np.isfinite(calc.x))
+
+    dc_bus = calc.result["dc"]["bus"]
+    dc_bus_by_idx = {
+        int(row[DC_BUS_COLS["idx"]]): row
+        for row in dc_bus
+    }
+    assert dc_bus_by_idx[1][DC_BUS_COLS["voltage"]] > 0.0
+    assert dc_bus_by_idx[2][DC_BUS_COLS["run_stat"]] == 1
+    assert dc_bus_by_idx[2][DC_BUS_COLS["voltage"]] == 0.0
+
+    dcdc = calc.result["dc"]["dcdc"]
+    assert dcdc.shape[0] == 1
+    assert dcdc[0, DCDC_COLS["run_stat"]] == 1
+    assert np.allclose(
+        dcdc[0, [DCDC_COLS[name] for name in ("i_p", "j_p", "i_c", "j_c")]],
+        0.0,
+    )
 
 
 def test_ac_multi_slack_island_is_warning_and_power_flow_continues():
