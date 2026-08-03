@@ -514,13 +514,15 @@ def test_matpower_export_eliminates_single_zero_star_arm_without_zero_branch():
 
 
 def test_offline_three_winding_transformer_clears_stale_terminal_results():
-    from model.ac_array_model import BUS_COLS, THREE_WINDING_TRANSFORMER_COLS, build_ac_ppc_from_e_file
+    from model.ac_array_model import BUS_COLS, LOAD_COLS, THREE_WINDING_TRANSFORMER_COLS, build_ac_ppc_from_e_file
     from model.topology import build_ac_topology_input_ppc
 
     ppc = build_ac_ppc_from_e_file(CASE_FILE)
     cols = THREE_WINDING_TRANSFORMER_COLS
     result_attrs = ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c", "k_p", "k_q", "k_c")
     ppc["three_winding_transformer"][0, [cols[attr] for attr in result_attrs]] = 9.0
+    # Keep a loaded slack island alive so this test reaches stale-result cleanup.
+    ppc["load"][0, LOAD_COLS["node"]] = ppc["bus"][0, BUS_COLS["idx"]]
     ppc["bus"][2, BUS_COLS["run_stat"]] = 0
     ppc.pop("_topology_arrays", None)
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
