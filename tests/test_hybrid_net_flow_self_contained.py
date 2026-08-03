@@ -296,6 +296,53 @@ def _pollute_dc_object_results(network, stale=99.0):
         branch.is_alive = False
 
 
+def _pollute_ac_object_results(network, stale=99.0):
+    for node in network.nodes:
+        node.voltage = stale
+        node.angle = stale
+        node.is_alive = False
+    for device in (*network.generators, *network.loads):
+        device.p = stale
+        device.q = stale
+        device.current = stale
+        device.is_alive = False
+    for branch in network.branches:
+        branch.i_p = stale
+        branch.i_q = stale
+        branch.i_c = stale
+        branch.j_p = stale
+        branch.j_q = stale
+        branch.j_c = stale
+        branch.is_alive = False
+
+
+def _assert_ac_objects_match_array_result(test_case, network, result):
+    from ac_array_model import BRANCH_COLS, BUS_COLS, GEN_COLS, LOAD_COLS
+
+    def rows_by_idx(key, columns):
+        return {int(row[columns["idx"]]): row for row in result[key]}
+
+    bus_by_idx = rows_by_idx("bus", BUS_COLS)
+    for node in network.nodes:
+        row = bus_by_idx[int(node.idx)]
+        test_case.assertAlmostEqual(float(row[BUS_COLS["voltage"]]), node.voltage)
+        test_case.assertAlmostEqual(float(row[BUS_COLS["angle"]]), node.angle)
+        test_case.assertTrue(node.is_alive)
+
+    for collection, key, columns, attrs in (
+        (network.generators, "gen", GEN_COLS, ("p", "q", "current")),
+        (network.loads, "load", LOAD_COLS, ("p", "q", "current")),
+        (network.branches, "branch", BRANCH_COLS, ("i_p", "i_q", "i_c", "j_p", "j_q", "j_c")),
+    ):
+        row_by_idx = rows_by_idx(key, columns)
+        for device in collection:
+            row = row_by_idx[int(device.idx)]
+            for attr in attrs:
+                test_case.assertAlmostEqual(float(row[columns[attr]]), getattr(device, attr))
+            test_case.assertTrue(device.is_alive)
+            test_case.assertEqual(1, device.run_stat)
+
+
 def _assert_dc_objects_match_array_result(test_case, network, result):
     from dc_array_model import BRANCH_COLS, BUS_COLS, GEN_COLS, LOAD_COLS
 
@@ -323,26 +370,94 @@ def _assert_dc_objects_match_array_result(test_case, network, result):
 
 
 class HybridNetFlowSelfContainedTest(unittest.TestCase):
-    def test_single_dc_full_object_array_mode_writes_array_results_back_by_sparse_idx(self):
-        from ac_model import ACPowerNetwork
+    def test_ppc_skipped_snapshots_are_built_only_for_dead_sides(self):
+        from unittest import mock
+
+        import lfcore.hybrid_lf as hybrid_lf
+
+        cases = (
+            (1, 1, 0, False, False),
+            (0, 1, 1, True, False),
+            (1, 0, 1, False, True),
+            (0, 0, 2, True, True),
+        )
+        for ac_run, dc_run, expected_calls, expect_ac, expect_dc in cases:
+            with self.subTest(ac_run=ac_run, dc_run=dc_run):
+                network = hybrid_lf._build_lf_network_from_hybrid_rows(
+                    Path("skipped_snapshot_counts.e"),
+                    _independent_hybrid_rows(ac_run=ac_run, dc_run=dc_run, stale=99.0),
+                )
+                with mock.patch.object(
+                    hybrid_lf,
+                    "_zero_subgrid_result",
+                    wraps=hybrid_lf._zero_subgrid_result,
+                ) as zero_result:
+                    calc = hybrid_lf.HybridPowerFlowCalc(
+                        network,
+                        result_mode="array",
+                        linear_solver="scipy",
+                        verbose=False,
+                    )
+
+                self.assertEqual(expected_calls, zero_result.call_count)
+                self.assertEqual(expect_ac, calc._skipped_ac_result is not None)
+                self.assertEqual(expect_dc, calc._skipped_dc_result is not None)
+
+    def test_single_live_full_object_side_writeback_respects_result_mode(self):
         from hybrid_model import HybridPowerNetwork
         from lfcore.hybrid_lf import HybridPowerFlowCalc
 
-        dc_network = _live_dc_object_network()
-        network = HybridPowerNetwork(ACPowerNetwork(), dc_network, [], [])
-        calc = HybridPowerFlowCalc(
-            network,
-            result_mode="array",
-            linear_solver="scipy",
-            verbose=False,
+        cases = (
+            (
+                "ac",
+                lambda: HybridPowerNetwork(_live_ac_object_network(), _dead_dc_object_network(), [], []),
+                _pollute_ac_object_results,
+                _assert_ac_objects_match_array_result,
+                "_write_ac_ppc_result_to_network",
+            ),
+            (
+                "dc",
+                lambda: HybridPowerNetwork(_dead_ac_object_network(), _live_dc_object_network(), [], []),
+                _pollute_dc_object_results,
+                _assert_dc_objects_match_array_result,
+                "_write_dc_ppc_result_to_network",
+            ),
         )
-        _pollute_dc_object_results(dc_network)
+        for side, network_factory, pollute, assert_matches, writeback_name in cases:
+            for mode in ("none", "summary", "array", "full"):
+                with self.subTest(side=side, mode=mode):
+                    network = network_factory()
+                    calc = HybridPowerFlowCalc(
+                        network,
+                        result_mode=mode,
+                        linear_solver="scipy",
+                        verbose=False,
+                    )
+                    active_network = getattr(network, side)
+                    dead_side = "dc" if side == "ac" else "ac"
+                    dead_network = getattr(network, dead_side)
+                    pollute(active_network)
 
-        self.assertEqual(0, calc.run())
+                    if mode != "full":
+                        def reject_active_object_writeback():
+                            raise AssertionError(f"{side} object writeback is full-mode only")
 
-        self.assertTrue(calc._single_dc_newton_block)
-        self.assertIsNone(calc.lf_result)
-        _assert_dc_objects_match_array_result(self, dc_network, calc.result["dc"])
+                        setattr(calc, writeback_name, reject_active_object_writeback)
+
+                    self.assertEqual(0, calc.run())
+                    self.assertTrue(getattr(calc, f"_single_{side}_newton_block"))
+                    self.assertIsNotNone(dead_network.result)
+                    self.assertTrue(all(node.voltage == 0.0 for node in dead_network.nodes))
+                    self.assertTrue(all(node.run_stat == 0 for node in dead_network.nodes))
+                    self.assertEqual(0, dead_network.switches[0].status)
+
+                    if mode == "full":
+                        assert_matches(self, active_network, calc.result[side])
+                        self.assertIsNotNone(calc.lf_result)
+                    else:
+                        self.assertTrue(all(node.voltage == 99.0 for node in active_network.nodes))
+                        self.assertTrue(all(not node.is_alive for node in active_network.nodes))
+                        self.assertIsNone(calc.lf_result)
 
     def test_general_full_hybrid_writes_dc_array_results_back_to_full_objects(self):
         from hybrid_model import HybridPowerNetwork
@@ -386,36 +501,42 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIsNotNone(calc.lf_result)
         _assert_dc_objects_match_array_result(self, dc_network, calc.result["dc"])
 
-    def test_live_full_object_sides_do_not_build_unused_skipped_ppc_snapshots(self):
+    def test_object_skipped_ppc_builders_run_only_for_dead_sides(self):
         from unittest import mock
 
         from hybrid_model import HybridPowerNetwork
         import lfcore.hybrid_lf as hybrid_lf
 
-        network = HybridPowerNetwork(_live_ac_object_network(), _live_dc_object_network(), [], [])
-        with (
-            mock.patch.object(
-                hybrid_lf,
-                "build_ac_ppc_from_network",
-                wraps=hybrid_lf.build_ac_ppc_from_network,
-            ) as ac_builder,
-            mock.patch.object(
-                hybrid_lf,
-                "build_dc_ppc_from_network",
-                wraps=hybrid_lf.build_dc_ppc_from_network,
-            ) as dc_builder,
-        ):
-            calc = hybrid_lf.HybridPowerFlowCalc(
-                network,
-                result_mode="array",
-                linear_solver="scipy",
-                verbose=False,
-            )
+        cases = (
+            (_live_ac_object_network, _live_dc_object_network, 0, 0),
+            (_dead_ac_object_network, _live_dc_object_network, 1, 0),
+            (_live_ac_object_network, _dead_dc_object_network, 0, 1),
+            (_dead_ac_object_network, _dead_dc_object_network, 1, 1),
+        )
+        for ac_factory, dc_factory, expected_ac_calls, expected_dc_calls in cases:
+            with self.subTest(ac_builder=expected_ac_calls, dc_builder=expected_dc_calls):
+                network = HybridPowerNetwork(ac_factory(), dc_factory(), [], [])
+                with (
+                    mock.patch.object(
+                        hybrid_lf,
+                        "build_ac_ppc_from_network",
+                        wraps=hybrid_lf.build_ac_ppc_from_network,
+                    ) as ac_builder,
+                    mock.patch.object(
+                        hybrid_lf,
+                        "build_dc_ppc_from_network",
+                        wraps=hybrid_lf.build_dc_ppc_from_network,
+                    ) as dc_builder,
+                ):
+                    hybrid_lf.HybridPowerFlowCalc(
+                        network,
+                        result_mode="array",
+                        linear_solver="scipy",
+                        verbose=False,
+                    )
 
-        self.assertTrue(calc.has_ac)
-        self.assertTrue(calc.has_dc)
-        ac_builder.assert_not_called()
-        dc_builder.assert_not_called()
+                self.assertEqual(expected_ac_calls, ac_builder.call_count)
+                self.assertEqual(expected_dc_calls, dc_builder.call_count)
 
     def test_no_ppc_full_object_skips_each_dead_side_and_solves_the_other(self):
         from ac_array_model import BUS_COLS as AC_BUS_COLS
@@ -515,7 +636,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             ("breakers", "break", "break", BREAK_COLS),
         )
 
-        for mode in ("full", "array"):
+        for mode in ("full",):
             with self.subTest(mode=mode):
                 ac_network = _mixed_alive_dead_ac_object_network()
                 network = HybridPowerNetwork(ac_network, DCPowerNetwork(), [], [])

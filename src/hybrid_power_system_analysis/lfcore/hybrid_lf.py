@@ -917,28 +917,24 @@ class HybridPowerFlowCalc:
         self._dc_ppc = getattr(network, "_dc_ppc", None) or getattr(network.dc, "ppc", None)
         self.has_ac = _ppc_has_operational_nodes(self._ac_ppc, network.ac)
         self.has_dc = _ppc_has_operational_nodes(self._dc_ppc, network.dc)
-        ac_result_source = self._ac_ppc
-        if (
-            ac_result_source is None
-            and not self.has_ac
-            and not getattr(network.ac, "_lf_lightweight", False)
-        ):
-            ac_result_source = build_ac_ppc_from_network(network.ac)
-        dc_result_source = self._dc_ppc
-        if (
-            dc_result_source is None
-            and not self.has_dc
-            and not getattr(network.dc, "_lf_lightweight", False)
-        ):
-            dc_result_source = build_dc_ppc_from_network(network.dc)
-        self._skipped_ac_result = _zero_subgrid_result(
-            ac_result_source,
-            _AC_ZERO_RESULT_TABLE_SPECS,
-        )
-        self._skipped_dc_result = _zero_subgrid_result(
-            dc_result_source,
-            _DC_ZERO_RESULT_TABLE_SPECS,
-        )
+        self._skipped_ac_result = None
+        if not self.has_ac:
+            ac_result_source = self._ac_ppc
+            if ac_result_source is None and not getattr(network.ac, "_lf_lightweight", False):
+                ac_result_source = build_ac_ppc_from_network(network.ac)
+            self._skipped_ac_result = _zero_subgrid_result(
+                ac_result_source,
+                _AC_ZERO_RESULT_TABLE_SPECS,
+            )
+        self._skipped_dc_result = None
+        if not self.has_dc:
+            dc_result_source = self._dc_ppc
+            if dc_result_source is None and not getattr(network.dc, "_lf_lightweight", False):
+                dc_result_source = build_dc_ppc_from_network(network.dc)
+            self._skipped_dc_result = _zero_subgrid_result(
+                dc_result_source,
+                _DC_ZERO_RESULT_TABLE_SPECS,
+            )
         # Hybrid 含 DC 网络时，PyKLU 在部分非对称/耦合矩阵上会失败；未显式指定时
         # 默认走 UMFPACK，若本机未安装则由 solver_common 回退到 SciPy/SuperLU。
         solver_name = str(linear_solver).strip().lower() if linear_solver is not None else ""
@@ -2720,9 +2716,15 @@ class HybridPowerFlowCalc:
     def _sync_single_subsolver_result(self, kind):
         ac_result = self.ac_calc.result if kind == "ac" else self._skipped_ac_result
         dc_result = self.dc_calc.result if kind == "dc" else self._skipped_dc_result
-        if kind == "ac":
+        if kind == "ac" and (
+            self.result_mode == "full"
+            or getattr(self.network.ac, "_lf_lightweight", False)
+        ):
             self._write_ac_ppc_result_to_network()
-        elif kind == "dc":
+        elif kind == "dc" and (
+            self.result_mode == "full"
+            or getattr(self.network.dc, "_lf_lightweight", False)
+        ):
             self._write_dc_ppc_result_to_network()
         self._write_skipped_results_to_network()
 
@@ -2783,7 +2785,13 @@ class HybridPowerFlowCalc:
         subcalc.result_mode = "array"
         subcalc.keep_node_objects = False
         subcalc.skip_lf_result = True
-        rc = subcalc._run_newton_raphson()
+        network_writeback = getattr(subcalc, "_network_writeback", None)
+        if self.result_mode != "full":
+            subcalc._network_writeback = None
+        try:
+            rc = subcalc._run_newton_raphson()
+        finally:
+            subcalc._network_writeback = network_writeback
         self.x = subcalc.x
         self.converged = bool(subcalc.converged)
         self.iterations = int(subcalc.iterations)
