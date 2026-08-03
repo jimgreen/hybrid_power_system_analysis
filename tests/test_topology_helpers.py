@@ -317,6 +317,42 @@ def _build_dcac_ph_with_pv_hybrid_ppc():
     return build_hybrid_ppc_with_topology_from_efile_rows(Path("dcac_ph_pv.e"), rows)
 
 
+def _build_dcac_v_with_dcdc_hybrid_ppc():
+    from model.ppc_topology import build_hybrid_ppc_with_topology_from_efile_rows
+
+    rows = {
+        "Model": _table("path name p_base u_unit p_unit i_unit", [["test", "dcac_v_dcdc", 100, "V", "kW", "A"]]),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[1, "converter-ac-node", 380, 380, 0, 1]],
+        ),
+        "DCNode": _table(
+            "idx name vbase voltage run_stat",
+            [
+                [1, "dc-source-node", 750, 750, 1],
+                [2, "converter-dc-node", 750, 750, 1],
+            ],
+        ),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set i_set run_stat",
+            [[1, "dc-source", 1, "V", 750, 0, 0, 1]],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat",
+            [[1, "converter-side-load", 2, 10, 1, 0, 0, 1]],
+        ),
+        "DCDCConverter": _table(
+            "idx name i_node j_node i_control_type j_control_type p_set i_set v_set run_stat r1 r2",
+            [[1, "source-load-link", 1, 2, "P", "NONE", 0, 0, 750, 1, 0, 0]],
+        ),
+        "DCACConverter": _table(
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "none-v-link", 1, 2, "NONE", "V", 0, 0, 380, 750, 1, 0, 0]],
+        ),
+    }
+    return build_hybrid_ppc_with_topology_from_efile_rows(Path("dcac_v_dcdc.e"), rows)
+
+
 def _build_dcdc_source_to_unreferenced_load_ppc():
     from model.dc_array_model import build_dc_ppc_from_efile_rows
     from model.ppc_topology import ensure_dc_ppc_topology
@@ -533,6 +569,81 @@ class TopologyHelperTest(unittest.TestCase):
         self.assertEqual([], ppc["ac"]["_auto_slack_gen_rows"].tolist())
         self.assertEqual([], network.ac._auto_slack_generators)
         self.assertFalse(network.dcac_converters[0].is_alive)
+
+    def test_removing_last_dcac_ph_reference_reconsiders_ac_auto_slack(self):
+        from model.hybrid_array_model import DCAC_COLS
+        from model.ppc_topology import ensure_hybrid_ppc_topology
+
+        ppc = _build_dcac_ph_with_pv_hybrid_ppc()
+        previous_topology = ppc["ac"]["_topology_arrays"]
+        ppc["dcac"] = np.empty((0, len(DCAC_COLS)), dtype=np.float64)
+
+        ensure_hybrid_ppc_topology(ppc)
+
+        self.assertNotIn("_hybrid_dcac_angle_reference_node_ids", ppc["ac"])
+        self.assertNotIn("_hybrid_dcac_voltage_reference_pu", ppc["ac"])
+        self.assertNotIn("_external_angle_reference_node_ids", ppc["ac"])
+        self.assertIsNot(previous_topology, ppc["ac"]["_topology_arrays"])
+        self.assertEqual([0], ppc["ac"]["_auto_slack_gen_rows"].tolist())
+        self.assertEqual([True], ppc["ac"]["_topology_arrays"].island_alive_mask.tolist())
+
+    def test_removing_last_dcac_v_reference_cannot_keep_dcdc_component_alive(self):
+        from model.hybrid_array_model import DCAC_COLS
+        from model.ppc_topology import ensure_hybrid_ppc_topology
+
+        ppc = _build_dcac_v_with_dcdc_hybrid_ppc()
+        self.assertEqual([True, True], ppc["dc"]["_topology_arrays"].island_alive_mask.tolist())
+        previous_topology = ppc["dc"]["_topology_arrays"]
+        ppc["dcac"] = np.empty((0, len(DCAC_COLS)), dtype=np.float64)
+
+        ensure_hybrid_ppc_topology(ppc)
+
+        self.assertNotIn("_hybrid_dcac_voltage_reference_node_ids", ppc["dc"])
+        self.assertNotIn("_hybrid_dcac_voltage_reference_pu", ppc["dc"])
+        self.assertNotIn("_external_voltage_reference_node_ids", ppc["dc"])
+        self.assertIsNot(previous_topology, ppc["dc"]["_topology_arrays"])
+        self.assertEqual([False, False], ppc["dc"]["_topology_arrays"].island_alive_mask.tolist())
+        self.assertEqual(
+            [False],
+            ppc["dc"]["_topology_arrays"].devices["dcdc"].alive_mask.tolist(),
+        )
+
+    def test_removing_dcac_references_preserves_caller_owned_external_metadata(self):
+        from model.hybrid_array_model import DCAC_COLS
+        from model.ppc_topology import ensure_hybrid_ppc_topology
+
+        ppc = _build_hybrid_island_ppc(
+            dc_breaker_status=1,
+            ac_control_type="PH",
+            dc_control_type="V",
+        )
+        ppc["ac"]["_external_angle_reference_node_ids"] = np.asarray([1], dtype=np.int64)
+        ppc["ac"]["_external_voltage_reference_pu"] = np.asarray([0.97], dtype=np.float64)
+        ppc["dc"]["_external_voltage_reference_node_ids"] = np.asarray([1], dtype=np.int64)
+        ppc["dc"]["_external_voltage_reference_pu"] = np.asarray([1.02], dtype=np.float64)
+        ensure_hybrid_ppc_topology(ppc)
+        ppc["dcac"] = np.empty((0, len(DCAC_COLS)), dtype=np.float64)
+
+        ensure_hybrid_ppc_topology(ppc)
+
+        np.testing.assert_array_equal(
+            np.asarray([1], dtype=np.int64),
+            ppc["ac"]["_external_angle_reference_node_ids"],
+        )
+        np.testing.assert_allclose(
+            np.asarray([0.97], dtype=np.float64),
+            ppc["ac"]["_external_voltage_reference_pu"],
+        )
+        np.testing.assert_array_equal(
+            np.asarray([1], dtype=np.int64),
+            ppc["dc"]["_external_voltage_reference_node_ids"],
+        )
+        np.testing.assert_allclose(
+            np.asarray([1.02], dtype=np.float64),
+            ppc["dc"]["_external_voltage_reference_pu"],
+        )
+        self.assertNotIn("_hybrid_dcac_angle_reference_node_ids", ppc["ac"])
+        self.assertNotIn("_hybrid_dcac_voltage_reference_node_ids", ppc["dc"])
 
     def test_dcdc_does_not_count_load_from_unreferenced_endpoint(self):
         ppc = _build_dcdc_source_to_unreferenced_load_ppc()

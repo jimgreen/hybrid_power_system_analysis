@@ -9,6 +9,47 @@ from scipy.sparse.csgraph import connected_components
 _EMPTY_INT = np.array([], dtype=np.int32)
 _EMPTY_BOOL = np.array([], dtype=bool)
 
+HYBRID_DCAC_AC_REFERENCE_NODE_IDS_KEY = "_hybrid_dcac_angle_reference_node_ids"
+HYBRID_DCAC_AC_REFERENCE_VALUES_KEY = "_hybrid_dcac_voltage_reference_pu"
+HYBRID_DCAC_DC_REFERENCE_NODE_IDS_KEY = "_hybrid_dcac_voltage_reference_node_ids"
+HYBRID_DCAC_DC_REFERENCE_VALUES_KEY = "_hybrid_dcac_voltage_reference_pu"
+
+
+def _reference_metadata_arrays(ppc: Dict, node_key: str, value_key: str):
+    nodes = np.asarray(ppc.get(node_key, ()), dtype=np.int64).reshape(-1)
+    raw_values = np.asarray(ppc.get(value_key, ()), dtype=np.float64).reshape(-1)
+    values = np.full(nodes.size, np.nan, dtype=np.float64)
+    count = min(nodes.size, raw_values.size)
+    if count:
+        values[:count] = raw_values[:count]
+    return nodes, values
+
+
+def _merged_reference_metadata(
+    ppc: Dict,
+    caller_node_key: str,
+    caller_value_key: str,
+    hybrid_node_key: str,
+    hybrid_value_key: str,
+):
+    caller_nodes, caller_values = _reference_metadata_arrays(
+        ppc,
+        caller_node_key,
+        caller_value_key,
+    )
+    hybrid_nodes, hybrid_values = _reference_metadata_arrays(
+        ppc,
+        hybrid_node_key,
+        hybrid_value_key,
+    )
+    if not caller_nodes.size and not hybrid_nodes.size:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+
+    nodes = np.concatenate((caller_nodes, hybrid_nodes))
+    values = np.concatenate((caller_values, hybrid_values))
+    unique_nodes, first_positions = np.unique(nodes, return_index=True)
+    return unique_nodes, values[first_positions]
+
 
 @dataclass
 class TerminalDeviceTopologyArrays:
@@ -1515,7 +1556,13 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                     topology.bus_ids,
                 )
 
-    external_ref_nodes = np.asarray(ppc.get("_external_angle_reference_node_ids", _EMPTY_INT), dtype=np.int64)
+    external_ref_nodes, _external_ref_values = _merged_reference_metadata(
+        ppc,
+        "_external_angle_reference_node_ids",
+        "_external_voltage_reference_pu",
+        HYBRID_DCAC_AC_REFERENCE_NODE_IDS_KEY,
+        HYBRID_DCAC_AC_REFERENCE_VALUES_KEY,
+    )
     if external_ref_nodes.size:
         external_ref_pos = _map_node_positions(external_ref_nodes, node_lookup)
         valid_ref = external_ref_pos >= 0
@@ -1950,7 +1997,13 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
         for island_pos, bus_pos in zip(dcdc_j_islands[j_v_mask], dcdc_j_buses[j_v_mask]):
             _mark_reference_bus(topology.island_reference_bus_pos, int(island_pos), int(bus_pos), topology.bus_ids)
 
-    external_ref_nodes = np.asarray(ppc.get("_external_voltage_reference_node_ids", _EMPTY_INT), dtype=np.int64)
+    external_ref_nodes, _external_ref_values = _merged_reference_metadata(
+        ppc,
+        "_external_voltage_reference_node_ids",
+        "_external_voltage_reference_pu",
+        HYBRID_DCAC_DC_REFERENCE_NODE_IDS_KEY,
+        HYBRID_DCAC_DC_REFERENCE_VALUES_KEY,
+    )
     if external_ref_nodes.size:
         external_ref_pos = _map_node_positions(external_ref_nodes, node_lookup)
         valid_ref = external_ref_pos >= 0
