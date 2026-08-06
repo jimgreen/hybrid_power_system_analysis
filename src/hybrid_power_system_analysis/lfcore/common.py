@@ -35,3 +35,95 @@ def normalize_result_mode(result_mode: str, context: str) -> str:
     if mode not in {"full", "summary", "array", "none"}:
         raise ValueError(f"Unsupported {context} result_mode: {result_mode!r}")
     return mode
+
+
+def optional_ppc_vector(ppc, key: str, size: int, default=np.nan) -> np.ndarray:
+    """Return a length-``size`` optional PPC vector without shape surprises."""
+    values = np.asarray((ppc or {}).get(key, ()), dtype=np.float64).reshape(-1)
+    result = np.full(int(size), float(default), dtype=np.float64)
+    if values.size:
+        result[: min(result.size, values.size)] = values[: result.size]
+    return result
+
+
+def allocate_limited_residual(
+    baseline,
+    target_total: float,
+    *,
+    lower=None,
+    upper=None,
+    alpha=None,
+    tolerance: float = 1e-12,
+) -> np.ndarray:
+    """Apply setpoints first, then distribute the residual with limits and weights.
+
+    Finite directional headroom is multiplied by ``alpha``. Missing limits remain
+    unbounded and fall back to the alpha weight, preserving legacy E files that
+    do not declare operating limits. Saturated devices are removed and the
+    remaining residual is redistributed in subsequent passes.
+    """
+    result = np.asarray(baseline, dtype=np.float64).reshape(-1).copy()
+    if result.size == 0:
+        return result
+
+    lower_values = (
+        np.full(result.size, -np.inf, dtype=np.float64)
+        if lower is None
+        else np.asarray(lower, dtype=np.float64).reshape(-1)
+    )
+    upper_values = (
+        np.full(result.size, np.inf, dtype=np.float64)
+        if upper is None
+        else np.asarray(upper, dtype=np.float64).reshape(-1)
+    )
+    if lower_values.size != result.size or upper_values.size != result.size:
+        raise ValueError("分配上下限必须与基准设定数组长度一致")
+    # NaN denotes an omitted optional limit. Keep explicit infinities intact.
+    lower_values = np.where(np.isnan(lower_values), -np.inf, lower_values)
+    upper_values = np.where(np.isnan(upper_values), np.inf, upper_values)
+
+    if alpha is None:
+        alpha_values = np.ones(result.size, dtype=np.float64)
+    else:
+        alpha_values = np.asarray(alpha, dtype=np.float64).reshape(-1)
+        if alpha_values.size != result.size:
+            raise ValueError("分配 alpha 必须与基准设定数组长度一致")
+    alpha_values = np.nan_to_num(alpha_values, nan=0.0, posinf=0.0, neginf=0.0)
+    alpha_values = np.maximum(alpha_values, 0.0)
+    if not np.any(alpha_values > 0.0):
+        alpha_values.fill(1.0)
+
+    remaining = float(target_total) - float(np.sum(result))
+    active = np.ones(result.size, dtype=bool)
+    for _ in range(result.size + 1):
+        if abs(remaining) <= tolerance:
+            break
+        if remaining > 0.0:
+            headroom = upper_values - result
+        else:
+            headroom = result - lower_values
+        usable = active & (headroom > tolerance)
+        if not np.any(usable):
+            break
+
+        finite_headroom = usable & np.isfinite(headroom)
+        weights = np.zeros(result.size, dtype=np.float64)
+        weights[finite_headroom] = headroom[finite_headroom] * alpha_values[finite_headroom]
+        unbounded = usable & ~finite_headroom
+        weights[unbounded] = alpha_values[unbounded]
+        if not np.any(weights > 0.0):
+            weights[usable] = 1.0
+        proposals = abs(remaining) * weights / float(np.sum(weights))
+        saturated = finite_headroom & (proposals >= headroom - tolerance)
+        applied = proposals.copy()
+        applied[saturated] = headroom[saturated]
+        applied[~usable] = 0.0
+        if remaining > 0.0:
+            result += applied
+        else:
+            result -= applied
+        remaining -= float(np.sum(applied)) if remaining > 0.0 else -float(np.sum(applied))
+        active[saturated] = False
+        if not np.any(saturated) and np.all(applied <= tolerance):
+            break
+    return result

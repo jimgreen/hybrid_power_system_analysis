@@ -34,6 +34,7 @@ from model.array_common import (
     _int_value,
     _name_array,
     _names_from_rows,
+    _optional_ppc_vector,
     _raw_vbase_by_node,
     _rows_for,
     _scale_by_node,
@@ -152,6 +153,8 @@ GEN_COLS = {
     "current": 10,
     "p_max": 11,
 }
+
+AC_GEN_LIMIT_KEYS = ("_gen_p_min", "_gen_q_min", "_gen_q_max")
 
 
 def ensure_ac_ppc_gen_columns(ppc: Dict) -> Dict:
@@ -700,6 +703,9 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
             get_current_scale_by_node,
         )
     gen_names = _names_from_rows(table_rows, columns, "gen", gen[:, GEN_COLS["idx"]])
+    gen_p_min = _float_column(table_rows, columns, "p_min", np.nan) / p_base
+    gen_q_min = _float_column(table_rows, columns, "q_min", np.nan) / p_base
+    gen_q_max = _float_column(table_rows, columns, "q_max", np.nan) / p_base
 
     columns, table_rows = _rows_for(rows, "ACLoad")
     load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64)
@@ -814,6 +820,9 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "transformer": transformer,
         "three_winding_transformer": three_winding_transformer,
         "gen": gen,
+        "_gen_p_min": gen_p_min,
+        "_gen_q_min": gen_q_min,
+        "_gen_q_max": gen_q_max,
         "load": load,
         "shunt": shunt,
         "zero_branch": zero_branch,
@@ -1106,6 +1115,9 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         dtype=np.float64,
     )
     gen0 = np.asarray(ac_ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
+    gen_p_min0 = _optional_ppc_vector(ac_ppc, "_gen_p_min", gen0.shape[0])
+    gen_q_min0 = _optional_ppc_vector(ac_ppc, "_gen_q_min", gen0.shape[0])
+    gen_q_max0 = _optional_ppc_vector(ac_ppc, "_gen_q_max", gen0.shape[0])
     load0 = np.asarray(ac_ppc.get("load", _empty(len(LOAD_COLS))), dtype=np.float64)
     shunt0 = np.asarray(ac_ppc.get("shunt", _empty(len(SHUNT_COLS))), dtype=np.float64)
     acac0 = np.asarray(ac_ppc.get("acac", _empty(len(ACAC_COLS))), dtype=np.float64)
@@ -1303,7 +1315,9 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         bus = np.vstack((bus, star_rows))
 
     gen_rows = []
-    for row in _active_rows(gen0, GEN_COLS["run_stat"]):
+    for gen_pos, row in enumerate(gen0):
+        if int(row[GEN_COLS["run_stat"]]) != 1:
+            continue
         bus_row = row_by_node.get(int(row[GEN_COLS["node"]]))
         if bus_row is None or row_to_comp[bus_row] < 0:
             continue
@@ -1311,14 +1325,17 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
         gen_row[MP_GEN_BUS] = row_to_bus_id[bus_row]
         gen_row[MP_PG] = row[GEN_COLS["p_set"]] * base_mva
         gen_row[MP_QG] = row[GEN_COLS["q_set"]] * base_mva
-        gen_row[MP_QMAX] = 1e9
-        gen_row[MP_QMIN] = -1e9
+        q_max = gen_q_max0[gen_pos]
+        q_min = gen_q_min0[gen_pos]
+        gen_row[MP_QMAX] = q_max * base_mva if np.isfinite(q_max) else 1e9
+        gen_row[MP_QMIN] = q_min * base_mva if np.isfinite(q_min) else -1e9
         gen_row[MP_VG] = row[GEN_COLS["v_set"]]
         gen_row[MP_MBASE] = base_mva
         gen_row[MP_GEN_STATUS] = 1
         p_max = row[GEN_COLS["p_max"]]
         gen_row[MP_PMAX] = p_max * base_mva if np.isfinite(p_max) else 1e9
-        gen_row[MP_PMIN] = -1e9
+        p_min = gen_p_min0[gen_pos]
+        gen_row[MP_PMIN] = p_min * base_mva if np.isfinite(p_min) else -1e9
         gen_rows.append(gen_row)
     gen_rows.extend(acac_gen_rows)
     gen = np.vstack(gen_rows) if gen_rows else np.zeros((0, 21), dtype=np.float64)
@@ -1496,6 +1513,21 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         gen[row_idx, GEN_COLS["p"]] = row[MP_PG] / base_mva
         gen[row_idx, GEN_COLS["q"]] = row[MP_QG] / base_mva
         gen[row_idx, GEN_COLS["p_max"]] = row[MP_PMAX] / base_mva if gen_mp.shape[1] > MP_PMAX else np.nan
+    gen_p_min = (
+        gen_mp[:, MP_PMIN] / base_mva
+        if gen_mp.shape[1] > MP_PMIN
+        else np.full(gen.shape[0], np.nan, dtype=np.float64)
+    )
+    gen_q_min = (
+        gen_mp[:, MP_QMIN] / base_mva
+        if gen_mp.shape[1] > MP_QMIN
+        else np.full(gen.shape[0], np.nan, dtype=np.float64)
+    )
+    gen_q_max = (
+        gen_mp[:, MP_QMAX] / base_mva
+        if gen_mp.shape[1] > MP_QMAX
+        else np.full(gen.shape[0], np.nan, dtype=np.float64)
+    )
     gen_names = np.asarray([f"gen_{int(row[GEN_COLS['idx']])}" for row in gen], dtype=object)
 
     branch_rows = []
@@ -1556,6 +1588,9 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "transformer": transformer,
         "three_winding_transformer": _empty(len(THREE_WINDING_TRANSFORMER_COLS)),
         "gen": gen,
+        "_gen_p_min": gen_p_min,
+        "_gen_q_min": gen_q_min,
+        "_gen_q_max": gen_q_max,
         "load": load,
         "shunt": shunt,
         "zero_branch": _empty(len(ZERO_BRANCH_COLS)),
@@ -1693,6 +1728,9 @@ def build_ac_ppc_from_network(network) -> Dict:
         )
 
     gen = np.zeros((len(generators), len(GEN_COLS)), dtype=np.float64)
+    gen_p_min = np.full(len(generators), np.nan, dtype=np.float64)
+    gen_q_min = np.full(len(generators), np.nan, dtype=np.float64)
+    gen_q_max = np.full(len(generators), np.nan, dtype=np.float64)
     for row, dev in enumerate(generators):
         gen[row, GEN_COLS["idx"]] = _int_value(dev, "idx")
         gen[row, GEN_COLS["node"]] = _int_value(dev, "node")
@@ -1703,6 +1741,9 @@ def build_ac_ppc_from_network(network) -> Dict:
         gen[row, GEN_COLS["alpha"]] = _float_value(dev, "alpha", 1.0)
         gen[row, GEN_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
         gen[row, GEN_COLS["p_max"]] = _float_value(dev, "p_max", np.nan)
+        gen_p_min[row] = _float_value(dev, "p_min", np.nan)
+        gen_q_min[row] = _float_value(dev, "q_min", np.nan)
+        gen_q_max[row] = _float_value(dev, "q_max", np.nan)
     for attr in ("p", "q", "current"):
         _fill_float_column_if_present(gen, generators, GEN_COLS[attr], attr)
 
@@ -1797,6 +1838,9 @@ def build_ac_ppc_from_network(network) -> Dict:
         "transformer": transformer,
         "three_winding_transformer": three_winding_transformer,
         "gen": gen,
+        "_gen_p_min": gen_p_min,
+        "_gen_q_min": gen_q_min,
+        "_gen_q_max": gen_q_max,
         "load": load,
         "shunt": shunt,
         "zero_branch": zero_branch,
@@ -1892,6 +1936,9 @@ def build_ac_network_from_ppc(ppc: Dict):
         three_winding_table.shape[0],
     )
     gen_names = _list_ppc_names(ppc, "gen_name", "gen", ppc["gen"].shape[0])
+    gen_p_min = _optional_ppc_vector(ppc, "_gen_p_min", len(gen_names))
+    gen_q_min = _optional_ppc_vector(ppc, "_gen_q_min", len(gen_names))
+    gen_q_max = _optional_ppc_vector(ppc, "_gen_q_max", len(gen_names))
     load_names = _list_ppc_names(ppc, "load_name", "load", ppc["load"].shape[0])
     shunt_names = _list_ppc_names(ppc, "shunt_name", "shunt", ppc["shunt"].shape[0])
     zero_branch_names = _list_ppc_names(ppc, "zero_branch_name", "zero_branch", ppc["zero_branch"].shape[0])
@@ -1999,8 +2046,11 @@ def build_ac_network_from_ppc(ppc: Dict):
             float(row[GEN_COLS["alpha"]]),
             int(row[GEN_COLS["run_stat"]]),
             float(row[GEN_COLS["p_max"]]) if np.isfinite(row[GEN_COLS["p_max"]]) else None,
+            float(gen_p_min[pos]) if np.isfinite(gen_p_min[pos]) else None,
+            float(gen_q_min[pos]) if np.isfinite(gen_q_min[pos]) else None,
+            float(gen_q_max[pos]) if np.isfinite(gen_q_max[pos]) else None,
         )
-        for row in ppc["gen"]
+        for pos, row in enumerate(ppc["gen"])
     ]
     network.loads = [
         ACLoad(

@@ -33,6 +33,7 @@ from model.array_common import (
     _int_value,
     _name_array,
     _names_from_rows,
+    _optional_ppc_vector,
     _raw_vbase_by_node,
     _rows_for,
     _scale_by_node,
@@ -157,6 +158,8 @@ GEN_COLS = {
     "p": 7,
     "current": 8,
 }
+
+DC_GEN_LIMIT_KEYS = ("_gen_p_min", "_gen_p_max", "_gen_alpha")
 ZERO_BRANCH_COLS = {
     "idx": 0,
     "i_node": 1,
@@ -366,6 +369,9 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         _assign_power_if_present(gen, GEN_COLS["p"], table_rows, columns, "p", p_base)
         _assign_current_if_present(gen, GEN_COLS["current"], table_rows, columns, "current", gen[:, GEN_COLS["node"]], get_current_scale_by_node)
     gen_names = _names_from_rows(table_rows, columns, "gen", gen[:, GEN_COLS["idx"]])
+    gen_p_min = _float_column(table_rows, columns, "p_min", np.nan) / p_base
+    gen_p_max = _float_column(table_rows, columns, "p_max", np.nan) / p_base
+    gen_alpha = _float_column(table_rows, columns, "alpha", 1.0)
 
     columns, table_rows = _rows_for(rows, "DCZeroBranch")
     zero_branch = np.zeros((len(table_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64)
@@ -430,6 +436,9 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "branch": branch,
         "load": load,
         "gen": gen,
+        "_gen_p_min": gen_p_min,
+        "_gen_p_max": gen_p_max,
+        "_gen_alpha": gen_alpha,
         "zero_branch": zero_branch,
         "switch": switch,
         "break": breaker,
@@ -589,6 +598,9 @@ def build_dc_ppc_from_network(network) -> Dict:
             (GEN_COLS["current"], "current", 0.0, _VALUE_FLOAT),
         ),
     )
+    gen_p_min = np.asarray([_float_value(dev, "p_min", np.nan) for dev in generators], dtype=np.float64)
+    gen_p_max = np.asarray([_float_value(dev, "p_max", np.nan) for dev in generators], dtype=np.float64)
+    gen_alpha = np.asarray([_float_value(dev, "alpha", 1.0) for dev in generators], dtype=np.float64)
 
     zero_branch = _device_array(
         zero_branches,
@@ -682,6 +694,9 @@ def build_dc_ppc_from_network(network) -> Dict:
         "branch": branch,
         "load": load,
         "gen": gen,
+        "_gen_p_min": gen_p_min,
+        "_gen_p_max": gen_p_max,
+        "_gen_alpha": gen_alpha,
         "zero_branch": zero_branch,
         "switch": build_switch_like(switches),
         "break": build_switch_like(breakers),
@@ -749,6 +764,9 @@ def build_dc_network_from_ppc(ppc: Dict):
     branch_names = names("branch_name", "branch", ppc["branch"].shape[0])
     load_names = names("load_name", "load", ppc["load"].shape[0])
     gen_names = names("gen_name", "gen", ppc["gen"].shape[0])
+    gen_p_min = _optional_ppc_vector(ppc, "_gen_p_min", len(gen_names))
+    gen_p_max = _optional_ppc_vector(ppc, "_gen_p_max", len(gen_names))
+    gen_alpha = _optional_ppc_vector(ppc, "_gen_alpha", len(gen_names), default=1.0)
     zero_branch_names = names("zero_branch_name", "zero_branch", ppc["zero_branch"].shape[0])
     switch_names = names("switch_name", "switch", ppc["switch"].shape[0])
     break_names = names("break_name", "break", ppc.get("break", _empty(len(BREAK_COLS))).shape[0])
@@ -821,8 +839,11 @@ def build_dc_network_from_ppc(ppc: Dict):
             float(row[GEN_COLS["v_set"]]),
             float(row[GEN_COLS["i_set"]]),
             int(row[GEN_COLS["run_stat"]]),
+            float(gen_p_min[pos]) if np.isfinite(gen_p_min[pos]) else None,
+            float(gen_p_max[pos]) if np.isfinite(gen_p_max[pos]) else None,
+            float(gen_alpha[pos]) if np.isfinite(gen_alpha[pos]) else 1.0,
         )
-        for row in ppc["gen"]
+        for pos, row in enumerate(ppc["gen"])
     ]
 
     network.zero_branches = [

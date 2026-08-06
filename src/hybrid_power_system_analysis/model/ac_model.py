@@ -111,7 +111,21 @@ class ACShuntCompensator:
         self.is_alive = False
 
 class ACGenerator:
-    def __init__(self, idx, node, control_type, p_set, q_set, v_set, alpha=None, run_stat=1, p_max=None):
+    def __init__(
+        self,
+        idx,
+        node,
+        control_type,
+        p_set,
+        q_set,
+        v_set,
+        alpha=None,
+        run_stat=1,
+        p_max=None,
+        p_min=None,
+        q_min=None,
+        q_max=None,
+    ):
         self.idx = idx
         self.node = node
         self.run_stat = run_stat
@@ -121,6 +135,9 @@ class ACGenerator:
         self.v_set = v_set
         self.alpha = alpha
         self.p_max = p_max
+        self.p_min = p_min
+        self.q_min = q_min
+        self.q_max = q_max
         self.p = None
         self.q = None
         self.current = None
@@ -427,6 +444,9 @@ _AC_ROW_DEFAULT_ATTRS = {
         "v_set": 1.0,
         "alpha": None,
         "p_max": None,
+        "p_min": None,
+        "q_min": None,
+        "q_max": None,
         "run_stat": 1,
         "p": None,
         "q": None,
@@ -730,8 +750,35 @@ class ACPowerNetwork:
         self.loads.append(ld)
         return ld
 
-    def add_generator(self, idx, node, control_type, p_set,q_set, v_set, alpha=None, run_stat=1, p_max=None):
-        gen = ACGenerator(idx, node, control_type, p_set, q_set, v_set, alpha, run_stat, p_max)
+    def add_generator(
+        self,
+        idx,
+        node,
+        control_type,
+        p_set,
+        q_set,
+        v_set,
+        alpha=None,
+        run_stat=1,
+        p_max=None,
+        p_min=None,
+        q_min=None,
+        q_max=None,
+    ):
+        gen = ACGenerator(
+            idx,
+            node,
+            control_type,
+            p_set,
+            q_set,
+            v_set,
+            alpha,
+            run_stat,
+            p_max,
+            p_min,
+            q_min,
+            q_max,
+        )
         self.generators.append(gen)
         return gen
 

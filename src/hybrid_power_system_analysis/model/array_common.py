@@ -20,6 +20,15 @@ def _empty(width: int) -> np.ndarray:
     return np.zeros((0, width), dtype=np.float64)
 
 
+def _optional_ppc_vector(ppc, key: str, size: int, default=np.nan) -> np.ndarray:
+    """Return an optional PPC vector padded to the requested device count."""
+    values = np.asarray((ppc or {}).get(key, ()), dtype=np.float64).reshape(-1)
+    result = np.full(int(size), float(default), dtype=np.float64)
+    if values.size:
+        result[: min(result.size, values.size)] = values[: result.size]
+    return result
+
+
 class EFileTableRows:
     """List-compatible E table rows with cached column access."""
 

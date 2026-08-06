@@ -309,7 +309,7 @@ generator ----> AC i
 | `PV` | `P_gen = p_set`, `V_i = v_set` | `Q_gen` 由无功平衡得到 |
 | `V/SLACK/PH` | `V_i = v_set`, `theta_i = theta_set` | `P_gen/Q_gen` 承担岛内平衡功率 |
 
-多台发电机接在同一节点时，平衡功率按 `alpha` 或内部分摊规则分配。
+同一母线上的多个平衡电源先响应各自的 `p_set`，再按上下限方向裕度与 `alpha` 分配剩余有功；同一母线上的多个电压控制电源先响应各自的 `q_set`，再按无功上下限裕度分配剩余无功。未声明限制时分别退化为 `alpha` 权重和等权分配。
 
 #### ACShuntCompensator
 

@@ -46,7 +46,7 @@ result = calc.result
 | `ACBranch` | 普通交流线路，参数 `r/x/b` |
 | `ACTransformer` | 主变，参数 `r/x/gt/bt/tap/shift`，其中 `gt/bt` 为 i 侧单端对地导纳 |
 | `ACThreeWindingTransformer` | 三绕组主变，三个外部端口通过星形等值漏阻抗连接，内部星点在求解前解析消元 |
-| `ACGenerator` | 发电机，支持 `V/SLACK/PH/PV/P/PQ` 等控制类型；可选 `p_max` 表示最大有功容量 |
+| `ACGenerator` | 发电机，支持 `V/SLACK/PH/PV/P/PQ` 等控制类型；可选 `p_min/p_max/q_min/q_max` 表示出力上下限 |
 | `ACLoad` | ZIP 负荷，`pv0/pv1/pv2/qv0/qv1/qv2` |
 | `ACShuntCompensator` | 并联设备，支持 `g_set/b_set/q_set/v_set` |
 | `ACZeroBranch` | 零阻抗支路 |
@@ -54,7 +54,9 @@ result = calc.result
 
 所有设备都通过 `run_stat` 控制是否参与计算。
 
-`ACGenerator.p_max` 使用 E 文件声明的功率单位，读入后按 `p_base` 转为标幺值。旧模型可以省略该列，运行时以 `NaN` 表示“未提供容量”，不会把缺省容量误判为零容量。
+`ACGenerator.p_min/p_max/q_min/q_max` 使用 E 文件声明的功率单位，读入后按 `p_base` 转为标幺值。旧模型可以省略这些列，运行时将缺失的上下限视为无界，不会把缺省值误判为零容量。
+
+同一 AC 母线上的多个平衡电源先分别响应自己的 `p_set`，再把剩余有功不平衡按方向裕度与 `alpha` 的乘积分配；达到上限或下限的设备退出后，剩余量继续在其他设备间分配。同一母线上的电压控制电源先响应 `q_set`，再按无功上下限裕度分配剩余无功，未声明无功上下限时按相同权重分配。
 
 每个存活 AC 拓扑岛都需要一个相角参考。若岛内没有显式 `V/SLACK/PH` 发电机，也没有外部变流器相角参考，拓扑准备阶段会从在线 `PV` 发电机中自动选择一台作为本次计算的 PH 发电机：优先选择 `p_max` 最大者；整个岛均未提供 `p_max` 时，依次按 `abs(p_set)` 最大、`alpha` 最大和 `idx` 最小确定。选择结果保存在运行时 PPC 的 `_auto_slack_gen_rows` 中，只影响本次求解，不会修改原始 E 文件。岛内没有在线 PV 发电机时，仍按无平衡节点岛处理。
 

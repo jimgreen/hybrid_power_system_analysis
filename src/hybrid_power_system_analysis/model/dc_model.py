@@ -87,7 +87,19 @@ class DCLoad:
         self.node_obj = None
 
 class DCGenerator:
-    def __init__(self, idx, node, control_type, p_set, v_set, i_set, run_stat=1):
+    def __init__(
+        self,
+        idx,
+        node,
+        control_type,
+        p_set,
+        v_set,
+        i_set,
+        run_stat=1,
+        p_min=None,
+        p_max=None,
+        alpha=1.0,
+    ):
         self.idx = idx
         self.node = node
         self.run_stat = run_stat
@@ -95,6 +107,9 @@ class DCGenerator:
         self.p_set = p_set
         self.v_set = v_set
         self.i_set = i_set
+        self.p_min = p_min
+        self.p_max = p_max
+        self.alpha = alpha
         self.p = None
         self.current = None
         self.node_obj = None
@@ -292,6 +307,9 @@ _DC_ROW_DEFAULT_ATTRS = {
         "p_set": 0.0,
         "v_set": 1.0,
         "i_set": 0.0,
+        "p_min": None,
+        "p_max": None,
+        "alpha": 1.0,
         "run_stat": 1,
         "p": None,
         "current": None,
@@ -440,8 +458,31 @@ class DCPowerNetwork:
         self.loads.append(ld)
         return ld
 
-    def add_generator(self, idx, node, control_type, p_set,v_set, i_set, run_stat=1):
-        gen = DCGenerator(idx, node, control_type, p_set, v_set, i_set, run_stat)
+    def add_generator(
+        self,
+        idx,
+        node,
+        control_type,
+        p_set,
+        v_set,
+        i_set,
+        run_stat=1,
+        p_min=None,
+        p_max=None,
+        alpha=1.0,
+    ):
+        gen = DCGenerator(
+            idx,
+            node,
+            control_type,
+            p_set,
+            v_set,
+            i_set,
+            run_stat,
+            p_min,
+            p_max,
+            alpha,
+        )
         self.generators.append(gen)
         return gen
 

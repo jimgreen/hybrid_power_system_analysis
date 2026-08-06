@@ -251,7 +251,7 @@ def test_ac_lf_unifies_zero_tied_ph_controls_before_newton():
     generated_p = result["gen"][:, GEN_COLS["p"]]
     generated_q = result["gen"][:, GEN_COLS["q"]]
     assert np.isclose(generated_p[1] / generated_p[0], 3.0, rtol=1e-8, atol=1e-8)
-    assert np.isclose(generated_q[1] / generated_q[0], 3.0, rtol=1e-8, atol=1e-8)
+    assert np.isclose(generated_q[1] / generated_q[0], 1.0, rtol=1e-8, atol=1e-8)
 
 
 def test_dc_lf_unifies_zero_tied_v_controls_before_newton():
@@ -336,7 +336,7 @@ def test_hybrid_lf_allows_fixed_pq_converter_on_zero_tied_ph_bus():
     generated_p = ac_result["gen"][:, AC_GEN_COLS["p"]]
     generated_q = ac_result["gen"][:, AC_GEN_COLS["q"]]
     assert np.isclose(generated_p[1] / generated_p[0], 3.0, rtol=1e-8, atol=1e-8)
-    assert np.isclose(generated_q[1] / generated_q[0], 3.0, rtol=1e-8, atol=1e-8)
+    assert np.isclose(generated_q[1] / generated_q[0], 1.0, rtol=1e-8, atol=1e-8)
 
     converter = calc.result["dcac"][0]
     assert np.isclose(converter[1], 0.1, atol=1e-10)

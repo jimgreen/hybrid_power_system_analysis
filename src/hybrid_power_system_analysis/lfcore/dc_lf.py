@@ -95,13 +95,17 @@ from model.dc_array_model import (
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 try:
     from lfcore.common import (
+        allocate_limited_residual,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
+        optional_ppc_vector,
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
+        allocate_limited_residual,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
+        optional_ppc_vector,
     )
 try:
     from lfcore.solver_common import (
@@ -1888,16 +1892,29 @@ class DCPowerFlowCalc:
             P_inj += np.bincount(self.dcdc_i, weights=dcdc_i_p, minlength=P_inj.size)
             P_inj += np.bincount(self.dcdc_j, weights=dcdc_j_p, minlength=P_inj.size)
 
+        gen_p_min_all = optional_ppc_vector(ppc, "_gen_p_min", gen.shape[0])
+        gen_p_max_all = optional_ppc_vector(ppc, "_gen_p_max", gen.shape[0])
+        gen_alpha_all = optional_ppc_vector(ppc, "_gen_alpha", gen.shape[0], default=1.0)
         for node, gens in self.slack_gen_info.items():
             if not gens:
                 continue
-            share = P_inj[node] / len(gens)
+            gen_refs = np.asarray(gens, dtype=np.int32)
+            allocated = allocate_limited_residual(
+                gen[gen_refs, DC_GEN_COLS["p_set"]],
+                P_inj[node],
+                lower=gen_p_min_all[gen_refs],
+                upper=gen_p_max_all[gen_refs],
+                alpha=gen_alpha_all[gen_refs],
+            )
             v = V_final[node]
-            current = share / v if abs(v) > self.min_voltage else 0.0
-            for gen_ref in gens:
-                if isinstance(gen_ref, (int, np.integer)):
-                    gen[int(gen_ref), DC_GEN_COLS["p"]] = share
-                    gen[int(gen_ref), DC_GEN_COLS["current"]] = current
+            current = np.divide(
+                allocated,
+                v,
+                out=np.zeros_like(allocated),
+                where=abs(v) > self.min_voltage,
+            )
+            gen[gen_refs, DC_GEN_COLS["p"]] = allocated
+            gen[gen_refs, DC_GEN_COLS["current"]] = current
 
         self.result = {
             "bus": bus,
