@@ -67,6 +67,47 @@ def _build_dc_multi_balance_ppc():
     return ensure_dc_ppc_topology(build_dc_ppc_from_efile_rows(Path("dc_balance_sharing.e"), rows))
 
 
+def _build_hybrid_dcac_balance_network():
+    from lfcore.hybrid_lf import _build_lf_network_from_hybrid_rows
+
+    rows = {
+        "Model": _table(
+            "path name p_base u_unit p_unit i_unit",
+            [["test", "hybrid_dcac_balance", 100, "V", "kW", "A"]],
+        ),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [[1, "ac_bus", 380, 380, 0, 1]],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha p_min p_max q_min q_max run_stat",
+            [[1, "ac_slack", 1, "PH", 0, 0, 380, 1, -100, 100, -100, 100, 1]],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [[1, "ac_load", 1, 10, 1, 0, 0, 0, 1, 0, 0, 1]],
+        ),
+        "DCNode": _table(
+            "idx name vbase voltage isl run_stat",
+            [[1, "dc_bus", 750, 750, 0, 1]],
+        ),
+        "DCGenerator": _table(
+            "idx name node control_type v_set p_set p_max p_min i_set alpha run_stat",
+            [[1, "dc_slack", 1, "V", 750, 0, 100, -100, 0, 1, 1]],
+        ),
+        "DCLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 run_stat",
+            [[1, "dc_load", 1, 20, 1, 0, 0, 1]],
+        ),
+        "DCACConverter": _table(
+            "idx name ac_node dc_node ac_control_type dc_control_type "
+            "p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "acdc", 1, 1, "PQ", "NONE", 30, 0, 380, 750, 1, 0, 0]],
+        ),
+    }
+    return _build_lf_network_from_hybrid_rows(Path("hybrid_dcac_balance.e"), rows)
+
+
 def test_ac_balance_devices_apply_p_set_then_limited_alpha_sharing():
     from ac_array_model import GEN_COLS
     from ac_lf import ACPowerFlowCalc
@@ -103,6 +144,77 @@ def test_dc_balance_devices_apply_p_set_then_limited_alpha_sharing():
     np.testing.assert_allclose(
         calc.result["gen"][:, GEN_COLS["p"]],
         [0.55, 0.45],
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_ac_balance_devices_exceed_limits_to_finish_unallocated_residual():
+    from ac_array_model import GEN_COLS, LOAD_COLS
+    from ac_lf import ACPowerFlowCalc
+
+    ppc = _build_ac_multi_balance_ppc()
+    ppc["load"][0, LOAD_COLS["pbase"]] = 2.0
+    ppc["load"][0, LOAD_COLS["qbase"]] = 2.0
+    calc = ACPowerFlowCalc(ppc, linear_solver="scipy", result_mode="array")
+
+    assert calc.run() == 0
+    assert calc.converged
+    np.testing.assert_allclose(
+        calc.result["gen"][:, GEN_COLS["p"]],
+        [1.05, 0.95],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        calc.result["gen"][:, GEN_COLS["q"]],
+        [1.1, 0.9],
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_dc_balance_devices_exceed_limits_to_finish_unallocated_residual():
+    from dc_array_model import GEN_COLS, LOAD_COLS
+    from dc_lf import DCPowerFlowCalc
+
+    ppc = _build_dc_multi_balance_ppc()
+    ppc["load"][0, LOAD_COLS["pbase"]] = 2.0
+    calc = DCPowerFlowCalc(ppc, linear_solver="scipy", result_mode="array")
+
+    assert calc.run() == 0
+    assert calc.converged
+    np.testing.assert_allclose(
+        calc.result["gen"][:, GEN_COLS["p"]],
+        [1.05, 0.95],
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_hybrid_dc_balance_writeback_includes_dcac_terminal_power():
+    from dc_array_model import GEN_COLS, LOAD_COLS
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    network = _build_hybrid_dcac_balance_network()
+    calc = HybridPowerFlowCalc(
+        network,
+        linear_solver="scipy",
+        result_mode="array",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    assert calc.converged
+
+    dc_gen = calc.result["dc"]["gen"][:, GEN_COLS["p"]]
+    dc_load = calc.result["dc"]["load"][:, LOAD_COLS["p"]]
+    dcac_p = calc.result["dcac"][:, 0]
+    np.testing.assert_allclose(dcac_p, [-0.3], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(dc_gen, [-0.1], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        float(np.sum(dc_load) - np.sum(dc_gen) + np.sum(dcac_p)),
+        0.0,
         rtol=0.0,
         atol=1e-12,
     )
@@ -385,6 +497,35 @@ def test_residual_allocator_handles_missing_limits_and_negative_residual():
             alpha=[1.0, 2.0],
         ),
         [0.2, 0.3],
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_residual_allocator_exceeds_bounds_only_after_headroom_is_exhausted():
+    from lfcore.common import allocate_limited_residual
+
+    np.testing.assert_allclose(
+        allocate_limited_residual(
+            [0.2, 0.1],
+            2.0,
+            lower=[0.0, 0.0],
+            upper=[0.8, 0.45],
+            alpha=[1.0, 2.0],
+        ),
+        [1.05, 0.95],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        allocate_limited_residual(
+            [0.0, 0.0],
+            -1.0,
+            lower=[-0.2, -0.4],
+            upper=[0.5, 0.5],
+            alpha=[1.0, 1.0],
+        ),
+        [-0.4, -0.6],
         rtol=0.0,
         atol=1e-12,
     )

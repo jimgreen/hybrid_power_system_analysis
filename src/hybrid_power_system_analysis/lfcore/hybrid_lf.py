@@ -3173,6 +3173,7 @@ class HybridPowerFlowCalc:
             self.ac_calc.iterations = self.iterations
             self.ac_calc._write_back_ppc()
         if self.dc_calc is not None:
+            self._set_dc_converter_power_injections(dcac_x)
             self.dc_calc.x = dc_x
             self.dc_calc.converged = self.converged
             self.dc_calc.iterations = self.iterations
@@ -3198,6 +3199,7 @@ class HybridPowerFlowCalc:
             )
             ac_result = self.ac_calc.result
         if self.dc_calc is not None:
+            self._set_dc_converter_power_injections(dcac_x)
             self.dc_calc.x = dc_x
             self.dc_calc.converged = self.converged
             self.dc_calc.iterations = self.iterations
@@ -3381,6 +3383,21 @@ class HybridPowerFlowCalc:
 
         self.ac_calc._external_ac_p_injection = p
         self.ac_calc._external_ac_q_injection = q
+
+    def _set_dc_converter_power_injections(self, dcac_x) -> None:
+        """Expose final DC-side converter injections to DC result writeback."""
+        if self.dc_calc is None:
+            return
+        if self.N_dcac == 0:
+            self.dc_calc._external_dc_p_injection = None
+            return
+
+        dcac = dcac_x.reshape(self.N_dcac, 3)
+        self.dc_calc._external_dc_p_injection = np.bincount(
+            self.dcac_dc_pos,
+            weights=dcac[:, 0],
+            minlength=self.dc_calc.N,
+        )
 
     @staticmethod
     def _ppc_converter_key(names, row_pos, idx) -> str:

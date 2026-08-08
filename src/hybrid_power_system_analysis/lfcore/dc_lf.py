@@ -281,6 +281,7 @@ class DCPowerFlowCalc:
         self.lf_result = None
         self.G = None
         self.x = np.array([], dtype=np.float64)
+        self._external_dc_p_injection = None
 
     @classmethod
     def from_file_fast(
@@ -1891,6 +1892,12 @@ class DCPowerFlowCalc:
             dcdc[self.dcdc_idx, DC_DCDC_COLS["j_c"]] = dcdc_j_c
             P_inj += np.bincount(self.dcdc_i, weights=dcdc_i_p, minlength=P_inj.size)
             P_inj += np.bincount(self.dcdc_j, weights=dcdc_j_p, minlength=P_inj.size)
+
+        external_p = self._external_dc_p_injection
+        if external_p is not None:
+            external_p = np.asarray(external_p, dtype=np.float64)
+            if external_p.shape == P_inj.shape:
+                P_inj = P_inj + external_p
 
         gen_p_min_all = optional_ppc_vector(ppc, "_gen_p_min", gen.shape[0])
         gen_p_max_all = optional_ppc_vector(ppc, "_gen_p_max", gen.shape[0])

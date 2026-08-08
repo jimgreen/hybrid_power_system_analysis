@@ -55,12 +55,17 @@ def allocate_limited_residual(
     alpha=None,
     tolerance: float = 1e-12,
 ) -> np.ndarray:
-    """Apply setpoints first, then distribute the residual with limits and weights.
+    """Apply setpoints first, then distribute the residual in two stages.
 
-    Finite directional headroom is multiplied by ``alpha``. Missing limits remain
-    unbounded and fall back to the alpha weight, preserving legacy E files that
-    do not declare operating limits. Saturated devices are removed and the
-    remaining residual is redistributed in subsequent passes.
+    The first stage respects directional operating limits. Finite headroom is
+    multiplied by ``alpha``; saturated devices are removed and the residual is
+    redistributed in subsequent passes. Missing limits remain unbounded and
+    fall back to the alpha weight, preserving legacy E files without limits.
+
+    If all available headroom is exhausted before the requested total is met,
+    the second stage deliberately exceeds the limits and allocates the remaining
+    residual by normalized ``alpha``. This keeps the solved network power-balanced
+    while leaving the limit violation visible to higher-level controls.
     """
     result = np.asarray(baseline, dtype=np.float64).reshape(-1).copy()
     if result.size == 0:
@@ -126,4 +131,18 @@ def allocate_limited_residual(
         active[saturated] = False
         if not np.any(saturated) and np.all(applied <= tolerance):
             break
+
+    remaining = float(target_total) - float(np.sum(result))
+    if abs(remaining) > tolerance:
+        overflow_weights = alpha_values.copy()
+        if not np.any(overflow_weights > 0.0):
+            overflow_weights.fill(1.0)
+        result += remaining * overflow_weights / float(np.sum(overflow_weights))
+
+        # Remove the final floating-point accumulation error without changing
+        # the intended participation set.
+        correction = float(target_total) - float(np.sum(result))
+        if abs(correction) > tolerance:
+            participating = np.flatnonzero(overflow_weights > 0.0)
+            result[int(participating[-1])] += correction
     return result
