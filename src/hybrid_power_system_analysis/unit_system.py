@@ -242,7 +242,7 @@ def normalize_model_named_units(model) -> float:
         node = ac_nodes.get(gen.node)
         _scale_power_attrs_in_dict(
             gen,
-            ("p_set", "q_set", "p_min", "p_max", "q_min", "q_max", "p", "q"),
+            ("p_set", "q_set", "p_min", "p_max", "q_min", "q_max", "rated_capacity", "p", "q"),
             p_base,
         )
         _scale_voltage_attr(gen, "v_set", node, settings)
@@ -292,7 +292,7 @@ def normalize_model_named_units(model) -> float:
 
     for gen in getattr(model, "DCGenerator", []):
         node = dc_nodes.get(gen.node)
-        _scale_power_attrs_in_dict(gen, ("p_set", "p_min", "p_max", "p"), p_base)
+        _scale_power_attrs_in_dict(gen, ("p_set", "p_min", "p_max", "rated_capacity", "p"), p_base)
         _scale_voltage_attr(gen, "v_set", node, settings)
         scale_base = dc_current_scales.get(gen.node)
         if scale_base is not None:

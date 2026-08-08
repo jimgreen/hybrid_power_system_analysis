@@ -690,7 +690,18 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         gen[:, GEN_COLS["v_set"]] = _voltage_set_column(table_rows, columns, "v_set", gen[:, GEN_COLS["node"]], raw_vbase_by_idx)
         gen[:, GEN_COLS["alpha"]] = _float_column(table_rows, columns, "alpha", 1.0)
         gen[:, GEN_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
-        gen[:, GEN_COLS["p_max"]] = _float_column(table_rows, columns, "p_max", np.nan) / p_base
+        gen_p_max = _float_column(table_rows, columns, "p_max", np.nan) / p_base
+        rated_capacity = _float_column(table_rows, columns, "rated_capacity", np.nan) / p_base
+        p_max_placeholder = (
+            np.isfinite(gen_p_max)
+            & (np.abs(gen_p_max) <= 1e-12)
+            & np.isfinite(rated_capacity)
+            & (rated_capacity > 0.0)
+        )
+        if np.any(p_max_placeholder):
+            gen_p_max = gen_p_max.copy()
+            gen_p_max[p_max_placeholder] = rated_capacity[p_max_placeholder]
+        gen[:, GEN_COLS["p_max"]] = gen_p_max
         _assign_power_if_present(gen, GEN_COLS["p"], table_rows, columns, "p", p_base)
         _assign_power_if_present(gen, GEN_COLS["q"], table_rows, columns, "q", p_base)
         _assign_current_if_present(
@@ -706,6 +717,20 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     gen_p_min = _float_column(table_rows, columns, "p_min", np.nan) / p_base
     gen_q_min = _float_column(table_rows, columns, "q_min", np.nan) / p_base
     gen_q_max = _float_column(table_rows, columns, "q_max", np.nan) / p_base
+    rated_capacity = _float_column(table_rows, columns, "rated_capacity", np.nan) / p_base
+    q_limit_placeholder = (
+        np.isfinite(gen_q_min)
+        & np.isfinite(gen_q_max)
+        & (np.abs(gen_q_min) <= 1e-12)
+        & (np.abs(gen_q_max) <= 1e-12)
+        & np.isfinite(rated_capacity)
+        & (rated_capacity > 0.0)
+    )
+    if np.any(q_limit_placeholder):
+        gen_q_min = gen_q_min.copy()
+        gen_q_max = gen_q_max.copy()
+        gen_q_min[q_limit_placeholder] = -rated_capacity[q_limit_placeholder]
+        gen_q_max[q_limit_placeholder] = rated_capacity[q_limit_placeholder]
 
     columns, table_rows = _rows_for(rows, "ACLoad")
     load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64)
@@ -1740,10 +1765,26 @@ def build_ac_ppc_from_network(network) -> Dict:
         gen[row, GEN_COLS["v_set"]] = _float_value(dev, "v_set", 1.0)
         gen[row, GEN_COLS["alpha"]] = _float_value(dev, "alpha", 1.0)
         gen[row, GEN_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
-        gen[row, GEN_COLS["p_max"]] = _float_value(dev, "p_max", np.nan)
+        rated_capacity = _float_value(dev, "rated_capacity", np.nan)
+        p_max = _float_value(dev, "p_max", np.nan)
+        if np.isfinite(p_max) and abs(p_max) <= 1e-12 and np.isfinite(rated_capacity) and rated_capacity > 0.0:
+            p_max = rated_capacity
+        gen[row, GEN_COLS["p_max"]] = p_max
         gen_p_min[row] = _float_value(dev, "p_min", np.nan)
-        gen_q_min[row] = _float_value(dev, "q_min", np.nan)
-        gen_q_max[row] = _float_value(dev, "q_max", np.nan)
+        q_min = _float_value(dev, "q_min", np.nan)
+        q_max = _float_value(dev, "q_max", np.nan)
+        if (
+            np.isfinite(q_min)
+            and np.isfinite(q_max)
+            and abs(q_min) <= 1e-12
+            and abs(q_max) <= 1e-12
+            and np.isfinite(rated_capacity)
+            and rated_capacity > 0.0
+        ):
+            q_min = -rated_capacity
+            q_max = rated_capacity
+        gen_q_min[row] = q_min
+        gen_q_max[row] = q_max
     for attr in ("p", "q", "current"):
         _fill_float_column_if_present(gen, generators, GEN_COLS[attr], attr)
 

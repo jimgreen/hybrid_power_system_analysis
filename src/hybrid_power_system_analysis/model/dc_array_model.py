@@ -371,6 +371,16 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     gen_names = _names_from_rows(table_rows, columns, "gen", gen[:, GEN_COLS["idx"]])
     gen_p_min = _float_column(table_rows, columns, "p_min", np.nan) / p_base
     gen_p_max = _float_column(table_rows, columns, "p_max", np.nan) / p_base
+    rated_capacity = _float_column(table_rows, columns, "rated_capacity", np.nan) / p_base
+    p_max_placeholder = (
+        np.isfinite(gen_p_max)
+        & (np.abs(gen_p_max) <= 1e-12)
+        & np.isfinite(rated_capacity)
+        & (rated_capacity > 0.0)
+    )
+    if np.any(p_max_placeholder):
+        gen_p_max = gen_p_max.copy()
+        gen_p_max[p_max_placeholder] = rated_capacity[p_max_placeholder]
     gen_alpha = _float_column(table_rows, columns, "alpha", 1.0)
 
     columns, table_rows = _rows_for(rows, "DCZeroBranch")
@@ -600,6 +610,19 @@ def build_dc_ppc_from_network(network) -> Dict:
     )
     gen_p_min = np.asarray([_float_value(dev, "p_min", np.nan) for dev in generators], dtype=np.float64)
     gen_p_max = np.asarray([_float_value(dev, "p_max", np.nan) for dev in generators], dtype=np.float64)
+    gen_rated_capacity = np.asarray(
+        [_float_value(dev, "rated_capacity", np.nan) for dev in generators],
+        dtype=np.float64,
+    )
+    p_max_placeholder = (
+        np.isfinite(gen_p_max)
+        & (np.abs(gen_p_max) <= 1e-12)
+        & np.isfinite(gen_rated_capacity)
+        & (gen_rated_capacity > 0.0)
+    )
+    if np.any(p_max_placeholder):
+        gen_p_max = gen_p_max.copy()
+        gen_p_max[p_max_placeholder] = gen_rated_capacity[p_max_placeholder]
     gen_alpha = np.asarray([_float_value(dev, "alpha", 1.0) for dev in generators], dtype=np.float64)
 
     zero_branch = _device_array(
