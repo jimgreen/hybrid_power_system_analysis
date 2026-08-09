@@ -44,6 +44,128 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertIsNotNone(snapshot.value("DCBreak", dc_breaker.name, "V_FROM"))
         self.assertIsNotNone(snapshot.value("DCBreak", dc_breaker.name, "I_FROM"))
 
+    def test_dcac_device_types_share_terminal_power_signs(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        source_text = (ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e").read_text(
+            encoding="utf-8"
+        )
+
+        def add_dev_type(text, dev_type):
+            lines = []
+            in_dcac = False
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped == "<DCACConverter>":
+                    in_dcac = True
+                elif stripped == "</DCACConverter>":
+                    in_dcac = False
+                elif in_dcac and (stripped.startswith("@") or stripped.startswith("#")):
+                    parts = line.split()
+                    parts.insert(3, "dev_type" if stripped.startswith("@") else dev_type)
+                    line = " ".join(parts)
+                lines.append(line)
+            return "\n".join(lines) + "\n"
+
+        states = {}
+        evaluated = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for raw_type, expected_type in (
+                ("acdc-converter", "ACDCConverter"),
+                ("dcac-converter", "DCACConverter"),
+            ):
+                e_file = Path(tmp_dir) / f"qinling_{raw_type}.e"
+                e_file.write_text(add_dev_type(source_text, raw_type), encoding="utf-8")
+                estimator = HybridStateEstimator(
+                    e_file=e_file,
+                    meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
+                    flat_start=True,
+                )
+                estimator.prepare()
+                x0 = estimator.initial_state()
+                self.assertTrue(
+                    all(
+                        conv.dev_type == expected_type
+                        for conv in estimator.dcac_converters
+                    )
+                )
+                states[expected_type] = x0
+                evaluated[expected_type] = estimator.evaluate(x0, estimator.active_measurements)
+                flat_converter_seed = estimator._hybrid_seed_flat_base
+
+                rectifier_pos = next(
+                    pos
+                    for pos, conv in enumerate(estimator.dcac_converters)
+                    if conv.name == "wt01_rect"
+                )
+                inverter_pos = next(
+                    pos
+                    for pos, conv in enumerate(estimator.dcac_converters)
+                    if conv.name == "grid_inv_acp"
+                )
+                self.assertAlmostEqual(-0.1, flat_converter_seed[3 * rectifier_pos])
+                self.assertAlmostEqual(0.1, flat_converter_seed[3 * rectifier_pos + 1])
+                self.assertAlmostEqual(3.5, flat_converter_seed[3 * inverter_pos])
+                self.assertAlmostEqual(-3.5, flat_converter_seed[3 * inverter_pos + 1])
+                self.assertLess(x0[estimator.dcac_p_dc_state_col[rectifier_pos]], 0.0)
+                self.assertGreater(x0[estimator.dcac_p_ac_state_col[rectifier_pos]], 0.0)
+                self.assertGreater(x0[estimator.dcac_p_dc_state_col[inverter_pos]], 0.0)
+                self.assertLess(x0[estimator.dcac_p_ac_state_col[inverter_pos]], 0.0)
+
+        np.testing.assert_allclose(states["ACDCConverter"], states["DCACConverter"])
+        np.testing.assert_allclose(evaluated["ACDCConverter"], evaluated["DCACConverter"])
+
+    def test_dcac_dc_p_control_flat_start_uses_dc_active_power_setpoint(self):
+        from secore.hybrid_se import HybridStateEstimator
+
+        source = ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
+        lines = []
+        in_dcac = False
+        for line in source.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped == "<DCACConverter>":
+                in_dcac = True
+            elif stripped == "</DCACConverter>":
+                in_dcac = False
+            elif in_dcac and stripped.startswith("@"):
+                parts = line.split()
+                parts.insert(parts.index("q_ac_set"), "p_dc_set")
+                line = " ".join(parts)
+            elif in_dcac and stripped.startswith("#"):
+                parts = line.split()
+                if parts[2] == "wt01_rect":
+                    parts[7] = "NONE"
+                    parts[8] = "P"
+                parts.insert(10, "30" if parts[2] == "wt01_rect" else "0")
+                line = " ".join(parts)
+            lines.append(line)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            e_file = Path(tmp_dir) / "qinling_dcp.e"
+            e_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            estimator = HybridStateEstimator(
+                e_file=e_file,
+                meas_file=ROOT_DIR / "data" / "meas" / "hybrid" / "qinling.meas",
+                flat_start=True,
+            )
+            estimator.prepare()
+
+        converter_pos = next(
+            pos
+            for pos, conv in enumerate(estimator.dcac_converters)
+            if conv.name == "wt01_rect"
+        )
+        converter = estimator.dcac_converters[converter_pos]
+        flat_converter_seed = estimator._hybrid_seed_flat_base
+
+        self.assertEqual("NONE", converter.ac_control_type)
+        self.assertEqual("P", converter.dc_control_type)
+        self.assertEqual("DCP", converter.control_type)
+        self.assertAlmostEqual(0.3, converter.p_dc_set)
+        self.assertAlmostEqual(0.3, flat_converter_seed[3 * converter_pos])
+        self.assertAlmostEqual(-0.3, flat_converter_seed[3 * converter_pos + 1])
+        self.assertAlmostEqual(0.0, flat_converter_seed[3 * converter_pos + 2])
+
     def test_hybrid_net_40_sparse_jacobian_skips_missing_balance_rows(self):
         from secore.hybrid_se import HybridStateEstimator
 

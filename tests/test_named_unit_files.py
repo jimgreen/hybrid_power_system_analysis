@@ -253,7 +253,16 @@ class NamedUnitFileTest(unittest.TestCase):
                 SimpleNamespace(node=1, p_set=20000.0, q_set=5000.0, p_max=80000.0)
             ],
             DCACConverter=[
-                SimpleNamespace(ac_node=1, dc_node=0, p_ac_set=10000.0, q_ac_set=0.0, dc_p=0.0, ac_p=0.0, ac_q=0.0)
+                SimpleNamespace(
+                    ac_node=1,
+                    dc_node=0,
+                    p_ac_set=10000.0,
+                    p_dc_set=30000.0,
+                    q_ac_set=0.0,
+                    dc_p=0.0,
+                    ac_p=0.0,
+                    ac_q=0.0,
+                )
             ],
         )
 
@@ -267,6 +276,7 @@ class NamedUnitFileTest(unittest.TestCase):
         self.assertAlmostEqual(model.ACBranch[0].i_c, 1.0, places=7)
         self.assertAlmostEqual(model.ACGenerator[0].p_max, 0.8)
         self.assertAlmostEqual(model.DCACConverter[0].p_ac_set, 0.1)
+        self.assertAlmostEqual(model.DCACConverter[0].p_dc_set, 0.3)
 
 
 if __name__ == "__main__":

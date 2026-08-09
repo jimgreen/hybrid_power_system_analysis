@@ -2347,6 +2347,23 @@ def print_dc_result(calc: DCPowerFlowCalc, rc: int) -> None:
             )
             print(f"     电流: {row[DC_SWITCH_COLS['current']]:.6f} pu, 功率: {row[DC_SWITCH_COLS['p']]:.6f} pu")
 
+        breaker = calc.result["break"]
+        breaker_names = _names("break_name", breaker.shape[0])
+        if breaker.shape[0]:
+            print("\n4.1 刀闸信息:")
+            for row, name in zip(breaker, breaker_names):
+                status = "闭合" if int(row[DC_BREAK_COLS["status"]]) == 1 else "断开"
+                i_node = int(row[DC_BREAK_COLS["i_node"]])
+                j_node = int(row[DC_BREAK_COLS["j_node"]])
+                print(
+                    f"   刀闸 {int(row[DC_BREAK_COLS['idx']])} {name} "
+                    f"({i_node}->{j_node}, 状态:{status}):"
+                )
+                print(
+                    f"     电流: {row[DC_BREAK_COLS['current']]:.6f} pu, "
+                    f"功率: {row[DC_BREAK_COLS['p']]:.6f} pu"
+                )
+
         dcdc = calc.result["dcdc"]
         dcdc_names = _names("dcdc_name", dcdc.shape[0])
         print("\n5. DC-DC变流器信息:")

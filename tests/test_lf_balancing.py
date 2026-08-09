@@ -67,7 +67,17 @@ def _build_dc_multi_balance_ppc():
     return ensure_dc_ppc_topology(build_dc_ppc_from_efile_rows(Path("dc_balance_sharing.e"), rows))
 
 
-def _build_hybrid_dcac_balance_network():
+def _build_hybrid_dcac_balance_network(
+    dev_type="DCACConverter",
+    p_ac_set=30,
+    *,
+    ac_control_type="PQ",
+    dc_control_type="NONE",
+    p_dc_set=0,
+    q_ac_set=0,
+    r1=0,
+    r2=0,
+):
     from lfcore.hybrid_lf import _build_lf_network_from_hybrid_rows
 
     rows = {
@@ -100,9 +110,25 @@ def _build_hybrid_dcac_balance_network():
             [[1, "dc_load", 1, 20, 1, 0, 0, 1]],
         ),
         "DCACConverter": _table(
-            "idx name ac_node dc_node ac_control_type dc_control_type "
-            "p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
-            [[1, "acdc", 1, 1, "PQ", "NONE", 30, 0, 380, 750, 1, 0, 0]],
+            "idx name dev_type ac_node dc_node ac_control_type dc_control_type "
+            "p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[
+                1,
+                "converter",
+                dev_type,
+                1,
+                1,
+                ac_control_type,
+                dc_control_type,
+                p_ac_set,
+                p_dc_set,
+                q_ac_set,
+                380,
+                750,
+                1,
+                r1,
+                r2,
+            ]],
         ),
     }
     return _build_lf_network_from_hybrid_rows(Path("hybrid_dcac_balance.e"), rows)
@@ -218,6 +244,188 @@ def test_hybrid_dc_balance_writeback_includes_dcac_terminal_power():
         rtol=0.0,
         atol=1e-12,
     )
+
+
+def test_hybrid_dcac_device_types_share_terminal_power_signs():
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    solved = {}
+    for p_ac_set, expected_terminal_powers in (
+        (30, [-0.3, 0.3]),
+        (-30, [0.3, -0.3]),
+    ):
+        for dev_type in ("ACDCConverter", "DCACConverter"):
+            network = _build_hybrid_dcac_balance_network(dev_type, p_ac_set)
+            converter = network.dcac_converters[0]
+            calc = HybridPowerFlowCalc(
+                network,
+                linear_solver="scipy",
+                result_mode="array",
+                verbose=False,
+            )
+
+            assert converter.dev_type == dev_type
+            assert calc.run() == 0
+            assert calc.converged
+            solved[(dev_type, p_ac_set)] = calc.result["dcac"][0].copy()
+            np.testing.assert_allclose(
+                solved[(dev_type, p_ac_set)][:2],
+                expected_terminal_powers,
+                rtol=0.0,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                np.sum(solved[(dev_type, p_ac_set)][:2]),
+                0.0,
+                rtol=0.0,
+                atol=1e-12,
+            )
+
+        np.testing.assert_allclose(
+            solved[("ACDCConverter", p_ac_set)],
+            solved[("DCACConverter", p_ac_set)],
+            rtol=0.0,
+            atol=1e-12,
+        )
+
+
+def test_hybrid_dcac_dc_p_control_uses_dc_setpoint_and_ac_q_setpoint():
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    solved = {}
+    for p_dc_set, expected_terminal_powers in (
+        (30, [0.3, -0.3, 0.07]),
+        (-30, [-0.3, 0.3, 0.07]),
+    ):
+        for dev_type in ("ACDCConverter", "DCACConverter"):
+            network = _build_hybrid_dcac_balance_network(
+                dev_type,
+                p_ac_set=0,
+                ac_control_type="NONE",
+                dc_control_type="P",
+                p_dc_set=p_dc_set,
+                q_ac_set=7,
+            )
+            converter = network.dcac_converters[0]
+            calc = HybridPowerFlowCalc(
+                network,
+                linear_solver="scipy",
+                result_mode="array",
+                verbose=False,
+            )
+
+            assert converter.p_dc_set == p_dc_set / 100.0
+            assert converter.control_type == "DCP"
+            assert converter.ac_control_type == "NONE"
+            assert converter.dc_control_type == "P"
+            assert calc.run() == 0
+            assert calc.converged
+            solved[(dev_type, p_dc_set)] = calc.result["dcac"][0].copy()
+            np.testing.assert_allclose(
+                solved[(dev_type, p_dc_set)][:3],
+                expected_terminal_powers,
+                rtol=0.0,
+                atol=1e-12,
+            )
+
+            residual = calc.get_f(calc.x)
+            np.testing.assert_allclose(
+                residual[calc.dcac_eq_start:calc.dcac_eq_start + 3],
+                0.0,
+                rtol=0.0,
+                atol=1e-12,
+            )
+
+        np.testing.assert_allclose(
+            solved[("ACDCConverter", p_dc_set)],
+            solved[("DCACConverter", p_dc_set)],
+            rtol=0.0,
+            atol=1e-12,
+        )
+
+
+def test_hybrid_dcac_dc_p_control_jacobian_matches_finite_difference():
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    network = _build_hybrid_dcac_balance_network(
+        p_ac_set=0,
+        ac_control_type="NONE",
+        dc_control_type="P",
+        p_dc_set=30,
+        q_ac_set=7,
+    )
+    calc = HybridPowerFlowCalc(
+        network,
+        linear_solver="scipy",
+        result_mode="array",
+        verbose=False,
+    )
+    calc.prepare()
+
+    x = calc.x.copy()
+    row = int(calc.dcac_eq_ctrl_1[0])
+    col = int(calc.dcac_dc_p_col[0])
+    analytic = float(calc.get_jacobi(x)[row, col])
+    step = 1e-7
+    x_plus = x.copy()
+    x_minus = x.copy()
+    x_plus[col] += step
+    x_minus[col] -= step
+    finite_difference = float(
+        (calc.get_f(x_plus)[row] - calc.get_f(x_minus)[row]) / (2.0 * step)
+    )
+
+    np.testing.assert_allclose(analytic, 1.0, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(finite_difference, analytic, rtol=0.0, atol=1e-9)
+
+
+def test_hybrid_dcac_dc_p_control_preserves_terminal_signs_with_losses():
+    from ac_array_model import BUS_COLS as AC_BUS_COLS
+    from dc_array_model import BUS_COLS as DC_BUS_COLS
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    solved = {}
+    for p_dc_set in (30, -30):
+        for dev_type in ("ACDCConverter", "DCACConverter"):
+            network = _build_hybrid_dcac_balance_network(
+                dev_type,
+                p_ac_set=0,
+                ac_control_type="NONE",
+                dc_control_type="P",
+                p_dc_set=p_dc_set,
+                q_ac_set=7,
+                r1=0.01,
+                r2=0.01,
+            )
+            calc = HybridPowerFlowCalc(
+                network,
+                linear_solver="scipy",
+                result_mode="array",
+                verbose=False,
+            )
+
+            assert calc.run() == 0
+            dc_p, ac_p, ac_q = calc.result["dcac"][0, :3]
+            solved[(dev_type, p_dc_set)] = calc.result["dcac"][0].copy()
+            np.testing.assert_allclose(dc_p, p_dc_set / 100.0, rtol=0.0, atol=1e-12)
+            assert np.signbit(ac_p) != np.signbit(dc_p)
+            assert dc_p + ac_p > 0.0
+
+            va = calc.ac_calc.result["bus"][0, AC_BUS_COLS["voltage"]]
+            vd = calc.dc_calc.result["bus"][0, DC_BUS_COLS["voltage"]]
+            loss_residual = (
+                vd * vd * va * va * (dc_p + ac_p)
+                - 0.01 * dc_p * dc_p * va * va
+                - 0.01 * (ac_p * ac_p + ac_q * ac_q) * vd * vd
+            )
+            np.testing.assert_allclose(loss_residual, 0.0, rtol=0.0, atol=1e-10)
+
+        np.testing.assert_allclose(
+            solved[("ACDCConverter", p_dc_set)],
+            solved[("DCACConverter", p_dc_set)],
+            rtol=0.0,
+            atol=1e-12,
+        )
 
 
 def test_ac_balance_devices_use_rated_capacity_when_zero_p_max_is_placeholder():

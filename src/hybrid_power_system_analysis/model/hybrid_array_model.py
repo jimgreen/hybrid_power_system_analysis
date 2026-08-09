@@ -30,7 +30,7 @@ from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
-DCAC_LEGACY_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2}
+DCAC_LEGACY_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2, "DCP": 3}
 DCAC_LEGACY_CONTROL_LABEL = {value: key for key, value in DCAC_LEGACY_CONTROL_CODE.items()}
 DCAC_AC_CONTROL_CODE = {"NONE": 0, "PQ": 1, "PV": 2, "PH": 3}
 DCAC_DC_CONTROL_CODE = {"NONE": 0, "P": 1, "V": 2, "I": 3}
@@ -50,10 +50,22 @@ DCAC_DC_CONTROL_PARSE_CODE = {
     "NA": DCAC_DC_CONTROL_CODE["NONE"],
     "不定": DCAC_DC_CONTROL_CODE["NONE"],
 }
+DCAC_DEVICE_TYPE_CODE = {
+    "DCACConverter": 1,
+    "ACDCConverter": 2,
+}
+DCAC_DEVICE_TYPE_LABEL = {value: key for key, value in DCAC_DEVICE_TYPE_CODE.items()}
+_DCAC_DEVICE_TYPE_BY_TOKEN = {
+    "DCAC": "DCACConverter",
+    "DCACCONVERTER": "DCACConverter",
+    "ACDC": "ACDCConverter",
+    "ACDCCONVERTER": "ACDCConverter",
+}
 DCAC_LEGACY_TO_PAIR = {
     "DCV": ("PQ", "V"),
     "ACV": ("PH", "NONE"),
     "ACP": ("PQ", "NONE"),
+    "DCP": ("NONE", "P"),
     "PH": ("PH", "NONE"),
     "PQ": ("PQ", "NONE"),
 }
@@ -61,6 +73,7 @@ DCAC_PAIR_TO_LEGACY = {
     ("PQ", "V"): "DCV",
     ("PH", "NONE"): "ACV",
     ("PQ", "NONE"): "ACP",
+    ("NONE", "P"): "DCP",
 }
 
 
@@ -87,6 +100,20 @@ def dcac_legacy_control_code(ac_control_type, dc_control_type) -> int:
 def dcac_combined_control_code(ac_control_type, dc_control_type) -> int:
     return dcac_legacy_control_code(ac_control_type, dc_control_type)
 
+
+def normalize_dcac_device_type(dev_type) -> str:
+    """Return the canonical converter type without changing power direction."""
+    token = "".join(
+        char
+        for char in str(dev_type or "DCACConverter").upper()
+        if char.isalnum()
+    )
+    label = _DCAC_DEVICE_TYPE_BY_TOKEN.get(token)
+    if label is None:
+        raise ValueError(f"未知 DCACConverter dev_type: {dev_type}")
+    return label
+
+
 DCAC_COLS = {
     "idx": 0,
     "ac_node": 1,
@@ -105,7 +132,11 @@ DCAC_COLS = {
     "ac_q": 14,
     "dc_i": 15,
     "ac_i": 16,
+    "dev_type": 17,
+    "p_dc_set": 18,
 }
+
+
 def _attr(obj, attr: str, default=""):
     value = getattr(obj, attr, default)
     return default if value in (None, "") else value
@@ -309,6 +340,7 @@ def _build_dcac(model) -> Tuple[np.ndarray, np.ndarray]:
         out[pos, DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_PARSE_CODE.get(str(ac_ctrl or "NONE").upper(), 0)
         out[pos, DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_PARSE_CODE.get(str(dc_ctrl or "NONE").upper(), 0)
         out[pos, DCAC_COLS["p_ac_set"]] = _float_attr(conv, "p_ac_set")
+        out[pos, DCAC_COLS["p_dc_set"]] = _float_attr(conv, "p_dc_set")
         out[pos, DCAC_COLS["q_ac_set"]] = _float_attr(conv, "q_ac_set")
         out[pos, DCAC_COLS["v_ac_set"]] = _float_attr(conv, "v_ac_set")
         out[pos, DCAC_COLS["v_dc_set"]] = _float_attr(conv, "v_dc_set")
@@ -318,6 +350,8 @@ def _build_dcac(model) -> Tuple[np.ndarray, np.ndarray]:
         out[pos, DCAC_COLS["ac_q"]] = _float_attr(conv, "ac_q")
         out[pos, DCAC_COLS["dc_i"]] = _float_attr(conv, "dc_i")
         out[pos, DCAC_COLS["ac_i"]] = _float_attr(conv, "ac_i")
+        dev_type = normalize_dcac_device_type(_attr(conv, "dev_type", "DCACConverter"))
+        out[pos, DCAC_COLS["dev_type"]] = DCAC_DEVICE_TYPE_CODE[dev_type]
     return out, names
 
 
@@ -353,6 +387,7 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         ac_control_code = DCAC_AC_CONTROL_PARSE_CODE.get(ac_control_type or "NONE", 0)
         dc_control_code = DCAC_DC_CONTROL_PARSE_CODE.get(dc_control_type or "NONE", 0)
         p_ac_set = _float_attr(conv, "p_ac_set")
+        p_dc_set = _float_attr(conv, "p_dc_set")
         q_ac_set = _float_attr(conv, "q_ac_set")
         v_ac_set = _float_attr(conv, "v_ac_set")
         v_dc_set = _float_attr(conv, "v_dc_set")
@@ -362,6 +397,7 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         ac_q = _float_attr(conv, "ac_q")
         dc_i = _float_attr(conv, "dc_i")
         ac_i = _float_attr(conv, "ac_i")
+        dev_type = normalize_dcac_device_type(_attr(conv, "dev_type", "DCACConverter"))
         out[pos, DCAC_COLS["idx"]] = idx
         out[pos, DCAC_COLS["ac_node"]] = ac_node
         out[pos, DCAC_COLS["dc_node"]] = dc_node
@@ -370,6 +406,7 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         out[pos, DCAC_COLS["ac_control_type"]] = ac_control_code
         out[pos, DCAC_COLS["dc_control_type"]] = dc_control_code
         out[pos, DCAC_COLS["p_ac_set"]] = p_ac_set
+        out[pos, DCAC_COLS["p_dc_set"]] = p_dc_set
         out[pos, DCAC_COLS["q_ac_set"]] = q_ac_set
         out[pos, DCAC_COLS["v_ac_set"]] = v_ac_set
         out[pos, DCAC_COLS["v_dc_set"]] = v_dc_set
@@ -379,6 +416,7 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         out[pos, DCAC_COLS["ac_q"]] = ac_q
         out[pos, DCAC_COLS["dc_i"]] = dc_i
         out[pos, DCAC_COLS["ac_i"]] = ac_i
+        out[pos, DCAC_COLS["dev_type"]] = DCAC_DEVICE_TYPE_CODE[dev_type]
         obj = DCACConverter(
             idx,
             ac_node,
@@ -392,6 +430,8 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
             v_ac_set,
             v_dc_set,
             run_stat,
+            dev_type=dev_type,
+            p_dc_set=p_dc_set,
         )
         obj.name = str(names[pos])
         obj.dc_p = dc_p
@@ -451,6 +491,7 @@ def _build_dcac_from_rows(
             dtype=np.float64,
         )
     out[:, DCAC_COLS["p_ac_set"]] = _power_column(table_rows, columns, "p_ac_set", p_base)
+    out[:, DCAC_COLS["p_dc_set"]] = _power_column(table_rows, columns, "p_dc_set", p_base)
     out[:, DCAC_COLS["q_ac_set"]] = _power_column(table_rows, columns, "q_ac_set", p_base)
     out[:, DCAC_COLS["v_ac_set"]] = _voltage_set_column(
         table_rows,
@@ -491,6 +532,15 @@ def _build_dcac_from_rows(
         out[:, DCAC_COLS["dc_i"]] = _current_column(table_rows, columns, "dc_i", out[:, DCAC_COLS["dc_node"]], dc_current)
     if "ac_i" in columns:
         out[:, DCAC_COLS["ac_i"]] = _current_column(table_rows, columns, "ac_i", out[:, DCAC_COLS["ac_node"]], ac_current)
+    dev_type_col = columns.get("dev_type")
+    dev_type_labels = [
+        normalize_dcac_device_type(_cell(row, dev_type_col, "DCACConverter"))
+        for row in table_rows
+    ]
+    out[:, DCAC_COLS["dev_type"]] = np.asarray(
+        [DCAC_DEVICE_TYPE_CODE[label] for label in dev_type_labels],
+        dtype=np.float64,
+    )
 
     names = _names_from_rows(table_rows, columns, "dcac", out[:, DCAC_COLS["idx"]])
     if not build_objects:
@@ -513,6 +563,8 @@ def _build_dcac_from_rows(
             float(row[DCAC_COLS["v_ac_set"]]),
             float(row[DCAC_COLS["v_dc_set"]]),
             int(row[DCAC_COLS["run_stat"]]),
+            dev_type=dev_type_labels[pos],
+            p_dc_set=float(row[DCAC_COLS["p_dc_set"]]),
         )
         obj.name = str(names[pos])
         obj.dc_p = float(row[DCAC_COLS["dc_p"]])
@@ -664,6 +716,11 @@ def build_hybrid_model_from_ppc(ppc: Dict):
                 float(row[DCAC_COLS["v_ac_set"]]),
                 float(row[DCAC_COLS["v_dc_set"]]),
                 int(row[DCAC_COLS["run_stat"]]),
+                dev_type=DCAC_DEVICE_TYPE_LABEL.get(
+                    int(row[DCAC_COLS["dev_type"]]),
+                    "DCACConverter",
+                ),
+                p_dc_set=float(row[DCAC_COLS["p_dc_set"]]),
             )
             for pos, row in enumerate(ppc["dcac"])
         ]

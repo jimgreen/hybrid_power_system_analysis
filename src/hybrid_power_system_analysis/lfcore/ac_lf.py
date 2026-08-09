@@ -40,6 +40,7 @@ from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters,
 from paths import model_file
 from ac_array_model import (
     ACAC_COLS,
+    BREAK_COLS,
     BRANCH_COLS,
     BUS_COLS,
     CTRL_P,
@@ -1867,7 +1868,7 @@ class ACPowerFlowCalc:
 
         if self.N_phi == 0:
             return
-        if self.total_eq == 0 or self.total_vars == 0 or self.standard_jac_rows.size == 0:
+        if self.total_eq == 0 or self.total_vars == 0:
             return
 
         rows_parts = []
@@ -3426,10 +3427,11 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     if breaker.shape[0]:
         print("\n5.1 刀闸信息:")
         for row, name in zip(breaker, breaker_names):
-            status = "闭合" if int(row[SWITCH_COLS["status"]]) == 1 else "断开"
+            status = "闭合" if int(row[BREAK_COLS["status"]]) == 1 else "断开"
             print(
-                f"   刀闸 {int(row[SWITCH_COLS['idx']])} {name} "
-                f"(状态:{status}): 电流={row[SWITCH_COLS['current']]:.6f} pu"
+                f"   刀闸 {int(row[BREAK_COLS['idx']])} {name} "
+                f"(状态:{status}): 电流={row[BREAK_COLS['current']]:.6f} pu, "
+                f"功率={row[BREAK_COLS['p']]:.6f} + j {row[BREAK_COLS['q']]:.6f} pu"
             )
 
     load = calc.result["load"]

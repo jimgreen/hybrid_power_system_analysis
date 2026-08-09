@@ -29,6 +29,7 @@ from model.hybrid_array_model import (
     DCAC_COLS,
     DCAC_AC_CONTROL_LABEL,
     DCAC_DC_CONTROL_LABEL,
+    DCAC_DEVICE_TYPE_LABEL,
     dcac_legacy_control_label,
 )
 from model.dc_array_model import (
@@ -274,6 +275,7 @@ def _build_se_dcac_converters(ppc: Dict) -> List[SimpleNamespace]:
                     DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
                 ),
                 p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
+                p_dc_set=float(row[DCAC_COLS["p_dc_set"]]),
                 q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
                 v_ac_set=float(row[DCAC_COLS["v_ac_set"]]),
                 v_dc_set=float(row[DCAC_COLS["v_dc_set"]]),
@@ -283,6 +285,10 @@ def _build_se_dcac_converters(ppc: Dict) -> List[SimpleNamespace]:
                 ac_q=float(row[DCAC_COLS["ac_q"]]),
                 dc_i=float(row[DCAC_COLS["dc_i"]]),
                 ac_i=float(row[DCAC_COLS["ac_i"]]),
+                dev_type=DCAC_DEVICE_TYPE_LABEL.get(
+                    int(row[DCAC_COLS["dev_type"]]),
+                    "DCACConverter",
+                ),
                 ac_node_obj=None,
                 dc_node_obj=None,
                 ac_isl_obj=None,
@@ -3501,10 +3507,22 @@ class HybridStateEstimator:
         nonflat_parts = []
         if self._dcac_count:
             dcac_flat = np.zeros(3 * self._dcac_count, dtype=np.float64)
-            dcac_flat[1::3] = np.asarray(
+            # Both dev_type values use terminal powers positive into the
+            # converter. A lossless seed therefore has P_DC == -P_AC.
+            p_ac_set = np.asarray(
                 [float(getattr(conv, "p_ac_set", 0.0) or 0.0) for conv in self.dcac_converters],
                 dtype=np.float64,
             )
+            p_dc_set = np.asarray(
+                [float(getattr(conv, "p_dc_set", 0.0) or 0.0) for conv in self.dcac_converters],
+                dtype=np.float64,
+            )
+            dc_p_control = np.asarray(
+                [str(getattr(conv, "dc_control_type", "NONE")).upper() == "P" for conv in self.dcac_converters],
+                dtype=bool,
+            )
+            dcac_flat[0::3] = np.where(dc_p_control, p_dc_set, -p_ac_set)
+            dcac_flat[1::3] = np.where(dc_p_control, -p_dc_set, p_ac_set)
             dcac_flat[2::3] = np.asarray(
                 [float(getattr(conv, "q_ac_set", 0.0) or 0.0) for conv in self.dcac_converters],
                 dtype=np.float64,

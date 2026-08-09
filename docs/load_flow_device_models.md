@@ -408,15 +408,21 @@ I_load = P_load / V
 | `dc_node` | DC 侧节点 |
 | `ac_node` | AC 侧节点 |
 | `r1`, `r2` | DC 侧与 AC 侧等效损耗电阻 |
-| `control_type` | `DCV`、`ACV`、`ACP` |
-| `p_ac_set` | AC 侧有功设定 |
-| `q_ac_set` | AC 侧无功设定 |
+| `dev_type` | `DCACConverter` 或 `ACDCConverter`，仅作为设备元数据 |
+| `ac_control_type` | AC 端控制类型：`PQ`、`PV`、`PH`、`NONE` |
+| `dc_control_type` | DC 端控制类型：`P`、`V`、`I`、`NONE` |
+| `p_ac_set` | 与 `Pac` 同号的 AC 端有功设定，AC 电网流入变流器为正 |
+| `p_dc_set` | 与 `Pdc` 同号的 DC 端有功设定，DC 电网流入变流器为正 |
+| `q_ac_set` | 与 `Qac` 同号的 AC 端无功设定，AC 电网流入变流器为正 |
 | `v_ac_set` | AC 侧电压设定 |
 | `v_dc_set` | DC 侧电压设定 |
 
 状态变量：
 
 - 每台 DCAC 引入三个未知量：`Pdc`、`Pac`、`Qac`。
+- `Pdc > 0` 表示从 DC 电网吸收有功，`Pac/Qac > 0` 表示从 AC 电网吸收有功/无功。
+- `DC -> AC` 时 `Pdc > 0、Pac < 0`；`AC -> DC` 时符号相反。
+- `dev_type` 不改变功率方向；无损时 `Pdc + Pac = 0`，有损时 `Pdc + Pac > 0`。
 
 约束：
 
@@ -427,11 +433,11 @@ I_load = P_load / V
 | DC P 平衡耦合 | `Pdc` 加入 DC 节点有功残差 |
 | 损耗方程 | `Pdc + Pac` 与两侧等效电阻损耗一致 |
 | 无功设定 | `Qac = q_ac_set` |
-| 控制方程 | `DCV` 给定 DC 电压，`ACV` 给定 AC 电压，`ACP` 给定 AC 有功 |
+| 控制方程 | `PQ/V` 给定 DC 电压和 AC 无功，`PH/NONE` 给定 AC 电压/相角，`PQ/NONE` 给定 AC 有功/无功，`NONE/P` 给定 DC 有功/AC 无功 |
 
 约束限制：
 
-- AC 侧节点必须是 PQ 节点，否则会与 AC PV/Slack 约束冲突。
+- 变流器 AC 端采用 `PV/PH` 定压控制时，拓扑后母线不能已有重复的 AC 定压控制；`PQ/NONE` 固定功率端允许接在受控母线上。
 - DC 和 AC 两侧节点必须都在可计算拓扑岛内。
 
 结果状态：

@@ -65,6 +65,10 @@ python -m secore.hybrid_se --case data\model\hybrid\qinling.e --meas data\meas\h
 | DCAC 功率 | `P_DC, P_AC, Q_AC` |
 | ACAC 功率 | `P_FROM, Q_FROM, P_TO, Q_TO` |
 
+DCAC 状态和量测采用端口功率约定：每一端都以对应电网流入变流器为正。因此 `DC -> AC` 时 `P_DC > 0、P_AC < 0`，`AC -> DC` 时 `P_DC < 0、P_AC > 0`；`Q_AC > 0` 表示从 AC 电网吸收无功。`ACDCConverter` 与 `DCACConverter` 两种 `dev_type` 只表示设备类型，不改变状态、量测或残差符号。
+
+平启动时，`ac_control_type=NONE、dc_control_type=P` 的变流器使用 `P_DC=p_dc_set、P_AC=-p_dc_set、Q_AC=q_ac_set` 作为耦合状态初值；SE 仍由量测和网络方程共同修正这些状态，不额外复制 LF 的硬控制方程。
+
 零阻抗等值节点会映射到同一个状态列或通过虚拟电流状态表达，减少不可观测冗余。
 
 ## 支持量测

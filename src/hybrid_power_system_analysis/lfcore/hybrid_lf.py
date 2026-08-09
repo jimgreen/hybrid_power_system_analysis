@@ -101,6 +101,7 @@ from hybrid_array_model import (
     DCAC_AC_CONTROL_PARSE_CODE,
     DCAC_DC_CONTROL_LABEL,
     DCAC_DC_CONTROL_PARSE_CODE,
+    DCAC_DEVICE_TYPE_LABEL,
     dcac_combined_control_code,
     dcac_legacy_control_label,
 )
@@ -498,6 +499,8 @@ class _PpcConverterList:
                 values[attr] = DCAC_AC_CONTROL_LABEL.get(int(raw), "")
             elif kind == "dc_control":
                 values[attr] = DCAC_DC_CONTROL_LABEL.get(int(raw), "")
+            elif kind == "dcac_device_type":
+                values[attr] = DCAC_DEVICE_TYPE_LABEL.get(int(raw), "DCACConverter")
             elif kind == "none":
                 values[attr] = None
             else:
@@ -728,6 +731,7 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
                 ("ac_control_type", "ac_control_type", "ac_control"),
                 ("dc_control_type", "dc_control_type", "dc_control"),
                 ("p_ac_set", "p_ac_set", "float"),
+                ("p_dc_set", "p_dc_set", "float"),
                 ("q_ac_set", "q_ac_set", "float"),
                 ("v_ac_set", "v_ac_set", "float"),
                 ("v_dc_set", "v_dc_set", "float"),
@@ -737,6 +741,7 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
                 ("ac_q", "ac_q", "float"),
                 ("dc_i", "dc_i", "float"),
                 ("ac_i", "ac_i", "float"),
+                ("dev_type", "dev_type", "dcac_device_type"),
                 ("ac_node_obj", "idx", "none"),
                 ("dc_node_obj", "idx", "none"),
             ),
@@ -1378,6 +1383,7 @@ class HybridPowerFlowCalc:
         self.dcac_v_dc_set = active[:, DCAC_COLS["v_dc_set"]].astype(np.float64, copy=True)
         self.dcac_v_ac_set = active[:, DCAC_COLS["v_ac_set"]].astype(np.float64, copy=True)
         self.dcac_p_ac_set = active[:, DCAC_COLS["p_ac_set"]].astype(np.float64, copy=True)
+        self.dcac_p_dc_set = active[:, DCAC_COLS["p_dc_set"]].astype(np.float64, copy=True)
         self.dcac_q_ac_set = active[:, DCAC_COLS["q_ac_set"]].astype(np.float64, copy=True)
         self.dcac_ac_p_row, self.dcac_ac_q_row = self._ac_balance_rows(self.dcac_ac_pos)
         self.dcac_ac_p_eq_mask = self.dcac_ac_p_row >= 0
@@ -1402,6 +1408,7 @@ class HybridPowerFlowCalc:
         self.dcac_v_dc_set = np.array([], dtype=np.float64)
         self.dcac_v_ac_set = np.array([], dtype=np.float64)
         self.dcac_p_ac_set = np.array([], dtype=np.float64)
+        self.dcac_p_dc_set = np.array([], dtype=np.float64)
         self.dcac_q_ac_set = np.array([], dtype=np.float64)
         self.dcac_ac_p_row = np.array([], dtype=np.int32)
         self.dcac_ac_q_row = np.array([], dtype=np.int32)
@@ -1419,7 +1426,7 @@ class HybridPowerFlowCalc:
         if not self.dcac_converters:
             self._clear_dcac_arrays()
             return
-        ctrl_map = {"DCV": 0, "ACV": 1, "ACP": 2}
+        ctrl_map = {"DCV": 0, "ACV": 1, "ACP": 2, "DCP": 3}
         self.dcac_ac_pos = np.asarray([item[1] for item in self.dcac_converters], dtype=np.int32)
         self.dcac_dc_pos = np.asarray([item[2] for item in self.dcac_converters], dtype=np.int32)
         self.dcac_ctrl_code = np.asarray([ctrl_map[item[3]] for item in self.dcac_converters], dtype=np.int8)
@@ -1430,6 +1437,7 @@ class HybridPowerFlowCalc:
         self.dcac_v_dc_set = np.asarray([conv.v_dc_set for conv in convs], dtype=np.float64)
         self.dcac_v_ac_set = np.asarray([conv.v_ac_set for conv in convs], dtype=np.float64)
         self.dcac_p_ac_set = np.asarray([conv.p_ac_set for conv in convs], dtype=np.float64)
+        self.dcac_p_dc_set = np.asarray([conv.p_dc_set for conv in convs], dtype=np.float64)
         self.dcac_q_ac_set = np.asarray([conv.q_ac_set for conv in convs], dtype=np.float64)
         self.dcac_ac_p_row, self.dcac_ac_q_row = self._ac_balance_rows(self.dcac_ac_pos)
         self.dcac_ac_p_eq_mask = self.dcac_ac_p_row >= 0
@@ -1581,6 +1589,7 @@ class HybridPowerFlowCalc:
         self.dcac_ctrl_dc_v_mask = np.array([], dtype=bool)
         self.dcac_ctrl_ac_v_mask = np.array([], dtype=bool)
         self.dcac_ctrl_ac_p_mask = np.array([], dtype=bool)
+        self.dcac_ctrl_dc_p_mask = np.array([], dtype=bool)
         self.dcac_ctrl_q_mask = np.array([], dtype=bool)
         self.dcac_ctrl_ac_theta_mask = np.array([], dtype=bool)
         self.dcac_dcv_avg_set = np.array([], dtype=np.float64)
@@ -1692,6 +1701,7 @@ class HybridPowerFlowCalc:
             self.dcac_ctrl_dc_v_mask = self.dcac_ctrl_code == 0
             self.dcac_ctrl_ac_v_mask = self.dcac_ctrl_code == 1
             self.dcac_ctrl_ac_p_mask = self.dcac_ctrl_code == 2
+            self.dcac_ctrl_dc_p_mask = self.dcac_ctrl_code == 3
             self.dcac_ctrl_ac_theta_mask = self.dcac_ctrl_ac_v_mask.copy()
             self.dcac_ctrl_q_mask = ~self.dcac_ctrl_ac_theta_mask
             (
@@ -1723,6 +1733,11 @@ class HybridPowerFlowCalc:
                 idx_mask = np.flatnonzero(self.dcac_ctrl_ac_p_mask).astype(np.int32, copy=False)
                 ctrl_rows.append(self.dcac_eq_ctrl_1[idx_mask])
                 ctrl_cols.append(self.dcac_ac_p_col[idx_mask])
+                ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
+            if np.any(self.dcac_ctrl_dc_p_mask):
+                idx_mask = np.flatnonzero(self.dcac_ctrl_dc_p_mask).astype(np.int32, copy=False)
+                ctrl_rows.append(self.dcac_eq_ctrl_1[idx_mask])
+                ctrl_cols.append(self.dcac_dc_p_col[idx_mask])
                 ctrl_data.append(np.ones(idx_mask.size, dtype=np.float64))
             if np.any(self.dcac_dcv_rep_mask):
                 idx_mask = np.flatnonzero(self.dcac_dcv_rep_mask).astype(np.int32, copy=False)
@@ -2084,9 +2099,12 @@ class HybridPowerFlowCalc:
         if self.N_dcac == 0:
             return np.array([], dtype=np.float64)
         x = np.zeros(self.N_dcac * 3, dtype=np.float64)
+        # Both dev_type values use terminal powers positive into the converter.
+        # Therefore DC -> AC has P_DC > 0 and P_AC < 0.
         ac_p = np.where(self.dcac_ctrl_code == 2, self.dcac_p_ac_set, 0.0)
-        x[0::3] = -ac_p
-        x[1::3] = ac_p
+        dc_p = np.where(self.dcac_ctrl_code == 3, self.dcac_p_dc_set, -ac_p)
+        x[0::3] = dc_p
+        x[1::3] = np.where(self.dcac_ctrl_code == 3, -dc_p, ac_p)
         x[2::3] = self.dcac_q_ac_set
         return x
 
@@ -2120,7 +2138,8 @@ class HybridPowerFlowCalc:
         dc_p = dcac[:, 0]
         ac_p = dcac[:, 1]
         ac_q = dcac[:, 2]
-        # Converter port powers are injected into the existing AC/DC nodal balance rows.
+        # DCAC terminal powers are positive from each grid into the converter,
+        # so both terminal values enter the existing nodal residuals directly.
         # bincount 比 np.add.at 显著更快；ac_f / dc_f 是预分配的全局 F 切片，
         # 这里用 += 把贡献加进去。
         if np.any(self.dcac_ac_p_eq_mask):
@@ -2154,6 +2173,9 @@ class HybridPowerFlowCalc:
         f_ctrl = dcac_f[1::3]
         f_ctrl[self.dcac_ctrl_ac_p_mask] = (
             ac_p[self.dcac_ctrl_ac_p_mask] - self.dcac_p_ac_set[self.dcac_ctrl_ac_p_mask]
+        )
+        f_ctrl[self.dcac_ctrl_dc_p_mask] = (
+            dc_p[self.dcac_ctrl_dc_p_mask] - self.dcac_p_dc_set[self.dcac_ctrl_dc_p_mask]
         )
         f_ctrl[self.dcac_dcv_rep_mask] = vd[self.dcac_dcv_rep_mask] - self.dcac_dcv_avg_set[self.dcac_dcv_rep_mask]
         if np.any(self.dcac_dcv_share_mask):
@@ -3360,7 +3382,7 @@ class HybridPowerFlowCalc:
             self.lf_result = self._build_lf_result(ac_V, dc_V)
 
     def _set_ac_converter_power_injections(self, dcac_x, acac_x) -> None:
-        """Expose final AC-side converter injections to AC result writeback."""
+        """Expose final AC-side converter terminal powers to AC writeback."""
         if self.ac_calc is None:
             return
         if self.N_dcac == 0 and self.N_acac == 0:
@@ -3460,6 +3482,8 @@ class HybridPowerFlowCalc:
                 )
 
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
+        ac_result = self.ac_calc._build_lf_result_from_ppc() if self.ac_calc is not None else None
+        dc_result = self.dc_calc._build_lf_result_from_ppc() if self.dc_calc is not None else None
         result = HybridLFResult(
             arrays=dict(self.result),
             network=self.network,
@@ -3469,8 +3493,8 @@ class HybridPowerFlowCalc:
             ac_calc=self.ac_calc,
             dc_calc=self.dc_calc,
             rc=0 if self.converged else -1,
-            ac=getattr(self.ac_calc, "lf_result", None),
-            dc=getattr(self.dc_calc, "lf_result", None),
+            ac=ac_result,
+            dc=dc_result,
         )
         if self._converter_ppc_mode:
             self._build_ppc_converter_lf_result(result, ac_V, dc_V)
@@ -3566,6 +3590,36 @@ def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int) -> None:
             f"Pj={conv.j_p:.6f} pu, Qj={conv.j_q:.6f} pu, "
             f"loss={conv.i_p + conv.j_p:.6f} pu"
         )
+
+    if result.ac is not None:
+        print("\n7.1 AC 零阻抗支路:")
+        for name, tie in result.ac.zero_branches.items():
+            print(
+                f"   {name}: P={tie.i_p:.6f} pu, Q={tie.i_q:.6f} pu, "
+                f"I={tie.i_c:.6f} pu, V={tie.i_v:.6f} pu"
+            )
+
+        print("\n7.2 AC 刀闸:")
+        for name, tie in result.ac.breakers.items():
+            print(
+                f"   {name}: P={tie.i_p:.6f} pu, Q={tie.i_q:.6f} pu, "
+                f"I={tie.i_c:.6f} pu, V={tie.i_v:.6f} pu"
+            )
+
+    if result.dc is not None:
+        print("\n7.3 DC 零阻抗支路:")
+        for name, tie in result.dc.zero_branches.items():
+            print(
+                f"   {name}: P={tie.i_p:.6f} pu, I={tie.i_c:.6f} pu, "
+                f"V={tie.i_v:.6f} pu"
+            )
+
+        print("\n7.4 DC 刀闸:")
+        for name, tie in result.dc.breakers.items():
+            print(
+                f"   {name}: P={tie.i_p:.6f} pu, I={tie.i_c:.6f} pu, "
+                f"V={tie.i_v:.6f} pu"
+            )
 
     print("\n8. 收敛信息:")
     if result.ac_calc is not None:

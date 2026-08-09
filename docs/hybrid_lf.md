@@ -119,6 +119,14 @@ x = [ac_x, dc_x, dcac_x, acac_x]
 [P_DC, P_AC, Q_AC]
 ```
 
+`DCACConverter` 两端均以“电网流入变流器”为正，不随 `dev_type` 改变：
+
+- `DC -> AC` 时，`P_DC > 0`、`P_AC < 0`。
+- `AC -> DC` 时，`P_DC < 0`、`P_AC > 0`。
+- `Q_AC > 0` 表示变流器从 AC 电网吸收无功，`Q_AC < 0` 表示向 AC 电网输出无功。
+- `p_ac_set` 与 `P_AC` 使用相同符号；`p_dc_set` 与 `P_DC` 使用相同符号。
+- 无损时 `P_DC + P_AC = 0`，有损时 `P_DC + P_AC = P_loss > 0`。
+
 损耗方程形式：
 
 ```text
@@ -129,17 +137,16 @@ Vdc^2 * Vac^2 * (Pdc + Pac)
 
 控制模式：
 
-| `control_type` | 控制方程 |
-| --- | --- |
-| 定 DC 电压 | `Vdc - v_dc_set = 0` |
-| 定 AC 电压 | `Vac - v_ac_set = 0` |
-| 定 AC 有功 | `P_AC - p_ac_set = 0` |
+| `ac_control_type / dc_control_type` | 第一控制方程 | 第二控制方程 |
+| --- | --- | --- |
+| `PQ / V` | `Vdc - v_dc_set = 0` | `Q_AC - q_ac_set = 0` |
+| `PH / NONE` | `Vac - v_ac_set = 0` | `theta_ac - theta_set = 0` |
+| `PQ / NONE` | `P_AC - p_ac_set = 0` | `Q_AC - q_ac_set = 0` |
+| `NONE / P` | `P_DC - p_dc_set = 0` | `Q_AC - q_ac_set = 0` |
 
-第三个方程固定 AC 无功：
+因此，`ac_control_type=NONE、dc_control_type=P` 表示 DC 端定有功、AC 端定无功；连同损耗方程，每台变流器仍提供三条独立方程。
 
-```text
-Q_AC - q_ac_set = 0
-```
+同一拓扑母线上的多个 `V` 或 `PH` 控制会使用代表电压/相角方程，其余设备以端口功率共享方程去重。
 
 ## ACAC 变流器模型
 

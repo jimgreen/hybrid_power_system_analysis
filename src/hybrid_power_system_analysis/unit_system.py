@@ -335,7 +335,11 @@ def normalize_model_named_units(model) -> float:
     for conv in getattr(model, "DCACConverter", []):
         ac_node = ac_nodes.get(conv.ac_node)
         dc_node = dc_nodes.get(conv.dc_node)
-        _scale_power_attrs_in_dict(conv, ("p_ac_set", "q_ac_set", "dc_p", "ac_p", "ac_q"), p_base)
+        _scale_power_attrs_in_dict(
+            conv,
+            ("p_ac_set", "p_dc_set", "q_ac_set", "dc_p", "ac_p", "ac_q"),
+            p_base,
+        )
         _scale_voltage_attr(conv, "v_ac_set", ac_node, settings)
         _scale_voltage_attr(conv, "v_dc_set", dc_node, settings)
         dc_scale_base = dc_current_scales.get(conv.dc_node)

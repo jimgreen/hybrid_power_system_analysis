@@ -187,13 +187,16 @@ Vdc^2 * Vac^2 * (Pdc + Pac)
 - r2 * (Pac^2 + Qac^2) * Vdc^2 = 0
 ```
 
+DCAC 两端均以对应电网流入变流器为正，不根据 `dev_type` 翻转。`DC -> AC` 时 `P_DC > 0、P_AC < 0`，`AC -> DC` 时符号相反；无损时 `P_DC + P_AC = 0`，有损时 `P_DC + P_AC > 0`。
+
 控制类型：
 
-| `control_type` | 控制方程 |
+| `ac_control_type / dc_control_type` | 控制方程 |
 | --- | --- |
-| `DCV` | DC 端电压固定 |
-| `ACV` | AC 端电压固定，旧输入别名 `PH` 也按 ACV 处理 |
-| `ACP` | AC 端有功固定，旧输入别名 `PQ` 也按 ACP 处理 |
+| `PQ / V` | DC 端定电压，AC 端定无功 |
+| `PH / NONE` | AC 端定电压、定相角 |
+| `PQ / NONE` | AC 端定有功、定无功 |
+| `NONE / P` | DC 端定有功、AC 端定无功 |
 
 ACAC 变流器模型：
 
@@ -216,7 +219,7 @@ Vi^2 * Vj^2 * (P_i + P_j)
 
 ### 2.4 元件支路结构图与运行方程
 
-本节给出 LF 和 SE 共用的设备运行方程。除特别说明外，端口功率正方向约定为从节点流入设备；发电机出力正方向为从设备注入节点。AC 复电压记为 `U_i = V_i * exp(j*theta_i)`，端口复功率为 `S_i = P_i + jQ_i = U_i * conj(I_i)`。
+本节给出 LF 和 SE 共用的设备运行方程。除特别说明外，端口功率正方向约定为从节点流入设备；发电机出力正方向为从设备注入节点。DCAC 的 AC/DC 两端也遵循这一端口约定，`dev_type` 不改变符号。AC 复电压记为 `U_i = V_i * exp(j*theta_i)`，端口复功率为 `S_i = P_i + jQ_i = U_i * conj(I_i)`。
 
 #### ACBranch
 
@@ -518,13 +521,14 @@ V_dc^2 * V_ac^2 * (P_DC + P_AC)
 
 控制方程：
 
-| `control_type` | 第一控制方程 | 第二控制方程 |
+| `ac_control_type / dc_control_type` | 第一控制方程 | 第二控制方程 |
 | --- | --- | --- |
-| `DCV` | `V_dc - v_dc_set = 0` | `Q_AC - q_ac_set = 0` |
-| `ACV` | `V_ac - v_ac_set = 0` | `Q_AC - q_ac_set = 0` |
-| `ACP` | `P_AC - p_ac_set = 0` | `Q_AC - q_ac_set = 0` |
+| `PQ / V` | `V_dc - v_dc_set = 0` | `Q_AC - q_ac_set = 0` |
+| `PH / NONE` | `V_ac - v_ac_set = 0` | `theta_ac - theta_set = 0` |
+| `PQ / NONE` | `P_AC - p_ac_set = 0` | `Q_AC - q_ac_set = 0` |
+| `NONE / P` | `P_DC - p_dc_set = 0` | `Q_AC - q_ac_set = 0` |
 
-端口功率正值表示对应 AC 或 DC 节点向 DCAC 送入功率。`ACV` 表示交流侧定电压，也就是旧模型语义里的交流侧 PH 模式。
+`P_DC/P_AC/Q_AC` 均以对应电网流入变流器为正：`DC -> AC` 时 `P_DC > 0、P_AC < 0`，`AC -> DC` 时 `P_DC < 0、P_AC > 0`；`Q_AC > 0` 表示从 AC 节点吸收无功。`p_ac_set` 与 `P_AC` 同号，`p_dc_set` 与 `P_DC` 同号；`dev_type` 仅保留设备类型，不参与符号判断。
 
 ## 3. 潮流算法原理
 

@@ -549,6 +549,7 @@ def _reconstruct_ac_ideal_edge_flows(ac_grid, dcac_converters=(), acac_converter
             add(device.node, complex(device.p, device.q))
     for device in dcac_converters:
         if _device_is_live(device):
+            # DCAC AC-terminal powers are positive from the AC grid into the converter.
             add(device.ac_node, complex(device.ac_p, device.ac_q))
     for device in acac_converters:
         if _device_is_live(device):

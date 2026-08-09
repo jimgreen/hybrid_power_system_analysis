@@ -21,9 +21,21 @@ from hybrid_array_model import (
     dcac_control_pair_from_legacy,
     dcac_legacy_control_label,
     build_hybrid_ppc_from_e_file,
+    normalize_dcac_device_type,
 )
 
+
 class DCACConverter:
+    """AC/DC converter with terminal-oriented active-power references.
+
+    Terminal powers are positive from the connected grid into the converter.
+    Thus DC-to-AC transfer has ``dc_p > 0`` and ``ac_p < 0``; AC-to-DC
+    transfer has the opposite signs. A lossless transfer has
+    ``dc_p + ac_p == 0``. ``dev_type`` is retained as equipment metadata and
+    never changes this sign convention. AC-side setpoints follow ``ac_p``;
+    DC-side active-power setpoints follow ``dc_p``.
+    """
+
     def __init__(
         self,
         idx,
@@ -38,6 +50,8 @@ class DCACConverter:
         v_ac_set,
         v_dc_set,
         run_stat=1,
+        dev_type="DCACConverter",
+        p_dc_set=0.0,
     ):
         self.idx = idx
         self.ac_node = ac_node
@@ -47,10 +61,12 @@ class DCACConverter:
         self.ac_control_type = str(ac_control_type or "NONE").upper()
         self.dc_control_type = str(dc_control_type or "NONE").upper()
         self.p_ac_set = p_ac_set
+        self.p_dc_set = p_dc_set
         self.q_ac_set = q_ac_set
         self.v_ac_set = v_ac_set
         self.v_dc_set = v_dc_set
         self.run_stat = run_stat
+        self.dev_type = normalize_dcac_device_type(dev_type)
         self.dc_p = None
         self.ac_p = None
         self.ac_q = None
