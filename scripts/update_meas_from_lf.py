@@ -30,6 +30,7 @@ for path in (SRC_DIR, MODEL_DIR, LFCORE_DIR):
         sys.path.insert(0, str(path))
 
 from ac_lf import ACPowerFlowCalc
+from ac_array_model import SHUNT_Q, SHUNT_V
 from ac_model import ACPowerNetwork
 from dc_lf import DCPowerFlowCalc
 from dc_model import DCPowerNetwork
@@ -93,7 +94,6 @@ class Snapshot:
         self.ac_devices = {
             "ACBranch": self._by_name(getattr(ac_grid, "branches", [])),
             "ACTransformer": self._by_name(getattr(ac_grid, "transformers", [])),
-            "ACSwitch": self._by_name(getattr(ac_grid, "switches", [])),
             "ACBreak": self._by_name(getattr(ac_grid, "breakers", [])),
             "ACZeroBranch": self._by_name(getattr(ac_grid, "zero_branches", [])),
             "ACGenerator": self._by_name(getattr(ac_grid, "generators", [])),
@@ -101,7 +101,6 @@ class Snapshot:
         }
         self.dc_devices = {
             "DCBranch": self._by_name(getattr(dc_grid, "branches", [])),
-            "DCSwitch": self._by_name(getattr(dc_grid, "switches", [])),
             "DCBreak": self._by_name(getattr(dc_grid, "breakers", [])),
             "DCZeroBranch": self._by_name(getattr(dc_grid, "zero_branches", [])),
             "DCDCConverter": self._by_name(getattr(dc_grid, "dcdc_converters", [])),
@@ -177,6 +176,8 @@ class Snapshot:
         return float(current) * self.i_scale * base
 
     def value(self, dev_type: str, dev_name: str, meas_type: str) -> Optional[float]:
+        if dev_type in ("ACSwitch", "DCSwitch"):
+            return None
         meas_type = meas_type.upper()
         if meas_type in ANGLE_TYPES:
             return self._angle_value(dev_type, dev_name, meas_type)
@@ -191,7 +192,7 @@ class Snapshot:
         if dev_type in ("ACBranch", "ACTransformer"):
             dev = self.ac_devices[dev_type].get(dev_name)
             return None if dev is None else self._ac_line_value(dev, meas_type)
-        if dev_type in ("ACSwitch", "ACBreak", "ACZeroBranch"):
+        if dev_type in ("ACBreak", "ACZeroBranch"):
             dev = self.ac_devices[dev_type].get(dev_name)
             return None if dev is None else self._ac_zero_value(dev, meas_type)
         if dev_type == "ACGenerator":
@@ -203,7 +204,7 @@ class Snapshot:
         if dev_type == "DCBranch":
             dev = self.dc_devices[dev_type].get(dev_name)
             return None if dev is None else self._dc_line_value(dev, meas_type)
-        if dev_type in ("DCSwitch", "DCBreak", "DCZeroBranch"):
+        if dev_type in ("DCBreak", "DCZeroBranch"):
             dev = self.dc_devices[dev_type].get(dev_name)
             return None if dev is None else self._dc_zero_value(dev, meas_type)
         if dev_type == "DCDCConverter":
@@ -227,7 +228,7 @@ class Snapshot:
         if dev_type == "ACNode" and meas_type in ("ANGLE", "THETA"):
             node = self.ac_nodes.get(dev_name)
             return None if node is None else math.degrees(self._float(node.angle))
-        if dev_type in ("ACSwitch", "ACZeroBranch") and meas_type in ("ANGLE_DIFF", "THETA_DIFF"):
+        if dev_type == "ACZeroBranch" and meas_type in ("ANGLE_DIFF", "THETA_DIFF"):
             dev = self.ac_devices[dev_type].get(dev_name)
             if dev is None or dev.i_node_obj is None or dev.j_node_obj is None:
                 return None
@@ -443,11 +444,17 @@ def _device_is_live(device, *, check_status: bool = False) -> bool:
     return bool(getattr(device, "is_alive", True))
 
 
-def _active_ideal_edges(grid) -> List[Tuple[str, int, object, object]]:
+def _active_explicit_ideal_edges(grid) -> List[Tuple[str, int, object, object]]:
+    """Return ideal edges that retain explicit LF current states.
+
+    Closed switches are already contracted into topology buses. Reintroducing
+    them here would make internal bus current sharing underdetermined and would
+    overwrite the explicit ZeroBranch/Break results with an arbitrary LSQR
+    distribution.
+    """
     edges: List[Tuple[str, int, object, object]] = []
     for table_key, devices, check_status in (
         ("zero_branch", getattr(grid, "zero_branches", ()), False),
-        ("switch", getattr(grid, "switches", ()), True),
         ("break", getattr(grid, "breakers", ()), True),
     ):
         cols = getattr(devices, "cols", None)
@@ -459,18 +466,66 @@ def _active_ideal_edges(grid) -> List[Tuple[str, int, object, object]]:
     return edges
 
 
-def _solve_ideal_edge_balance(nodes, edges, imbalance: np.ndarray):
+def _closed_switch_group_labels(nodes, switches) -> np.ndarray:
+    """Map original nodes to topology buses formed by closed switches."""
     node_ids = [int(node.idx) for node in nodes]
     node_pos = {node_id: pos for pos, node_id in enumerate(node_ids)}
+    left = []
+    right = []
+    for switch in switches:
+        if not _device_is_live(switch, check_status=True):
+            continue
+        i_pos = node_pos.get(int(getattr(switch, "i_node", -1)))
+        j_pos = node_pos.get(int(getattr(switch, "j_node", -1)))
+        if i_pos is None or j_pos is None or i_pos == j_pos:
+            continue
+        left.append(i_pos)
+        right.append(j_pos)
+    if not left:
+        return np.arange(len(nodes), dtype=np.int32)
+    graph_rows = np.asarray(left + right, dtype=np.int32)
+    graph_cols = np.asarray(right + left, dtype=np.int32)
+    graph = coo_matrix(
+        (np.ones(graph_rows.size, dtype=np.int8), (graph_rows, graph_cols)),
+        shape=(len(nodes), len(nodes)),
+    ).tocsr()
+    from scipy.sparse.csgraph import connected_components
+
+    _count, labels = connected_components(graph, directed=False, return_labels=True)
+    return np.asarray(labels, dtype=np.int32)
+
+
+def _solve_ideal_edge_balance(nodes, edges, imbalance: np.ndarray, node_group_labels=None):
+    node_ids = [int(node.idx) for node in nodes]
+    node_pos = {node_id: pos for pos, node_id in enumerate(node_ids)}
+    labels = (
+        np.arange(len(node_ids), dtype=np.int32)
+        if node_group_labels is None
+        else np.asarray(node_group_labels, dtype=np.int32)
+    )
+    if labels.size != len(node_ids):
+        raise ValueError("node_group_labels must match the node count")
+    group_count = int(labels.max()) + 1 if labels.size else 0
     active_edges = [
         edge_ref
         for edge_ref in edges
         if int(getattr(edge_ref[3], "i_node", -1)) in node_pos
         and int(getattr(edge_ref[3], "j_node", -1)) in node_pos
+        and labels[node_pos[int(edge_ref[3].i_node)]]
+        != labels[node_pos[int(edge_ref[3].j_node)]]
     ]
+    if np.iscomplexobj(imbalance):
+        grouped_imbalance = np.bincount(labels, weights=imbalance.real, minlength=group_count)
+        grouped_imbalance = grouped_imbalance + 1j * np.bincount(
+            labels,
+            weights=imbalance.imag,
+            minlength=group_count,
+        )
+    else:
+        grouped_imbalance = np.bincount(labels, weights=imbalance, minlength=group_count)
     if not active_edges:
-        residual = float(np.max(np.abs(imbalance))) if imbalance.size else 0.0
-        return active_edges, np.zeros(0, dtype=imbalance.dtype), residual
+        residual = float(np.max(np.abs(grouped_imbalance))) if grouped_imbalance.size else 0.0
+        return active_edges, np.zeros(0, dtype=grouped_imbalance.dtype), residual
 
     edge_count = len(active_edges)
     rows = np.empty(2 * edge_count, dtype=np.int32)
@@ -478,20 +533,20 @@ def _solve_ideal_edge_balance(nodes, edges, imbalance: np.ndarray):
     data = np.tile(np.array([1.0, -1.0]), edge_count)
     for edge_pos, edge_ref in enumerate(active_edges):
         edge = edge_ref[3]
-        rows[2 * edge_pos] = node_pos[int(edge.i_node)]
-        rows[2 * edge_pos + 1] = node_pos[int(edge.j_node)]
-    incidence = coo_matrix((data, (rows, cols)), shape=(len(node_ids), edge_count)).tocsr()
+        rows[2 * edge_pos] = labels[node_pos[int(edge.i_node)]]
+        rows[2 * edge_pos + 1] = labels[node_pos[int(edge.j_node)]]
+    incidence = coo_matrix((data, (rows, cols)), shape=(group_count, edge_count)).tocsr()
     solve_options = {
         "atol": 1e-13,
         "btol": 1e-13,
         "iter_lim": max(20, 4 * edge_count),
     }
-    if np.iscomplexobj(imbalance):
-        edge_flow = lsqr(incidence, -imbalance.real, **solve_options)[0]
-        edge_flow = edge_flow + 1j * lsqr(incidence, -imbalance.imag, **solve_options)[0]
+    if np.iscomplexobj(grouped_imbalance):
+        edge_flow = lsqr(incidence, -grouped_imbalance.real, **solve_options)[0]
+        edge_flow = edge_flow + 1j * lsqr(incidence, -grouped_imbalance.imag, **solve_options)[0]
     else:
-        edge_flow = lsqr(incidence, -imbalance, **solve_options)[0]
-    residual = imbalance + incidence.dot(edge_flow)
+        edge_flow = lsqr(incidence, -grouped_imbalance, **solve_options)[0]
+    residual = grouped_imbalance + incidence.dot(edge_flow)
     max_residual = float(np.max(np.abs(residual))) if residual.size else 0.0
     return active_edges, edge_flow, max_residual
 
@@ -546,7 +601,11 @@ def _reconstruct_ac_ideal_edge_flows(ac_grid, dcac_converters=(), acac_converter
             add(device.node, complex(device.p, device.q))
     for device in getattr(ac_grid, "shunt_compensators", ()):
         if _device_is_live(device):
-            add(device.node, complex(device.p, device.q))
+            power = complex(device.p, device.q)
+            control = device.control_type
+            if control in {SHUNT_Q, SHUNT_V} or str(control).upper() in {"Q", "V"}:
+                power = -power
+            add(device.node, power)
     for device in dcac_converters:
         if _device_is_live(device):
             # DCAC AC-terminal powers are positive from the AC grid into the converter.
@@ -558,8 +617,9 @@ def _reconstruct_ac_ideal_edge_flows(ac_grid, dcac_converters=(), acac_converter
 
     edges, edge_power, max_residual = _solve_ideal_edge_balance(
         nodes,
-        _active_ideal_edges(ac_grid),
+        _active_explicit_ideal_edges(ac_grid),
         imbalance,
+        _closed_switch_group_labels(nodes, getattr(ac_grid, "switches", ())),
     )
     for edge_ref, power in zip(edges, edge_power):
         device = edge_ref[3]
@@ -606,8 +666,9 @@ def _reconstruct_dc_ideal_edge_flows(dc_grid, dcac_converters=()) -> float:
 
     edges, edge_power, max_residual = _solve_ideal_edge_balance(
         nodes,
-        _active_ideal_edges(dc_grid),
+        _active_explicit_ideal_edges(dc_grid),
         imbalance,
+        _closed_switch_group_labels(nodes, getattr(dc_grid, "switches", ())),
     )
     for edge_ref, power in zip(edges, edge_power):
         device = edge_ref[3]
@@ -763,8 +824,11 @@ def rewrite_measurements(meas_file: Path, snapshot: Snapshot) -> Tuple[int, int]
     updated = 0
     missing = 0
     for row in rows:
-        row[6] = "1"
         dev_type, dev_name, meas_type = row[2], row[3], row[4].upper()
+        if dev_type in ("ACSwitch", "DCSwitch"):
+            row[6] = "0"
+            continue
+        row[6] = "1"
         value = snapshot.value(dev_type, dev_name, meas_type)
         if value is None:
             if meas_type in VALUE_TYPES or meas_type in ANGLE_TYPES:

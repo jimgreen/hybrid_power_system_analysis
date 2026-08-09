@@ -174,7 +174,7 @@ def _build_hybrid_island_ppc(
             [[1, "converter_breaker", 1, 2, dc_breaker_status, 1]],
         ),
         "DCACConverter": _table(
-            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
             [
                 [
                     1,
@@ -183,6 +183,7 @@ def _build_hybrid_island_ppc(
                     2,
                     ac_control_type,
                     dc_control_type,
+                    0,
                     0,
                     0,
                     380,
@@ -310,8 +311,8 @@ def _build_dcac_ph_with_pv_hybrid_ppc():
             [[1, "converter-dc-load", 1, 10, 1, 0, 0, 1]],
         ),
         "DCACConverter": _table(
-            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
-            [[1, "ph-none-link", 1, 1, "PH", "NONE", 0, 0, 380, 750, 1, 0, 0]],
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "ph-none-link", 1, 1, "PH", "NONE", 0, 0, 0, 380, 750, 1, 0, 0]],
         ),
     }
     return build_hybrid_ppc_with_topology_from_efile_rows(Path("dcac_ph_pv.e"), rows)
@@ -346,8 +347,8 @@ def _build_dcac_v_with_dcdc_hybrid_ppc():
             [[1, "source-load-link", 1, 2, "P", "NONE", 0, 0, 750, 1, 0, 0]],
         ),
         "DCACConverter": _table(
-            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
-            [[1, "none-v-link", 1, 2, "NONE", "V", 0, 0, 380, 750, 1, 0, 0]],
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "pq-v-link", 1, 2, "PQ", "V", 0, 0, 0, 380, 750, 1, 0, 0]],
         ),
     }
     return build_hybrid_ppc_with_topology_from_efile_rows(Path("dcac_v_dcdc.e"), rows)
@@ -382,8 +383,8 @@ def _build_dc_balance_to_ac_ph_hybrid_ppc():
             [[1, "dc-load", 1, 10, 1, 0, 0, 1]],
         ),
         "DCACConverter": _table(
-            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
-            [[1, "ph-none-link", 1, 1, "PH", "NONE", 0, 0, 380, 750, 1, 0, 0]],
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "ph-none-link", 1, 1, "PH", "NONE", 0, 0, 0, 380, 750, 1, 0, 0]],
         ),
     }
     return build_hybrid_ppc_with_topology_from_efile_rows(Path("dc_balance_ac_ph.e"), rows)
@@ -697,14 +698,23 @@ class TopologyHelperTest(unittest.TestCase):
         )
 
     def test_removing_dcac_references_preserves_caller_owned_external_metadata(self):
-        from model.hybrid_array_model import DCAC_COLS
+        from model.hybrid_array_model import (
+            DCAC_AC_CONTROL_CODE,
+            DCAC_COLS,
+            DCAC_DC_CONTROL_CODE,
+        )
         from model.ppc_topology import ensure_hybrid_ppc_topology
 
         ppc = _build_hybrid_island_ppc(
             dc_breaker_status=1,
             ac_control_type="PH",
-            dc_control_type="V",
+            dc_control_type="NONE",
         )
+        dc_voltage_converter = ppc["dcac"][0].copy()
+        dc_voltage_converter[DCAC_COLS["idx"]] = 2
+        dc_voltage_converter[DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_CODE["PQ"]
+        dc_voltage_converter[DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_CODE["V"]
+        ppc["dcac"] = np.vstack((ppc["dcac"], dc_voltage_converter))
         ppc["ac"]["_external_angle_reference_node_ids"] = np.asarray([2, 1], dtype=np.int64)
         ppc["ac"]["_external_voltage_reference_pu"] = np.asarray([0.97, 0.96], dtype=np.float64)
         ppc["dc"]["_external_voltage_reference_node_ids"] = np.asarray([2, 1], dtype=np.int64)

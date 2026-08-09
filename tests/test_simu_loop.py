@@ -487,8 +487,8 @@ class SimulationLoopTest(unittest.TestCase):
                     "# 2 ess01_dcdc 2 3 0.01 0.01 P NONE 0 0 0 1",
                     "</DCDCConverter>",
                     "<DCACConverter>",
-                    "@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat",
-                    "# 1 wt01_rect 1 1 0.01 0.01 PQ NONE 0 0 0 0 1",
+                    "@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat",
+                    "# 1 wt01_rect 1 1 0.01 0.01 PQ NONE 0 0 0 0 0 1",
                     "</DCACConverter>",
                     "",
                 ]

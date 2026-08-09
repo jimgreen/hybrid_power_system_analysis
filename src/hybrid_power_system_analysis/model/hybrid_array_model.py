@@ -30,8 +30,6 @@ from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
 
-DCAC_LEGACY_CONTROL_CODE = {"DCV": 0, "ACV": 1, "ACP": 2, "DCP": 3}
-DCAC_LEGACY_CONTROL_LABEL = {value: key for key, value in DCAC_LEGACY_CONTROL_CODE.items()}
 DCAC_AC_CONTROL_CODE = {"NONE": 0, "PQ": 1, "PV": 2, "PH": 3}
 DCAC_DC_CONTROL_CODE = {"NONE": 0, "P": 1, "V": 2, "I": 3}
 DCAC_AC_CONTROL_LABEL = {value: key for key, value in DCAC_AC_CONTROL_CODE.items()}
@@ -61,57 +59,53 @@ _DCAC_DEVICE_TYPE_BY_TOKEN = {
     "ACDC": "ACDCConverter",
     "ACDCCONVERTER": "ACDCConverter",
 }
-DCAC_LEGACY_TO_PAIR = {
-    "DCV": ("PQ", "V"),
-    "ACV": ("PH", "NONE"),
-    "ACP": ("PQ", "NONE"),
-    "DCP": ("NONE", "P"),
-    "PH": ("PH", "NONE"),
-    "PQ": ("PQ", "NONE"),
-}
-DCAC_PAIR_TO_LEGACY = {
-    ("PQ", "V"): "DCV",
-    ("PH", "NONE"): "ACV",
-    ("PQ", "NONE"): "ACP",
-    ("NONE", "P"): "DCP",
-}
+DCAC_SUPPORTED_CONTROL_PAIRS = frozenset(
+    {
+        ("PQ", "V"),
+        ("PH", "NONE"),
+        ("PQ", "NONE"),
+        ("NONE", "P"),
+    }
+)
 
 
-def dcac_control_pair_from_legacy(control_type) -> Tuple[str, str]:
-    label = str(control_type or "ACP").upper()
-    if label not in DCAC_LEGACY_TO_PAIR:
-        raise ValueError(f"未知 DCACConverter 控制模式: {control_type}")
-    return DCAC_LEGACY_TO_PAIR[label]
+def normalize_dcac_ac_control_type(value) -> str:
+    token = str(value or "NONE").upper()
+    code = DCAC_AC_CONTROL_PARSE_CODE.get(token)
+    if code is None:
+        raise ValueError(f"未知 DCACConverter AC 控制模式: {value}")
+    return DCAC_AC_CONTROL_LABEL[code]
 
 
-def dcac_legacy_control_label(ac_control_type, dc_control_type) -> str:
-    ac_label = str(ac_control_type or "NONE").upper()
-    dc_label = str(dc_control_type or "NONE").upper()
-    legacy = DCAC_PAIR_TO_LEGACY.get((ac_label, dc_label))
-    if legacy is None:
+def normalize_dcac_dc_control_type(value) -> str:
+    token = str(value or "NONE").upper()
+    code = DCAC_DC_CONTROL_PARSE_CODE.get(token)
+    if code is None:
+        raise ValueError(f"未知 DCACConverter DC 控制模式: {value}")
+    return DCAC_DC_CONTROL_LABEL[code]
+
+
+def validate_dcac_control_types(ac_control_type, dc_control_type) -> Tuple[str, str]:
+    ac_label = normalize_dcac_ac_control_type(ac_control_type)
+    dc_label = normalize_dcac_dc_control_type(dc_control_type)
+    if (ac_label, dc_label) not in DCAC_SUPPORTED_CONTROL_PAIRS:
         raise ValueError(f"不支持的 DCACConverter 控制组合: ({ac_label}, {dc_label})")
-    return legacy
-
-
-def dcac_legacy_control_code(ac_control_type, dc_control_type) -> int:
-    return DCAC_LEGACY_CONTROL_CODE[dcac_legacy_control_label(ac_control_type, dc_control_type)]
-
-
-def dcac_combined_control_code(ac_control_type, dc_control_type) -> int:
-    return dcac_legacy_control_code(ac_control_type, dc_control_type)
+    return ac_label, dc_label
 
 
 def normalize_dcac_device_type(dev_type) -> str:
-    """Return the canonical converter type without changing power direction."""
+    """Return compatibility metadata without using it for calculation.
+
+    Every row in the ``DCACConverter`` table has the same terminal-oriented
+    power convention.  Model-specific values such as ``wind-acdc-converter``
+    describe equipment ownership and must not block or alter the solver.
+    """
     token = "".join(
         char
         for char in str(dev_type or "DCACConverter").upper()
         if char.isalnum()
     )
-    label = _DCAC_DEVICE_TYPE_BY_TOKEN.get(token)
-    if label is None:
-        raise ValueError(f"未知 DCACConverter dev_type: {dev_type}")
-    return label
+    return _DCAC_DEVICE_TYPE_BY_TOKEN.get(token, "DCACConverter")
 
 
 DCAC_COLS = {
@@ -333,12 +327,12 @@ def _build_dcac(model) -> Tuple[np.ndarray, np.ndarray]:
         out[pos, DCAC_COLS["dc_node"]] = _int_attr(conv, "dc_node")
         out[pos, DCAC_COLS["r1"]] = _float_attr(conv, "r1")
         out[pos, DCAC_COLS["r2"]] = _float_attr(conv, "r2")
-        ac_ctrl = _attr(conv, "ac_control_type", "")
-        dc_ctrl = _attr(conv, "dc_control_type", "")
-        if not ac_ctrl and not dc_ctrl:
-            ac_ctrl, dc_ctrl = dcac_control_pair_from_legacy(_attr(conv, "control_type", "ACP"))
-        out[pos, DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_PARSE_CODE.get(str(ac_ctrl or "NONE").upper(), 0)
-        out[pos, DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_PARSE_CODE.get(str(dc_ctrl or "NONE").upper(), 0)
+        ac_ctrl, dc_ctrl = validate_dcac_control_types(
+            _attr(conv, "ac_control_type", ""),
+            _attr(conv, "dc_control_type", ""),
+        )
+        out[pos, DCAC_COLS["ac_control_type"]] = DCAC_AC_CONTROL_CODE[ac_ctrl]
+        out[pos, DCAC_COLS["dc_control_type"]] = DCAC_DC_CONTROL_CODE[dc_ctrl]
         out[pos, DCAC_COLS["p_ac_set"]] = _float_attr(conv, "p_ac_set")
         out[pos, DCAC_COLS["p_dc_set"]] = _float_attr(conv, "p_dc_set")
         out[pos, DCAC_COLS["q_ac_set"]] = _float_attr(conv, "q_ac_set")
@@ -380,12 +374,12 @@ def _build_dcac_with_objects(model) -> Tuple[np.ndarray, np.ndarray, list]:
         dc_node = _int_attr(conv, "dc_node")
         r1 = _float_attr(conv, "r1")
         r2 = _float_attr(conv, "r2")
-        ac_control_type = str(_attr(conv, "ac_control_type", "")).upper()
-        dc_control_type = str(_attr(conv, "dc_control_type", "")).upper()
-        if not ac_control_type and not dc_control_type:
-            ac_control_type, dc_control_type = dcac_control_pair_from_legacy(_attr(conv, "control_type", "ACP"))
-        ac_control_code = DCAC_AC_CONTROL_PARSE_CODE.get(ac_control_type or "NONE", 0)
-        dc_control_code = DCAC_DC_CONTROL_PARSE_CODE.get(dc_control_type or "NONE", 0)
+        ac_control_type, dc_control_type = validate_dcac_control_types(
+            _attr(conv, "ac_control_type", ""),
+            _attr(conv, "dc_control_type", ""),
+        )
+        ac_control_code = DCAC_AC_CONTROL_CODE[ac_control_type]
+        dc_control_code = DCAC_DC_CONTROL_CODE[dc_control_type]
         p_ac_set = _float_attr(conv, "p_ac_set")
         p_dc_set = _float_attr(conv, "p_dc_set")
         q_ac_set = _float_attr(conv, "q_ac_set")
@@ -455,6 +449,12 @@ def _build_dcac_from_rows(
     columns, table_rows = _rows_for(rows, "DCACConverter")
     if not table_rows:
         return _empty(len(DCAC_COLS)), np.asarray([], dtype=object), []
+    if "control_type" in columns:
+        raise ValueError("DCACConverter 已取消 control_type，请使用 ac_control_type 和 dc_control_type")
+    required_columns = {"ac_control_type", "dc_control_type", "p_ac_set", "p_dc_set"}
+    missing_columns = sorted(required_columns - set(columns))
+    if missing_columns:
+        raise ValueError(f"DCACConverter 缺少必需字段: {', '.join(missing_columns)}")
     p_base = float(ac_ppc["base"]["p_base"])
     ac_raw_vbase, dc_raw_vbase, ac_current, dc_current = (
         _raw_vbase_maps(ac_ppc, dc_ppc) if vbase_maps is None else vbase_maps
@@ -465,31 +465,21 @@ def _build_dcac_from_rows(
     out[:, DCAC_COLS["dc_node"]] = _int_column(table_rows, columns, "dc_node")
     out[:, DCAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
     out[:, DCAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-    if "ac_control_type" in columns or "dc_control_type" in columns:
-        out[:, DCAC_COLS["ac_control_type"]] = _code_column(
-            table_rows,
-            columns,
-            "ac_control_type",
-            DCAC_AC_CONTROL_PARSE_CODE,
-            "NONE",
+    control_pairs = [
+        validate_dcac_control_types(
+            _cell(row, columns["ac_control_type"], "NONE"),
+            _cell(row, columns["dc_control_type"], "NONE"),
         )
-        out[:, DCAC_COLS["dc_control_type"]] = _code_column(
-            table_rows,
-            columns,
-            "dc_control_type",
-            DCAC_DC_CONTROL_PARSE_CODE,
-            "NONE",
-        )
-    else:
-        legacy_pairs = [dcac_control_pair_from_legacy(_cell(row, columns.get("control_type"), "ACP")) for row in table_rows]
-        out[:, DCAC_COLS["ac_control_type"]] = np.asarray(
-            [DCAC_AC_CONTROL_PARSE_CODE[ac_ctrl] for ac_ctrl, _dc_ctrl in legacy_pairs],
-            dtype=np.float64,
-        )
-        out[:, DCAC_COLS["dc_control_type"]] = np.asarray(
-            [DCAC_DC_CONTROL_PARSE_CODE[dc_ctrl] for _ac_ctrl, dc_ctrl in legacy_pairs],
-            dtype=np.float64,
-        )
+        for row in table_rows
+    ]
+    out[:, DCAC_COLS["ac_control_type"]] = np.asarray(
+        [DCAC_AC_CONTROL_CODE[ac_control] for ac_control, _dc_control in control_pairs],
+        dtype=np.float64,
+    )
+    out[:, DCAC_COLS["dc_control_type"]] = np.asarray(
+        [DCAC_DC_CONTROL_CODE[dc_control] for _ac_control, dc_control in control_pairs],
+        dtype=np.float64,
+    )
     out[:, DCAC_COLS["p_ac_set"]] = _power_column(table_rows, columns, "p_ac_set", p_base)
     out[:, DCAC_COLS["p_dc_set"]] = _power_column(table_rows, columns, "p_dc_set", p_base)
     out[:, DCAC_COLS["q_ac_set"]] = _power_column(table_rows, columns, "q_ac_set", p_base)

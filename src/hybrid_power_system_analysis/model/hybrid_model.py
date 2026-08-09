@@ -16,12 +16,11 @@ from ac_model import (
 )
 from dc_model import DCPowerNetwork
 from hybrid_array_model import (
-    DCAC_AC_CONTROL_PARSE_CODE,
-    DCAC_DC_CONTROL_PARSE_CODE,
-    dcac_control_pair_from_legacy,
-    dcac_legacy_control_label,
     build_hybrid_ppc_from_e_file,
+    normalize_dcac_ac_control_type,
+    normalize_dcac_dc_control_type,
     normalize_dcac_device_type,
+    validate_dcac_control_types,
 )
 
 
@@ -58,8 +57,9 @@ class DCACConverter:
         self.dc_node = dc_node
         self.r1 = r1
         self.r2 = r2
-        self.ac_control_type = str(ac_control_type or "NONE").upper()
-        self.dc_control_type = str(dc_control_type or "NONE").upper()
+        self.ac_control_type = normalize_dcac_ac_control_type(ac_control_type)
+        self.dc_control_type = normalize_dcac_dc_control_type(dc_control_type)
+        validate_dcac_control_types(self.ac_control_type, self.dc_control_type)
         self.p_ac_set = p_ac_set
         self.p_dc_set = p_dc_set
         self.q_ac_set = q_ac_set
@@ -74,16 +74,6 @@ class DCACConverter:
         self.ac_i = None
         self.ac_node_obj = None
         self.dc_node_obj = None
-
-    @property
-    def control_type(self):
-        return dcac_legacy_control_label(self.ac_control_type, self.dc_control_type)
-
-    @control_type.setter
-    def control_type(self, value):
-        ac_control_type, dc_control_type = dcac_control_pair_from_legacy(value)
-        self.ac_control_type = ac_control_type
-        self.dc_control_type = dc_control_type
 
 class HybridIsland:
     def __init__(self, idx: int):
@@ -716,18 +706,13 @@ class HybridPowerNetwork:
                 errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 引用的 DC 节点 {conv.dc_node} 不存在")
             if conv.ac_node not in self.ac.node_dict or conv.dc_node not in self.dc.node_dict:
                 continue
-            ac_ctrl = str(getattr(conv, "ac_control_type", "NONE")).upper()
-            dc_ctrl = str(getattr(conv, "dc_control_type", "NONE")).upper()
-            if ac_ctrl not in DCAC_AC_CONTROL_PARSE_CODE:
-                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} AC 控制模式 {ac_ctrl} 不支持")
-            if dc_ctrl not in DCAC_DC_CONTROL_PARSE_CODE:
-                errors.append(f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} DC 控制模式 {dc_ctrl} 不支持")
+            ac_ctrl = getattr(conv, "ac_control_type", "NONE")
+            dc_ctrl = getattr(conv, "dc_control_type", "NONE")
             try:
-                dcac_legacy_control_label(ac_ctrl, dc_ctrl)
-            except ValueError:
+                ac_ctrl, dc_ctrl = validate_dcac_control_types(ac_ctrl, dc_ctrl)
+            except ValueError as exc:
                 errors.append(
-                    f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} 控制组合 "
-                    f"({ac_ctrl}, {dc_ctrl}) 当前程序不支持"
+                    f"DCACConverter[{conv.idx}] {getattr(conv, 'name', '')} {exc}"
                 )
         return errors
 

@@ -51,8 +51,6 @@ from model.meas_type import (
     DEVICE_TYPE_DCGenerator,
     DEVICE_TYPE_DCLoad,
     DEVICE_TYPE_DCNode,
-    DEVICE_TYPE_DCSwitch,
-    DEVICE_TYPE_DCSwitchConstraint,
     DEVICE_TYPE_DCZeroBranch,
     DEVICE_TYPE_DCZeroBranchConstraint,
     MEAS_TYPE_CODES,
@@ -401,7 +399,7 @@ class DCStateEstimator:
         measurements: Optional[object] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
-        auto_prepare: bool = False,
+        auto_prepare: bool = True,
         matrix_dump_dir: Optional[Path] = None,
         power_flow_linear_solver: Optional[str] = None,
     ):
@@ -589,15 +587,6 @@ class DCStateEstimator:
             self._zero_branch_j_pos,
             _zero_unused,
         ) = terminal_context("zero_branch", "zero_branch_name", DC_ZERO_BRANCH_COLS, "zero_branch")
-        (
-            self._switch_rows,
-            self._switch_names,
-            self._switch_i_node,
-            self._switch_j_node,
-            self._switch_i_pos,
-            self._switch_j_pos,
-            _switch_unused,
-        ) = terminal_context("switch", "switch_name", DC_SWITCH_COLS, "switch")
         (
             self._break_rows,
             self._break_names,
@@ -1000,6 +989,7 @@ class DCStateEstimator:
         measurements_already_normalized: bool = False,
     ) -> "DCStateEstimator":
         self._defer_prepare_finalize_pending = False
+        self._disable_unavailable_measurements()
         if not measurements_already_normalized:
             stage_start = time.perf_counter()
             self._convert_measurements_to_pu()
@@ -1420,6 +1410,76 @@ class DCStateEstimator:
         table = self._measurement_table_for_indexed_plan(measurements)
         return self._active_measurement_plan_tables(table)
 
+    def install_measurement_runtime(self, measurements) -> Dict[str, MeasurementPlanTable]:
+        """Install a delegated DC measurement block as the active array runtime."""
+        plan_tables = self._measurement_plan_tables_for(measurements)
+        common_table = self._common_measurement_plan_table(plan_tables).table
+        self._jacobian_builder = SparseJacobianBuilder((len(measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._active_measurement_plan_tables_cache = plan_tables
+        self.active_measurements = measurements
+        self.active_measurement_table = common_table
+        self.active_z = np.asarray(common_table.value, dtype=np.float64)
+        self.active_weight = np.asarray(common_table.weight, dtype=np.float64)
+        self.active_angle_residual_mask = np.asarray(common_table.angle_mask, dtype=bool)
+        self._allow_nonflat_fast_observability_certificate = True
+        self._active_measurement_plan = None
+        vector_plans = self._vector_plans_for_measurement_plan_tables(plan_tables)
+        handled = np.zeros(len(measurements), dtype=bool)
+        handled_valid = True
+        for plan in vector_plans.values():
+            plan_handled = np.asarray(plan.get("handled_mask", ()), dtype=bool)
+            if plan_handled.size != handled.size:
+                handled_valid = False
+                break
+            handled |= plan_handled
+        self.active_measurements_are_vectorized = bool(handled_valid and np.all(handled))
+        return plan_tables
+
+    def measurement_device_counts(self) -> Dict[int, int]:
+        """Return DC measurement-device counts in DC plan order."""
+        def size(name: str) -> int:
+            return int(np.asarray(getattr(self, name, ())).size)
+
+        zero_count = size("_zero_branch_names")
+        break_count = size("_break_names")
+        constraint_count = zero_count + break_count
+        return {
+            DEVICE_TYPE_DCNode: size("_raw_node_names_alive"),
+            DEVICE_TYPE_DCBranch: size("_branch_names"),
+            DEVICE_TYPE_DCBreak: break_count,
+            DEVICE_TYPE_DCZeroBranch: zero_count,
+            DEVICE_TYPE_DCGenerator: size("_generator_names"),
+            DEVICE_TYPE_DCLoad: size("_load_names"),
+            DEVICE_TYPE_DCDCConverter: size("_dcdc_names"),
+            DEVICE_TYPE_DCZeroBranchConstraint: constraint_count,
+            DEVICE_TYPE_DCBreakConstraint: constraint_count,
+        }
+
+    def measurement_device_names(self, requested_codes=None) -> Dict[int, np.ndarray]:
+        """Return DC measurement-device names in the same plan order as device_pos."""
+        requested = None if requested_codes is None else {int(code) for code in requested_codes}
+        constraint_names = np.concatenate(
+            (
+                np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
+                np.asarray(getattr(self, "_break_names", ()), dtype=object),
+            )
+        )
+        names = {
+            DEVICE_TYPE_DCNode: np.asarray(getattr(self, "_raw_node_names_alive", ()), dtype=object),
+            DEVICE_TYPE_DCBranch: np.asarray(getattr(self, "_branch_names", ()), dtype=object),
+            DEVICE_TYPE_DCBreak: np.asarray(getattr(self, "_break_names", ()), dtype=object),
+            DEVICE_TYPE_DCZeroBranch: np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
+            DEVICE_TYPE_DCGenerator: np.asarray(getattr(self, "_generator_names", ()), dtype=object),
+            DEVICE_TYPE_DCLoad: np.asarray(getattr(self, "_load_names", ()), dtype=object),
+            DEVICE_TYPE_DCDCConverter: np.asarray(getattr(self, "_dcdc_names", ()), dtype=object),
+            DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
+            DEVICE_TYPE_DCBreakConstraint: constraint_names,
+        }
+        if requested is None:
+            return names
+        return {int(code): value for code, value in names.items() if int(code) in requested}
+
     def _vector_plans_for_measurement_plan_tables(self, plan_tables) -> Dict[str, Dict[str, np.ndarray]]:
         if self._measurement_plan_tables_are_active(plan_tables):
             plan = getattr(self, "_active_measurement_plan", None)
@@ -1607,7 +1667,11 @@ class DCStateEstimator:
         table_status = measurement_table_status_code(table) if table_valid is not None else None
         if table_valid is not None:
             device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
-            device_pos = self._measurement_device_pos_array(table)
+            precomputed_device_pos = getattr(table, "device_pos", None)
+            if precomputed_device_pos is not None and np.asarray(precomputed_device_pos).size == len(table_valid):
+                device_pos = np.asarray(precomputed_device_pos, dtype=np.int64)
+            else:
+                device_pos = self._measurement_device_pos_array(table)
             active = table_valid & (np.asarray(table.weight, dtype=np.float64) > 0.0)
             supported = np.isin(
                 device_type_code,
@@ -1685,6 +1749,19 @@ class DCStateEstimator:
         if meas_code == MEAS_TYPE_V_TO:
             return int(j_node[pos])
         return None
+
+    def voltage_measurement_node_idx(
+        self,
+        device_type_code: int,
+        device_pos: int,
+        meas_type_code: int,
+    ) -> Optional[int]:
+        """Return the DC node index associated with a voltage measurement row."""
+        return self._voltage_measurement_node_idx_from_pos(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+        )
 
     def _real_voltage_observation_nodes(self) -> Dict[int, float]:
         """Return nodes covered by real usable voltage measurements on any DC device."""
@@ -1768,7 +1845,6 @@ class DCStateEstimator:
         for left, right in (
             (self._branch_i_pos, self._branch_j_pos),
             (self._zero_branch_i_pos, self._zero_branch_j_pos),
-            (self._switch_i_pos, self._switch_j_pos),
             (self._break_i_pos, self._break_j_pos),
         ):
             left = np.asarray(left, dtype=np.int64)
@@ -1844,13 +1920,16 @@ class DCStateEstimator:
         return references[:ref_count].astype(np.int64, copy=False)
 
     def _build_zero_tie_voltage_layout(self) -> None:
-        """Compress DC voltage states across closed switches and zero branches."""
+        """Compress DC voltage states across explicit zero branches and breakers.
+
+        Closed switches have already been contracted by PPC topology and do not
+        appear as independent SE devices or constraints.
+        """
         n = int(self.n_nodes)
         left_chunks = []
         right_chunks = []
         for left, right in (
             (self._zero_branch_i_pos, self._zero_branch_j_pos),
-            (self._switch_i_pos, self._switch_j_pos),
             (self._break_i_pos, self._break_j_pos),
         ):
             left = np.asarray(left, dtype=np.int64)
@@ -2076,8 +2155,8 @@ class DCStateEstimator:
         self._zero_branch_plan_current_pos = np.arange(self._zero_branch_names.size, dtype=np.int64)
         self._zero_branch_plan_current_col = self.switch_start + self._zero_branch_plan_current_pos
 
-        constraint_i = np.concatenate((self._zero_branch_i_pos, self._switch_i_pos, self._break_i_pos)).astype(np.int64, copy=False)
-        constraint_j = np.concatenate((self._zero_branch_j_pos, self._switch_j_pos, self._break_j_pos)).astype(np.int64, copy=False)
+        constraint_i = np.concatenate((self._zero_branch_i_pos, self._break_i_pos)).astype(np.int64, copy=False)
+        constraint_j = np.concatenate((self._zero_branch_j_pos, self._break_j_pos)).astype(np.int64, copy=False)
         self._constraint_plan_i = constraint_i
         self._constraint_plan_j = constraint_j
         self._constraint_plan_i_col = self.voltage_col[constraint_i.astype(np.intp, copy=False)].astype(np.int64, copy=False)
@@ -2127,14 +2206,12 @@ class DCStateEstimator:
         constraint_names = np.concatenate(
             (
                 np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
-                np.asarray(getattr(self, "_switch_names", ()), dtype=object),
                 np.asarray(getattr(self, "_break_names", ()), dtype=object),
             )
         )
         name_arrays_by_code = {
             DEVICE_TYPE_DCNode: np.asarray(getattr(self, "_raw_node_names_alive", ()), dtype=object),
             DEVICE_TYPE_DCBranch: np.asarray(getattr(self, "_branch_names", ()), dtype=object),
-            DEVICE_TYPE_DCSwitch: np.asarray(getattr(self, "_switch_names", ()), dtype=object),
             DEVICE_TYPE_DCBreak: np.asarray(getattr(self, "_break_names", ()), dtype=object),
             DEVICE_TYPE_DCZeroBranch: np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
             DEVICE_TYPE_DCGenerator: np.asarray(getattr(self, "_generator_names", ()), dtype=object),
@@ -2142,7 +2219,6 @@ class DCStateEstimator:
             DEVICE_TYPE_DCDCConverter: np.asarray(getattr(self, "_dcdc_names", ()), dtype=object),
             DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
             DEVICE_TYPE_DCBreakConstraint: constraint_names,
-            DEVICE_TYPE_DCSwitchConstraint: constraint_names,
         }
         device_pos = attach_device_pos_from_name_arrays(meas_ppc, name_arrays_by_code)
         table = getattr(getattr(self, "measurements", None), "table", None)
@@ -2789,11 +2865,11 @@ class DCStateEstimator:
         def apply_constraint(rows: np.ndarray) -> None:
             if rows.size == 0:
                 return
-            constraint_i_pos = np.concatenate((self._zero_branch_i_pos, self._switch_i_pos, self._break_i_pos)).astype(
+            constraint_i_pos = np.concatenate((self._zero_branch_i_pos, self._break_i_pos)).astype(
                 np.int64,
                 copy=False,
             )
-            constraint_j_pos = np.concatenate((self._zero_branch_j_pos, self._switch_j_pos, self._break_j_pos)).astype(
+            constraint_j_pos = np.concatenate((self._zero_branch_j_pos, self._break_j_pos)).astype(
                 np.int64,
                 copy=False,
             )
@@ -2821,7 +2897,6 @@ class DCStateEstimator:
                 (
                     rows_for(DEVICE_TYPE_DCZeroBranchConstraint),
                     rows_for(DEVICE_TYPE_DCBreakConstraint),
-                    rows_for(DEVICE_TYPE_DCSwitchConstraint),
                 )
             ).astype(np.int64, copy=False)
         )

@@ -1,7 +1,9 @@
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 
 import numpy as np
+import pytest
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -134,6 +136,77 @@ def _build_hybrid_dcac_balance_network(
     return _build_lf_network_from_hybrid_rows(Path("hybrid_dcac_balance.e"), rows)
 
 
+def test_dcac_legacy_combined_control_column_is_rejected():
+    from hybrid_array_model import build_hybrid_ppc_from_e_file
+
+    source = ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
+    lines = []
+    in_dcac = False
+    ac_control_index = -1
+    dc_control_index = -1
+    for line in source.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped == "<DCACConverter>":
+            in_dcac = True
+        elif stripped == "</DCACConverter>":
+            in_dcac = False
+        elif in_dcac and stripped.startswith("@"):
+            parts = line.split()
+            ac_control_index = parts.index("ac_control_type")
+            dc_control_index = parts.index("dc_control_type")
+            parts[ac_control_index] = "control_type"
+            parts.pop(dc_control_index)
+            line = " ".join(parts)
+        elif in_dcac and stripped.startswith("#"):
+            parts = line.split()
+            parts[ac_control_index] = "ACP"
+            parts.pop(dc_control_index)
+            line = " ".join(parts)
+        lines.append(line)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        legacy_file = Path(temporary) / "legacy_dcac.e"
+        legacy_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="control_type"):
+            build_hybrid_ppc_from_e_file(legacy_file)
+
+
+@pytest.mark.parametrize(
+    ("ac_control_type", "dc_control_type", "expected_ac_code", "expected_dc_code"),
+    (
+        ("PQ", "NONE", 1, 0),
+        ("PQ", "V", 1, 2),
+        ("NONE", "P", 0, 1),
+    ),
+)
+def test_hybrid_dcac_kernel_keeps_separate_terminal_control_codes(
+    ac_control_type,
+    dc_control_type,
+    expected_ac_code,
+    expected_dc_code,
+):
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    network = _build_hybrid_dcac_balance_network(
+        ac_control_type=ac_control_type,
+        dc_control_type=dc_control_type,
+        p_ac_set=30,
+        p_dc_set=30,
+    )
+    calc = HybridPowerFlowCalc(
+        network,
+        linear_solver="scipy",
+        result_mode="array",
+        verbose=False,
+    )
+
+    calc.prepare()
+
+    assert not hasattr(calc, "dcac_ctrl_code")
+    np.testing.assert_array_equal(calc.dcac_ac_control_code, [expected_ac_code])
+    np.testing.assert_array_equal(calc.dcac_dc_control_code, [expected_dc_code])
+
+
 def test_ac_balance_devices_apply_p_set_then_limited_alpha_sharing():
     from ac_array_model import GEN_COLS
     from ac_lf import ACPowerFlowCalc
@@ -195,6 +268,71 @@ def test_ac_balance_devices_exceed_limits_to_finish_unallocated_residual():
     np.testing.assert_allclose(
         calc.result["gen"][:, GEN_COLS["q"]],
         [1.1, 0.9],
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
+def test_ac_voltage_control_generator_and_shunt_share_reactive_balance():
+    from ac_array_model import GEN_COLS, SHUNT_COLS, build_ac_ppc_from_efile_rows
+    from ac_lf import ACPowerFlowCalc
+    from model.ppc_topology import ensure_ac_ppc_topology
+
+    rows = {
+        "Model": _table(
+            "path name p_base u_unit p_unit i_unit",
+            [["test", "ac_shunt_q_sharing", 100, "V", "kW", "A"]],
+        ),
+        "ACNode": _table(
+            "idx name vbase voltage angle run_stat",
+            [
+                [1, "bus_1", 380, 380, 0, 1],
+                [2, "bus_2", 380, 380, 0, 1],
+            ],
+        ),
+        "ACGenerator": _table(
+            "idx name node control_type p_set q_set v_set alpha run_stat",
+            [[1, "slack", 1, "PH", 0, 20, 380, 1, 1]],
+        ),
+        "ACLoad": _table(
+            "idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            [[1, "load", 1, 0, 1, 0, 0, 100, 1, 0, 0, 1]],
+        ),
+        "ACShuntCompensator": _table(
+            "idx name node control_type q_set g_set b_set v_set run_stat",
+            [
+                [1, "fixed_q", 1, "Q", 20, 0, 0, 0, 1],
+                [2, "voltage_q", 1, "V", 10, 0, 0, 380, 1],
+                [3, "fixed_z", 1, "Z", 0, 0, -0.1, 0, 1],
+            ],
+        ),
+        "ACBranch": _table(
+            "idx name i_node j_node r x b run_stat",
+            [[1, "line", 1, 2, 0.01, 0.1, 0, 1]],
+        ),
+    }
+    ppc = ensure_ac_ppc_topology(
+        build_ac_ppc_from_efile_rows(Path("ac_shunt_q_sharing.e"), rows)
+    )
+    calc = ACPowerFlowCalc(ppc, linear_solver="scipy", result_mode="array")
+
+    assert calc.run() == 0
+    assert calc.converged
+    np.testing.assert_allclose(
+        calc.result["gen"][:, GEN_COLS["q"]],
+        [0.5],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        calc.result["shunt"][:, SHUNT_COLS["q"]],
+        [0.2, 0.4, 0.1],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        calc.result["shunt"][:, SHUNT_COLS["current"]],
+        [0.2, 0.4, 0.1],
         rtol=0.0,
         atol=1e-12,
     )
@@ -289,6 +427,44 @@ def test_hybrid_dcac_device_types_share_terminal_power_signs():
         )
 
 
+def test_hybrid_dcac_descriptive_dev_type_does_not_change_calculation():
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    solved = {}
+    for dev_type in (
+        "DCACConverter",
+        "wind-acdc-converter",
+        "grid-acdc-converter",
+        "storage-dcac-converter",
+    ):
+        network = _build_hybrid_dcac_balance_network(dev_type, p_ac_set=-30)
+        calc = HybridPowerFlowCalc(
+            network,
+            linear_solver="scipy",
+            result_mode="array",
+            verbose=False,
+        )
+
+        assert calc.run() == 0
+        assert calc.converged
+        solved[dev_type] = calc.result["dcac"][0].copy()
+        np.testing.assert_allclose(
+            solved[dev_type][:2],
+            [0.3, -0.3],
+            rtol=0.0,
+            atol=1e-12,
+        )
+
+    for dev_type, result in solved.items():
+        np.testing.assert_allclose(
+            result,
+            solved["DCACConverter"],
+            rtol=0.0,
+            atol=1e-12,
+            err_msg=f"descriptive dev_type changed calculation: {dev_type}",
+        )
+
+
 def test_hybrid_dcac_dc_p_control_uses_dc_setpoint_and_ac_q_setpoint():
     from lfcore.hybrid_lf import HybridPowerFlowCalc
 
@@ -315,7 +491,7 @@ def test_hybrid_dcac_dc_p_control_uses_dc_setpoint_and_ac_q_setpoint():
             )
 
             assert converter.p_dc_set == p_dc_set / 100.0
-            assert converter.control_type == "DCP"
+            assert not hasattr(converter, "control_type")
             assert converter.ac_control_type == "NONE"
             assert converter.dc_control_type == "P"
             assert calc.run() == 0

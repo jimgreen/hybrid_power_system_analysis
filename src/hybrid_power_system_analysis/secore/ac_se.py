@@ -38,6 +38,7 @@ from ac_array_model import (
     BREAK_COLS,
     SHUNT_B,
     SHUNT_COLS,
+    SHUNT_Q,
     SHUNT_V,
     SHUNT_Z,
     THREE_WINDING_TRANSFORMER_COLS,
@@ -603,7 +604,7 @@ class ACStateEstimator:
         measurements: Optional[Sequence[Measurement]] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
-        auto_prepare: bool = False,
+        auto_prepare: bool = True,
         matrix_dump_dir: Optional[Path] = None,
         power_flow_linear_solver: Optional[str] = None,
     ):
@@ -1244,6 +1245,15 @@ class ACStateEstimator:
             voltage_control_rows = shunt_rows[v_mask]
             voltage_control_names = np.asarray(getattr(self, "_ac_shunt_device_names", ()), dtype=object)[v_mask]
             shunt_node_pos = self._required_array_attr("_ac_shunt_device_node_pos", dtype=np.int32, context="finalize_prepare")
+            q_mask = control_type == SHUNT_Q
+            self.fixed_shunt_q_injection_array = np.bincount(
+                shunt_node_pos[q_mask],
+                weights=shunt_table[
+                    shunt_rows[q_mask].astype(np.intp, copy=False),
+                    SHUNT_COLS["q_set"],
+                ],
+                minlength=self.n_nodes,
+            ).astype(np.float64, copy=False)
             self.shunt_q_pos_array = shunt_node_pos[v_mask].astype(np.int32, copy=False)
             self.initial_shunt_q_array = shunt_table[
                 voltage_control_rows.astype(np.intp, copy=False),
@@ -1252,6 +1262,7 @@ class ACStateEstimator:
         else:
             voltage_control_rows = np.asarray([], dtype=np.int64)
             voltage_control_names = np.asarray([], dtype=object)
+            self.fixed_shunt_q_injection_array = np.zeros(self.n_nodes, dtype=np.float64)
             self.shunt_q_pos_array = np.asarray([], dtype=np.int32)
             self.initial_shunt_q_array = np.asarray([], dtype=np.float64)
         self._ac_voltage_control_shunt_names = voltage_control_names
@@ -1558,6 +1569,92 @@ class ACStateEstimator:
             return self._active_measurement_plan_tables_ref()
         table = self._measurement_table_for_indexed_plan(measurements)
         return self._active_measurement_plan_tables(table)
+
+    def install_measurement_runtime(self, measurements) -> Dict[str, MeasurementPlanTable]:
+        """Install a delegated AC measurement block as the active array runtime."""
+        plan_tables = self._measurement_plan_tables_for(measurements)
+        common_table = self._common_measurement_plan_table(plan_tables).table
+        self._jacobian_builder = SparseJacobianBuilder((len(measurements), self.n_state))
+        self._jacobian_builder._assume_fixed_pattern = True
+        self._active_measurement_plan_tables_cache = plan_tables
+        self.active_measurements = measurements
+        self.active_measurement_table = common_table
+        self.active_z = np.asarray(common_table.value, dtype=np.float64)
+        self.active_weight = np.asarray(common_table.weight, dtype=np.float64)
+        self.active_angle_residual_mask = np.asarray(common_table.angle_mask, dtype=bool)
+        self._allow_nonflat_fast_observability_certificate = True
+        self._active_branch_transformer_vector_plan = None
+        self._active_zero_current_vector_plan = None
+        self._active_simple_jacobian_plan = None
+        self._active_balance_measurement_plan = None
+        self._active_generator_measurement_plan = None
+        self._active_acac_measurement_plan = None
+        vector_plans = self._vector_plans_for_measurement_plan_tables(plan_tables)
+        handled = np.zeros(len(measurements), dtype=bool)
+        handled_valid = True
+        for plan in vector_plans.values():
+            plan_handled = np.asarray(plan.get("handled_mask", ()), dtype=bool)
+            if plan_handled.size != handled.size:
+                handled_valid = False
+                break
+            handled |= plan_handled
+        self.active_measurements_are_vectorized = bool(handled_valid and np.all(handled))
+        return plan_tables
+
+    def measurement_device_counts(self) -> Dict[int, int]:
+        """Return AC measurement-device counts in AC plan order."""
+        def size(name: str) -> int:
+            return int(np.asarray(getattr(self, name, ())).size)
+
+        node_count = size("_ac_node_plan_pos") or size("_ac_node_names")
+        zero_count = size("_ac_zero_branch_plan_i")
+        break_count = size("_ac_break_plan_i")
+        return {
+            DEVICE_TYPE_ACNode: node_count,
+            DEVICE_TYPE_ACPowerBalance: node_count,
+            DEVICE_TYPE_ACBranch: size("_ac_branch_plan_i"),
+            DEVICE_TYPE_ACTransformer: size("_ac_transformer_plan_i"),
+            DEVICE_TYPE_ACThreeWindingTransformer: size("_ac_three_winding_transformer_plan_i"),
+            DEVICE_TYPE_ACLoad: size("_ac_load_plan_node_pos"),
+            DEVICE_TYPE_ACGenerator: size("_ac_generator_plan_node_pos"),
+            DEVICE_TYPE_ACZeroBranch: zero_count,
+            DEVICE_TYPE_ACZeroBranchConstraint: zero_count,
+            DEVICE_TYPE_ACBreak: break_count,
+            DEVICE_TYPE_ACBreakConstraint: break_count,
+            DEVICE_TYPE_ACACConverter: size("_ac_acac_plan_i"),
+        }
+
+    def measurement_device_names(self, requested_codes=None) -> Dict[int, np.ndarray]:
+        """Return AC measurement-device names in the same plan order as device_pos."""
+        requested = None if requested_codes is None else {int(code) for code in requested_codes}
+        ppc = self._ac_ppc_dict()
+        name_key_by_code = {
+            DEVICE_TYPE_ACNode: "bus_name",
+            DEVICE_TYPE_ACBranch: "branch_name",
+            DEVICE_TYPE_ACTransformer: "transformer_name",
+            DEVICE_TYPE_ACThreeWindingTransformer: "three_winding_transformer_name",
+            DEVICE_TYPE_ACLoad: "load_name",
+            DEVICE_TYPE_ACGenerator: "gen_name",
+            DEVICE_TYPE_ACZeroBranch: "zero_branch_name",
+            DEVICE_TYPE_ACBreak: "break_name",
+            DEVICE_TYPE_ACACConverter: "acac_name",
+            DEVICE_TYPE_ACZeroBranchConstraint: "zero_branch_name",
+            DEVICE_TYPE_ACBreakConstraint: "break_name",
+            DEVICE_TYPE_ACPowerBalance: "bus_name",
+        }
+        result: Dict[int, np.ndarray] = {}
+        for code, rows in (getattr(self, "_ac_measurement_plan_rows_by_type_code", {}) or {}).items():
+            code = int(code)
+            if requested is not None and code not in requested:
+                continue
+            name_key = name_key_by_code.get(code)
+            if name_key is None:
+                continue
+            result[code] = self._ppc_names_for_rows(
+                ppc.get(name_key, np.asarray([], dtype=object)),
+                np.asarray(rows, dtype=np.int64),
+            )
+        return result
 
     def _vector_plans_for_measurement_plan_tables(
         self,
@@ -3415,7 +3512,13 @@ class ACStateEstimator:
             meas_type_code_array,
             np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO), dtype=np.int16),
         )
-        ac_current_mask &= ~ideal_edge_current_mask
+        supported_acac_current_mask = (
+            device_type_code_array == DEVICE_TYPE_ACACConverter
+        ) & np.isin(
+            meas_type_code_array,
+            np.asarray((MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO), dtype=np.int16),
+        )
+        ac_current_mask &= ~(ideal_edge_current_mask | supported_acac_current_mask)
         if ac_current_mask.any():
             valid_array[ac_current_mask] = False
             status_array[ac_current_mask] = MEAS_STATUS_INVALID
@@ -4079,6 +4182,13 @@ class ACStateEstimator:
                 else getattr(self, "_ac_break_plan_j", np.asarray([], dtype=np.int64))
             )
             valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
+        elif code == DEVICE_TYPE_ACACConverter:
+            values = (
+                getattr(self, "_ac_acac_plan_i", np.asarray([], dtype=np.int64))
+                if meas_code == MEAS_TYPE_V_FROM
+                else getattr(self, "_ac_acac_plan_j", np.asarray([], dtype=np.int64))
+            )
+            valid_meas = meas_code in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO)
         else:
             return -1
         if not valid_meas:
@@ -4087,6 +4197,23 @@ class ACStateEstimator:
         if pos >= values.size:
             return -1
         return int(values[pos])
+
+    def voltage_measurement_node_idx(
+        self,
+        device_type_code: int,
+        device_pos: int,
+        meas_type_code: int,
+    ) -> Optional[int]:
+        """Return the AC node index associated with a voltage measurement row."""
+        solver_pos = self._voltage_measurement_node_pos_from_code(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+        )
+        node_ids = np.asarray(getattr(self, "_ac_node_ids", ()), dtype=np.int64)
+        if solver_pos < 0 or solver_pos >= node_ids.size:
+            return None
+        return int(node_ids[solver_pos])
 
     def _voltage_pseudo_is_covered_by_code(
         self,
@@ -4226,7 +4353,8 @@ class ACStateEstimator:
             * (
                 int(np.asarray(ppc.get("gen", np.zeros((0, len(GEN_COLS)))), dtype=np.float64).shape[0])
                 + int(np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64).shape[0])
-            ),
+            )
+            + 6 * int(getattr(self, "n_acac_power", 0)),
             store_strings=store_strings,
         )
 
@@ -4304,6 +4432,52 @@ class ACStateEstimator:
             np.maximum(load_voltage, self.voltage_floor),
             voltage_missing_mask(load_node_pos),
         )
+
+        acac_count = int(getattr(self, "n_acac_power", 0))
+        if acac_count:
+            acac_plan_pos = np.arange(acac_count, dtype=np.int64)
+            acac_i_pos = np.asarray(self._ac_acac_power_i_pos, dtype=np.int64)
+            acac_j_pos = np.asarray(self._ac_acac_power_j_pos, dtype=np.int64)
+            i_voltage = np.maximum(self.file_voltage[acac_i_pos], self.voltage_floor)
+            j_voltage = np.maximum(self.file_voltage[acac_j_pos], self.voltage_floor)
+            append_missing(
+                DEVICE_TYPE_ACACConverter,
+                acac_plan_pos,
+                MEAS_TYPE_P_FROM,
+                self.initial_acac_p_from_array,
+            )
+            append_missing(
+                DEVICE_TYPE_ACACConverter,
+                acac_plan_pos,
+                MEAS_TYPE_Q_FROM,
+                self.initial_acac_q_from_array,
+            )
+            append_missing(
+                DEVICE_TYPE_ACACConverter,
+                acac_plan_pos,
+                MEAS_TYPE_V_FROM,
+                i_voltage,
+                voltage_missing_mask(acac_i_pos),
+            )
+            append_missing(
+                DEVICE_TYPE_ACACConverter,
+                acac_plan_pos,
+                MEAS_TYPE_P_TO,
+                self.initial_acac_p_to_array,
+            )
+            append_missing(
+                DEVICE_TYPE_ACACConverter,
+                acac_plan_pos,
+                MEAS_TYPE_Q_TO,
+                self.initial_acac_q_to_array,
+            )
+            append_missing(
+                DEVICE_TYPE_ACACConverter,
+                acac_plan_pos,
+                MEAS_TYPE_V_TO,
+                j_voltage,
+                voltage_missing_mask(acac_j_pos),
+            )
         next_idx = self._append_pseudo_measurement_rows(
             next_idx,
             pseudo_rows.names,
@@ -4344,6 +4518,7 @@ class ACStateEstimator:
 
         gen_index = np.asarray(getattr(self, "_ac_generator_plan_index", ()), dtype=np.int64)
         load_index = np.asarray(getattr(self, "_ac_load_plan_index", ()), dtype=np.int64)
+        acac_index = np.asarray(getattr(self, "_ac_acac_plan_index", ()), dtype=np.int64)
         meas_mask = (1 << _ACTIVE_MEASUREMENT_KEY_MEAS_BITS) - 1
         pos_mask = (1 << _ACTIVE_DEVICE_KEY_POS_BITS) - 1
         meas_type_code = keys & meas_mask
@@ -4376,6 +4551,10 @@ class ACStateEstimator:
         assign(DEVICE_TYPE_ACGenerator, MEAS_TYPE_Q_GEN, gen_index, self.initial_gen_q_array)
         assign(DEVICE_TYPE_ACLoad, MEAS_TYPE_P_LOAD, load_index, self.initial_load_p_array)
         assign(DEVICE_TYPE_ACLoad, MEAS_TYPE_Q_LOAD, load_index, self.initial_load_q_array)
+        assign(DEVICE_TYPE_ACACConverter, MEAS_TYPE_P_FROM, acac_index, self.initial_acac_p_from_array)
+        assign(DEVICE_TYPE_ACACConverter, MEAS_TYPE_Q_FROM, acac_index, self.initial_acac_q_from_array)
+        assign(DEVICE_TYPE_ACACConverter, MEAS_TYPE_P_TO, acac_index, self.initial_acac_p_to_array)
+        assign(DEVICE_TYPE_ACACConverter, MEAS_TYPE_Q_TO, acac_index, self.initial_acac_q_to_array)
 
     @staticmethod
     def _covers_all_state_indices(indices: np.ndarray, count: int) -> bool:
@@ -4420,6 +4599,7 @@ class ACStateEstimator:
             getattr(self, "_active_simple_jacobian_plan", None),
             getattr(self, "_active_zero_current_vector_plan", None),
             getattr(self, "_active_generator_measurement_plan", None),
+            getattr(self, "_active_acac_measurement_plan", None),
             getattr(self, "_active_balance_measurement_plan", None),
         )
         if any(plan is None for plan in vector_plans):
@@ -4650,7 +4830,8 @@ class ACStateEstimator:
                     ),
                     dtype=np.float64,
                 ).shape[0]
-            ),
+            )
+            + 6 * int(getattr(self, "n_acac_power", 0)),
             store_strings=store_strings,
         )
 
@@ -4889,6 +5070,36 @@ class ACStateEstimator:
                     )
 
         add_three_terminal_candidates()
+
+        acac_rows = np.asarray(getattr(self, "_ac_acac_power_rows", ()), dtype=np.int64)
+        if acac_rows.size:
+            acac_plan_pos = np.arange(acac_rows.size, dtype=np.int64)
+            acac_names = (
+                np.asarray(getattr(self, "_ac_acac_power_names", ()), dtype=object)
+                if store_strings
+                else repeat("", int(acac_rows.size))
+            )
+            acac_i_pos = np.asarray(self._ac_acac_power_i_pos, dtype=np.int64)
+            acac_j_pos = np.asarray(self._ac_acac_power_j_pos, dtype=np.int64)
+            i_voltage = np.maximum(self.file_voltage[acac_i_pos], self.voltage_floor)
+            j_voltage = np.maximum(self.file_voltage[acac_j_pos], self.voltage_floor)
+            for name, pos, p_from, q_from, p_to, q_to, v_from, v_to in zip(
+                acac_names,
+                acac_plan_pos,
+                self.initial_acac_p_from_array,
+                self.initial_acac_q_from_array,
+                self.initial_acac_p_to_array,
+                self.initial_acac_q_to_array,
+                i_voltage,
+                j_voltage,
+            ):
+                device_name = str(name) if store_strings else ""
+                add(DEVICE_TYPE_ACACConverter, "ACACConverter", device_name, int(pos), MEAS_TYPE_P_FROM, "P_FROM", float(p_from))
+                add(DEVICE_TYPE_ACACConverter, "ACACConverter", device_name, int(pos), MEAS_TYPE_Q_FROM, "Q_FROM", float(q_from))
+                add(DEVICE_TYPE_ACACConverter, "ACACConverter", device_name, int(pos), MEAS_TYPE_V_FROM, "V_FROM", float(v_from))
+                add(DEVICE_TYPE_ACACConverter, "ACACConverter", device_name, int(pos), MEAS_TYPE_P_TO, "P_TO", float(p_to))
+                add(DEVICE_TYPE_ACACConverter, "ACACConverter", device_name, int(pos), MEAS_TYPE_Q_TO, "Q_TO", float(q_to))
+                add(DEVICE_TYPE_ACACConverter, "ACACConverter", device_name, int(pos), MEAS_TYPE_V_TO, "V_TO", float(v_to))
 
         candidate_table = self._pseudo_measurement_table(
             candidate_rows.names,
@@ -6307,9 +6518,13 @@ class ACStateEstimator:
         p_load, q_load = self._load_power_totals_from_state(x)
         p_gen, q_gen = self._generator_power_totals_from_state(x)
         q_shunt = self._shunt_q_injections_from_state(x)
+        fixed_q_shunt = np.asarray(
+            getattr(self, "fixed_shunt_q_injection_array", np.zeros(self.n_nodes)),
+            dtype=np.float64,
+        )
         return (
             s_network.real + p_switch + p_acac + p_load - p_gen,
-            s_network.imag + q_switch + q_acac + q_load - q_gen - q_shunt,
+            s_network.imag + q_switch + q_acac + q_load - q_gen - q_shunt - fixed_q_shunt,
         )
 
     @staticmethod
@@ -7504,7 +7719,7 @@ class ACStateEstimator:
         return plan
 
     def _build_zero_current_vector_plan(self, measurements: Sequence[Measurement]) -> Dict[str, np.ndarray]:
-        """Precompute ACSwitch/ACZeroBranch row metadata for explicit-current states."""
+        """Precompute ACZeroBranch/ACBreak row metadata for explicit-current states."""
         self._ensure_measurement_sequence_indexes(measurements)
         plan_table = self._measurement_plan_table(
             measurements,
@@ -7672,7 +7887,7 @@ class ACStateEstimator:
         voltage_complex: np.ndarray,
         switch_current: np.ndarray,
     ) -> np.ndarray:
-        """Batch-evaluate ACSwitch/ACZeroBranch P/Q/V/I measurements."""
+        """Batch-evaluate ACZeroBranch/ACBreak P/Q/V/I measurements."""
         rows = plan["voltage_rows"]
         if rows.size:
             values[rows] = voltage[plan["voltage_pos"]]
@@ -7706,7 +7921,7 @@ class ACStateEstimator:
         voltage_complex: np.ndarray,
         switch_current: np.ndarray,
     ) -> np.ndarray:
-        """Batch-fill ACSwitch/ACZeroBranch Jacobian rows from explicit current states."""
+        """Batch-fill ACZeroBranch/ACBreak Jacobian rows from explicit current states."""
         if plan["scalar_rows"].size:
             self._add_indexed_values(H, plan["scalar_rows"], plan["scalar_cols"], plan["scalar_values"])
 
@@ -9967,16 +10182,48 @@ class ACStateEstimator:
             load[load_rows.astype(np.intp, copy=False), LOAD_COLS["p"]] = x[self.base_load_p : self.base_load_q]
             load[load_rows.astype(np.intp, copy=False), LOAD_COLS["q"]] = x[self.base_load_q : self.base_shunt_q]
         shunt_rows = np.asarray(getattr(self, "_ac_shunt_device_rows", ()), dtype=np.int64)
-        if shunt_rows.size and self.n_shunt_q:
+        if shunt_rows.size:
             shunt = np.asarray(ppc["shunt"], dtype=np.float64)
-            control_type = shunt[shunt_rows.astype(np.intp, copy=False), SHUNT_COLS["control_type"]].astype(
-                np.int64,
-                copy=False,
+            row_idx = shunt_rows.astype(np.intp, copy=False)
+            live_shunt = shunt[row_idx]
+            control_type = live_shunt[:, SHUNT_COLS["control_type"]].astype(np.int64, copy=False)
+            shunt_node_pos = self._required_array_attr(
+                "_ac_shunt_device_node_pos",
+                dtype=np.int32,
+                context="apply_state",
             )
-            q_rows = shunt_rows[control_type == SHUNT_V]
-            shunt[q_rows.astype(np.intp, copy=False), SHUNT_COLS["q"]] = x[
-                self.base_shunt_q : self.base_acac_p_from
-            ]
+            vm = voltage[shunt_node_pos]
+            vm2 = vm * vm
+            g_set = live_shunt[:, SHUNT_COLS["g_set"]]
+            b_set = live_shunt[:, SHUNT_COLS["b_set"]]
+            admittance_mask = (
+                (control_type == SHUNT_B)
+                | (control_type == SHUNT_Z)
+                | (g_set != 0.0)
+            )
+            admittance_p = np.zeros(shunt_rows.size, dtype=np.float64)
+            admittance_q = np.zeros(shunt_rows.size, dtype=np.float64)
+            admittance_p[admittance_mask] = vm2[admittance_mask] * g_set[admittance_mask]
+            admittance_q[admittance_mask] = -vm2[admittance_mask] * b_set[admittance_mask]
+
+            admittance_control = (control_type == SHUNT_B) | (control_type == SHUNT_Z)
+            injection_control = ~admittance_control
+            result_p = np.where(admittance_control, admittance_p, -admittance_p)
+            result_q = np.where(admittance_control, admittance_q, -admittance_q)
+            q_mask = control_type == SHUNT_Q
+            result_q[q_mask] += live_shunt[q_mask, SHUNT_COLS["q_set"]]
+            v_mask = control_type == SHUNT_V
+            if np.any(v_mask):
+                result_q[v_mask] += x[self.base_shunt_q : self.base_acac_p_from]
+            result_current = np.divide(
+                np.hypot(result_p, result_q),
+                vm,
+                out=np.zeros_like(result_p),
+                where=np.abs(vm) > 1e-12,
+            )
+            shunt[row_idx, SHUNT_COLS["p"]] = result_p
+            shunt[row_idx, SHUNT_COLS["q"]] = result_q
+            shunt[row_idx, SHUNT_COLS["current"]] = result_current
         acac_rows = np.asarray(getattr(self, "_ac_acac_power_rows", ()), dtype=np.int64)
         if acac_rows.size and self.n_acac_power:
             acac = np.asarray(ppc.get("acac", np.zeros((0, len(ACAC_COLS)))), dtype=np.float64)

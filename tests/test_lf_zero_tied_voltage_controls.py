@@ -148,9 +148,9 @@ def _hybrid_zero_tied_ph_with_fixed_pq_converter_network(include_acac=False, inc
         "DCACConverter": _table(
             (
                 "idx name ac_node dc_node r1 r2 ac_control_type dc_control_type "
-                "p_ac_set q_ac_set v_ac_set v_dc_set run_stat"
+                "p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat"
             ),
-            [[1, "fixed_pq", 3, 1, 0.01, 0.01, "PQ", "NONE", 10, 2, 0, 0, 1]],
+            [[1, "fixed_pq", 3, 1, 0.01, 0.01, "PQ", "NONE", 10, 0, 2, 0, 0, 1]],
         ),
     }
     if include_acac:
@@ -344,6 +344,7 @@ def test_hybrid_lf_allows_fixed_pq_converter_on_zero_tied_ph_bus():
 
 
 def test_hybrid_lf_allows_fixed_pq_acac_terminal_on_zero_tied_ph_bus():
+    from ac_array_model import ACAC_COLS
     from hybrid_lf import HybridPowerFlowCalc
 
     network = _hybrid_zero_tied_ph_with_fixed_pq_converter_network(include_acac=True)
@@ -357,14 +358,14 @@ def test_hybrid_lf_allows_fixed_pq_acac_terminal_on_zero_tied_ph_bus():
     )
 
     assert calc.run() == 0
-    converter = calc.result["acac"][0]
-    assert np.isclose(converter[0], 0.05, atol=1e-10)
-    assert np.isclose(converter[1], 0.01, atol=1e-10)
-    assert np.isclose(converter[3], 0.015, atol=1e-10)
+    converter = calc.result["ac"]["acac"][0]
+    assert np.isclose(converter[ACAC_COLS["i_p"]], 0.05, atol=1e-10)
+    assert np.isclose(converter[ACAC_COLS["i_q"]], 0.01, atol=1e-10)
+    assert np.isclose(converter[ACAC_COLS["j_q"]], 0.015, atol=1e-10)
 
 
 def test_hybrid_lf_unifies_zero_tied_acac_pv_controls():
-    from ac_array_model import BUS_COLS as AC_BUS_COLS
+    from ac_array_model import ACAC_COLS, BUS_COLS as AC_BUS_COLS
     from hybrid_lf import HybridPowerFlowCalc
 
     network = _hybrid_zero_tied_acac_pv_network()
@@ -385,7 +386,11 @@ def test_hybrid_lf_unifies_zero_tied_acac_pv_controls():
     ac_result = calc.result["ac"]
     controlled_rows = np.isin(ac_result["bus"][:, AC_BUS_COLS["idx"]].astype(int), [1, 2])
     assert np.allclose(ac_result["bus"][controlled_rows, AC_BUS_COLS["voltage"]], 1.02, atol=1e-9)
-    assert np.isclose(calc.result["acac"][0, 1], calc.result["acac"][1, 1], atol=1e-9)
+    assert np.isclose(
+        calc.result["ac"]["acac"][0, ACAC_COLS["i_q"]],
+        calc.result["ac"]["acac"][1, ACAC_COLS["i_q"]],
+        atol=1e-9,
+    )
 
 
 def test_hybrid_lf_skips_floating_dc_island_and_solves_referenced_side():

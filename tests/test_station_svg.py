@@ -73,6 +73,35 @@ def test_station_svg_reports_no_crossings_for_simple_radial_case(tmp_path):
     assert layout.crossing_count == 0
 
 
+def test_station_svg_layout_is_independent_of_device_names(tmp_path):
+    from hybrid_power_system_analysis.drawcore.station_svg import parse_station_graph, layout_station_graph
+
+    original_file = tmp_path / "original.e"
+    renamed_file = tmp_path / "renamed.e"
+    original_file.write_text(_sample_station_e(), encoding="utf-8")
+    renamed = (
+        _sample_station_e()
+        .replace("bus", "opaque_node_a")
+        .replace("line1", "opaque_node_b")
+        .replace("line2", "opaque_node_c")
+        .replace("gen1", "opaque_node_d")
+        .replace("bay_opaque_node_b", "edge_alpha")
+        .replace("bay_opaque_node_c", "edge_beta")
+        .replace("bay_opaque_node_d", "edge_gamma")
+        .replace("opaque_node_d_unit", "source_alpha")
+    )
+    renamed_file.write_text(renamed, encoding="utf-8")
+
+    original_graph = parse_station_graph(original_file)
+    renamed_graph = parse_station_graph(renamed_file)
+    original_layout = layout_station_graph(original_graph)
+    renamed_layout = layout_station_graph(renamed_graph)
+
+    assert original_layout.positions == renamed_layout.positions
+    assert original_layout.routes == renamed_layout.routes
+    assert original_layout.crossing_count == renamed_layout.crossing_count
+
+
 def test_station_svg_qinling_uses_low_crossing_station_layout():
     from hybrid_power_system_analysis.drawcore.station_svg import parse_station_graph, layout_station_graph
 
@@ -214,15 +243,24 @@ def test_station_svg_qinling_layout_is_compact(tmp_path):
     assert float(root.attrib["height"]) <= 660.0
 
 
-def test_station_svg_qinling_uses_right_lower_area():
+def test_station_svg_qinling_spreads_dc_injection_bays_across_lower_area():
     from hybrid_power_system_analysis.drawcore.station_svg import parse_station_graph, layout_station_graph
 
     graph = parse_station_graph(Path("data/model/hybrid/qinling.e"))
     layout = layout_station_graph(graph)
-    node_by_name = {node.name: key for key, node in graph.nodes.items()}
+    dc_bus_y = next(
+        layout.positions[key][1]
+        for key, node in graph.nodes.items()
+        if node.side == "DC" and node.is_bus
+    )
+    dc_injection_positions = [
+        layout.positions[injection.node]
+        for injection in graph.injections
+        if injection.side == "DC" and not graph.nodes[injection.node].is_bus
+    ]
 
-    assert layout.positions[node_by_name["ess05_300v"]][0] >= 900.0
-    assert layout.positions[node_by_name["fc01_src"]][0] >= 950.0
+    assert max(x for x, _y in dc_injection_positions) - min(x for x, _y in dc_injection_positions) >= 500.0
+    assert all(y > dc_bus_y for _x, y in dc_injection_positions)
 
 
 def test_station_svg_connection_nodes_are_not_displayed(tmp_path):

@@ -237,8 +237,8 @@ def test_hybrid_ppc_boundary_propagates_state_to_referenced_dcac_converter():
             [[1, "dc_load", 1, 5, 1, 0, 0, 1]],
         ),
         "DCACConverter": _table(
-            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
-            [[1, "grid_converter", 1, 1, "PQ", "NONE", 0, 0, 380, 750, 1, 0, 0]],
+            "idx name ac_node dc_node ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat r1 r2",
+            [[1, "grid_converter", 1, 1, "PQ", "NONE", 0, 0, 0, 380, 750, 1, 0, 0]],
         ),
         "ConverterComposite": _table(
             "idx name run_stat idx_dcac_converter_t1",
@@ -248,7 +248,7 @@ def test_hybrid_ppc_boundary_propagates_state_to_referenced_dcac_converter():
 
     ppc = build_hybrid_ppc_only_from_efile_rows(Path("hybrid_composite_state.e"), rows)
 
-    assert rows["DCACConverter"]["rows"][0][10] == 1
+    assert rows["DCACConverter"]["rows"][0][11] == 1
     assert ppc["dcac"][0, DCAC_COLS["run_stat"]] == 0
     override = next(
         item

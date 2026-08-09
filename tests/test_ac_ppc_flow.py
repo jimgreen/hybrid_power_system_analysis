@@ -144,7 +144,7 @@ def _ac_ppc_with_active_and_inactive_acac(stale=99.0):
 
 
 class ACPPCFlowTest(unittest.TestCase):
-    def test_acac_delegation_owns_working_table_and_zeroes_inactive_results(self):
+    def test_acac_direct_solver_owns_state_block_and_zeroes_inactive_results(self):
         from ac_array_model import ACAC_COLS
         from ac_lf import ACPowerFlowCalc
 
@@ -159,16 +159,18 @@ class ACPPCFlowTest(unittest.TestCase):
                 self.assertTrue(calc.converged)
                 np.testing.assert_array_equal(ppc["acac"], source)
 
-                delegated = calc._delegated_hybrid_calc
-                self.assertIsNot(delegated.network.ppc["acac"], ppc["acac"])
-                self.assertIs(
-                    delegated.network.ppc["ac"]["acac"],
-                    delegated.network.ppc["acac"],
-                )
-                self.assertEqual([0], delegated.acac_row_pos.tolist())
+                self.assertEqual(1, calc.N_acac)
+                self.assertEqual([0], calc.acac_row_pos.tolist())
+                self.assertEqual(calc.ac_core_vars + 4 * calc.N_acac, calc.total_vars)
+                self.assertEqual(calc.ac_core_eq + 4 * calc.N_acac, calc.total_eq)
+                self.assertFalse(hasattr(calc, "_delegated_hybrid_calc"))
 
                 if result_mode == "none":
                     self.assertEqual({}, calc.result)
+                    continue
+                if result_mode == "summary":
+                    self.assertTrue(calc.result["summary"]["converged"])
+                    self.assertNotIn("acac", calc.result)
                     continue
 
                 result = calc.result["acac"]

@@ -99,7 +99,7 @@ def _independent_hybrid_rows(*, ac_run=1, dc_run=1, stale=0.0, include_converter
     if include_converter:
         rows["DCACConverter"] = _table(
             "idx name ac_node dc_node r1 r2 ac_control_type dc_control_type "
-            "p_ac_set q_ac_set v_ac_set v_dc_set run_stat dc_p ac_p ac_q dc_i ac_i",
+            "p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat dc_p ac_p ac_q dc_i ac_i",
             [
                 [
                     1,
@@ -110,6 +110,7 @@ def _independent_hybrid_rows(*, ac_run=1, dc_run=1, stale=0.0, include_converter
                     0,
                     "PQ",
                     "NONE",
+                    0,
                     0,
                     0,
                     380,
@@ -910,8 +911,9 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
                 self.assertTrue(calc.converged)
                 self.assertIsNotNone(calc.ac_calc)
                 self.assertIsNone(calc.dc_calc)
-                self.assertEqual(1, calc.N_acac)
-                self.assertFalse(calc._single_ac_newton_block)
+                self.assertEqual(1, calc.ac_calc.N_acac)
+                self.assertFalse(hasattr(calc, "N_acac"))
+                self.assertTrue(calc._single_ac_newton_block)
                 self.assertIsNotNone(network.dc.result)
 
                 for key, columns in dynamic_columns.items():
@@ -1121,12 +1123,13 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(result.total_nodes, 40)
         self.assertEqual(len(result.ac_network.nodes), 10)
         self.assertEqual(len(result.dc_network.nodes), 30)
-        self.assertTrue(result.has_acac)
-        self.assertEqual(result.calc.N_acac, 1)
+        self.assertTrue(result.ac.acac_converters)
+        self.assertEqual(result.calc.ac_calc.N_acac, 1)
+        self.assertFalse(hasattr(result.calc, "N_acac"))
         self.assertGreater(result.global_jacobian_shape[0], 0)
         self.assertEqual(result.global_jacobian_shape[0], result.global_jacobian_shape[1])
 
-        ac_x, dc_x, _, _ = result.calc._split_x(result.calc.x)
+        ac_x, dc_x, _ = result.calc._split_x(result.calc.x)
         with contextlib.redirect_stdout(io.StringIO()):
             ac_j = result.calc.ac_calc.get_jacobi(ac_x)
             dc_j = result.calc.dc_calc.get_jacobi(dc_x)
@@ -1440,7 +1443,18 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(10, len(network.ac.nodes))
         self.assertGreater(len(network.dc.nodes), 0)
         self.assertGreater(len(network.dcac_converters), 0)
-        self.assertGreater(len(network.acac_converters), 0)
+        self.assertGreater(len(network.ac.acac_converters), 0)
+        self.assertIs(network.acac_converters, network.ac.acac_converters)
+
+    def test_lf_file_kind_treats_acac_as_an_ac_device(self):
+        import lfcore.hybrid_lf as hybrid_lf
+
+        rows = {
+            "ACNode": {"rows": [[1, "ac_bus"]]},
+            "ACACConverter": {"rows": [[1, "acac"]]},
+        }
+
+        self.assertEqual("ac", hybrid_lf._detect_lf_rows_kind(rows))
 
     def test_lf_loader_does_not_rebuild_full_ac_dc_networks(self):
         import lfcore.hybrid_lf as hybrid_lf
@@ -1476,9 +1490,10 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         try:
             network = hybrid_lf._read_lf_network_from_file(ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e")
             self.assertEqual(network.ppc["dcac"].shape[0], len(network.dcac_converters))
-            self.assertEqual(network.ppc["acac"].shape[0], len(network.acac_converters))
+            self.assertEqual(network.ppc["ac"]["acac"].shape[0], len(network.ac.acac_converters))
             self.assertNotIsInstance(network.dcac_converters, list)
-            self.assertNotIsInstance(network.acac_converters, list)
+            self.assertNotIsInstance(network.ac.acac_converters, list)
+            self.assertIs(network.acac_converters, network.ac.acac_converters)
 
             calc = hybrid_lf.HybridPowerFlowCalc(network, verbose=False, result_mode="array")
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1490,11 +1505,12 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertTrue(calc.converged)
         self.assertEqual(network.ppc["dcac"].shape[0], calc.N_dcac)
-        self.assertEqual(network.ppc["acac"].shape[0], calc.N_acac)
+        self.assertEqual(network.ppc["ac"]["acac"].shape[0], calc.ac_calc.N_acac)
         self.assertEqual((calc.N_dcac, 5), calc.result["dcac"].shape)
-        self.assertEqual((calc.N_acac, 6), calc.result["acac"].shape)
+        self.assertEqual(network.ppc["ac"]["acac"].shape, calc.result["ac"]["acac"].shape)
+        self.assertNotIn("acac", calc.result)
         self.assertFalse(calc.dcac_devices)
-        self.assertFalse(calc.acac_devices)
+        self.assertFalse(hasattr(calc, "acac_devices"))
 
     def test_hybrid_lf_full_result_builds_converter_entries_from_ppc(self):
         import lfcore.hybrid_lf as hybrid_lf
@@ -1517,11 +1533,11 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
 
         self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
         self.assertTrue(result.dcac.dcac_converters)
-        self.assertTrue(result.acac.acac_converters)
+        self.assertTrue(result.ac.acac_converters)
         self.assertFalse(result.calc.dcac_devices)
-        self.assertFalse(result.calc.acac_devices)
+        self.assertFalse(hasattr(result.calc, "acac_devices"))
         first_dcac = next(iter(result.dcac.dcac_converters.values()))
-        first_acac = next(iter(result.acac.acac_converters.values()))
+        first_acac = next(iter(result.ac.acac_converters.values()))
         self.assertGreater(first_dcac.i_v, 0.0)
         self.assertGreater(first_dcac.j_v, 0.0)
         self.assertGreater(first_acac.i_v, 0.0)
@@ -1529,11 +1545,10 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIn("ac", result.arrays)
         self.assertIn("dc", result.arrays)
         self.assertIn("dcac", result.arrays)
-        self.assertIn("acac", result.arrays)
+        self.assertNotIn("acac", result.arrays)
         self.assertIs(result.arrays["ac"], result.calc.result["ac"])
         self.assertIs(result.arrays["dc"], result.calc.result["dc"])
         self.assertIs(result.arrays["dcac"], result.calc.result["dcac"])
-        self.assertIs(result.arrays["acac"], result.calc.result["acac"])
 
     def test_hybrid_ppc_model_build_delegates_to_ac_dc_array_helpers(self):
         import model.hybrid_array_model as hybrid_array_model
@@ -1582,7 +1597,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIn("bus", result.calc.ac_calc.result)
         self.assertIn("bus", result.calc.dc_calc.result)
         self.assertTrue(result.dcac.dcac_converters)
-        self.assertTrue(result.acac.acac_converters)
+        self.assertTrue(result.ac.acac_converters)
 
     def test_hybrid_subcalculations_always_use_array_results(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
@@ -1627,14 +1642,13 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             calc.prepare()
 
         expected_dcac = calc._initial_dcac_x()
-        expected_acac = calc._initial_acac_x()
+        expected_acac = calc.ac_calc._initial_acac_x()
         calc.dcac_converters = NonIterableConverters()
-        calc.acac_converters = NonIterableConverters()
 
         self.assertGreater(calc.N_dcac, 0)
-        self.assertGreater(calc.N_acac, 0)
+        self.assertGreater(calc.ac_calc.N_acac, 0)
         self.assertEqual(expected_dcac.tolist(), calc._initial_dcac_x().tolist())
-        self.assertEqual(expected_acac.tolist(), calc._initial_acac_x().tolist())
+        self.assertEqual(expected_acac.tolist(), calc.ac_calc._initial_acac_x().tolist())
         calc._write_back()
 
     def test_hybrid_power_flow_can_skip_full_lf_result_build(self):
@@ -1705,9 +1719,9 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertTrue(calc.converged)
         self.assertIsNone(calc.lf_result)
-        self.assertEqual({"ac", "dc", "dcac", "acac", "summary"}, set(calc.result))
+        self.assertEqual({"ac", "dc", "dcac", "summary"}, set(calc.result))
         self.assertIsInstance(calc.result["dcac"], np.ndarray)
-        self.assertIsInstance(calc.result["acac"], np.ndarray)
+        self.assertIsInstance(calc.result["ac"]["acac"], np.ndarray)
         self.assertIn("bus", calc.result["ac"])
         self.assertIn("bus", calc.result["dc"])
         self.assertIsNone(getattr(calc.ac_calc, "lf_result", None))
@@ -1719,14 +1733,14 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             result_mode="array",
         )
         self.assertIsInstance(result, dict)
-        self.assertEqual({"ac", "dc", "dcac", "acac", "summary"}, set(result))
+        self.assertEqual({"ac", "dc", "dcac", "summary"}, set(result))
         self.assertNotIn("calc", result)
         self.assertNotIn("network", result)
         self.assertTrue(result["summary"]["converged"])
         self.assertIsInstance(result["ac"]["bus"], np.ndarray)
         self.assertIsInstance(result["dc"]["bus"], np.ndarray)
         self.assertIsInstance(result["dcac"], np.ndarray)
-        self.assertIsInstance(result["acac"], np.ndarray)
+        self.assertIsInstance(result["ac"]["acac"], np.ndarray)
 
         ac_only_result = _run_hybrid_lf(
             ROOT / "data" / "model" / "ac" / "ieee14.e",
@@ -1738,7 +1752,8 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertIn("bus", ac_only_result["ac"])
         self.assertIsNone(ac_only_result["dc"])
         self.assertEqual((0, 5), ac_only_result["dcac"].shape)
-        self.assertEqual((0, 6), ac_only_result["acac"].shape)
+        self.assertEqual(0, ac_only_result["ac"]["acac"].shape[0])
+        self.assertNotIn("acac", ac_only_result)
 
     def test_single_ac_hybrid_newton_uses_ac_solver_without_global_packaging(self):
         from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
@@ -2024,7 +2039,7 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
         self.assertEqual("PV", converter.j_control_type)
         self.assertEqual("PQV", converter.control_type)
 
-    def test_acac_converter_is_solved_inside_hybrid_newton_system(self):
+    def test_acac_in_hybrid_case_is_owned_by_ac_newton_block(self):
         import hybrid_net_flow
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2043,16 +2058,20 @@ class HybridNetFlowSelfContainedTest(unittest.TestCase):
             result = _run_hybrid_lf(case_path, verbose=False)
 
         self.assertTrue(result.converged, (result.ac_errors, result.dc_errors, result.calc.normF))
-        self.assertTrue(result.has_acac)
-        self.assertEqual(len(result.network.acac_converters), 1)
-        self.assertEqual(result.calc.N_acac, 1)
+        self.assertTrue(result.ac.acac_converters)
+        self.assertEqual(len(result.ac_network.acac_converters), 1)
+        self.assertIs(result.network.acac_converters, result.ac_network.acac_converters)
+        self.assertEqual(result.calc.ac_calc.N_acac, 1)
+        self.assertFalse(hasattr(result.calc, "N_acac"))
+        self.assertFalse(result.calc._single_ac_newton_block)
+        self.assertGreater(result.calc.N_dcac, 0)
         self.assertEqual(
             result.global_jacobian_shape[0],
-            result.calc.ac_eq + result.calc.dc_eq + result.calc.N_dcac * 3 + result.calc.N_acac * 4,
+            result.calc.ac_eq + result.calc.dc_eq + result.calc.N_dcac * 3,
         )
         self.assertEqual(result.global_jacobian_shape[0], result.global_jacobian_shape[1])
 
-        conv = result.network.acac_converters[0]
+        conv = result.ac_network.acac_converters[0]
         self.assertEqual("PQ", conv.i_control_type)
         self.assertEqual("PQ", conv.j_control_type)
         self.assertAlmostEqual(conv.i_p, 0.05, places=8)

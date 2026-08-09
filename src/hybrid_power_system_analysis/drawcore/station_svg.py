@@ -7,7 +7,7 @@ import math
 import re
 import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -65,6 +65,7 @@ class StationNode:
     table: str
     vbase: str = ""
     run_stat: int = 1
+    is_bus: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class StationEdge:
 
 @dataclass(frozen=True)
 class StationInjection:
+    idx: int
     name: str
     table: str
     node: str
@@ -173,6 +175,7 @@ def _add_injection(graph: StationGraph, table: str, row: dict, side: str, node_c
     kind = "load" if "Load" in table else "generator"
     graph.injections.append(
         StationInjection(
+            idx=_as_int(row.get("idx")),
             name=str(row.get("name", row.get("idx", table))),
             table=table,
             node=node,
@@ -186,6 +189,12 @@ def _add_injection(graph: StationGraph, table: str, row: dict, side: str, node_c
 def parse_station_graph(e_file: str | Path) -> StationGraph:
     book = EBook(e_file)
     graph = StationGraph()
+    declared_bus_nodes = set()
+    for table, side in (("ACRealBs", "AC"), ("DCRealBs", "DC")):
+        block = book.data.get(table)
+        for row in getattr(block, "data", []):
+            if _is_running(row):
+                declared_bus_nodes.add(_node_key(side, row.get("node")))
 
     for table in NODE_TABLES:
         side = "AC" if table.startswith("AC") else "DC"
@@ -205,6 +214,7 @@ def parse_station_graph(e_file: str | Path) -> StationGraph:
                 table=table,
                 vbase=str(row.get("vbase", "")),
                 run_stat=_as_int(row.get("run_stat", 1), 1),
+                is_bus=key in declared_bus_nodes,
             )
 
     edge_specs = {
@@ -260,20 +270,14 @@ def _choose_root(graph: StationGraph, keys: Iterable[str], adjacency: dict[str, 
     key_list = list(keys)
     if not key_list:
         raise ValueError("empty side")
-    named_bus = [
-        key for key in key_list
-        if "bus" in graph.nodes[key].name.lower() or "母线" in graph.nodes[key].name
-    ]
-    candidates = named_bus or key_list
+    declared_buses = [key for key in key_list if graph.nodes[key].is_bus]
+    candidates = declared_buses or key_list
     return max(candidates, key=lambda key: (len(adjacency.get(key, ())), -graph.nodes[key].idx))
 
 
 def _natural_node_order(graph: StationGraph, key: str):
     node = graph.nodes[key]
-    parts = re.split(r"(\d+)", node.name.lower())
-    natural = tuple(int(part) if part.isdigit() else part for part in parts)
-    bus_rank = 0 if "bus" in node.name.lower() or "母线" in node.name else 1
-    return bus_rank, natural, node.idx
+    return 0 if node.is_bus else 1, node.idx, node.key
 
 
 def _bfs_component_levels(start: str, levels: dict[str, int], adjacency: dict[str, set[str]]) -> None:
@@ -571,70 +575,57 @@ def _count_crossings(routes: dict[int, list[tuple[float, float]]]) -> int:
 
 
 def _is_bus_node(node: StationNode) -> bool:
-    name = node.name.lower()
-    return "bus" in name or "母线" in node.name
+    return node.is_bus
 
 
-def _bay_key(name: str) -> tuple[str, int, str]:
-    text = name.lower()
-    match = re.search(r"(wt|pv|ess|fc)[_ -]?0*(\d+)", text)
-    if match:
-        return match.group(1), int(match.group(2)), f"{match.group(1)}{int(match.group(2)):02d}"
-    match = re.search(r"(?:ac_)?load[_ -]?0*(\d+)", text)
-    if match:
-        return "load", int(match.group(1)), f"load{int(match.group(1)):02d}"
-    if "diesel" in text:
-        return "diesel", 0, "diesel"
-    if "grid" in text or "inv" in text:
-        return "grid", 0, "grid"
-    if "h2" in text:
-        return "h2", 0, "h2"
-    prefix = re.split(r"[_ -]", text, maxsplit=1)[0]
-    return prefix, 0, prefix
+def _station_graph_adjacency(graph: StationGraph) -> dict[str, set[str]]:
+    adjacency = {key: set() for key in graph.nodes}
+    for edge in graph.edges:
+        adjacency[edge.source].add(edge.target)
+        adjacency[edge.target].add(edge.source)
+    return adjacency
 
 
-def _bay_sort_key(key: str):
-    family_order = {
-        "wt": 10,
-        "pv": 20,
-        "ess": 30,
-        "fc": 40,
-        "grid": 50,
-        "diesel": 60,
-        "load": 70,
-        "h2": 80,
-    }
-    match = re.match(r"([a-z]+)(\d*)", key)
-    family = match.group(1) if match else key
-    number = int(match.group(2)) if match and match.group(2) else 0
-    return family_order.get(family, 90), number, key
+def _distances_from(start: str, adjacency: dict[str, set[str]]) -> dict[str, int]:
+    distances = {start: 0}
+    queue = deque([start])
+    while queue:
+        current = queue.popleft()
+        for neighbor in sorted(adjacency.get(current, ())):
+            if neighbor in distances:
+                continue
+            distances[neighbor] = distances[current] + 1
+            queue.append(neighbor)
+    return distances
 
 
-def _node_y_for_station_bay(node: StationNode, ac_bus_y: float, dc_bus_y: float) -> float:
-    name = node.name.lower()
-    if node.side == "AC":
-        if _is_bus_node(node):
-            return ac_bus_y
-        if name.endswith("_src") or "diesel_node" in name or "ac_load" in name or name == "h2_load" or name == "grid_inv_ac":
-            return ac_bus_y - 155.0
-        if "rect" in name or name.endswith("_sw") or name.endswith("sw"):
-            return ac_bus_y - 65.0
-        return ac_bus_y - 108.0
-
-    if _is_bus_node(node):
-        return dc_bus_y
-    family, _number, _key = _bay_key(node.name)
-    if family == "wt":
-        if "line" in name:
-            return dc_bus_y - 35.0
-        return dc_bus_y - 115.0
-    if "line" in name:
-        return dc_bus_y + 36.0
-    if "dc_sw" in name or name.endswith("_sw"):
-        return dc_bus_y + 78.0
-    if "720v" in name or "grid_inv_dc" in name:
-        return dc_bus_y + 78.0
-    return dc_bus_y + 160.0
+def _station_bay_components(
+    graph: StationGraph,
+    adjacency: dict[str, set[str]],
+) -> list[set[str]]:
+    bus_nodes = {key for key, node in graph.nodes.items() if node.is_bus}
+    remaining = set(graph.nodes) - bus_nodes
+    components = []
+    while remaining:
+        start = min(remaining, key=lambda key: (graph.nodes[key].side, graph.nodes[key].idx, key))
+        component = set()
+        queue = deque([start])
+        remaining.remove(start)
+        while queue:
+            current = queue.popleft()
+            component.add(current)
+            for neighbor in adjacency.get(current, ()):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+        components.append(component)
+    return sorted(
+        components,
+        key=lambda component: min(
+            (graph.nodes[key].idx, 0 if graph.nodes[key].side == "AC" else 1, key)
+            for key in component
+        ),
+    )
 
 
 def _route_station_edge(
@@ -667,51 +658,38 @@ def _layout_station_bays(graph: StationGraph) -> StationLayout:
 
     bus_by_side: dict[str, str] = {}
     for side in ("AC", "DC"):
-        side_nodes = [node for node in graph.nodes.values() if node.side == side]
-        buses = [node for node in side_nodes if _is_bus_node(node)]
+        buses = [node for node in graph.nodes.values() if node.side == side and node.is_bus]
         if buses:
-            bus_by_side[side] = max(buses, key=lambda node: (node.name.lower().endswith("bus"), -node.idx)).key
+            bus_by_side[side] = min(buses, key=lambda node: node.idx).key
 
-    bay_keys = {
-        _bay_key(node.name)[2]
-        for node in graph.nodes.values()
-        if not _is_bus_node(node)
+    adjacency = _station_graph_adjacency(graph)
+    components = _station_bay_components(graph, adjacency)
+    x_margin = 75.0
+    x_step = min(70.0, 1050.0 / max(1, len(components) - 1))
+    component_x = {
+        frozenset(component): x_margin + index * x_step
+        for index, component in enumerate(components)
     }
-    x_start = 75.0
-    x_step = 70.0
-    sorted_bays = sorted(bay_keys, key=_bay_sort_key)
-    wind_bays = [key for key in sorted_bays if key.startswith("wt")]
-    left_dc_bays = [
-        key for key in sorted_bays
-        if key.startswith("pv") or key in {"ess01", "ess02", "ess03"}
-    ]
-    right_dc_bays = [key for key in ("ess04", "ess05", "fc01") if key in bay_keys]
-    ac_load_bays = [key for key in ("grid", "diesel", "load01", "load02", "h2") if key in bay_keys]
-    other_bays = [
-        key for key in sorted_bays
-        if key not in set(wind_bays + left_dc_bays + right_dc_bays + ac_load_bays)
-    ]
-
-    bay_x: dict[str, float] = {}
-    for idx, key in enumerate(wind_bays):
-        bay_x[key] = x_start + idx * x_step
-    dc_start = x_start
-    for idx, key in enumerate(left_dc_bays):
-        bay_x[key] = dc_start + idx * x_step
-    ac_load_start = x_start + len(wind_bays) * x_step
-    for idx, key in enumerate(ac_load_bays):
-        bay_x[key] = ac_load_start + idx * x_step
-    right_dc_start = ac_load_start + 2 * x_step
-    for idx, key in enumerate(right_dc_bays):
-        bay_x[key] = right_dc_start + idx * x_step
-    other_start = max(bay_x.values(), default=x_start) + x_step
-    for idx, key in enumerate(other_bays):
-        bay_x[key] = other_start + idx * x_step
-
-    width = int(max(920.0, max(bay_x.values(), default=x_start) + x_start))
+    node_x = {
+        key: x
+        for component, x in component_x.items()
+        for key in component
+    }
+    width = int(max(920.0, 2 * x_margin + max(0, len(components) - 1) * x_step))
     ac_bus_y = 265.0
     dc_bus_y = 395.0
     positions: dict[str, tuple[float, float]] = {}
+    side_distances = {
+        side: _distances_from(bus_key, _build_adjacency(graph, side))
+        for side, bus_key in bus_by_side.items()
+    }
+    injection_nodes = {injection.node for injection in graph.injections}
+    cross_domain_nodes = {
+        key
+        for edge in graph.edges
+        if graph.nodes[edge.source].side != graph.nodes[edge.target].side
+        for key in (edge.source, edge.target)
+    }
 
     center_x = width / 2
     for key, node in graph.nodes.items():
@@ -719,8 +697,28 @@ def _layout_station_bays(graph: StationGraph) -> StationLayout:
             y = ac_bus_y if node.side == "AC" else dc_bus_y
             positions[key] = (center_x, y)
             continue
-        bay = _bay_key(node.name)[2]
-        positions[key] = (bay_x[bay], _node_y_for_station_bay(node, ac_bus_y, dc_bus_y))
+        distance = side_distances.get(node.side, {}).get(key)
+        if node.side == "AC":
+            if distance is not None:
+                offset = min(155.0, 65.0 + max(0, distance - 1) * 45.0)
+            elif key in injection_nodes:
+                offset = 155.0
+            elif key in cross_domain_nodes:
+                offset = 65.0
+            else:
+                offset = 108.0
+            y = ac_bus_y - offset
+        else:
+            if distance is not None:
+                offset = min(160.0, 36.0 + max(0, distance - 1) * 42.0)
+            elif key in injection_nodes:
+                offset = 160.0
+            elif key in cross_domain_nodes:
+                offset = 78.0
+            else:
+                offset = 110.0
+            y = dc_bus_y + offset
+        positions[key] = (node_x[key], y)
 
     routes = {}
     channel_index = 0
@@ -743,42 +741,19 @@ def _layout_station_bays(graph: StationGraph) -> StationLayout:
 
 
 def layout_station_graph(graph: StationGraph) -> StationLayout:
-    if any(_is_bus_node(node) for node in graph.nodes.values()):
-        return _layout_station_bays(graph)
-
-    ac_positions = _layout_side(graph, "AC", y_root=150.0, y_step=110.0, x_margin=620.0, x_step=115.0)
-    dc_positions = _layout_side(graph, "DC", y_root=520.0, y_step=95.0, x_margin=620.0, x_step=105.0)
-    positions = {**ac_positions, **dc_positions}
-    if not positions:
-        raise ValueError("E 文件中没有可绘制的 ACNode/DCNode")
-
-    min_x = min(x for x, _ in positions.values())
-    max_x = max(x for x, _ in positions.values())
-    min_y = min(y for _, y in positions.values())
-    max_y = max(y for _, y in positions.values())
-    shift_x = 90.0 - min_x if min_x < 90.0 else 0.0
-    shift_y = 90.0 - min_y if min_y < 90.0 else 0.0
-    if shift_x or shift_y:
-        positions = {key: (x + shift_x, y + shift_y) for key, (x, y) in positions.items()}
-        max_x += shift_x
-        max_y += shift_y
-
-    side_bounds: dict[str, tuple[float, float]] = {}
     for side in ("AC", "DC"):
-        side_ys = [positions[key][1] for key, node in graph.nodes.items() if node.side == side and key in positions]
-        if side_ys:
-            side_bounds[side] = (min(side_ys), max(side_ys))
-    routes = _build_grid_routes(graph, positions, side_bounds)
+        side_keys = {
+            key
+            for key, node in graph.nodes.items()
+            if node.side == side
+        }
+        if not side_keys or any(graph.nodes[key].is_bus for key in side_keys):
+            continue
+        adjacency = _build_adjacency(graph, side)
+        root = _choose_root(graph, side_keys, adjacency)
+        graph.nodes[root] = replace(graph.nodes[root], is_bus=True)
 
-    width = int(math.ceil(max(max_x + 160.0, 900.0)))
-    height = int(math.ceil(max(max_y + 140.0, 720.0)))
-    return StationLayout(
-        positions=positions,
-        routes=routes,
-        width=width,
-        height=height,
-        crossing_count=_count_crossings(routes),
-    )
+    return _layout_station_bays(graph)
 
 
 def _svg_points(points: list[tuple[float, float]]) -> str:
@@ -1036,7 +1011,7 @@ def render_station_svg(graph: StationGraph, layout: StationLayout, title: str = 
         if injection.node in layout.positions:
             injections_by_node[injection.node].append(injection)
     for node_key, injections in injections_by_node.items():
-        ordered = sorted(injections, key=lambda item: (item.kind, item.name))
+        ordered = sorted(injections, key=lambda item: (item.kind, item.table, item.idx))
         for order_index, injection in enumerate(ordered):
             parts.append(_injection_symbol(injection, graph, layout, order_index, len(ordered)))
 
@@ -1044,7 +1019,7 @@ def render_station_svg(graph: StationGraph, layout: StationLayout, title: str = 
         if key not in layout.positions:
             continue
         x, y = layout.positions[key]
-        if "bus" in node.name.lower() or "母线" in node.name:
+        if _is_bus_node(node):
             cls = "busbar-ac" if node.side == "AC" else "busbar-dc"
             bus_left, bus_right = bus_extents.get(key, (x - 42.0, x + 42.0))
             parts.append(f'<line x1="{bus_left:.1f}" y1="{y:.1f}" x2="{bus_right:.1f}" y2="{y:.1f}" class="{cls}"/>')

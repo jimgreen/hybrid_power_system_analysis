@@ -232,16 +232,16 @@
 </DCDCConverter>
 
 <DCACConverter>
-@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set q_ac_set v_ac_set v_dc_set run_stat
-# 1 wt01_rect 11 2 0.005 0.005 PQ NONE 10 0 0 0 1
-# 2 wt02_rect 12 3 0.005 0.005 PQ NONE 10 0 0 0 1
-# 3 wt03_rect 13 4 0.005 0.005 PQ NONE 10 0 0 0 1
-# 4 wt04_rect 14 5 0.005 0.005 PQ NONE 10 0 0 0 1
-# 5 wt05_rect 15 6 0.005 0.005 PQ NONE 10 0 0 0 1
-# 6 wt06_rect 16 7 0.005 0.005 PQ NONE 10 0 0 0 1
-# 7 wt07_rect 17 8 0.005 0.005 PQ NONE 10 0 0 0 1
-# 8 wt08_rect 18 9 0.005 0.005 PQ NONE 10 0 0 0 1
-# 9 wt09_rect 19 10 0.005 0.005 PQ NONE 10 0 0 0 1
-# 10 wt10_rect 20 11 0.005 0.005 PQ NONE 10 0 0 0 1
-# 11 grid_inv_acp 25 28 0.005 0.005 PQ NONE -350 0 0 0 1
+@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat
+# 1 wt01_rect 11 2 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 2 wt02_rect 12 3 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 3 wt03_rect 13 4 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 4 wt04_rect 14 5 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 5 wt05_rect 15 6 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 6 wt06_rect 16 7 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 7 wt07_rect 17 8 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 8 wt08_rect 18 9 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 9 wt09_rect 19 10 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 10 wt10_rect 20 11 0.005 0.005 PQ NONE 10 -10 0 0 0 1
+# 11 grid_inv_acp 25 28 0.005 0.005 PQ NONE -350 350 0 0 0 1
 </DCACConverter>

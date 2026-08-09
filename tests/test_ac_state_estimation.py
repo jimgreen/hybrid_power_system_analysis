@@ -3813,7 +3813,7 @@ class ACStateEstimationTest(unittest.TestCase):
             return original_evaluate(*args, **kwargs)
 
         estimator.evaluate = counted_evaluate
-        H = estimator.jacobian(estimator.initial_state())
+        H = estimator.jacobian_sparse(estimator.initial_state()).toarray()
 
         self.assertEqual((len(estimator.active_measurements), estimator.n_state), H.shape)
         self.assertLessEqual(call_count, 1)
@@ -3828,7 +3828,7 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator.jacobian_sparse(x).toarray()
         sparse = estimator.jacobian_sparse(x)
 
         self.assertTrue(issparse(sparse))
@@ -3845,7 +3845,7 @@ class ACStateEstimationTest(unittest.TestCase):
             flat_start=True,
         )
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator.jacobian_sparse(x).toarray()
 
         active_devices = {meas.device_type for meas in estimator.active_measurements}
         self.assertIn("ACBreak", active_devices)
@@ -3988,7 +3988,7 @@ class ACStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator.jacobian_sparse(x).toarray()
 
         def fail_per_row_generator_path(*args, **kwargs):
             raise AssertionError("sparse generator rows must be assembled in batches")
@@ -4009,7 +4009,7 @@ class ACStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator.jacobian_sparse(x).toarray()
 
         def fail_repeated_generator_rows(*args, **kwargs):
             raise AssertionError("sparse generator triplets must be emitted in one batch")
@@ -4030,7 +4030,7 @@ class ACStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator.jacobian_sparse(x).toarray()
 
         def fail_uncached_y_row_path(*args, **kwargs):
             raise AssertionError("sparse generator Jacobian must use cached Y-row metadata")
@@ -4051,7 +4051,7 @@ class ACStateEstimationTest(unittest.TestCase):
             meas_file=ROOT_DIR / "data" / "meas" / "ac" / "ieee39.meas",
         )
         x = estimator.initial_state()
-        dense = estimator.jacobian(x)
+        dense = estimator.jacobian_sparse(x).toarray()
 
         def fail_single_generator_derivative(*args, **kwargs):
             raise AssertionError("sparse generator Jacobian must vectorize all generator entries")
@@ -5482,7 +5482,7 @@ class ACStateEstimationTest(unittest.TestCase):
         estimator._build_branch_transformer_vector_plan = counted_builder
         x = estimator.initial_state()
         estimator.evaluate(x, estimator.active_measurements)
-        estimator.jacobian(x, estimator.active_measurements)
+        estimator.jacobian_sparse(x, estimator.active_measurements)
 
         self.assertEqual(0, call_count)
 
@@ -5519,7 +5519,7 @@ class ACStateEstimationTest(unittest.TestCase):
 
         self.assertFalse(hasattr(ACStateEstimator, "_branch_power_derivatives"))
         self.assertFalse(hasattr(ACStateEstimator, "_branch_current_derivatives"))
-        jac = estimator.jacobian(estimator.initial_state(), measurements)
+        jac = estimator.jacobian_sparse(estimator.initial_state(), measurements).toarray()
         self.assertEqual(len(measurements), jac.shape[0])
 
     def test_jacobian_no_longer_uses_dense_generator_derivative_vectors(self):
@@ -5541,7 +5541,7 @@ class ACStateEstimationTest(unittest.TestCase):
         ]
         self.assertEqual(wanted_types, {meas.meas_type for meas in measurements})
 
-        estimator.jacobian(estimator.initial_state(), measurements)
+        estimator.jacobian_sparse(estimator.initial_state(), measurements)
 
         self.assertFalse(hasattr(estimator, "_generator_derivative_vectors"))
 
@@ -5561,7 +5561,7 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertTrue(generator_measurements)
         self.assertFalse(hasattr(estimator, "_network_power_derivatives"))
 
-        H = estimator.jacobian(estimator.initial_state(), generator_measurements)
+        H = estimator.jacobian_sparse(estimator.initial_state(), generator_measurements).toarray()
         self.assertEqual(len(generator_measurements), H.shape[0])
 
     def test_analytic_jacobian_matches_finite_difference(self):
@@ -5573,7 +5573,7 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         x = estimator.initial_state()
-        H = estimator.jacobian(x)
+        H = estimator.jacobian_sparse(x).toarray()
         H_num = np.zeros_like(H)
         for col in range(estimator.n_state):
             step = 1e-6 * max(1.0, abs(x[col]))
@@ -6566,6 +6566,90 @@ class ACStateEstimationTest(unittest.TestCase):
         self.assertEqual(0.0, calls[0]["diag_pivot_thresh"])
         self.assertEqual("MMD_AT_PLUS_A", calls[0]["permc_spec"])
 
+    def test_ac_state_estimator_owns_acac_states_measurements_and_voltage_mapping(self):
+        from secore.ac_se import ACStateEstimator
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            e_file = Path(tmp_dir) / "acac_reference.e"
+            e_file.write_text(
+                "\n".join(
+                    [
+                        "<PowerBase>",
+                        "@ p_base u_unit p_unit i_unit",
+                        "# 100 kV kW kA",
+                        "</PowerBase>",
+                        "",
+                        "<ACNode>",
+                        "@ idx name vbase voltage angle isl run_stat",
+                        "# 1 ac_ref_a 1.0 1.0 0 0 1",
+                        "# 2 ac_ref_b 1.0 1.0 0 0 1",
+                        "</ACNode>",
+                        "",
+                        "<ACGenerator>",
+                        "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                        "# 1 gen_a 1 V 0 0 1.0 1.0 1",
+                        "# 2 gen_b 2 V 0 0 1.0 1.0 1",
+                        "</ACGenerator>",
+                        "",
+                        "<ACACConverter>",
+                        "@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
+                        "# 1 acac_ref 1 2 0.01 0.01 PQ PQ 0 0 0 0 0 1",
+                        "</ACACConverter>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            meas_file = Path(tmp_dir) / "acac_reference.meas"
+            meas_file.write_text(
+                "\n".join(
+                    [
+                        "<Measurement>",
+                        "@ idx name dev_type dev_name meas_type weight valid value",
+                        "# 1 v_a ACNode ac_ref_a V 1.0 1 0.97",
+                        "# 2 v_b ACNode ac_ref_b V 1.0 1 1.03",
+                        "# 3 vf ACACConverter acac_ref V_FROM 1.0 1 0.97",
+                        "# 4 vt ACACConverter acac_ref V_TO 1.0 1 1.03",
+                        "</Measurement>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            estimator = ACStateEstimator(e_file=e_file, meas_file=meas_file, flat_start=True)
+
+        counts = estimator.measurement_device_counts()
+        names = estimator.measurement_device_names({mt.DEVICE_TYPE_ACACConverter})
+        self.assertEqual(1, counts[mt.DEVICE_TYPE_ACACConverter])
+        self.assertEqual(["acac_ref"], names[mt.DEVICE_TYPE_ACACConverter].tolist())
+        self.assertEqual(1, estimator.n_acac_power)
+        self.assertEqual(4, sum(label.startswith("ACAC_") for label in estimator.state_labels))
+        self.assertEqual(
+            1,
+            estimator.voltage_measurement_node_idx(
+                mt.DEVICE_TYPE_ACACConverter,
+                0,
+                mt.MEAS_TYPE_V_FROM,
+            ),
+        )
+        self.assertEqual(
+            2,
+            estimator.voltage_measurement_node_idx(
+                mt.DEVICE_TYPE_ACACConverter,
+                0,
+                mt.MEAS_TYPE_V_TO,
+            ),
+        )
+
+        plan_tables = estimator.install_measurement_runtime(estimator.active_measurements)
+        self.assertIn("acac", plan_tables)
+        z_est = estimator.evaluate(estimator.initial_state(), plan_tables)
+        table = estimator.active_measurements.table
+        vf = (table.device_type_code == mt.DEVICE_TYPE_ACACConverter) & (table.meas_type_code == mt.MEAS_TYPE_V_FROM)
+        vt = (table.device_type_code == mt.DEVICE_TYPE_ACACConverter) & (table.meas_type_code == mt.MEAS_TYPE_V_TO)
+        self.assertAlmostEqual(0.97, float(z_est[np.flatnonzero(vf)[0]]))
+        self.assertAlmostEqual(1.03, float(z_est[np.flatnonzero(vt)[0]]))
+
     def test_ac_net_30_analytic_jacobian_matches_finite_difference(self):
         from secore.ac_se import ACStateEstimator
 
@@ -6576,7 +6660,7 @@ class ACStateEstimationTest(unittest.TestCase):
         )
 
         x = estimator.initial_state()
-        H = estimator.jacobian(x)
+        H = estimator.jacobian_sparse(x).toarray()
         H_num = np.zeros_like(H)
         for col in range(estimator.n_state):
             step = 1e-6 * max(1.0, abs(x[col]))
