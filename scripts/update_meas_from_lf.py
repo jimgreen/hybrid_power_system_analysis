@@ -52,6 +52,10 @@ VALUE_TYPES = {
     "Q_TO",
     "I_TO",
     "V_TO",
+    "P_THIRD",
+    "Q_THIRD",
+    "I_THIRD",
+    "V_THIRD",
     "P_GEN",
     "Q_GEN",
     "I_GEN",
@@ -94,6 +98,9 @@ class Snapshot:
         self.ac_devices = {
             "ACBranch": self._by_name(getattr(ac_grid, "branches", [])),
             "ACTransformer": self._by_name(getattr(ac_grid, "transformers", [])),
+            "ACThreeWindingTransformer": self._by_name(
+                getattr(ac_grid, "three_winding_transformers", [])
+            ),
             "ACBreak": self._by_name(getattr(ac_grid, "breakers", [])),
             "ACZeroBranch": self._by_name(getattr(ac_grid, "zero_branches", [])),
             "ACGenerator": self._by_name(getattr(ac_grid, "generators", [])),
@@ -192,6 +199,9 @@ class Snapshot:
         if dev_type in ("ACBranch", "ACTransformer"):
             dev = self.ac_devices[dev_type].get(dev_name)
             return None if dev is None else self._ac_line_value(dev, meas_type)
+        if dev_type == "ACThreeWindingTransformer":
+            dev = self.ac_devices[dev_type].get(dev_name)
+            return None if dev is None else self._ac_three_winding_value(dev, meas_type)
         if dev_type in ("ACBreak", "ACZeroBranch"):
             dev = self.ac_devices[dev_type].get(dev_name)
             return None if dev is None else self._ac_zero_value(dev, meas_type)
@@ -433,6 +443,32 @@ class Snapshot:
             return None if j_node is None else self.ac_voltage_to_file(j_node)
         if meas_type == "I_TO":
             return None if j_node is None else self.ac_current_to_file(j_node, self._float(dev.j_i))
+        return None
+
+    def _ac_three_winding_value(self, dev, meas_type: str) -> Optional[float]:
+        terminal = {
+            "FROM": ("i", "i_p", "i_q", "i_c"),
+            "TO": ("j", "j_p", "j_q", "j_c"),
+            "THIRD": ("k", "k_p", "k_q", "k_c"),
+        }
+        quantity, _, side_name = meas_type.partition("_")
+        side = terminal.get(side_name)
+        if side is None:
+            return None
+        node_attr, p_attr, q_attr, current_attr = side
+        node = getattr(dev, f"{node_attr}_node_obj", None)
+        if node is None:
+            node = self.ac_nodes_by_idx.get(getattr(dev, f"{node_attr}_node", None))
+        if quantity == "P":
+            return self.power_to_file(self._float(getattr(dev, p_attr, 0.0)))
+        if quantity == "Q":
+            return self.power_to_file(self._float(getattr(dev, q_attr, 0.0)))
+        if quantity == "V":
+            return None if node is None else self.ac_voltage_to_file(node)
+        if quantity == "I":
+            if node is None:
+                return None
+            return self.ac_current_to_file(node, self._float(getattr(dev, current_attr, 0.0)))
         return None
 
 
