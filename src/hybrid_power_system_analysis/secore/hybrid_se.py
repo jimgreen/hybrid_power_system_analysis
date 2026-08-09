@@ -609,6 +609,11 @@ class HybridStateEstimator:
     AC and DC device rows are normalized, evaluated and differentiated by
     ACStateEstimator/DCStateEstimator.  This class owns only measurement
     partitioning, global WLS assembly and converter-side rows.
+
+    For a coupled hybrid network, the side estimators are measurement-model
+    providers only: they do not run independent WLS iterations.  All AC, DC
+    and converter states are assembled into one state vector, one sparse H,
+    and one global normal equation solved jointly in each iteration.
     """
 
     _AC_MEASUREMENT_DEVICE_TYPES = frozenset(

@@ -833,6 +833,10 @@ class HybridPowerFlowCalc:
     ACACConverter 由 ACPowerFlowCalc 作为交流侧设备处理；本类只拼接
     AC、DC 子块和 DCACConverter 的跨域耦合方程。
 
+    混联网中 ACPowerFlowCalc/DCPowerFlowCalc 只作为方程和导数提供器，
+    不分别执行潮流迭代。每次 Newton 迭代只形成一个全局残差向量和一个
+    全局稀疏 Jacobian，并对完整线性方程组做一次联合求解。
+
     Hybrid LF 继承 AC/DC 两侧的控制语义：同一 AC 或 DC 母线上若存在
     多个定压设备，可在 LF 中做代表控制方程和功率分摊。Hybrid SE 目前
     仍以子估计器显式状态为主，不强制复制这套硬聚合布局。
@@ -1998,7 +2002,7 @@ class HybridPowerFlowCalc:
         return jac
 
     def _build_newton_system(self, x: np.ndarray, *, return_jacobian=True, jacobian_format="csc"):
-        """Build residual and Jacobian together, reusing AC/DC sub-solver caches."""
+        """Build one global residual/Jacobian while reusing AC/DC equation caches."""
         if self._single_ac_newton_block:
             F, J = self.ac_calc._build_newton_system(
                 x,
@@ -2278,7 +2282,7 @@ class HybridPowerFlowCalc:
         return self._run_newton_raphson()
 
     def _run_newton_raphson(self) -> int:
-        """Execute Newton iterations or delegate single-block AC/DC cases."""
+        """Solve the complete hybrid Jacobian; delegate only uncoupled one-side files."""
         kind, subcalc, eq_count, var_count = self._single_block()
         if subcalc is not None:
             return self._run_single_subsolver(kind, subcalc, eq_count, var_count)
