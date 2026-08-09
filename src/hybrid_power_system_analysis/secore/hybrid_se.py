@@ -3507,8 +3507,8 @@ class HybridStateEstimator:
         nonflat_parts = []
         if self._dcac_count:
             dcac_flat = np.zeros(3 * self._dcac_count, dtype=np.float64)
-            # Both dev_type values use terminal powers positive into the
-            # converter. A lossless seed therefore has P_DC == -P_AC.
+            # Terminal powers are always positive into the converter. A
+            # lossless seed therefore has P_DC == -P_AC.
             p_ac_set = np.asarray(
                 [float(getattr(conv, "p_ac_set", 0.0) or 0.0) for conv in self.dcac_converters],
                 dtype=np.float64,

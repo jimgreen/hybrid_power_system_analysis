@@ -2099,8 +2099,8 @@ class HybridPowerFlowCalc:
         if self.N_dcac == 0:
             return np.array([], dtype=np.float64)
         x = np.zeros(self.N_dcac * 3, dtype=np.float64)
-        # Both dev_type values use terminal powers positive into the converter.
-        # Therefore DC -> AC has P_DC > 0 and P_AC < 0.
+        # Terminal powers are always positive into the converter, independent
+        # of descriptive converter metadata.
         ac_p = np.where(self.dcac_ctrl_code == 2, self.dcac_p_ac_set, 0.0)
         dc_p = np.where(self.dcac_ctrl_code == 3, self.dcac_p_dc_set, -ac_p)
         x[0::3] = dc_p

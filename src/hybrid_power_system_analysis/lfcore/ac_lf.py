@@ -3270,13 +3270,13 @@ class ACPowerFlowCalc:
             switch[:, [SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]]] = 0.0
         if breaker.size:
             breaker[:, [SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]]] = 0.0
-        for dev_idx, dev_type, a, current in zip(self.zero_idx, self.zero_type, self.zero_a, I_ab):
+        for dev_idx, edge_type, a, current in zip(self.zero_idx, self.zero_type, self.zero_a, I_ab):
             s_from = Vc[a] * np.conj(current)
-            if dev_type == 0:
+            if edge_type == 0:
                 zero_branch[dev_idx, ZERO_BRANCH_COLS["p"]] = s_from.real
                 zero_branch[dev_idx, ZERO_BRANCH_COLS["q"]] = s_from.imag
                 zero_branch[dev_idx, ZERO_BRANCH_COLS["current"]] = abs(current)
-            elif dev_type == 2:
+            elif edge_type == 2:
                 breaker[dev_idx, SWITCH_COLS["p"]] = s_from.real
                 breaker[dev_idx, SWITCH_COLS["q"]] = s_from.imag
                 breaker[dev_idx, SWITCH_COLS["current"]] = abs(current)

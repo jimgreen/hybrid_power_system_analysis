@@ -26,6 +26,8 @@ DEFAULT_BALANCE_DEADBAND = 1e-3
 DEFAULT_DIESEL_MIN_DEADBAND = 1e-3
 DEFAULT_STORAGE_SOC_DEADBAND = 0.0
 DEFAULT_CONTROL_STEP = 1e9
+YT_ROLE_HYDROGEN_ABSORB = "HYDROGEN_ABSORB"
+YT_ROLE_FUEL_CELL_SUPPORT = "FUEL_CELL_SUPPORT"
 
 
 @dataclass(frozen=True)
@@ -454,10 +456,11 @@ def _storage_by_soc(model, reverse: bool) -> list:
     )
 
 
-def _find_first_by_name(items: Iterable, keywords: Tuple[str, ...]):
+def _find_first_by_control_role(items: Iterable, control_role: str):
+    expected_role = str(control_role).strip().upper()
     for item in items:
-        name = str(getattr(item, "name", ""))
-        if any(keyword in name for keyword in keywords):
+        item_role = str(getattr(item, "control_role", "")).strip().upper()
+        if item_role == expected_role:
             return item
     return None
 
@@ -765,7 +768,10 @@ def _apply_diesel_min_output_coordination(logger, model) -> None:
 def _send_hydrogen_absorb(logger, model, surplus: float) -> float:
     if surplus <= 0.0:
         return 0.0
-    yt = _find_first_by_name(getattr(model, "yt", []), ("制氢", "电解"))
+    yt = _find_first_by_control_role(
+        getattr(model, "yt", []),
+        YT_ROLE_HYDROGEN_ABSORB,
+    )
     if yt is None:
         return surplus
     model.config.send_yt_cmd(yt, surplus)
@@ -776,7 +782,10 @@ def _send_hydrogen_absorb(logger, model, surplus: float) -> float:
 def _send_fuel_cell_support(logger, model, deficit: float) -> float:
     if deficit <= 0.0:
         return 0.0
-    yt = _find_first_by_name(getattr(model, "yt", []), ("燃料电池", "燃电"))
+    yt = _find_first_by_control_role(
+        getattr(model, "yt", []),
+        YT_ROLE_FUEL_CELL_SUPPORT,
+    )
     if yt is None:
         return deficit
     model.config.send_yt_cmd(yt, deficit)

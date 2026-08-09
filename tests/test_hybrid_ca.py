@@ -12,22 +12,22 @@ def _write_tight_calmt(path: Path) -> None:
             [
                 "<ACNode>",
                 "@ idx name v_max v_min",
-                "# 0 nd_0 0.5 0.4",
+                "# 1 unrelated_ac_node_name 0.5 0.4",
                 "</ACNode>",
                 "",
                 "<DCNode>",
                 "@ idx name v_max v_min",
-                "# 0 nd_1 50 40",
+                "# 1 unrelated_dc_node_name 50 40",
                 "</DCNode>",
                 "",
                 "<ACBranch>",
                 "@ idx name i_max p_max",
-                "# 0 line_0_1 0.000001 0.000001",
+                "# 1 unrelated_ac_branch_name 0.000001 0.000001",
                 "</ACBranch>",
                 "",
                 "<DCBranch>",
                 "@ idx name i_max p_max",
-                "# 0 line_0_1 0.000001 0.000001",
+                "# 1 unrelated_dc_branch_name 0.000001 0.000001",
                 "</DCBranch>",
                 "",
             ]
@@ -85,9 +85,36 @@ def test_hybrid_ca_n1_scan_includes_ac_units_and_loads():
 
     contingencies = set(_contingency_rows(ROOT / "data" / "model" / "hybrid" / "qinling.e"))
 
-    assert ("ACGenerator", "ACUnit", "wt01_10kw") in contingencies
-    assert ("ACLoad", "ACLoad", "load_ac_1") in contingencies
-    assert ("DCGenerator", "DCUnit", "pv01_vsrc") in contingencies
+    assert ("ACGenerator", "ACUnit", 1, "wt01_10kw") in contingencies
+    assert ("ACLoad", "ACLoad", 1, "load_ac_1") in contingencies
+    assert ("DCGenerator", "DCUnit", 2, "pv01_vsrc") in contingencies
+
+
+def test_ca_outage_selection_uses_device_idx_instead_of_name(tmp_path):
+    from cacore.hybrid_ca import _write_outage_case
+    from efile_read import EBook
+
+    source = tmp_path / "source.e"
+    target = tmp_path / "target.e"
+    source.write_text(
+        "\n".join(
+            [
+                "<ACGenerator>",
+                "@ idx name run_stat",
+                "# 7 arbitrary_name 1",
+                "# 8 another_name 1",
+                "</ACGenerator>",
+                "",
+            ]
+        ),
+        encoding="utf8",
+    )
+
+    _write_outage_case(source, target, "ACGenerator", 8)
+
+    rows = EBook(target).data["ACGenerator"].data
+    assert rows[0]["run_stat"] == "1"
+    assert rows[1]["run_stat"] == "0"
 
 
 def test_ca_efile_output_columns_are_aligned(tmp_path):

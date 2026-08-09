@@ -42,6 +42,16 @@ def _as_float(value, default=0.0) -> float:
         return default
 
 
+def _as_idx(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid device idx: {value!r}") from exc
+
+
 def _fmt(value) -> str:
     if isinstance(value, str):
         return value
@@ -77,14 +87,18 @@ def _format_efile_block(table_name: str, header: list[str], rows: list[dict[str,
     return "".join(parts)
 
 
-def read_constraints(limit_file: str | Path) -> dict[str, dict[str, dict[str, float]]]:
+def read_constraints(limit_file: str | Path) -> dict[str, dict[int, dict[str, float]]]:
     book = EBook(limit_file)
-    constraints: dict[str, dict[str, dict[str, float]]] = {}
+    constraints: dict[str, dict[int, dict[str, float]]] = {}
     for table_name, block in book.data.items():
         table = constraints.setdefault(table_name, {})
         for row in block.data:
-            name = str(row.get("name", row.get("idx", "")))
-            table[name] = {
+            if "idx" not in row:
+                raise ValueError(f"constraint row missing idx: {table_name}")
+            idx = _as_idx(row["idx"])
+            if idx in table:
+                raise ValueError(f"duplicate constraint idx: {table_name}.{idx}")
+            table[idx] = {
                 key: _as_float(value)
                 for key, value in row.items()
                 if key not in {"idx", "name"}
@@ -105,14 +119,15 @@ def _add_risk(
 
 def _check_range(
     risks: list[CARisk],
-    constraints: dict[str, dict[str, dict[str, float]]],
+    constraints: dict[str, dict[int, dict[str, float]]],
     table: str,
-    name: str,
+    idx: int,
+    display_name: str,
     field: str,
     value: float,
     source: str,
 ) -> None:
-    limit = constraints.get(table, {}).get(name)
+    limit = constraints.get(table, {}).get(idx)
     if not limit:
         return
     max_key = f"{field}_max"
@@ -121,7 +136,7 @@ def _check_range(
         _add_risk(
             risks,
             source,
-            f"{table}.{name}.{field}",
+            f"{table}.{display_name}.{field}",
             "越限",
             value,
             f"{field}={_fmt(value)}>{max_key}={_fmt(limit[max_key])}",
@@ -130,7 +145,7 @@ def _check_range(
         _add_risk(
             risks,
             source,
-            f"{table}.{name}.{field}",
+            f"{table}.{display_name}.{field}",
             "越限",
             value,
             f"{field}={_fmt(value)}<{min_key}={_fmt(limit[min_key])}",
@@ -139,6 +154,31 @@ def _check_range(
 
 def _device_name(device) -> str:
     return str(getattr(device, "name", getattr(device, "idx", "")))
+
+
+def _device_idx(device) -> int:
+    return _as_idx(getattr(device, "idx", None))
+
+
+def _check_device_range(
+    risks: list[CARisk],
+    constraints: dict[str, dict[int, dict[str, float]]],
+    table: str,
+    device,
+    field: str,
+    value: float,
+    source: str,
+) -> None:
+    _check_range(
+        risks,
+        constraints,
+        table,
+        _device_idx(device),
+        _device_name(device),
+        field,
+        value,
+        source,
+    )
 
 
 def _node_voltage(network, side: str, node_idx) -> float:
@@ -190,30 +230,25 @@ def collect_limit_risks(result, constraints, source: str) -> list[CARisk]:
     network = result.network
 
     for node in getattr(result.ac_network, "nodes", []):
-        _check_range(risks, constraints, "ACNode", _device_name(node), "v", _physical_voltage(network, node), source)
+        _check_device_range(risks, constraints, "ACNode", node, "v", _physical_voltage(network, node), source)
     for node in getattr(result.dc_network, "nodes", []):
-        _check_range(risks, constraints, "DCNode", _device_name(node), "v", _physical_voltage(network, node), source)
+        _check_device_range(risks, constraints, "DCNode", node, "v", _physical_voltage(network, node), source)
 
     for gen in getattr(result.ac_network, "generators", []):
-        name = _device_name(gen)
-        _check_range(risks, constraints, "ACUnit", name, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
-        _check_range(risks, constraints, "ACUnit", name, "v", _node_voltage(network, "ac", gen.node), source)
+        _check_device_range(risks, constraints, "ACUnit", gen, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
+        _check_device_range(risks, constraints, "ACUnit", gen, "v", _node_voltage(network, "ac", gen.node), source)
     for gen in getattr(result.dc_network, "generators", []):
-        name = _device_name(gen)
-        _check_range(risks, constraints, "DCUnit", name, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
-        _check_range(risks, constraints, "DCUnit", name, "v", _node_voltage(network, "dc", gen.node), source)
+        _check_device_range(risks, constraints, "DCUnit", gen, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
+        _check_device_range(risks, constraints, "DCUnit", gen, "v", _node_voltage(network, "dc", gen.node), source)
 
     for load in getattr(result.ac_network, "loads", []):
-        name = _device_name(load)
-        _check_range(risks, constraints, "ACLoad", name, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
-        _check_range(risks, constraints, "ACLoad", name, "v", _node_voltage(network, "ac", load.node), source)
+        _check_device_range(risks, constraints, "ACLoad", load, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
+        _check_device_range(risks, constraints, "ACLoad", load, "v", _node_voltage(network, "ac", load.node), source)
     for load in getattr(result.dc_network, "loads", []):
-        name = _device_name(load)
-        _check_range(risks, constraints, "DCLoad", name, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
-        _check_range(risks, constraints, "DCLoad", name, "v", _node_voltage(network, "dc", load.node), source)
+        _check_device_range(risks, constraints, "DCLoad", load, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
+        _check_device_range(risks, constraints, "DCLoad", load, "v", _node_voltage(network, "dc", load.node), source)
 
     for branch in getattr(result.ac_network, "branches", []):
-        name = _device_name(branch)
         i_node = _terminal_node(network, "ac", branch.i_node)
         j_node = _terminal_node(network, "ac", branch.j_node)
         current = max(
@@ -224,45 +259,39 @@ def collect_limit_risks(result, constraints, source: str) -> list[CARisk]:
             _physical_power(network, math.hypot(_as_float(getattr(branch, "i_p", 0.0)), _as_float(getattr(branch, "i_q", 0.0)))),
             _physical_power(network, math.hypot(_as_float(getattr(branch, "j_p", 0.0)), _as_float(getattr(branch, "j_q", 0.0)))),
         )
-        _check_range(risks, constraints, "ACBranch", name, "i", current, source)
-        _check_range(risks, constraints, "ACBranch", name, "p", power, source)
+        _check_device_range(risks, constraints, "ACBranch", branch, "i", current, source)
+        _check_device_range(risks, constraints, "ACBranch", branch, "p", power, source)
     for branch in getattr(result.dc_network, "branches", []):
-        name = _device_name(branch)
         i_node = _terminal_node(network, "dc", branch.i_node)
         current = abs(_physical_current(network, getattr(branch, "current", 0.0), i_node))
         power = max(abs(_physical_power(network, getattr(branch, "i_p", 0.0))), abs(_physical_power(network, getattr(branch, "j_p", 0.0))))
-        _check_range(risks, constraints, "DCBranch", name, "i", current, source)
-        _check_range(risks, constraints, "DCBranch", name, "p", power, source)
+        _check_device_range(risks, constraints, "DCBranch", branch, "i", current, source)
+        _check_device_range(risks, constraints, "DCBranch", branch, "p", power, source)
 
     for brk in getattr(result.ac_network, "breakers", []):
-        name = _device_name(brk)
-        _check_range(risks, constraints, "ACBreaker", name, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "ac", brk.i_node))), source)
+        _check_device_range(risks, constraints, "ACBreaker", brk, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "ac", brk.i_node))), source)
         voltage = max(_node_voltage(network, "ac", brk.i_node), _node_voltage(network, "ac", brk.j_node))
-        _check_range(risks, constraints, "ACBreaker", name, "v", voltage, source)
+        _check_device_range(risks, constraints, "ACBreaker", brk, "v", voltage, source)
     for brk in getattr(result.dc_network, "breakers", []):
-        name = _device_name(brk)
-        _check_range(risks, constraints, "DCBreaker", name, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "dc", brk.i_node))), source)
+        _check_device_range(risks, constraints, "DCBreaker", brk, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "dc", brk.i_node))), source)
         voltage = max(_node_voltage(network, "dc", brk.i_node), _node_voltage(network, "dc", brk.j_node))
-        _check_range(risks, constraints, "DCBreaker", name, "v", voltage, source)
+        _check_device_range(risks, constraints, "DCBreaker", brk, "v", voltage, source)
 
     for conv in getattr(result.dc_network, "dcdc_converters", []):
-        name = _device_name(conv)
-        _check_range(risks, constraints, "DCDCConver", name, "i_c", _physical_current(network, getattr(conv, "i_c", 0.0), _terminal_node(network, "dc", conv.i_node)), source)
-        _check_range(risks, constraints, "DCDCConver", name, "j_c", _physical_current(network, getattr(conv, "j_c", 0.0), _terminal_node(network, "dc", conv.j_node)), source)
-        _check_range(risks, constraints, "DCDCConver", name, "i_v", _node_voltage(network, "dc", conv.i_node), source)
-        _check_range(risks, constraints, "DCDCConver", name, "j_v", _node_voltage(network, "dc", conv.j_node), source)
+        _check_device_range(risks, constraints, "DCDCConver", conv, "i_c", _physical_current(network, getattr(conv, "i_c", 0.0), _terminal_node(network, "dc", conv.i_node)), source)
+        _check_device_range(risks, constraints, "DCDCConver", conv, "j_c", _physical_current(network, getattr(conv, "j_c", 0.0), _terminal_node(network, "dc", conv.j_node)), source)
+        _check_device_range(risks, constraints, "DCDCConver", conv, "i_v", _node_voltage(network, "dc", conv.i_node), source)
+        _check_device_range(risks, constraints, "DCDCConver", conv, "j_v", _node_voltage(network, "dc", conv.j_node), source)
     for conv in getattr(network, "dcac_converters", []):
-        name = _device_name(conv)
-        _check_range(risks, constraints, "DCACConver", name, "i_c", _physical_current(network, getattr(conv, "dc_i", 0.0), _terminal_node(network, "dc", conv.dc_node)), source)
-        _check_range(risks, constraints, "DCACConver", name, "j_c", _physical_current(network, getattr(conv, "ac_i", 0.0), _terminal_node(network, "ac", conv.ac_node)), source)
-        _check_range(risks, constraints, "DCACConver", name, "i_v", _node_voltage(network, "dc", conv.dc_node), source)
-        _check_range(risks, constraints, "DCACConver", name, "j_v", _node_voltage(network, "ac", conv.ac_node), source)
+        _check_device_range(risks, constraints, "DCACConver", conv, "i_c", _physical_current(network, getattr(conv, "dc_i", 0.0), _terminal_node(network, "dc", conv.dc_node)), source)
+        _check_device_range(risks, constraints, "DCACConver", conv, "j_c", _physical_current(network, getattr(conv, "ac_i", 0.0), _terminal_node(network, "ac", conv.ac_node)), source)
+        _check_device_range(risks, constraints, "DCACConver", conv, "i_v", _node_voltage(network, "dc", conv.dc_node), source)
+        _check_device_range(risks, constraints, "DCACConver", conv, "j_v", _node_voltage(network, "ac", conv.ac_node), source)
     for conv in getattr(network, "acac_converters", []):
-        name = _device_name(conv)
-        _check_range(risks, constraints, "ACACConver", name, "i_c", _physical_current(network, getattr(conv, "i_i", 0.0), _terminal_node(network, "ac", conv.i_node)), source)
-        _check_range(risks, constraints, "ACACConver", name, "j_c", _physical_current(network, getattr(conv, "j_i", 0.0), _terminal_node(network, "ac", conv.j_node)), source)
-        _check_range(risks, constraints, "ACACConver", name, "i_v", _node_voltage(network, "ac", conv.i_node), source)
-        _check_range(risks, constraints, "ACACConver", name, "j_v", _node_voltage(network, "ac", conv.j_node), source)
+        _check_device_range(risks, constraints, "ACACConver", conv, "i_c", _physical_current(network, getattr(conv, "i_i", 0.0), _terminal_node(network, "ac", conv.i_node)), source)
+        _check_device_range(risks, constraints, "ACACConver", conv, "j_c", _physical_current(network, getattr(conv, "j_i", 0.0), _terminal_node(network, "ac", conv.j_node)), source)
+        _check_device_range(risks, constraints, "ACACConver", conv, "i_v", _node_voltage(network, "ac", conv.i_node), source)
+        _check_device_range(risks, constraints, "ACACConver", conv, "j_v", _node_voltage(network, "ac", conv.j_node), source)
 
     return risks
 
@@ -278,7 +307,7 @@ def _run_case(model_file: str | Path):
         return None, exc
 
 
-def _contingency_rows(model_file: str | Path) -> Iterable[tuple[str, str, str]]:
+def _contingency_rows(model_file: str | Path) -> Iterable[tuple[str, str, int, str]]:
     book = EBook(model_file)
     for table, source_table in (
         ("ACGenerator", "ACUnit"),
@@ -299,18 +328,19 @@ def _contingency_rows(model_file: str | Path) -> Iterable[tuple[str, str, str]]:
             continue
         for row in block.data:
             if int(_as_float(row.get("run_stat", 1), 1)) == 1:
-                yield table, source_table, str(row.get("name", row.get("idx")))
+                idx = _as_idx(row.get("idx"))
+                yield table, source_table, idx, str(row.get("name", idx))
 
 
-def _write_outage_case(src_file: str | Path, dst_file: str | Path, table: str, name: str) -> None:
+def _write_outage_case(src_file: str | Path, dst_file: str | Path, table: str, idx: int) -> None:
     book = EBook(src_file)
     block = book.data[table]
     for row in block.data:
-        if str(row.get("name", row.get("idx"))) == name:
+        if _as_idx(row.get("idx")) == idx:
             row["run_stat"] = 0
             break
     else:
-        raise ValueError(f"contingency device not found: {table}.{name}")
+        raise ValueError(f"contingency device not found: {table}.{idx}")
     book.apply_to_file(dst_file)
 
 
@@ -420,11 +450,11 @@ def run_hybrid_ca(
     if scan_n1:
         with tempfile.TemporaryDirectory(prefix="hybrid_ca_") as tmp_dir:
             tmp_path = Path(tmp_dir)
-            for table, source_table, name in _contingency_rows(model_file):
+            for table, source_table, idx, display_name in _contingency_rows(model_file):
                 n1_scan_count += 1
-                source = f"N-1:{source_table}.{name}"
-                outage_file = tmp_path / f"{table}_{name}.e"
-                _write_outage_case(model_file, outage_file, table, name)
+                source = f"N-1:{source_table}.{display_name}"
+                outage_file = tmp_path / f"{table}_{idx}.e"
+                _write_outage_case(model_file, outage_file, table, idx)
                 result, error = _run_case(outage_file)
                 if error is not None or result is None or not result.converged:
                     detail = str(error) if error is not None else "hybrid_power_flow_not_converged"

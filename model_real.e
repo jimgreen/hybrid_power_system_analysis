@@ -60,11 +60,11 @@
 </yk>
 
 <yt>
-@ id name                   rtu  pnt
-# 1  制氢框架请求电流          3    3
-# 2  制氢系统_电解电流远程设定   7    1
-# 3  30kw燃料电池有功功率设定   3    1
-# 4  燃料电池_功率设定         7    2
+@ id name                   rtu  pnt control_role
+# 1  制氢框架请求电流          3    3 HYDROGEN_ABSORB
+# 2  制氢系统_电解电流远程设定   7    1 HYDROGEN_ABSORB
+# 3  30kw燃料电池有功功率设定   3    1 FUEL_CELL_SUPPORT
+# 4  燃料电池_功率设定         7    2 FUEL_CELL_SUPPORT
 </yt>
 
 

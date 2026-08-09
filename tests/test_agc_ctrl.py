@@ -461,6 +461,52 @@ class AGCControlTest(unittest.TestCase):
         self.assertEqual(model.wind_generator[0].p_ctrl, 50.0)
         self.assertEqual(model.pv_generator[0].p_ctrl, 150.0)
 
+    def test_yt_dispatch_uses_explicit_control_role_instead_of_device_name(self):
+        commands = []
+        model = SimpleNamespace(
+            yt=[
+                SimpleNamespace(
+                    id=1,
+                    name="fuel_cell_name_but_hydrogen_role",
+                    control_role="HYDROGEN_ABSORB",
+                ),
+                SimpleNamespace(
+                    id=2,
+                    name="hydrogen_name_but_fuel_cell_role",
+                    control_role="FUEL_CELL_SUPPORT",
+                ),
+            ],
+            config=SimpleNamespace(
+                send_yt_cmd=lambda device, value: commands.append((device.id, value))
+            ),
+        )
+
+        self.assertEqual(
+            agc_ctrl._send_hydrogen_absorb(logging.getLogger("test"), model, 12.0),
+            0.0,
+        )
+        self.assertEqual(
+            agc_ctrl._send_fuel_cell_support(logging.getLogger("test"), model, 7.0),
+            0.0,
+        )
+        self.assertEqual(commands, [(1, 12.0), (2, 7.0)])
+
+    def test_yt_dispatch_does_not_infer_role_from_device_name(self):
+        commands = []
+        model = SimpleNamespace(
+            yt=[SimpleNamespace(id=1, name="制氢设备")],
+            config=SimpleNamespace(
+                send_yt_cmd=lambda device, value: commands.append((device.id, value))
+            ),
+        )
+
+        remaining = agc_ctrl._send_hydrogen_absorb(
+            logging.getLogger("test"), model, 12.0
+        )
+
+        self.assertEqual(remaining, 12.0)
+        self.assertEqual(commands, [])
+
 
 if __name__ == "__main__":
     unittest.main()
