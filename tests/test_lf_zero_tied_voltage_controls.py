@@ -31,6 +31,7 @@ def _ac_zero_tied_ph_ppc():
                 [2, "source_2", 380, 380, 0, 1],
                 [3, "source_bus", 380, 380, 0, 1],
                 [4, "load_bus", 380, 380, 0, 1],
+                [5, "ideal_tie_bus", 380, 380, 0, 1],
             ],
         ),
         "ACSwitch": _table(
@@ -39,7 +40,14 @@ def _ac_zero_tied_ph_ppc():
         ),
         "ACZeroBranch": _table(
             "idx name i_node j_node run_stat p q current",
-            [[1, "zbr_2_3", 2, 3, 1, 0, 0, 0]],
+            [[1, "zbr_2_5", 2, 5, 1, 0, 0, 0]],
+        ),
+        "ACBreak": _table(
+            "idx name i_node j_node status run_stat",
+            [
+                [1, "break_5_3", 5, 3, 1, 1],
+                [2, "open_break_2_4", 2, 4, 0, 1],
+            ],
         ),
         "ACBranch": _table(
             "idx name i_node j_node r x b run_stat",
@@ -73,6 +81,7 @@ def _dc_zero_tied_v_ppc():
                 [2, "source_2", 100, 100, 0, 1],
                 [3, "source_bus", 100, 100, 0, 1],
                 [4, "load_bus", 100, 100, 0, 1],
+                [5, "ideal_tie_bus", 100, 100, 0, 1],
             ],
         ),
         "DCSwitch": _table(
@@ -81,7 +90,14 @@ def _dc_zero_tied_v_ppc():
         ),
         "DCZeroBranch": _table(
             "idx name i_node j_node run_stat p current",
-            [[1, "zbr_2_3", 2, 3, 1, 0, 0]],
+            [[1, "zbr_2_5", 2, 5, 1, 0, 0]],
+        ),
+        "DCBreak": _table(
+            "idx name i_node j_node status run_stat",
+            [
+                [1, "break_5_3", 5, 3, 1, 1],
+                [2, "open_break_2_4", 2, 4, 0, 1],
+            ],
         ),
         "DCBranch": _table(
             "idx name i_node j_node r run_stat",
@@ -229,6 +245,7 @@ def test_ac_lf_unifies_zero_tied_ph_controls_before_newton():
     topology = ppc["_topology_arrays"]
     assert topology.node_to_bus_pos[0] == topology.node_to_bus_pos[2]
     assert topology.node_to_bus_pos[1] != topology.node_to_bus_pos[2]
+    assert topology.node_to_bus_pos[4] != topology.node_to_bus_pos[2]
 
     calc = ACPowerFlowCalc(
         ppc,
@@ -240,13 +257,17 @@ def test_ac_lf_unifies_zero_tied_ph_controls_before_newton():
     )
     calc.prepare()
 
+    source_solver_positions = calc.row_to_pos[np.asarray([0, 1, 2, 4], dtype=np.int32)]
+    assert np.unique(source_solver_positions).size == 1
+    assert calc.row_to_pos[3] != source_solver_positions[0]
+
     jacobian = calc.get_jacobi(calc.x)
     assert calc.total_vars == calc.total_eq
     assert np.linalg.matrix_rank(jacobian.toarray()) == calc.total_vars
     assert calc.run() == 0
 
     result = calc.result
-    source_rows = np.isin(result["bus"][:, BUS_COLS["idx"]].astype(int), [1, 2, 3])
+    source_rows = np.isin(result["bus"][:, BUS_COLS["idx"]].astype(int), [1, 2, 3, 5])
     assert np.allclose(result["bus"][source_rows, BUS_COLS["voltage"]], 1.02, atol=1e-9)
     generated_p = result["gen"][:, GEN_COLS["p"]]
     generated_q = result["gen"][:, GEN_COLS["q"]]
@@ -262,6 +283,7 @@ def test_dc_lf_unifies_zero_tied_v_controls_before_newton():
     topology = ppc["_topology_arrays"]
     assert topology.node_to_bus_pos[0] == topology.node_to_bus_pos[2]
     assert topology.node_to_bus_pos[1] != topology.node_to_bus_pos[2]
+    assert topology.node_to_bus_pos[4] != topology.node_to_bus_pos[2]
 
     calc = DCPowerFlowCalc(
         ppc,
@@ -273,13 +295,17 @@ def test_dc_lf_unifies_zero_tied_v_controls_before_newton():
     )
     calc.prepare()
 
+    source_solver_positions = calc._alive_node_lookup[np.asarray([1, 2, 3, 5], dtype=np.int32)]
+    assert np.unique(source_solver_positions).size == 1
+    assert calc._alive_node_lookup[4] != source_solver_positions[0]
+
     jacobian = calc.get_jacobi(calc.x)
     assert calc.total_vars == calc.total_eq
     assert np.linalg.matrix_rank(jacobian.toarray()) == calc.total_vars
     assert calc.run() == 0
 
     result = calc.result
-    source_rows = np.isin(result["bus"][:, BUS_COLS["idx"]].astype(int), [1, 2, 3])
+    source_rows = np.isin(result["bus"][:, BUS_COLS["idx"]].astype(int), [1, 2, 3, 5])
     assert np.allclose(result["bus"][source_rows, BUS_COLS["voltage"]], 1.0, atol=1e-9)
     generated_p = result["gen"][:, GEN_COLS["p"]]
     assert np.isclose(generated_p[0], generated_p[1], rtol=1e-9, atol=1e-9)
