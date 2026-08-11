@@ -505,7 +505,11 @@ def build_measurements_from_lf(network, calc) -> list[Measurement]:
         )
     for source_pos, name in enumerate(network.source_name.tolist()):
         add(
-            f"{network.prefix}Source",
+            (
+                f"{network.prefix}Storage"
+                if bool(network.source_is_storage[source_pos])
+                else f"{network.prefix}Source"
+            ),
             str(name),
             "FLOW",
             calc.source_flow[source_pos],

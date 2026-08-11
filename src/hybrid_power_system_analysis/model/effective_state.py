@@ -23,12 +23,15 @@ _KNOWN_REFERENCE_ALIASES = {
     "heatunit": ("HeatUnit", "HeatSource"),
     "heatsource": ("HeatSource",),
     "heatload": ("HeatLoad",),
+    "heatstorage": ("HeatStorage",),
     "gasunit": ("GasUnit", "GasSource"),
     "gassource": ("GasSource",),
     "gasload": ("GasLoad",),
+    "gasstorage": ("GasStorage",),
     "steamunit": ("SteamUnit", "SteamSource"),
     "steamsource": ("SteamSource",),
     "steamload": ("SteamLoad",),
+    "steamstorage": ("SteamStorage",),
 }
 
 

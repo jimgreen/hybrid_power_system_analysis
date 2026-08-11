@@ -51,6 +51,10 @@ DEVICE_TYPE_SteamValve = 48
 DEVICE_TYPE_SteamPressureReducer = 49
 DEVICE_TYPE_SteamSource = 50
 DEVICE_TYPE_SteamLoad = 51
+DEVICE_TYPE_HeatStorage = 52
+DEVICE_TYPE_GasStorage = 53
+DEVICE_TYPE_HydroStorage = 54
+DEVICE_TYPE_SteamStorage = 55
 
 DEVICE_TYPE_CODES = {
     "ACNode": DEVICE_TYPE_ACNode,
@@ -105,6 +109,10 @@ DEVICE_TYPE_CODES = {
     "SteamPressureReducer": DEVICE_TYPE_SteamPressureReducer,
     "SteamSource": DEVICE_TYPE_SteamSource,
     "SteamLoad": DEVICE_TYPE_SteamLoad,
+    "HeatStorage": DEVICE_TYPE_HeatStorage,
+    "GasStorage": DEVICE_TYPE_GasStorage,
+    "HydroStorage": DEVICE_TYPE_HydroStorage,
+    "SteamStorage": DEVICE_TYPE_SteamStorage,
 }
 DEVICE_TYPE_NAMES = {code: name for name, code in DEVICE_TYPE_CODES.items()}
 

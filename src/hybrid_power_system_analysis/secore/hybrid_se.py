@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.sparse import eye as sparse_eye
+from scipy.sparse import block_diag, coo_matrix, csr_matrix, eye as sparse_eye, hstack, vstack
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -117,6 +117,7 @@ from model.meas_type import (
     MEAS_TYPE_V_THIRD,
     MEAS_TYPE_V_GEN,
     MEAS_TYPE_V_LOAD,
+    MEAS_TYPE_CODES,
     MEAS_TYPE_NAMES,
 )
 from model.meas_model import (
@@ -664,6 +665,28 @@ class MultiEnergySEResult:
         return sum(len(getattr(estimator, "bad_data", ())) for estimator in self.fluid_estimators.values())
 
 
+@dataclass(frozen=True)
+class _MultiEnergySEEndpoint:
+    provider: str
+    row: int
+    domain: str
+    device_type: str
+    device_idx: int
+
+
+@dataclass(frozen=True)
+class _MultiEnergySECouplingPlan:
+    coupling: object
+    t1: _MultiEnergySEEndpoint
+    t2: _MultiEnergySEEndpoint
+    t1_scale: float
+    t2_scale: float
+    normalization: float
+    measurement_row: int
+    control_col: int = -1
+    prior_measurement_row: int = -1
+
+
 class HybridStateEstimator:
     """AC/DC and fluid-network state-estimation orchestrator.
 
@@ -953,12 +976,17 @@ class HybridStateEstimator:
         self.fluid_se_rc: Dict[str, int] = {}
         self.fluid_se_errors: Dict[str, str] = {}
         self.multi_energy_result = MultiEnergySEResult()
+        self.multi_energy_se_coupling_plans: List[_MultiEnergySECouplingPlan] = []
+        self.multi_energy_estimate_result: Optional[EstimateResult] = None
+        self.multi_energy_observability_result: Optional[ObservabilityResult] = None
+        self._multi_energy_se_layout_ready = False
         if auto_prepare:
             self.prepare()
 
     def prepare(self) -> "HybridStateEstimator":
         result = self._prepare_electric()
         self._prepare_fluid_estimators()
+        self._prepare_multi_energy_se_layout()
         return result
 
     def _prepare_electric(self) -> "HybridStateEstimator":
@@ -1130,6 +1158,1140 @@ class HybridStateEstimator:
             )
             estimator.prepare()
             self.fluid_estimators[name] = estimator
+
+    def _add_multi_energy_warning(self, message: str) -> None:
+        if message not in self.multi_energy.warnings:
+            self.multi_energy.warnings.append(message)
+
+    def _electric_endpoint_measurement(self, terminal) -> Tuple[Optional[Measurement], str]:
+        domain = str(terminal.domain)
+        device_type = str(terminal.device_type)
+        is_load = device_type.endswith("Load")
+        is_source = device_type.endswith(("Generator", "Unit", "Source"))
+        if domain not in {"ac", "dc"} or (not is_load and not is_source):
+            return None, f"unsupported electric endpoint type {device_type}"
+
+        ppc = getattr(self.network, "ppc", {}) or {}
+        side_ppc = ppc.get(domain)
+        if not isinstance(side_ppc, dict):
+            return None, f"{domain} endpoint has no active estimator block"
+        if domain == "ac":
+            estimator = self._ac_sub_estimator
+            table_key = "load" if is_load else "gen"
+            columns = AC_LOAD_COLS if is_load else AC_GEN_COLS
+            device_type_code = DEVICE_TYPE_ACLoad if is_load else DEVICE_TYPE_ACGenerator
+            meas_type = "P_LOAD" if is_load else "P_GEN"
+            meas_type_code = MEAS_TYPE_P_LOAD if is_load else MEAS_TYPE_P_GEN
+        else:
+            estimator = self._dc_sub_estimator
+            table_key = "load" if is_load else "gen"
+            columns = DC_LOAD_COLS if is_load else DC_GEN_COLS
+            device_type_code = DEVICE_TYPE_DCLoad if is_load else DEVICE_TYPE_DCGenerator
+            meas_type = "P_LOAD" if is_load else "P_GEN"
+            meas_type_code = MEAS_TYPE_P_LOAD if is_load else MEAS_TYPE_P_GEN
+        if estimator is None:
+            return None, f"{domain} endpoint has no active state estimator"
+
+        table = np.asarray(side_ppc.get(table_key, ()), dtype=np.float64)
+        if table.ndim != 2 or table.size == 0:
+            return None, f"missing {device_type} idx={int(terminal.device_idx)}"
+        rows = np.flatnonzero(
+            table[:, columns["idx"]].astype(np.int64, copy=False)
+            == int(terminal.device_idx)
+        )
+        if rows.size == 0:
+            return None, f"missing {device_type} idx={int(terminal.device_idx)}"
+        table_row = int(rows[0])
+        run_stat_col = columns.get("run_stat")
+        if run_stat_col is not None and int(table[table_row, run_stat_col]) != 1:
+            return None, f"inactive {device_type} idx={int(terminal.device_idx)}"
+
+        if domain == "ac":
+            positions = estimator._plan_pos_for_ppc_rows(
+                device_type_code,
+                np.asarray([table_row], dtype=np.int64),
+                table.shape[0],
+            )
+            device_pos = int(positions[0]) if positions.size else -1
+        else:
+            active_rows = np.asarray(
+                estimator._load_rows if is_load else estimator._generator_rows,
+                dtype=np.int64,
+            )
+            positions = np.flatnonzero(active_rows == table_row)
+            device_pos = int(positions[0]) if positions.size else -1
+        if device_pos < 0:
+            return None, f"{device_type} idx={int(terminal.device_idx)} is outside the live topology"
+
+        measurement = Measurement(
+            0,
+            f"coupling_endpoint_{domain}_{device_type_code}_{device_pos}",
+            "ACLoad" if domain == "ac" and is_load else
+            "ACGenerator" if domain == "ac" else
+            "DCLoad" if is_load else "DCGenerator",
+            "",
+            meas_type,
+            1.0,
+            True,
+            0.0,
+            status=MEAS_STATUS_PSEUDO,
+            device_type_code=device_type_code,
+            meas_type_code=meas_type_code,
+            device_pos=device_pos,
+        )
+        return measurement, ""
+
+    def _fluid_endpoint_measurement(self, terminal) -> Tuple[Optional[Measurement], str]:
+        domain = str(terminal.domain)
+        estimator = self.fluid_estimators.get(domain)
+        if estimator is None:
+            return None, f"{domain} endpoint has no active state estimator"
+        device_type = str(terminal.device_type)
+        is_load = device_type.endswith("Load")
+        is_storage = device_type.endswith("Storage")
+        is_source = device_type.endswith(("Source", "Unit", "Generator")) or is_storage
+        if not is_load and not is_source:
+            return None, f"unsupported fluid endpoint type {device_type}"
+        if is_load:
+            positions = [
+                pos
+                for pos, device in enumerate(estimator.network.loads)
+                if int(device.idx) == int(terminal.device_idx)
+            ]
+        else:
+            positions = [
+                pos
+                for pos, device in enumerate(estimator.network.sources)
+                if bool(estimator.network.source_is_storage[pos]) == is_storage
+                and int(device.idx) == int(terminal.device_idx)
+            ]
+        if not positions:
+            return None, f"missing {device_type} idx={int(terminal.device_idx)}"
+        device_pos = int(positions[0])
+        runtime_device_type = (
+            f"{estimator.network.prefix}Load"
+            if is_load
+            else f"{estimator.network.prefix}Storage"
+            if is_storage
+            else f"{estimator.network.prefix}Source"
+        )
+        measurement = Measurement(
+            0,
+            f"coupling_endpoint_{domain}_{device_pos}",
+            runtime_device_type,
+            "",
+            "FLOW",
+            1.0,
+            True,
+            0.0,
+            status=MEAS_STATUS_PSEUDO,
+            device_type_code=int(DEVICE_TYPE_CODES.get(runtime_device_type, 0)),
+            meas_type_code=int(MEAS_TYPE_CODES.get("FLOW", 0)),
+            device_pos=device_pos,
+        )
+        return measurement, ""
+
+    def _resolve_multi_energy_se_endpoint(self, terminal) -> Tuple[Optional[Measurement], str]:
+        if str(terminal.domain) in {"ac", "dc"}:
+            return self._electric_endpoint_measurement(terminal)
+        return self._fluid_endpoint_measurement(terminal)
+
+    def _prepare_multi_energy_se_layout(self) -> None:
+        if self._multi_energy_se_layout_ready or not self.fluid_estimators:
+            return
+
+        for estimator in self.fluid_estimators.values():
+            estimator.analyze_observability(add_pseudo=True)
+
+        self.electric_state_count = 0 if self._fluid_only else int(self.n_state)
+        self.electric_state_slice = slice(0, self.electric_state_count)
+        state_offset = self.electric_state_count
+        self.fluid_state_slices: Dict[str, slice] = {}
+        for name, estimator in self.fluid_estimators.items():
+            self.fluid_state_slices[name] = slice(
+                state_offset,
+                state_offset + int(estimator.state_count),
+            )
+            state_offset += int(estimator.state_count)
+        self.multi_energy_state_count = state_offset
+
+        self.electric_measurement_count = 0 if self._fluid_only else len(self.active_measurements)
+        self.electric_measurement_slice = slice(0, self.electric_measurement_count)
+        measurement_offset = self.electric_measurement_count
+        self.fluid_measurement_slices: Dict[str, slice] = {}
+        for name, estimator in self.fluid_estimators.items():
+            count = len(estimator.active_measurements)
+            self.fluid_measurement_slices[name] = slice(
+                measurement_offset,
+                measurement_offset + count,
+            )
+            measurement_offset += count
+
+        endpoint_measurements: Dict[str, MeasurementList] = {
+            "electric": MeasurementList()
+        }
+        endpoint_measurements.update(
+            {name: MeasurementList() for name in self.fluid_estimators}
+        )
+        endpoint_cache: Dict[Tuple[str, str, int], _MultiEnergySEEndpoint] = {}
+
+        def register(terminal) -> Tuple[Optional[_MultiEnergySEEndpoint], str]:
+            key = (
+                str(terminal.domain),
+                str(terminal.device_type),
+                int(terminal.device_idx),
+            )
+            cached = endpoint_cache.get(key)
+            if cached is not None:
+                return cached, ""
+            measurement, reason = self._resolve_multi_energy_se_endpoint(terminal)
+            if measurement is None:
+                return None, reason
+            provider = "electric" if str(terminal.domain) in {"ac", "dc"} else str(terminal.domain)
+            rows = endpoint_measurements[provider]
+            endpoint = _MultiEnergySEEndpoint(
+                provider=provider,
+                row=len(rows),
+                domain=str(terminal.domain),
+                device_type=str(terminal.device_type),
+                device_idx=int(terminal.device_idx),
+            )
+            rows.append(measurement)
+            endpoint_cache[key] = endpoint
+            return endpoint, ""
+
+        pending = []
+        for coupling in self.multi_energy.couplings:
+            if not coupling.active or not coupling.supports_energy_balance:
+                continue
+            t1, reason = register(coupling.t1)
+            if t1 is None:
+                self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                continue
+            t2, reason = register(coupling.t2)
+            if t2 is None:
+                self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                continue
+            electric_scale = float(getattr(self.network, "p_base_kW", self.p_base_kW))
+            factor = float(coupling.energy_factor)
+            pending.append(
+                (
+                    coupling,
+                    t1,
+                    t2,
+                    electric_scale if t1.domain in {"ac", "dc"} else factor,
+                    electric_scale if t2.domain in {"ac", "dc"} else factor,
+                )
+            )
+
+        for measurements in endpoint_measurements.values():
+            measurements.table = _measurement_table_from_measurements(measurements)
+        self._multi_energy_endpoint_measurements = endpoint_measurements
+        self._multi_energy_se_layout_ready = True
+
+        initial_state = self._multi_energy_initial_state()
+        endpoint_values, endpoint_jacobians = self._multi_energy_endpoint_runtime(
+            initial_state,
+            with_jacobian=True,
+        )
+        local_weight_max = 1.0
+        for table in self._multi_energy_local_measurement_tables():
+            if table.weight.size:
+                local_weight_max = max(local_weight_max, float(np.max(table.weight)))
+        self.multi_energy_coupling_weight = max(1.0e6, 100.0 * local_weight_max)
+        self.multi_energy_coupling_prior_weight = local_weight_max
+        control_measurements = MeasurementList()
+        control_initial = []
+        prepared = []
+        for coupling, t1, t2, t1_scale, t2_scale in pending:
+            t1_value = float(endpoint_values[t1.provider][t1.row])
+            t2_value = float(endpoint_values[t2.provider][t2.row])
+            normalization = max(
+                1.0,
+                abs(t1_value * t1_scale),
+                abs(t2_value * t2_scale),
+            )
+            endpoint_row = endpoint_jacobians[t1.provider].getrow(t1.row)
+            control_col = -1
+            prior_measurement_row = -1
+            if endpoint_row.nnz == 0:
+                control_col = self.multi_energy_state_count + len(control_initial)
+                prior_measurement_row = measurement_offset + len(control_measurements)
+                control_initial.append(t1_value)
+                control_measurements.append(
+                    Measurement(
+                        prior_measurement_row + 1,
+                        f"coupling_control_{coupling.table_name}_{coupling.idx}",
+                        str(coupling.table_name),
+                        str(coupling.name),
+                        "T1_CONTROL",
+                        self.multi_energy_coupling_prior_weight,
+                        True,
+                        t1_value,
+                        status=MEAS_STATUS_PSEUDO,
+                    )
+                )
+            prepared.append(
+                (
+                    coupling,
+                    t1,
+                    t2,
+                    float(t1_scale),
+                    float(t2_scale),
+                    float(normalization),
+                    control_col,
+                    prior_measurement_row,
+                )
+            )
+
+        self._multi_energy_coupling_state_initial = np.asarray(control_initial, dtype=np.float64)
+        self.multi_energy_coupling_state_slice = slice(
+            self.multi_energy_state_count,
+            self.multi_energy_state_count + len(control_initial),
+        )
+        self.multi_energy_state_count = self.multi_energy_coupling_state_slice.stop
+        self.multi_energy_control_measurement_slice = slice(
+            measurement_offset,
+            measurement_offset + len(control_measurements),
+        )
+        energy_measurement_offset = self.multi_energy_control_measurement_slice.stop
+        energy_measurements = MeasurementList()
+        self.multi_energy_se_coupling_plans = []
+        for (
+            coupling,
+            t1,
+            t2,
+            t1_scale,
+            t2_scale,
+            normalization,
+            control_col,
+            prior_measurement_row,
+        ) in prepared:
+            measurement_row = energy_measurement_offset + len(energy_measurements)
+            self.multi_energy_se_coupling_plans.append(
+                _MultiEnergySECouplingPlan(
+                    coupling=coupling,
+                    t1=t1,
+                    t2=t2,
+                    t1_scale=t1_scale,
+                    t2_scale=t2_scale,
+                    normalization=normalization,
+                    measurement_row=measurement_row,
+                    control_col=control_col,
+                    prior_measurement_row=prior_measurement_row,
+                )
+            )
+            energy_measurements.append(
+                Measurement(
+                    measurement_row + 1,
+                    f"coupling_{coupling.table_name}_{coupling.idx}",
+                    str(coupling.table_name),
+                    str(coupling.name),
+                    "ENERGY_BALANCE",
+                    self.multi_energy_coupling_weight,
+                    True,
+                    0.0,
+                    status=MEAS_STATUS_PSEUDO,
+                )
+            )
+        coupling_measurements = MeasurementList([*control_measurements, *energy_measurements])
+        coupling_measurements.table = _measurement_table_from_measurements(coupling_measurements)
+        self._multi_energy_coupling_measurements = coupling_measurements
+        self.multi_energy_coupling_measurement_slice = slice(
+            energy_measurement_offset,
+            energy_measurement_offset + len(energy_measurements),
+        )
+        self.multi_energy_measurement_count = energy_measurement_offset + len(energy_measurements)
+        self._multi_energy_measurement_table = self._build_multi_energy_measurement_table()
+        self._multi_energy_z = np.asarray(self._multi_energy_measurement_table.value, dtype=np.float64)
+        self._multi_energy_weight = np.asarray(self._multi_energy_measurement_table.weight, dtype=np.float64)
+        self._multi_energy_angle_mask = np.asarray(
+            self._multi_energy_measurement_table.angle_mask,
+            dtype=bool,
+        )
+        self._multi_energy_has_angle_measurements = bool(np.any(self._multi_energy_angle_mask))
+        voltage_cols = []
+        if self.electric_state_count:
+            voltage_cols.extend(np.asarray(self.voltage_cols, dtype=np.int64).tolist())
+        self._multi_energy_voltage_cols = np.asarray(voltage_cols, dtype=np.int64)
+        self._multi_energy_fluid_potential_cols = np.concatenate(
+            [
+                np.arange(state_slice.start, state_slice.start + estimator.n_potential, dtype=np.int64)
+                for name, estimator in self.fluid_estimators.items()
+                for state_slice in (self.fluid_state_slices[name],)
+            ]
+        ) if self.fluid_estimators else np.asarray([], dtype=np.int64)
+        electric_labels = [] if self._fluid_only else list(self.state_labels)
+        self.multi_energy_state_labels = electric_labels + [
+            label
+            for name, estimator in self.fluid_estimators.items()
+            for label in estimator.state_labels
+        ] + [
+            f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:T1_CONTROL"
+            for plan in self.multi_energy_se_coupling_plans
+            if plan.control_col >= 0
+        ]
+        self._multi_energy_observability_cache = None
+
+    def _multi_energy_local_measurement_tables(self) -> List[MeasurementTable]:
+        tables = []
+        if not self._fluid_only:
+            tables.append(
+                self._measurement_table_with_string_columns(
+                    self._measurement_table(self.active_measurements)
+                )
+            )
+        tables.extend(
+            estimator.active_measurements.table
+            for estimator in self.fluid_estimators.values()
+        )
+        return tables
+
+    def _build_multi_energy_measurement_table(self) -> MeasurementTable:
+        tables = self._multi_energy_local_measurement_tables()
+        tables.append(self._multi_energy_coupling_measurements.table)
+        combined = _measurement_table_from_measurements(MeasurementList())
+        for table in tables:
+            combined = concat_measurement_tables(combined, table)
+        combined.idx = np.arange(1, combined.idx.size + 1, dtype=np.int64)
+        return combined
+
+    def _multi_energy_initial_state(self) -> np.ndarray:
+        parts = []
+        if not self._fluid_only:
+            parts.append(np.asarray(self.initial_state(), dtype=np.float64))
+        parts.extend(
+            np.asarray(estimator.initial_state(), dtype=np.float64)
+            for estimator in self.fluid_estimators.values()
+        )
+        coupling_initial = np.asarray(
+            getattr(self, "_multi_energy_coupling_state_initial", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        )
+        if coupling_initial.size:
+            parts.append(coupling_initial.copy())
+        return np.concatenate(parts) if parts else np.asarray([], dtype=np.float64)
+
+    def _multi_energy_endpoint_runtime(self, x: np.ndarray, *, with_jacobian: bool):
+        values = {}
+        jacobians = {}
+        for provider, measurements in self._multi_energy_endpoint_measurements.items():
+            if not measurements:
+                values[provider] = np.asarray([], dtype=np.float64)
+                if with_jacobian:
+                    state_slice = (
+                        self.electric_state_slice
+                        if provider == "electric"
+                        else self.fluid_state_slices[provider]
+                    )
+                    jacobians[provider] = csr_matrix((0, state_slice.stop - state_slice.start))
+                continue
+            if provider == "electric":
+                local_x = x[self.electric_state_slice]
+                values[provider] = self.evaluate(local_x, measurements)
+                if with_jacobian:
+                    jacobians[provider] = self.jacobian_sparse(local_x, measurements)
+            else:
+                estimator = self.fluid_estimators[provider]
+                local_x = x[self.fluid_state_slices[provider]]
+                values[provider] = estimator.evaluate(local_x, measurements)
+                if with_jacobian:
+                    jacobians[provider] = estimator.jacobian_sparse(local_x, measurements)
+        return values, jacobians
+
+    def _evaluate_multi_energy(self, x: np.ndarray) -> np.ndarray:
+        self._prepare_multi_energy_se_layout()
+        state = np.asarray(x, dtype=np.float64)
+        values = np.empty(self.multi_energy_measurement_count, dtype=np.float64)
+        if self.electric_measurement_count:
+            values[self.electric_measurement_slice] = self.evaluate(
+                state[self.electric_state_slice],
+                self.active_measurements,
+            )
+        for name, estimator in self.fluid_estimators.items():
+            values[self.fluid_measurement_slices[name]] = estimator.evaluate(
+                state[self.fluid_state_slices[name]],
+            )
+        endpoint_values, _endpoint_jacobians = self._multi_energy_endpoint_runtime(
+            state,
+            with_jacobian=False,
+        )
+        for plan in self.multi_energy_se_coupling_plans:
+            if plan.control_col >= 0:
+                t1_value = float(state[plan.control_col])
+                values[plan.prior_measurement_row] = t1_value
+            else:
+                t1_value = float(endpoint_values[plan.t1.provider][plan.t1.row])
+            t2_value = float(endpoint_values[plan.t2.provider][plan.t2.row])
+            values[plan.measurement_row] = (
+                abs(t2_value) * plan.t2_scale
+                - float(plan.coupling.efficiency) * abs(t1_value) * plan.t1_scale
+            ) / plan.normalization
+        return values
+
+    @staticmethod
+    def _append_multi_energy_endpoint_jacobian(
+        rows: List[int],
+        cols: List[int],
+        data: List[float],
+        *,
+        target_row: int,
+        endpoint: _MultiEnergySEEndpoint,
+        endpoint_jacobians: Dict[str, csr_matrix],
+        state_slice: slice,
+        scale: float,
+    ) -> None:
+        jacobian_row = endpoint_jacobians[endpoint.provider].getrow(endpoint.row)
+        start, stop = jacobian_row.indptr[0], jacobian_row.indptr[1]
+        if stop <= start:
+            return
+        rows.extend([target_row] * (stop - start))
+        cols.extend((state_slice.start + jacobian_row.indices[start:stop]).tolist())
+        data.extend((scale * jacobian_row.data[start:stop]).tolist())
+
+    def _multi_energy_jacobian_sparse(self, x: np.ndarray) -> csr_matrix:
+        self._prepare_multi_energy_se_layout()
+        state = np.asarray(x, dtype=np.float64)
+        local_blocks = []
+        if not self._fluid_only:
+            local_blocks.append(
+                self.jacobian_sparse(state[self.electric_state_slice], self.active_measurements)
+            )
+        local_blocks.extend(
+            estimator.jacobian_sparse(state[self.fluid_state_slices[name]])
+            for name, estimator in self.fluid_estimators.items()
+        )
+        local_jacobian = (
+            block_diag(local_blocks, format="csr")
+            if local_blocks
+            else csr_matrix((0, self.multi_energy_state_count), dtype=np.float64)
+        )
+        if local_jacobian.shape[1] < self.multi_energy_state_count:
+            local_jacobian = hstack(
+                (
+                    local_jacobian,
+                    csr_matrix(
+                        (
+                            local_jacobian.shape[0],
+                            self.multi_energy_state_count - local_jacobian.shape[1],
+                        ),
+                        dtype=np.float64,
+                    ),
+                ),
+                format="csr",
+            )
+        endpoint_values, endpoint_jacobians = self._multi_energy_endpoint_runtime(
+            state,
+            with_jacobian=True,
+        )
+        rows: List[int] = []
+        cols: List[int] = []
+        data: List[float] = []
+        added_row_offset = self.multi_energy_control_measurement_slice.start
+        for plan in self.multi_energy_se_coupling_plans:
+            local_row = plan.measurement_row - added_row_offset
+            if plan.control_col >= 0:
+                t1_value = float(state[plan.control_col])
+                prior_row = plan.prior_measurement_row - added_row_offset
+                rows.append(prior_row)
+                cols.append(plan.control_col)
+                data.append(1.0)
+            else:
+                t1_value = float(endpoint_values[plan.t1.provider][plan.t1.row])
+            t2_value = float(endpoint_values[plan.t2.provider][plan.t2.row])
+            t1_sign = 1.0 if t1_value >= 0.0 else -1.0
+            t2_sign = 1.0 if t2_value >= 0.0 else -1.0
+            t1_slice = (
+                self.electric_state_slice
+                if plan.t1.provider == "electric"
+                else self.fluid_state_slices[plan.t1.provider]
+            )
+            t2_slice = (
+                self.electric_state_slice
+                if plan.t2.provider == "electric"
+                else self.fluid_state_slices[plan.t2.provider]
+            )
+            if plan.control_col >= 0:
+                rows.append(local_row)
+                cols.append(plan.control_col)
+                data.append(
+                    -float(plan.coupling.efficiency)
+                    * t1_sign
+                    * plan.t1_scale
+                    / plan.normalization
+                )
+            else:
+                self._append_multi_energy_endpoint_jacobian(
+                    rows,
+                    cols,
+                    data,
+                    target_row=local_row,
+                    endpoint=plan.t1,
+                    endpoint_jacobians=endpoint_jacobians,
+                    state_slice=t1_slice,
+                    scale=(
+                        -float(plan.coupling.efficiency)
+                        * t1_sign
+                        * plan.t1_scale
+                        / plan.normalization
+                    ),
+                )
+            self._append_multi_energy_endpoint_jacobian(
+                rows,
+                cols,
+                data,
+                target_row=local_row,
+                endpoint=plan.t2,
+                endpoint_jacobians=endpoint_jacobians,
+                state_slice=t2_slice,
+                scale=t2_sign * plan.t2_scale / plan.normalization,
+            )
+        coupling_jacobian = coo_matrix(
+            (
+                np.asarray(data, dtype=np.float64),
+                (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)),
+            ),
+            shape=(
+                self.multi_energy_measurement_count - added_row_offset,
+                self.multi_energy_state_count,
+            ),
+        ).tocsr()
+        return vstack((local_jacobian, coupling_jacobian), format="csr")
+
+    def _apply_multi_energy_state_bounds(self, x: np.ndarray) -> np.ndarray:
+        if self._multi_energy_voltage_cols.size:
+            x[self._multi_energy_voltage_cols] = np.maximum(
+                x[self._multi_energy_voltage_cols],
+                self.voltage_floor,
+            )
+        if self._multi_energy_fluid_potential_cols.size:
+            x[self._multi_energy_fluid_potential_cols] = np.maximum(
+                x[self._multi_energy_fluid_potential_cols],
+                1.0e-12,
+            )
+        return x
+
+    def _multi_energy_measurement_residual(
+        self,
+        z_est: np.ndarray,
+        *,
+        measurement_rows: Optional[np.ndarray] = None,
+        out: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        rows = None if measurement_rows is None else np.asarray(measurement_rows, dtype=np.int64)
+        z = self._multi_energy_z if rows is None else self._multi_energy_z[rows]
+        residual = (
+            z - z_est
+            if out is None
+            else np.subtract(z, z_est, out=out)
+        )
+        mask = self._multi_energy_angle_mask if rows is None else self._multi_energy_angle_mask[rows]
+        if np.any(mask):
+            residual[mask] = (residual[mask] + np.pi) % (2.0 * np.pi) - np.pi
+        return residual
+
+    def _multi_energy_observability_analysis(
+        self,
+        x: Optional[np.ndarray] = None,
+        H=None,
+        measurement_rows: Optional[np.ndarray] = None,
+    ) -> ObservabilityResult:
+        self._prepare_multi_energy_se_layout()
+        state = self._multi_energy_initial_state() if x is None else np.asarray(x, dtype=np.float64)
+        rows = (
+            np.arange(self.multi_energy_measurement_count, dtype=np.int64)
+            if measurement_rows is None
+            else np.asarray(measurement_rows, dtype=np.int64)
+        )
+        jacobian = self._multi_energy_jacobian_sparse(state) if H is None else H
+        if jacobian.shape[0] != rows.size:
+            jacobian = jacobian[rows]
+        measurement_count = int(rows.size)
+        if matrix_is_empty(jacobian):
+            result = ObservabilityResult(
+                False,
+                0,
+                self.multi_energy_state_count,
+                measurement_count,
+                self.multi_energy_state_count,
+                np.asarray([], dtype=np.float64),
+                [],
+            )
+        else:
+            structural_rank = sparse_structural_rank(jacobian)
+            if structural_rank == self.multi_energy_state_count:
+                result = ObservabilityResult(
+                    True,
+                    self.multi_energy_state_count,
+                    self.multi_energy_state_count,
+                    measurement_count,
+                    0,
+                    np.asarray([], dtype=np.float64),
+                    [],
+                )
+            else:
+                rank, deficiency, singular_values, weak_states = observability_rank_details(
+                    jacobian,
+                    self.multi_energy_state_count,
+                )
+                result = ObservabilityResult(
+                    rank == self.multi_energy_state_count,
+                    rank,
+                    self.multi_energy_state_count,
+                    measurement_count,
+                    max(0, deficiency),
+                    singular_values,
+                    weak_states,
+                )
+        self.multi_energy_observability_result = result
+        self._multi_energy_observability_cache = {
+            "result": result,
+            "x": state.copy(),
+            "H": jacobian,
+            "measurement_rows": rows.copy(),
+        }
+        return result
+
+    def _estimate_multi_energy(
+        self,
+        *,
+        x0: Optional[np.ndarray] = None,
+        measurement_rows: Optional[np.ndarray] = None,
+        verbose: bool = False,
+        final_diagnostics: bool = True,
+        observability: Optional[ObservabilityResult] = None,
+    ) -> EstimateResult:
+        self._prepare_multi_energy_se_layout()
+        x = self._multi_energy_initial_state() if x0 is None else np.asarray(x0, dtype=np.float64).copy()
+        if x.size != self.multi_energy_state_count:
+            raise ValueError(
+                f"multi-energy initial state has {x.size} values; expected {self.multi_energy_state_count}"
+            )
+        rows = (
+            np.arange(self.multi_energy_measurement_count, dtype=np.int64)
+            if measurement_rows is None
+            else np.asarray(measurement_rows, dtype=np.int64)
+        )
+        observability = observability or self._multi_energy_observability_analysis(
+            x,
+            measurement_rows=rows,
+        )
+        cached_H = None
+        cache = self._multi_energy_observability_cache
+        if cache is not None and cache.get("result") is observability:
+            cached_x = np.asarray(cache.get("x"), dtype=np.float64)
+            cached_rows = np.asarray(cache.get("measurement_rows"), dtype=np.int64)
+            if (
+                cached_x.shape == x.shape
+                and np.array_equal(cached_x, x)
+                and np.array_equal(cached_rows, rows)
+            ):
+                cached_H = cache.get("H")
+
+        weight = self._multi_energy_weight[rows]
+        uniform_weight = self._uniform_weight(weight)
+        weights_are_uniform = uniform_weight is not None
+        weighted_residual = None if weights_are_uniform else np.empty_like(weight)
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=True)
+        normal_pattern = None
+        z_est = np.empty(rows.size, dtype=np.float64)
+        residual = np.empty_like(z_est)
+        candidate_z_est = np.empty_like(z_est)
+        candidate_residual = np.empty_like(z_est)
+        converged = False
+        objective = np.inf
+        residual_inf = np.inf
+        max_correction = np.inf
+        scaled_correction = np.inf
+        iteration = 0
+        H = None
+        gain = None
+        if verbose:
+            _print_iteration_header()
+
+        for iteration in range(1, self.max_iter + 1):
+            z_est[:] = self._evaluate_multi_energy(x)[rows]
+            self._multi_energy_measurement_residual(
+                z_est,
+                measurement_rows=rows,
+                out=residual,
+            )
+            objective = self._weighted_objective(weight, residual)
+            residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+            if iteration == 1 and cached_H is not None:
+                H = cached_H
+                cached_H = None
+            else:
+                H = self._multi_energy_jacobian_sparse(x)[rows]
+            if normal_pattern is None:
+                normal_pattern = _normal_equation_structural_pattern(H)
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            gain, rhs = build_normal_equations(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+                normal_pattern=normal_pattern,
+                assume_normal_pattern_matches=True,
+            )
+            dx, _factor_diag = normal_solver.solve(
+                gain,
+                rhs,
+                return_factor_diag=final_diagnostics,
+            )
+            if dx.size and not np.all(np.isfinite(dx)):
+                break
+            max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
+            scaled_correction = (
+                float(np.max(np.abs(dx) / np.maximum(1.0, np.abs(x))))
+                if dx.size
+                else 0.0
+            )
+            if scaled_correction < self.tol:
+                converged = True
+                if verbose:
+                    _print_iteration(iteration, objective, residual_inf, max_correction, None, True)
+                break
+
+            accepted = False
+            stationary = False
+            step_scale = 1.0
+            for _attempt in range(16):
+                candidate = self._apply_multi_energy_state_bounds(x + step_scale * dx)
+                candidate_z_est[:] = self._evaluate_multi_energy(candidate)[rows]
+                self._multi_energy_measurement_residual(
+                    candidate_z_est,
+                    measurement_rows=rows,
+                    out=candidate_residual,
+                )
+                candidate_objective = self._weighted_objective(weight, candidate_residual)
+                if np.isfinite(candidate_objective) and candidate_objective <= objective + 1.0e-12:
+                    relative_objective_change = abs(objective - candidate_objective) / max(1.0, abs(objective))
+                    x = candidate
+                    z_est, candidate_z_est = candidate_z_est, z_est
+                    residual, candidate_residual = candidate_residual, residual
+                    objective = candidate_objective
+                    residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+                    accepted = True
+                    stationary = bool(
+                        relative_objective_change < self.tol
+                        and scaled_correction < np.sqrt(self.tol)
+                    )
+                    break
+                step_scale *= 0.5
+            if not accepted:
+                break
+            if stationary:
+                converged = True
+                if verbose:
+                    _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, True)
+                break
+            if verbose:
+                _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, False)
+
+        z_est[:] = self._evaluate_multi_energy(x)[rows]
+        self._multi_energy_measurement_residual(
+            z_est,
+            measurement_rows=rows,
+            out=residual,
+        )
+        objective = self._weighted_objective(weight, residual)
+        residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+        if scaled_correction < self.tol:
+            converged = True
+        if final_diagnostics or H is None or gain is None:
+            H = self._multi_energy_jacobian_sparse(x)[rows]
+            normal_pattern = _normal_equation_structural_pattern(H)
+            if weighted_residual is not None:
+                np.multiply(weight, residual, out=weighted_residual)
+            gain, _rhs = build_normal_equations(
+                H,
+                residual,
+                weight,
+                uniform_weight=uniform_weight,
+                weights_are_uniform=weights_are_uniform,
+                weighted_residual=weighted_residual,
+                normal_pattern=normal_pattern,
+                assume_normal_pattern_matches=True,
+            )
+        result = EstimateResult(
+            converged=bool(converged and observability.observable),
+            iterations=int(iteration),
+            objective=float(objective),
+            max_correction=float(max_correction),
+            residual_inf=float(residual_inf),
+            x=x,
+            z_est=z_est.copy(),
+            residual=residual.copy(),
+            H=H,
+            gain=gain,
+            measurements=[],
+            observability=observability,
+            measurement_table=measurement_table_take(self._multi_energy_measurement_table, rows),
+        )
+        result.multi_energy_rows = rows.copy()
+        self.multi_energy_estimate_result = result
+        return result
+
+    @staticmethod
+    def _local_observability_result(H, state_count: int, measurement_count: int) -> ObservabilityResult:
+        if state_count == 0:
+            return ObservabilityResult(True, 0, 0, measurement_count, 0, np.asarray([]), [])
+        rank, deficiency, singular_values, weak_states = observability_rank_details(H, state_count)
+        return ObservabilityResult(
+            rank == state_count,
+            rank,
+            state_count,
+            measurement_count,
+            max(0, deficiency),
+            singular_values,
+            weak_states,
+        )
+
+    def _multi_energy_local_result(
+        self,
+        global_result: EstimateResult,
+        measurement_slice: slice,
+        state_slice: slice,
+        measurement_table: MeasurementTable,
+    ) -> EstimateResult:
+        selected_rows = np.asarray(
+            getattr(
+                global_result,
+                "multi_energy_rows",
+                np.arange(self.multi_energy_measurement_count, dtype=np.int64),
+            ),
+            dtype=np.int64,
+        )
+        selected_positions = np.flatnonzero(
+            (selected_rows >= measurement_slice.start)
+            & (selected_rows < measurement_slice.stop)
+        )
+        local_rows = selected_rows[selected_positions] - measurement_slice.start
+        local_table = measurement_table_take(measurement_table, local_rows)
+        H = global_result.H[selected_positions, state_slice].tocsr()
+        weights = np.asarray(local_table.weight, dtype=np.float64)
+        gain, _rhs = build_normal_equations(
+            H,
+            global_result.residual[selected_positions],
+            weights,
+        )
+        observability = self._local_observability_result(
+            H,
+            state_slice.stop - state_slice.start,
+            int(selected_positions.size),
+        )
+        residual = global_result.residual[selected_positions].copy()
+        return EstimateResult(
+            converged=bool(global_result.converged and observability.observable),
+            iterations=global_result.iterations,
+            objective=self._weighted_objective(weights, residual),
+            max_correction=global_result.max_correction,
+            residual_inf=float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0,
+            x=global_result.x[state_slice].copy(),
+            z_est=global_result.z_est[selected_positions].copy(),
+            residual=residual,
+            H=H,
+            gain=gain,
+            measurements=[],
+            observability=observability,
+            measurement_table=local_table,
+        )
+
+    def _build_result_from_table(
+        self,
+        result: EstimateResult,
+        *,
+        bad_items: Sequence[BadDataItem],
+        normalized_residual: np.ndarray,
+        result_mode: str,
+        all_measurement_table: MeasurementTable,
+    ) -> Optional[SEResult]:
+        mode = normalize_seresult_result_mode(result_mode)
+        if mode in {"none", "array"}:
+            return None
+        if mode == "summary":
+            return build_seresult_summary_from_table(
+                result,
+                bad_items=bad_items,
+                all_measurement_table=all_measurement_table,
+            )
+        return build_seresult_full_from_table(
+            result,
+            bad_items=bad_items,
+            normalized_residual=normalized_residual,
+            all_measurement_table=all_measurement_table,
+        )
+
+    def _commit_multi_energy_results(
+        self,
+        result: EstimateResult,
+        *,
+        result_mode: str,
+        skip_bad_data: bool,
+        threshold: float,
+        removed_bad_data: Optional[Sequence[BadDataItem]] = None,
+    ) -> Optional[SEResult]:
+        self.multi_energy_estimate_result = result
+        self.estimate_result = result
+        self.observability_result = result.observability
+        self.multi_energy_observability_result = result.observability
+        self.removed_bad_data = list(removed_bad_data or ())
+        if skip_bad_data:
+            bad_items = []
+            normalized = np.asarray([], dtype=np.float64)
+        else:
+            bad_items, normalized = self.identify_bad_data(result, threshold)
+        self.bad_items = list(bad_items)
+        self.normalized_residual = np.asarray(normalized, dtype=np.float64)
+        self.se_result = self._build_result_from_table(
+            result,
+            bad_items=bad_items,
+            normalized_residual=self.normalized_residual,
+            result_mode=result_mode,
+            all_measurement_table=self._multi_energy_measurement_table,
+        )
+
+        electric_se_result = None
+        if not self._fluid_only:
+            electric_table = self._measurement_table(self.active_measurements)
+            electric_estimate = self._multi_energy_local_result(
+                result,
+                self.electric_measurement_slice,
+                self.electric_state_slice,
+                electric_table,
+            )
+            self.electric_estimate_result = electric_estimate
+            electric_se_result = self._build_result_from_table(
+                electric_estimate,
+                bad_items=[],
+                normalized_residual=np.asarray([], dtype=np.float64),
+                result_mode=result_mode,
+                all_measurement_table=electric_table,
+            )
+            self.electric_se_result = electric_se_result
+
+        self.fluid_se_rc = {}
+        self.fluid_se_errors = {}
+        for name, estimator in self.fluid_estimators.items():
+            local_result = self._multi_energy_local_result(
+                result,
+                self.fluid_measurement_slices[name],
+                self.fluid_state_slices[name],
+                estimator.active_measurements.table,
+            )
+            estimator.result = local_result
+            estimator.observability = local_result.observability
+            estimator._write_back_state(local_result.x)
+            if skip_bad_data:
+                estimator.bad_data = []
+                estimator.normalized_residual = np.asarray([], dtype=np.float64)
+            else:
+                local_bad_data, local_normalized = self.identify_bad_data(
+                    local_result,
+                    threshold,
+                )
+                estimator.bad_data = local_bad_data
+                estimator.normalized_residual = local_normalized
+            estimator.se_result = self._build_result_from_table(
+                local_result,
+                bad_items=estimator.bad_data,
+                normalized_residual=estimator.normalized_residual,
+                result_mode=result_mode,
+                all_measurement_table=estimator.active_measurements.table,
+            )
+            self.fluid_se_rc[name] = 0 if local_result.converged else 1
+            if not local_result.converged:
+                self.fluid_se_errors[name] = (
+                    f"fluid state estimation residual={float(local_result.residual_inf):.6e}"
+                )
+
+        self._build_multi_energy_result(electric_se_result)
+        return None if self._fluid_only else self.se_result
+
+    def _run_multi_energy(
+        self,
+        *,
+        result_mode: str,
+        remove_bad_data: bool,
+        bad_threshold: Optional[float],
+        max_remove: Optional[int],
+        skip_bad_data: bool,
+        verbose: bool,
+        final_diagnostics: bool,
+        observability: Optional[ObservabilityResult],
+    ) -> Optional[SEResult]:
+        threshold = self.params.bad_threshold if bad_threshold is None else float(bad_threshold)
+        removed: List[BadDataItem] = []
+        if remove_bad_data:
+            result, removed = self._estimate_multi_energy_with_bad_data_removal(
+                threshold=threshold,
+                max_remove=max_remove,
+                verbose=verbose,
+                observability=observability,
+            )
+        else:
+            result = self._estimate_multi_energy(
+                verbose=verbose,
+                final_diagnostics=final_diagnostics or not skip_bad_data,
+                observability=observability,
+            )
+        return self._commit_multi_energy_results(
+            result,
+            result_mode=result_mode,
+            skip_bad_data=skip_bad_data,
+            threshold=threshold,
+            removed_bad_data=removed,
+        )
+
+    def _estimate_multi_energy_with_bad_data_removal(
+        self,
+        *,
+        threshold: float,
+        max_remove: Optional[int],
+        verbose: bool,
+        observability: Optional[ObservabilityResult] = None,
+    ) -> Tuple[EstimateResult, List[BadDataItem]]:
+        remove_limit = self.params.bad_max_remove if max_remove is None else int(max_remove)
+        rows = np.arange(self.multi_energy_measurement_count, dtype=np.int64)
+        x0 = None
+        result = None
+        removed: List[BadDataItem] = []
+        current_observability = observability
+        while True:
+            result = self._estimate_multi_energy(
+                x0=x0,
+                measurement_rows=rows,
+                verbose=verbose,
+                final_diagnostics=True,
+                observability=current_observability,
+            )
+            bad_items, _normalized = self.identify_bad_data(result, threshold)
+            removable = []
+            for item in bad_items:
+                global_row = int(rows[int(item.row_pos)])
+                if global_row < self.multi_energy_control_measurement_slice.start:
+                    removable.append((item, global_row))
+            if not removable or len(removed) >= remove_limit:
+                break
+            worst, global_row = removable[0]
+            trial_rows = rows[rows != global_row]
+            trial_observability = self._multi_energy_observability_analysis(
+                result.x,
+                measurement_rows=trial_rows,
+            )
+            if not trial_observability.observable:
+                break
+            removed.append(worst)
+            rows = trial_rows
+            x0 = result.x
+            current_observability = trial_observability
+        if result is None:
+            raise RuntimeError("multi-energy bad-data estimation did not start")
+        return result, removed
 
     def _prepare_uncoupled_direct_delegate(self, side: str, profile_start: float) -> "HybridStateEstimator":
         stage_start = time.perf_counter()
@@ -6238,6 +7400,8 @@ class HybridStateEstimator:
         normal_matrix: Optional[np.ndarray] = None,
         normal_factor_diag: Optional[np.ndarray] = None,
     ) -> ObservabilityResult:
+        if self.fluid_estimators and measurements is None and normal_matrix is None and normal_factor_diag is None:
+            return self._multi_energy_observability_analysis(x=x, H=H)
         delegate = self._delegate()
         if delegate is not None:
             return delegate.observability_analysis(x, measurements, H, normal_matrix, normal_factor_diag)
@@ -6315,6 +7479,13 @@ class HybridStateEstimator:
     ) -> EstimateResult:
         if not self._prepared:
             self.prepare()
+        if self.fluid_estimators and measurements is None:
+            return self._estimate_multi_energy(
+                x0=x0,
+                verbose=verbose,
+                final_diagnostics=final_diagnostics,
+                observability=observability,
+            )
         solve_profile_start = time.perf_counter() if self.profile_enabled else None
         delegate = self._delegate()
         if delegate is not None:
@@ -6618,6 +7789,21 @@ class HybridStateEstimator:
     ) -> Optional[SEResult]:
         """Build the structured state-estimation result snapshot after WLS."""
         mode = normalize_seresult_result_mode(result_mode)
+        if self.fluid_estimators and result is self.multi_energy_estimate_result:
+            if bad_items is None or normalized_residual is None:
+                computed_bad_items, computed_normalized = self.identify_bad_data(result, threshold)
+                if bad_items is None:
+                    bad_items = computed_bad_items
+                if normalized_residual is None:
+                    normalized_residual = computed_normalized
+            self.se_result = self._build_result_from_table(
+                result,
+                bad_items=bad_items,
+                normalized_residual=np.asarray(normalized_residual, dtype=np.float64),
+                result_mode=mode,
+                all_measurement_table=self._multi_energy_measurement_table,
+            )
+            return self.se_result
         if mode in ("none", "array"):
             self.se_result = None
             return None
@@ -6681,6 +7867,19 @@ class HybridStateEstimator:
         final_diagnostics: bool = True,
         observability: Optional[ObservabilityResult] = None,
     ) -> Optional[SEResult]:
+        if not self._prepared:
+            self.prepare()
+        if self.fluid_estimators:
+            return self._run_multi_energy(
+                result_mode=result_mode,
+                remove_bad_data=remove_bad_data,
+                bad_threshold=bad_threshold,
+                max_remove=max_remove,
+                skip_bad_data=skip_bad_data,
+                verbose=verbose,
+                final_diagnostics=final_diagnostics,
+                observability=observability,
+            )
         electric_result = self._run_electric(
             result_mode=result_mode,
             remove_bad_data=remove_bad_data,
@@ -6793,20 +7992,50 @@ class HybridStateEstimator:
                 )
 
     def _build_multi_energy_coupling_results(self) -> List[object]:
+        plan_by_key = {
+            (plan.coupling.table_name, int(plan.coupling.idx)): plan
+            for plan in self.multi_energy_se_coupling_plans
+        }
+        endpoint_values = {}
+        if self.multi_energy_estimate_result is not None and self._multi_energy_se_layout_ready:
+            endpoint_values, _endpoint_jacobians = self._multi_energy_endpoint_runtime(
+                self.multi_energy_estimate_result.x,
+                with_jacobian=False,
+            )
         results = []
         for coupling in self.multi_energy.couplings:
+            plan = plan_by_key.get((coupling.table_name, int(coupling.idx)))
             domains_ready = all(
                 terminal.domain in {"ac", "dc"}
                 or terminal.domain in self.fluid_estimators
                 for terminal in (coupling.t1, coupling.t2)
             )
-            status = (
-                "inactive"
-                if not coupling.active
-                else "associated"
-                if domains_ready
-                else "unavailable"
-            )
+            t1_value = None
+            t2_value = None
+            residual = None
+            if not coupling.active:
+                status = "inactive"
+            elif plan is not None and endpoint_values:
+                t1_value = (
+                    float(self.multi_energy_estimate_result.x[plan.control_col])
+                    if plan.control_col >= 0
+                    else float(endpoint_values[plan.t1.provider][plan.t1.row])
+                )
+                t2_value = float(endpoint_values[plan.t2.provider][plan.t2.row])
+                residual = (
+                    abs(t2_value) * plan.t2_scale
+                    - float(coupling.efficiency) * abs(t1_value) * plan.t1_scale
+                )
+                normalized_tolerance = max(
+                    10.0 * self.tol,
+                    3.0 / np.sqrt(max(self.multi_energy_coupling_weight, 1.0)),
+                )
+                tolerance = max(1.0e-7, normalized_tolerance * plan.normalization)
+                status = "balanced" if abs(residual) <= tolerance else "mismatch"
+            elif domains_ready:
+                status = "associated"
+            else:
+                status = "unavailable"
             results.append(
                 SimpleNamespace(
                     coupling=coupling,
@@ -6817,6 +8046,9 @@ class HybridStateEstimator:
                     control_type=coupling.control_type,
                     efficiency=coupling.efficiency,
                     energy_factor=coupling.energy_factor,
+                    t1_value=t1_value,
+                    t2_value=t2_value,
+                    residual=residual,
                     status=status,
                 )
             )
@@ -6866,6 +8098,13 @@ class HybridStateEstimator:
         max_remove: Optional[int] = None,
         verbose: bool = False,
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
+        if self.fluid_estimators:
+            threshold_value = self.params.bad_threshold if threshold is None else float(threshold)
+            return self._estimate_multi_energy_with_bad_data_removal(
+                threshold=threshold_value,
+                max_remove=max_remove,
+                verbose=verbose,
+            )
         delegate = self._delegate()
         if delegate is not None:
             return delegate.estimate_with_bad_data_removal(

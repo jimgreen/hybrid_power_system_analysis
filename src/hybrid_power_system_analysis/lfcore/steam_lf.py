@@ -63,7 +63,12 @@ class SteamPowerFlowCalc(FluidPowerFlowCalc):
             result.j_temperature = float(self._steam_temperature([j_enthalpy])[0])
             result.heat_loss = float(abs(self.edge_flow[edge_pos]) * abs(i_enthalpy - j_enthalpy))
         for source_pos, source in enumerate(net.sources):
-            result = self.lf_result.sources[source.name]
+            collection = (
+                self.lf_result.storages
+                if bool(net.source_is_storage[source_pos])
+                else self.lf_result.sources
+            )
+            result = collection[source.name]
             result.enthalpy = float(net.source_enthalpy_set[source_pos])
             result.temperature = float(self._steam_temperature([net.source_enthalpy_set[source_pos]])[0])
             result.heat_power = float(

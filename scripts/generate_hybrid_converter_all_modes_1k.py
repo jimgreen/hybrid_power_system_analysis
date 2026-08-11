@@ -75,9 +75,6 @@ def _extended_case_text(ac_node_count: int, dc_node_count: int) -> str:
         raise ValueError("AC node count must be at least 22")
     if dc_node_count < 46:
         raise ValueError("DC node count must be at least 46")
-    if ac_node_count + dc_node_count <= 1000:
-        raise ValueError("combined AC/DC node count must exceed 1000")
-
     text = BASE_CASE.read_text(encoding="utf-8")
 
     ac_nodes = [

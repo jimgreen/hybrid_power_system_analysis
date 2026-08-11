@@ -717,4 +717,6 @@
 # 715 m_00715 HydroSource     交流电制氢-1_氢能设备端氢源    FLOW               1     1           0.2
 # 716 m_00716 HydroSource     交流电制氢-1_氢能设备端氢源    PRESSURE           1     1             3
 # 717 m_00717 HydroLoad       直流燃料电池-1_氢能设备端氢荷   PRESSURE           1     1   2.987881798
+# 718 m_00718 HydroStorage    集装格式储氢罐-1             FLOW               1     1             0
+# 719 m_00719 HydroStorage    集装格式储氢罐-1             PRESSURE           1     1    29.9394703
 </Measurement>

@@ -144,6 +144,11 @@ class FluidSource:
 
 
 @dataclass(slots=True)
+class FluidStorage(FluidSource):
+    """Bidirectional source-equivalent storage; positive flow discharges to the node."""
+
+
+@dataclass(slots=True)
 class FluidLoad:
     idx: int
     name: str
@@ -200,6 +205,7 @@ class FluidNetwork:
     medium: FluidMedium = field(default_factory=FluidMedium)
     nodes: List[FluidNode] = field(default_factory=list)
     sources: List[FluidSource] = field(default_factory=list)
+    storages: List[FluidStorage] = field(default_factory=list)
     loads: List[FluidLoad] = field(default_factory=list)
     pipes: List[FluidEdge] = field(default_factory=list)
     valves: List[FluidEdge] = field(default_factory=list)
@@ -209,6 +215,10 @@ class FluidNetwork:
     source: Optional[Path] = None
 
     def prepare(self) -> "FluidNetwork":
+        known_sources = {id(item) for item in self.sources}
+        self.sources.extend(
+            item for item in self.storages if id(item) not in known_sources
+        )
         live_nodes = [node for node in self.nodes if int(node.run_stat) == 1]
         if not live_nodes:
             raise RuntimeError(f"{self.prefix} network has no live nodes")
@@ -301,6 +311,9 @@ class FluidNetwork:
                 if int(item.run_stat) == 1 and int(item.node) in self.node_pos_by_idx
             ]
             self.heat_exchangers = []
+        self.storages = [
+            item for item in self.sources if isinstance(item, FluidStorage)
+        ]
         all_edges = [*self.pipes, *self.valves, *self.controllers]
         self.edges = [
             edge
@@ -526,8 +539,18 @@ class FluidNetwork:
             self.load_supply_node_pos = self.load_node_pos
             self.load_return_node_pos = self.load_node_pos
         self.source_name = np.asarray([item.name for item in self.sources], dtype=object)
+        self.source_is_storage = np.asarray(
+            [isinstance(item, FluidStorage) for item in self.sources],
+            dtype=bool,
+        )
+        self.storage_source_pos = np.flatnonzero(self.source_is_storage).astype(np.int64)
+        self.storage_name = self.source_name[self.storage_source_pos]
         self.load_name = np.asarray([item.name for item in self.loads], dtype=object)
         self.source_pos_by_name = {str(name): pos for pos, name in enumerate(self.source_name.tolist())}
+        self.storage_pos_by_name = {
+            str(self.source_name[pos]): int(pos)
+            for pos in self.storage_source_pos.tolist()
+        }
         self.load_pos_by_name = {str(name): pos for pos, name in enumerate(self.load_name.tolist())}
         self.source_control_type = np.asarray(
             [normalize_control_type(item.control_type, FLOW_CONTROL) for item in self.sources], dtype=object
@@ -861,6 +884,35 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
     return sources
 
 
+def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
+    storages = []
+    for row in getattr(model, f"{prefix}Storage", ()) or ():
+        max_charge_flow = abs(_float(row, "max_charge_flow", np.inf))
+        max_discharge_flow = abs(_float(row, "max_discharge_flow", np.inf))
+        storages.append(
+            FluidStorage(
+                idx=_int(row, "idx"),
+                name=_text(row, "name", f"{prefix.lower()}_storage_{_int(row, 'idx')}"),
+                node=_optional_int(row, "node"),
+                control_type=normalize_control_type(
+                    _text(row, "control_type", FLOW_CONTROL),
+                    FLOW_CONTROL,
+                ),
+                pressure_set=_float(row, "pressure_set", _float(row, "p_set", 1.0)),
+                flow_set=_float(row, "flow_set", _float(row, "mass_flow", 0.0)),
+                alpha=_float(row, "alpha", 1.0),
+                flow_min=_float(row, "flow_min", -max_charge_flow),
+                flow_max=_float(row, "flow_max", max_discharge_flow),
+                supply_temperature=_float(row, "supply_temperature", 80.0 if thermal else 20.0),
+                enthalpy_set=_float(row, "enthalpy_set", _float(row, "h_set", 3000.0)),
+                run_stat=_int(row, "run_stat", 1),
+                supply_node=_optional_int(row, "supply_node"),
+                return_node=_optional_int(row, "return_node"),
+            )
+        )
+    return storages
+
+
 def _parse_loads(model, prefix: str) -> List[FluidLoad]:
     loads = []
     for row in getattr(model, f"{prefix}Load", ()) or ():
@@ -978,6 +1030,7 @@ def build_fluid_network_from_model(
 ) -> FluidNetwork:
     controller_suffix = controller_suffix or ("Pump" if thermal else "Compressor")
     sources = _parse_sources(model, prefix, thermal)
+    storages = _parse_storages(model, prefix, thermal)
     loads = _parse_loads(model, prefix)
     heat_exchangers = _parse_heat_exchangers(model) if thermal else []
     network = FluidNetwork(
@@ -988,6 +1041,7 @@ def build_fluid_network_from_model(
         medium=_medium_from_model(model, prefix, thermal, steam),
         nodes=_parse_nodes(model, prefix, thermal),
         sources=sources,
+        storages=storages,
         loads=loads,
         pipes=_parse_edges(model, prefix, "Pipe", "pipe", PASSIVE_CONTROL),
         valves=_parse_edges(model, prefix, "Valve", "valve", PASSIVE_CONTROL),
@@ -1000,7 +1054,9 @@ def build_fluid_network_from_model(
         ),
         heat_exchangers=heat_exchangers,
         explicit_return=(
-            _validate_heat_ports(sources, loads, heat_exchangers) if thermal else False
+            _validate_heat_ports([*sources, *storages], loads, heat_exchangers)
+            if thermal
+            else False
         ),
         source=source,
     )

@@ -311,8 +311,8 @@
 </HydroCompressor>
 
 <HydroStorage>
-@    idx    name              dev_type                   node    run_stat
-#    1      集装格式储氢罐-1    hydrogen-tank-container    3       1
+@    idx    name              dev_type                   node    control_type    flow_set    alpha    flow_min    flow_max    run_stat
+#    1      集装格式储氢罐-1    hydrogen-tank-container    3       FLOW            0.0         1.0      -2.0        2.0         1
 </HydroStorage>
 
 <AcE2Hydro>

@@ -1,4 +1,6 @@
 from pathlib import Path
+import importlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,6 +9,94 @@ from model.meas_model import Measurement
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _fluid_storage_case(case_type):
+    if case_type == "heat":
+        from heat_lf import HeatPowerFlowCalc
+        from heat_se import HeatStateEstimator
+        from model.heat_model import build_heat_network_from_model
+
+        return (
+            "Heat",
+            "heat_net_3.e",
+            2.0,
+            build_heat_network_from_model,
+            HeatPowerFlowCalc,
+            HeatStateEstimator,
+        )
+    if case_type == "gas":
+        from gas_lf import GasPowerFlowCalc
+        from gas_se import GasStateEstimator
+        from model.gas_model import build_gas_network_from_model
+
+        return (
+            "Gas",
+            "gas_net_3.e",
+            1.0,
+            build_gas_network_from_model,
+            GasPowerFlowCalc,
+            GasStateEstimator,
+        )
+    if case_type == "hydro":
+        from hydro_lf import HydroPowerFlowCalc
+        from hydro_se import HydroStateEstimator
+        from model.hydro_model import build_hydro_network_from_model
+
+        return (
+            "Hydro",
+            "hydro_net_3.e",
+            0.5,
+            build_hydro_network_from_model,
+            HydroPowerFlowCalc,
+            HydroStateEstimator,
+        )
+
+    from model.steam_model import build_steam_network_from_model
+    from steam_lf import SteamPowerFlowCalc
+    from steam_se import SteamStateEstimator
+
+    return (
+        "Steam",
+        "steam_net_5.e",
+        1.0,
+        build_steam_network_from_model,
+        SteamPowerFlowCalc,
+        SteamStateEstimator,
+    )
+
+
+def _model_with_storage(case_type, storage_flow):
+    from efile_read import efile_factory_from_file
+
+    prefix, case_name, *_rest = _fluid_storage_case(case_type)
+    model = efile_factory_from_file(
+        ROOT / "data" / "model" / case_type / case_name
+    )
+    storage_name = f"{case_type}_storage"
+    setattr(
+        model,
+        f"{prefix}Storage",
+        [
+            SimpleNamespace(
+                idx=1,
+                name=storage_name,
+                node=3,
+                control_type="FLOW",
+                pressure_set=1.0,
+                flow_set=float(storage_flow),
+                alpha=1.0,
+                flow_min=-1.0,
+                flow_max=1.0,
+                supply_temperature=87.0,
+                enthalpy_set=3110.0,
+                run_stat=1,
+                supply_node=None,
+                return_node=None,
+            )
+        ],
+    )
+    return model, storage_name
 
 
 @pytest.mark.parametrize(
@@ -62,6 +152,88 @@ def test_compressible_fluid_load_flow_converges_and_balances(
     np.add.at(node_balance, network.load_node_pos, -network.load_flow_set)
     node_balance += network.incidence @ calc.edge_flow
     np.testing.assert_allclose(node_balance, 0.0, rtol=0.0, atol=1e-9)
+
+
+@pytest.mark.parametrize("case_type", ("heat", "gas", "hydro", "steam"))
+@pytest.mark.parametrize("storage_flow", (0.1, -0.1))
+def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_flow):
+    from model.fluid_model import PRESSURE_CONTROL
+    from model.meas_type import DEVICE_TYPE_CODES
+    from scripts.check_fluid_scale_lf_se import build_measurements_from_lf
+
+    (
+        prefix,
+        _case_name,
+        base_source_flow,
+        build_network,
+        calc_class,
+        estimator_class,
+    ) = _fluid_storage_case(case_type)
+    model, storage_name = _model_with_storage(case_type, storage_flow)
+    network = build_network(model)
+
+    assert len(network.storages) == 1
+    assert network.storage_source_pos.tolist() == [1]
+    assert network.source_is_storage.tolist() == [False, True]
+    assert network.storage_pos_by_name == {storage_name: 1}
+    assert DEVICE_TYPE_CODES[f"{prefix}Storage"] > 0
+
+    calc = calc_class(
+        network,
+        tol=1e-10,
+        max_iter=100,
+        result_mode="full",
+    )
+    assert calc.run() == 0
+    assert calc.converged
+    np.testing.assert_allclose(
+        calc.source_flow,
+        [base_source_flow - storage_flow, storage_flow],
+        rtol=0.0,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(calc.lf_result.arrays["storage_flow"], [storage_flow])
+    assert storage_name in calc.lf_result.storages
+    assert storage_name not in calc.lf_result.sources
+    assert calc.lf_result.storages[storage_name].flow == pytest.approx(storage_flow)
+
+    node_balance = (
+        network.fixed_injection
+        - network.demand
+        + np.asarray(network.incidence @ calc.edge_flow, dtype=np.float64)
+    )
+    pressure_sources = np.flatnonzero(network.source_control_type == PRESSURE_CONTROL)
+    for source_pos in pressure_sources.tolist():
+        flow = float(calc.source_flow[source_pos])
+        if network.thermal and network.source_explicit_return[source_pos]:
+            node_balance[network.source_return_node_pos[source_pos]] -= flow
+            node_balance[network.source_supply_node_pos[source_pos]] += flow
+        else:
+            node_balance[network.source_node_pos[source_pos]] += flow
+    np.testing.assert_allclose(node_balance, 0.0, rtol=0.0, atol=1e-9)
+
+    measurements = build_measurements_from_lf(network, calc)
+    storage_measurements = [
+        measurement
+        for measurement in measurements
+        if measurement.device_type == f"{prefix}Storage"
+    ]
+    assert len(storage_measurements) == 1
+    assert storage_measurements[0].value == pytest.approx(storage_flow)
+
+    estimator = estimator_class(
+        network,
+        measurements=measurements,
+        flat_start=True,
+        tol=1e-8,
+        max_iter=100,
+    )
+    assert estimator.run() == 0
+    assert estimator.result.converged
+    assert not any(
+        measurement.device_type == f"{prefix}Storage"
+        for measurement, _reason in estimator.prefiltered_measurements
+    )
 
 
 def test_heat_load_flow_solves_hydraulics_supply_and_return_temperature():
@@ -121,6 +293,96 @@ def test_fixed_heat_exchanger_uses_secondary_temperature_anchor():
     assert exchanger.primary_out_temperature == pytest.approx(
         exchanger.primary_in_temperature - 20.0 / network.medium.heat_capacity
     )
+
+
+@pytest.mark.parametrize(
+    ("case_type", "case_name"),
+    (("heat", "heat_net_3.e"), ("steam", "steam_net_5.e")),
+)
+def test_joint_fluid_lf_jacobian_matches_finite_difference(case_type, case_name):
+    if case_type == "heat":
+        from heat_lf import HeatPowerFlowCalc as PowerFlowCalc
+        from model.heat_model import load_heat_network_from_e_file as load_network
+    else:
+        from model.steam_model import load_steam_network_from_e_file as load_network
+        from steam_lf import SteamPowerFlowCalc as PowerFlowCalc
+
+    case_file = ROOT / "data" / "model" / case_type / case_name
+    calc = PowerFlowCalc(
+        load_network(case_file),
+        tol=1e-12,
+        max_iter=100,
+        result_mode="array",
+    )
+    assert calc.run() == 0
+
+    state = calc.x.copy()
+    analytic = calc.get_jacobi(state).toarray()
+    numeric = np.zeros_like(analytic)
+    for column in range(state.size):
+        step = 1e-6 * max(1.0, abs(float(state[column])))
+        upper = state.copy()
+        lower = state.copy()
+        upper[column] += step
+        lower[column] -= step
+        numeric[:, column] = (calc.get_f(upper) - calc.get_f(lower)) / (2.0 * step)
+
+    cross = analytic[calc.hydraulic_state_count :, : calc.hydraulic_state_count]
+    assert np.max(np.abs(cross)) > 0.0
+    np.testing.assert_allclose(analytic, numeric, rtol=2e-6, atol=2e-7)
+
+
+@pytest.mark.parametrize(
+    ("case_type", "case_name"),
+    (
+        ("heat", "heat_net_3.e"),
+        ("gas", "gas_net_3.e"),
+        ("hydro", "hydro_net_3.e"),
+        ("steam", "steam_net_5.e"),
+    ),
+)
+def test_fluid_residual_only_path_skips_sparse_jacobian_build(
+    monkeypatch,
+    case_type,
+    case_name,
+):
+    if case_type == "heat":
+        from heat_lf import HeatPowerFlowCalc as PowerFlowCalc
+        from model.heat_model import load_heat_network_from_e_file as load_network
+    elif case_type == "gas":
+        from gas_lf import GasPowerFlowCalc as PowerFlowCalc
+        from model.gas_model import load_gas_network_from_e_file as load_network
+    elif case_type == "hydro":
+        from hydro_lf import HydroPowerFlowCalc as PowerFlowCalc
+        from model.hydro_model import load_hydro_network_from_e_file as load_network
+    else:
+        from model.steam_model import load_steam_network_from_e_file as load_network
+        from steam_lf import SteamPowerFlowCalc as PowerFlowCalc
+
+    calc = PowerFlowCalc(
+        load_network(ROOT / "data" / "model" / case_type / case_name),
+        result_mode="array",
+    ).prepare()
+    state = calc.x.copy()
+    expected, jacobian = calc._build_newton_system(state, return_jacobian=True)
+    assert jacobian is not None
+
+    fluid_module = importlib.import_module(calc.__class__.__mro__[1].__module__)
+
+    def fail_sparse_build(*_args, **_kwargs):
+        raise AssertionError("residual-only evaluation must not build sparse Jacobian data")
+
+    monkeypatch.setattr(fluid_module, "coo_matrix", fail_sparse_build)
+    monkeypatch.setattr(fluid_module, "bmat", fail_sparse_build)
+    monkeypatch.setattr(calc, "_edge_flow_jacobian", fail_sparse_build)
+
+    actual, residual_jacobian = calc._build_newton_system(
+        state,
+        return_jacobian=False,
+    )
+
+    assert residual_jacobian is None
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_explicit_return_heat_network_solves_dual_port_devices_and_four_port_exchanger():

@@ -168,6 +168,8 @@ class FluidStateEstimator:
             return int(net.edge_pos_by_name.get(name, -1))
         if device_type == f"{prefix}Source":
             return int(net.source_pos_by_name.get(name, -1))
+        if device_type == f"{prefix}Storage":
+            return int(net.storage_pos_by_name.get(name, -1))
         if device_type == f"{prefix}Load":
             return int(net.load_pos_by_name.get(name, -1))
         if net.thermal and device_type == "HeatExchanger":
@@ -180,6 +182,10 @@ class FluidStateEstimator:
         if self.network.steam:
             return "SteamPressureReducer"
         return f"{self.network.prefix}Compressor"
+
+    def _source_device_types(self) -> frozenset[str]:
+        prefix = self.network.prefix
+        return frozenset((f"{prefix}Source", f"{prefix}Storage"))
 
     def _install_measurement_runtime(self) -> None:
         prefix = self.network.prefix
@@ -467,7 +473,7 @@ class FluidStateEstimator:
                         T_TO=self._steam_temperature([h_to])[0],
                     )
                 values[row] = edge_values.get(meas_type, np.nan)
-            elif device_type == f"{net.prefix}Source":
+            elif device_type in self._source_device_types():
                 supply_node = int(net.source_supply_node_pos[pos])
                 return_node = int(net.source_return_node_pos[pos])
                 if meas_type == "FLOW":
@@ -756,7 +762,7 @@ class FluidStateEstimator:
                             )
                             append_sparse_row(row, flow_derivative.getrow(pos), flow_scale)
                 continue
-            if device_type == f"{net.prefix}Source":
+            if device_type in self._source_device_types():
                 supply_node = int(net.source_supply_node_pos[pos])
                 return_node = int(net.source_return_node_pos[pos])
                 if meas_type == "FLOW":

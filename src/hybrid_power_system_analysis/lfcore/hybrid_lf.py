@@ -49,6 +49,7 @@ from gas_lf import GasPowerFlowCalc
 from heat_lf import HeatPowerFlowCalc
 from hydro_lf import HydroPowerFlowCalc
 from steam_lf import SteamPowerFlowCalc
+from scipy.sparse import block_diag
 try:
     from _sparse_pattern import (
         apply_raw_sum_plan,
@@ -921,12 +922,12 @@ class HybridPowerFlowCalc:
     全局稀疏 Jacobian，并对完整线性方程组做一次联合求解。
 
     Hybrid LF 继承 AC/DC 两侧的控制语义：同一 AC 或 DC 母线上若存在
-    多个定压设备，可在 LF 中做代表控制方程和功率分摊。Hybrid SE 目前
-    仍以子估计器显式状态为主，不强制复制这套硬聚合布局。
+    多个定压设备，可在 LF 中做代表控制方程和功率分摊。
 
-    Heat、gas、hydrogen 和 steam 网络由各自的稀疏求解器负责；本类统一
-    调度、汇总结果，并解析跨能源耦合设备。仅当耦合表给出能量换算因子时
-    才计算跨域能量残差，否则保留为已校验的端点关联。
+    Heat、gas、hydrogen 和 steam 子模块只提供各自的状态、残差和稀疏
+    Jacobian。本类把电气、流体和跨能源耦合块拼成一个全局 Newton 问题，
+    每次迭代只做一次联合线性求解。仅当耦合表给出能量换算因子时才增加
+    跨域控制状态和能量平衡方程，否则保留为已校验的端点关联。
     """
 
     def __init__(
@@ -1008,9 +1009,12 @@ class HybridPowerFlowCalc:
         self.N_dcac = 0
         self.total_vars = 0
         self.total_eq = 0
+        self.electric_vars = 0
+        self.electric_eq = 0
         self.dc_G = None
         self.last_jacobian_shape = (0, 0)
         self._residual_work = np.array([], dtype=np.float64)
+        self._electric_residual_work = np.array([], dtype=np.float64)
         self._converter_ppc_mode = bool(
             getattr(network, "_lf_lightweight", False)
             and isinstance(getattr(network, "ppc", None), dict)
@@ -1047,10 +1051,16 @@ class HybridPowerFlowCalc:
             MultiEnergyContext(),
         )
         self.fluid_calcs = self._build_fluid_subcalcs()
+        self.fluid_state_slices: Dict[str, slice] = {}
+        self.fluid_eq_slices: Dict[str, slice] = {}
+        self.energy_coupling_plans: List[object] = []
+        self.energy_coupling_state_slice = slice(0, 0)
+        self.energy_coupling_eq_slice = slice(0, 0)
         self.fluid_rc: Dict[str, int] = {}
         self.fluid_errors: Dict[str, str] = {}
         self.coupling_results: List[object] = []
         self.electric_converged = False
+        self._prepared = False
 
     @classmethod
     def from_file_fast(
@@ -1144,6 +1154,353 @@ class HybridPowerFlowCalc:
             for name, network in self.multi_energy.fluid_networks.items()
         }
 
+    def _add_multi_energy_warning(self, message: str) -> None:
+        if message not in self.multi_energy.warnings:
+            self.multi_energy.warnings.append(message)
+
+    @staticmethod
+    def _device_row_by_idx(table: np.ndarray, columns: Dict[str, int], device_idx: int) -> int:
+        if table.ndim != 2 or table.size == 0:
+            return -1
+        rows = np.flatnonzero(
+            table[:, columns["idx"]].astype(np.int64, copy=False) == int(device_idx)
+        )
+        return int(rows[0]) if rows.size else -1
+
+    def _resolve_energy_endpoint(self, terminal, *, adjustable: bool):
+        domain = str(terminal.domain)
+        device_type = str(terminal.device_type)
+        is_load = device_type.endswith("Load")
+        is_storage = device_type.endswith("Storage")
+        is_source = device_type.endswith(("Source", "Generator", "Unit")) or is_storage
+        if not is_load and not is_source:
+            return None, f"unsupported endpoint type {device_type}"
+
+        if domain in {"ac", "dc"}:
+            calc = self.ac_calc if domain == "ac" else self.dc_calc
+            ppc = self._ac_ppc if domain == "ac" else self._dc_ppc
+            if calc is None or not isinstance(ppc, dict):
+                return None, f"{domain} endpoint has no active solver block"
+            if domain == "ac":
+                columns = AC_LOAD_COLS if is_load else AC_GEN_COLS
+            else:
+                columns = DC_LOAD_COLS if is_load else DC_GEN_COLS
+            table_key = "load" if is_load else "gen"
+            table = np.asarray(ppc.get(table_key, ()), dtype=np.float64)
+            row = self._device_row_by_idx(table, columns, terminal.device_idx)
+            if row < 0 or int(table[row, columns["run_stat"]]) != 1:
+                return None, f"missing or inactive {device_type} idx={terminal.device_idx}"
+            node_id = int(table[row, columns["node"]])
+            solver_pos = (
+                self._ac_solver_pos(node_id)
+                if domain == "ac"
+                else self._dc_solver_pos(node_id)
+            )
+            if solver_pos < 0:
+                return None, f"{device_type} idx={terminal.device_idx} is outside the live topology"
+            if domain == "ac":
+                balance_row = int(self._ac_balance_rows([solver_pos])[0][0])
+                state_voltage_col = int(self.ac_calc.v_col_by_node[solver_pos])
+            else:
+                local_row = int(self.dc_calc.node_eq[solver_pos])
+                balance_row = -1 if local_row < 0 else self.ac_eq + local_row
+                state_voltage_col = self.ac_size + solver_pos
+            if adjustable and balance_row < 0:
+                return None, (
+                    f"{device_type} idx={terminal.device_idx} is a reference endpoint; "
+                    "its power cannot be released as a coupling control"
+                )
+            return SimpleNamespace(
+                domain=domain,
+                device_type=device_type,
+                device_idx=int(terminal.device_idx),
+                kind="load" if is_load else "source",
+                table_key=table_key,
+                table=table,
+                columns=columns,
+                row=row,
+                solver_pos=solver_pos,
+                balance_row=balance_row,
+                state_voltage_col=state_voltage_col,
+                correction_sign=1.0 if is_load else -1.0,
+                energy_scale=float(getattr(self.network, "p_base_kW", 1.0)),
+            ), ""
+
+        calc = self.fluid_calcs.get(domain)
+        if calc is None:
+            return None, f"{domain} endpoint has no active solver block"
+        network = calc.network
+        if is_load:
+            positions = [
+                pos
+                for pos, device in enumerate(network.loads)
+                if int(device.idx) == int(terminal.device_idx)
+            ]
+        else:
+            positions = [
+                pos
+                for pos, device in enumerate(network.sources)
+                if bool(network.source_is_storage[pos]) == is_storage
+                and int(device.idx) == int(terminal.device_idx)
+            ]
+        if not positions:
+            return None, f"missing {device_type} idx={terminal.device_idx}"
+        device_pos = int(positions[0])
+        if is_load:
+            node_pos = int(network.load_node_pos[device_pos])
+            explicit_return = bool(network.load_explicit_return[device_pos])
+            control_type = "FLOW"
+        else:
+            node_pos = int(network.source_node_pos[device_pos])
+            explicit_return = bool(network.source_explicit_return[device_pos])
+            control_type = str(network.source_control_type[device_pos])
+        if adjustable and network.thermal:
+            return None, (
+                f"{device_type} idx={terminal.device_idx} changes transport energy equations; "
+                "use a non-reference gas/hydrogen endpoint as coupling control"
+            )
+        if adjustable and network.steam and not is_load:
+            return None, (
+                f"{device_type} idx={terminal.device_idx} changes the steam enthalpy boundary; "
+                "use a steam load as the released endpoint"
+            )
+        if adjustable and explicit_return:
+            return None, (
+                f"{device_type} idx={terminal.device_idx} has explicit return flow and "
+                "cannot yet be released as one scalar coupling control"
+            )
+        if adjustable and not is_load and control_type != "FLOW":
+            return None, (
+                f"{device_type} idx={terminal.device_idx} is pressure-controlled; "
+                "use it as the dependent endpoint, not the released endpoint"
+            )
+        local_row = int(network.balance_row_by_node[node_pos])
+        if adjustable and local_row < 0:
+            return None, f"{device_type} idx={terminal.device_idx} has no hydraulic balance row"
+        return SimpleNamespace(
+            domain=domain,
+            device_type=device_type,
+            device_idx=int(terminal.device_idx),
+            kind="load" if is_load else "storage" if is_storage else "source",
+            device_pos=device_pos,
+            solver_pos=node_pos,
+            balance_row=(
+                -1 if local_row < 0 else self.fluid_eq_slices[domain].start + local_row
+            ),
+            correction_sign=-1.0 if is_load else 1.0,
+            energy_scale=1.0,
+        ), ""
+
+    def _energy_endpoint_value_and_derivative(self, endpoint, x: np.ndarray):
+        domain = endpoint.domain
+        if domain == "ac":
+            if endpoint.kind == "source":
+                return float(endpoint.table[endpoint.row, endpoint.columns["p_set"]]), (), ()
+            ac_x = x[: self.electric_vars]
+            _theta, voltage, _phi_re, _phi_im = self.ac_calc._extract_state_vars(
+                ac_x,
+                update_cache=False,
+            )
+            value_v = float(voltage[endpoint.solver_pos])
+            row = endpoint.table[endpoint.row]
+            pbase = float(row[endpoint.columns["pbase"]])
+            pv0 = float(row[endpoint.columns["pv0"]])
+            pv1 = float(row[endpoint.columns["pv1"]])
+            pv2 = float(row[endpoint.columns["pv2"]])
+            value = pbase * (pv0 + pv1 * value_v + pv2 * value_v * value_v)
+            if endpoint.state_voltage_col < 0:
+                return value, (), ()
+            derivative = pbase * (pv1 + 2.0 * pv2 * value_v)
+            return value, (endpoint.state_voltage_col,), (derivative,)
+
+        if domain == "dc":
+            if endpoint.kind == "source":
+                return float(endpoint.table[endpoint.row, endpoint.columns["p_set"]]), (), ()
+            value_v = float(x[self.ac_size + endpoint.solver_pos])
+            row = endpoint.table[endpoint.row]
+            pbase = float(row[endpoint.columns["pbase"]])
+            pv0 = float(row[endpoint.columns["pv0"]])
+            pv1 = float(row[endpoint.columns["pv1"]])
+            pv2 = float(row[endpoint.columns["pv2"]])
+            value = pbase * (pv0 + pv1 * value_v + pv2 * value_v * value_v)
+            derivative = pbase * (pv1 + 2.0 * pv2 * value_v)
+            return value, (endpoint.state_voltage_col,), (derivative,)
+
+        calc = self.fluid_calcs[domain]
+        network = calc.network
+        if endpoint.kind == "load":
+            return float(network.load_flow_set[endpoint.device_pos]), (), ()
+        if str(network.source_control_type[endpoint.device_pos]) != "PRESSURE":
+            return float(network.source_flow_set[endpoint.device_pos]), (), ()
+        state_slice = self.fluid_state_slices[domain]
+        source_flow, source_jacobian = calc.source_flows_and_jacobian(x[state_slice])
+        derivative = source_jacobian.getrow(endpoint.device_pos).tocoo()
+        columns = tuple((state_slice.start + derivative.col).tolist())
+        return (
+            float(source_flow[endpoint.device_pos]),
+            columns,
+            tuple(derivative.data.tolist()),
+        )
+
+    def _prepare_energy_coupling_plans(
+        self,
+        uncoupled_state: np.ndarray,
+        state_offset: int,
+        eq_offset: int,
+    ) -> np.ndarray:
+        self.energy_coupling_plans = []
+        initial = []
+        released_endpoints = set()
+        for coupling in self.multi_energy.couplings:
+            if not coupling.active or not coupling.supports_energy_balance:
+                continue
+            t1, reason = self._resolve_energy_endpoint(coupling.t1, adjustable=True)
+            if t1 is None:
+                self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                continue
+            key = (t1.domain, t1.device_type, t1.device_idx)
+            if key in released_endpoints:
+                self._add_multi_energy_warning(
+                    f"{coupling.table_name}:{coupling.name}: endpoint {key} is already controlled by another coupling"
+                )
+                continue
+            t2, reason = self._resolve_energy_endpoint(coupling.t2, adjustable=False)
+            if t2 is None:
+                self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                continue
+            t1_value, _columns, _derivatives = self._energy_endpoint_value_and_derivative(
+                t1,
+                uncoupled_state,
+            )
+            t1.energy_scale = (
+                float(getattr(self.network, "p_base_kW", 1.0))
+                if t1.domain in {"ac", "dc"}
+                else float(coupling.energy_factor)
+            )
+            t2.energy_scale = (
+                float(getattr(self.network, "p_base_kW", 1.0))
+                if t2.domain in {"ac", "dc"}
+                else float(coupling.energy_factor)
+            )
+            t2_value, _columns, _derivatives = self._energy_endpoint_value_and_derivative(
+                t2,
+                uncoupled_state,
+            )
+            normalization = max(
+                1.0,
+                abs(t1_value * t1.energy_scale),
+                abs(t2_value * t2.energy_scale),
+            )
+            plan_pos = len(self.energy_coupling_plans)
+            self.energy_coupling_plans.append(
+                SimpleNamespace(
+                    coupling=coupling,
+                    t1=t1,
+                    t2=t2,
+                    state_col=state_offset + plan_pos,
+                    eq_row=eq_offset + plan_pos,
+                    normalization=normalization,
+                )
+            )
+            released_endpoints.add(key)
+            initial.append(float(t1_value))
+        return np.asarray(initial, dtype=np.float64)
+
+    def _apply_energy_coupling_terms(
+        self,
+        x: np.ndarray,
+        residual: np.ndarray,
+        jacobian,
+        *,
+        jacobian_format: str,
+    ):
+        if not self.energy_coupling_plans:
+            return jacobian
+        rows = []
+        cols = []
+        data = []
+        for plan in self.energy_coupling_plans:
+            controlled_value = float(x[plan.state_col])
+            base_value, base_cols, base_derivatives = (
+                self._energy_endpoint_value_and_derivative(plan.t1, x)
+            )
+            correction = controlled_value - base_value
+            residual[plan.t1.balance_row] += plan.t1.correction_sign * correction
+            if jacobian is not None:
+                rows.append(plan.t1.balance_row)
+                cols.append(plan.state_col)
+                data.append(plan.t1.correction_sign)
+                for column, derivative in zip(base_cols, base_derivatives):
+                    rows.append(plan.t1.balance_row)
+                    cols.append(int(column))
+                    data.append(-plan.t1.correction_sign * float(derivative))
+
+            dependent_value, dependent_cols, dependent_derivatives = (
+                self._energy_endpoint_value_and_derivative(plan.t2, x)
+            )
+            efficiency = float(plan.coupling.efficiency)
+            residual[plan.eq_row] = (
+                abs(dependent_value) * plan.t2.energy_scale
+                - efficiency * abs(controlled_value) * plan.t1.energy_scale
+            ) / plan.normalization
+            if jacobian is None:
+                continue
+            controlled_sign = 1.0 if controlled_value >= 0.0 else -1.0
+            dependent_sign = 1.0 if dependent_value >= 0.0 else -1.0
+            rows.append(plan.eq_row)
+            cols.append(plan.state_col)
+            data.append(
+                -efficiency
+                * controlled_sign
+                * plan.t1.energy_scale
+                / plan.normalization
+            )
+            for column, derivative in zip(dependent_cols, dependent_derivatives):
+                rows.append(plan.eq_row)
+                cols.append(int(column))
+                data.append(
+                    dependent_sign
+                    * plan.t2.energy_scale
+                    * float(derivative)
+                    / plan.normalization
+                )
+
+        if jacobian is None or not rows:
+            return jacobian
+        correction = coo_matrix(
+            (
+                np.asarray(data, dtype=np.float64),
+                (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)),
+            ),
+            shape=(self.total_eq, self.total_vars),
+        )
+        jacobian = jacobian + correction.asformat(jacobian_format)
+        return jacobian.asformat(jacobian_format)
+
+    def _apply_final_coupling_endpoint_controls(self, ac_result, dc_result) -> None:
+        for plan in self.energy_coupling_plans:
+            endpoint = plan.t1
+            value = float(self.x[plan.state_col])
+            if endpoint.domain in {"ac", "dc"}:
+                endpoint.table[endpoint.row, endpoint.columns["p"]] = value
+                result = ac_result if endpoint.domain == "ac" else dc_result
+                if isinstance(result, dict) and endpoint.table_key in result:
+                    result[endpoint.table_key][endpoint.row, endpoint.columns["p"]] = value
+                continue
+
+            calc = self.fluid_calcs[endpoint.domain]
+            network = calc.network
+            if endpoint.kind == "load":
+                old_value = float(network.load_flow_set[endpoint.device_pos])
+                network.load_flow_set[endpoint.device_pos] = value
+                network.demand[endpoint.solver_pos] += value - old_value
+                network.loads[endpoint.device_pos].flow_set = value
+            else:
+                old_value = float(network.source_flow_set[endpoint.device_pos])
+                network.source_flow_set[endpoint.device_pos] = value
+                network.fixed_injection[endpoint.solver_pos] += value - old_value
+                network.sources[endpoint.device_pos].flow_set = value
+
     def _clear_converter_outputs(self):
         ppc = getattr(self.network, "ppc", {}) or {}
         dcac = ppc.get("dcac")
@@ -1193,13 +1550,70 @@ class HybridPowerFlowCalc:
             self.ac_calc.ppc.pop("_external_voltage_control_node_ids", None)
 
     def prepare(self):
-        x = self._prepare_electric()
-        for calc in self.fluid_calcs.values():
+        if self._prepared:
+            return self.x
+        electric_x = self._prepare_electric().copy()
+        self.electric_vars = int(self.total_vars)
+        self.electric_eq = int(self.total_eq)
+        self._electric_residual_work = self._residual_work
+        state_parts = [electric_x] if electric_x.size else []
+        state_offset = self.electric_vars
+        eq_offset = self.electric_eq
+        self.fluid_state_slices = {}
+        self.fluid_eq_slices = {}
+        for name, calc in self.fluid_calcs.items():
             calc.result_mode = self.result_mode
             calc.verbose = self.verbose
             if not calc.prepared:
                 calc.prepare()
-        return x
+            state_slice = slice(state_offset, state_offset + calc.total_vars)
+            eq_slice = slice(eq_offset, eq_offset + calc.total_eq)
+            self.fluid_state_slices[name] = state_slice
+            self.fluid_eq_slices[name] = eq_slice
+            state_parts.append(calc.x.copy())
+            state_offset = state_slice.stop
+            eq_offset = eq_slice.stop
+        uncoupled_state = (
+            np.concatenate(state_parts) if state_parts else np.empty(0, dtype=np.float64)
+        )
+        coupling_initial = self._prepare_energy_coupling_plans(
+            uncoupled_state,
+            state_offset,
+            eq_offset,
+        )
+        if coupling_initial.size:
+            state_parts.append(coupling_initial)
+            self.energy_coupling_state_slice = slice(
+                state_offset,
+                state_offset + coupling_initial.size,
+            )
+            self.energy_coupling_eq_slice = slice(
+                eq_offset,
+                eq_offset + coupling_initial.size,
+            )
+            state_offset = self.energy_coupling_state_slice.stop
+            eq_offset = self.energy_coupling_eq_slice.stop
+        else:
+            self.energy_coupling_state_slice = slice(state_offset, state_offset)
+            self.energy_coupling_eq_slice = slice(eq_offset, eq_offset)
+        self.x = np.concatenate(state_parts) if state_parts else np.empty(0, dtype=np.float64)
+        self.total_vars = int(state_offset)
+        self.total_eq = int(eq_offset)
+        self.last_jacobian_shape = (self.total_eq, self.total_vars)
+        if self.fluid_calcs:
+            self._single_ac_newton_block = False
+            self._single_dc_newton_block = False
+        if self.verbose:
+            fluid_vars = self.total_vars - self.electric_vars
+            print(
+                "Multi-energy prepare:",
+                f"electric_vars={self.electric_vars}",
+                f"fluid_vars={fluid_vars}",
+                f"total_vars={self.total_vars}",
+                f"total_eq={self.total_eq}",
+            )
+        self._prepared = True
+        return self.x
 
     def _prepare_electric(self):
         """Build the global hybrid state vector and block equation layout.
@@ -1228,6 +1642,8 @@ class HybridPowerFlowCalc:
             self.x = np.empty(0, dtype=np.float64)
             self.total_vars = 0
             self.total_eq = 0
+            self.electric_vars = 0
+            self.electric_eq = 0
             self.last_jacobian_shape = (0, 0)
             self._residual_work = np.empty(0, dtype=np.float64)
             return self.x
@@ -1240,6 +1656,8 @@ class HybridPowerFlowCalc:
         self.x = np.concatenate(parts)
         self.total_vars = self.x.size
         self.total_eq = self.dcac_eq_start + self.N_dcac * 3
+        self.electric_vars = int(self.total_vars)
+        self.electric_eq = int(self.total_eq)
         # Variable/equation order is block diagonal first, then converter coupling rows.
         self.last_jacobian_shape = (self.total_eq, self.total_vars)
         self._residual_work = np.empty(self.total_eq, dtype=np.float64)
@@ -1763,7 +2181,7 @@ class HybridPowerFlowCalc:
     def _cache_global_jacobian_pattern(self):
         """Precompute global hybrid Jacobian CSR pattern for repeated Newton iterations."""
         self._clear_global_jacobian_pattern()
-        if self.total_eq == 0 or self.total_vars == 0:
+        if self.electric_eq == 0 or self.electric_vars == 0:
             return
 
         rows_parts = []
@@ -1807,8 +2225,8 @@ class HybridPowerFlowCalc:
 
         self.global_jac_raw_data = np.empty(raw_count, dtype=np.float64)
         if raw_count == 0:
-            self.global_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
-            self.global_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
+            self.global_jac_csr_indptr = np.zeros(self.electric_eq + 1, dtype=np.int32)
+            self.global_jac_csc_indptr = np.zeros(self.electric_vars + 1, dtype=np.int32)
             return
 
         raw_rows = np.concatenate(rows_parts)
@@ -1817,12 +2235,12 @@ class HybridPowerFlowCalc:
             self.global_jac_csr_indices,
             self.global_jac_csr_indptr,
             self.global_jac_raw_to_csr_pos,
-        ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.electric_eq)
         (
             self.global_jac_csc_indices,
             self.global_jac_csc_indptr,
             self.global_jac_raw_to_csc_pos,
-        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
+        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.electric_vars)
         self.global_jac_csr_data = np.empty(self.global_jac_csr_indices.size, dtype=np.float64)
         self.global_jac_csc_data = np.empty(self.global_jac_csc_indices.size, dtype=np.float64)
         self.global_jac_csr_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csr_pos, self.global_jac_csr_data.size)
@@ -1934,9 +2352,9 @@ class HybridPowerFlowCalc:
 
     def _fill_residual_work(self, ac_f, dc_f, dcac_x, ac_theta, ac_V, dc_V):
         """Fill the preallocated global residual vector and return it."""
-        if self._residual_work.size != self.total_eq:
-            self._residual_work = np.empty(self.total_eq, dtype=np.float64)
-        F = self._residual_work
+        if self._electric_residual_work.size != self.electric_eq:
+            self._electric_residual_work = np.empty(self.electric_eq, dtype=np.float64)
+        F = self._electric_residual_work
         ac_view = None
         dc_view = None
         if self.ac_eq:
@@ -1946,11 +2364,11 @@ class HybridPowerFlowCalc:
             dc_view = F[self.ac_eq:self.ac_eq + self.dc_eq]
             dc_view[:] = dc_f
         if self.N_dcac:
-            dcac_view = F[self.dcac_eq_start:self.total_eq]
+            dcac_view = F[self.dcac_eq_start:self.electric_eq]
             self._append_dcac_residuals(ac_view, dc_view, dcac_x, ac_theta, ac_V, dc_V, out=dcac_view)
         return F
 
-    def get_f(self, x: np.ndarray) -> np.ndarray:
+    def _get_electric_f(self, x: np.ndarray) -> np.ndarray:
         """Assemble AC/DC residuals and DCAC coupling equations."""
         # 纯 AC/纯 DC 文件没有跨域耦合时，直接复用子求解器残差，避免全局向量拆装。
         if self._single_ac_newton_block:
@@ -1969,7 +2387,7 @@ class HybridPowerFlowCalc:
             ac_theta, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
         return self._fill_residual_work(ac_f, dc_f, dcac_x, ac_theta, ac_V, dc_V)
 
-    def get_jacobi(self, x: np.ndarray) -> csr_matrix:
+    def _get_electric_jacobi(self, x: np.ndarray) -> csr_matrix:
         """Build the global sparse Jacobian from sub-solver blocks plus converter couplings."""
         # 单块 Newton 的 Jacobian 与子系统完全一致，不需要再包一层 hybrid CSR。
         if self._single_ac_newton_block:
@@ -1980,7 +2398,11 @@ class HybridPowerFlowCalc:
             jac = self.dc_calc.get_jacobi(x)
             self.last_jacobian_shape = jac.shape
             return jac
-        _residual, jac = self._build_newton_system(x, return_jacobian=True, jacobian_format="csr")
+        _residual, jac = self._build_electric_newton_system(
+            x,
+            return_jacobian=True,
+            jacobian_format="csr",
+        )
         return jac
 
     @staticmethod
@@ -2060,14 +2482,14 @@ class HybridPowerFlowCalc:
             apply_raw_sum_plan(self.global_jac_csc_data, raw, self.global_jac_csc_sum_plan)
             jac = csc_matrix(
                 (self.global_jac_csc_data, self.global_jac_csc_indices, self.global_jac_csc_indptr),
-                shape=(self.total_eq, self.total_vars),
+                shape=(self.electric_eq, self.electric_vars),
                 copy=False,
             )
         else:
             apply_raw_sum_plan(self.global_jac_csr_data, raw, self.global_jac_csr_sum_plan)
             jac = csr_matrix(
                 (self.global_jac_csr_data, self.global_jac_csr_indices, self.global_jac_csr_indptr),
-                shape=(self.total_eq, self.total_vars),
+                shape=(self.electric_eq, self.electric_vars),
                 copy=False,
             )
         self.last_jacobian_shape = jac.shape
@@ -2096,7 +2518,7 @@ class HybridPowerFlowCalc:
             row_parts.append(ac_coo.row)
             col_parts.append(ac_coo.col)
             data_parts.append(ac_coo.data)
-        target_shape = (self.total_eq, self.total_vars)
+        target_shape = (self.electric_eq, self.electric_vars)
         if dc_j is not None:
             dc_coo = dc_j.tocoo()
             row_parts.append(dc_coo.row + self.ac_eq)
@@ -2125,7 +2547,13 @@ class HybridPowerFlowCalc:
         self.last_jacobian_shape = jac.shape
         return jac
 
-    def _build_newton_system(self, x: np.ndarray, *, return_jacobian=True, jacobian_format="csc"):
+    def _build_electric_newton_system(
+        self,
+        x: np.ndarray,
+        *,
+        return_jacobian=True,
+        jacobian_format="csc",
+    ):
         """Build one global residual/Jacobian while reusing AC/DC equation caches."""
         if self._single_ac_newton_block:
             F, J = self.ac_calc._build_newton_system(
@@ -2187,6 +2615,79 @@ class HybridPowerFlowCalc:
             matrix_format=jacobian_format,
         )
         return F, J
+
+    def _build_newton_system(self, x: np.ndarray, *, return_jacobian=True, jacobian_format="csc"):
+        """Assemble every energy-domain block into one sparse Newton system."""
+        if not self.fluid_calcs:
+            return self._build_electric_newton_system(
+                x,
+                return_jacobian=return_jacobian,
+                jacobian_format=jacobian_format,
+            )
+
+        residual_parts = []
+        jacobian_blocks = []
+        if self.electric_eq:
+            electric_f, electric_j = self._build_electric_newton_system(
+                x[: self.electric_vars],
+                return_jacobian=return_jacobian,
+                jacobian_format="csc",
+            )
+            residual_parts.append(np.asarray(electric_f, dtype=np.float64).copy())
+            if return_jacobian:
+                jacobian_blocks.append(electric_j)
+
+        for name, calc in self.fluid_calcs.items():
+            state = x[self.fluid_state_slices[name]]
+            residual, jacobian = calc._build_newton_system(
+                state,
+                return_jacobian=return_jacobian,
+                jacobian_format="csc",
+            )
+            residual_parts.append(np.asarray(residual, dtype=np.float64))
+            if return_jacobian:
+                jacobian_blocks.append(jacobian)
+
+        coupling_count = len(self.energy_coupling_plans)
+        if coupling_count:
+            residual_parts.append(np.zeros(coupling_count, dtype=np.float64))
+            if return_jacobian:
+                jacobian_blocks.append(
+                    coo_matrix((coupling_count, coupling_count), dtype=np.float64)
+                )
+
+        residual = (
+            np.concatenate(residual_parts)
+            if residual_parts
+            else np.empty(0, dtype=np.float64)
+        )
+        if not return_jacobian:
+            self._apply_energy_coupling_terms(
+                x,
+                residual,
+                None,
+                jacobian_format=jacobian_format,
+            )
+            return residual, None
+        jacobian = block_diag(jacobian_blocks, format=jacobian_format)
+        jacobian = self._apply_energy_coupling_terms(
+            x,
+            residual,
+            jacobian,
+            jacobian_format=jacobian_format,
+        )
+        self.last_jacobian_shape = jacobian.shape
+        return residual, jacobian
+
+    def get_f(self, x: np.ndarray) -> np.ndarray:
+        return self._build_newton_system(x, return_jacobian=False)[0]
+
+    def get_jacobi(self, x: np.ndarray) -> csr_matrix:
+        return self._build_newton_system(
+            x,
+            return_jacobian=True,
+            jacobian_format="csr",
+        )[1]
 
     def _append_dcac_jacobian_terms(self, row_parts, col_parts, data_parts, dcac_x, ac_V, dc_V):
         """Append DC/AC converter Jacobian entries to global COO buffers."""
@@ -2410,18 +2911,18 @@ class HybridPowerFlowCalc:
         return self._run_newton_raphson()
 
     def _finish_multi_energy_run(self, electric_rc: int) -> int:
-        self.electric_converged = bool(self.converged)
+        global_converged = bool(self.converged)
+        if self.electric_eq:
+            electric_f = self.get_f(self.x)[: self.electric_eq]
+            self.electric_converged = bool(
+                np.linalg.norm(electric_f, np.inf) < self.tol
+            )
+        else:
+            self.electric_converged = True
         self.fluid_rc = {}
         self.fluid_errors = {}
         for name, calc in self.fluid_calcs.items():
-            try:
-                calc.result_mode = self.result_mode
-                calc.verbose = self.verbose
-                rc = int(calc.run())
-            except (RuntimeError, ValueError, ArithmeticError) as exc:
-                rc = 1
-                calc.converged = False
-                calc.failure_reason = str(exc)
+            rc = 0 if calc.converged else 1
             self.fluid_rc[name] = rc
             if rc != 0 or not calc.converged:
                 self.fluid_errors[name] = str(
@@ -2431,7 +2932,7 @@ class HybridPowerFlowCalc:
             rc == 0 and self.fluid_calcs[name].converged
             for name, rc in self.fluid_rc.items()
         )
-        self.converged = bool(self.electric_converged and fluids_converged)
+        self.converged = bool(global_converged and self.electric_converged and fluids_converged)
         self.coupling_results = self._build_energy_coupling_results()
         self._attach_multi_energy_results()
         if self.fluid_errors:
@@ -2439,7 +2940,7 @@ class HybridPowerFlowCalc:
             self.failure_reason = "; ".join(
                 item for item in (self.failure_reason, details) if item
             )
-        if electric_rc == 0 and fluids_converged:
+        if electric_rc == 0 and self.converged:
             return 0
         return electric_rc if electric_rc != 0 else 1
 
@@ -2450,9 +2951,13 @@ class HybridPowerFlowCalc:
         if domain in self.fluid_calcs:
             calc = self.fluid_calcs[domain]
             network = calc.network
-            if device_type.endswith("Source"):
+            if device_type.endswith(("Source", "Storage")):
                 for pos, device in enumerate(network.sources):
-                    if int(device.idx) == device_idx:
+                    is_storage = device_type.endswith("Storage")
+                    if (
+                        bool(network.source_is_storage[pos]) == is_storage
+                        and int(device.idx) == device_idx
+                    ):
                         return float(calc.source_flow[pos]), "flow"
             if device_type.endswith("Load"):
                 for pos, device in enumerate(network.loads):
@@ -2488,9 +2993,23 @@ class HybridPowerFlowCalc:
 
     def _build_energy_coupling_results(self) -> List[object]:
         results = []
+        plans = {
+            (plan.coupling.table_name, int(plan.coupling.idx)): plan
+            for plan in self.energy_coupling_plans
+        }
         for coupling in self.multi_energy.couplings:
-            t1_value, t1_unit = self._terminal_result_value(coupling.t1)
-            t2_value, t2_unit = self._terminal_result_value(coupling.t2)
+            plan = plans.get((coupling.table_name, int(coupling.idx)))
+            if plan is None:
+                t1_value, t1_unit = self._terminal_result_value(coupling.t1)
+                t2_value, t2_unit = self._terminal_result_value(coupling.t2)
+            else:
+                t1_value = float(self.x[plan.state_col])
+                t1_unit = "pu" if plan.t1.domain in {"ac", "dc"} else "flow"
+                t2_value, _columns, _derivatives = self._energy_endpoint_value_and_derivative(
+                    plan.t2,
+                    self.x,
+                )
+                t2_unit = "pu" if plan.t2.domain in {"ac", "dc"} else "flow"
             residual = None
             status = "inactive" if not coupling.active else "linked"
             if coupling.active and (t1_value is None or t2_value is None):
@@ -2577,6 +3096,24 @@ class HybridPowerFlowCalc:
             self._linear_solver_resolved = "scipy"
             self._linear_solver_fn = _scipy_spsolve
 
+        def bounded_candidate(candidate):
+            candidate = np.asarray(candidate, dtype=np.float64).copy()
+            for name, calc in self.fluid_calcs.items():
+                count = int(calc.network.free_node_pos.size)
+                if count:
+                    state_slice = self.fluid_state_slices[name]
+                    start = state_slice.start
+                    candidate[start : start + count] = np.maximum(
+                        candidate[start : start + count],
+                        calc._minimum_potential(),
+                    )
+            if self.energy_coupling_state_slice.stop > self.energy_coupling_state_slice.start:
+                candidate[self.energy_coupling_state_slice] = np.maximum(
+                    candidate[self.energy_coupling_state_slice],
+                    0.0,
+                )
+            return candidate
+
         for it in range(self.max_iter):
             F, J = self._build_newton_system(x)
             self.iterations = it + 1
@@ -2598,12 +3135,23 @@ class HybridPowerFlowCalc:
             if self.dc_calc is not None:
                 self.dc_calc.iterations = self.iterations
                 self.dc_calc.normF = dc_norm
+            fluid_norms = {}
+            for name, calc in self.fluid_calcs.items():
+                fluid_f = F[self.fluid_eq_slices[name]]
+                fluid_norm = np.linalg.norm(fluid_f, np.inf) if fluid_f.size else 0.0
+                fluid_norms[name] = fluid_norm
+                calc.iterations = self.iterations
+                calc.normF = fluid_norm
 
             if self.verbose:
                 print(
                     f"Iter {it + 1}: |F| = {self.normF:.2e}, "
                     f"|F_ac| = {ac_norm:.2e}, "
-                    f"|F_dc| = {dc_norm:.2e}"
+                    f"|F_dc| = {dc_norm:.2e}, "
+                    + ", ".join(
+                        f"|F_{name}| = {value:.2e}"
+                        for name, value in fluid_norms.items()
+                    )
                 )
 
             if self.normF < self.tol:
@@ -2635,8 +3183,34 @@ class HybridPowerFlowCalc:
                 self._linear_solver_resolved = "scipy"
                 self._linear_solver_fn = _scipy_spsolve
                 delta = _scipy_spsolve(J, F)
-            # 与 AC/DC 潮流一致：方程定义为 F(x)=0，使用 x_new = x - J^{-1}F。
-            x -= delta
+            if not self.fluid_calcs:
+                x -= delta
+                continue
+            # 方程定义为 F(x)=0，Newton 方向为 -J^{-1}F。流体势变量的
+            # 非线性比电压方程更强，因此在同一个全局方向上做残差下降线搜索。
+            accepted = False
+            step = 1.0
+            for _ in range(24):
+                candidate = bounded_candidate(x - step * delta)
+                candidate_f, _ = self._build_newton_system(
+                    candidate,
+                    return_jacobian=False,
+                )
+                candidate_norm = (
+                    float(np.linalg.norm(candidate_f, np.inf))
+                    if candidate_f.size
+                    else 0.0
+                )
+                if np.isfinite(candidate_norm) and candidate_norm < self.normF:
+                    x = candidate
+                    accepted = True
+                    break
+                step *= 0.5
+            if not accepted:
+                self.failure_reason = "global Newton line search could not reduce the residual"
+                self.x = x
+                self._write_back()
+                return -1
 
         if self.verbose:
             print(f"达到最大迭代次数 {self.max_iter}，未收敛")
@@ -2666,10 +3240,10 @@ class HybridPowerFlowCalc:
     def _global_state_label(self, column):
         """Return a compact diagnostic label for a global Newton state column."""
         column = int(column)
-        if column < self.ac_size:
+        if column < self.electric_vars and column < self.ac_size:
             return f"AC_state[{column}]"
         dc_stop = self.ac_size + self.dc_size
-        if column < dc_stop:
+        if column < self.electric_vars and column < dc_stop:
             local = column - self.ac_size
             if self.dc_calc is not None and local < self.dc_calc.N:
                 node_ids = sorted(
@@ -2682,7 +3256,25 @@ class HybridPowerFlowCalc:
                 if node_ids:
                     return "V_DC(nodes " + ",".join(str(node_id) for node_id in node_ids) + ")"
             return f"DC_state[{local}]"
-        return f"DCAC_state[{column - self.dcac_start}]"
+        if column < self.electric_vars:
+            return f"DCAC_state[{column - self.dcac_start}]"
+        for name, state_slice in self.fluid_state_slices.items():
+            if state_slice.start <= column < state_slice.stop:
+                calc = self.fluid_calcs[name]
+                local = column - state_slice.start
+                if local < calc.n_potential:
+                    return f"{name}_pressure_potential[{local}]"
+                if local < calc.base_temperature:
+                    return f"{name}_regulated_flow[{local - calc.n_potential}]"
+                if calc.network.thermal and local < calc.base_enthalpy:
+                    return f"{name}_temperature[{local - calc.base_temperature}]"
+                if calc.network.steam:
+                    return f"{name}_enthalpy[{local - calc.base_enthalpy}]"
+                return f"{name}_state[{local}]"
+        for plan in self.energy_coupling_plans:
+            if int(plan.state_col) == column:
+                return f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:T1"
+        return f"global_state[{column}]"
 
     def _write_summary_result(self):
         x = self.x
@@ -2778,6 +3370,21 @@ class HybridPowerFlowCalc:
                 self.dc_calc._write_back,
             )
             dc_result = self.dc_calc.result
+
+        self._apply_final_coupling_endpoint_controls(ac_result, dc_result)
+        global_f = self.get_f(x) if self.fluid_calcs else np.empty(0, dtype=np.float64)
+        for name, calc in self.fluid_calcs.items():
+            state = x[self.fluid_state_slices[name]]
+            fluid_f = global_f[self.fluid_eq_slices[name]]
+            fluid_norm = np.linalg.norm(fluid_f, np.inf) if fluid_f.size else 0.0
+            calc.result_mode = self.result_mode
+            calc.verbose = self.verbose
+            calc.commit_state(
+                state,
+                converged=bool(self.converged and fluid_norm < self.tol),
+                iterations=self.iterations,
+                normF=fluid_norm,
+            )
 
         self._write_skipped_results_to_network()
 
