@@ -737,7 +737,12 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     if table_rows:
         load[:, LOAD_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         load[:, LOAD_COLS["node"]] = _int_column(table_rows, columns, "node")
-        load[:, LOAD_COLS["pbase"]] = _float_column(table_rows, columns, "pbase", 1.0) / p_base
+        load[:, LOAD_COLS["pbase"]] = _aliased_float_column(
+            table_rows,
+            columns,
+            ("p_set", "pbase"),
+            1.0,
+        ) / p_base
         load[:, LOAD_COLS["pv0"]] = _float_column(table_rows, columns, "pv0")
         load[:, LOAD_COLS["pv1"]] = _float_column(table_rows, columns, "pv1")
         load[:, LOAD_COLS["pv2"]] = _float_column(table_rows, columns, "pv2")
@@ -1792,7 +1797,11 @@ def build_ac_ppc_from_network(network) -> Dict:
     for row, dev in enumerate(loads):
         load[row, LOAD_COLS["idx"]] = _int_value(dev, "idx")
         load[row, LOAD_COLS["node"]] = _int_value(dev, "node")
-        load[row, LOAD_COLS["pbase"]] = _float_value(dev, "pbase", 1.0)
+        load[row, LOAD_COLS["pbase"]] = _float_value(
+            dev,
+            "p_set",
+            _float_value(dev, "pbase", 1.0),
+        )
         load[row, LOAD_COLS["pv0"]] = _float_value(dev, "pv0")
         load[row, LOAD_COLS["pv1"]] = _float_value(dev, "pv1")
         load[row, LOAD_COLS["pv2"]] = _float_value(dev, "pv2")

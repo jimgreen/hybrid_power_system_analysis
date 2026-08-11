@@ -469,6 +469,13 @@ def _edge_device_type(network, edge_pos: int) -> str:
 
 def build_measurements_from_lf(network, calc) -> list[Measurement]:
     measurements: list[Measurement] = []
+    result_arrays = getattr(getattr(calc, "lf_result", None), "arrays", {})
+    calculated_load_flow = np.asarray(
+        result_arrays.get("load_flow", network.load_flow_set),
+        dtype=np.float64,
+    )
+    if calculated_load_flow.shape != network.load_flow_set.shape:
+        calculated_load_flow = network.load_flow_set
 
     def add(device_type: str, device_name: str, meas_type: str, value: float) -> None:
         idx = len(measurements) + 1
@@ -519,7 +526,7 @@ def build_measurements_from_lf(network, calc) -> list[Measurement]:
             f"{network.prefix}Load",
             str(name),
             "FLOW",
-            network.load_flow_set[load_pos],
+            calculated_load_flow[load_pos],
         )
     if network.thermal and network.exchanger_i.size:
         primary_heat, _, primary_out, secondary_out = calc._heat_exchanger_quantities()

@@ -86,6 +86,14 @@ class DCLoad:
         self.current = None
         self.node_obj = None
 
+    @property
+    def p_set(self):
+        return self.pbase
+
+    @p_set.setter
+    def p_set(self, value):
+        self.pbase = value
+
 class DCGenerator:
     def __init__(
         self,
@@ -291,6 +299,7 @@ _DC_ROW_DEFAULT_ATTRS = {
         "name": "",
         "node": 0,
         "pbase": 1.0,
+        "p_set": None,
         "pv0": 0.0,
         "pv1": 0.0,
         "pv2": 0.0,
@@ -390,6 +399,8 @@ def _coerce_dc_rows(rows, table_name):
         obj = row_cls.__new__(row_cls)
         obj.__dict__.update({key: value.copy() if isinstance(value, list) else value for key, value in defaults.items()})
         obj.__dict__.update(row_values)
+        if table_name == "DCLoad" and row_values.get("p_set") not in (None, "", "-"):
+            obj.pbase = float(row_values["p_set"])
         if table_name == "DCDCConverter":
             _normalize_dcdc_converter_controls(obj)
         output.append(obj)

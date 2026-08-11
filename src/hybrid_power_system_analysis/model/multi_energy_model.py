@@ -17,6 +17,7 @@ from model.effective_state import propagate_composite_run_states
 
 FLUID_SYSTEM_PREFIXES = ("Heat", "Gas", "Hydro", "Steam")
 FLUID_SYSTEM_KEYS = tuple(prefix.lower() for prefix in FLUID_SYSTEM_PREFIXES)
+HYDROGEN_ELECTRIC_CONTROL_TYPES = frozenset(("P", "FLOW"))
 
 _NETWORK_BUILDERS = {
     "heat": build_heat_network_from_model,
@@ -60,13 +61,72 @@ class EnergyCoupling:
     t1: EnergyTerminal
     t2: EnergyTerminal
     efficiency: float = 1.0
+    e2h_coeff: Optional[float] = None
+    h2e_coeff: Optional[float] = None
     energy_factor: Optional[float] = None
     control_type: str = "MONITOR"
     active: bool = True
 
     @property
     def supports_energy_balance(self) -> bool:
+        if self.is_hydrogen_electric_control:
+            coefficient = self.hydrogen_electric_coeff
+            return coefficient is not None and coefficient > 0.0
         return self.energy_factor is not None
+
+    @property
+    def hydrogen_electric_direction(self) -> Optional[str]:
+        match = _COUPLING_TABLE_RE.match(self.table_name)
+        if match is None:
+            return None
+        source_domain = _normalize_domain(match.group(1))
+        target_domain = _normalize_domain(match.group(2))
+        if source_domain in {"ac", "dc"} and target_domain == "hydro":
+            return "E2H"
+        if source_domain == "hydro" and target_domain in {"ac", "dc"}:
+            return "H2E"
+        return None
+
+    @property
+    def is_hydrogen_electric_control(self) -> bool:
+        return (
+            self.hydrogen_electric_direction is not None
+            and self.control_type in HYDROGEN_ELECTRIC_CONTROL_TYPES
+        )
+
+    @property
+    def hydrogen_electric_coeff(self) -> Optional[float]:
+        if self.hydrogen_electric_direction == "E2H":
+            return self.e2h_coeff
+        if self.hydrogen_electric_direction == "H2E":
+            return self.h2e_coeff
+        return None
+
+    @property
+    def electric_terminal(self) -> Optional[EnergyTerminal]:
+        for terminal in (self.t1, self.t2):
+            if terminal.domain in {"ac", "dc"}:
+                return terminal
+        return None
+
+    @property
+    def hydro_terminal(self) -> Optional[EnergyTerminal]:
+        for terminal in (self.t1, self.t2):
+            if terminal.domain == "hydro":
+                return terminal
+        return None
+
+    @property
+    def controlled_terminal(self) -> Optional[EnergyTerminal]:
+        if not self.is_hydrogen_electric_control:
+            return None
+        return self.electric_terminal if self.control_type == "P" else self.hydro_terminal
+
+    @property
+    def dependent_terminal(self) -> Optional[EnergyTerminal]:
+        if not self.is_hydrogen_electric_control:
+            return None
+        return self.hydro_terminal if self.control_type == "P" else self.electric_terminal
 
 
 @dataclass
@@ -106,6 +166,79 @@ def _int(row, name: str, default: int = 0) -> int:
 
 def _normalize_domain(token: str) -> Optional[str]:
     return _DOMAIN_ALIASES.get(str(token).lower())
+
+
+def normalize_energy_coupling_control_type(value: str) -> str:
+    token = str(value or "MONITOR").strip().upper().replace("-", "_")
+    aliases = {
+        "POWER": "P",
+        "P_SET": "P",
+        "CONST_P": "P",
+        "GAS_FLOW": "FLOW",
+        "H2_FLOW": "FLOW",
+        "FLOW_SET": "FLOW",
+        "CONST_FLOW": "FLOW",
+        "NONE": "MONITOR",
+    }
+    return aliases.get(token, token)
+
+
+def hydrogen_electric_dependent_value(
+    coupling: EnergyCoupling,
+    controlled_value: float,
+    p_base_kw: float,
+) -> float:
+    """Convert the active endpoint setpoint into the dependent endpoint value.
+
+    Electric endpoint values use per-unit power, fluid endpoint values use Nm3/h.
+    Electrolyzer efficiency is Nm3/kWh; fuel-cell efficiency is kWh/Nm3.
+    """
+    if not coupling.is_hydrogen_electric_control:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} is not P/FLOW controlled")
+    coefficient = coupling.hydrogen_electric_coeff
+    power_base = float(p_base_kw)
+    value = float(controlled_value)
+    if coefficient is None or coefficient <= 0.0:
+        field = "e2h_coeff" if coupling.hydrogen_electric_direction == "E2H" else "h2e_coeff"
+        raise ValueError(f"{coupling.table_name}:{coupling.name} {field} must be positive")
+    if power_base <= 0.0:
+        raise ValueError("electric power base must be positive")
+    if value < 0.0:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} setpoint must be non-negative")
+
+    if coupling.control_type == "P":
+        power_kw = value * power_base
+        return (
+            power_kw * coefficient
+            if coupling.hydrogen_electric_direction == "E2H"
+            else power_kw / coefficient
+        )
+
+    return (
+        value / coefficient / power_base
+        if coupling.hydrogen_electric_direction == "E2H"
+        else value * coefficient / power_base
+    )
+
+
+def hydrogen_electric_balance_residual(
+    coupling: EnergyCoupling,
+    electric_power_pu: float,
+    hydro_flow: float,
+    p_base_kw: float,
+) -> float:
+    """Return the dimensional conversion mismatch for an electric/H2 device."""
+    power_kw = float(electric_power_pu) * float(p_base_kw)
+    flow = float(hydro_flow)
+    coefficient = coupling.hydrogen_electric_coeff
+    if coefficient is None or coefficient <= 0.0:
+        field = "e2h_coeff" if coupling.hydrogen_electric_direction == "E2H" else "h2e_coeff"
+        raise ValueError(f"{coupling.table_name}:{coupling.name} {field} must be positive")
+    if coupling.hydrogen_electric_direction == "E2H":
+        return flow - power_kw * coefficient
+    if coupling.hydrogen_electric_direction == "H2E":
+        return power_kw - flow * coefficient
+    raise ValueError(f"{coupling.table_name}:{coupling.name} is not an electric/H2 coupling")
 
 
 def _domain_from_reference_field(reference_field: str, fallback: str) -> str:
@@ -207,6 +340,63 @@ def _parse_couplings(model) -> Tuple[List[EnergyCoupling], List[str]]:
                 endpoint is not None and _int(endpoint, "run_stat", 1) == 1
                 for endpoint in (t1_row, t2_row)
             )
+            direction = None
+            if t1_domain in {"ac", "dc"} and t2_domain == "hydro":
+                direction = "E2H"
+            elif t1_domain == "hydro" and t2_domain in {"ac", "dc"}:
+                direction = "H2E"
+            default_control_type = (
+                "FLOW"
+                if direction == "E2H"
+                else "P"
+                if direction == "H2E"
+                else "MONITOR"
+            )
+            control_type = normalize_energy_coupling_control_type(
+                _text(row, "control_type", default_control_type)
+            )
+            coefficient_names = (
+                (
+                    "e2h_coeff",
+                    "electric_to_hydrogen_efficiency",
+                    "electric_gas_efficiency",
+                    "e2h_efficiency",
+                    "efficiency",
+                    "eta",
+                    "conversion_efficiency",
+                )
+                if direction == "E2H"
+                else (
+                    "h2e_coeff",
+                    "hydrogen_to_electric_efficiency",
+                    "gas_electric_efficiency",
+                    "h2e_efficiency",
+                    "efficiency",
+                    "eta",
+                    "conversion_efficiency",
+                )
+            )
+            direct_control = (
+                direction is not None
+                and control_type in HYDROGEN_ELECTRIC_CONTROL_TYPES
+            )
+            coefficient = _float(
+                row,
+                coefficient_names,
+                None if direct_control else 1.0,
+            )
+            if direct_control and (coefficient is None or coefficient <= 0.0):
+                unit = "Nm3/kWh" if direction == "E2H" else "kWh/Nm3"
+                field = "e2h_coeff" if direction == "E2H" else "h2e_coeff"
+                warnings.append(
+                    f"{table_name}:{coupling_name} requires positive {field} ({unit})"
+                )
+                coefficient = 0.0
+            generic_efficiency = _float(
+                row,
+                ("efficiency", "eta", "conversion_efficiency"),
+                1.0,
+            )
             couplings.append(
                 EnergyCoupling(
                     table_name=table_name,
@@ -215,15 +405,15 @@ def _parse_couplings(model) -> Tuple[List[EnergyCoupling], List[str]]:
                     run_stat=_int(row, "run_stat", 1),
                     t1=EnergyTerminal(row_t1_domain, t1_type, t1_idx, t1_field),
                     t2=EnergyTerminal(row_t2_domain, t2_type, t2_idx, t2_field),
-                    efficiency=float(
-                        _float(row, ("efficiency", "eta", "conversion_efficiency"), 1.0)
-                    ),
+                    efficiency=float(generic_efficiency),
+                    e2h_coeff=(float(coefficient) if direction == "E2H" else None),
+                    h2e_coeff=(float(coefficient) if direction == "H2E" else None),
                     energy_factor=_float(
                         row,
                         ("energy_factor", "conversion_factor", "heating_value", "calorific_value"),
                         None,
                     ),
-                    control_type=_text(row, "control_type", "MONITOR").strip().upper(),
+                    control_type=control_type,
                     active=bool(row_alive and endpoints_alive),
                 )
             )

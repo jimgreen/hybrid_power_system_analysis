@@ -74,6 +74,22 @@ def test_multi_energy_5k_structure_and_control_coverage():
         COUPLING_TYPES
     )
     assert not calc.multi_energy.warnings
+    hydrogen_plans = [
+        plan
+        for plan in calc.energy_coupling_plans
+        if plan.coupling.hydrogen_electric_direction is not None
+    ]
+    assert {plan.coupling.control_type for plan in hydrogen_plans} == {"P", "FLOW"}
+    assert all(
+        plan.coupling.e2h_coeff is not None
+        for plan in hydrogen_plans
+        if plan.coupling.hydrogen_electric_direction == "E2H"
+    )
+    assert all(
+        plan.coupling.h2e_coeff is not None
+        for plan in hydrogen_plans
+        if plan.coupling.hydrogen_electric_direction == "H2E"
+    )
     for table_name in ("Steam2AcE", "Steam2DcE"):
         plans = [
             plan
@@ -145,7 +161,7 @@ def test_multi_energy_5k_se_is_observable_accurate_and_joint(monkeypatch):
     estimator.prepare()
     observability = estimator.observability_analysis()
     assert observability.observable
-    assert observability.rank == observability.state_count == 8600
+    assert observability.rank == observability.state_count == 8640
 
     def fail_local_run(*_args, **_kwargs):
         raise AssertionError("Hybrid SE must not launch a separate fluid WLS loop")
@@ -159,7 +175,7 @@ def test_multi_energy_5k_se_is_observable_accurate_and_joint(monkeypatch):
     assert result.iterations <= 12
     assert result.residual_inf < 5e-8
     assert result.objective < 1e-10
-    assert result.H.shape == (25577, 8600)
+    assert result.H.shape == (25537, 8640)
     assert result.H.nnz > 50000
     assert all(rc == 0 for rc in estimator.fluid_se_rc.values())
     assert {item.status for item in estimator.multi_energy_result.couplings} == {

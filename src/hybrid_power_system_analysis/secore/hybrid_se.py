@@ -24,6 +24,8 @@ from model.multi_energy_model import (
     MultiEnergyContext,
     attach_multi_energy_context,
     build_multi_energy_context_from_rows,
+    hydrogen_electric_balance_residual,
+    hydrogen_electric_dependent_value,
 )
 from model.ac_array_model import (
     BRANCH_COLS as AC_BRANCH_COLS,
@@ -672,6 +674,9 @@ class _MultiEnergySEEndpoint:
     domain: str
     device_type: str
     device_idx: int
+    device_type_code: int
+    meas_type_code: int
+    device_pos: int
 
 
 @dataclass(frozen=True)
@@ -685,6 +690,12 @@ class _MultiEnergySECouplingPlan:
     measurement_row: int
     control_col: int = -1
     prior_measurement_row: int = -1
+    hydrogen_electric: bool = False
+    controlled: Optional[_MultiEnergySEEndpoint] = None
+    dependent: Optional[_MultiEnergySEEndpoint] = None
+    controlled_setpoint: float = 0.0
+    controlled_measurement_rows: Tuple[int, ...] = ()
+    dependent_measurement_rows: Tuple[int, ...] = ()
 
 
 class HybridStateEstimator:
@@ -1296,6 +1307,72 @@ class HybridStateEstimator:
             return self._electric_endpoint_measurement(terminal)
         return self._fluid_endpoint_measurement(terminal)
 
+    def _multi_energy_terminal_setpoint(self, terminal) -> float:
+        domain = str(terminal.domain)
+        device_type = str(terminal.device_type)
+        is_load = device_type.endswith("Load")
+        is_storage = device_type.endswith("Storage")
+        if domain in {"ac", "dc"}:
+            side_ppc = (getattr(self.network, "ppc", {}) or {}).get(domain, {})
+            table_key = "load" if is_load else "gen"
+            columns = (
+                AC_LOAD_COLS if domain == "ac" and is_load else
+                AC_GEN_COLS if domain == "ac" else
+                DC_LOAD_COLS if is_load else DC_GEN_COLS
+            )
+            table = np.asarray(side_ppc.get(table_key, ()), dtype=np.float64)
+            if table.ndim != 2 or table.size == 0:
+                raise ValueError(f"missing {device_type} idx={int(terminal.device_idx)}")
+            rows = np.flatnonzero(
+                table[:, columns["idx"]].astype(np.int64, copy=False)
+                == int(terminal.device_idx)
+            )
+            if rows.size == 0:
+                raise ValueError(f"missing {device_type} idx={int(terminal.device_idx)}")
+            column = "pbase" if is_load else "p_set"
+            return float(table[int(rows[0]), columns[column]])
+
+        estimator = self.fluid_estimators[domain]
+        network = estimator.network
+        if is_load:
+            positions = [
+                pos
+                for pos, device in enumerate(network.loads)
+                if int(device.idx) == int(terminal.device_idx)
+            ]
+            if not positions:
+                raise ValueError(f"missing {device_type} idx={int(terminal.device_idx)}")
+            return float(network.load_flow_set[int(positions[0])])
+        positions = [
+            pos
+            for pos, device in enumerate(network.sources)
+            if bool(network.source_is_storage[pos]) == is_storage
+            and int(device.idx) == int(terminal.device_idx)
+        ]
+        if not positions:
+            raise ValueError(f"missing {device_type} idx={int(terminal.device_idx)}")
+        return float(network.source_flow_set[int(positions[0])])
+
+    def _multi_energy_endpoint_measurement_rows(
+        self,
+        endpoint: _MultiEnergySEEndpoint,
+    ) -> Tuple[int, ...]:
+        if endpoint.provider == "electric":
+            measurements = self.active_measurements
+            measurement_slice = self.electric_measurement_slice
+        else:
+            measurements = self.fluid_estimators[endpoint.provider].active_measurements
+            measurement_slice = self.fluid_measurement_slices[endpoint.provider]
+        table = measurements.table
+        mask = (
+            (np.asarray(table.device_type_code, dtype=np.int64) == endpoint.device_type_code)
+            & (np.asarray(table.meas_type_code, dtype=np.int64) == endpoint.meas_type_code)
+            & (np.asarray(table.device_pos, dtype=np.int64) == endpoint.device_pos)
+        )
+        return tuple(
+            (measurement_slice.start + np.flatnonzero(mask)).astype(np.int64).tolist()
+        )
+
     def _prepare_multi_energy_se_layout(self) -> None:
         if self._multi_energy_se_layout_ready or not self.fluid_estimators:
             return
@@ -1355,6 +1432,9 @@ class HybridStateEstimator:
                 domain=str(terminal.domain),
                 device_type=str(terminal.device_type),
                 device_idx=int(terminal.device_idx),
+                device_type_code=int(measurement.device_type_code),
+                meas_type_code=int(measurement.meas_type_code),
+                device_pos=int(measurement.device_pos),
             )
             rows.append(measurement)
             endpoint_cache[key] = endpoint
@@ -1373,14 +1453,47 @@ class HybridStateEstimator:
                 self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
                 continue
             electric_scale = float(getattr(self.network, "p_base_kW", self.p_base_kW))
+            if coupling.is_hydrogen_electric_control:
+                controlled_terminal = coupling.controlled_terminal
+                dependent_terminal = coupling.dependent_terminal
+                controlled = t1 if coupling.t1 == controlled_terminal else t2
+                dependent = t1 if coupling.t1 == dependent_terminal else t2
+                controlled_setpoint = self._multi_energy_terminal_setpoint(
+                    controlled_terminal
+                )
+                dependent_setpoint = hydrogen_electric_dependent_value(
+                    coupling,
+                    controlled_setpoint,
+                    electric_scale,
+                )
+                pending.append(
+                    SimpleNamespace(
+                        coupling=coupling,
+                        t1=t1,
+                        t2=t2,
+                        t1_scale=1.0,
+                        t2_scale=1.0,
+                        hydrogen_electric=True,
+                        controlled=controlled,
+                        dependent=dependent,
+                        controlled_setpoint=float(controlled_setpoint),
+                        dependent_setpoint=float(dependent_setpoint),
+                    )
+                )
+                continue
             factor = float(coupling.energy_factor)
             pending.append(
-                (
-                    coupling,
-                    t1,
-                    t2,
-                    electric_scale if t1.domain in {"ac", "dc"} else factor,
-                    electric_scale if t2.domain in {"ac", "dc"} else factor,
+                SimpleNamespace(
+                    coupling=coupling,
+                    t1=t1,
+                    t2=t2,
+                    t1_scale=electric_scale if t1.domain in {"ac", "dc"} else factor,
+                    t2_scale=electric_scale if t2.domain in {"ac", "dc"} else factor,
+                    hydrogen_electric=False,
+                    controlled=None,
+                    dependent=None,
+                    controlled_setpoint=0.0,
+                    dependent_setpoint=0.0,
                 )
             )
 
@@ -1403,44 +1516,74 @@ class HybridStateEstimator:
         control_measurements = MeasurementList()
         control_initial = []
         prepared = []
-        for coupling, t1, t2, t1_scale, t2_scale in pending:
+        for item in pending:
+            coupling = item.coupling
+            t1 = item.t1
+            t2 = item.t2
+            t1_scale = item.t1_scale
+            t2_scale = item.t2_scale
             t1_value = float(endpoint_values[t1.provider][t1.row])
             t2_value = float(endpoint_values[t2.provider][t2.row])
-            normalization = max(
-                1.0,
-                abs(t1_value * t1_scale),
-                abs(t2_value * t2_scale),
+            endpoint = item.dependent if item.hydrogen_electric else t1
+            endpoint_value = (
+                float(endpoint_values[endpoint.provider][endpoint.row])
+                if item.hydrogen_electric
+                else t1_value
             )
-            endpoint_row = endpoint_jacobians[t1.provider].getrow(t1.row)
+            normalization = (
+                max(1.0, abs(endpoint_value), abs(item.dependent_setpoint))
+                if item.hydrogen_electric
+                else max(
+                    1.0,
+                    abs(t1_value * t1_scale),
+                    abs(t2_value * t2_scale),
+                )
+            )
+            endpoint_row = endpoint_jacobians[endpoint.provider].getrow(endpoint.row)
             control_col = -1
             prior_measurement_row = -1
-            if endpoint_row.nnz == 0:
+            if item.hydrogen_electric or endpoint_row.nnz == 0:
                 control_col = self.multi_energy_state_count + len(control_initial)
-                prior_measurement_row = measurement_offset + len(control_measurements)
-                control_initial.append(t1_value)
-                control_measurements.append(
-                    Measurement(
-                        prior_measurement_row + 1,
-                        f"coupling_control_{coupling.table_name}_{coupling.idx}",
-                        str(coupling.table_name),
-                        str(coupling.name),
-                        "T1_CONTROL",
-                        self.multi_energy_coupling_prior_weight,
-                        True,
-                        t1_value,
-                        status=MEAS_STATUS_PSEUDO,
-                    )
+                control_initial.append(
+                    item.dependent_setpoint if item.hydrogen_electric else t1_value
                 )
+                if not item.hydrogen_electric:
+                    prior_measurement_row = measurement_offset + len(control_measurements)
+                    control_measurements.append(
+                        Measurement(
+                            prior_measurement_row + 1,
+                            f"coupling_control_{coupling.table_name}_{coupling.idx}",
+                            str(coupling.table_name),
+                            str(coupling.name),
+                            "T1_CONTROL",
+                            self.multi_energy_coupling_prior_weight,
+                            True,
+                            t1_value,
+                            status=MEAS_STATUS_PSEUDO,
+                        )
+                    )
             prepared.append(
-                (
-                    coupling,
-                    t1,
-                    t2,
-                    float(t1_scale),
-                    float(t2_scale),
-                    float(normalization),
-                    control_col,
-                    prior_measurement_row,
+                SimpleNamespace(
+                    coupling=coupling,
+                    t1=t1,
+                    t2=t2,
+                    t1_scale=float(t1_scale),
+                    t2_scale=float(t2_scale),
+                    normalization=float(normalization),
+                    control_col=control_col,
+                    prior_measurement_row=prior_measurement_row,
+                    hydrogen_electric=item.hydrogen_electric,
+                    controlled=item.controlled,
+                    dependent=item.dependent,
+                    controlled_setpoint=item.controlled_setpoint,
+                    controlled_measurement_rows=(
+                        self._multi_energy_endpoint_measurement_rows(item.controlled)
+                        if item.hydrogen_electric else ()
+                    ),
+                    dependent_measurement_rows=(
+                        self._multi_energy_endpoint_measurement_rows(item.dependent)
+                        if item.hydrogen_electric else ()
+                    ),
                 )
             )
 
@@ -1457,28 +1600,26 @@ class HybridStateEstimator:
         energy_measurement_offset = self.multi_energy_control_measurement_slice.stop
         energy_measurements = MeasurementList()
         self.multi_energy_se_coupling_plans = []
-        for (
-            coupling,
-            t1,
-            t2,
-            t1_scale,
-            t2_scale,
-            normalization,
-            control_col,
-            prior_measurement_row,
-        ) in prepared:
+        for item in prepared:
+            coupling = item.coupling
             measurement_row = energy_measurement_offset + len(energy_measurements)
             self.multi_energy_se_coupling_plans.append(
                 _MultiEnergySECouplingPlan(
                     coupling=coupling,
-                    t1=t1,
-                    t2=t2,
-                    t1_scale=t1_scale,
-                    t2_scale=t2_scale,
-                    normalization=normalization,
+                    t1=item.t1,
+                    t2=item.t2,
+                    t1_scale=item.t1_scale,
+                    t2_scale=item.t2_scale,
+                    normalization=item.normalization,
                     measurement_row=measurement_row,
-                    control_col=control_col,
-                    prior_measurement_row=prior_measurement_row,
+                    control_col=item.control_col,
+                    prior_measurement_row=item.prior_measurement_row,
+                    hydrogen_electric=item.hydrogen_electric,
+                    controlled=item.controlled,
+                    dependent=item.dependent,
+                    controlled_setpoint=item.controlled_setpoint,
+                    controlled_measurement_rows=item.controlled_measurement_rows,
+                    dependent_measurement_rows=item.dependent_measurement_rows,
                 )
             )
             energy_measurements.append(
@@ -1527,7 +1668,8 @@ class HybridStateEstimator:
             for name, estimator in self.fluid_estimators.items()
             for label in estimator.state_labels
         ] + [
-            f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:T1_CONTROL"
+            f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:"
+            f"{'DEPENDENT' if plan.hydrogen_electric else 'T1_CONTROL'}"
             for plan in self.multi_energy_se_coupling_plans
             if plan.control_col >= 0
         ]
@@ -1617,6 +1759,31 @@ class HybridStateEstimator:
             with_jacobian=False,
         )
         for plan in self.multi_energy_se_coupling_plans:
+            if plan.hydrogen_electric:
+                dependent_value = (
+                    float(state[plan.control_col])
+                    if plan.control_col >= 0
+                    else float(
+                        endpoint_values[plan.dependent.provider][plan.dependent.row]
+                    )
+                )
+                expected = hydrogen_electric_dependent_value(
+                    plan.coupling,
+                    plan.controlled_setpoint,
+                    float(getattr(self.network, "p_base_kW", self.p_base_kW)),
+                )
+                if plan.controlled_measurement_rows:
+                    values[np.asarray(plan.controlled_measurement_rows, dtype=np.int64)] = (
+                        plan.controlled_setpoint
+                    )
+                if plan.dependent_measurement_rows:
+                    values[np.asarray(plan.dependent_measurement_rows, dtype=np.int64)] = (
+                        dependent_value
+                    )
+                values[plan.measurement_row] = (
+                    dependent_value - expected
+                ) / plan.normalization
+                continue
             if plan.control_col >= 0:
                 t1_value = float(state[plan.control_col])
                 values[plan.prior_measurement_row] = t1_value
@@ -1680,6 +1847,20 @@ class HybridStateEstimator:
                 ),
                 format="csr",
             )
+        if any(plan.hydrogen_electric for plan in self.multi_energy_se_coupling_plans):
+            local_jacobian = local_jacobian.tolil()
+            for plan in self.multi_energy_se_coupling_plans:
+                if not plan.hydrogen_electric:
+                    continue
+                for row in plan.controlled_measurement_rows:
+                    local_jacobian.rows[row] = []
+                    local_jacobian.data[row] = []
+                if plan.control_col < 0:
+                    continue
+                for row in plan.dependent_measurement_rows:
+                    local_jacobian.rows[row] = [plan.control_col]
+                    local_jacobian.data[row] = [1.0]
+            local_jacobian = local_jacobian.tocsr()
         endpoint_values, endpoint_jacobians = self._multi_energy_endpoint_runtime(
             state,
             with_jacobian=True,
@@ -1690,6 +1871,28 @@ class HybridStateEstimator:
         added_row_offset = self.multi_energy_control_measurement_slice.start
         for plan in self.multi_energy_se_coupling_plans:
             local_row = plan.measurement_row - added_row_offset
+            if plan.hydrogen_electric:
+                if plan.control_col >= 0:
+                    rows.append(local_row)
+                    cols.append(plan.control_col)
+                    data.append(1.0 / plan.normalization)
+                else:
+                    dependent_slice = (
+                        self.electric_state_slice
+                        if plan.dependent.provider == "electric"
+                        else self.fluid_state_slices[plan.dependent.provider]
+                    )
+                    self._append_multi_energy_endpoint_jacobian(
+                        rows,
+                        cols,
+                        data,
+                        target_row=local_row,
+                        endpoint=plan.dependent,
+                        endpoint_jacobians=endpoint_jacobians,
+                        state_slice=dependent_slice,
+                        scale=1.0 / plan.normalization,
+                    )
+                continue
             if plan.control_col >= 0:
                 t1_value = float(state[plan.control_col])
                 prior_row = plan.prior_measurement_row - added_row_offset
@@ -8016,16 +8219,40 @@ class HybridStateEstimator:
             if not coupling.active:
                 status = "inactive"
             elif plan is not None and endpoint_values:
-                t1_value = (
-                    float(self.multi_energy_estimate_result.x[plan.control_col])
-                    if plan.control_col >= 0
-                    else float(endpoint_values[plan.t1.provider][plan.t1.row])
-                )
-                t2_value = float(endpoint_values[plan.t2.provider][plan.t2.row])
-                residual = (
-                    abs(t2_value) * plan.t2_scale
-                    - float(coupling.efficiency) * abs(t1_value) * plan.t1_scale
-                )
+                if plan.hydrogen_electric:
+                    dependent_value = (
+                        float(self.multi_energy_estimate_result.x[plan.control_col])
+                        if plan.control_col >= 0
+                        else float(
+                            endpoint_values[plan.dependent.provider][plan.dependent.row]
+                        )
+                    )
+                    controlled_value = float(plan.controlled_setpoint)
+                    if plan.t1 == plan.controlled:
+                        t1_value, t2_value = controlled_value, dependent_value
+                    else:
+                        t1_value, t2_value = dependent_value, controlled_value
+                    electric_value = (
+                        t1_value if plan.t1.domain in {"ac", "dc"} else t2_value
+                    )
+                    hydro_value = t1_value if plan.t1.domain == "hydro" else t2_value
+                    residual = hydrogen_electric_balance_residual(
+                        coupling,
+                        electric_value,
+                        hydro_value,
+                        float(getattr(self.network, "p_base_kW", self.p_base_kW)),
+                    )
+                else:
+                    t1_value = (
+                        float(self.multi_energy_estimate_result.x[plan.control_col])
+                        if plan.control_col >= 0
+                        else float(endpoint_values[plan.t1.provider][plan.t1.row])
+                    )
+                    t2_value = float(endpoint_values[plan.t2.provider][plan.t2.row])
+                    residual = (
+                        abs(t2_value) * plan.t2_scale
+                        - float(coupling.efficiency) * abs(t1_value) * plan.t1_scale
+                    )
                 normalized_tolerance = max(
                     10.0 * self.tol,
                     3.0 / np.sqrt(max(self.multi_energy_coupling_weight, 1.0)),
@@ -8044,6 +8271,8 @@ class HybridStateEstimator:
                     name=coupling.name,
                     active=coupling.active,
                     control_type=coupling.control_type,
+                    e2h_coeff=coupling.e2h_coeff,
+                    h2e_coeff=coupling.h2e_coeff,
                     efficiency=coupling.efficiency,
                     energy_factor=coupling.energy_factor,
                     t1_value=t1_value,

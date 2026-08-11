@@ -187,14 +187,60 @@ def _coupling_blocks(couplings_per_type: int) -> str:
     )
     blocks = []
     for table_name, endpoint_header, t1_indices, t2_indices, efficiency, factor in specifications:
-        rows = [
-            _row((pos, f"{table_name.lower()}_{pos}", 1, t1_idx, t2_idx, efficiency, factor))
-            for pos, (t1_idx, t2_idx) in enumerate(zip(t1_indices, t2_indices), start=1)
-        ]
+        if table_name in {"AcE2Hydro", "DcE2Hydro"}:
+            coefficient_field = "e2h_coeff"
+            default_control = "FLOW"
+        elif table_name in {"Hydro2AcE", "Hydro2DcE"}:
+            coefficient_field = "h2e_coeff"
+            default_control = "P"
+        else:
+            coefficient_field = ""
+            default_control = ""
+        if coefficient_field:
+            alternate_control = "P" if default_control == "FLOW" else "FLOW"
+            rows = [
+                _row(
+                    (
+                        pos,
+                        f"{table_name.lower()}_{pos}",
+                        1,
+                        default_control if pos % 2 else alternate_control,
+                        t1_idx,
+                        t2_idx,
+                        efficiency,
+                    )
+                )
+                for pos, (t1_idx, t2_idx) in enumerate(
+                    zip(t1_indices, t2_indices),
+                    start=1,
+                )
+            ]
+            header = (
+                f"idx name run_stat control_type {endpoint_header} {coefficient_field}"
+            )
+        else:
+            rows = [
+                _row(
+                    (
+                        pos,
+                        f"{table_name.lower()}_{pos}",
+                        1,
+                        t1_idx,
+                        t2_idx,
+                        efficiency,
+                        factor,
+                    )
+                )
+                for pos, (t1_idx, t2_idx) in enumerate(
+                    zip(t1_indices, t2_indices),
+                    start=1,
+                )
+            ]
+            header = f"idx name run_stat {endpoint_header} efficiency energy_factor"
         blocks.append(
             _block(
                 table_name,
-                f"idx name run_stat {endpoint_header} efficiency energy_factor",
+                header,
                 rows,
             )
         )

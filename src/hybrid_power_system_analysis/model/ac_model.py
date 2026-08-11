@@ -94,6 +94,14 @@ class ACLoad:
         self.current = None
         self.node_obj = None
 
+    @property
+    def p_set(self):
+        return self.pbase
+
+    @p_set.setter
+    def p_set(self, value):
+        self.pbase = value
+
 
 class ACShuntCompensator:
     def __init__(self, idx, node, control_type='Q', q_set=0.0, g_set=0.0, b_set=0.0, v_set=1.0, run_stat=1):
@@ -421,6 +429,7 @@ _AC_ROW_DEFAULT_ATTRS = {
         "name": "",
         "node": 0,
         "pbase": 1.0,
+        "p_set": None,
         "pv0": 0.0,
         "pv1": 0.0,
         "pv2": 0.0,
@@ -675,6 +684,8 @@ def _coerce_ac_rows(rows, table_name):
         obj = row_cls.__new__(row_cls)
         obj.__dict__.update(defaults)
         obj.__dict__.update(row_values)
+        if table_name == "ACLoad" and row_values.get("p_set") not in (None, "", "-"):
+            obj.pbase = float(row_values["p_set"])
         if table_name == "ACTransformer":
             # Compatibility for older E files/objects that used one total
             # shunt susceptance column b. The new transformer model is T-type

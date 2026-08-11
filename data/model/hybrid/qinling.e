@@ -94,9 +94,9 @@
 </ACBranch>
 
 <ACLoad>
-@    idx    name                            dev_type           node    p_max    p_min    q_max    q_min    run_stat    rated_capacity    pbase    pv0    pv1    pv2    qbase    qv0    qv1    qv2    v_max    v_min
-#    1      交流负荷-1                       ac-load            32      5        0        1.2      0        1           5                 150      1.0    0.0    0.0    50       1.0    0.0    0.0    1.1      0.9
-#    2      交流电制氢-1_交流设备端交流电负荷    ac-electrolyzer    31      0        0        0        0        1           0                 0        1.0    0.0    0.0    0        1.0    0.0    0.0    0        0
+@    idx    name                            dev_type           node    p_set    p_max    p_min    q_max    q_min    run_stat    rated_capacity    pbase    pv0    pv1    pv2    qbase    qv0    qv1    qv2    v_max    v_min
+#    1      交流负荷-1                       ac-load            32      150      5        0        1.2      0        1           5                 150      1.0    0.0    0.0    50       1.0    0.0    0.0    1.1      0.9
+#    2      交流电制氢-1_交流设备端交流电负荷    ac-electrolyzer    31      0        0        0        0        0        1           0                 0        1.0    0.0    0.0    0        1.0    0.0    0.0    0        0
 </ACLoad>
 
 <ACGenerator>
@@ -290,7 +290,7 @@
 
 <HydroSource>
 @    idx    name                       dev_type           node    control_type    pressure_set    flow_set    alpha    flow_min    flow_max    run_stat
-#    1      交流电制氢-1_氢能设备端氢源    ac-electrolyzer    1       PRESSURE        3.00            0.0         1.0      0.0         2.0         1
+#    1      交流电制氢-1_氢能设备端氢源    ac-electrolyzer    1       FLOW            3.00            0.20        1.0      0.0         2.0         1
 </HydroSource>
 
 <HydroLoad>
@@ -311,18 +311,18 @@
 </HydroCompressor>
 
 <HydroStorage>
-@    idx    name              dev_type                   node    control_type    flow_set    alpha    flow_min    flow_max    run_stat
-#    1      集装格式储氢罐-1    hydrogen-tank-container    3       FLOW            0.0         1.0      -2.0        2.0         1
+@    idx    name              dev_type                   node    control_type    pressure_set    flow_set    alpha    flow_min    flow_max    run_stat
+#    1      集装格式储氢罐-1    hydrogen-tank-container    3       PRESSURE        29.80           0.0         1.0      -2.0        2.0         1
 </HydroStorage>
 
 <AcE2Hydro>
-@    idx    name          run_stat    idx_ac_load_t1    idx_h2_unit_t2
-#    1      交流电制氢-1    1           2                 1
+@    idx    name          run_stat    control_type    e2h_coeff    idx_ac_load_t1    idx_h2_unit_t2
+#    1      交流电制氢-1    1           FLOW            0.20          2                 1
 </AcE2Hydro>
 
 <Hydro2DcE>
-@    idx    name            run_stat    idx_dc_unit_t1    idx_h2_load_t2
-#    1      直流燃料电池-1    1           10                1
+@    idx    name            run_stat    control_type    h2e_coeff    idx_dc_unit_t1    idx_h2_load_t2
+#    1      直流燃料电池-1    1           FLOW            1.50          10                1
 </Hydro2DcE>
 
 <ACWindGen>

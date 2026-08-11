@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 import numpy as np
 import pytest
@@ -59,8 +60,8 @@ def _build_multi_energy_case(tmp_path: Path):
 </Gas2AcE>
 
 <AcE2Hydro>
-@ idx name run_stat idx_ac_load_t1 idx_h2_unit_t2 efficiency energy_factor
-# 1 electrolyzer 1 2 1 0.75 100.0
+@ idx name run_stat control_type idx_ac_load_t1 idx_h2_unit_t2 efficiency energy_factor
+# 1 electrolyzer 1 MONITOR 2 1 0.75 100.0
 </AcE2Hydro>
 
 <Steam2DcE>
@@ -93,6 +94,59 @@ def _build_multi_energy_case(tmp_path: Path):
     return case_file, meas_file
 
 
+def _replace_model_block(text: str, block_name: str, replacement: str) -> str:
+    pattern = rf"<{block_name}>.*?</{block_name}>"
+    updated, count = re.subn(pattern, replacement.strip(), text, count=1, flags=re.DOTALL)
+    assert count == 1
+    return updated
+
+
+def _build_direct_hydrogen_conversion_case(
+    tmp_path: Path,
+    *,
+    table_name: str,
+    control_type: str | None,
+):
+    case_file, meas_file = _build_multi_energy_case(tmp_path)
+    text = case_file.read_text(encoding="utf8")
+    text = _replace_model_block(
+        text,
+        "HydroSource",
+        """
+<HydroSource>
+@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat
+# 1 hydro_source 1 PRESSURE 3.00 0.0 1.0 0.0 2.0 1
+# 2 electrolyzer_h2 3 FLOW 2.98 0.4 1.0 0.0 10.0 1
+</HydroSource>
+""",
+    )
+    if table_name == "AcE2Hydro":
+        control_header = " control_type" if control_type is not None else ""
+        control_value = f" {control_type}" if control_type is not None else ""
+        text = _replace_model_block(
+            text,
+            "AcE2Hydro",
+            f"""
+<AcE2Hydro>
+@ idx name run_stat{control_header} idx_ac_load_t1 idx_h2_unit_t2 e2h_coeff
+# 1 direct_electrolyzer 1{control_value} 7 2 0.02
+</AcE2Hydro>
+""",
+        )
+    else:
+        control_header = " control_type" if control_type is not None else ""
+        control_value = f" {control_type}" if control_type is not None else ""
+        text += f"""
+
+<Hydro2DcE>
+@ idx name run_stat{control_header} idx_dc_unit_t1 idx_h2_load_t2 h2e_coeff
+# 1 direct_fuel_cell 1{control_value} 3 3 600.0
+</Hydro2DcE>
+"""
+    case_file.write_text(text, encoding="utf8")
+    return case_file, meas_file
+
+
 def test_hybrid_lf_runs_all_fluid_networks_and_parses_couplings(tmp_path):
     case_file, _ = _build_multi_energy_case(tmp_path)
     calc = HybridPowerFlowCalc.from_file_fast(
@@ -121,6 +175,163 @@ def test_hybrid_lf_runs_all_fluid_networks_and_parses_couplings(tmp_path):
     assert steam_plan.t2.domain == "dc"
 
 
+@pytest.mark.parametrize(
+    ("control_type", "adjustable_domain"),
+    (("P", "hydro"), ("FLOW", "ac")),
+)
+def test_electrolyzer_control_mode_selects_endpoint_and_direct_efficiency(
+    tmp_path,
+    control_type,
+    adjustable_domain,
+):
+    case_file, _meas_file = _build_direct_hydrogen_conversion_case(
+        tmp_path,
+        table_name="AcE2Hydro",
+        control_type=control_type,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    plan = next(
+        item
+        for item in calc.energy_coupling_plans
+        if item.coupling.name == "direct_electrolyzer"
+    )
+    result = next(
+        item for item in calc.coupling_results if item.name == "direct_electrolyzer"
+    )
+    assert plan.adjustable.domain == adjustable_domain
+    electric_kw = float(result.t1_value) * float(calc.network.p_base_kW)
+    hydrogen_flow = float(result.t2_value)
+    assert hydrogen_flow == pytest.approx(0.02 * electric_kw, rel=1e-7, abs=1e-9)
+    if control_type == "FLOW":
+        assert hydrogen_flow == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize(
+    ("control_type", "adjustable_domain"),
+    (("P", "hydro"), ("FLOW", "dc")),
+)
+def test_fuel_cell_control_mode_selects_endpoint_and_direct_efficiency(
+    tmp_path,
+    control_type,
+    adjustable_domain,
+):
+    case_file, _meas_file = _build_direct_hydrogen_conversion_case(
+        tmp_path,
+        table_name="Hydro2DcE",
+        control_type=control_type,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    plan = next(
+        item
+        for item in calc.energy_coupling_plans
+        if item.coupling.name == "direct_fuel_cell"
+    )
+    result = next(
+        item for item in calc.coupling_results if item.name == "direct_fuel_cell"
+    )
+    assert plan.adjustable.domain == adjustable_domain
+    electric_kw = float(result.t1_value) * float(calc.network.p_base_kW)
+    hydrogen_flow = float(result.t2_value)
+    assert electric_kw == pytest.approx(600.0 * hydrogen_flow, rel=1e-7, abs=1e-9)
+    if control_type == "FLOW":
+        assert hydrogen_flow == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "expected_control", "coefficient_field"),
+    (
+        ("AcE2Hydro", "FLOW", "e2h_coeff"),
+        ("Hydro2DcE", "P", "h2e_coeff"),
+    ),
+)
+def test_hydrogen_conversion_uses_direction_specific_default_control(
+    tmp_path,
+    table_name,
+    expected_control,
+    coefficient_field,
+):
+    case_file, _meas_file = _build_direct_hydrogen_conversion_case(
+        tmp_path,
+        table_name=table_name,
+        control_type=None,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="array",
+        linear_solver="scipy",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    coupling = next(
+        item
+        for item in calc.multi_energy.couplings
+        if item.table_name == table_name and item.is_hydrogen_electric_control
+    )
+    assert coupling.control_type == expected_control
+    assert getattr(coupling, coefficient_field) is not None
+
+
+def test_hybrid_se_maps_flow_controlled_fuel_cell_power_row_to_coupling_state(
+    tmp_path,
+):
+    case_file, meas_file = _build_direct_hydrogen_conversion_case(
+        tmp_path,
+        table_name="Hydro2DcE",
+        control_type="FLOW",
+    )
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        auto_prepare=False,
+    )
+    estimator.prepare()
+    estimator._prepare_multi_energy_se_layout()
+    plan = next(
+        item
+        for item in estimator.multi_energy_se_coupling_plans
+        if item.coupling.name == "direct_fuel_cell"
+    )
+
+    assert plan.control_col >= 0
+    assert plan.dependent_measurement_rows
+    state = estimator._multi_energy_initial_state()
+    analytic = estimator._multi_energy_jacobian_sparse(state)
+    step = 1.0e-6
+    upper = state.copy()
+    lower = state.copy()
+    upper[plan.control_col] += step
+    lower[plan.control_col] -= step
+    numeric = (
+        estimator._evaluate_multi_energy(upper)
+        - estimator._evaluate_multi_energy(lower)
+    ) / (2.0 * step)
+
+    for row in plan.dependent_measurement_rows:
+        jacobian_row = analytic.getrow(row)
+        np.testing.assert_array_equal(jacobian_row.indices, [plan.control_col])
+        np.testing.assert_allclose(jacobian_row.data, [1.0], rtol=0.0, atol=0.0)
+        assert numeric[row] == pytest.approx(1.0, rel=1.0e-9, abs=1.0e-9)
+    for row in plan.controlled_measurement_rows:
+        assert analytic.getrow(row).nnz == 0
+        assert numeric[row] == pytest.approx(0.0, rel=0.0, abs=1.0e-12)
+
+
 def test_hybrid_storage_endpoint_keeps_storage_identity_and_source_balance(tmp_path):
     case_file, meas_file = _build_multi_energy_case(tmp_path)
     storage_blocks = """
@@ -130,8 +341,8 @@ def test_hybrid_storage_endpoint_keeps_storage_identity_and_source_balance(tmp_p
 </HydroStorage>
 
 <Hydro2DcE>
-@ idx name run_stat idx_h2_storage_t1 idx_dc_unit_t2 efficiency energy_factor
-# 1 hydrogen_buffer_supply 1 1 2 1.0 100.0
+@ idx name run_stat control_type idx_h2_storage_t1 idx_dc_unit_t2 efficiency energy_factor
+# 1 hydrogen_buffer_supply 1 MONITOR 1 2 1.0 100.0
 </Hydro2DcE>
 """.strip()
     case_file.write_text(

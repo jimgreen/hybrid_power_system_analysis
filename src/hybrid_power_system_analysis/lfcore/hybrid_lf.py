@@ -70,6 +70,8 @@ from model.multi_energy_model import (
     MultiEnergyContext,
     attach_multi_energy_context,
     build_multi_energy_context_from_rows,
+    hydrogen_electric_balance_residual,
+    hydrogen_electric_dependent_value,
 )
 from ac_array_model import (
     ACAC_COLS,
@@ -1342,6 +1344,15 @@ class HybridPowerFlowCalc:
             tuple(derivative.data.tolist()),
         )
 
+    def _energy_endpoint_setpoint(self, endpoint) -> float:
+        if endpoint.domain in {"ac", "dc"}:
+            column = "pbase" if endpoint.kind == "load" else "p_set"
+            return float(endpoint.table[endpoint.row, endpoint.columns[column]])
+        network = self.fluid_calcs[endpoint.domain].network
+        if endpoint.kind == "load":
+            return float(network.load_flow_set[endpoint.device_pos])
+        return float(network.source_flow_set[endpoint.device_pos])
+
     def _prepare_energy_coupling_plans(
         self,
         uncoupled_state: np.ndarray,
@@ -1353,6 +1364,67 @@ class HybridPowerFlowCalc:
         released_endpoints = set()
         for coupling in self.multi_energy.couplings:
             if not coupling.active or not coupling.supports_energy_balance:
+                continue
+            if coupling.is_hydrogen_electric_control:
+                dependent_terminal = coupling.dependent_terminal
+                controlled_terminal = coupling.controlled_terminal
+                if dependent_terminal is None or controlled_terminal is None:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: missing electric or hydrogen endpoint"
+                    )
+                    continue
+                t1_is_dependent = coupling.t1 == dependent_terminal
+                t1, reason = self._resolve_energy_endpoint(
+                    coupling.t1,
+                    adjustable=t1_is_dependent,
+                )
+                if t1 is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                t2, reason = self._resolve_energy_endpoint(
+                    coupling.t2,
+                    adjustable=not t1_is_dependent,
+                )
+                if t2 is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                dependent = t1 if t1_is_dependent else t2
+                controlled = t2 if t1_is_dependent else t1
+                if controlled.balance_row < 0:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: controlled endpoint has no balance row"
+                    )
+                    continue
+                key = (dependent.domain, dependent.device_type, dependent.device_idx)
+                if key in released_endpoints:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: endpoint {key} is already controlled by another coupling"
+                    )
+                    continue
+                controlled_setpoint = self._energy_endpoint_setpoint(controlled)
+                dependent_initial = hydrogen_electric_dependent_value(
+                    coupling,
+                    controlled_setpoint,
+                    float(getattr(self.network, "p_base_kW", 1.0)),
+                )
+                plan_pos = len(self.energy_coupling_plans)
+                self.energy_coupling_plans.append(
+                    SimpleNamespace(
+                        coupling=coupling,
+                        t1=t1,
+                        t2=t2,
+                        controlled=controlled,
+                        dependent=dependent,
+                        adjustable=dependent,
+                        controlled_setpoint=float(controlled_setpoint),
+                        state_col=state_offset + plan_pos,
+                        eq_row=eq_offset + plan_pos,
+                        normalization=max(1.0, abs(float(dependent_initial))),
+                        hydrogen_electric=True,
+                    )
+                )
+                released_endpoints.add(key)
+                initial.append(float(dependent_initial))
                 continue
             t1, reason = self._resolve_energy_endpoint(coupling.t1, adjustable=True)
             if t1 is None:
@@ -1400,6 +1472,7 @@ class HybridPowerFlowCalc:
                     state_col=state_offset + plan_pos,
                     eq_row=eq_offset + plan_pos,
                     normalization=normalization,
+                    hydrogen_electric=False,
                 )
             )
             released_endpoints.add(key)
@@ -1421,6 +1494,48 @@ class HybridPowerFlowCalc:
         data = []
         for plan in self.energy_coupling_plans:
             controlled_value = float(x[plan.state_col])
+            if plan.hydrogen_electric:
+                controlled_base, controlled_cols, controlled_derivatives = (
+                    self._energy_endpoint_value_and_derivative(plan.controlled, x)
+                )
+                controlled_correction = plan.controlled_setpoint - controlled_base
+                residual[plan.controlled.balance_row] += (
+                    plan.controlled.correction_sign * controlled_correction
+                )
+                dependent_base, dependent_cols, dependent_derivatives = (
+                    self._energy_endpoint_value_and_derivative(plan.dependent, x)
+                )
+                dependent_correction = controlled_value - dependent_base
+                residual[plan.dependent.balance_row] += (
+                    plan.dependent.correction_sign * dependent_correction
+                )
+                expected = hydrogen_electric_dependent_value(
+                    plan.coupling,
+                    plan.controlled_setpoint,
+                    float(getattr(self.network, "p_base_kW", 1.0)),
+                )
+                residual[plan.eq_row] = (
+                    controlled_value - expected
+                ) / plan.normalization
+                if jacobian is None:
+                    continue
+                for endpoint, columns, derivatives in (
+                    (plan.controlled, controlled_cols, controlled_derivatives),
+                    (plan.dependent, dependent_cols, dependent_derivatives),
+                ):
+                    for column, derivative in zip(columns, derivatives):
+                        rows.append(endpoint.balance_row)
+                        cols.append(int(column))
+                        data.append(-endpoint.correction_sign * float(derivative))
+                rows.extend((plan.dependent.balance_row, plan.eq_row))
+                cols.extend((plan.state_col, plan.state_col))
+                data.extend(
+                    (
+                        plan.dependent.correction_sign,
+                        1.0 / plan.normalization,
+                    )
+                )
+                continue
             base_value, base_cols, base_derivatives = (
                 self._energy_endpoint_value_and_derivative(plan.t1, x)
             )
@@ -1477,29 +1592,60 @@ class HybridPowerFlowCalc:
         jacobian = jacobian + correction.asformat(jacobian_format)
         return jacobian.asformat(jacobian_format)
 
+    def _apply_final_energy_endpoint_value(self, endpoint, value, ac_result, dc_result) -> None:
+        value = float(value)
+        if endpoint.domain in {"ac", "dc"}:
+            endpoint.table[endpoint.row, endpoint.columns["p"]] = value
+            result = ac_result if endpoint.domain == "ac" else dc_result
+            if isinstance(result, dict) and endpoint.table_key in result:
+                result[endpoint.table_key][endpoint.row, endpoint.columns["p"]] = value
+            return
+
+        calc = self.fluid_calcs[endpoint.domain]
+        result = calc.lf_result
+        network = calc.network
+        if endpoint.kind == "load":
+            if "load_flow" in result.arrays:
+                result.arrays["load_flow"][endpoint.device_pos] = value
+            name = str(network.load_name[endpoint.device_pos])
+            if name in result.loads:
+                result.loads[name].flow = value
+            return
+
+        calc.source_flow[endpoint.device_pos] = value
+        if "source_flow" in result.arrays:
+            result.arrays["source_flow"][endpoint.device_pos] = value
+        if endpoint.kind == "storage" and "storage_flow" in result.arrays:
+            storage_rows = np.flatnonzero(network.storage_source_pos == endpoint.device_pos)
+            if storage_rows.size:
+                result.arrays["storage_flow"][int(storage_rows[0])] = value
+        collection = result.storages if endpoint.kind == "storage" else result.sources
+        name = str(network.source_name[endpoint.device_pos])
+        if name in collection:
+            collection[name].flow = value
+
     def _apply_final_coupling_endpoint_controls(self, ac_result, dc_result) -> None:
         for plan in self.energy_coupling_plans:
-            endpoint = plan.t1
-            value = float(self.x[plan.state_col])
-            if endpoint.domain in {"ac", "dc"}:
-                endpoint.table[endpoint.row, endpoint.columns["p"]] = value
-                result = ac_result if endpoint.domain == "ac" else dc_result
-                if isinstance(result, dict) and endpoint.table_key in result:
-                    result[endpoint.table_key][endpoint.row, endpoint.columns["p"]] = value
-                continue
-
-            calc = self.fluid_calcs[endpoint.domain]
-            network = calc.network
-            if endpoint.kind == "load":
-                old_value = float(network.load_flow_set[endpoint.device_pos])
-                network.load_flow_set[endpoint.device_pos] = value
-                network.demand[endpoint.solver_pos] += value - old_value
-                network.loads[endpoint.device_pos].flow_set = value
+            if plan.hydrogen_electric:
+                self._apply_final_energy_endpoint_value(
+                    plan.controlled,
+                    plan.controlled_setpoint,
+                    ac_result,
+                    dc_result,
+                )
+                self._apply_final_energy_endpoint_value(
+                    plan.dependent,
+                    self.x[plan.state_col],
+                    ac_result,
+                    dc_result,
+                )
             else:
-                old_value = float(network.source_flow_set[endpoint.device_pos])
-                network.source_flow_set[endpoint.device_pos] = value
-                network.fixed_injection[endpoint.solver_pos] += value - old_value
-                network.sources[endpoint.device_pos].flow_set = value
+                self._apply_final_energy_endpoint_value(
+                    plan.t1,
+                    self.x[plan.state_col],
+                    ac_result,
+                    dc_result,
+                )
 
     def _clear_converter_outputs(self):
         ppc = getattr(self.network, "ppc", {}) or {}
@@ -3002,6 +3148,15 @@ class HybridPowerFlowCalc:
             if plan is None:
                 t1_value, t1_unit = self._terminal_result_value(coupling.t1)
                 t2_value, t2_unit = self._terminal_result_value(coupling.t2)
+            elif plan.hydrogen_electric:
+                dependent_value = float(self.x[plan.state_col])
+                controlled_value = float(plan.controlled_setpoint)
+                if plan.t1 is plan.controlled:
+                    t1_value, t2_value = controlled_value, dependent_value
+                else:
+                    t1_value, t2_value = dependent_value, controlled_value
+                t1_unit = "pu" if plan.t1.domain in {"ac", "dc"} else "Nm3/h"
+                t2_unit = "pu" if plan.t2.domain in {"ac", "dc"} else "Nm3/h"
             else:
                 t1_value = float(self.x[plan.state_col])
                 t1_unit = "pu" if plan.t1.domain in {"ac", "dc"} else "flow"
@@ -3014,6 +3169,16 @@ class HybridPowerFlowCalc:
             status = "inactive" if not coupling.active else "linked"
             if coupling.active and (t1_value is None or t2_value is None):
                 status = "unavailable"
+            elif coupling.active and coupling.is_hydrogen_electric_control:
+                electric_value = t1_value if coupling.t1.domain in {"ac", "dc"} else t2_value
+                hydro_value = t1_value if coupling.t1.domain == "hydro" else t2_value
+                residual = hydrogen_electric_balance_residual(
+                    coupling,
+                    electric_value,
+                    hydro_value,
+                    float(getattr(self.network, "p_base_kW", 1.0)),
+                )
+                status = "balanced" if abs(residual) <= max(self.tol, 1e-9) else "mismatch"
             elif coupling.active and coupling.supports_energy_balance:
                 factor = float(coupling.energy_factor)
                 t1_energy = (
@@ -3036,6 +3201,8 @@ class HybridPowerFlowCalc:
                     name=coupling.name,
                     active=coupling.active,
                     control_type=coupling.control_type,
+                    e2h_coeff=coupling.e2h_coeff,
+                    h2e_coeff=coupling.h2e_coeff,
                     t1_value=t1_value,
                     t1_unit=t1_unit,
                     t2_value=t2_value,
@@ -3273,7 +3440,8 @@ class HybridPowerFlowCalc:
                 return f"{name}_state[{local}]"
         for plan in self.energy_coupling_plans:
             if int(plan.state_col) == column:
-                return f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:T1"
+                suffix = "DEPENDENT" if plan.hydrogen_electric else "T1"
+                return f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:{suffix}"
         return f"global_state[{column}]"
 
     def _write_summary_result(self):
@@ -3371,7 +3539,6 @@ class HybridPowerFlowCalc:
             )
             dc_result = self.dc_calc.result
 
-        self._apply_final_coupling_endpoint_controls(ac_result, dc_result)
         global_f = self.get_f(x) if self.fluid_calcs else np.empty(0, dtype=np.float64)
         for name, calc in self.fluid_calcs.items():
             state = x[self.fluid_state_slices[name]]
@@ -3385,6 +3552,8 @@ class HybridPowerFlowCalc:
                 iterations=self.iterations,
                 normF=fluid_norm,
             )
+
+        self._apply_final_coupling_endpoint_controls(ac_result, dc_result)
 
         self._write_skipped_results_to_network()
 

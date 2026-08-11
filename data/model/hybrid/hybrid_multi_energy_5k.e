@@ -12047,27 +12047,27 @@
 </Gas2DcE>
 
 <DcE2Hydro>
-@ idx name run_stat idx_dc_load_t1 idx_h2_unit_t2 efficiency energy_factor
-# 1 dce2hydro_1 1 37 2 0.75 750.0
-# 2 dce2hydro_2 1 38 3 0.75 750.0
-# 3 dce2hydro_3 1 39 4 0.75 750.0
-# 4 dce2hydro_4 1 40 5 0.75 750.0
-# 5 dce2hydro_5 1 41 6 0.75 750.0
-# 6 dce2hydro_6 1 42 7 0.75 750.0
-# 7 dce2hydro_7 1 43 8 0.75 750.0
-# 8 dce2hydro_8 1 44 9 0.75 750.0
-# 9 dce2hydro_9 1 45 10 0.75 750.0
-# 10 dce2hydro_10 1 46 11 0.75 750.0
-# 11 dce2hydro_11 1 47 12 0.75 750.0
-# 12 dce2hydro_12 1 48 13 0.75 750.0
-# 13 dce2hydro_13 1 49 14 0.75 750.0
-# 14 dce2hydro_14 1 50 15 0.75 750.0
-# 15 dce2hydro_15 1 51 16 0.75 750.0
-# 16 dce2hydro_16 1 52 17 0.75 750.0
-# 17 dce2hydro_17 1 53 18 0.75 750.0
-# 18 dce2hydro_18 1 54 19 0.75 750.0
-# 19 dce2hydro_19 1 55 20 0.75 750.0
-# 20 dce2hydro_20 1 56 21 0.75 750.0
+@ idx name run_stat control_type idx_dc_load_t1 idx_h2_unit_t2 e2h_coeff
+# 1 dce2hydro_1 1 FLOW 37 2 0.75
+# 2 dce2hydro_2 1 P 38 3 0.75
+# 3 dce2hydro_3 1 FLOW 39 4 0.75
+# 4 dce2hydro_4 1 P 40 5 0.75
+# 5 dce2hydro_5 1 FLOW 41 6 0.75
+# 6 dce2hydro_6 1 P 42 7 0.75
+# 7 dce2hydro_7 1 FLOW 43 8 0.75
+# 8 dce2hydro_8 1 P 44 9 0.75
+# 9 dce2hydro_9 1 FLOW 45 10 0.75
+# 10 dce2hydro_10 1 P 46 11 0.75
+# 11 dce2hydro_11 1 FLOW 47 12 0.75
+# 12 dce2hydro_12 1 P 48 13 0.75
+# 13 dce2hydro_13 1 FLOW 49 14 0.75
+# 14 dce2hydro_14 1 P 50 15 0.75
+# 15 dce2hydro_15 1 FLOW 51 16 0.75
+# 16 dce2hydro_16 1 P 52 17 0.75
+# 17 dce2hydro_17 1 FLOW 53 18 0.75
+# 18 dce2hydro_18 1 P 54 19 0.75
+# 19 dce2hydro_19 1 FLOW 55 20 0.75
+# 20 dce2hydro_20 1 P 56 21 0.75
 </DcE2Hydro>
 
 <Steam2AcE>
@@ -12119,51 +12119,51 @@
 </Gas2AcE>
 
 <Hydro2AcE>
-@ idx name run_stat idx_h2_load_t1 idx_ac_unit_t2 efficiency energy_factor
-# 1 hydro2ace_1 1 1 45 0.55 545.4545454545455
-# 2 hydro2ace_2 1 2 46 0.55 545.4545454545455
-# 3 hydro2ace_3 1 3 47 0.55 545.4545454545455
-# 4 hydro2ace_4 1 4 48 0.55 545.4545454545455
-# 5 hydro2ace_5 1 5 49 0.55 545.4545454545455
-# 6 hydro2ace_6 1 6 50 0.55 545.4545454545455
-# 7 hydro2ace_7 1 7 51 0.55 545.4545454545455
-# 8 hydro2ace_8 1 8 52 0.55 545.4545454545455
-# 9 hydro2ace_9 1 9 53 0.55 545.4545454545455
-# 10 hydro2ace_10 1 10 54 0.55 545.4545454545455
-# 11 hydro2ace_11 1 11 55 0.55 545.4545454545455
-# 12 hydro2ace_12 1 12 56 0.55 545.4545454545455
-# 13 hydro2ace_13 1 13 57 0.55 545.4545454545455
-# 14 hydro2ace_14 1 14 58 0.55 545.4545454545455
-# 15 hydro2ace_15 1 15 59 0.55 545.4545454545455
-# 16 hydro2ace_16 1 16 60 0.55 545.4545454545455
-# 17 hydro2ace_17 1 17 61 0.55 545.4545454545455
-# 18 hydro2ace_18 1 18 62 0.55 545.4545454545455
-# 19 hydro2ace_19 1 19 63 0.55 545.4545454545455
-# 20 hydro2ace_20 1 20 64 0.55 545.4545454545455
+@ idx name run_stat control_type idx_h2_load_t1 idx_ac_unit_t2 h2e_coeff
+# 1 hydro2ace_1 1 P 1 45 0.55
+# 2 hydro2ace_2 1 FLOW 2 46 0.55
+# 3 hydro2ace_3 1 P 3 47 0.55
+# 4 hydro2ace_4 1 FLOW 4 48 0.55
+# 5 hydro2ace_5 1 P 5 49 0.55
+# 6 hydro2ace_6 1 FLOW 6 50 0.55
+# 7 hydro2ace_7 1 P 7 51 0.55
+# 8 hydro2ace_8 1 FLOW 8 52 0.55
+# 9 hydro2ace_9 1 P 9 53 0.55
+# 10 hydro2ace_10 1 FLOW 10 54 0.55
+# 11 hydro2ace_11 1 P 11 55 0.55
+# 12 hydro2ace_12 1 FLOW 12 56 0.55
+# 13 hydro2ace_13 1 P 13 57 0.55
+# 14 hydro2ace_14 1 FLOW 14 58 0.55
+# 15 hydro2ace_15 1 P 15 59 0.55
+# 16 hydro2ace_16 1 FLOW 16 60 0.55
+# 17 hydro2ace_17 1 P 17 61 0.55
+# 18 hydro2ace_18 1 FLOW 18 62 0.55
+# 19 hydro2ace_19 1 P 19 63 0.55
+# 20 hydro2ace_20 1 FLOW 20 64 0.55
 </Hydro2AcE>
 
 <Hydro2DcE>
-@ idx name run_stat idx_h2_load_t1 idx_dc_unit_t2 efficiency energy_factor
-# 1 hydro2dce_1 1 21 35 0.55 545.4545454545455
-# 2 hydro2dce_2 1 22 36 0.55 545.4545454545455
-# 3 hydro2dce_3 1 23 37 0.55 545.4545454545455
-# 4 hydro2dce_4 1 24 38 0.55 545.4545454545455
-# 5 hydro2dce_5 1 25 39 0.55 545.4545454545455
-# 6 hydro2dce_6 1 26 40 0.55 545.4545454545455
-# 7 hydro2dce_7 1 27 41 0.55 545.4545454545455
-# 8 hydro2dce_8 1 28 42 0.55 545.4545454545455
-# 9 hydro2dce_9 1 29 43 0.55 545.4545454545455
-# 10 hydro2dce_10 1 30 44 0.55 545.4545454545455
-# 11 hydro2dce_11 1 31 45 0.55 545.4545454545455
-# 12 hydro2dce_12 1 32 46 0.55 545.4545454545455
-# 13 hydro2dce_13 1 33 47 0.55 545.4545454545455
-# 14 hydro2dce_14 1 34 48 0.55 545.4545454545455
-# 15 hydro2dce_15 1 35 49 0.55 545.4545454545455
-# 16 hydro2dce_16 1 36 50 0.55 545.4545454545455
-# 17 hydro2dce_17 1 37 51 0.55 545.4545454545455
-# 18 hydro2dce_18 1 38 52 0.55 545.4545454545455
-# 19 hydro2dce_19 1 39 53 0.55 545.4545454545455
-# 20 hydro2dce_20 1 40 54 0.55 545.4545454545455
+@ idx name run_stat control_type idx_h2_load_t1 idx_dc_unit_t2 h2e_coeff
+# 1 hydro2dce_1 1 P 21 35 0.55
+# 2 hydro2dce_2 1 FLOW 22 36 0.55
+# 3 hydro2dce_3 1 P 23 37 0.55
+# 4 hydro2dce_4 1 FLOW 24 38 0.55
+# 5 hydro2dce_5 1 P 25 39 0.55
+# 6 hydro2dce_6 1 FLOW 26 40 0.55
+# 7 hydro2dce_7 1 P 27 41 0.55
+# 8 hydro2dce_8 1 FLOW 28 42 0.55
+# 9 hydro2dce_9 1 P 29 43 0.55
+# 10 hydro2dce_10 1 FLOW 30 44 0.55
+# 11 hydro2dce_11 1 P 31 45 0.55
+# 12 hydro2dce_12 1 FLOW 32 46 0.55
+# 13 hydro2dce_13 1 P 33 47 0.55
+# 14 hydro2dce_14 1 FLOW 34 48 0.55
+# 15 hydro2dce_15 1 P 35 49 0.55
+# 16 hydro2dce_16 1 FLOW 36 50 0.55
+# 17 hydro2dce_17 1 P 37 51 0.55
+# 18 hydro2dce_18 1 FLOW 38 52 0.55
+# 19 hydro2dce_19 1 P 39 53 0.55
+# 20 hydro2dce_20 1 FLOW 40 54 0.55
 </Hydro2DcE>
 
 <AcE2Heat>
@@ -12191,27 +12191,27 @@
 </AcE2Heat>
 
 <AcE2Hydro>
-@ idx name run_stat idx_ac_load_t1 idx_h2_unit_t2 efficiency energy_factor
-# 1 ace2hydro_1 1 28 22 0.72 720.0
-# 2 ace2hydro_2 1 29 23 0.72 720.0
-# 3 ace2hydro_3 1 30 24 0.72 720.0
-# 4 ace2hydro_4 1 31 25 0.72 720.0
-# 5 ace2hydro_5 1 32 26 0.72 720.0
-# 6 ace2hydro_6 1 33 27 0.72 720.0
-# 7 ace2hydro_7 1 34 28 0.72 720.0
-# 8 ace2hydro_8 1 35 29 0.72 720.0
-# 9 ace2hydro_9 1 36 30 0.72 720.0
-# 10 ace2hydro_10 1 37 31 0.72 720.0
-# 11 ace2hydro_11 1 38 32 0.72 720.0
-# 12 ace2hydro_12 1 39 33 0.72 720.0
-# 13 ace2hydro_13 1 40 34 0.72 720.0
-# 14 ace2hydro_14 1 41 35 0.72 720.0
-# 15 ace2hydro_15 1 42 36 0.72 720.0
-# 16 ace2hydro_16 1 43 37 0.72 720.0
-# 17 ace2hydro_17 1 44 38 0.72 720.0
-# 18 ace2hydro_18 1 45 39 0.72 720.0
-# 19 ace2hydro_19 1 46 40 0.72 720.0
-# 20 ace2hydro_20 1 47 41 0.72 720.0
+@ idx name run_stat control_type idx_ac_load_t1 idx_h2_unit_t2 e2h_coeff
+# 1 ace2hydro_1 1 FLOW 28 22 0.72
+# 2 ace2hydro_2 1 P 29 23 0.72
+# 3 ace2hydro_3 1 FLOW 30 24 0.72
+# 4 ace2hydro_4 1 P 31 25 0.72
+# 5 ace2hydro_5 1 FLOW 32 26 0.72
+# 6 ace2hydro_6 1 P 33 27 0.72
+# 7 ace2hydro_7 1 FLOW 34 28 0.72
+# 8 ace2hydro_8 1 P 35 29 0.72
+# 9 ace2hydro_9 1 FLOW 36 30 0.72
+# 10 ace2hydro_10 1 P 37 31 0.72
+# 11 ace2hydro_11 1 FLOW 38 32 0.72
+# 12 ace2hydro_12 1 P 39 33 0.72
+# 13 ace2hydro_13 1 FLOW 40 34 0.72
+# 14 ace2hydro_14 1 P 41 35 0.72
+# 15 ace2hydro_15 1 FLOW 42 36 0.72
+# 16 ace2hydro_16 1 P 43 37 0.72
+# 17 ace2hydro_17 1 FLOW 44 38 0.72
+# 18 ace2hydro_18 1 P 45 39 0.72
+# 19 ace2hydro_19 1 FLOW 46 40 0.72
+# 20 ace2hydro_20 1 P 47 41 0.72
 </AcE2Hydro>
 
 <Steam2DcE>
