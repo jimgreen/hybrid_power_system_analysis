@@ -387,7 +387,7 @@ def _generate_heat_case(node_count: int) -> str:
             "HeatSource",
             (
                 "idx name node supply_node return_node control_type pressure_set "
-                "flow_set alpha flow_min flow_max supply_temperature run_stat"
+                "flow_set alpha flow_min flow_max supply_temperature_set run_stat"
             ),
             [
                 f"1 primary_source - {supply_nodes[0]} {return_nodes[0]} PRESSURE "
@@ -511,16 +511,32 @@ def build_measurements_from_lf(network, calc) -> list[Measurement]:
             calc.edge_flow[edge_pos],
         )
     for source_pos, name in enumerate(network.source_name.tolist()):
+        source_device_type = (
+            f"{network.prefix}Storage"
+            if bool(network.source_is_storage[source_pos])
+            else f"{network.prefix}Source"
+        )
         add(
-            (
-                f"{network.prefix}Storage"
-                if bool(network.source_is_storage[source_pos])
-                else f"{network.prefix}Source"
-            ),
+            source_device_type,
             str(name),
             "FLOW",
             calc.source_flow[source_pos],
         )
+        if network.thermal:
+            source_supply_temperature = np.asarray(
+                result_arrays.get(
+                    "source_t_out",
+                    np.full(len(network.sources), np.nan, dtype=np.float64),
+                ),
+                dtype=np.float64,
+            )
+            if np.isfinite(source_supply_temperature[source_pos]):
+                add(
+                    source_device_type,
+                    str(name),
+                    "T_SUPPLY",
+                    source_supply_temperature[source_pos],
+                )
     for load_pos, name in enumerate(network.load_name.tolist()):
         add(
             f"{network.prefix}Load",

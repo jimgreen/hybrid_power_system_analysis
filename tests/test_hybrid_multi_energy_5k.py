@@ -90,6 +90,11 @@ def test_multi_energy_5k_structure_and_control_coverage():
         for plan in hydrogen_plans
         if plan.coupling.hydrogen_electric_direction == "H2E"
     )
+    electric_heat_plans = [
+        plan for plan in calc.energy_coupling_plans if plan.coupling.is_electric_heat_control
+    ]
+    assert {plan.coupling.control_type for plan in electric_heat_plans} == {"P", "T_OUT"}
+    assert all(plan.coupling.e2h_coeff is not None for plan in electric_heat_plans)
     for table_name in ("Steam2AcE", "Steam2DcE"):
         plans = [
             plan
@@ -134,7 +139,12 @@ def test_multi_energy_5k_lf_is_one_global_newton_problem(monkeypatch):
     for plan in selected.values():
         column = int(plan.state_col)
         nonzero_rows = jacobian.getcol(column).nonzero()[0]
-        assert int(plan.t1.balance_row) in nonzero_rows
+        expected_balance_row = (
+            int(plan.heat_temperature_eq_row)
+            if plan.electric_heat and plan.coupling.control_type == "P"
+            else int(plan.t1.balance_row)
+        )
+        assert expected_balance_row in nonzero_rows
         assert int(plan.eq_row) in nonzero_rows
         step = 1e-6 * max(1.0, abs(float(calc.x[column])))
         upper = calc.x.copy()
@@ -161,7 +171,7 @@ def test_multi_energy_5k_se_is_observable_accurate_and_joint(monkeypatch):
     estimator.prepare()
     observability = estimator.observability_analysis()
     assert observability.observable
-    assert observability.rank == observability.state_count == 8640
+    assert observability.rank == observability.state_count == 8680
 
     def fail_local_run(*_args, **_kwargs):
         raise AssertionError("Hybrid SE must not launch a separate fluid WLS loop")
@@ -175,7 +185,7 @@ def test_multi_energy_5k_se_is_observable_accurate_and_joint(monkeypatch):
     assert result.iterations <= 12
     assert result.residual_inf < 5e-8
     assert result.objective < 1e-10
-    assert result.H.shape == (25537, 8640)
+    assert result.H.shape == (25577, 8680)
     assert result.H.nnz > 50000
     assert all(rc == 0 for rc in estimator.fluid_se_rc.values())
     assert {item.status for item in estimator.multi_energy_result.couplings} == {

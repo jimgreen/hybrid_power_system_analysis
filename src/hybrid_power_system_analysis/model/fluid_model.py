@@ -137,10 +137,18 @@ class FluidSource:
     flow_min: float = -np.inf
     flow_max: float = np.inf
     supply_temperature: float = 80.0
+    supply_temperature_set: Optional[float] = None
     enthalpy_set: float = 3000.0
     run_stat: int = 1
     supply_node: Optional[int] = None
     return_node: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.supply_temperature_set is None:
+            self.supply_temperature_set = float(self.supply_temperature)
+        else:
+            self.supply_temperature_set = float(self.supply_temperature_set)
+            self.supply_temperature = self.supply_temperature_set
 
 
 @dataclass(slots=True)
@@ -560,9 +568,11 @@ class FluidNetwork:
         self.source_alpha = np.asarray([max(item.alpha, 0.0) for item in self.sources], dtype=np.float64)
         self.source_flow_min = np.asarray([item.flow_min for item in self.sources], dtype=np.float64)
         self.source_flow_max = np.asarray([item.flow_max for item in self.sources], dtype=np.float64)
-        self.source_supply_temperature = np.asarray(
-            [item.supply_temperature for item in self.sources], dtype=np.float64
+        self.source_supply_temperature_set = np.asarray(
+            [item.supply_temperature_set for item in self.sources], dtype=np.float64
         )
+        # Compatibility view for thermal transport code and existing result APIs.
+        self.source_supply_temperature = self.source_supply_temperature_set
         self.source_enthalpy_set = np.asarray([item.enthalpy_set for item in self.sources], dtype=np.float64)
         self.load_flow_set = np.asarray([max(item.flow_set, 0.0) for item in self.loads], dtype=np.float64)
         self.load_heat_power = np.asarray([max(item.heat_power, 0.0) for item in self.loads], dtype=np.float64)
@@ -863,6 +873,16 @@ def _parse_nodes(model, prefix: str, thermal: bool) -> List[FluidNode]:
 def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
     sources = []
     for row in getattr(model, f"{prefix}Source", ()) or ():
+        legacy_temperature = _float(
+            row,
+            "supply_temperature",
+            80.0 if thermal else 20.0,
+        )
+        supply_temperature_set = _float(
+            row,
+            "supply_temperature_set",
+            legacy_temperature,
+        )
         sources.append(
             FluidSource(
                 idx=_int(row, "idx"),
@@ -874,7 +894,8 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
                 alpha=_float(row, "alpha", 1.0),
                 flow_min=_float(row, "flow_min", -np.inf),
                 flow_max=_float(row, "flow_max", np.inf),
-                supply_temperature=_float(row, "supply_temperature", 80.0 if thermal else 20.0),
+                supply_temperature=supply_temperature_set,
+                supply_temperature_set=supply_temperature_set,
                 enthalpy_set=_float(row, "enthalpy_set", _float(row, "h_set", 3000.0)),
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int(row, "supply_node"),
@@ -889,6 +910,16 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
     for row in getattr(model, f"{prefix}Storage", ()) or ():
         max_charge_flow = abs(_float(row, "max_charge_flow", np.inf))
         max_discharge_flow = abs(_float(row, "max_discharge_flow", np.inf))
+        legacy_temperature = _float(
+            row,
+            "supply_temperature",
+            80.0 if thermal else 20.0,
+        )
+        supply_temperature_set = _float(
+            row,
+            "supply_temperature_set",
+            legacy_temperature,
+        )
         storages.append(
             FluidStorage(
                 idx=_int(row, "idx"),
@@ -903,7 +934,8 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
                 alpha=_float(row, "alpha", 1.0),
                 flow_min=_float(row, "flow_min", -max_charge_flow),
                 flow_max=_float(row, "flow_max", max_discharge_flow),
-                supply_temperature=_float(row, "supply_temperature", 80.0 if thermal else 20.0),
+                supply_temperature=supply_temperature_set,
+                supply_temperature_set=supply_temperature_set,
                 enthalpy_set=_float(row, "enthalpy_set", _float(row, "h_set", 3000.0)),
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int(row, "supply_node"),

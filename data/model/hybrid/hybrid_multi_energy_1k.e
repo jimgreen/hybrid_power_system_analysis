@@ -524,11 +524,11 @@
 #   5 load_7    8   1.0  70  20  10   1.0  60  20  20        1
 #   6 load_8    9   1.0  50  30  20   1.0  40  30  30        1
 #   7 load_9   10   1.0  60  20  20   1.0  50  30  20        1
-# 8 coupled_ac_load_8 40 0.001 100 0 0 0.0002 100 0 0 1
-# 9 coupled_ac_load_9 41 0.001 100 0 0 0.0002 100 0 0 1
-# 10 coupled_ac_load_10 42 0.001 100 0 0 0.0002 100 0 0 1
-# 11 coupled_ac_load_11 43 0.001 100 0 0 0.0002 100 0 0 1
-# 12 coupled_ac_load_12 44 0.001 100 0 0 0.0002 100 0 0 1
+# 8 coupled_ac_load_8 40 0.02 100 0 0 0.0002 100 0 0 1
+# 9 coupled_ac_load_9 41 0.02 100 0 0 0.0002 100 0 0 1
+# 10 coupled_ac_load_10 42 0.02 100 0 0 0.0002 100 0 0 1
+# 11 coupled_ac_load_11 43 0.02 100 0 0 0.0002 100 0 0 1
+# 12 coupled_ac_load_12 44 0.02 100 0 0 0.0002 100 0 0 1
 # 13 coupled_ac_load_13 45 0.001 100 0 0 0.0002 100 0 0 1
 # 14 coupled_ac_load_14 46 0.001 100 0 0 0.0002 100 0 0 1
 # 15 coupled_ac_load_15 47 0.001 100 0 0 0.0002 100 0 0 1
@@ -918,11 +918,11 @@
 #  14 load_14   25   1.0 100  10   0        1
 #  15 load_15   27   1.0 100  20  20        1
 #  16 load_16   29   1.0 100  10   0        1
-# 17 coupled_dc_load_17 70 0.001 100 0 0 1
-# 18 coupled_dc_load_18 71 0.001 100 0 0 1
-# 19 coupled_dc_load_19 72 0.001 100 0 0 1
-# 20 coupled_dc_load_20 73 0.001 100 0 0 1
-# 21 coupled_dc_load_21 74 0.001 100 0 0 1
+# 17 coupled_dc_load_17 70 0.02 100 0 0 1
+# 18 coupled_dc_load_18 71 0.02 100 0 0 1
+# 19 coupled_dc_load_19 72 0.02 100 0 0 1
+# 20 coupled_dc_load_20 73 0.02 100 0 0 1
+# 21 coupled_dc_load_21 74 0.02 100 0 0 1
 # 22 coupled_dc_load_22 75 0.001 100 0 0 1
 # 23 coupled_dc_load_23 76 0.001 100 0 0 1
 # 24 coupled_dc_load_24 77 0.001 100 0 0 1
@@ -1179,7 +1179,7 @@
 </HeatNode>
 
 <HeatSource>
-@ idx name node supply_node return_node control_type pressure_set flow_set alpha flow_min flow_max supply_temperature run_stat
+@ idx name node supply_node return_node control_type pressure_set flow_set alpha flow_min flow_max supply_temperature_set run_stat
 # 1 primary_source - 1 38 PRESSURE 10.0 0.0 1.0 0.0 3.0 90.0 1
 # 2 coupled_heat_source_2 80 - - FLOW 0.0 0.0001 1.0 0.0 0.01 85.0 1
 # 3 coupled_heat_source_3 81 - - FLOW 0.0 0.0001 1.0 0.0 0.01 85.0 1
@@ -2649,12 +2649,12 @@
 </SteamPressureReducer>
 
 <DcE2Heat>
-@ idx name run_stat idx_dc_load_t1 idx_heat_unit_t2 efficiency energy_factor
-# 1 dce2heat_1 1 17 2 0.95 950.0
-# 2 dce2heat_2 1 18 3 0.95 950.0
-# 3 dce2heat_3 1 19 4 0.95 950.0
-# 4 dce2heat_4 1 20 5 0.95 950.0
-# 5 dce2heat_5 1 21 6 0.95 950.0
+@ idx name run_stat control_type idx_dc_load_t1 idx_heat_unit_t2 e2h_coeff
+# 1 dce2heat_1 1 P 17 2 0.95
+# 2 dce2heat_2 1 T_OUT 18 3 0.95
+# 3 dce2heat_3 1 P 19 4 0.95
+# 4 dce2heat_4 1 T_OUT 20 5 0.95
+# 5 dce2heat_5 1 P 21 6 0.95
 </DcE2Heat>
 
 <Gas2DcE>
@@ -2712,12 +2712,12 @@
 </Hydro2DcE>
 
 <AcE2Heat>
-@ idx name run_stat idx_ac_load_t1 idx_heat_unit_t2 efficiency energy_factor
-# 1 ace2heat_1 1 8 7 0.94 940.0
-# 2 ace2heat_2 1 9 8 0.94 940.0
-# 3 ace2heat_3 1 10 9 0.94 940.0
-# 4 ace2heat_4 1 11 10 0.94 940.0
-# 5 ace2heat_5 1 12 11 0.94 940.0
+@ idx name run_stat control_type idx_ac_load_t1 idx_heat_unit_t2 e2h_coeff
+# 1 ace2heat_1 1 P 8 7 0.94
+# 2 ace2heat_2 1 T_OUT 9 8 0.94
+# 3 ace2heat_3 1 P 10 9 0.94
+# 4 ace2heat_4 1 T_OUT 11 10 0.94
+# 5 ace2heat_5 1 P 12 11 0.94
 </AcE2Heat>
 
 <AcE2Hydro>

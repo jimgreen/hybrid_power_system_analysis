@@ -68,7 +68,22 @@ def _block(name: str, header: str, rows: Iterable[str]) -> str:
 def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
     count = int(couplings_per_type)
     ac_load_rows = [
-        _row((8 + pos, f"coupled_ac_load_{8 + pos}", 40 + pos, 0.001, 100, 0, 0, 0.0002, 100, 0, 0, 1))
+        _row(
+            (
+                8 + pos,
+                f"coupled_ac_load_{8 + pos}",
+                40 + pos,
+                0.02 if pos < count else 0.001,
+                100,
+                0,
+                0,
+                0.0002,
+                100,
+                0,
+                0,
+                1,
+            )
+        )
         for pos in range(2 * count)
     ]
     text = _append_block_rows(text, "ACLoad", ac_load_rows)
@@ -80,7 +95,18 @@ def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
     text = _append_block_rows(text, "ACGenerator", ac_generator_rows)
 
     dc_load_rows = [
-        _row((17 + pos, f"coupled_dc_load_{17 + pos}", 70 + pos, 0.001, 100, 0, 0, 1))
+        _row(
+            (
+                17 + pos,
+                f"coupled_dc_load_{17 + pos}",
+                70 + pos,
+                0.02 if pos < count else 0.001,
+                100,
+                0,
+                0,
+                1,
+            )
+        )
         for pos in range(2 * count)
     ]
     text = _append_block_rows(text, "DCLoad", dc_load_rows)
@@ -187,7 +213,10 @@ def _coupling_blocks(couplings_per_type: int) -> str:
     )
     blocks = []
     for table_name, endpoint_header, t1_indices, t2_indices, efficiency, factor in specifications:
-        if table_name in {"AcE2Hydro", "DcE2Hydro"}:
+        if table_name in {"AcE2Heat", "DcE2Heat"}:
+            coefficient_field = "e2h_coeff"
+            default_control = "P"
+        elif table_name in {"AcE2Hydro", "DcE2Hydro"}:
             coefficient_field = "e2h_coeff"
             default_control = "FLOW"
         elif table_name in {"Hydro2AcE", "Hydro2DcE"}:
@@ -197,7 +226,13 @@ def _coupling_blocks(couplings_per_type: int) -> str:
             coefficient_field = ""
             default_control = ""
         if coefficient_field:
-            alternate_control = "P" if default_control == "FLOW" else "FLOW"
+            alternate_control = (
+                "T_OUT"
+                if table_name in {"AcE2Heat", "DcE2Heat"}
+                else "P"
+                if default_control == "FLOW"
+                else "FLOW"
+            )
             rows = [
                 _row(
                     (

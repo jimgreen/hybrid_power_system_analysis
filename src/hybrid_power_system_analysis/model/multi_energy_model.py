@@ -18,6 +18,7 @@ from model.effective_state import propagate_composite_run_states
 FLUID_SYSTEM_PREFIXES = ("Heat", "Gas", "Hydro", "Steam")
 FLUID_SYSTEM_KEYS = tuple(prefix.lower() for prefix in FLUID_SYSTEM_PREFIXES)
 HYDROGEN_ELECTRIC_CONTROL_TYPES = frozenset(("P", "FLOW"))
+ELECTRIC_HEAT_CONTROL_TYPES = frozenset(("P", "T_OUT"))
 
 _NETWORK_BUILDERS = {
     "heat": build_heat_network_from_model,
@@ -69,6 +70,8 @@ class EnergyCoupling:
 
     @property
     def supports_energy_balance(self) -> bool:
+        if self.is_electric_heat_control:
+            return self.e2h_coeff is not None and self.e2h_coeff > 0.0
         if self.is_hydrogen_electric_control:
             coefficient = self.hydrogen_electric_coeff
             return coefficient is not None and coefficient > 0.0
@@ -95,6 +98,24 @@ class EnergyCoupling:
         )
 
     @property
+    def electric_heat_direction(self) -> Optional[str]:
+        match = _COUPLING_TABLE_RE.match(self.table_name)
+        if match is None:
+            return None
+        source_domain = _normalize_domain(match.group(1))
+        target_domain = _normalize_domain(match.group(2))
+        if source_domain in {"ac", "dc"} and target_domain == "heat":
+            return "E2HEAT"
+        return None
+
+    @property
+    def is_electric_heat_control(self) -> bool:
+        return (
+            self.electric_heat_direction is not None
+            and self.control_type in ELECTRIC_HEAT_CONTROL_TYPES
+        )
+
+    @property
     def hydrogen_electric_coeff(self) -> Optional[float]:
         if self.hydrogen_electric_direction == "E2H":
             return self.e2h_coeff
@@ -117,13 +138,24 @@ class EnergyCoupling:
         return None
 
     @property
+    def heat_terminal(self) -> Optional[EnergyTerminal]:
+        for terminal in (self.t1, self.t2):
+            if terminal.domain == "heat":
+                return terminal
+        return None
+
+    @property
     def controlled_terminal(self) -> Optional[EnergyTerminal]:
+        if self.is_electric_heat_control:
+            return self.electric_terminal if self.control_type == "P" else self.heat_terminal
         if not self.is_hydrogen_electric_control:
             return None
         return self.electric_terminal if self.control_type == "P" else self.hydro_terminal
 
     @property
     def dependent_terminal(self) -> Optional[EnergyTerminal]:
+        if self.is_electric_heat_control:
+            return self.heat_terminal if self.control_type == "P" else self.electric_terminal
         if not self.is_hydrogen_electric_control:
             return None
         return self.hydro_terminal if self.control_type == "P" else self.electric_terminal
@@ -178,6 +210,10 @@ def normalize_energy_coupling_control_type(value: str) -> str:
         "H2_FLOW": "FLOW",
         "FLOW_SET": "FLOW",
         "CONST_FLOW": "FLOW",
+        "OUTLET_TEMPERATURE": "T_OUT",
+        "T_OUT_SET": "T_OUT",
+        "CONST_T_OUT": "T_OUT",
+        "TEMPERATURE": "T_OUT",
         "NONE": "MONITOR",
     }
     return aliases.get(token, token)
@@ -191,7 +227,8 @@ def hydrogen_electric_dependent_value(
     """Convert the active endpoint setpoint into the dependent endpoint value.
 
     Electric endpoint values use per-unit power, fluid endpoint values use Nm3/h.
-    Electrolyzer efficiency is Nm3/kWh; fuel-cell efficiency is kWh/Nm3.
+    Electrolyzers use ``e2h_coeff`` in Nm3/kWh; fuel cells use
+    ``h2e_coeff`` in kWh/Nm3.
     """
     if not coupling.is_hydrogen_electric_control:
         raise ValueError(f"{coupling.table_name}:{coupling.name} is not P/FLOW controlled")
@@ -239,6 +276,29 @@ def hydrogen_electric_balance_residual(
     if coupling.hydrogen_electric_direction == "H2E":
         return power_kw - flow * coefficient
     raise ValueError(f"{coupling.table_name}:{coupling.name} is not an electric/H2 coupling")
+
+
+def electric_heat_balance_residual(
+    coupling: EnergyCoupling,
+    electric_power_pu: float,
+    source_flow: float,
+    t_out: float,
+    t_return: float,
+    heat_capacity: float,
+    p_base_kw: float,
+) -> float:
+    """Return electric input minus delivered heat in kW."""
+    if not coupling.is_electric_heat_control:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} is not an electric/heat coupling")
+    coefficient = coupling.e2h_coeff
+    if coefficient is None or coefficient <= 0.0:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} e2h_coeff must be positive")
+    return (
+        float(electric_power_pu) * float(p_base_kw) * float(coefficient)
+        - float(source_flow)
+        * float(heat_capacity)
+        * (float(t_out) - float(t_return))
+    )
 
 
 def _domain_from_reference_field(reference_field: str, fallback: str) -> str:
@@ -345,49 +405,39 @@ def _parse_couplings(model) -> Tuple[List[EnergyCoupling], List[str]]:
                 direction = "E2H"
             elif t1_domain == "hydro" and t2_domain in {"ac", "dc"}:
                 direction = "H2E"
+            electric_heat = t1_domain in {"ac", "dc"} and t2_domain == "heat"
+            coefficient_names = (
+                ("e2h_coeff",)
+                if direction == "E2H" or electric_heat
+                else ("h2e_coeff",)
+            )
+            coefficient = _float(row, coefficient_names, None)
             default_control_type = (
+                "P"
+                if electric_heat and coefficient is not None
+                else
                 "FLOW"
-                if direction == "E2H"
+                if direction == "E2H" and coefficient is not None
                 else "P"
-                if direction == "H2E"
+                if direction == "H2E" and coefficient is not None
                 else "MONITOR"
             )
             control_type = normalize_energy_coupling_control_type(
                 _text(row, "control_type", default_control_type)
             )
-            coefficient_names = (
-                (
-                    "e2h_coeff",
-                    "electric_to_hydrogen_efficiency",
-                    "electric_gas_efficiency",
-                    "e2h_efficiency",
-                    "efficiency",
-                    "eta",
-                    "conversion_efficiency",
-                )
-                if direction == "E2H"
-                else (
-                    "h2e_coeff",
-                    "hydrogen_to_electric_efficiency",
-                    "gas_electric_efficiency",
-                    "h2e_efficiency",
-                    "efficiency",
-                    "eta",
-                    "conversion_efficiency",
-                )
-            )
             direct_control = (
-                direction is not None
-                and control_type in HYDROGEN_ELECTRIC_CONTROL_TYPES
-            )
-            coefficient = _float(
-                row,
-                coefficient_names,
-                None if direct_control else 1.0,
+                (direction is not None and control_type in HYDROGEN_ELECTRIC_CONTROL_TYPES)
+                or (electric_heat and control_type in ELECTRIC_HEAT_CONTROL_TYPES)
             )
             if direct_control and (coefficient is None or coefficient <= 0.0):
-                unit = "Nm3/kWh" if direction == "E2H" else "kWh/Nm3"
-                field = "e2h_coeff" if direction == "E2H" else "h2e_coeff"
+                unit = (
+                    "kWh/kWh"
+                    if electric_heat
+                    else "Nm3/kWh"
+                    if direction == "E2H"
+                    else "kWh/Nm3"
+                )
+                field = "e2h_coeff" if direction == "E2H" or electric_heat else "h2e_coeff"
                 warnings.append(
                     f"{table_name}:{coupling_name} requires positive {field} ({unit})"
                 )
@@ -406,8 +456,16 @@ def _parse_couplings(model) -> Tuple[List[EnergyCoupling], List[str]]:
                     t1=EnergyTerminal(row_t1_domain, t1_type, t1_idx, t1_field),
                     t2=EnergyTerminal(row_t2_domain, t2_type, t2_idx, t2_field),
                     efficiency=float(generic_efficiency),
-                    e2h_coeff=(float(coefficient) if direction == "E2H" else None),
-                    h2e_coeff=(float(coefficient) if direction == "H2E" else None),
+                    e2h_coeff=(
+                        float(coefficient)
+                        if (direction == "E2H" or electric_heat) and coefficient is not None
+                        else None
+                    ),
+                    h2e_coeff=(
+                        float(coefficient)
+                        if direction == "H2E" and coefficient is not None
+                        else None
+                    ),
                     energy_factor=_float(
                         row,
                         ("energy_factor", "conversion_factor", "heating_value", "calorific_value"),

@@ -70,6 +70,7 @@ from model.multi_energy_model import (
     MultiEnergyContext,
     attach_multi_energy_context,
     build_multi_energy_context_from_rows,
+    electric_heat_balance_residual,
     hydrogen_electric_balance_residual,
     hydrogen_electric_dependent_value,
 )
@@ -1169,7 +1170,13 @@ class HybridPowerFlowCalc:
         )
         return int(rows[0]) if rows.size else -1
 
-    def _resolve_energy_endpoint(self, terminal, *, adjustable: bool):
+    def _resolve_energy_endpoint(
+        self,
+        terminal,
+        *,
+        adjustable: bool,
+        allow_missing_fluid_balance: bool = False,
+    ):
         domain = str(terminal.domain)
         device_type = str(terminal.device_type)
         is_load = device_type.endswith("Load")
@@ -1277,7 +1284,7 @@ class HybridPowerFlowCalc:
                 "use it as the dependent endpoint, not the released endpoint"
             )
         local_row = int(network.balance_row_by_node[node_pos])
-        if adjustable and local_row < 0:
+        if adjustable and local_row < 0 and not allow_missing_fluid_balance:
             return None, f"{device_type} idx={terminal.device_idx} has no hydraulic balance row"
         return SimpleNamespace(
             domain=domain,
@@ -1353,6 +1360,20 @@ class HybridPowerFlowCalc:
             return float(network.load_flow_set[endpoint.device_pos])
         return float(network.source_flow_set[endpoint.device_pos])
 
+    def _set_fixed_fluid_endpoint_value(self, endpoint, value: float) -> None:
+        network = self.fluid_calcs[endpoint.domain].network
+        value = float(value)
+        if endpoint.kind == "load":
+            old_value = float(network.load_flow_set[endpoint.device_pos])
+            network.load_flow_set[endpoint.device_pos] = value
+            network.demand[endpoint.solver_pos] += value - old_value
+            network.loads[endpoint.device_pos].flow_set = value
+            return
+        old_value = float(network.source_flow_set[endpoint.device_pos])
+        network.source_flow_set[endpoint.device_pos] = value
+        network.fixed_injection[endpoint.solver_pos] += value - old_value
+        network.sources[endpoint.device_pos].flow_set = value
+
     def _prepare_energy_coupling_plans(
         self,
         uncoupled_state: np.ndarray,
@@ -1364,6 +1385,135 @@ class HybridPowerFlowCalc:
         released_endpoints = set()
         for coupling in self.multi_energy.couplings:
             if not coupling.active or not coupling.supports_energy_balance:
+                continue
+            if coupling.is_electric_heat_control:
+                electric_terminal = coupling.electric_terminal
+                heat_terminal = coupling.heat_terminal
+                if electric_terminal is None or heat_terminal is None:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: missing electric or heat endpoint"
+                    )
+                    continue
+                electric, reason = self._resolve_energy_endpoint(
+                    electric_terminal,
+                    adjustable=False,
+                )
+                if electric is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                heat, reason = self._resolve_energy_endpoint(
+                    heat_terminal,
+                    adjustable=False,
+                )
+                if heat is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                if heat.domain != "heat" or heat.kind not in {"source", "storage"}:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: heat endpoint must be a HeatSource or HeatStorage"
+                    )
+                    continue
+                adjustable_kind = "temperature" if coupling.control_type == "P" else "power"
+                adjustable = heat if adjustable_kind == "temperature" else electric
+                key = (
+                    adjustable.domain,
+                    adjustable.device_type,
+                    adjustable.device_idx,
+                    adjustable_kind,
+                )
+                if key in released_endpoints:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: endpoint {key} is already controlled by another coupling"
+                    )
+                    continue
+
+                heat_calc = self.fluid_calcs["heat"]
+                heat_network = heat_calc.network
+                source_pos = int(heat.device_pos)
+                supply_node = int(heat_network.source_supply_node_pos[source_pos])
+                return_node = int(heat_network.source_return_node_pos[source_pos])
+                heat_state_slice = self.fluid_state_slices["heat"]
+                supply_temperature_col = (
+                    heat_state_slice.start
+                    + heat_calc.base_temperature
+                    + int(heat_network.supply_temperature_state_by_node[supply_node])
+                )
+                return_temperature_col = (
+                    heat_state_slice.start
+                    + heat_calc.base_temperature
+                    + int(heat_network.return_temperature_state_by_node[return_node])
+                )
+                heat_temperature_eq_row = (
+                    self.fluid_eq_slices["heat"].start
+                    + heat_calc.hydraulic_state_count
+                    + int(heat_network.supply_temperature_state_by_node[supply_node])
+                )
+                electric_setpoint = self._energy_endpoint_setpoint(electric)
+                source_flow, _flow_cols, _flow_derivatives = (
+                    self._energy_endpoint_value_and_derivative(heat, uncoupled_state)
+                )
+                t_return = float(uncoupled_state[return_temperature_col])
+                supply_temperature_set = float(
+                    heat_network.source_supply_temperature_set[source_pos]
+                )
+                coefficient = float(coupling.e2h_coeff)
+                heat_capacity = max(float(heat_network.medium.heat_capacity), 1.0e-12)
+                power_scale = float(getattr(self.network, "p_base_kW", 1.0))
+                if coupling.control_type == "P":
+                    initial_value = (
+                        t_return
+                        + electric_setpoint * power_scale * coefficient
+                        / (source_flow * heat_capacity)
+                        if abs(source_flow) > 1.0e-12
+                        else supply_temperature_set
+                    )
+                    controlled_setpoint = electric_setpoint
+                else:
+                    initial_value = (
+                        source_flow
+                        * heat_capacity
+                        * (supply_temperature_set - t_return)
+                        / (power_scale * coefficient)
+                    )
+                    controlled_setpoint = supply_temperature_set
+                energy_scale = max(
+                    1.0,
+                    abs(electric_setpoint * power_scale * coefficient),
+                    abs(
+                        source_flow
+                        * heat_capacity
+                        * (supply_temperature_set - t_return)
+                    ),
+                )
+                plan_pos = len(self.energy_coupling_plans)
+                self.energy_coupling_plans.append(
+                    SimpleNamespace(
+                        coupling=coupling,
+                        t1=electric if coupling.t1 == electric_terminal else heat,
+                        t2=heat if coupling.t2 == heat_terminal else electric,
+                        electric=electric,
+                        heat=heat,
+                        controlled=(electric if coupling.control_type == "P" else heat),
+                        dependent=(heat if coupling.control_type == "P" else electric),
+                        adjustable=adjustable,
+                        adjustable_kind=adjustable_kind,
+                        controlled_setpoint=float(controlled_setpoint),
+                        electric_setpoint=float(electric_setpoint),
+                        supply_temperature_set=supply_temperature_set,
+                        supply_temperature_col=supply_temperature_col,
+                        return_temperature_col=return_temperature_col,
+                        heat_temperature_eq_row=heat_temperature_eq_row,
+                        heat_capacity=heat_capacity,
+                        power_scale=power_scale,
+                        state_col=state_offset + plan_pos,
+                        eq_row=eq_offset + plan_pos,
+                        normalization=energy_scale,
+                        electric_heat=True,
+                        hydrogen_electric=False,
+                    )
+                )
+                released_endpoints.add(key)
+                initial.append(float(initial_value))
                 continue
             if coupling.is_hydrogen_electric_control:
                 dependent_terminal = coupling.dependent_terminal
@@ -1377,6 +1527,9 @@ class HybridPowerFlowCalc:
                 t1, reason = self._resolve_energy_endpoint(
                     coupling.t1,
                     adjustable=t1_is_dependent,
+                    allow_missing_fluid_balance=(
+                        t1_is_dependent and coupling.t1.domain not in {"ac", "dc"}
+                    ),
                 )
                 if t1 is None:
                     self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
@@ -1384,17 +1537,27 @@ class HybridPowerFlowCalc:
                 t2, reason = self._resolve_energy_endpoint(
                     coupling.t2,
                     adjustable=not t1_is_dependent,
+                    allow_missing_fluid_balance=(
+                        not t1_is_dependent and coupling.t2.domain not in {"ac", "dc"}
+                    ),
                 )
                 if t2 is None:
                     self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
                     continue
                 dependent = t1 if t1_is_dependent else t2
                 controlled = t2 if t1_is_dependent else t1
-                if controlled.balance_row < 0:
+                if controlled.balance_row < 0 and controlled.domain in {"ac", "dc"}:
                     self._add_multi_energy_warning(
                         f"{coupling.table_name}:{coupling.name}: controlled endpoint has no balance row"
                     )
                     continue
+                if controlled.domain not in {"ac", "dc"} and controlled.kind != "load":
+                    controlled_network = self.fluid_calcs[controlled.domain].network
+                    if str(controlled_network.source_control_type[controlled.device_pos]) != "FLOW":
+                        self._add_multi_energy_warning(
+                            f"{coupling.table_name}:{coupling.name}: FLOW control requires a flow-controlled hydrogen endpoint"
+                        )
+                        continue
                 key = (dependent.domain, dependent.device_type, dependent.device_idx)
                 if key in released_endpoints:
                     self._add_multi_energy_warning(
@@ -1407,6 +1570,8 @@ class HybridPowerFlowCalc:
                     controlled_setpoint,
                     float(getattr(self.network, "p_base_kW", 1.0)),
                 )
+                if dependent.domain not in {"ac", "dc"} and dependent.balance_row < 0:
+                    self._set_fixed_fluid_endpoint_value(dependent, dependent_initial)
                 plan_pos = len(self.energy_coupling_plans)
                 self.energy_coupling_plans.append(
                     SimpleNamespace(
@@ -1420,6 +1585,7 @@ class HybridPowerFlowCalc:
                         state_col=state_offset + plan_pos,
                         eq_row=eq_offset + plan_pos,
                         normalization=max(1.0, abs(float(dependent_initial))),
+                        electric_heat=False,
                         hydrogen_electric=True,
                     )
                 )
@@ -1472,6 +1638,7 @@ class HybridPowerFlowCalc:
                     state_col=state_offset + plan_pos,
                     eq_row=eq_offset + plan_pos,
                     normalization=normalization,
+                    electric_heat=False,
                     hydrogen_electric=False,
                 )
             )
@@ -1494,21 +1661,104 @@ class HybridPowerFlowCalc:
         data = []
         for plan in self.energy_coupling_plans:
             controlled_value = float(x[plan.state_col])
+            if plan.electric_heat:
+                electric_base, electric_cols, electric_derivatives = (
+                    self._energy_endpoint_value_and_derivative(plan.electric, x)
+                )
+                source_flow, flow_cols, flow_derivatives = (
+                    self._energy_endpoint_value_and_derivative(plan.heat, x)
+                )
+                t_return = float(x[plan.return_temperature_col])
+                if plan.coupling.control_type == "P":
+                    electric_power = plan.electric_setpoint
+                    t_out = controlled_value
+                    electric_target = plan.electric_setpoint
+                else:
+                    electric_power = controlled_value
+                    t_out = plan.supply_temperature_set
+                    electric_target = controlled_value
+
+                if plan.electric.balance_row >= 0:
+                    residual[plan.electric.balance_row] += (
+                        plan.electric.correction_sign * (electric_target - electric_base)
+                    )
+                if plan.coupling.control_type == "P":
+                    boundary_delta = controlled_value - plan.supply_temperature_set
+                    residual[plan.heat_temperature_eq_row] -= source_flow * boundary_delta
+                residual[plan.eq_row] = electric_heat_balance_residual(
+                    plan.coupling,
+                    electric_power,
+                    source_flow,
+                    t_out,
+                    t_return,
+                    plan.heat_capacity,
+                    plan.power_scale,
+                ) / plan.normalization
+                if jacobian is None:
+                    continue
+
+                if plan.electric.balance_row >= 0:
+                    for column, derivative in zip(electric_cols, electric_derivatives):
+                        rows.append(plan.electric.balance_row)
+                        cols.append(int(column))
+                        data.append(-plan.electric.correction_sign * float(derivative))
+                    if plan.coupling.control_type == "T_OUT":
+                        rows.append(plan.electric.balance_row)
+                        cols.append(plan.state_col)
+                        data.append(plan.electric.correction_sign)
+
+                if plan.coupling.control_type == "P":
+                    rows.append(plan.heat_temperature_eq_row)
+                    cols.append(plan.state_col)
+                    data.append(-source_flow)
+                    for column, derivative in zip(flow_cols, flow_derivatives):
+                        rows.append(plan.heat_temperature_eq_row)
+                        cols.append(int(column))
+                        data.append(
+                            -(controlled_value - plan.supply_temperature_set)
+                            * float(derivative)
+                        )
+
+                thermal_gap = t_out - t_return
+                for column, derivative in zip(flow_cols, flow_derivatives):
+                    rows.append(plan.eq_row)
+                    cols.append(int(column))
+                    data.append(
+                        -plan.heat_capacity
+                        * thermal_gap
+                        * float(derivative)
+                        / plan.normalization
+                    )
+                rows.append(plan.eq_row)
+                cols.append(plan.return_temperature_col)
+                data.append(source_flow * plan.heat_capacity / plan.normalization)
+                rows.append(plan.eq_row)
+                cols.append(plan.state_col)
+                data.append(
+                    -source_flow * plan.heat_capacity / plan.normalization
+                    if plan.coupling.control_type == "P"
+                    else plan.power_scale
+                    * float(plan.coupling.e2h_coeff)
+                    / plan.normalization
+                )
+                continue
             if plan.hydrogen_electric:
                 controlled_base, controlled_cols, controlled_derivatives = (
                     self._energy_endpoint_value_and_derivative(plan.controlled, x)
                 )
                 controlled_correction = plan.controlled_setpoint - controlled_base
-                residual[plan.controlled.balance_row] += (
-                    plan.controlled.correction_sign * controlled_correction
-                )
+                if plan.controlled.balance_row >= 0:
+                    residual[plan.controlled.balance_row] += (
+                        plan.controlled.correction_sign * controlled_correction
+                    )
                 dependent_base, dependent_cols, dependent_derivatives = (
                     self._energy_endpoint_value_and_derivative(plan.dependent, x)
                 )
                 dependent_correction = controlled_value - dependent_base
-                residual[plan.dependent.balance_row] += (
-                    plan.dependent.correction_sign * dependent_correction
-                )
+                if plan.dependent.balance_row >= 0:
+                    residual[plan.dependent.balance_row] += (
+                        plan.dependent.correction_sign * dependent_correction
+                    )
                 expected = hydrogen_electric_dependent_value(
                     plan.coupling,
                     plan.controlled_setpoint,
@@ -1523,18 +1773,19 @@ class HybridPowerFlowCalc:
                     (plan.controlled, controlled_cols, controlled_derivatives),
                     (plan.dependent, dependent_cols, dependent_derivatives),
                 ):
+                    if endpoint.balance_row < 0:
+                        continue
                     for column, derivative in zip(columns, derivatives):
                         rows.append(endpoint.balance_row)
                         cols.append(int(column))
                         data.append(-endpoint.correction_sign * float(derivative))
-                rows.extend((plan.dependent.balance_row, plan.eq_row))
-                cols.extend((plan.state_col, plan.state_col))
-                data.extend(
-                    (
-                        plan.dependent.correction_sign,
-                        1.0 / plan.normalization,
-                    )
-                )
+                if plan.dependent.balance_row >= 0:
+                    rows.append(plan.dependent.balance_row)
+                    cols.append(plan.state_col)
+                    data.append(plan.dependent.correction_sign)
+                rows.append(plan.eq_row)
+                cols.append(plan.state_col)
+                data.append(1.0 / plan.normalization)
                 continue
             base_value, base_cols, base_derivatives = (
                 self._energy_endpoint_value_and_derivative(plan.t1, x)
@@ -1626,6 +1877,44 @@ class HybridPowerFlowCalc:
 
     def _apply_final_coupling_endpoint_controls(self, ac_result, dc_result) -> None:
         for plan in self.energy_coupling_plans:
+            if plan.electric_heat:
+                electric_power = (
+                    plan.electric_setpoint
+                    if plan.coupling.control_type == "P"
+                    else float(self.x[plan.state_col])
+                )
+                t_out = (
+                    float(self.x[plan.state_col])
+                    if plan.coupling.control_type == "P"
+                    else plan.supply_temperature_set
+                )
+                self._apply_final_energy_endpoint_value(
+                    plan.electric,
+                    electric_power,
+                    ac_result,
+                    dc_result,
+                )
+                heat_calc = self.fluid_calcs["heat"]
+                heat_result = heat_calc.lf_result
+                source_pos = int(plan.heat.device_pos)
+                if heat_result is not None:
+                    heat_result.arrays.setdefault(
+                        "source_t_out",
+                        np.full(
+                            len(heat_calc.network.sources),
+                            np.nan,
+                            dtype=np.float64,
+                        ),
+                    )[source_pos] = t_out
+                    source_name = str(heat_calc.network.source_name[source_pos])
+                    collection = (
+                        heat_result.storages
+                        if plan.heat.kind == "storage"
+                        else heat_result.sources
+                    )
+                    if source_name in collection:
+                        collection[source_name].t_out = t_out
+                continue
             if plan.hydrogen_electric:
                 self._apply_final_energy_endpoint_value(
                     plan.controlled,
@@ -3145,9 +3434,35 @@ class HybridPowerFlowCalc:
         }
         for coupling in self.multi_energy.couplings:
             plan = plans.get((coupling.table_name, int(coupling.idx)))
+            electric_value = None
+            source_flow = None
+            t_out = None
+            t_return = None
             if plan is None:
                 t1_value, t1_unit = self._terminal_result_value(coupling.t1)
                 t2_value, t2_unit = self._terminal_result_value(coupling.t2)
+            elif plan.electric_heat:
+                electric_value = (
+                    plan.electric_setpoint
+                    if coupling.control_type == "P"
+                    else float(self.x[plan.state_col])
+                )
+                t_out = (
+                    float(self.x[plan.state_col])
+                    if coupling.control_type == "P"
+                    else plan.supply_temperature_set
+                )
+                source_flow, _columns, _derivatives = self._energy_endpoint_value_and_derivative(
+                    plan.heat,
+                    self.x,
+                )
+                t_return = float(self.x[plan.return_temperature_col])
+                if plan.t1 is plan.electric:
+                    t1_value, t2_value = electric_value, t_out
+                    t1_unit, t2_unit = "pu", "degC"
+                else:
+                    t1_value, t2_value = t_out, electric_value
+                    t1_unit, t2_unit = "degC", "pu"
             elif plan.hydrogen_electric:
                 dependent_value = float(self.x[plan.state_col])
                 controlled_value = float(plan.controlled_setpoint)
@@ -3169,6 +3484,17 @@ class HybridPowerFlowCalc:
             status = "inactive" if not coupling.active else "linked"
             if coupling.active and (t1_value is None or t2_value is None):
                 status = "unavailable"
+            elif coupling.active and coupling.is_electric_heat_control and plan is not None:
+                residual = electric_heat_balance_residual(
+                    coupling,
+                    electric_value,
+                    source_flow,
+                    t_out,
+                    t_return,
+                    plan.heat_capacity,
+                    plan.power_scale,
+                )
+                status = "balanced" if abs(residual) <= max(self.tol, 1e-9) else "mismatch"
             elif coupling.active and coupling.is_hydrogen_electric_control:
                 electric_value = t1_value if coupling.t1.domain in {"ac", "dc"} else t2_value
                 hydro_value = t1_value if coupling.t1.domain == "hydro" else t2_value
@@ -3209,6 +3535,9 @@ class HybridPowerFlowCalc:
                     t2_unit=t2_unit,
                     efficiency=coupling.efficiency,
                     energy_factor=coupling.energy_factor,
+                    source_flow=source_flow,
+                    t_out=t_out,
+                    t_return=t_return,
                     residual=residual,
                     status=status,
                 )
@@ -3440,7 +3769,13 @@ class HybridPowerFlowCalc:
                 return f"{name}_state[{local}]"
         for plan in self.energy_coupling_plans:
             if int(plan.state_col) == column:
-                suffix = "DEPENDENT" if plan.hydrogen_electric else "T1"
+                suffix = (
+                    plan.adjustable_kind.upper()
+                    if plan.electric_heat
+                    else "DEPENDENT"
+                    if plan.hydrogen_electric
+                    else "T1"
+                )
                 return f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:{suffix}"
         return f"global_state[{column}]"
 
