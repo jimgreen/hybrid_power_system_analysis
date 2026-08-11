@@ -3,7 +3,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +45,10 @@ except ImportError:  # pragma: no cover - direct script import path
     )
 from scipy.sparse.linalg import spsolve as _scipy_spsolve
 from dc_lf import DCLFResult, DCPowerFlowCalc
+from gas_lf import GasPowerFlowCalc
+from heat_lf import HeatPowerFlowCalc
+from hydro_lf import HydroPowerFlowCalc
+from steam_lf import SteamPowerFlowCalc
 try:
     from _sparse_pattern import (
         apply_raw_sum_plan,
@@ -60,6 +64,12 @@ except ImportError:  # pragma: no cover - package import path
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
 from paths import model_file
 from hybrid_model import HybridPowerNetwork
+from model.multi_energy_model import (
+    EnergyCoupling,
+    MultiEnergyContext,
+    attach_multi_energy_context,
+    build_multi_energy_context_from_rows,
+)
 from ac_array_model import (
     ACAC_COLS,
     ACAC_SIDE_CONTROL_LABEL,
@@ -625,7 +635,61 @@ def _detect_lf_rows_kind(rows) -> str:
         return "ac"
     if has_dc:
         return "dc"
+    if any(bool(rows.get(f"{prefix}Node", {}).get("rows")) for prefix in ("Heat", "Gas", "Hydro", "Steam")):
+        return "fluid"
     return "hybrid"
+
+
+def _build_lf_network_from_fluid_only(file_name) -> _LightweightHybridNetwork:
+    ac_network = SimpleNamespace(
+        _lf_lightweight=True,
+        ppc=None,
+        result=None,
+        nodes=[],
+        branches=[],
+        transformers=[],
+        three_winding_transformers=[],
+        generators=[],
+        loads=[],
+        shunt_compensators=[],
+        zero_branches=[],
+        switches=[],
+        breakers=[],
+        acac_converters=[],
+        islands=[],
+        node_dict={},
+    )
+    dc_network = SimpleNamespace(
+        _lf_lightweight=True,
+        ppc=None,
+        result=None,
+        nodes=[],
+        branches=[],
+        generators=[],
+        loads=[],
+        zero_branches=[],
+        switches=[],
+        breakers=[],
+        dcdc_converters=[],
+        islands=[],
+        node_dict={},
+    )
+    network = _LightweightHybridNetwork(
+        _lf_lightweight=True,
+        ac=ac_network,
+        dc=dc_network,
+        dcac_converters=[],
+        hybrid_islands=[],
+        _ac_ppc=None,
+        _dc_ppc=None,
+        p_base=1.0,
+        p_base_kW=1.0,
+        u_scale=1.0,
+        p_scale=1.0,
+        i_scale=1.0,
+        source=str(Path(file_name).resolve()),
+    )
+    return network
 
 
 def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightHybridNetwork:
@@ -762,11 +826,15 @@ def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
     efile_rows = _read_efile_rows(file_name)
     file_kind = _detect_lf_rows_kind(efile_rows)
     if file_kind == "ac":
-        return _build_lf_network_from_single_ac_file(file_name, efile_rows)
-    if file_kind == "dc":
-        return _build_lf_network_from_single_dc_file(file_name, efile_rows)
-
-    return _build_lf_network_from_hybrid_rows(file_name, efile_rows)
+        network = _build_lf_network_from_single_ac_file(file_name, efile_rows)
+    elif file_kind == "dc":
+        network = _build_lf_network_from_single_dc_file(file_name, efile_rows)
+    elif file_kind == "fluid":
+        network = _build_lf_network_from_fluid_only(file_name)
+    else:
+        network = _build_lf_network_from_hybrid_rows(file_name, efile_rows)
+    context = build_multi_energy_context_from_rows(efile_rows, source=file_name)
+    return attach_multi_energy_context(network, context)
 
 
 @dataclass
@@ -791,6 +859,11 @@ class HybridLFResult:
     ac: Optional[ACLFResult] = None
     dc: Optional[DCLFResult] = None
     dcac: DCACLFResult = field(default_factory=DCACLFResult)
+    fluid: Dict[str, object] = field(default_factory=dict)
+    fluid_calcs: Dict[str, object] = field(default_factory=dict)
+    fluid_warnings: List[str] = field(default_factory=list)
+    fluid_errors: Dict[str, str] = field(default_factory=dict)
+    couplings: List[object] = field(default_factory=list)
 
     @property
     def lf_result(self) -> "HybridLFResult":
@@ -801,6 +874,15 @@ class HybridLFResult:
         return 0 if self.network is None else self.network.total_nodes
 
     @property
+    def total_fluid_nodes(self) -> int:
+        context = None if self.network is None else getattr(self.network, "multi_energy", None)
+        return 0 if context is None else int(context.total_fluid_nodes)
+
+    @property
+    def total_energy_nodes(self) -> int:
+        return self.total_nodes + self.total_fluid_nodes
+
+    @property
     def converged(self) -> bool:
         return (
             self.rc == 0
@@ -808,6 +890,7 @@ class HybridLFResult:
             and self.calc.converged
             and not self.ac_errors
             and not self.dc_errors
+            and not self.fluid_errors
         )
 
     @property
@@ -840,6 +923,10 @@ class HybridPowerFlowCalc:
     Hybrid LF 继承 AC/DC 两侧的控制语义：同一 AC 或 DC 母线上若存在
     多个定压设备，可在 LF 中做代表控制方程和功率分摊。Hybrid SE 目前
     仍以子估计器显式状态为主，不强制复制这套硬聚合布局。
+
+    Heat、gas、hydrogen 和 steam 网络由各自的稀疏求解器负责；本类统一
+    调度、汇总结果，并解析跨能源耦合设备。仅当耦合表给出能量换算因子时
+    才计算跨域能量残差，否则保留为已校验的端点关联。
     """
 
     def __init__(
@@ -954,6 +1041,16 @@ class HybridPowerFlowCalc:
         self._single_ac_newton_block = False
         self._single_dc_newton_block = False
         self.result = {}
+        self.multi_energy: MultiEnergyContext = getattr(
+            network,
+            "multi_energy",
+            MultiEnergyContext(),
+        )
+        self.fluid_calcs = self._build_fluid_subcalcs()
+        self.fluid_rc: Dict[str, int] = {}
+        self.fluid_errors: Dict[str, str] = {}
+        self.coupling_results: List[object] = []
+        self.electric_converged = False
 
     @classmethod
     def from_file_fast(
@@ -1029,6 +1126,24 @@ class HybridPowerFlowCalc:
             calc._network_writeback = self.network.dc
         return calc
 
+    def _build_fluid_subcalcs(self) -> Dict[str, object]:
+        calc_types = {
+            "heat": HeatPowerFlowCalc,
+            "gas": GasPowerFlowCalc,
+            "hydro": HydroPowerFlowCalc,
+            "steam": SteamPowerFlowCalc,
+        }
+        return {
+            name: calc_types[name](
+                network,
+                parameters=self.params,
+                linear_solver="scipy",
+                result_mode=self.result_mode,
+                verbose=self.verbose,
+            )
+            for name, network in self.multi_energy.fluid_networks.items()
+        }
+
     def _clear_converter_outputs(self):
         ppc = getattr(self.network, "ppc", {}) or {}
         dcac = ppc.get("dcac")
@@ -1078,6 +1193,15 @@ class HybridPowerFlowCalc:
             self.ac_calc.ppc.pop("_external_voltage_control_node_ids", None)
 
     def prepare(self):
+        x = self._prepare_electric()
+        for calc in self.fluid_calcs.values():
+            calc.result_mode = self.result_mode
+            calc.verbose = self.verbose
+            if not calc.prepared:
+                calc.prepare()
+        return x
+
+    def _prepare_electric(self):
         """Build the global hybrid state vector and block equation layout.
 
         调用方无需先对 HybridPowerNetwork 显式执行 `prepare()` 或 `topo()`；
@@ -2266,6 +2390,10 @@ class HybridPowerFlowCalc:
         return rc
 
     def run(self, result_mode=None) -> int:
+        electric_rc = self._run_electric(result_mode=result_mode)
+        return self._finish_multi_energy_run(electric_rc)
+
+    def _run_electric(self, result_mode=None) -> int:
         """Execute unified Newton iterations over the full hybrid state vector."""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
@@ -2280,6 +2408,153 @@ class HybridPowerFlowCalc:
         ):
             return self._finish_empty_system()
         return self._run_newton_raphson()
+
+    def _finish_multi_energy_run(self, electric_rc: int) -> int:
+        self.electric_converged = bool(self.converged)
+        self.fluid_rc = {}
+        self.fluid_errors = {}
+        for name, calc in self.fluid_calcs.items():
+            try:
+                calc.result_mode = self.result_mode
+                calc.verbose = self.verbose
+                rc = int(calc.run())
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                rc = 1
+                calc.converged = False
+                calc.failure_reason = str(exc)
+            self.fluid_rc[name] = rc
+            if rc != 0 or not calc.converged:
+                self.fluid_errors[name] = str(
+                    getattr(calc, "failure_reason", "") or "fluid load flow did not converge"
+                )
+        fluids_converged = all(
+            rc == 0 and self.fluid_calcs[name].converged
+            for name, rc in self.fluid_rc.items()
+        )
+        self.converged = bool(self.electric_converged and fluids_converged)
+        self.coupling_results = self._build_energy_coupling_results()
+        self._attach_multi_energy_results()
+        if self.fluid_errors:
+            details = "; ".join(f"{name}: {reason}" for name, reason in self.fluid_errors.items())
+            self.failure_reason = "; ".join(
+                item for item in (self.failure_reason, details) if item
+            )
+        if electric_rc == 0 and fluids_converged:
+            return 0
+        return electric_rc if electric_rc != 0 else 1
+
+    def _terminal_result_value(self, terminal) -> Tuple[Optional[float], str]:
+        domain = terminal.domain
+        device_type = terminal.device_type
+        device_idx = int(terminal.device_idx)
+        if domain in self.fluid_calcs:
+            calc = self.fluid_calcs[domain]
+            network = calc.network
+            if device_type.endswith("Source"):
+                for pos, device in enumerate(network.sources):
+                    if int(device.idx) == device_idx:
+                        return float(calc.source_flow[pos]), "flow"
+            if device_type.endswith("Load"):
+                for pos, device in enumerate(network.loads):
+                    if int(device.idx) == device_idx:
+                        return float(network.load_flow_set[pos]), "flow"
+            if device_type.endswith("Node"):
+                for pos, device in enumerate(network.nodes):
+                    if int(device.idx) == device_idx:
+                        return float(calc.pressure[pos]), "pressure"
+            return None, ""
+        if domain not in {"ac", "dc"}:
+            return None, ""
+        ppc = self._ac_ppc if domain == "ac" else self._dc_ppc
+        if not isinstance(ppc, dict):
+            return None, ""
+        if domain == "ac":
+            table_key = "load" if device_type == "ACLoad" else "gen"
+            columns = AC_LOAD_COLS if table_key == "load" else AC_GEN_COLS
+        else:
+            table_key = "load" if device_type == "DCLoad" else "gen"
+            columns = DC_LOAD_COLS if table_key == "load" else DC_GEN_COLS
+        table = np.asarray(ppc.get(table_key, ()), dtype=np.float64)
+        if table.ndim != 2 or table.size == 0:
+            return None, ""
+        idx_col = columns.get("idx", 0)
+        p_col = columns.get("p")
+        if p_col is None:
+            return None, ""
+        rows = np.flatnonzero(table[:, idx_col].astype(np.int64, copy=False) == device_idx)
+        if rows.size == 0:
+            return None, ""
+        return float(table[int(rows[0]), p_col]), "pu"
+
+    def _build_energy_coupling_results(self) -> List[object]:
+        results = []
+        for coupling in self.multi_energy.couplings:
+            t1_value, t1_unit = self._terminal_result_value(coupling.t1)
+            t2_value, t2_unit = self._terminal_result_value(coupling.t2)
+            residual = None
+            status = "inactive" if not coupling.active else "linked"
+            if coupling.active and (t1_value is None or t2_value is None):
+                status = "unavailable"
+            elif coupling.active and coupling.supports_energy_balance:
+                factor = float(coupling.energy_factor)
+                t1_energy = (
+                    abs(t1_value) * self.network.p_base_kW
+                    if t1_unit == "pu"
+                    else abs(t1_value) * factor
+                )
+                t2_energy = (
+                    abs(t2_value) * self.network.p_base_kW
+                    if t2_unit == "pu"
+                    else abs(t2_value) * factor
+                )
+                residual = t2_energy - t1_energy * float(coupling.efficiency)
+                status = "balanced" if abs(residual) <= max(self.tol, 1e-9) else "mismatch"
+            results.append(
+                SimpleNamespace(
+                    coupling=coupling,
+                    table_name=coupling.table_name,
+                    idx=coupling.idx,
+                    name=coupling.name,
+                    active=coupling.active,
+                    control_type=coupling.control_type,
+                    t1_value=t1_value,
+                    t1_unit=t1_unit,
+                    t2_value=t2_value,
+                    t2_unit=t2_unit,
+                    efficiency=coupling.efficiency,
+                    energy_factor=coupling.energy_factor,
+                    residual=residual,
+                    status=status,
+                )
+            )
+        return results
+
+    def _attach_multi_energy_results(self) -> None:
+        fluid_results = {
+            name: calc.lf_result for name, calc in self.fluid_calcs.items()
+        }
+        fluid_summary = {
+            name: {
+                "converged": bool(calc.converged),
+                "iterations": int(calc.iterations),
+                "residual": float(calc.normF),
+                "nodes": len(calc.network.nodes),
+                "edges": len(calc.network.edges),
+            }
+            for name, calc in self.fluid_calcs.items()
+        }
+        if isinstance(self.result, dict):
+            self.result["fluids"] = fluid_summary
+            self.result["couplings"] = self.coupling_results
+        if self.result_mode == "full" and self.lf_result is None:
+            self.lf_result = self._build_lf_result()
+        if self.lf_result is not None:
+            self.lf_result.rc = 0 if self.converged else -1
+            self.lf_result.fluid = fluid_results
+            self.lf_result.fluid_calcs = dict(self.fluid_calcs)
+            self.lf_result.fluid_warnings = list(self.multi_energy.warnings)
+            self.lf_result.fluid_errors = dict(self.fluid_errors)
+            self.lf_result.couplings = list(self.coupling_results)
 
     def _run_newton_raphson(self) -> int:
         """Solve the complete hybrid Jacobian; delegate only uncoupled one-side files."""
@@ -2711,8 +2986,12 @@ def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int) -> None:
         if calc.failure_reason:
             print(f"失败原因: {calc.failure_reason}")
         return
-    print("\n=== 交直流联合潮流计算结果 ===")
-    print(f"节点总数: {result.total_nodes} (AC={len(result.ac_network.nodes)}, DC={len(result.dc_network.nodes)})")
+    print("\n=== 多能系统联合潮流计算结果 ===")
+    print(
+        f"节点总数: {result.total_energy_nodes} "
+        f"(AC={len(result.ac_network.nodes)}, DC={len(result.dc_network.nodes)}, "
+        f"流体={result.total_fluid_nodes})"
+    )
 
     print("\n1. AC 节点电压:")
     for node in result.ac_network.nodes:
@@ -2809,9 +3088,26 @@ def print_hybrid_result(calc: HybridPowerFlowCalc, rc: int) -> None:
     print(f"   AC: gen={ac_gen:.6f} pu, load={ac_load:.6f} pu, diff={ac_gen - ac_load:.6f} pu")
     print(f"   DC: gen={dc_gen:.6f} pu, load={dc_load:.6f} pu, diff={dc_gen - dc_load:.6f} pu")
 
+    if result.fluid_calcs:
+        print("\n10. 流体网络:")
+        for name, fluid_calc in result.fluid_calcs.items():
+            print(
+                f"   {name}: {'已收敛' if fluid_calc.converged else '未收敛'}, "
+                f"nodes={len(fluid_calc.network.nodes)}, edges={len(fluid_calc.network.edges)}, "
+                f"iter={fluid_calc.iterations}, normF={fluid_calc.normF:.3e}"
+            )
+    if result.couplings:
+        print("\n11. 多能耦合设备:")
+        for item in result.couplings:
+            print(
+                f"   {item.table_name}:{item.name}: status={item.status}, "
+                f"t1={item.t1_value} {item.t1_unit}, t2={item.t2_value} {item.t2_unit}, "
+                f"residual={item.residual}"
+            )
+
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Hybrid AC/DC power flow")
+    parser = argparse.ArgumentParser(description="Hybrid electric/heat/gas/hydrogen/steam power flow")
     parser.add_argument("file", nargs="?", default=str(DEFAULT_HYBRID_EFILE), help="Hybrid E file path")
     parser.add_argument("--para", default=str(DEFAULT_LF_PARAMETER_FILE), help="Power-flow algorithm parameter file.")
     parser.add_argument("--tol", type=float, default=None)
@@ -2842,6 +3138,11 @@ def main(argv=None) -> int:
         print_hybrid_result(calc, rc)
     elif not args.quiet:
         print(f"收敛状态: {'已收敛' if calc.converged else '未收敛'}, iter={calc.iterations}, normF={calc.normF:.3e}")
+        for name, fluid_calc in calc.fluid_calcs.items():
+            print(
+                f"{name}: {'已收敛' if fluid_calc.converged else '未收敛'}, "
+                f"iter={fluid_calc.iterations}, normF={fluid_calc.normF:.3e}"
+            )
         if calc.failure_reason:
             print(f"失败原因: {calc.failure_reason}")
     return 0 if rc == 0 else 1

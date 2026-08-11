@@ -2,7 +2,7 @@ import argparse
 import sys
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -20,6 +20,11 @@ from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParam
 from paths import measurement_file, model_file
 from efile_read import _read_efile_rows
 from hybrid_lf import HybridPowerNetwork
+from model.multi_energy_model import (
+    MultiEnergyContext,
+    attach_multi_energy_context,
+    build_multi_energy_context_from_rows,
+)
 from model.ac_array_model import (
     BRANCH_COLS as AC_BRANCH_COLS,
     BUS_COLS as AC_BUS_COLS,
@@ -139,6 +144,10 @@ from secore.ac_se import (
     _build_ac_se_ppc_namespace,
 )
 from secore.dc_se import DCStateEstimator, _build_dc_se_ppc_namespace
+from secore.gas_se import GasStateEstimator
+from secore.heat_se import HeatStateEstimator
+from secore.hydro_se import HydroStateEstimator
+from secore.steam_se import SteamStateEstimator
 from secore.se_array_plan import (
     MeasurementPartitions,
     append_active_measurement_view,
@@ -357,6 +366,11 @@ def _detect_se_rows_kind(rows) -> str:
         return "ac"
     if has_dc:
         return "dc"
+    if any(
+        bool(rows.get(f"{prefix}Node", {}).get("rows"))
+        for prefix in ("Heat", "Gas", "Hydro", "Steam")
+    ):
+        return "fluid"
     return "hybrid"
 
 
@@ -374,6 +388,37 @@ def _empty_se_side(base: Dict) -> SimpleNamespace:
         i_scale=float(base.get("i_scale", 1.0)),
         nodes=[],
         node_dict={},
+    )
+
+
+def _build_se_network_from_fluid_only(file_name) -> _SELightweightHybridNetwork:
+    base = {
+        "p_base": 1.0,
+        "p_base_kW": 1.0,
+        "u_scale": 1.0,
+        "p_scale": 1.0,
+        "i_scale": 1.0,
+    }
+    return _SELightweightHybridNetwork(
+        _se_lightweight=True,
+        ac=_empty_se_side(base),
+        dc=_empty_se_side(base),
+        dcac_converters=[],
+        hybrid_islands=[],
+        ppc={
+            "format": "hybrid_ppc_v1",
+            "source": str(Path(file_name).resolve()),
+            "base": base,
+            "ac": None,
+            "dc": None,
+        },
+        _ac_ppc=None,
+        _dc_ppc=None,
+        p_base=1.0,
+        p_base_kW=1.0,
+        u_scale=1.0,
+        p_scale=1.0,
+        i_scale=1.0,
     )
 
 
@@ -603,17 +648,37 @@ class _HybridStateMetaView:
             yield self[pos]
 
 
+@dataclass
+class MultiEnergySEResult:
+    electric: Optional[SEResult] = None
+    fluids: Dict[str, SEResult] = field(default_factory=dict)
+    fluid_estimators: Dict[str, object] = field(default_factory=dict)
+    couplings: List[object] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    errors: Dict[str, str] = field(default_factory=dict)
+    converged: bool = False
+    observable: bool = False
+
+    @property
+    def bad_data_count(self) -> int:
+        return sum(len(getattr(estimator, "bad_data", ())) for estimator in self.fluid_estimators.values())
+
+
 class HybridStateEstimator:
-    """AC/DC state-estimation orchestrator.
+    """AC/DC and fluid-network state-estimation orchestrator.
 
     AC and DC device rows are normalized, evaluated and differentiated by
     ACStateEstimator/DCStateEstimator.  This class owns only measurement
-    partitioning, global WLS assembly and converter-side rows.
+    partitioning, global WLS assembly and converter-side rows. Heat, gas,
+    hydrogen and steam measurements are partitioned by device ownership and
+    delegated to their specialized sparse WLS estimators.
 
     For a coupled hybrid network, the side estimators are measurement-model
     providers only: they do not run independent WLS iterations.  All AC, DC
     and converter states are assembled into one state vector, one sparse H,
     and one global normal equation solved jointly in each iteration.
+    Multi-energy coupling rows remain in this layer for endpoint validation
+    and aggregate result reporting.
     """
 
     _AC_MEASUREMENT_DEVICE_TYPES = frozenset(
@@ -882,15 +947,30 @@ class HybridStateEstimator:
         self.power_flow_state = np.array([], dtype=np.float64)
         self.flat_state = np.array([], dtype=np.float64)
         self._initial_state_cache_ready = False
+        self.multi_energy = MultiEnergyContext()
+        self._fluid_only = False
+        self.fluid_estimators: Dict[str, object] = {}
+        self.fluid_se_rc: Dict[str, int] = {}
+        self.fluid_se_errors: Dict[str, str] = {}
+        self.multi_energy_result = MultiEnergySEResult()
         if auto_prepare:
             self.prepare()
 
     def prepare(self) -> "HybridStateEstimator":
+        result = self._prepare_electric()
+        self._prepare_fluid_estimators()
+        return result
+
+    def _prepare_electric(self) -> "HybridStateEstimator":
         if self._prepared:
             return self
         profile_start = time.perf_counter()
         stage_start = time.perf_counter()
         efile_rows = _read_efile_rows(self.e_file)
+        self.multi_energy = build_multi_energy_context_from_rows(
+            efile_rows,
+            source=self.e_file,
+        )
         rows_kind = _detect_se_rows_kind(efile_rows)
         if rows_kind == "ac":
             ac_ppc = build_ac_ppc_with_topology_from_efile_rows(self.e_file, efile_rows)
@@ -918,10 +998,14 @@ class HybridStateEstimator:
                 _ac_ppc=None,
                 _dc_ppc=dc_ppc,
             )
+        elif rows_kind == "fluid":
+            self.network = _build_se_network_from_fluid_only(self.e_file)
+            self._fluid_only = True
         else:
             self.network = _build_hybrid_se_network_from_ppc(
                 build_hybrid_ppc_with_topology_from_efile_rows(self.e_file, efile_rows)
             )
+        attach_multi_energy_context(self.network, self.multi_energy)
         if rows_kind in ("ac", "dc"):
             base = self.network.ppc["base"]
             self.network.p_base = float(base["p_base"])
@@ -935,6 +1019,13 @@ class HybridStateEstimator:
         self.u_scale = float(getattr(self.network, "u_scale", 1.0))
         self.p_scale = float(getattr(self.network, "p_scale", 1.0))
         self.i_scale = float(getattr(self.network, "i_scale", 1.0))
+        if self._fluid_only:
+            self._ac_sub_estimator = None
+            self._dc_sub_estimator = None
+            self._delegate_estimator = None
+            self._prepared = True
+            self._record_profile_time("init.total", time.perf_counter() - profile_start)
+            return self
         if rows_kind in ("ac", "dc"):
             return self._prepare_uncoupled_direct_delegate(rows_kind, profile_start)
         stage_start = time.perf_counter()
@@ -1010,6 +1101,35 @@ class HybridStateEstimator:
         self._prepared = True
         self._record_profile_time("init.total", time.perf_counter() - profile_start)
         return self
+
+    def _prepare_fluid_estimators(self) -> None:
+        if self.fluid_estimators or not self.multi_energy.fluid_networks:
+            return
+        all_measurements = Measurement.read_from_file(self.meas_file)
+        estimator_types = {
+            "heat": HeatStateEstimator,
+            "gas": GasStateEstimator,
+            "hydro": HydroStateEstimator,
+            "steam": SteamStateEstimator,
+        }
+        for name, network in self.multi_energy.fluid_networks.items():
+            prefix = network.prefix
+            measurements = [
+                measurement
+                for measurement in all_measurements
+                if str(measurement.device_type).startswith(prefix)
+            ]
+            estimator = estimator_types[name](
+                network,
+                measurements=measurements,
+                parameters=self.params,
+                flat_start=self.flat_start,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                verbose=False,
+            )
+            estimator.prepare()
+            self.fluid_estimators[name] = estimator
 
     def _prepare_uncoupled_direct_delegate(self, side: str, profile_start: float) -> "HybridStateEstimator":
         stage_start = time.perf_counter()
@@ -2589,7 +2709,10 @@ class HybridStateEstimator:
                 return
             if rows.size == 0:
                 continue
-            master_table.valid[rows] = table.valid
+            # A side partition may reject additional rows, but it must not
+            # reactivate rows already rejected by Hybrid-level ownership or
+            # device-position validation.
+            master_table.valid[rows] &= np.asarray(table.valid, dtype=bool)
             master_table.weight[rows] = table.weight
             master_table.value[rows] = table.value
 
@@ -6558,8 +6681,36 @@ class HybridStateEstimator:
         final_diagnostics: bool = True,
         observability: Optional[ObservabilityResult] = None,
     ) -> Optional[SEResult]:
+        electric_result = self._run_electric(
+            result_mode=result_mode,
+            remove_bad_data=remove_bad_data,
+            bad_threshold=bad_threshold,
+            max_remove=max_remove,
+            skip_bad_data=skip_bad_data,
+            verbose=verbose,
+            final_diagnostics=final_diagnostics,
+            observability=observability,
+        )
+        self._run_fluid_estimators()
+        self._build_multi_energy_result(electric_result)
+        return electric_result
+
+    def _run_electric(
+        self,
+        *,
+        result_mode: str = "full",
+        remove_bad_data: bool = False,
+        bad_threshold: Optional[float] = None,
+        max_remove: Optional[int] = None,
+        skip_bad_data: bool = False,
+        verbose: bool = False,
+        final_diagnostics: bool = True,
+        observability: Optional[ObservabilityResult] = None,
+    ) -> Optional[SEResult]:
         if not self._prepared:
             self.prepare()
+        if self._fluid_only:
+            return None
         mode = normalize_seresult_result_mode(result_mode)
         threshold = self.params.bad_threshold if bad_threshold is None else bad_threshold
         array_only = mode == "array"
@@ -6622,6 +6773,92 @@ class HybridStateEstimator:
             threshold=threshold,
             result_mode=mode,
         )
+
+    def _run_fluid_estimators(self) -> None:
+        self.fluid_se_rc = {}
+        self.fluid_se_errors = {}
+        for name, estimator in self.fluid_estimators.items():
+            try:
+                rc = int(estimator.run())
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                rc = 1
+                self.fluid_se_errors[name] = str(exc)
+            self.fluid_se_rc[name] = rc
+            if rc != 0 and name not in self.fluid_se_errors:
+                result = getattr(estimator, "result", None)
+                self.fluid_se_errors[name] = (
+                    "fluid state estimation did not converge"
+                    if result is None
+                    else f"fluid state estimation residual={float(result.residual_inf):.6e}"
+                )
+
+    def _build_multi_energy_coupling_results(self) -> List[object]:
+        results = []
+        for coupling in self.multi_energy.couplings:
+            domains_ready = all(
+                terminal.domain in {"ac", "dc"}
+                or terminal.domain in self.fluid_estimators
+                for terminal in (coupling.t1, coupling.t2)
+            )
+            status = (
+                "inactive"
+                if not coupling.active
+                else "associated"
+                if domains_ready
+                else "unavailable"
+            )
+            results.append(
+                SimpleNamespace(
+                    coupling=coupling,
+                    table_name=coupling.table_name,
+                    idx=coupling.idx,
+                    name=coupling.name,
+                    active=coupling.active,
+                    control_type=coupling.control_type,
+                    efficiency=coupling.efficiency,
+                    energy_factor=coupling.energy_factor,
+                    status=status,
+                )
+            )
+        return results
+
+    def _build_multi_energy_result(self, electric_result: Optional[SEResult]) -> MultiEnergySEResult:
+        fluid_results = {
+            name: estimator.se_result
+            for name, estimator in self.fluid_estimators.items()
+            if getattr(estimator, "se_result", None) is not None
+        }
+        electric_converged = self._fluid_only or bool(
+            self.estimate_result is not None and self.estimate_result.converged
+        )
+        electric_observable = self._fluid_only or bool(
+            self.observability_result is not None and self.observability_result.observable
+        )
+        fluid_converged = all(
+            self.fluid_se_rc.get(name, 1) == 0
+            and getattr(estimator, "result", None) is not None
+            and estimator.result.converged
+            for name, estimator in self.fluid_estimators.items()
+        )
+        fluid_observable = all(
+            getattr(estimator, "result", None) is not None
+            and estimator.result.observability.observable
+            for estimator in self.fluid_estimators.values()
+        )
+        result = MultiEnergySEResult(
+            electric=electric_result,
+            fluids=fluid_results,
+            fluid_estimators=dict(self.fluid_estimators),
+            couplings=self._build_multi_energy_coupling_results(),
+            warnings=list(self.multi_energy.warnings),
+            errors=dict(self.fluid_se_errors),
+            converged=bool(electric_converged and fluid_converged),
+            observable=bool(electric_observable and fluid_observable),
+        )
+        self.multi_energy_result = result
+        if self.se_result is not None:
+            self.se_result.multi_energy = result
+        return result
 
     def estimate_with_bad_data_removal(
         self,
@@ -6725,11 +6962,18 @@ def _profile_time_items(estimator: HybridStateEstimator) -> List[Tuple[str, floa
                 (f"{side}.{name}", value)
                 for name, value in getattr(sub_estimator, "profile_times", {}).items()
             )
+    for side, sub_estimator in estimator.fluid_estimators.items():
+        items.extend(
+            (f"{side}.{name}", value)
+            for name, value in getattr(sub_estimator, "profile_times", {}).items()
+        )
     return sorted(items)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Hybrid AC/DC weighted least-squares state estimation.")
+    parser = argparse.ArgumentParser(
+        description="Hybrid electric/heat/gas/hydrogen/steam weighted least-squares state estimation."
+    )
     parser.add_argument("--case", default=str(DEFAULT_CASE), help="Hybrid network E file.")
     parser.add_argument("--meas", default=str(DEFAULT_MEAS), help="Measurement E file.")
     parser.add_argument("--para", default=str(DEFAULT_SE_PARAMETER_FILE), help="State-estimation algorithm parameter file.")
@@ -6777,7 +7021,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_remove=args.max_remove,
         verbose=not args.quiet,
     )
-    _print_observability(estimator.observability_result)
+    if estimator.observability_result is not None:
+        _print_observability(estimator.observability_result)
     result = estimator.estimate_result
     removed = estimator.removed_bad_data
     if removed:
@@ -6786,20 +7031,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  idx={item.measurement.idx} name={item.measurement.name} rn={item.normalized_residual:.3e}")
     bad_items = estimator.bad_items
     normalized = estimator.normalized_residual
+    if result is not None:
+        print(
+            "State estimation: "
+            f"converged={result.converged}, iterations={result.iterations}, "
+            f"objective={result.objective:.6e}, max_dx={result.max_correction:.3e}, "
+            f"residual_inf={result.residual_inf:.3e}"
+        )
+        _print_bad_data(bad_items, normalized, bad_threshold)
+    if estimator.fluid_estimators:
+        print("Fluid state estimation:")
+        for name, fluid_estimator in estimator.fluid_estimators.items():
+            fluid_result = fluid_estimator.result
+            print(
+                f"  {name}: converged={fluid_result.converged}, "
+                f"observable={fluid_result.observability.observable}, "
+                f"rank={fluid_result.observability.rank}/{fluid_result.observability.state_count}, "
+                f"iterations={fluid_result.iterations}, residual={fluid_result.residual_inf:.6e}, "
+                f"bad_data={len(fluid_estimator.bad_data)}"
+            )
+    if estimator.multi_energy_result.couplings:
+        print("Multi-energy couplings:")
+        for item in estimator.multi_energy_result.couplings:
+            print(f"  {item.table_name}:{item.name}: status={item.status}")
     print(
-        "State estimation: "
-        f"converged={result.converged}, iterations={result.iterations}, "
-        f"objective={result.objective:.6e}, max_dx={result.max_correction:.3e}, "
-        f"residual_inf={result.residual_inf:.3e}"
+        "Multi-energy result: "
+        f"converged={estimator.multi_energy_result.converged}, "
+        f"observable={estimator.multi_energy_result.observable}"
     )
-    _print_bad_data(bad_items, normalized, bad_threshold)
-    if args.print_state:
+    if args.print_state and result is not None:
         estimator.print_state(result.x)
     if args.profile:
         print("Profile:")
         for name, value in _profile_time_items(estimator):
             print(f"  {name}={value:.6f}s")
-    return 0 if result.converged and result.observability.observable else 1
+    return 0 if estimator.multi_energy_result.converged and estimator.multi_energy_result.observable else 1
 
 
 if __name__ == "__main__":

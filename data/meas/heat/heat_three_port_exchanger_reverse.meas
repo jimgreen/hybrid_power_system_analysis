@@ -1,0 +1,23 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 reverse_p1 HeatNode primary_hx_node PRESSURE 10 1 10.0
+# 2 reverse_p2 HeatNode secondary_hx_return PRESSURE 10 1 2.0
+# 3 reverse_p3 HeatNode secondary_hx_supply PRESSURE 10 1 8.0
+# 4 reverse_p4 HeatNode secondary_load_supply PRESSURE 10 1 7.0
+# 5 reverse_p5 HeatNode secondary_load_return PRESSURE 10 1 3.0
+# 6 reverse_ts1 HeatNode primary_hx_node T_SUPPLY 10 1 90.0
+# 7 reverse_tr1 HeatNode primary_hx_node T_RETURN 10 1 78.05542283803153
+# 8 reverse_t2 HeatNode secondary_hx_return TEMPERATURE 10 1 75.06927854753941
+# 9 reverse_t3 HeatNode secondary_hx_supply TEMPERATURE 10 1 87.01385570950788
+# 10 reverse_t4 HeatNode secondary_load_supply TEMPERATURE 10 1 87.01385570950788
+# 11 reverse_t5 HeatNode secondary_load_return TEMPERATURE 10 1 75.06927854753941
+# 12 reverse_source_flow HeatSource primary_source FLOW 10 1 1.0
+# 13 reverse_load_heat HeatLoad secondary_load HEAT 10 1 50.0
+# 14 reverse_hx_primary_flow HeatExchanger reverse_three_port_heat_exchanger FLOW_FROM 10 1 1.0
+# 15 reverse_hx_secondary_flow HeatExchanger reverse_three_port_heat_exchanger FLOW_TO 10 1 1.0
+# 16 reverse_hx_primary_in HeatExchanger reverse_three_port_heat_exchanger TS_FROM 10 1 90.0
+# 17 reverse_hx_primary_out HeatExchanger reverse_three_port_heat_exchanger TR_FROM 10 1 78.05542283803153
+# 18 reverse_hx_secondary_in HeatExchanger reverse_three_port_heat_exchanger TR_TO 10 1 75.06927854753941
+# 19 reverse_hx_secondary_out HeatExchanger reverse_three_port_heat_exchanger TS_TO 10 1 87.01385570950788
+# 20 reverse_hx_heat HeatExchanger reverse_three_port_heat_exchanger HEAT 10 1 50.0
+</Measurement>

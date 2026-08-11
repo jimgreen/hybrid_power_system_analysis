@@ -1,0 +1,22 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 hx_p1 HeatNode primary_source_node PRESSURE 10 1 10.0
+# 2 hx_p2 HeatNode primary_hx_node PRESSURE 10 1 9.0
+# 3 hx_p3 HeatNode secondary_hx_node PRESSURE 10 1 8.0
+# 4 hx_p4 HeatNode secondary_load_node PRESSURE 10 1 7.0
+# 5 hx_ts1 HeatNode primary_source_node T_SUPPLY 10 1 90.0
+# 6 hx_ts2 HeatNode primary_hx_node T_SUPPLY 10 1 90.0
+# 7 hx_ts3 HeatNode secondary_hx_node T_SUPPLY 10 1 87.01385570950788
+# 8 hx_ts4 HeatNode secondary_load_node T_SUPPLY 10 1 87.01385570950788
+# 9 hx_tr1 HeatNode primary_source_node T_RETURN 10 1 78.05542283803153
+# 10 hx_tr2 HeatNode primary_hx_node T_RETURN 10 1 78.05542283803153
+# 11 hx_tr3 HeatNode secondary_hx_node T_RETURN 10 1 75.06927854753941
+# 12 hx_tr4 HeatNode secondary_load_node T_RETURN 10 1 75.06927854753941
+# 13 hx_primary_flow HeatExchanger main_heat_exchanger FLOW_FROM 1 1 1.0
+# 14 hx_secondary_flow HeatExchanger main_heat_exchanger FLOW_TO 1 1 1.0
+# 15 hx_primary_in HeatExchanger main_heat_exchanger TS_FROM 10 1 90.0
+# 16 hx_primary_out HeatExchanger main_heat_exchanger TR_FROM 10 1 78.05542283803153
+# 17 hx_secondary_in HeatExchanger main_heat_exchanger TR_TO 10 1 75.06927854753941
+# 18 hx_secondary_out HeatExchanger main_heat_exchanger TS_TO 10 1 87.01385570950788
+# 19 hx_heat HeatExchanger main_heat_exchanger HEAT 10 1 50.0
+</Measurement>

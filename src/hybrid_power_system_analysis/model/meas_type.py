@@ -26,6 +26,31 @@ DEVICE_TYPE_ACBreakConstraint = 23
 DEVICE_TYPE_DCBreak = 24
 DEVICE_TYPE_DCBreakConstraint = 25
 DEVICE_TYPE_ACThreeWindingTransformer = 26
+DEVICE_TYPE_HeatNode = 27
+DEVICE_TYPE_HeatPipe = 28
+DEVICE_TYPE_HeatValve = 29
+DEVICE_TYPE_HeatPump = 30
+DEVICE_TYPE_HeatSource = 31
+DEVICE_TYPE_HeatLoad = 32
+DEVICE_TYPE_GasNode = 33
+DEVICE_TYPE_GasPipe = 34
+DEVICE_TYPE_GasValve = 35
+DEVICE_TYPE_GasCompressor = 36
+DEVICE_TYPE_GasSource = 37
+DEVICE_TYPE_GasLoad = 38
+DEVICE_TYPE_HydroNode = 39
+DEVICE_TYPE_HydroPipe = 40
+DEVICE_TYPE_HydroValve = 41
+DEVICE_TYPE_HydroCompressor = 42
+DEVICE_TYPE_HydroSource = 43
+DEVICE_TYPE_HydroLoad = 44
+DEVICE_TYPE_HeatExchanger = 45
+DEVICE_TYPE_SteamNode = 46
+DEVICE_TYPE_SteamPipe = 47
+DEVICE_TYPE_SteamValve = 48
+DEVICE_TYPE_SteamPressureReducer = 49
+DEVICE_TYPE_SteamSource = 50
+DEVICE_TYPE_SteamLoad = 51
 
 DEVICE_TYPE_CODES = {
     "ACNode": DEVICE_TYPE_ACNode,
@@ -55,6 +80,31 @@ DEVICE_TYPE_CODES = {
     "DCBreakConstraint": DEVICE_TYPE_DCBreakConstraint,
     "AC3WTransformer": DEVICE_TYPE_ACThreeWindingTransformer,
     "ACThreeWindingTransformer": DEVICE_TYPE_ACThreeWindingTransformer,
+    "HeatNode": DEVICE_TYPE_HeatNode,
+    "HeatPipe": DEVICE_TYPE_HeatPipe,
+    "HeatValve": DEVICE_TYPE_HeatValve,
+    "HeatPump": DEVICE_TYPE_HeatPump,
+    "HeatSource": DEVICE_TYPE_HeatSource,
+    "HeatLoad": DEVICE_TYPE_HeatLoad,
+    "GasNode": DEVICE_TYPE_GasNode,
+    "GasPipe": DEVICE_TYPE_GasPipe,
+    "GasValve": DEVICE_TYPE_GasValve,
+    "GasCompressor": DEVICE_TYPE_GasCompressor,
+    "GasSource": DEVICE_TYPE_GasSource,
+    "GasLoad": DEVICE_TYPE_GasLoad,
+    "HydroNode": DEVICE_TYPE_HydroNode,
+    "HydroPipe": DEVICE_TYPE_HydroPipe,
+    "HydroValve": DEVICE_TYPE_HydroValve,
+    "HydroCompressor": DEVICE_TYPE_HydroCompressor,
+    "HydroSource": DEVICE_TYPE_HydroSource,
+    "HydroLoad": DEVICE_TYPE_HydroLoad,
+    "HeatExchanger": DEVICE_TYPE_HeatExchanger,
+    "SteamNode": DEVICE_TYPE_SteamNode,
+    "SteamPipe": DEVICE_TYPE_SteamPipe,
+    "SteamValve": DEVICE_TYPE_SteamValve,
+    "SteamPressureReducer": DEVICE_TYPE_SteamPressureReducer,
+    "SteamSource": DEVICE_TYPE_SteamSource,
+    "SteamLoad": DEVICE_TYPE_SteamLoad,
 }
 DEVICE_TYPE_NAMES = {code: name for name, code in DEVICE_TYPE_CODES.items()}
 
@@ -97,6 +147,25 @@ MEAS_TYPE_P_THIRD = 35
 MEAS_TYPE_Q_THIRD = 36
 MEAS_TYPE_V_THIRD = 37
 MEAS_TYPE_I_THIRD = 38
+MEAS_TYPE_PRESSURE = 39
+MEAS_TYPE_FLOW_FROM = 40
+MEAS_TYPE_FLOW_TO = 41
+MEAS_TYPE_FLOW = 42
+MEAS_TYPE_T_SUPPLY = 43
+MEAS_TYPE_T_RETURN = 44
+MEAS_TYPE_HEAT = 45
+MEAS_TYPE_PRESSURE_FROM = 46
+MEAS_TYPE_PRESSURE_TO = 47
+MEAS_TYPE_TS_FROM = 48
+MEAS_TYPE_TS_TO = 49
+MEAS_TYPE_TR_FROM = 50
+MEAS_TYPE_TR_TO = 51
+MEAS_TYPE_ENTHALPY = 52
+MEAS_TYPE_TEMPERATURE = 53
+MEAS_TYPE_H_FROM = 54
+MEAS_TYPE_H_TO = 55
+MEAS_TYPE_T_FROM = 56
+MEAS_TYPE_T_TO = 57
 
 MEAS_TYPE_CODES = {
     "UNKNOWN": MEAS_TYPE_UNKNOWN,
@@ -138,6 +207,25 @@ MEAS_TYPE_CODES = {
     "Q_THIRD": MEAS_TYPE_Q_THIRD,
     "V_THIRD": MEAS_TYPE_V_THIRD,
     "I_THIRD": MEAS_TYPE_I_THIRD,
+    "PRESSURE": MEAS_TYPE_PRESSURE,
+    "FLOW_FROM": MEAS_TYPE_FLOW_FROM,
+    "FLOW_TO": MEAS_TYPE_FLOW_TO,
+    "FLOW": MEAS_TYPE_FLOW,
+    "T_SUPPLY": MEAS_TYPE_T_SUPPLY,
+    "T_RETURN": MEAS_TYPE_T_RETURN,
+    "HEAT": MEAS_TYPE_HEAT,
+    "PRESSURE_FROM": MEAS_TYPE_PRESSURE_FROM,
+    "PRESSURE_TO": MEAS_TYPE_PRESSURE_TO,
+    "TS_FROM": MEAS_TYPE_TS_FROM,
+    "TS_TO": MEAS_TYPE_TS_TO,
+    "TR_FROM": MEAS_TYPE_TR_FROM,
+    "TR_TO": MEAS_TYPE_TR_TO,
+    "ENTHALPY": MEAS_TYPE_ENTHALPY,
+    "TEMPERATURE": MEAS_TYPE_TEMPERATURE,
+    "H_FROM": MEAS_TYPE_H_FROM,
+    "H_TO": MEAS_TYPE_H_TO,
+    "T_FROM": MEAS_TYPE_T_FROM,
+    "T_TO": MEAS_TYPE_T_TO,
 }
 MEAS_TYPE_NAMES = {code: name for name, code in MEAS_TYPE_CODES.items()}
 MEAS_TYPE_CODES.update(

@@ -1,0 +1,28 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 scale_meas_1 HydroNode hydro_n1 PRESSURE 10 1 10
+# 2 scale_meas_2 HydroNode hydro_n2 PRESSURE 10 1 10
+# 3 scale_meas_3 HydroNode hydro_n3 PRESSURE 10 1 9.9919967974374373
+# 4 scale_meas_4 HydroNode hydro_n4 PRESSURE 10 1 9.9919967974374373
+# 5 scale_meas_5 HydroNode hydro_n5 PRESSURE 10 1 9.9979997999618693
+# 6 scale_meas_6 HydroNode hydro_n6 PRESSURE 10 1 9.989994994995623
+# 7 scale_meas_7 HydroNode hydro_n7 PRESSURE 10 1 9.989994994995623
+# 8 scale_meas_8 HydroNode hydro_n8 PRESSURE 10 1 9.9899949949955609
+# 9 scale_meas_9 HydroNode hydro_n9 PRESSURE 10 1 9.9899949949955609
+# 10 scale_meas_10 HydroNode hydro_n10 PRESSURE 10 1 9.9959991996835384
+# 11 scale_meas_11 HydroPipe hydro_pipe_2_4 FLOW_FROM 10 1 0.39999999999999575
+# 12 scale_meas_12 HydroPipe hydro_pipe_2_5 FLOW_FROM 10 1 0.19999999990604636
+# 13 scale_meas_13 HydroPipe hydro_pipe_3_6 FLOW_FROM 10 1 0.19999999990604636
+# 14 scale_meas_14 HydroPipe hydro_pipe_3_7 FLOW_FROM 10 1 0.19999999990604636
+# 15 scale_meas_15 HydroPipe hydro_pipe_4_8 FLOW_FROM 10 1 0.19999999990910169
+# 16 scale_meas_16 HydroPipe hydro_pipe_4_9 FLOW_FROM 10 1 0.19999999990910169
+# 17 scale_meas_17 HydroPipe hydro_pipe_5_10 FLOW_FROM 10 1 0.19999999990910169
+# 18 scale_meas_18 HydroValve hydro_valve_1_3 FLOW_FROM 10 1 0.39999999999999575
+# 19 scale_meas_19 HydroCompressor hydro_compressor_1_2 FLOW_FROM 10 1 0.60000000000000009
+# 20 scale_meas_20 HydroSource hydro_source FLOW 10 1 0.99999999999999578
+# 21 scale_meas_21 HydroLoad hydro_load_1 FLOW 10 1 0.20000000000000001
+# 22 scale_meas_22 HydroLoad hydro_load_2 FLOW 10 1 0.20000000000000001
+# 23 scale_meas_23 HydroLoad hydro_load_3 FLOW 10 1 0.20000000000000001
+# 24 scale_meas_24 HydroLoad hydro_load_4 FLOW 10 1 0.20000000000000001
+# 25 scale_meas_25 HydroLoad hydro_load_5 FLOW 10 1 0.20000000000000001
+</Measurement>

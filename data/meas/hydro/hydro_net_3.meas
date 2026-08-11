@@ -1,0 +1,15 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 hydro_p1 HydroNode hydro_n1 PRESSURE 10 1 3.0
+# 2 hydro_p2 HydroNode hydro_n2 PRESSURE 10 1 2.961966007635045
+# 3 hydro_p3 HydroNode hydro_n3 PRESSURE 10 1 2.9915856677113957
+# 4 hydro_p4 HydroNode hydro_n4 PRESSURE 10 1 2.9636105608043173
+# 5 hydro_p5 HydroNode hydro_n5 PRESSURE 10 1 2.9498059093861846
+# 6 hydro_q12 HydroPipe hydro_pipe_12 FLOW_FROM 10 1 0.5
+# 7 hydro_q45 HydroPipe hydro_pipe_45 FLOW_FROM 10 1 0.25
+# 8 hydro_q34 HydroValve hydro_valve_34 FLOW_FROM 10 1 0.4
+# 9 hydro_q23 HydroCompressor hydro_compressor_23 FLOW_FROM 10 1 0.4
+# 10 hydro_source_q HydroSource hydro_source FLOW 10 1 0.5
+# 11 hydro_load_2_q HydroLoad hydro_load_2 FLOW 1 1 0.1
+# 12 hydro_load_5_q HydroLoad hydro_load_5 FLOW 1 1 0.25
+</Measurement>

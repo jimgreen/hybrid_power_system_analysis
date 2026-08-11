@@ -1,0 +1,15 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 gas_p1 GasNode gas_n1 PRESSURE 10 1 5.0
+# 2 gas_p2 GasNode gas_n2 PRESSURE 10 1 4.898979485566356
+# 3 gas_p3 GasNode gas_n3 PRESSURE 10 1 4.996959075277683
+# 4 gas_p4 GasNode gas_n4 PRESSURE 10 1 4.932504434868761
+# 5 gas_p5 GasNode gas_n5 PRESSURE 10 1 4.907096901427564
+# 6 gas_q12 GasPipe gas_pipe_12 FLOW_FROM 10 1 1.0
+# 7 gas_q45 GasPipe gas_pipe_45 FLOW_FROM 10 1 0.5
+# 8 gas_q34 GasValve gas_valve_34 FLOW_FROM 10 1 0.8
+# 9 gas_q23 GasCompressor gas_compressor_23 FLOW_FROM 10 1 0.8
+# 10 gas_source_q GasSource gas_source FLOW 10 1 1.0
+# 11 gas_load_2_q GasLoad gas_load_2 FLOW 1 1 0.2
+# 12 gas_load_5_q GasLoad gas_load_5 FLOW 1 1 0.5
+</Measurement>

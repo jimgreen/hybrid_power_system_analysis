@@ -1,0 +1,27 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 heat_p1 HeatNode heat_n1 PRESSURE 10 1 10.0
+# 2 heat_p2 HeatNode heat_n2 PRESSURE 10 1 6.0
+# 3 heat_p3 HeatNode heat_n3 PRESSURE 10 1 8.0
+# 4 heat_p4 HeatNode heat_n4 PRESSURE 10 1 5.75
+# 5 heat_p5 HeatNode heat_n5 PRESSURE 10 1 5.26
+# 6 heat_ts1 HeatNode heat_n1 T_SUPPLY 10 1 90.0
+# 7 heat_ts2 HeatNode heat_n2 T_SUPPLY 10 1 87.25526074066264
+# 8 heat_ts3 HeatNode heat_n3 T_SUPPLY 10 1 86.36447569453769
+# 9 heat_ts4 HeatNode heat_n4 T_SUPPLY 10 1 85.05037103048424
+# 10 heat_ts5 HeatNode heat_n5 T_SUPPLY 10 1 80.56597927242069
+# 11 heat_tr1 HeatNode heat_n1 T_RETURN 10 1 66.6209785632429
+# 12 heat_tr2 HeatNode heat_n2 T_RETURN 10 1 68.52361679201557
+# 13 heat_tr3 HeatNode heat_n3 T_RETURN 10 1 67.68920210602552
+# 14 heat_tr4 HeatNode heat_n4 T_RETURN 10 1 68.65258789337402
+# 15 heat_tr5 HeatNode heat_n5 T_RETURN 10 1 68.62140211045222
+# 16 heat_pump_q HeatPump heat_pump_23 FLOW_FROM 10 1 1.5
+# 17 heat_pipe_12_q HeatPipe heat_pipe_12 FLOW_FROM 10 1 2.0
+# 18 heat_pipe_45_q HeatPipe heat_pipe_45 FLOW_FROM 10 1 0.7
+# 19 heat_valve_34_q HeatValve heat_valve_34 FLOW_FROM 10 1 1.5
+# 20 heat_source_q HeatSource heat_source FLOW 10 1 2.0
+# 21 heat_load_2_q HeatLoad heat_load_2 FLOW 1 1 0.5
+# 22 heat_load_2_heat HeatLoad heat_load_2 HEAT 1 1 30.0
+# 23 heat_load_4_heat HeatLoad heat_load_4 HEAT 1 1 45.0
+# 24 heat_load_5_heat HeatLoad heat_load_5 HEAT 1 1 35.0
+</Measurement>

@@ -17,6 +17,18 @@ _KNOWN_REFERENCE_ALIASES = {
     "h2source": ("H2Source", "HydroSource"),
     "h2load": ("H2Load", "HydroLoad"),
     "h2storage": ("H2Storage", "HydroStorage"),
+    "hydrosource": ("HydroSource",),
+    "hydroload": ("HydroLoad",),
+    "hydrostorage": ("HydroStorage",),
+    "heatunit": ("HeatUnit", "HeatSource"),
+    "heatsource": ("HeatSource",),
+    "heatload": ("HeatLoad",),
+    "gasunit": ("GasUnit", "GasSource"),
+    "gassource": ("GasSource",),
+    "gasload": ("GasLoad",),
+    "steamunit": ("SteamUnit", "SteamSource"),
+    "steamsource": ("SteamSource",),
+    "steamload": ("SteamLoad",),
 }
 
 

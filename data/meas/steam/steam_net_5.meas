@@ -1,0 +1,23 @@
+<Measurement>
+@ idx name dev_type dev_name meas_type weight valid value
+# 1 steam_p1 SteamNode steam_n1 PRESSURE 10 1 5.0
+# 2 steam_p2 SteamNode steam_n2 PRESSURE 10 1 4.898979485566356
+# 3 steam_p3 SteamNode steam_n3 PRESSURE 10 1 4.409081537009721
+# 4 steam_p4 SteamNode steam_n4 PRESSURE 10 1 4.33589667773576
+# 5 steam_p5 SteamNode steam_n5 PRESSURE 10 1 4.306971093471606
+# 6 steam_h1 SteamNode steam_n1 ENTHALPY 10 1 3200.0
+# 7 steam_h2 SteamNode steam_n2 ENTHALPY 10 1 3144.9325104660866
+# 8 steam_h3 SteamNode steam_n3 ENTHALPY 10 1 3111.0704329808623
+# 9 steam_h4 SteamNode steam_n4 ENTHALPY 10 1 3061.064384083266
+# 10 steam_h5 SteamNode steam_n5 ENTHALPY 10 1 2957.4675577876887
+# 11 steam_reducer_q SteamPressureReducer steam_reducer_23 FLOW_FROM 10 1 0.8
+# 12 steam_pipe_12_q SteamPipe steam_pipe_12 FLOW_FROM 10 1 1.0
+# 13 steam_pipe_45_q SteamPipe steam_pipe_45 FLOW_FROM 10 1 0.5
+# 14 steam_valve_34_q SteamValve steam_valve_34 FLOW_FROM 10 1 0.8
+# 15 steam_source_q SteamSource steam_source FLOW 10 1 1.0
+# 16 steam_t5 SteamNode steam_n5 TEMPERATURE 1 1 235.32094124408113
+# 17 steam_load_2_heat SteamLoad steam_load_2 HEAT 1 1 545.1865020932173
+# 18 steam_load_5_heat SteamLoad steam_load_5 HEAT 1 1 1269.2337788938444
+# 19 steam_pipe_12_h_to SteamPipe steam_pipe_12 H_TO 10 1 3144.9325104660866
+# 20 steam_reducer_t_to SteamPressureReducer steam_reducer_23 T_TO 1 1 309.1684773946453
+</Measurement>

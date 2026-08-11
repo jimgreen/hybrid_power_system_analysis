@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 MODEL_DIR = Path(__file__).resolve().parent
 for path in (MODEL_DIR,):
@@ -15,12 +15,17 @@ from ac_model import (
     acac_legacy_control_label,
 )
 from dc_model import DCPowerNetwork
+from efile_read import _read_efile_rows
 from hybrid_array_model import (
-    build_hybrid_ppc_from_e_file,
+    build_hybrid_ppc_from_efile_rows,
     normalize_dcac_ac_control_type,
     normalize_dcac_dc_control_type,
     normalize_dcac_device_type,
     validate_dcac_control_types,
+)
+from model.multi_energy_model import (
+    attach_multi_energy_context,
+    build_multi_energy_context_from_rows,
 )
 
 
@@ -124,18 +129,32 @@ class HybridPowerNetwork:
     dcac_converters: List
     acac_converters: List
     hybrid_islands: List[HybridIsland] = field(default_factory=list)
+    fluid_networks: Dict[str, object] = field(default_factory=dict)
+    energy_couplings: List[object] = field(default_factory=list)
+    multi_energy: Optional[object] = None
 
     def __post_init__(self):
         self.ac.acac_converters = self.acac_converters
 
     @classmethod
     def read_from_file(cls, file_name) -> "HybridPowerNetwork":
-        network, _ppc = build_hybrid_ppc_from_e_file(file_name)
+        rows = _read_efile_rows(file_name)
+        network, _ppc = build_hybrid_ppc_from_efile_rows(file_name, rows)
+        attach_multi_energy_context(
+            network,
+            build_multi_energy_context_from_rows(rows, source=file_name),
+        )
         return network
 
     @property
     def total_nodes(self) -> int:
         return len(self.ac.nodes) + len(self.dc.nodes)
+
+    @property
+    def total_energy_nodes(self) -> int:
+        return self.total_nodes + sum(
+            len(network.nodes) for network in self.fluid_networks.values()
+        )
 
     def _physical_ac_angle_reference_node_ids(self):
         ac_nodes = {int(node.idx): node for node in self.ac.nodes}
