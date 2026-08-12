@@ -852,6 +852,20 @@ def test_hybrid_lf_runs_all_fluid_networks_and_parses_couplings(tmp_path):
     assert set(calc.fluid_calcs) == {"heat", "gas", "hydro", "steam"}
     assert all(item.converged for item in calc.fluid_calcs.values())
     assert set(calc.lf_result.fluid) == {"heat", "gas", "hydro", "steam"}
+    heat_result = calc.lf_result.fluid["heat"]
+    gas_result = calc.lf_result.fluid["gas"]
+    hydro_result = calc.lf_result.fluid["hydro"]
+    steam_result = calc.lf_result.fluid["steam"]
+    assert heat_result.pipes and heat_result.valves and heat_result.pumps
+    assert gas_result.pipes and gas_result.valves and gas_result.compressors
+    assert hydro_result.pipes and hydro_result.valves and hydro_result.compressors
+    assert (
+        steam_result.pipes
+        and steam_result.valves
+        and steam_result.pressure_reducers
+    )
+    assert hasattr(next(iter(heat_result.pipes.values())), "i_heat_power")
+    assert hasattr(next(iter(steam_result.pipes.values())), "i_enthalpy")
     assert calc.lf_result.total_fluid_nodes == 20
     assert len(calc.coupling_results) == 5
     assert {item.status for item in calc.coupling_results} == {"balanced"}

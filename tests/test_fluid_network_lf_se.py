@@ -154,6 +154,79 @@ def test_compressible_fluid_load_flow_converges_and_balances(
     np.testing.assert_allclose(node_balance, 0.0, rtol=0.0, atol=1e-9)
 
 
+def test_single_node_hydrogen_storage_balances_net_flow_without_newton_states():
+    from hydro_lf import HydroPowerFlowCalc
+    from model.hydro_model import build_hydro_network_from_model
+
+    model = SimpleNamespace(
+        HydroMedium=[],
+        HydroNode=[SimpleNamespace(idx=1, name="h2_bus", pressure=35.0, run_stat=1)],
+        HydroSource=[
+            SimpleNamespace(
+                idx=1,
+                name="electrolyzer",
+                node=1,
+                control_type="FLOW",
+                pressure_set=35.0,
+                flow_set=0.004,
+                alpha=1.0,
+                flow_min=0.0,
+                flow_max=10.0,
+                run_stat=1,
+            )
+        ],
+        HydroLoad=[
+            SimpleNamespace(
+                idx=1,
+                name="fuel_cell",
+                node=1,
+                flow_set=6.666666666666667,
+                run_stat=1,
+            )
+        ],
+        HydroStorage=[
+            SimpleNamespace(
+                idx=1,
+                name="hydrogen_tank",
+                node=1,
+                control_type="PRESSURE",
+                pressure_set=35.0,
+                flow_set=0.0,
+                alpha=1.0,
+                flow_min=-10.0,
+                flow_max=10.0,
+                run_stat=1,
+            )
+        ],
+        HydroPipe=[],
+        HydroValve=[],
+        HydroCompressor=[],
+    )
+    network = build_hydro_network_from_model(model)
+    calc = HydroPowerFlowCalc(network, result_mode="full")
+
+    assert calc.total_vars == 0
+    assert calc.total_eq == 0
+    assert calc.run() == 0
+
+    expected_storage_flow = 6.666666666666667 - 0.004
+    np.testing.assert_allclose(
+        calc.source_flow,
+        [0.004, expected_storage_flow],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    assert calc.lf_result.storages["hydrogen_tank"].flow == pytest.approx(
+        expected_storage_flow
+    )
+    np.testing.assert_allclose(
+        np.sum(calc.source_flow),
+        np.sum(network.load_flow_set),
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
 @pytest.mark.parametrize("case_type", ("heat", "gas", "hydro", "steam"))
 @pytest.mark.parametrize("storage_flow", (0.1, -0.1))
 def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_flow):
@@ -364,6 +437,139 @@ def test_heat_load_flow_solves_hydraulics_supply_and_return_temperature():
     assert np.all(np.isfinite(calc.return_temperature))
     assert calc.supply_temperature[0] > calc.supply_temperature[-1]
     assert sum(item.heat_power for item in calc.lf_result.loads.values()) == pytest.approx(110.0)
+
+
+def test_heat_full_result_exposes_source_load_pipe_valve_and_pump_outputs():
+    from heat_lf import HeatPowerFlowCalc
+    from model.heat_model import load_heat_network_from_e_file
+
+    network = load_heat_network_from_e_file(
+        ROOT / "data" / "model" / "heat" / "heat_net_3.e"
+    )
+    calc = HeatPowerFlowCalc(network, tol=1e-10, max_iter=100, result_mode="full")
+
+    assert calc.run() == 0
+    result = calc.lf_result
+    assert result.pumps["heat_pump_23"] is result.controllers["heat_pump_23"]
+    for collection in (result.pipes, result.valves, result.pumps):
+        for item in collection.values():
+            assert item.i_flow == pytest.approx(-item.j_flow)
+            assert np.all(
+                np.isfinite(
+                    [
+                        item.i_pressure,
+                        item.j_pressure,
+                        item.i_supply_temperature,
+                        item.j_supply_temperature,
+                        item.i_return_temperature,
+                        item.j_return_temperature,
+                        item.i_heat_power,
+                        item.j_heat_power,
+                        item.heat_loss,
+                    ]
+                )
+            )
+            assert item.heat_loss == pytest.approx(
+                item.i_heat_power + item.j_heat_power
+            )
+    for collection in (result.sources, result.loads):
+        for item in collection.values():
+            assert np.all(
+                np.isfinite(
+                    [
+                        item.flow,
+                        item.supply_pressure,
+                        item.return_pressure,
+                        item.supply_temperature,
+                        item.return_temperature,
+                        item.heat_power,
+                    ]
+                )
+            )
+
+    source_heat = sum(item.heat_power for item in result.sources.values())
+    load_heat = sum(item.heat_power for item in result.loads.values())
+    edge_heat_loss = sum(
+        item.heat_loss
+        for collection in (result.pipes, result.valves, result.pumps)
+        for item in collection.values()
+    )
+    assert source_heat == pytest.approx(load_heat + edge_heat_loss, abs=1e-9)
+
+
+def test_fluid_array_result_keeps_arrays_without_per_device_objects():
+    from heat_lf import HeatPowerFlowCalc
+    from model.heat_model import load_heat_network_from_e_file
+
+    calc = HeatPowerFlowCalc(
+        load_heat_network_from_e_file(
+            ROOT / "data" / "model" / "heat" / "heat_net_3.e"
+        ),
+        tol=1e-10,
+        max_iter=100,
+        result_mode="array",
+    )
+
+    assert calc.run() == 0
+    result = calc.lf_result
+    assert result.arrays["edge_i_pressure"].size == len(calc.network.edges)
+    assert result.arrays["edge_i_heat_power"].size == len(calc.network.edges)
+    for collection_name in (
+        "nodes",
+        "pipes",
+        "valves",
+        "controllers",
+        "pumps",
+        "compressors",
+        "pressure_reducers",
+        "sources",
+        "storages",
+        "loads",
+        "heat_exchangers",
+    ):
+        assert not getattr(result, collection_name)
+
+
+@pytest.mark.parametrize(
+    ("domain", "case_name", "controller_name"),
+    (
+        ("gas", "gas_net_3.e", "gas_compressor_23"),
+        ("hydro", "hydro_net_3.e", "hydro_compressor_23"),
+    ),
+)
+def test_compressible_full_result_exposes_source_load_and_edge_outputs(
+    domain,
+    case_name,
+    controller_name,
+):
+    if domain == "gas":
+        from gas_lf import GasPowerFlowCalc as Calc
+        from model.gas_model import load_gas_network_from_e_file as load_network
+    else:
+        from hydro_lf import HydroPowerFlowCalc as Calc
+        from model.hydro_model import load_hydro_network_from_e_file as load_network
+
+    calc = Calc(
+        load_network(ROOT / "data" / "model" / domain / case_name),
+        tol=1e-9,
+        max_iter=100,
+        result_mode="full",
+    )
+
+    assert calc.run() == 0
+    result = calc.lf_result
+    assert result.compressors[controller_name] is result.controllers[controller_name]
+    for collection in (result.pipes, result.valves, result.compressors):
+        for item in collection.values():
+            assert item.i_flow == pytest.approx(-item.j_flow)
+            assert np.all(
+                np.isfinite(
+                    [item.i_flow, item.i_pressure, item.j_pressure]
+                )
+            )
+    for collection in (result.sources, result.loads):
+        for item in collection.values():
+            assert np.all(np.isfinite([item.flow, item.pressure]))
 
 
 def test_heat_exchanger_couples_temperature_without_merging_hydraulic_islands():
@@ -822,6 +1028,60 @@ def test_steam_load_flow_balances_mass_and_enthalpy():
         for item in collection.values()
     )
     assert source_heat == pytest.approx(load_heat + network_loss, abs=1e-9)
+
+
+def test_steam_full_result_exposes_source_load_pipe_valve_and_reducer_outputs():
+    from model.steam_model import load_steam_network_from_e_file
+    from steam_lf import SteamPowerFlowCalc
+
+    network = load_steam_network_from_e_file(
+        ROOT / "data" / "model" / "steam" / "steam_net_5.e"
+    )
+    calc = SteamPowerFlowCalc(
+        network,
+        tol=1e-12,
+        max_iter=100,
+        result_mode="full",
+    )
+
+    assert calc.run() == 0
+    result = calc.lf_result
+    reducer = result.pressure_reducers["steam_reducer_23"]
+    assert reducer is result.controllers["steam_reducer_23"]
+    for collection in (result.pipes, result.valves, result.pressure_reducers):
+        for item in collection.values():
+            assert item.i_flow == pytest.approx(-item.j_flow)
+            assert np.all(
+                np.isfinite(
+                    [
+                        item.i_pressure,
+                        item.j_pressure,
+                        item.i_temperature,
+                        item.j_temperature,
+                        item.i_enthalpy,
+                        item.j_enthalpy,
+                        item.i_heat_power,
+                        item.j_heat_power,
+                        item.heat_loss,
+                    ]
+                )
+            )
+            assert item.heat_loss == pytest.approx(
+                item.i_heat_power + item.j_heat_power
+            )
+    for collection in (result.sources, result.loads):
+        for item in collection.values():
+            assert np.all(
+                np.isfinite(
+                    [
+                        item.flow,
+                        item.pressure,
+                        item.temperature,
+                        item.enthalpy,
+                        item.heat_power,
+                    ]
+                )
+            )
 
 
 def test_steam_state_estimation_flat_start_recovers_pressure_and_enthalpy():

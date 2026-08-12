@@ -36,12 +36,22 @@ THERMAL_ZERO_FLOW_TOLERANCE = 1.0e-10
 
 @dataclass
 class FluidLFResult:
+    """Fluid load-flow outputs.
+
+    ``full`` mode populates the named device collections. Edge ``i_*`` and
+    ``j_*`` flow/heat values are positive into the edge at that terminal, so
+    their sum is the edge loss. Other modes retain only ``arrays``.
+    """
+
     arrays: Dict[str, np.ndarray] = field(default_factory=dict)
     metadata: Dict[str, object] = field(default_factory=dict)
     nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
     pipes: Dict[str, SimpleNamespace] = field(default_factory=dict)
     valves: Dict[str, SimpleNamespace] = field(default_factory=dict)
     controllers: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    pumps: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    compressors: Dict[str, SimpleNamespace] = field(default_factory=dict)
+    pressure_reducers: Dict[str, SimpleNamespace] = field(default_factory=dict)
     heat_exchangers: Dict[str, SimpleNamespace] = field(default_factory=dict)
     sources: Dict[str, SimpleNamespace] = field(default_factory=dict)
     storages: Dict[str, SimpleNamespace] = field(default_factory=dict)
@@ -370,11 +380,16 @@ class FluidPowerFlowCalc:
         self.network.node_idx = np.empty(0, dtype=np.int64)
         self.network.node_name = np.empty(0, dtype=object)
         self.network.node_explicit_return = np.empty(0, dtype=bool)
+        self.network.edge_i = np.empty(0, dtype=np.int64)
+        self.network.edge_j = np.empty(0, dtype=np.int64)
+        self.network.edge_heat_loss = np.empty(0, dtype=np.float64)
+        self.network.incidence = csr_matrix((0, 0), dtype=np.float64)
         self.network.source_name = np.empty(0, dtype=object)
         self.network.source_is_storage = np.empty(0, dtype=bool)
         self.network.storage_source_pos = np.empty(0, dtype=np.int64)
         self.network.load_name = np.empty(0, dtype=object)
         self.network.load_flow_set = np.empty(0, dtype=np.float64)
+        self.network.load_heat_power = np.empty(0, dtype=np.float64)
         self.network.source_supply_node_pos = np.empty(0, dtype=np.int64)
         self.network.source_return_node_pos = np.empty(0, dtype=np.int64)
         self.network.load_supply_node_pos = np.empty(0, dtype=np.int64)
@@ -1578,6 +1593,7 @@ class FluidPowerFlowCalc:
             self.iterations = 0
             self.normF = 0.0
             self.failure_reason = ""
+            self._allocate_source_flows()
             self._write_back()
             return 0
         self.converged = False
@@ -1660,6 +1676,7 @@ class FluidPowerFlowCalc:
                 self.converged = bool(converged)
             if iterations is not None:
                 self.iterations = int(iterations)
+            self._allocate_source_flows()
             self._write_back()
             return
         residual, _jacobian, potential, edge_flow = self._residual_and_jacobian(
@@ -1699,6 +1716,10 @@ class FluidPowerFlowCalc:
 
     def _allocate_source_flows(self) -> None:
         net = self.network
+        if not net.nodes:
+            self.source_flow = np.empty(0, dtype=np.float64)
+            self.pressure_source_group_flow = np.empty(0, dtype=np.float64)
+            return
         source_flow, _ = self._explicit_pressure_source_flows(
             self.x,
             return_shares=False,
@@ -1743,6 +1764,86 @@ class FluidPowerFlowCalc:
             -self.network.edge_heat_loss[active] / np.maximum(mass[active], 1e-9)
         )
         return attenuation
+
+    def _heat_edge_result_arrays(self) -> Dict[str, np.ndarray]:
+        """Return endpoint temperatures and heat flows for heat-network edges."""
+        net = self.network
+        count = len(net.edges)
+        flow = np.asarray(self.edge_flow, dtype=np.float64)
+        active = np.abs(flow) > THERMAL_ZERO_FLOW_TOLERANCE
+        attenuation = self._edge_attenuation()
+        nan = np.full(count, np.nan, dtype=np.float64)
+        values = {
+            "edge_thermal_active": active,
+            "edge_i_temperature": nan.copy(),
+            "edge_j_temperature": nan.copy(),
+            "edge_i_supply_temperature": nan.copy(),
+            "edge_j_supply_temperature": nan.copy(),
+            "edge_i_return_temperature": nan.copy(),
+            "edge_j_return_temperature": nan.copy(),
+            "edge_i_supply_heat_power": nan.copy(),
+            "edge_j_supply_heat_power": nan.copy(),
+            "edge_i_return_heat_power": nan.copy(),
+            "edge_j_return_heat_power": nan.copy(),
+            "edge_i_heat_power": np.zeros(count, dtype=np.float64),
+            "edge_j_heat_power": np.zeros(count, dtype=np.float64),
+            "edge_heat_loss": np.zeros(count, dtype=np.float64),
+        }
+        cp = float(net.medium.heat_capacity)
+        ambient = float(net.medium.ambient_temperature)
+        for edge_pos in range(count):
+            i = int(net.edge_i[edge_pos])
+            j = int(net.edge_j[edge_pos])
+            edge_flow = float(flow[edge_pos])
+            factor = float(attenuation[edge_pos])
+            if net.node_explicit_return[i]:
+                if not active[edge_pos]:
+                    i_temperature = float(self.temperature[i])
+                    j_temperature = float(self.temperature[j])
+                elif edge_flow > 0.0:
+                    i_temperature = float(self.temperature[i])
+                    j_temperature = ambient + (i_temperature - ambient) * factor
+                else:
+                    j_temperature = float(self.temperature[j])
+                    i_temperature = ambient + (j_temperature - ambient) * factor
+                i_heat_power = edge_flow * cp * (i_temperature - ambient)
+                j_heat_power = -edge_flow * cp * (j_temperature - ambient)
+                values["edge_i_temperature"][edge_pos] = i_temperature
+                values["edge_j_temperature"][edge_pos] = j_temperature
+            else:
+                if not active[edge_pos]:
+                    i_supply = float(self.supply_temperature[i])
+                    j_supply = float(self.supply_temperature[j])
+                    i_return = float(self.return_temperature[i])
+                    j_return = float(self.return_temperature[j])
+                elif edge_flow > 0.0:
+                    i_supply = float(self.supply_temperature[i])
+                    j_supply = ambient + (i_supply - ambient) * factor
+                    j_return = float(self.return_temperature[j])
+                    i_return = ambient + (j_return - ambient) * factor
+                else:
+                    j_supply = float(self.supply_temperature[j])
+                    i_supply = ambient + (j_supply - ambient) * factor
+                    i_return = float(self.return_temperature[i])
+                    j_return = ambient + (i_return - ambient) * factor
+                i_supply_heat_power = edge_flow * cp * (i_supply - ambient)
+                j_supply_heat_power = -edge_flow * cp * (j_supply - ambient)
+                i_return_heat_power = -edge_flow * cp * (i_return - ambient)
+                j_return_heat_power = edge_flow * cp * (j_return - ambient)
+                i_heat_power = i_supply_heat_power + i_return_heat_power
+                j_heat_power = j_supply_heat_power + j_return_heat_power
+                values["edge_i_supply_temperature"][edge_pos] = i_supply
+                values["edge_j_supply_temperature"][edge_pos] = j_supply
+                values["edge_i_return_temperature"][edge_pos] = i_return
+                values["edge_j_return_temperature"][edge_pos] = j_return
+                values["edge_i_supply_heat_power"][edge_pos] = i_supply_heat_power
+                values["edge_j_supply_heat_power"][edge_pos] = j_supply_heat_power
+                values["edge_i_return_heat_power"][edge_pos] = i_return_heat_power
+                values["edge_j_return_heat_power"][edge_pos] = j_return_heat_power
+            values["edge_i_heat_power"][edge_pos] = i_heat_power
+            values["edge_j_heat_power"][edge_pos] = j_heat_power
+            values["edge_heat_loss"][edge_pos] = i_heat_power + j_heat_power
+        return values
 
     def _solve_heat_temperatures(self) -> None:
         net = self.network
@@ -1995,17 +2096,29 @@ class FluidPowerFlowCalc:
 
     def _write_back(self) -> None:
         net = self.network
+        edge_i_pressure = self.pressure[net.edge_i].copy()
+        edge_j_pressure = self.pressure[net.edge_j].copy()
+        source_supply_pressure = self.pressure[net.source_supply_node_pos].copy()
+        source_return_pressure = self.pressure[net.source_return_node_pos].copy()
+        load_supply_pressure = self.pressure[net.load_supply_node_pos].copy()
+        load_return_pressure = self.pressure[net.load_return_node_pos].copy()
         arrays = {
             "node_pressure": self.pressure.copy(),
             "edge_flow": self.edge_flow.copy(),
+            "edge_i_pressure": edge_i_pressure,
+            "edge_j_pressure": edge_j_pressure,
             "source_flow": self.source_flow.copy(),
+            "source_supply_pressure": source_supply_pressure,
+            "source_return_pressure": source_return_pressure,
             "storage_flow": self.source_flow[net.storage_source_pos].copy(),
             "load_flow": net.load_flow_set.copy(),
+            "load_supply_pressure": load_supply_pressure,
+            "load_return_pressure": load_return_pressure,
         }
+        heat_edge_arrays = None
         if net.thermal:
-            arrays["edge_thermal_active"] = (
-                np.abs(self.edge_flow) > THERMAL_ZERO_FLOW_TOLERANCE
-            )
+            heat_edge_arrays = self._heat_edge_result_arrays()
+            arrays.update(heat_edge_arrays)
             arrays["node_supply_temperature"] = self.supply_temperature.copy()
             arrays["node_return_temperature"] = self.return_temperature.copy()
             arrays["node_temperature"] = self.temperature.copy()
@@ -2027,6 +2140,13 @@ class FluidPowerFlowCalc:
             arrays["storage_heat_power"] = source_heat_power[
                 net.storage_source_pos
             ].copy()
+            arrays["load_supply_temperature"] = self.supply_temperature[
+                net.load_supply_node_pos
+            ].copy()
+            arrays["load_return_temperature"] = self.return_temperature[
+                net.load_return_node_pos
+            ].copy()
+            arrays["load_heat_power"] = net.load_heat_power.copy()
             if net.exchanger_i.size:
                 primary_heat, secondary_heat, primary_out, secondary_out = self._heat_exchanger_quantities()
                 arrays["exchanger_primary_heat"] = primary_heat
@@ -2045,6 +2165,9 @@ class FluidPowerFlowCalc:
 
         for pos, node in enumerate(net.nodes):
             values = {
+                "idx": int(node.idx),
+                "name": str(node.name),
+                "device_type": f"{net.prefix}Node",
                 "pressure": float(self.pressure[pos]),
                 "island": int(net.node_island[pos]),
             }
@@ -2057,69 +2180,73 @@ class FluidPowerFlowCalc:
                         return_temperature=float(self.return_temperature[pos]),
                     )
             result.nodes[node.name] = SimpleNamespace(**values)
-        attenuation = self._edge_attenuation()
         for edge_pos, edge in enumerate(net.edges):
             i = int(net.edge_i[edge_pos])
             j = int(net.edge_j[edge_pos])
             values = {
+                "idx": int(edge.idx),
+                "name": str(edge.name),
+                "kind": str(edge.kind),
+                "device_type": (
+                    f"{net.prefix}"
+                    + str(edge.kind).replace("_", " ").title().replace(" ", "")
+                ),
+                "flow": float(self.edge_flow[edge_pos]),
                 "i_flow": float(self.edge_flow[edge_pos]),
                 "j_flow": float(-self.edge_flow[edge_pos]),
                 "i_pressure": float(self.pressure[i]),
                 "j_pressure": float(self.pressure[j]),
             }
             if net.thermal:
-                flow = float(self.edge_flow[edge_pos])
-                thermal_active = self._active_transport_flow(flow)
+                thermal_active = bool(
+                    heat_edge_arrays["edge_thermal_active"][edge_pos]
+                )
                 values["thermal_active"] = thermal_active
-                factor = float(attenuation[edge_pos])
                 if net.node_explicit_return[i]:
-                    if not thermal_active:
-                        i_temperature = self.temperature[i]
-                        j_temperature = self.temperature[j]
-                    elif flow > 0.0:
-                        i_temperature = self.temperature[i]
-                        j_temperature = net.medium.ambient_temperature + (
-                            self.temperature[i] - net.medium.ambient_temperature
-                        ) * factor
-                    else:
-                        j_temperature = self.temperature[j]
-                        i_temperature = net.medium.ambient_temperature + (
-                            self.temperature[j] - net.medium.ambient_temperature
-                        ) * factor
                     values.update(
-                        i_temperature=float(i_temperature),
-                        j_temperature=float(j_temperature),
+                        i_temperature=float(
+                            heat_edge_arrays["edge_i_temperature"][edge_pos]
+                        ),
+                        j_temperature=float(
+                            heat_edge_arrays["edge_j_temperature"][edge_pos]
+                        ),
                     )
                 else:
-                    if not thermal_active:
-                        i_supply = self.supply_temperature[i]
-                        j_supply = self.supply_temperature[j]
-                        i_return = self.return_temperature[i]
-                        j_return = self.return_temperature[j]
-                    elif flow > 0.0:
-                        i_supply = self.supply_temperature[i]
-                        j_supply = net.medium.ambient_temperature + (
-                            self.supply_temperature[i] - net.medium.ambient_temperature
-                        ) * factor
-                        j_return = self.return_temperature[j]
-                        i_return = net.medium.ambient_temperature + (
-                            self.return_temperature[j] - net.medium.ambient_temperature
-                        ) * factor
-                    else:
-                        j_supply = self.supply_temperature[j]
-                        i_supply = net.medium.ambient_temperature + (
-                            self.supply_temperature[j] - net.medium.ambient_temperature
-                        ) * factor
-                        i_return = self.return_temperature[i]
-                        j_return = net.medium.ambient_temperature + (
-                            self.return_temperature[i] - net.medium.ambient_temperature
-                        ) * factor
                     values.update(
-                        i_supply_temperature=float(i_supply),
-                        j_supply_temperature=float(j_supply),
-                        i_return_temperature=float(i_return),
-                        j_return_temperature=float(j_return),
+                        i_supply_temperature=float(
+                            heat_edge_arrays["edge_i_supply_temperature"][edge_pos]
+                        ),
+                        j_supply_temperature=float(
+                            heat_edge_arrays["edge_j_supply_temperature"][edge_pos]
+                        ),
+                        i_return_temperature=float(
+                            heat_edge_arrays["edge_i_return_temperature"][edge_pos]
+                        ),
+                        j_return_temperature=float(
+                            heat_edge_arrays["edge_j_return_temperature"][edge_pos]
+                        ),
+                        i_supply_heat_power=float(
+                            heat_edge_arrays["edge_i_supply_heat_power"][edge_pos]
+                        ),
+                        j_supply_heat_power=float(
+                            heat_edge_arrays["edge_j_supply_heat_power"][edge_pos]
+                        ),
+                        i_return_heat_power=float(
+                            heat_edge_arrays["edge_i_return_heat_power"][edge_pos]
+                        ),
+                        j_return_heat_power=float(
+                            heat_edge_arrays["edge_j_return_heat_power"][edge_pos]
+                        ),
                     )
+                values.update(
+                    i_heat_power=float(
+                        heat_edge_arrays["edge_i_heat_power"][edge_pos]
+                    ),
+                    j_heat_power=float(
+                        heat_edge_arrays["edge_j_heat_power"][edge_pos]
+                    ),
+                    heat_loss=float(heat_edge_arrays["edge_heat_loss"][edge_pos]),
+                )
             namespace = SimpleNamespace(**values)
             if edge.kind == "pipe":
                 result.pipes[edge.name] = namespace
@@ -2127,10 +2254,25 @@ class FluidPowerFlowCalc:
                 result.valves[edge.name] = namespace
             else:
                 result.controllers[edge.name] = namespace
+                if edge.kind == "pump":
+                    result.pumps[edge.name] = namespace
+                elif edge.kind == "compressor":
+                    result.compressors[edge.name] = namespace
+                elif edge.kind == "pressure_reducer":
+                    result.pressure_reducers[edge.name] = namespace
         for source_pos, source in enumerate(net.sources):
             supply_node = int(net.source_supply_node_pos[source_pos])
             return_node = int(net.source_return_node_pos[source_pos])
-            values = {"flow": float(self.source_flow[source_pos])}
+            values = {
+                "idx": int(source.idx),
+                "name": str(source.name),
+                "device_type": (
+                    f"{net.prefix}Storage"
+                    if bool(net.source_is_storage[source_pos])
+                    else f"{net.prefix}Source"
+                ),
+                "flow": float(self.source_flow[source_pos]),
+            }
             if net.thermal:
                 values.update(
                     supply_pressure=float(self.pressure[supply_node]),
@@ -2159,7 +2301,12 @@ class FluidPowerFlowCalc:
         for load_pos, load in enumerate(net.loads):
             supply_node = int(net.load_supply_node_pos[load_pos])
             return_node = int(net.load_return_node_pos[load_pos])
-            values = {"flow": float(net.load_flow_set[load_pos])}
+            values = {
+                "idx": int(load.idx),
+                "name": str(load.name),
+                "device_type": f"{net.prefix}Load",
+                "flow": float(net.load_flow_set[load_pos]),
+            }
             if net.thermal:
                 values.update(
                     supply_pressure=float(self.pressure[supply_node]),
@@ -2216,7 +2363,13 @@ def print_fluid_result(calc: FluidPowerFlowCalc, rc: int) -> None:
         return
     print("  node results:")
     for pos, (name, item) in enumerate(calc.lf_result.nodes.items()):
-        if net.thermal:
+        if net.steam:
+            print(
+                f"    {name}: pressure={item.pressure:.6f}, "
+                f"temperature={item.temperature:.6f}, "
+                f"enthalpy={item.enthalpy:.6f}"
+            )
+        elif net.thermal:
             if net.node_explicit_return[pos]:
                 print(
                     f"    {name}: pressure={item.pressure:.6f}, "
@@ -2229,22 +2382,103 @@ def print_fluid_result(calc: FluidPowerFlowCalc, rc: int) -> None:
                 )
         else:
             print(f"    {name}: pressure={item.pressure:.6f}")
-    print("  edge flows:")
-    for collection in (calc.lf_result.pipes, calc.lf_result.valves, calc.lf_result.controllers):
+    def edge_text(item) -> str:
+        text = (
+            f"flow={item.flow:.6f}, Pi={item.i_pressure:.6f}, "
+            f"Pj={item.j_pressure:.6f}"
+        )
+        if hasattr(item, "i_supply_temperature"):
+            text += (
+                f", Tsi={item.i_supply_temperature:.6f}, "
+                f"Tsj={item.j_supply_temperature:.6f}, "
+                f"Tri={item.i_return_temperature:.6f}, "
+                f"Trj={item.j_return_temperature:.6f}"
+            )
+        elif hasattr(item, "i_temperature"):
+            text += (
+                f", Ti={item.i_temperature:.6f}, "
+                f"Tj={item.j_temperature:.6f}"
+            )
+        if hasattr(item, "i_enthalpy"):
+            text += f", hi={item.i_enthalpy:.6f}, hj={item.j_enthalpy:.6f}"
+        if hasattr(item, "i_heat_power"):
+            text += (
+                f", Qi={item.i_heat_power:.6f}, "
+                f"Qj={item.j_heat_power:.6f}, loss={item.heat_loss:.6f}"
+            )
+        return text
+
+    categorized_controllers = set()
+    edge_collections = (
+        ("pipes", calc.lf_result.pipes),
+        ("valves", calc.lf_result.valves),
+        ("pumps", calc.lf_result.pumps),
+        ("compressors", calc.lf_result.compressors),
+        ("pressure reducers", calc.lf_result.pressure_reducers),
+    )
+    for label, collection in edge_collections:
+        if not collection:
+            continue
+        print(f"  {label}:")
+        categorized_controllers.update(collection)
         for name, item in collection.items():
-            print(f"    {name}: i_flow={item.i_flow:.6f}, j_flow={item.j_flow:.6f}")
-    print("  source flows:")
-    for name, item in calc.lf_result.sources.items():
-        print(f"    {name}: flow={item.flow:.6f}")
-    if calc.lf_result.storages:
-        print("  storage flows (positive=discharge):")
-        for name, item in calc.lf_result.storages.items():
-            print(f"    {name}: flow={item.flow:.6f}")
+            print(f"    {name}: {edge_text(item)}")
+    other_controllers = {
+        name: item
+        for name, item in calc.lf_result.controllers.items()
+        if name not in categorized_controllers
+    }
+    if other_controllers:
+        print("  controllers:")
+        for name, item in other_controllers.items():
+            print(f"    {name}: {edge_text(item)}")
+
+    def terminal_text(item) -> str:
+        text = f"flow={item.flow:.6f}"
+        if hasattr(item, "supply_pressure"):
+            text += (
+                f", Ps={item.supply_pressure:.6f}, "
+                f"Pr={item.return_pressure:.6f}"
+            )
+        elif hasattr(item, "pressure"):
+            text += f", pressure={item.pressure:.6f}"
+        if hasattr(item, "supply_temperature"):
+            text += (
+                f", Ts={item.supply_temperature:.6f}, "
+                f"Tr={item.return_temperature:.6f}"
+            )
+        elif hasattr(item, "temperature"):
+            text += f", temperature={item.temperature:.6f}"
+        if hasattr(item, "enthalpy"):
+            text += f", enthalpy={item.enthalpy:.6f}"
+        if hasattr(item, "heat_power"):
+            text += f", heat={item.heat_power:.6f}"
+        return text
+
+    for label, collection in (
+        ("sources", calc.lf_result.sources),
+        ("storages (positive flow=discharge)", calc.lf_result.storages),
+        ("loads", calc.lf_result.loads),
+    ):
+        if not collection:
+            continue
+        print(f"  {label}:")
+        for name, item in collection.items():
+            print(f"    {name}: {terminal_text(item)}")
     if calc.lf_result.heat_exchangers:
         print("  heat exchangers:")
         for name, item in calc.lf_result.heat_exchangers.items():
             print(
-                f"    {name}: heat={item.primary_heat:.6f}, secondary_heat={item.secondary_heat:.6f}, "
-                f"primary={item.primary_in_temperature:.6f}->{item.primary_out_temperature:.6f}, "
-                f"secondary={item.secondary_in_temperature:.6f}->{item.secondary_out_temperature:.6f}"
+                f"    {name}: primary_flow={item.primary_flow:.6f}, "
+                f"secondary_flow={item.secondary_flow:.6f}, "
+                f"primary_pressure={item.primary_supply_pressure:.6f}"
+                f"->{item.primary_return_pressure:.6f}, "
+                f"secondary_pressure={item.secondary_return_pressure:.6f}"
+                f"->{item.secondary_supply_pressure:.6f}, "
+                f"primary_temperature={item.primary_in_temperature:.6f}"
+                f"->{item.primary_out_temperature:.6f}, "
+                f"secondary_temperature={item.secondary_in_temperature:.6f}"
+                f"->{item.secondary_out_temperature:.6f}, "
+                f"primary_heat={item.primary_heat:.6f}, "
+                f"secondary_heat={item.secondary_heat:.6f}"
             )
