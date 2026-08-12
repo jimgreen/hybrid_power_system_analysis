@@ -65,8 +65,14 @@ def _block(name: str, header: str, rows: Iterable[str]) -> str:
     return "\n".join((f"<{name}>", "@ " + header, *rows, f"</{name}>", ""))
 
 
-def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
+def _add_coupling_electric_devices(
+    text: str,
+    couplings_per_type: int,
+    *,
+    include_heat2: bool = False,
+) -> str:
     count = int(couplings_per_type)
+    electric_load_groups = 3 if include_heat2 else 2
     ac_load_rows = [
         _row(
             (
@@ -84,7 +90,7 @@ def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
                 1,
             )
         )
-        for pos in range(2 * count)
+        for pos in range(electric_load_groups * count)
     ]
     text = _append_block_rows(text, "ACLoad", ac_load_rows)
 
@@ -119,7 +125,7 @@ def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
                 1,
             )
         )
-        for pos in range(2 * count)
+        for pos in range(electric_load_groups * count)
     ]
     text = _append_block_rows(text, "DCLoad", dc_load_rows)
 
@@ -145,21 +151,29 @@ def _add_coupling_fluid_sources(
     text: str,
     node_counts: dict[str, int],
     couplings_per_type: int,
+    *,
+    include_heat2: bool = False,
 ) -> str:
     count = int(couplings_per_type)
     heat_node_start = 2 * max(2, int(node_counts["heat"]) // 4) + 6
     heat_source_rows = []
-    for pos in range(3 * count):
-        idx = pos + 2
-        flow = 0.00012 if pos >= 2 * count else 0.0001
+
+    def add_heat_source(
+        idx: int,
+        *,
+        node: object = "-",
+        supply_node: object = "-",
+        return_node: object = "-",
+        flow: float = 0.0001,
+    ) -> None:
         heat_source_rows.append(
             _row(
                 (
                     idx,
                     f"coupled_heat_source_{idx}",
-                    heat_node_start + pos,
-                    "-",
-                    "-",
+                    node,
+                    supply_node,
+                    return_node,
                     "FLOW",
                     0.0,
                     flow,
@@ -171,6 +185,41 @@ def _add_coupling_fluid_sources(
                 )
             )
         )
+
+    if include_heat2:
+        supply_count = max(2, int(node_counts["heat"]) // 4)
+        explicit_supply_start = supply_count // 2 + 1
+        explicit_return_start = supply_count + explicit_supply_start
+        explicit_leaf_count = supply_count - supply_count // 2
+        explicit_source_count = 2 * count
+        # Span the explicit supply/return tree instead of creating a symmetric
+        # cluster of temperature controls on one local branch.
+        for group in range(5):
+            for pos in range(count):
+                idx = 2 + group * count + pos
+                if group in {1, 3}:
+                    source_pos = (group // 2) * count + pos
+                    explicit_pos = source_pos * explicit_leaf_count // explicit_source_count
+                    add_heat_source(
+                        idx,
+                        supply_node=explicit_supply_start + explicit_pos,
+                        return_node=explicit_return_start + explicit_pos,
+                    )
+                else:
+                    implicit_group = group // 2
+                    add_heat_source(
+                        idx,
+                        node=heat_node_start + implicit_group * count + pos,
+                        flow=0.00012 if group == 4 else 0.0001,
+                    )
+    else:
+        for pos in range(3 * count):
+            idx = pos + 2
+            add_heat_source(
+                idx,
+                node=heat_node_start + pos,
+                flow=0.00012 if pos >= 2 * count else 0.0001,
+            )
     text = _append_block_rows(text, "HeatSource", heat_source_rows)
 
     hydro_node_start = int(node_counts["hydro"]) // 2 + 25
@@ -214,29 +263,67 @@ def _scale_coupled_fluid_loads(text: str, couplings_per_type: int) -> str:
     return "\n".join(output)
 
 
-def _coupling_blocks(couplings_per_type: int) -> str:
+def _coupling_blocks(
+    couplings_per_type: int,
+    *,
+    include_heat2: bool = False,
+) -> str:
     count = int(couplings_per_type)
 
     def indices(start: int, group: int) -> range:
         first = int(start) + int(group) * count
         return range(first, first + count)
 
-    specifications = (
+    dc_hydro_group = 2 if include_heat2 else 1
+    ac_hydro_group = 2 if include_heat2 else 1
+    ac_heat_group = 2 if include_heat2 else 1
+    gas_heat_group = 4 if include_heat2 else 2
+    specifications = [
         ("DcE2Heat", "idx_dc_load_t1 idx_heat_unit_t2", indices(17, 0), indices(2, 0), 0.95, 950.0),
+    ]
+    if include_heat2:
+        specifications.append(
+            (
+                "DcE2Heat2",
+                "idx_dc_load_t1 idx_heat_unit_t2",
+                indices(17, 1),
+                indices(2, 1),
+                0.95,
+                950.0,
+            )
+        )
+    specifications.extend(
+        (
         ("Gas2DcE", "idx_gas_load_t1 idx_dc_unit_t2", indices(1, 0), indices(15, 0), 0.40, 750.0),
-        ("DcE2Hydro", "idx_dc_load_t1 idx_h2_unit_t2", indices(17, 1), indices(2, 0), 0.75, 750.0),
+        ("DcE2Hydro", "idx_dc_load_t1 idx_h2_unit_t2", indices(17, dc_hydro_group), indices(2, 0), 0.75, 750.0),
         ("Steam2AcE", "idx_steam_load_t1 idx_ac_unit_t2", indices(1, 0), indices(5, 0), 0.35, 857.1428571428571),
         ("Gas2AcE", "idx_gas_load_t1 idx_ac_unit_t2", indices(1, 1), indices(5, 1), 0.40, 750.0),
         ("Hydro2AcE", "idx_h2_load_t1 idx_ac_unit_t2", indices(1, 0), indices(5, 2), 0.55, 545.4545454545455),
         ("Hydro2DcE", "idx_h2_load_t1 idx_dc_unit_t2", indices(1, 1), indices(15, 1), 0.55, 545.4545454545455),
-        ("AcE2Heat", "idx_ac_load_t1 idx_heat_unit_t2", indices(8, 0), indices(2, 1), 0.94, 940.0),
-        ("AcE2Hydro", "idx_ac_load_t1 idx_h2_unit_t2", indices(8, 1), indices(2, 1), 0.72, 720.0),
+        ("AcE2Heat", "idx_ac_load_t1 idx_heat_unit_t2", indices(8, 0), indices(2, ac_heat_group), 0.94, 940.0),
+        )
+    )
+    if include_heat2:
+        specifications.append(
+            (
+                "AcE2Heat2",
+                "idx_ac_load_t1 idx_heat_unit_t2",
+                indices(8, 1),
+                indices(2, 3),
+                0.94,
+                940.0,
+            )
+        )
+    specifications.extend(
+        (
+        ("AcE2Hydro", "idx_ac_load_t1 idx_h2_unit_t2", indices(8, ac_hydro_group), indices(2, 1), 0.72, 720.0),
         ("Steam2DcE", "idx_steam_load_t1 idx_dc_unit_t2", indices(1, 1), indices(15, 2), 0.35, 857.1428571428571),
-        ("Gas2Heat", "idx_gas_load_t1 idx_heat_unit_t2", indices(1, 2), indices(2, 2), 0.90, 750.0),
+        ("Gas2Heat", "idx_gas_load_t1 idx_heat_unit_t2", indices(1, 2), indices(2, gas_heat_group), 0.90, 750.0),
+        )
     )
     blocks = []
     for table_name, endpoint_header, t1_indices, t2_indices, efficiency, factor in specifications:
-        if table_name in {"AcE2Heat", "DcE2Heat"}:
+        if table_name.startswith(("AcE2Heat", "DcE2Heat")):
             coefficient_field = "e2h_coeff"
             default_control = "P"
         elif table_name in {"AcE2Hydro", "DcE2Hydro"}:
@@ -263,7 +350,7 @@ def _coupling_blocks(couplings_per_type: int) -> str:
         if coefficient_field:
             alternate_control = (
                 "T_OUT"
-                if table_name in {"AcE2Heat", "DcE2Heat", "Gas2Heat"}
+                if table_name.startswith(("AcE2Heat", "DcE2Heat")) or table_name == "Gas2Heat"
                 else "P"
                 if default_control == "FLOW"
                 else "FLOW"
@@ -327,13 +414,19 @@ def _validated_node_counts(node_counts: dict[str, int]) -> dict[str, int]:
     return counts
 
 
-def _validate_case_capacity(node_counts: dict[str, int], couplings_per_type: int) -> None:
+def _validate_case_capacity(
+    node_counts: dict[str, int],
+    couplings_per_type: int,
+    *,
+    include_heat2: bool = False,
+) -> None:
     count = int(couplings_per_type)
     if count < 1:
         raise ValueError("couplings_per_type must be positive")
+    electric_load_groups = 3 if include_heat2 else 2
     minimums = {
-        "ac": 59 + 3 * count,
-        "dc": 89 + 3 * count,
+        "ac": max(39 + electric_load_groups * count, 59 + 3 * count),
+        "dc": max(69 + electric_load_groups * count, 89 + 3 * count),
         "heat": 2 * max(2, node_counts["heat"] // 4) + 5 + 3 * count,
         "gas": 6 * count,
         "hydro": max(4 * count, node_counts["hydro"] // 2 + 24 + 2 * count),
@@ -346,16 +439,34 @@ def _validate_case_capacity(node_counts: dict[str, int], couplings_per_type: int
     }
     if insufficient:
         raise ValueError(f"node counts are too small for coupling endpoints: {insufficient}")
+    if include_heat2:
+        supply_count = max(2, node_counts["heat"] // 4)
+        explicit_leaf_count = supply_count - supply_count // 2
+        if explicit_leaf_count < 2 * count:
+            raise ValueError(
+                "insufficient explicit heat supply/return leaf pairs for Heat2 sources: "
+                f"need {2 * count}, got {explicit_leaf_count}"
+            )
 
 
 def build_case_text(
     node_counts: dict[str, int] | None = None,
     couplings_per_type: int = COUPLINGS_PER_TYPE,
+    *,
+    include_heat2: bool = False,
 ) -> str:
     counts = _validated_node_counts(NODE_COUNTS if node_counts is None else node_counts)
-    _validate_case_capacity(counts, couplings_per_type)
+    _validate_case_capacity(
+        counts,
+        couplings_per_type,
+        include_heat2=include_heat2,
+    )
     electric = _extended_case_text(counts["ac"], counts["dc"])
-    electric = _add_coupling_electric_devices(electric, couplings_per_type)
+    electric = _add_coupling_electric_devices(
+        electric,
+        couplings_per_type,
+        include_heat2=include_heat2,
+    )
     fluid = (
         _generate_heat_case(counts["heat"]),
         _generate_compressible_case("gas", counts["gas"]),
@@ -364,8 +475,21 @@ def build_case_text(
     )
     model = "\n\n".join((electric, *fluid))
     model = _scale_coupled_fluid_loads(model, couplings_per_type)
-    model = _add_coupling_fluid_sources(model, counts, couplings_per_type)
-    return "\n\n".join((model, _coupling_blocks(couplings_per_type))).rstrip() + "\n"
+    model = _add_coupling_fluid_sources(
+        model,
+        counts,
+        couplings_per_type,
+        include_heat2=include_heat2,
+    )
+    return "\n\n".join(
+        (
+            model,
+            _coupling_blocks(
+                couplings_per_type,
+                include_heat2=include_heat2,
+            ),
+        )
+    ).rstrip() + "\n"
 
 
 def _populate_measurements(
@@ -430,13 +554,18 @@ def generate_case(
     node_counts: dict[str, int] | None = None,
     couplings_per_type: int = COUPLINGS_PER_TYPE,
     measurement_prefix: str = "multi_energy_1k",
+    include_heat2: bool = False,
 ) -> tuple[Path, Path, dict[str, object]]:
     model_path = Path(model_path)
     measurement_path = Path(measurement_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     measurement_path.parent.mkdir(parents=True, exist_ok=True)
     model_path.write_text(
-        build_case_text(node_counts, couplings_per_type),
+        build_case_text(
+            node_counts,
+            couplings_per_type,
+            include_heat2=include_heat2,
+        ),
         encoding="utf-8",
         newline="\n",
     )

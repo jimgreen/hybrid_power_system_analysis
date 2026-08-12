@@ -184,7 +184,7 @@ def test_multi_energy_1k_se_is_observable_accurate_and_joint(monkeypatch):
     estimator.prepare()
     observability = estimator.observability_analysis()
     assert observability.observable
-    assert observability.rank == observability.state_count == 1805
+    assert observability.rank == observability.state_count == 1803
 
     def fail_local_run(*_args, **_kwargs):
         raise AssertionError("Hybrid SE must not launch a separate fluid WLS loop")

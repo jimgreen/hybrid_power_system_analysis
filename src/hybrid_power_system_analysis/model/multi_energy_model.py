@@ -43,7 +43,7 @@ _DOMAIN_ALIASES = {
 }
 _COUPLING_TABLE_RE = re.compile(
     r"^(AcE|DcE|Heat|Gas|Hydro|H2|Hydrogen|Steam)2"
-    r"(AcE|DcE|Heat|Gas|Hydro|H2|Hydrogen|Steam)$",
+    r"(AcE|DcE|Heat|Gas|Hydro|H2|Hydrogen|Steam)(?:\d+)?$",
     re.IGNORECASE,
 )
 

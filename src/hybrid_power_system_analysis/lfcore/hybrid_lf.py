@@ -1258,6 +1258,11 @@ class HybridPowerFlowCalc:
                 and int(device.idx) == int(terminal.device_idx)
             ]
         if not positions:
+            if (device_type, int(terminal.device_idx)) in calc.excluded_device_keys:
+                return None, (
+                    f"{device_type} idx={terminal.device_idx} was excluded with a "
+                    "zero-flow heat hydraulic island before global load flow"
+                )
             return None, f"missing {device_type} idx={terminal.device_idx}"
         device_pos = int(positions[0])
         if is_load:
@@ -3991,6 +3996,9 @@ class HybridPowerFlowCalc:
                 "residual": float(calc.normF),
                 "nodes": len(calc.network.nodes),
                 "edges": len(calc.network.edges),
+                "dead_islands": len(
+                    calc.hydraulic_presolve.get("dead_island_ids", ())
+                ),
             }
             for name, calc in self.fluid_calcs.items()
         }
@@ -4031,6 +4039,8 @@ class HybridPowerFlowCalc:
         def bounded_candidate(candidate):
             candidate = np.asarray(candidate, dtype=np.float64).copy()
             for name, calc in self.fluid_calcs.items():
+                if calc.total_vars == 0:
+                    continue
                 count = int(calc.network.free_node_pos.size)
                 if count:
                     state_slice = self.fluid_state_slices[name]

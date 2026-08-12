@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 import sys
 
 import numpy as np
@@ -27,12 +27,17 @@ from model.fluid_model import (
     PRESSURE_CONTROL,
     RATIO_CONTROL,
     FluidNetwork,
+    FluidStorage,
 )
+
+
+THERMAL_ZERO_FLOW_TOLERANCE = 1.0e-10
 
 
 @dataclass
 class FluidLFResult:
     arrays: Dict[str, np.ndarray] = field(default_factory=dict)
+    metadata: Dict[str, object] = field(default_factory=dict)
     nodes: Dict[str, SimpleNamespace] = field(default_factory=dict)
     pipes: Dict[str, SimpleNamespace] = field(default_factory=dict)
     valves: Dict[str, SimpleNamespace] = field(default_factory=dict)
@@ -94,6 +99,313 @@ class FluidPowerFlowCalc:
         self.enthalpy = np.empty(0, dtype=np.float64)
         self.temperature = np.empty(0, dtype=np.float64)
         self.lf_result = self.result_class()
+        self.failure_reason = ""
+        self.hydraulic_presolve: Dict[str, object] = {}
+        self.excluded_device_keys: set[tuple[str, int]] = set()
+        self.thermal_zero_flow_edge_pos = np.empty(0, dtype=np.int64)
+
+    def _transport_flow_tolerance(self) -> float:
+        return THERMAL_ZERO_FLOW_TOLERANCE if self.network.thermal else 1.0e-12
+
+    def _active_transport_flow(self, flow: float) -> bool:
+        """Return whether a hydraulic flow has a defined thermal direction."""
+        return abs(float(flow)) > self._transport_flow_tolerance()
+
+    def _zero_flow_thermal_edges(self, edge_flow: np.ndarray) -> np.ndarray:
+        return np.flatnonzero(
+            np.abs(np.asarray(edge_flow, dtype=np.float64))
+            <= THERMAL_ZERO_FLOW_TOLERANCE
+        ).astype(np.int64)
+
+    def _configure_state_layout(self) -> None:
+        net = self.network
+        n_pressure_group = int(net.pressure_source_group_nodes.size) if net.thermal else 0
+        self.base_pressure_source_group_flow = (
+            net.free_node_pos.size + net.regulated_edge_pos.size
+        )
+        self.hydraulic_state_count = self.base_pressure_source_group_flow + n_pressure_group
+        self.base_temperature = self.hydraulic_state_count
+        self.base_enthalpy = self.base_temperature + (
+            int(net.temperature_state_count) if net.thermal else 0
+        )
+        self.total_vars = self.base_enthalpy + (len(net.nodes) if net.steam else 0)
+        self.total_eq = self.total_vars
+
+    def _initial_hydraulic_state(self) -> np.ndarray:
+        net = self.network
+        potential = net.initial_potential()
+        state = np.empty(self.hydraulic_state_count, dtype=np.float64)
+        state[: net.free_node_pos.size] = potential[net.free_node_pos]
+        if net.regulated_edge_pos.size:
+            state[
+                net.free_node_pos.size : self.base_pressure_source_group_flow
+            ] = net.edge_flow_set[net.regulated_edge_pos]
+        if net.thermal and net.pressure_source_group_nodes.size:
+            state[
+                self.base_pressure_source_group_flow : self.hydraulic_state_count
+            ] = self._initial_pressure_source_group_flows()
+        return state
+
+    def _solve_hydraulic_initial_state(self) -> tuple[np.ndarray, dict]:
+        state = self._initial_hydraulic_state()
+        minimum = self._minimum_potential()
+        converged = False
+        norm = np.inf
+        failure_reason = ""
+        iterations = 0
+        potential = self.network.initial_potential()
+        edge_flow = np.zeros(len(self.network.edges), dtype=np.float64)
+        for iteration in range(1, self.max_iter + 1):
+            residual, jacobian, potential, edge_flow = self._hydraulic_residual_and_jacobian(state)
+            iterations = iteration
+            norm = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+            if norm < self.tol:
+                converged = True
+                break
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", MatrixRankWarning)
+                    correction = np.asarray(spsolve(csc_matrix(jacobian), -residual), dtype=np.float64)
+            except (MatrixRankWarning, RuntimeError, ValueError) as exc:
+                failure_reason = str(exc)
+                break
+            if not np.all(np.isfinite(correction)):
+                failure_reason = "non-finite hydraulic Newton correction"
+                break
+            accepted = False
+            step = 1.0
+            for _ in range(24):
+                candidate = state + step * correction
+                if self.network.free_node_pos.size:
+                    candidate[: self.network.free_node_pos.size] = np.maximum(
+                        candidate[: self.network.free_node_pos.size], minimum
+                    )
+                candidate_residual = self._hydraulic_residual_and_jacobian(
+                    candidate,
+                    return_jacobian=False,
+                )[0]
+                candidate_norm = (
+                    float(np.linalg.norm(candidate_residual, np.inf))
+                    if candidate_residual.size
+                    else 0.0
+                )
+                if np.isfinite(candidate_norm) and candidate_norm < norm:
+                    state = candidate
+                    accepted = True
+                    break
+                step *= 0.5
+            if not accepted:
+                failure_reason = "hydraulic line search could not reduce the residual"
+                break
+
+        residual, _jacobian, potential, edge_flow = self._hydraulic_residual_and_jacobian(
+            state,
+            return_jacobian=False,
+        )
+        norm = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+        converged = bool(norm < self.tol)
+        source_flow = self._source_flows(state, edge_flow)[0]
+        return state, {
+            "converged": converged,
+            "iterations": iterations,
+            "residual": norm,
+            "failure_reason": failure_reason,
+            "potential": potential,
+            "edge_flow": edge_flow,
+            "source_flow": source_flow,
+        }
+
+    @staticmethod
+    def _device_node_indices(item) -> tuple[int, ...]:
+        values = []
+        for field_name in (
+            "node",
+            "supply_node",
+            "return_node",
+            "i_node",
+            "j_node",
+            "primary_supply_node",
+            "primary_return_node",
+            "secondary_return_node",
+            "secondary_supply_node",
+        ):
+            value = getattr(item, field_name, None)
+            if value is not None:
+                values.append(int(value))
+        return tuple(dict.fromkeys(values))
+
+    def _classify_hydraulic_islands(
+        self,
+        edge_flow: np.ndarray,
+        source_flow: np.ndarray,
+        *,
+        flow_tolerance: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        net = self.network
+        activity = np.zeros(int(net.island_count), dtype=np.float64)
+
+        for edge_pos, flow in enumerate(edge_flow.tolist()):
+            island = int(net.node_island[int(net.edge_i[edge_pos])])
+            activity[island] = max(activity[island], abs(float(flow)))
+        for source_pos, flow in enumerate(source_flow.tolist()):
+            magnitude = abs(float(flow))
+            if str(net.source_control_type[source_pos]) != PRESSURE_CONTROL:
+                magnitude = max(
+                    magnitude,
+                    abs(float(net.source_flow_set[source_pos])),
+                )
+            for node_pos in (
+                int(net.source_supply_node_pos[source_pos]),
+                int(net.source_return_node_pos[source_pos]),
+            ):
+                island = int(net.node_island[node_pos])
+                activity[island] = max(activity[island], magnitude)
+        for load_pos, flow in enumerate(net.load_flow_set.tolist()):
+            for node_pos in (
+                int(net.load_supply_node_pos[load_pos]),
+                int(net.load_return_node_pos[load_pos]),
+            ):
+                island = int(net.node_island[node_pos])
+                activity[island] = max(activity[island], abs(float(flow)))
+        for exchanger_pos in range(int(net.exchanger_i.size)):
+            primary_magnitude = abs(float(net.exchanger_primary_flow[exchanger_pos]))
+            secondary_magnitude = abs(float(net.exchanger_secondary_flow[exchanger_pos]))
+            for node_pos in (
+                int(net.exchanger_primary_supply[exchanger_pos]),
+                int(net.exchanger_primary_return[exchanger_pos]),
+            ):
+                island = int(net.node_island[node_pos])
+                activity[island] = max(activity[island], primary_magnitude)
+            for node_pos in (
+                int(net.exchanger_secondary_return[exchanger_pos]),
+                int(net.exchanger_secondary_supply[exchanger_pos]),
+            ):
+                island = int(net.node_island[node_pos])
+                activity[island] = max(activity[island], secondary_magnitude)
+
+        active = np.flatnonzero(activity > flow_tolerance).astype(np.int64)
+        dead = np.flatnonzero(activity <= flow_tolerance).astype(np.int64)
+        return active, dead
+
+    def _excluded_thermal_devices(self, active_islands: Sequence[int]) -> list[dict]:
+        net = self.network
+        active_islands = set(np.asarray(active_islands, dtype=np.int64).tolist())
+
+        def touches_excluded_island(item) -> bool:
+            return any(
+                int(net.node_island[net.node_pos_by_idx[node_idx]]) not in active_islands
+                for node_idx in self._device_node_indices(item)
+            )
+
+        devices = []
+        collections = (
+            (
+                net.sources,
+                lambda item: f"{net.prefix}Storage"
+                if isinstance(item, FluidStorage)
+                else f"{net.prefix}Source",
+            ),
+            (net.loads, lambda _item: f"{net.prefix}Load"),
+            (net.pipes, lambda _item: f"{net.prefix}Pipe"),
+            (net.valves, lambda _item: f"{net.prefix}Valve"),
+            (
+                net.controllers,
+                lambda item: f"{net.prefix}{str(item.kind).replace('_', ' ').title().replace(' ', '')}",
+            ),
+            (net.heat_exchangers, lambda _item: "HeatExchanger"),
+        )
+        for collection, device_type_for in collections:
+            for item in collection:
+                if not touches_excluded_island(item):
+                    continue
+                device_type = str(device_type_for(item))
+                device_idx = int(item.idx)
+                self.excluded_device_keys.add((device_type, device_idx))
+                devices.append(
+                    {
+                        "device_type": device_type,
+                        "idx": device_idx,
+                        "name": str(item.name),
+                    }
+                )
+        return devices
+
+    def _compact_thermal_network(self, active_islands: Sequence[int]) -> None:
+        net = self.network
+        active_islands = np.asarray(active_islands, dtype=np.int64)
+        keep_nodes = np.isin(net.node_island, active_islands)
+        keep_node_indices = {
+            int(net.node_idx[pos]) for pos in np.flatnonzero(keep_nodes).tolist()
+        }
+
+        def device_is_active(item) -> bool:
+            nodes = self._device_node_indices(item)
+            return bool(nodes) and all(node in keep_node_indices for node in nodes)
+
+        net.nodes = [node for node in net.nodes if int(node.idx) in keep_node_indices]
+        net.sources = [item for item in net.sources if device_is_active(item)]
+        net.storages = [item for item in net.storages if device_is_active(item)]
+        net.loads = [item for item in net.loads if device_is_active(item)]
+        net.pipes = [item for item in net.pipes if device_is_active(item)]
+        net.valves = [item for item in net.valves if device_is_active(item)]
+        net.controllers = [item for item in net.controllers if device_is_active(item)]
+        net.heat_exchangers = [
+            item for item in net.heat_exchangers if device_is_active(item)
+        ]
+        net.prepared = False
+        net.prepare()
+
+    def _prepare_empty_thermal_block(self, metadata: dict) -> "FluidPowerFlowCalc":
+        self.network.nodes = []
+        self.network.sources = []
+        self.network.storages = []
+        self.network.loads = []
+        self.network.pipes = []
+        self.network.valves = []
+        self.network.controllers = []
+        self.network.heat_exchangers = []
+        self.network.edges = []
+        self.network.island_count = 0
+        self.network.node_island = np.empty(0, dtype=np.int32)
+        self.network.node_idx = np.empty(0, dtype=np.int64)
+        self.network.node_name = np.empty(0, dtype=object)
+        self.network.node_explicit_return = np.empty(0, dtype=bool)
+        self.network.source_name = np.empty(0, dtype=object)
+        self.network.source_is_storage = np.empty(0, dtype=bool)
+        self.network.storage_source_pos = np.empty(0, dtype=np.int64)
+        self.network.load_name = np.empty(0, dtype=object)
+        self.network.load_flow_set = np.empty(0, dtype=np.float64)
+        self.network.source_supply_node_pos = np.empty(0, dtype=np.int64)
+        self.network.source_return_node_pos = np.empty(0, dtype=np.int64)
+        self.network.load_supply_node_pos = np.empty(0, dtype=np.int64)
+        self.network.load_return_node_pos = np.empty(0, dtype=np.int64)
+        self.network.exchanger_i = np.empty(0, dtype=np.int64)
+        self.network.exchanger_j = np.empty(0, dtype=np.int64)
+        self.network.free_node_pos = np.empty(0, dtype=np.int64)
+        self.network.pressure_source_group_nodes = np.empty(0, dtype=np.int64)
+        self.hydraulic_state_count = 0
+        self.base_pressure_source_group_flow = 0
+        self.base_temperature = 0
+        self.base_enthalpy = 0
+        self.total_vars = 0
+        self.total_eq = 0
+        self.x = np.empty(0, dtype=np.float64)
+        self.potential = np.empty(0, dtype=np.float64)
+        self.pressure = np.empty(0, dtype=np.float64)
+        self.edge_flow = np.empty(0, dtype=np.float64)
+        self.source_flow = np.empty(0, dtype=np.float64)
+        self.pressure_source_group_flow = np.empty(0, dtype=np.float64)
+        self.heat_temperature_state = np.empty(0, dtype=np.float64)
+        self.supply_temperature = np.empty(0, dtype=np.float64)
+        self.return_temperature = np.empty(0, dtype=np.float64)
+        self.temperature = np.empty(0, dtype=np.float64)
+        self.enthalpy = np.empty(0, dtype=np.float64)
+        self.hydraulic_presolve = metadata
+        self.converged = True
+        self.iterations = 0
+        self.normF = 0.0
+        self.prepared = True
+        return self
 
     def _initial_pressure_source_group_flows(self) -> np.ndarray:
         """Balance each explicit-return supply island at the initial state."""
@@ -129,29 +441,122 @@ class FluidPowerFlowCalc:
         return initial
 
     def prepare(self) -> "FluidPowerFlowCalc":
+        if self.prepared:
+            return self
         net = self.network.prepare()
+        self._configure_state_layout()
+        hydraulic_initial = None
+        if net.thermal:
+            model_hydraulic_initial = self._initial_hydraulic_state()
+            original_island_count = int(net.island_count)
+            original_node_names = net.node_name.copy()
+            original_node_island = net.node_island.copy()
+            original_node_island_by_idx = {
+                int(node_idx): int(island)
+                for node_idx, island in zip(
+                    net.node_idx.tolist(),
+                    original_node_island.tolist(),
+                )
+            }
+            # This is a physical zero-flow test, independent of the Newton residual tolerance.
+            flow_tolerance = THERMAL_ZERO_FLOW_TOLERANCE
+            original_dead_islands: set[int] = set()
+            excluded_devices_by_key: Dict[tuple[str, int], dict] = {}
+            self.excluded_device_keys = set()
+            presolve_iterations = 0
+            presolve_passes = 0
+
+            while True:
+                hydraulic_initial, presolve = self._solve_hydraulic_initial_state()
+                presolve_passes += 1
+                presolve_iterations += int(presolve["iterations"])
+                if not presolve["converged"]:
+                    raise RuntimeError(
+                        "heat hydraulic initialization did not converge: "
+                        f"residual={presolve['residual']:.6e}; {presolve['failure_reason']}"
+                    )
+                active_islands, dead_islands = self._classify_hydraulic_islands(
+                    presolve["edge_flow"],
+                    presolve["source_flow"],
+                    flow_tolerance=flow_tolerance,
+                )
+                if dead_islands.size == 0:
+                    break
+
+                for node_pos in np.flatnonzero(
+                    np.isin(net.node_island, dead_islands)
+                ).tolist():
+                    original_dead_islands.add(
+                        original_node_island_by_idx[int(net.node_idx[node_pos])]
+                    )
+                for item in self._excluded_thermal_devices(active_islands):
+                    key = (str(item["device_type"]), int(item["idx"]))
+                    excluded_devices_by_key[key] = item
+                if active_islands.size == 0:
+                    break
+                self._compact_thermal_network(active_islands)
+                net = self.network
+                self._configure_state_layout()
+
+            dead_island_ids = sorted(original_dead_islands)
+            active_island_ids = sorted(
+                set(range(original_island_count)) - original_dead_islands
+            )
+            dead_node_names = original_node_names[
+                np.isin(original_node_island, dead_island_ids)
+            ].tolist()
+            self.thermal_zero_flow_edge_pos = self._zero_flow_thermal_edges(
+                presolve["edge_flow"]
+            )
+            metadata = {
+                "converged": True,
+                "iterations": presolve_iterations,
+                "passes": presolve_passes,
+                "residual": float(presolve["residual"]),
+                "flow_tolerance": float(flow_tolerance),
+                "original_island_count": original_island_count,
+                "active_island_ids": active_island_ids,
+                "dead_island_ids": dead_island_ids,
+                "dead_node_names": [str(name) for name in dead_node_names],
+                "excluded_devices": list(excluded_devices_by_key.values()),
+                "zero_flow_thermal_edge_positions": (
+                    self.thermal_zero_flow_edge_pos.tolist()
+                ),
+                "zero_flow_thermal_edge_names": [
+                    str(net.edge_name[pos])
+                    for pos in self.thermal_zero_flow_edge_pos.tolist()
+                ],
+                "initial_state_policy": (
+                    "presolved_after_dead_island_compaction"
+                    if dead_island_ids
+                    else "model"
+                ),
+                "presolved_state_used": bool(dead_island_ids),
+            }
+            if dead_island_ids:
+                warning = (
+                    f"excluded {len(dead_island_ids)} zero-flow heat hydraulic island(s) "
+                    f"before global load flow: islands={dead_island_ids}"
+                )
+                if not active_island_ids:
+                    if warning not in net.warnings:
+                        net.warnings.append(warning)
+                    return self._prepare_empty_thermal_block(metadata)
+                if warning not in net.warnings:
+                    net.warnings.append(warning)
+            else:
+                # The pre-solve is still required to classify every island.  With no
+                # topology reduction, retain the model state because it can follow a
+                # better path in the complete electric/fluid Newton problem.
+                hydraulic_initial = model_hydraulic_initial
+            self.hydraulic_presolve = metadata
+
         potential = net.initial_potential()
         n_pressure_group = int(net.pressure_source_group_nodes.size) if net.thermal else 0
-        self.base_pressure_source_group_flow = (
-            net.free_node_pos.size + net.regulated_edge_pos.size
-        )
-        self.hydraulic_state_count = self.base_pressure_source_group_flow + n_pressure_group
-        self.base_temperature = self.hydraulic_state_count
-        self.base_enthalpy = self.base_temperature + (
-            int(net.temperature_state_count) if net.thermal else 0
-        )
-        self.total_vars = self.base_enthalpy + (len(net.nodes) if net.steam else 0)
-        self.total_eq = self.total_vars
         x = np.empty(self.total_vars, dtype=np.float64)
-        x[: net.free_node_pos.size] = potential[net.free_node_pos]
-        if net.regulated_edge_pos.size:
-            x[
-                net.free_node_pos.size : self.base_pressure_source_group_flow
-            ] = net.edge_flow_set[net.regulated_edge_pos]
-        if n_pressure_group:
-            x[
-                self.base_pressure_source_group_flow : self.hydraulic_state_count
-            ] = self._initial_pressure_source_group_flows()
+        if hydraulic_initial is None:
+            hydraulic_initial = self._initial_hydraulic_state()
+        x[: self.hydraulic_state_count] = hydraulic_initial
         if net.thermal:
             x[self.base_temperature : self.base_enthalpy] = net.initial_temperature_state
         elif net.steam:
@@ -600,7 +1005,7 @@ class FluidPowerFlowCalc:
                 parent[right_root] = left_root
 
         for edge_pos, flow in enumerate(edge_flow.tolist()):
-            if abs(flow) <= 1e-12:
+            if not self._active_transport_flow(flow):
                 continue
             i = int(net.edge_i[edge_pos])
             j = int(net.edge_j[edge_pos])
@@ -619,7 +1024,10 @@ class FluidPowerFlowCalc:
 
         if net.thermal:
             for load_pos in range(len(net.loads)):
-                if float(net.load_flow_set[load_pos]) <= 1e-12:
+                if (
+                    float(net.load_flow_set[load_pos])
+                    <= THERMAL_ZERO_FLOW_TOLERANCE
+                ):
                     continue
                 union(
                     int(
@@ -635,8 +1043,10 @@ class FluidPowerFlowCalc:
                 )
             for exchanger_pos in range(int(net.exchanger_i.size)):
                 if (
-                    float(net.exchanger_primary_flow[exchanger_pos]) <= 1e-12
-                    or float(net.exchanger_secondary_flow[exchanger_pos]) <= 1e-12
+                    float(net.exchanger_primary_flow[exchanger_pos])
+                    <= THERMAL_ZERO_FLOW_TOLERANCE
+                    or float(net.exchanger_secondary_flow[exchanger_pos])
+                    <= THERMAL_ZERO_FLOW_TOLERANCE
                 ):
                     continue
                 states = (
@@ -673,7 +1083,7 @@ class FluidPowerFlowCalc:
     def _thermal_source_injection(self, source_pos: int, flow: float):
         """Return the thermal inlet represented by a signed source flow."""
         net = self.network
-        if flow > 1.0e-12:
+        if flow > THERMAL_ZERO_FLOW_TOLERANCE:
             node_pos = int(net.source_supply_node_pos[source_pos])
             state = int(net.supply_temperature_state_by_node[node_pos])
             return (
@@ -683,7 +1093,7 @@ class FluidPowerFlowCalc:
                 1.0,
             )
         if (
-            flow < -1.0e-12
+            flow < -THERMAL_ZERO_FLOW_TOLERANCE
             and bool(net.source_is_storage[source_pos])
             and bool(net.source_explicit_return[source_pos])
         ):
@@ -706,10 +1116,14 @@ class FluidPowerFlowCalc:
     ) -> list[np.ndarray]:
         """Find zero-flow pressure sources in transport components without a boundary."""
         labels = self._transport_state_components(edge_flow, incoming_mass.size)
-        anchored = set(labels[np.flatnonzero(incoming_mass <= 1e-12)].tolist())
+        anchored = set(
+            labels[
+                np.flatnonzero(incoming_mass <= THERMAL_ZERO_FLOW_TOLERANCE)
+            ].tolist()
+        )
         injection_state = source_state.copy()
         reverse_storage = (
-            (source_flow < -1.0e-12)
+            (source_flow < -THERMAL_ZERO_FLOW_TOLERANCE)
             & self.network.source_is_storage
             & self.network.source_explicit_return
         )
@@ -720,12 +1134,12 @@ class FluidPowerFlowCalc:
                 ]
             )
         injecting_sources = np.flatnonzero(
-            (source_flow > 1.0e-12) | reverse_storage
+            (source_flow > THERMAL_ZERO_FLOW_TOLERANCE) | reverse_storage
         )
         anchored.update(labels[injection_state[injecting_sources]].tolist())
         candidates = np.flatnonzero(
             (self.network.source_control_type == PRESSURE_CONTROL)
-            & (np.abs(source_flow) <= 1e-12)
+            & (np.abs(source_flow) <= THERMAL_ZERO_FLOW_TOLERANCE)
         )
         groups = []
         for label in np.unique(labels[source_state[candidates]]).tolist():
@@ -767,7 +1181,7 @@ class FluidPowerFlowCalc:
 
         def add_transport(edge_pos: int, upstream: int, downstream: int, flow: float) -> None:
             mass = abs(float(flow))
-            if mass <= 1e-12:
+            if not self._active_transport_flow(mass):
                 return
             loss = float(net.edge_heat_loss[edge_pos])
             attenuation = float(np.exp(-loss / max(mass, 1e-9)))
@@ -793,7 +1207,7 @@ class FluidPowerFlowCalc:
                 )
 
         for edge_pos, flow in enumerate(edge_flow.tolist()):
-            if abs(flow) <= 1e-12:
+            if not self._active_transport_flow(flow):
                 continue
             if flow > 0.0:
                 upstream_node = int(net.edge_i[edge_pos])
@@ -837,7 +1251,7 @@ class FluidPowerFlowCalc:
 
         for load_pos in range(len(net.loads)):
             mass = float(net.load_flow_set[load_pos])
-            if mass <= 1e-12:
+            if mass <= THERMAL_ZERO_FLOW_TOLERANCE:
                 continue
             supply_node = int(net.load_supply_node_pos[load_pos])
             return_node = int(net.load_return_node_pos[load_pos])
@@ -862,7 +1276,10 @@ class FluidPowerFlowCalc:
             ss = int(net.supply_temperature_state_by_node[secondary_supply])
             primary_mass = float(net.exchanger_primary_flow[exchanger_pos])
             secondary_mass = float(net.exchanger_secondary_flow[exchanger_pos])
-            if primary_mass <= 1e-12 or secondary_mass <= 1e-12:
+            if (
+                primary_mass <= THERMAL_ZERO_FLOW_TOLERANCE
+                or secondary_mass <= THERMAL_ZERO_FLOW_TOLERANCE
+            ):
                 continue
             incoming_mass[ss] += secondary_mass
             incoming_mass[pr] += primary_mass
@@ -921,7 +1338,7 @@ class FluidPowerFlowCalc:
                 add_temp(state, state, mass)
 
         for state_pos in range(count):
-            if incoming_mass[state_pos] > 1e-12:
+            if incoming_mass[state_pos] > THERMAL_ZERO_FLOW_TOLERANCE:
                 continue
             residual[state_pos] = temperature[state_pos] - net.initial_temperature_state[state_pos]
             add_temp(state_pos, state_pos, 1.0)
@@ -1076,6 +1493,10 @@ class FluidPowerFlowCalc:
         *,
         return_jacobian: bool = True,
     ):
+        if self.total_vars == 0 and self.total_eq == 0:
+            empty = np.empty(0, dtype=np.float64)
+            jacobian = csc_matrix((0, 0), dtype=np.float64) if return_jacobian else None
+            return empty, jacobian, empty, empty
         hydraulic_x = np.asarray(x[: self.hydraulic_state_count], dtype=np.float64)
         hydraulic_residual, hydraulic_jacobian, potential, edge_flow = (
             self._hydraulic_residual_and_jacobian(
@@ -1152,6 +1573,13 @@ class FluidPowerFlowCalc:
             self.result_mode = normalize_result_mode(result_mode, f"{self.network.prefix} LF")
         if not self.prepared:
             self.prepare()
+        if self.total_vars == 0 and self.total_eq == 0:
+            self.converged = True
+            self.iterations = 0
+            self.normF = 0.0
+            self.failure_reason = ""
+            self._write_back()
+            return 0
         self.converged = False
         self.iterations = 0
         x = self.x.copy()
@@ -1225,6 +1653,15 @@ class FluidPowerFlowCalc:
     ) -> None:
         """Write a state solved by either the local or global Newton loop."""
         state = np.asarray(x, dtype=np.float64).copy()
+        if self.total_vars == 0 and self.total_eq == 0:
+            self.x = state
+            self.normF = 0.0 if normF is None else float(normF)
+            if converged is not None:
+                self.converged = bool(converged)
+            if iterations is not None:
+                self.iterations = int(iterations)
+            self._write_back()
+            return
         residual, _jacobian, potential, edge_flow = self._residual_and_jacobian(
             state,
             return_jacobian=False,
@@ -1299,8 +1736,13 @@ class FluidPowerFlowCalc:
     def _edge_attenuation(self) -> np.ndarray:
         if not self.network.thermal and not self.network.steam:
             return np.ones(len(self.network.edges), dtype=np.float64)
-        mass = np.maximum(np.abs(self.edge_flow), 1e-9)
-        return np.exp(-self.network.edge_heat_loss / mass)
+        mass = np.abs(self.edge_flow)
+        attenuation = np.ones(mass.size, dtype=np.float64)
+        active = mass > self._transport_flow_tolerance()
+        attenuation[active] = np.exp(
+            -self.network.edge_heat_loss[active] / np.maximum(mass[active], 1e-9)
+        )
+        return attenuation
 
     def _solve_heat_temperatures(self) -> None:
         net = self.network
@@ -1331,7 +1773,7 @@ class FluidPowerFlowCalc:
             rhs[downstream_state] += mass * (1.0 - factor) * ambient
 
         for edge_pos, flow in enumerate(self.edge_flow.tolist()):
-            if abs(flow) <= 1e-12:
+            if not self._active_transport_flow(flow):
                 continue
             if flow > 0.0:
                 upstream, downstream = int(net.edge_i[edge_pos]), int(net.edge_j[edge_pos])
@@ -1368,7 +1810,7 @@ class FluidPowerFlowCalc:
             rhs[state] += mass * temperature_set
         for load_pos in range(len(net.loads)):
             mass = float(net.load_flow_set[load_pos])
-            if mass <= 1e-12:
+            if mass <= THERMAL_ZERO_FLOW_TOLERANCE:
                 continue
             supply_node = int(net.load_supply_node_pos[load_pos])
             return_node = int(net.load_return_node_pos[load_pos])
@@ -1397,7 +1839,10 @@ class FluidPowerFlowCalc:
             )
             primary_mass = float(net.exchanger_primary_flow[exchanger_pos])
             secondary_mass = float(net.exchanger_secondary_flow[exchanger_pos])
-            if primary_mass <= 1e-12 or secondary_mass <= 1e-12:
+            if (
+                primary_mass <= THERMAL_ZERO_FLOW_TOLERANCE
+                or secondary_mass <= THERMAL_ZERO_FLOW_TOLERANCE
+            ):
                 continue
             control = str(net.exchanger_control_type[exchanger_pos])
             loss_factor = 1.0 - float(net.exchanger_heat_loss[exchanger_pos])
@@ -1433,7 +1878,7 @@ class FluidPowerFlowCalc:
                 rhs[primary_return_state] -= primary_heat / cp
 
         for state_pos in range(n_temperature):
-            if incoming_mass[state_pos] <= 1e-12:
+            if incoming_mass[state_pos] <= THERMAL_ZERO_FLOW_TOLERANCE:
                 add(state_pos, state_pos, 1.0)
                 rhs[state_pos] = net.initial_temperature_state[state_pos]
             else:
@@ -1465,8 +1910,17 @@ class FluidPowerFlowCalc:
         for pos in range(count):
             i = int(net.exchanger_i[pos])
             j = int(net.exchanger_j[pos])
-            primary_mass = max(float(net.exchanger_primary_flow[pos]), 1e-12)
-            secondary_mass = max(float(net.exchanger_secondary_flow[pos]), 1e-12)
+            primary_mass = float(net.exchanger_primary_flow[pos])
+            secondary_mass = float(net.exchanger_secondary_flow[pos])
+            if (
+                primary_mass <= THERMAL_ZERO_FLOW_TOLERANCE
+                or secondary_mass <= THERMAL_ZERO_FLOW_TOLERANCE
+            ):
+                primary_return = int(net.exchanger_primary_return[pos])
+                secondary_supply = int(net.exchanger_secondary_supply[pos])
+                primary_out[pos] = self.return_temperature[primary_return]
+                secondary_out[pos] = self.supply_temperature[secondary_supply]
+                continue
             if str(net.exchanger_control_type[pos]) == "EFFECTIVENESS":
                 primary_heat[pos] = (
                     net.exchanger_effectiveness[pos]
@@ -1549,6 +2003,9 @@ class FluidPowerFlowCalc:
             "load_flow": net.load_flow_set.copy(),
         }
         if net.thermal:
+            arrays["edge_thermal_active"] = (
+                np.abs(self.edge_flow) > THERMAL_ZERO_FLOW_TOLERANCE
+            )
             arrays["node_supply_temperature"] = self.supply_temperature.copy()
             arrays["node_return_temperature"] = self.return_temperature.copy()
             arrays["node_temperature"] = self.temperature.copy()
@@ -1576,7 +2033,12 @@ class FluidPowerFlowCalc:
                 arrays["exchanger_secondary_heat"] = secondary_heat
                 arrays["exchanger_primary_out_temperature"] = primary_out
                 arrays["exchanger_secondary_out_temperature"] = secondary_out
-        result = self.result_class(arrays=arrays)
+        metadata = (
+            {"hydraulic_presolve": dict(self.hydraulic_presolve)}
+            if self.hydraulic_presolve
+            else {}
+        )
+        result = self.result_class(arrays=arrays, metadata=metadata)
         if self.result_mode in {"none", "array", "summary"}:
             self.lf_result = result
             return
@@ -1607,9 +2069,14 @@ class FluidPowerFlowCalc:
             }
             if net.thermal:
                 flow = float(self.edge_flow[edge_pos])
+                thermal_active = self._active_transport_flow(flow)
+                values["thermal_active"] = thermal_active
                 factor = float(attenuation[edge_pos])
                 if net.node_explicit_return[i]:
-                    if flow >= 0.0:
+                    if not thermal_active:
+                        i_temperature = self.temperature[i]
+                        j_temperature = self.temperature[j]
+                    elif flow > 0.0:
                         i_temperature = self.temperature[i]
                         j_temperature = net.medium.ambient_temperature + (
                             self.temperature[i] - net.medium.ambient_temperature
@@ -1624,7 +2091,12 @@ class FluidPowerFlowCalc:
                         j_temperature=float(j_temperature),
                     )
                 else:
-                    if flow >= 0.0:
+                    if not thermal_active:
+                        i_supply = self.supply_temperature[i]
+                        j_supply = self.supply_temperature[j]
+                        i_return = self.return_temperature[i]
+                        j_return = self.return_temperature[j]
+                    elif flow > 0.0:
                         i_supply = self.supply_temperature[i]
                         j_supply = net.medium.ambient_temperature + (
                             self.supply_temperature[i] - net.medium.ambient_temperature
@@ -1721,6 +2193,12 @@ class FluidPowerFlowCalc:
                     secondary_out_temperature=float(secondary_out[pos]),
                     primary_heat=float(primary_heat[pos]),
                     secondary_heat=float(secondary_heat[pos]),
+                    thermal_active=bool(
+                        net.exchanger_primary_flow[pos]
+                        > THERMAL_ZERO_FLOW_TOLERANCE
+                        and net.exchanger_secondary_flow[pos]
+                        > THERMAL_ZERO_FLOW_TOLERANCE
+                    ),
                 )
         self.lf_result = result
 

@@ -711,6 +711,8 @@ class _MultiEnergySECouplingPlan:
     controlled_setpoint: float = 0.0
     controlled_measurement_rows: Tuple[int, ...] = ()
     dependent_measurement_rows: Tuple[int, ...] = ()
+    heat_supply_measurement_rows: Tuple[int, ...] = ()
+    heat_power_measurement_rows: Tuple[int, ...] = ()
     electric_setpoint: float = 0.0
     gas_setpoint: float = 0.0
     return_temperature_col: int = -1
@@ -1406,6 +1408,7 @@ class HybridStateEstimator:
     def _multi_energy_endpoint_measurement_rows(
         self,
         endpoint: _MultiEnergySEEndpoint,
+        meas_type_code: Optional[int] = None,
     ) -> Tuple[int, ...]:
         if endpoint.provider == "electric":
             measurements = self.active_measurements
@@ -1416,7 +1419,14 @@ class HybridStateEstimator:
         table = measurements.table
         mask = (
             (np.asarray(table.device_type_code, dtype=np.int64) == endpoint.device_type_code)
-            & (np.asarray(table.meas_type_code, dtype=np.int64) == endpoint.meas_type_code)
+            & (
+                np.asarray(table.meas_type_code, dtype=np.int64)
+                == (
+                    endpoint.meas_type_code
+                    if meas_type_code is None
+                    else int(meas_type_code)
+                )
+            )
             & (np.asarray(table.device_pos, dtype=np.int64) == endpoint.device_pos)
         )
         return tuple(
@@ -1843,6 +1853,35 @@ class HybridStateEstimator:
             initial_state,
             with_jacobian=True,
         )
+
+        def direct_endpoint_state_col(endpoint: _MultiEnergySEEndpoint) -> int:
+            """Return the existing state column for an identity endpoint row."""
+            endpoint_row = endpoint_jacobians[endpoint.provider].getrow(endpoint.row)
+            if endpoint_row.nnz != 1 or not np.isclose(
+                endpoint_row.data[0],
+                1.0,
+                rtol=0.0,
+                atol=1.0e-12,
+            ):
+                return -1
+            state_slice = (
+                self.electric_state_slice
+                if endpoint.provider == "electric"
+                else self.fluid_state_slices[endpoint.provider]
+            )
+            state_col = state_slice.start + int(endpoint_row.indices[0])
+            endpoint_value = float(endpoint_values[endpoint.provider][endpoint.row])
+            return (
+                state_col
+                if np.isclose(
+                    initial_state[state_col],
+                    endpoint_value,
+                    rtol=1.0e-10,
+                    atol=1.0e-12,
+                )
+                else -1
+            )
+
         local_weight_max = 1.0
         for table in self._multi_energy_local_measurement_tables():
             if table.weight.size:
@@ -1888,13 +1927,28 @@ class HybridStateEstimator:
                     abs(item.electric_setpoint * item.power_scale * coefficient),
                     abs(source_flow * item.heat_capacity * thermal_gap),
                 )
-                control_col = self.multi_energy_state_count + len(control_initial)
-                control_initial.append(float(dependent_setpoint))
+                control_col = (
+                    direct_endpoint_state_col(item.dependent)
+                    if coupling.control_type == "T_OUT"
+                    else -1
+                )
+                if control_col < 0:
+                    control_col = self.multi_energy_state_count + len(control_initial)
+                    control_initial.append(float(dependent_setpoint))
                 controlled_measurement_rows = (
                     self._multi_energy_endpoint_measurement_rows(item.controlled)
                 )
                 dependent_measurement_rows = (
                     self._multi_energy_endpoint_measurement_rows(item.dependent)
+                )
+                heat_supply_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(item.heat_temperature)
+                )
+                heat_power_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(
+                        item.heat_flow,
+                        MEAS_TYPE_CODES["HEAT"],
+                    )
                 )
                 prior_measurement_row = -1
                 if not dependent_measurement_rows:
@@ -1936,6 +1990,8 @@ class HybridStateEstimator:
                         controlled_setpoint=float(item.controlled_setpoint),
                         controlled_measurement_rows=controlled_measurement_rows,
                         dependent_measurement_rows=dependent_measurement_rows,
+                        heat_supply_measurement_rows=heat_supply_measurement_rows,
+                        heat_power_measurement_rows=heat_power_measurement_rows,
                         return_temperature_col=item.return_temperature_col,
                         supply_temperature_set=item.supply_temperature_set,
                         heat_capacity=item.heat_capacity,
@@ -1976,13 +2032,28 @@ class HybridStateEstimator:
                     abs(item.gas_setpoint * coefficient),
                     abs(heat_flow * item.heat_capacity * thermal_gap),
                 )
-                control_col = self.multi_energy_state_count + len(control_initial)
-                control_initial.append(float(dependent_setpoint))
+                control_col = (
+                    direct_endpoint_state_col(item.dependent)
+                    if coupling.control_type == "T_OUT"
+                    else -1
+                )
+                if control_col < 0:
+                    control_col = self.multi_energy_state_count + len(control_initial)
+                    control_initial.append(float(dependent_setpoint))
                 controlled_measurement_rows = (
                     self._multi_energy_endpoint_measurement_rows(item.controlled)
                 )
                 dependent_measurement_rows = (
                     self._multi_energy_endpoint_measurement_rows(item.dependent)
+                )
+                heat_supply_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(item.heat_temperature)
+                )
+                heat_power_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(
+                        item.heat_flow,
+                        MEAS_TYPE_CODES["HEAT"],
+                    )
                 )
                 prior_measurement_row = -1
                 if not dependent_measurement_rows:
@@ -2024,6 +2095,8 @@ class HybridStateEstimator:
                         controlled_setpoint=float(item.controlled_setpoint),
                         controlled_measurement_rows=controlled_measurement_rows,
                         dependent_measurement_rows=dependent_measurement_rows,
+                        heat_supply_measurement_rows=heat_supply_measurement_rows,
+                        heat_power_measurement_rows=heat_power_measurement_rows,
                         return_temperature_col=item.return_temperature_col,
                         supply_temperature_set=item.supply_temperature_set,
                         heat_capacity=item.heat_capacity,
@@ -2239,6 +2312,16 @@ class HybridStateEstimator:
                     controlled_setpoint=item.controlled_setpoint,
                     controlled_measurement_rows=item.controlled_measurement_rows,
                     dependent_measurement_rows=item.dependent_measurement_rows,
+                    heat_supply_measurement_rows=getattr(
+                        item,
+                        "heat_supply_measurement_rows",
+                        (),
+                    ),
+                    heat_power_measurement_rows=getattr(
+                        item,
+                        "heat_power_measurement_rows",
+                        (),
+                    ),
                     electric_setpoint=item.electric_setpoint,
                     gas_setpoint=item.gas_setpoint,
                     return_temperature_col=item.return_temperature_col,
@@ -2298,7 +2381,9 @@ class HybridStateEstimator:
             f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:"
             f"{'TEMPERATURE' if (plan.electric_heat and plan.coupling.control_type == 'P') or (plan.gas_heat and plan.coupling.control_type == 'FLOW') else 'POWER' if plan.electric_heat else 'GAS_FLOW' if plan.gas_heat else 'DEPENDENT' if plan.hydrogen_electric or plan.gas_electric or plan.steam_electric else 'T1_CONTROL'}"
             for plan in self.multi_energy_se_coupling_plans
-            if plan.control_col >= 0
+            if self.multi_energy_coupling_state_slice.start
+            <= plan.control_col
+            < self.multi_energy_coupling_state_slice.stop
         ]
         self._multi_energy_observability_cache = None
 
@@ -2400,6 +2485,18 @@ class HybridStateEstimator:
                 else:
                     electric_power = dependent_value
                     t_out = plan.supply_temperature_set
+                if plan.heat_supply_measurement_rows:
+                    values[
+                        np.asarray(plan.heat_supply_measurement_rows, dtype=np.int64)
+                    ] = t_out
+                if plan.heat_power_measurement_rows:
+                    values[
+                        np.asarray(plan.heat_power_measurement_rows, dtype=np.int64)
+                    ] = (
+                        source_flow
+                        * plan.heat_capacity
+                        * (t_out - t_return)
+                    )
                 if plan.controlled_measurement_rows:
                     values[np.asarray(plan.controlled_measurement_rows, dtype=np.int64)] = (
                         plan.controlled_setpoint
@@ -2432,6 +2529,18 @@ class HybridStateEstimator:
                 else:
                     gas_flow = dependent_value
                     t_out = plan.supply_temperature_set
+                if plan.heat_supply_measurement_rows:
+                    values[
+                        np.asarray(plan.heat_supply_measurement_rows, dtype=np.int64)
+                    ] = t_out
+                if plan.heat_power_measurement_rows:
+                    values[
+                        np.asarray(plan.heat_power_measurement_rows, dtype=np.int64)
+                    ] = (
+                        heat_flow
+                        * plan.heat_capacity
+                        * (t_out - t_return)
+                    )
                 if plan.controlled_measurement_rows:
                     values[np.asarray(plan.controlled_measurement_rows, dtype=np.int64)] = (
                         plan.controlled_setpoint
@@ -2592,6 +2701,53 @@ class HybridStateEstimator:
             state,
             with_jacobian=True,
         )
+        if any(
+            plan.heat_power_measurement_rows
+            for plan in self.multi_energy_se_coupling_plans
+        ):
+            local_jacobian = local_jacobian.tolil()
+            for plan in self.multi_energy_se_coupling_plans:
+                if not plan.heat_power_measurement_rows:
+                    continue
+                source_flow = float(
+                    endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
+                )
+                t_return = float(state[plan.return_temperature_col])
+                variable_outlet = (
+                    plan.electric_heat and plan.coupling.control_type == "P"
+                ) or (
+                    plan.gas_heat and plan.coupling.control_type == "FLOW"
+                )
+                t_out = (
+                    float(state[plan.control_col])
+                    if variable_outlet
+                    else plan.supply_temperature_set
+                )
+                flow_row = endpoint_jacobians[plan.heat_flow.provider].getrow(
+                    plan.heat_flow.row
+                )
+                flow_slice = self.fluid_state_slices[plan.heat_flow.provider]
+                flow_start, flow_stop = flow_row.indptr[0], flow_row.indptr[1]
+                flow_cols = (
+                    flow_slice.start + flow_row.indices[flow_start:flow_stop]
+                ).tolist()
+                flow_data = (
+                    plan.heat_capacity
+                    * (t_out - t_return)
+                    * flow_row.data[flow_start:flow_stop]
+                ).tolist()
+                for row in plan.heat_power_measurement_rows:
+                    cols = [*flow_cols, plan.return_temperature_col]
+                    row_data = [
+                        *flow_data,
+                        -source_flow * plan.heat_capacity,
+                    ]
+                    if variable_outlet:
+                        cols.append(plan.control_col)
+                        row_data.append(source_flow * plan.heat_capacity)
+                    local_jacobian.rows[row] = cols
+                    local_jacobian.data[row] = row_data
+            local_jacobian = local_jacobian.tocsr()
         rows: List[int] = []
         cols: List[int] = []
         data: List[float] = []

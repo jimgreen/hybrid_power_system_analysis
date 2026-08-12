@@ -303,7 +303,7 @@ def _build_direct_electric_heat_case(
         ),
     ]
     electric_text = model_parts[0]
-    if table_name == "AcE2Heat":
+    if table_name.startswith("AcE2Heat"):
         electric_text, count = re.subn(
             r"(#\s+1\s+load_3\s+4\s+)1\.0",
             r"\g<1>100.0",
@@ -331,7 +331,11 @@ def _build_direct_electric_heat_case(
 """,
     )
     model_parts[1] = heat_text
-    endpoint_field = "idx_ac_load_t1" if table_name == "AcE2Heat" else "idx_dc_load_t1"
+    endpoint_field = (
+        "idx_ac_load_t1"
+        if table_name.startswith("AcE2Heat")
+        else "idx_dc_load_t1"
+    )
     coupling = f"""
 <{table_name}>
 @ idx name run_stat control_type {endpoint_field} idx_heat_unit_t2 e2h_coeff
@@ -430,7 +434,7 @@ def _build_direct_electric_heat_storage_case(
 </HeatStorage>
 """
     electric_field = (
-        "idx_ac_load_t1" if table_name == "AcE2Heat" else "idx_dc_load_t1"
+        "idx_ac_load_t1" if table_name.startswith("AcE2Heat") else "idx_dc_load_t1"
     )
     text = _replace_model_block(
         text,
@@ -443,10 +447,36 @@ def _build_direct_electric_heat_storage_case(
 """,
     )
     case_file.write_text(text, encoding="utf8")
+    measurement_text = meas_file.read_text(encoding="utf8")
+    measurement_rows = _measurement_rows(meas_file)
+    storage_measurements = (
+        ("storage_flow", "FLOW", 0.2),
+        ("storage_t_supply", "T_SUPPLY", 85.0),
+        ("storage_t_return", "T_RETURN", 50.0),
+        ("storage_heat", "HEAT", 0.0),
+    )
+    added_rows = [
+        (
+            f"# {len(measurement_rows) + offset} {name} HeatStorage "
+            f"thermal_buffer {meas_type} 10 1 {value}"
+        )
+        for offset, (name, meas_type, value) in enumerate(
+            storage_measurements,
+            start=1,
+        )
+    ]
+    measurement_text = measurement_text.replace(
+        "</Measurement>",
+        "\n".join((*added_rows, "</Measurement>")),
+    )
+    meas_file.write_text(measurement_text, encoding="utf8")
     return case_file, meas_file
 
 
-@pytest.mark.parametrize("table_name", ("AcE2Heat", "DcE2Heat"))
+@pytest.mark.parametrize(
+    "table_name",
+    ("AcE2Heat", "AcE2Heat2", "DcE2Heat", "DcE2Heat2"),
+)
 @pytest.mark.parametrize("control_type", ("P", "T_OUT"))
 def test_direct_electric_heat_control_uses_e2h_coeff_and_sparse_jacobian(
     tmp_path,
@@ -560,7 +590,10 @@ def test_direct_electric_heat_supports_explicit_return_source(tmp_path, control_
         assert calc.x[plan.supply_temperature_col] == pytest.approx(90.0, abs=1.0e-8)
 
 
-@pytest.mark.parametrize("table_name", ("AcE2Heat", "DcE2Heat"))
+@pytest.mark.parametrize(
+    "table_name",
+    ("AcE2Heat", "AcE2Heat2", "DcE2Heat", "DcE2Heat2"),
+)
 @pytest.mark.parametrize("control_type", ("P", "T_OUT"))
 def test_direct_electric_heat_accepts_heat_storage_endpoint(
     tmp_path,
@@ -606,6 +639,83 @@ def test_direct_electric_heat_accepts_heat_storage_endpoint(
     )
     assert se_plan.heat_flow.device_type == "HeatStorage"
     assert se_plan.heat_temperature.device_type == "HeatStorage"
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    ("AcE2Heat", "AcE2Heat2", "DcE2Heat", "DcE2Heat2"),
+)
+@pytest.mark.parametrize("control_type", ("P", "T_OUT"))
+def test_hybrid_se_uses_coupled_heat_storage_outlet_for_heat_measurement(
+    tmp_path,
+    table_name,
+    control_type,
+):
+    case_file, meas_file = _build_direct_electric_heat_storage_case(
+        tmp_path,
+        table_name=table_name,
+        control_type=control_type,
+    )
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        auto_prepare=False,
+    )
+    estimator.prepare()
+    estimator._prepare_multi_energy_se_layout()
+    plan = next(
+        item
+        for item in estimator.multi_energy_se_coupling_plans
+        if item.coupling.name == "storage_electric_heater"
+    )
+    state = estimator._multi_energy_initial_state()
+    if control_type == "P":
+        state[plan.control_col] += 3.0
+
+    values = estimator._evaluate_multi_energy(state)
+    endpoint_values, _ = estimator._multi_energy_endpoint_runtime(
+        state,
+        with_jacobian=False,
+    )
+    source_flow = float(endpoint_values[plan.heat_flow.provider][plan.heat_flow.row])
+    outlet_temperature = (
+        float(state[plan.control_col])
+        if control_type == "P"
+        else float(plan.supply_temperature_set)
+    )
+    return_temperature = float(state[plan.return_temperature_col])
+    expected_heat = (
+        source_flow
+        * float(plan.heat_capacity)
+        * (outlet_temperature - return_temperature)
+    )
+
+    assert plan.heat_power_measurement_rows
+    for row in plan.heat_power_measurement_rows:
+        assert values[row] == pytest.approx(expected_heat, rel=1.0e-10, abs=1.0e-12)
+
+    analytic = estimator._multi_energy_jacobian_sparse(state)
+    checked_columns = {plan.return_temperature_col}
+    if control_type == "P":
+        checked_columns.add(plan.control_col)
+    heat_rows = np.asarray(plan.heat_power_measurement_rows, dtype=np.int64)
+    for column in checked_columns:
+        step = 1.0e-6 * max(1.0, abs(float(state[column])))
+        upper = state.copy()
+        lower = state.copy()
+        upper[column] += step
+        lower[column] -= step
+        numeric = (
+            estimator._evaluate_multi_energy(upper)
+            - estimator._evaluate_multi_energy(lower)
+        ) / (2.0 * step)
+        np.testing.assert_allclose(
+            analytic[heat_rows, column].toarray().ravel(),
+            numeric[heat_rows],
+            rtol=3.0e-6,
+            atol=2.0e-7,
+        )
 
 
 @pytest.mark.parametrize("table_name", ("AcE2Heat", "DcE2Heat"))
