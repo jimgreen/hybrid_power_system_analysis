@@ -510,6 +510,27 @@ def build_measurements_from_lf(network, calc) -> list[Measurement]:
             "FLOW_FROM",
             calc.edge_flow[edge_pos],
         )
+    source_t_out = np.asarray(
+        result_arrays.get(
+            "source_t_out",
+            np.full(len(network.sources), np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    )
+    source_supply_temperature = np.asarray(
+        result_arrays.get(
+            "source_supply_temperature",
+            np.full(len(network.sources), np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    )
+    source_return_temperature = np.asarray(
+        result_arrays.get(
+            "source_return_temperature",
+            np.full(len(network.sources), np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    )
     for source_pos, name in enumerate(network.source_name.tolist()):
         source_device_type = (
             f"{network.prefix}Storage"
@@ -523,19 +544,29 @@ def build_measurements_from_lf(network, calc) -> list[Measurement]:
             calc.source_flow[source_pos],
         )
         if network.thermal:
-            source_supply_temperature = np.asarray(
-                result_arrays.get(
-                    "source_t_out",
-                    np.full(len(network.sources), np.nan, dtype=np.float64),
-                ),
-                dtype=np.float64,
+            t_supply = (
+                float(source_t_out[source_pos])
+                if np.isfinite(source_t_out[source_pos])
+                else float(source_supply_temperature[source_pos])
             )
-            if np.isfinite(source_supply_temperature[source_pos]):
+            if bool(network.source_is_storage[source_pos]):
+                t_return = float(source_return_temperature[source_pos])
+                add(source_device_type, str(name), "T_SUPPLY", t_supply)
+                add(source_device_type, str(name), "T_RETURN", t_return)
+                add(
+                    source_device_type,
+                    str(name),
+                    "HEAT",
+                    calc.source_flow[source_pos]
+                    * float(network.medium.heat_capacity)
+                    * (t_supply - t_return),
+                )
+            elif np.isfinite(source_t_out[source_pos]):
                 add(
                     source_device_type,
                     str(name),
                     "T_SUPPLY",
-                    source_supply_temperature[source_pos],
+                    t_supply,
                 )
     for load_pos, name in enumerate(network.load_name.tolist()):
         add(

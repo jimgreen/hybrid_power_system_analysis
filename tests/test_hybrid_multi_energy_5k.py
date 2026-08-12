@@ -95,6 +95,21 @@ def test_multi_energy_5k_structure_and_control_coverage():
     ]
     assert {plan.coupling.control_type for plan in electric_heat_plans} == {"P", "T_OUT"}
     assert all(plan.coupling.e2h_coeff is not None for plan in electric_heat_plans)
+    gas_electric_plans = [
+        plan for plan in calc.energy_coupling_plans if plan.coupling.is_gas_electric_control
+    ]
+    assert {plan.coupling.control_type for plan in gas_electric_plans} == {"P", "FLOW"}
+    assert all(plan.coupling.g2e_coeff is not None for plan in gas_electric_plans)
+    steam_electric_plans = [
+        plan for plan in calc.energy_coupling_plans if plan.coupling.is_steam_electric_control
+    ]
+    assert {plan.coupling.control_type for plan in steam_electric_plans} == {"P", "FLOW"}
+    assert all(plan.coupling.s2e_coeff is not None for plan in steam_electric_plans)
+    gas_heat_plans = [
+        plan for plan in calc.energy_coupling_plans if plan.coupling.is_gas_heat_control
+    ]
+    assert {plan.coupling.control_type for plan in gas_heat_plans} == {"FLOW", "T_OUT"}
+    assert all(plan.coupling.g2h_coeff is not None for plan in gas_heat_plans)
     for table_name in ("Steam2AcE", "Steam2DcE"):
         plans = [
             plan
@@ -141,7 +156,10 @@ def test_multi_energy_5k_lf_is_one_global_newton_problem(monkeypatch):
         nonzero_rows = jacobian.getcol(column).nonzero()[0]
         expected_balance_row = (
             int(plan.heat_temperature_eq_row)
-            if plan.electric_heat and plan.coupling.control_type == "P"
+            if (
+                (plan.electric_heat and plan.coupling.control_type == "P")
+                or (plan.gas_heat and plan.coupling.control_type == "FLOW")
+            )
             else int(plan.t1.balance_row)
         )
         assert expected_balance_row in nonzero_rows
@@ -185,7 +203,26 @@ def test_multi_energy_5k_se_is_observable_accurate_and_joint(monkeypatch):
     assert result.iterations <= 12
     assert result.residual_inf < 5e-8
     assert result.objective < 1e-10
-    assert result.H.shape == (25577, 8680)
+    expected_measurement_count = (
+        estimator.electric_measurement_count
+        + sum(
+            measurement_slice.stop - measurement_slice.start
+            for measurement_slice in estimator.fluid_measurement_slices.values()
+        )
+        + (
+            estimator.multi_energy_control_measurement_slice.stop
+            - estimator.multi_energy_control_measurement_slice.start
+        )
+        + (
+            estimator.multi_energy_coupling_measurement_slice.stop
+            - estimator.multi_energy_coupling_measurement_slice.start
+        )
+    )
+    assert estimator.multi_energy_measurement_count == expected_measurement_count
+    assert result.H.shape == (
+        estimator.multi_energy_measurement_count,
+        estimator.multi_energy_state_count,
+    )
     assert result.H.nnz > 50000
     assert all(rc == 0 for rc in estimator.fluid_se_rc.values())
     assert {item.status for item in estimator.multi_energy_result.couplings} == {

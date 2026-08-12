@@ -169,6 +169,123 @@ def _build_direct_hydrogen_conversion_case(
     return case_file, meas_file
 
 
+def _build_direct_gas_or_steam_conversion_case(
+    tmp_path: Path,
+    *,
+    domain: str,
+    control_type: str,
+):
+    electric_model = ROOT / "data" / "model" / "ac" / "ac_net_10.e"
+    fluid_model = (
+        ROOT
+        / "data"
+        / "model"
+        / domain
+        / ("gas_net_3.e" if domain == "gas" else "steam_net_5.e")
+    )
+    text = "\n\n".join(
+        (
+            electric_model.read_text(encoding="utf8"),
+            fluid_model.read_text(encoding="utf8"),
+        )
+    )
+    if domain == "gas":
+        table_name = "Gas2AcE"
+        fluid_field = "idx_gas_load_t1"
+        coefficient_field = "g2e_coeff"
+        coefficient = 10.0
+        generator_power = 2.0
+    else:
+        table_name = "Steam2AcE"
+        fluid_field = "idx_steam_load_t1"
+        electric_field = "idx_ac_unit_t2"
+        coefficient_field = "s2e_coeff"
+        coefficient = 0.35
+        generator_power = 50.0
+    if domain == "gas":
+        electric_field = "idx_ac_unit_t2"
+        power_pattern = r"(#\s+4\s+gen_pq9\s+10\s+PQ\s+)50(?=\s+10)"
+    else:
+        power_pattern = r"(#\s+4\s+gen_pq9\s+10\s+PQ\s+)50(?=\s+10)"
+    text, count = re.subn(power_pattern, rf"\g<1>{generator_power}", text, count=1)
+    assert count == 1
+    text = _replace_model_block(
+        text + f"\n\n<{table_name}></{table_name}>\n",
+        table_name,
+        f"""
+<{table_name}>
+@ idx name run_stat control_type {fluid_field} {electric_field} {coefficient_field}
+# 1 direct_{domain}_generator 1 {control_type} 1 4 {coefficient}
+</{table_name}>
+""",
+    )
+    case_file = tmp_path / f"direct_{domain}_{control_type.lower()}.e"
+    case_file.write_text(text, encoding="utf8")
+
+    measurement_paths = (
+        ROOT / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+        ROOT
+        / "data"
+        / "meas"
+        / domain
+        / ("gas_net_3.meas" if domain == "gas" else "steam_net_5.meas"),
+    )
+    rows = []
+    for measurement_path in measurement_paths:
+        for row in _measurement_rows(measurement_path):
+            if measurement_path.name != "hybrid_net_40.meas" or row[2].startswith("AC"):
+                rows.append(row)
+    meas_file = tmp_path / f"direct_{domain}_{control_type.lower()}.meas"
+    output = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value",
+    ]
+    for idx, row in enumerate(rows, start=1):
+        row[0] = str(idx)
+        output.append("# " + " ".join(row))
+    output.append("</Measurement>")
+    meas_file.write_text("\n".join(output) + "\n", encoding="utf8")
+    return case_file, meas_file
+
+
+def _build_direct_gas_heat_case(tmp_path: Path, *, control_type: str):
+    model_paths = (
+        ROOT / "data" / "model" / "gas" / "gas_net_3.e",
+        ROOT / "data" / "model" / "heat" / "heat_net_3.e",
+    )
+    coupling = f"""
+<Gas2Heat>
+@ idx name run_stat control_type idx_gas_load_t1 idx_heat_unit_t2 g2h_coeff
+# 1 direct_gas_boiler 1 {control_type} 1 1 1700.0
+</Gas2Heat>
+""".strip()
+    case_file = tmp_path / f"direct_gas_heat_{control_type.lower()}.e"
+    case_file.write_text(
+        "\n\n".join(path.read_text(encoding="utf8") for path in model_paths)
+        + "\n\n"
+        + coupling
+        + "\n",
+        encoding="utf8",
+    )
+
+    rows = []
+    for domain, stem in (("gas", "gas_net_3"), ("heat", "heat_net_3")):
+        rows.extend(
+            _measurement_rows(ROOT / "data" / "meas" / domain / f"{stem}.meas")
+        )
+    meas_file = tmp_path / f"direct_gas_heat_{control_type.lower()}.meas"
+    output = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value",
+    ]
+    for idx, row in enumerate(rows, start=1):
+        row[0] = str(idx)
+        output.append("# " + " ".join(row))
+    output.append("</Measurement>")
+    meas_file.write_text("\n".join(output) + "\n", encoding="utf8")
+    return case_file, meas_file
+
+
 def _build_direct_electric_heat_case(
     tmp_path: Path,
     *,
@@ -247,6 +364,88 @@ def _build_direct_electric_heat_case(
     return case_file, meas_file
 
 
+def _build_explicit_return_electric_heat_case(
+    tmp_path: Path,
+    *,
+    control_type: str,
+) -> Path:
+    electric_text = (
+        ROOT / "data" / "model" / "hybrid" / "hybrid_net_40.e"
+    ).read_text(encoding="utf8")
+    electric_text, count = re.subn(
+        r"(#\s+1\s+load_3\s+4\s+)1\.0",
+        r"\g<1>10.0",
+        electric_text,
+        count=1,
+    )
+    assert count == 1
+
+    heat_text = (
+        ROOT / "data" / "model" / "heat" / "heat_explicit_return.e"
+    ).read_text(encoding="utf8")
+    heat_text = heat_text.replace(
+        "flow_min flow_max supply_temperature run_stat",
+        "flow_min flow_max supply_temperature_set run_stat",
+    )
+    heat_text, count = re.subn(
+        r"(?m)^(#\s+\d+\s+\S+\s+\d+\s+\d+\s+1\.0)\s+0\.0\s+1$",
+        r"\1 0.1 1",
+        heat_text,
+    )
+    assert count == 4
+
+    coupling = f"""
+<AcE2Heat>
+@ idx name run_stat control_type idx_ac_load_t1 idx_heat_unit_t2 e2h_coeff
+# 1 explicit_return_heater 1 {control_type} 1 1 2.0
+</AcE2Heat>
+""".strip()
+    case_file = tmp_path / f"explicit_return_electric_heat_{control_type.lower()}.e"
+    case_file.write_text(
+        "\n\n".join((electric_text, heat_text, coupling)) + "\n",
+        encoding="utf8",
+    )
+    return case_file
+
+
+def _build_direct_electric_heat_storage_case(
+    tmp_path: Path,
+    *,
+    table_name: str,
+    control_type: str,
+):
+    case_file, meas_file = _build_direct_electric_heat_case(
+        tmp_path,
+        table_name=table_name,
+        control_type=control_type,
+        supply_temperature_set=85.0,
+        e2h_coeff=2.0,
+    )
+    text = case_file.read_text(encoding="utf8")
+    text += """
+
+<HeatStorage>
+@ idx name node control_type pressure_set flow_set alpha flow_min flow_max supply_temperature_set return_temperature_set run_stat
+# 1 thermal_buffer 1 FLOW 10.0 0.2 1.0 -0.5 0.5 85.0 50.0 1
+</HeatStorage>
+"""
+    electric_field = (
+        "idx_ac_load_t1" if table_name == "AcE2Heat" else "idx_dc_load_t1"
+    )
+    text = _replace_model_block(
+        text,
+        table_name,
+        f"""
+<{table_name}>
+@ idx name run_stat control_type {electric_field} idx_heat_storage_t2 e2h_coeff
+# 1 storage_electric_heater 1 {control_type} 1 1 2.0
+</{table_name}>
+""",
+    )
+    case_file.write_text(text, encoding="utf8")
+    return case_file, meas_file
+
+
 @pytest.mark.parametrize("table_name", ("AcE2Heat", "DcE2Heat"))
 @pytest.mark.parametrize("control_type", ("P", "T_OUT"))
 def test_direct_electric_heat_control_uses_e2h_coeff_and_sparse_jacobian(
@@ -322,6 +521,91 @@ def test_direct_electric_heat_p_control_keeps_inactive_supply_temperature_set(tm
     assert calc.run() == 0
     assert calc.fluid_calcs["heat"].network.source_supply_temperature_set[0] == pytest.approx(72.0)
     assert float(calc.x[plan.state_col]) != pytest.approx(72.0)
+
+
+@pytest.mark.parametrize("control_type", ("P", "T_OUT"))
+def test_direct_electric_heat_supports_explicit_return_source(tmp_path, control_type):
+    case_file = _build_explicit_return_electric_heat_case(
+        tmp_path,
+        control_type=control_type,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+    calc.prepare()
+
+    heat_calc = calc.fluid_calcs["heat"]
+    initial_group_flow = heat_calc.x[
+        heat_calc.base_pressure_source_group_flow : heat_calc.hydraulic_state_count
+    ]
+    np.testing.assert_allclose(initial_group_flow, [1.0], rtol=0.0, atol=1.0e-12)
+
+    assert calc.run() == 0
+    plan = next(item for item in calc.energy_coupling_plans if item.electric_heat)
+    result = next(
+        item for item in calc.coupling_results if item.name == "explicit_return_heater"
+    )
+    assert result.status == "balanced"
+    assert abs(float(result.residual)) < 1.0e-8
+    assert heat_calc.network.source_supply_temperature_set[0] == pytest.approx(90.0)
+    if control_type == "P":
+        assert calc.x[plan.supply_temperature_col] == pytest.approx(
+            calc.x[plan.state_col],
+            abs=1.0e-8,
+        )
+    else:
+        assert calc.x[plan.supply_temperature_col] == pytest.approx(90.0, abs=1.0e-8)
+
+
+@pytest.mark.parametrize("table_name", ("AcE2Heat", "DcE2Heat"))
+@pytest.mark.parametrize("control_type", ("P", "T_OUT"))
+def test_direct_electric_heat_accepts_heat_storage_endpoint(
+    tmp_path,
+    table_name,
+    control_type,
+):
+    case_file, meas_file = _build_direct_electric_heat_storage_case(
+        tmp_path,
+        table_name=table_name,
+        control_type=control_type,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    plan = next(item for item in calc.energy_coupling_plans if item.electric_heat)
+    result = next(
+        item for item in calc.coupling_results if item.name == "storage_electric_heater"
+    )
+    assert plan.heat.kind == "storage"
+    assert plan.heat.device_type == "HeatStorage"
+    assert result.status == "balanced"
+    assert abs(float(result.residual)) < 1.0e-8
+    assert "thermal_buffer" in calc.fluid_calcs["heat"].lf_result.storages
+    assert "thermal_buffer" not in calc.fluid_calcs["heat"].lf_result.sources
+
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        auto_prepare=False,
+    )
+    estimator.prepare()
+    estimator._prepare_multi_energy_se_layout()
+    se_plan = next(
+        item
+        for item in estimator.multi_energy_se_coupling_plans
+        if item.coupling.name == "storage_electric_heater"
+    )
+    assert se_plan.heat_flow.device_type == "HeatStorage"
+    assert se_plan.heat_temperature.device_type == "HeatStorage"
 
 
 @pytest.mark.parametrize("table_name", ("AcE2Heat", "DcE2Heat"))
@@ -546,6 +830,160 @@ def test_fuel_cell_control_mode_selects_endpoint_and_h2e_coeff(
     assert electric_kw == pytest.approx(600.0 * hydrogen_flow, rel=1e-7, abs=1e-9)
     if control_type == "FLOW":
         assert hydrogen_flow == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("domain", ("gas", "steam"))
+@pytest.mark.parametrize("control_type", ("P", "FLOW"))
+def test_gas_and_steam_electric_controls_join_lf_newton_system(
+    tmp_path,
+    domain,
+    control_type,
+):
+    case_file, _meas_file = _build_direct_gas_or_steam_conversion_case(
+        tmp_path,
+        domain=domain,
+        control_type=control_type,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    plan = next(
+        item
+        for item in calc.energy_coupling_plans
+        if item.coupling.name == f"direct_{domain}_generator"
+    )
+    result = next(
+        item
+        for item in calc.coupling_results
+        if item.name == f"direct_{domain}_generator"
+    )
+    assert plan.dependent.domain == (domain if control_type == "P" else "ac")
+    assert result.status == "balanced"
+    assert abs(float(result.residual)) < 1.0e-8
+
+    jacobian = calc.get_jacobi(calc.x).tocsr()
+    column = int(plan.state_col)
+    step = 1.0e-6 * max(1.0, abs(float(calc.x[column])))
+    upper = calc.x.copy()
+    lower = calc.x.copy()
+    upper[column] += step
+    lower[column] -= step
+    finite_difference = (calc.get_f(upper) - calc.get_f(lower)) / (2.0 * step)
+    np.testing.assert_allclose(
+        jacobian.getcol(column).toarray().ravel(),
+        finite_difference,
+        rtol=2.0e-5,
+        atol=2.0e-7,
+    )
+    if domain == "steam":
+        assert jacobian[plan.eq_row, plan.steam_enthalpy_col] != 0.0
+
+
+@pytest.mark.parametrize("domain", ("gas", "steam"))
+@pytest.mark.parametrize("control_type", ("P", "FLOW"))
+def test_gas_and_steam_electric_controls_join_se_wls(
+    tmp_path,
+    domain,
+    control_type,
+):
+    case_file, meas_file = _build_direct_gas_or_steam_conversion_case(
+        tmp_path,
+        domain=domain,
+        control_type=control_type,
+    )
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        auto_prepare=False,
+    )
+    estimator.prepare()
+    estimator._prepare_multi_energy_se_layout()
+    plan = next(
+        item
+        for item in estimator.multi_energy_se_coupling_plans
+        if item.coupling.name == f"direct_{domain}_generator"
+    )
+    state = estimator._multi_energy_initial_state()
+    analytic = estimator._multi_energy_jacobian_sparse(state)
+    step = 1.0e-6 * max(1.0, abs(float(state[plan.control_col])))
+    upper = state.copy()
+    lower = state.copy()
+    upper[plan.control_col] += step
+    lower[plan.control_col] -= step
+    numeric = (
+        estimator._evaluate_multi_energy(upper)
+        - estimator._evaluate_multi_energy(lower)
+    ) / (2.0 * step)
+    np.testing.assert_allclose(
+        analytic.getcol(plan.control_col).toarray().ravel(),
+        numeric,
+        rtol=2.0e-5,
+        atol=2.0e-7,
+    )
+    if domain == "steam":
+        assert analytic[plan.measurement_row, plan.steam_enthalpy_col] != 0.0
+
+    estimator.run(result_mode="array", skip_bad_data=True, verbose=False)
+    assert estimator.multi_energy_estimate_result.converged
+    result = next(
+        item
+        for item in estimator.multi_energy_result.couplings
+        if item.name == f"direct_{domain}_generator"
+    )
+    assert result.status == "balanced"
+
+
+@pytest.mark.parametrize("control_type", ("FLOW", "T_OUT"))
+def test_gas_heat_control_uses_thermal_power_in_lf_and_se(tmp_path, control_type):
+    case_file, meas_file = _build_direct_gas_heat_case(
+        tmp_path,
+        control_type=control_type,
+    )
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+    assert calc.run() == 0
+    plan = next(item for item in calc.energy_coupling_plans if item.gas_heat)
+    result = next(
+        item for item in calc.coupling_results if item.name == "direct_gas_boiler"
+    )
+    assert result.status == "balanced"
+    assert abs(float(result.residual)) < 1.0e-8
+    jacobian = calc.get_jacobi(calc.x).tocsr()
+    assert jacobian[plan.eq_row, plan.state_col] != 0.0
+    assert jacobian[plan.eq_row, plan.return_temperature_col] != 0.0
+
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        auto_prepare=False,
+    )
+    estimator.prepare()
+    estimator.run(result_mode="array", skip_bad_data=True, verbose=False)
+    assert estimator.multi_energy_estimate_result.converged
+    se_plan = next(
+        item for item in estimator.multi_energy_se_coupling_plans if item.gas_heat
+    )
+    assert estimator.multi_energy_estimate_result.H[
+        se_plan.measurement_row,
+        se_plan.return_temperature_col,
+    ] != 0.0
+    se_result = next(
+        item
+        for item in estimator.multi_energy_result.couplings
+        if item.name == "direct_gas_boiler"
+    )
+    assert se_result.status == "balanced"
 
 
 @pytest.mark.parametrize(

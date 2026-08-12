@@ -89,7 +89,19 @@ def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
     text = _append_block_rows(text, "ACLoad", ac_load_rows)
 
     ac_generator_rows = [
-        _row((5 + pos, f"coupled_ac_gen_{5 + pos}", 60 + pos, "PQ", 0.04, 0.005, 0.0, 1.0, 1))
+        _row(
+            (
+                5 + pos,
+                f"coupled_ac_gen_{5 + pos}",
+                60 + pos,
+                "PQ",
+                0.04,
+                0.005,
+                0.0,
+                1.0,
+                1,
+            )
+        )
         for pos in range(3 * count)
     ]
     text = _append_block_rows(text, "ACGenerator", ac_generator_rows)
@@ -112,7 +124,18 @@ def _add_coupling_electric_devices(text: str, couplings_per_type: int) -> str:
     text = _append_block_rows(text, "DCLoad", dc_load_rows)
 
     dc_generator_rows = [
-        _row((15 + pos, f"coupled_dc_gen_{15 + pos}", 90 + pos, "P", 100.0, 0.04, 0.0, 1))
+        _row(
+            (
+                15 + pos,
+                f"coupled_dc_gen_{15 + pos}",
+                90 + pos,
+                "P",
+                100.0,
+                0.04,
+                0.0,
+                1,
+            )
+        )
         for pos in range(3 * count)
     ]
     return _append_block_rows(text, "DCGenerator", dc_generator_rows)
@@ -222,13 +245,25 @@ def _coupling_blocks(couplings_per_type: int) -> str:
         elif table_name in {"Hydro2AcE", "Hydro2DcE"}:
             coefficient_field = "h2e_coeff"
             default_control = "P"
+        elif table_name in {"Gas2AcE", "Gas2DcE"}:
+            coefficient_field = "g2e_coeff"
+            default_control = "P"
+            efficiency = 300.0
+        elif table_name in {"Steam2AcE", "Steam2DcE"}:
+            coefficient_field = "s2e_coeff"
+            default_control = "P"
+            efficiency = 0.35
+        elif table_name == "Gas2Heat":
+            coefficient_field = "g2h_coeff"
+            default_control = "FLOW"
+            efficiency = 86.64
         else:
             coefficient_field = ""
             default_control = ""
         if coefficient_field:
             alternate_control = (
                 "T_OUT"
-                if table_name in {"AcE2Heat", "DcE2Heat"}
+                if table_name in {"AcE2Heat", "DcE2Heat", "Gas2Heat"}
                 else "P"
                 if default_control == "FLOW"
                 else "FLOW"

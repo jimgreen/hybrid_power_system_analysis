@@ -95,6 +95,39 @@ class FluidPowerFlowCalc:
         self.temperature = np.empty(0, dtype=np.float64)
         self.lf_result = self.result_class()
 
+    def _initial_pressure_source_group_flows(self) -> np.ndarray:
+        """Balance each explicit-return supply island at the initial state."""
+        net = self.network
+        group_count = int(net.pressure_source_group_nodes.size)
+        initial = np.zeros(group_count, dtype=np.float64)
+        groups_by_island: Dict[int, list[int]] = {}
+        for group_pos, node_pos in enumerate(net.pressure_source_group_nodes.tolist()):
+            island = int(net.node_island[int(node_pos)])
+            groups_by_island.setdefault(island, []).append(group_pos)
+
+        for island, group_positions in groups_by_island.items():
+            island_nodes = np.flatnonzero(net.node_island == island)
+            target_total = float(
+                np.sum(net.demand[island_nodes])
+                - np.sum(net.fixed_injection[island_nodes])
+            )
+            source_positions = np.concatenate(
+                [net.pressure_source_groups[pos] for pos in group_positions]
+            )
+            allocated = allocate_limited_residual(
+                net.source_flow_set[source_positions],
+                target_total,
+                lower=net.source_flow_min[source_positions],
+                upper=net.source_flow_max[source_positions],
+                alpha=net.source_alpha[source_positions],
+            )
+            offset = 0
+            for group_pos in group_positions:
+                group_size = int(net.pressure_source_groups[group_pos].size)
+                initial[group_pos] = float(np.sum(allocated[offset : offset + group_size]))
+                offset += group_size
+        return initial
+
     def prepare(self) -> "FluidPowerFlowCalc":
         net = self.network.prepare()
         potential = net.initial_potential()
@@ -116,13 +149,9 @@ class FluidPowerFlowCalc:
                 net.free_node_pos.size : self.base_pressure_source_group_flow
             ] = net.edge_flow_set[net.regulated_edge_pos]
         if n_pressure_group:
-            x[self.base_pressure_source_group_flow : self.hydraulic_state_count] = np.asarray(
-                [
-                    np.sum(net.source_flow_set[source_positions])
-                    for source_positions in net.pressure_source_groups
-                ],
-                dtype=np.float64,
-            )
+            x[
+                self.base_pressure_source_group_flow : self.hydraulic_state_count
+            ] = self._initial_pressure_source_group_flows()
         if net.thermal:
             x[self.base_temperature : self.base_enthalpy] = net.initial_temperature_state
         elif net.steam:
@@ -641,6 +670,33 @@ class FluidPowerFlowCalc:
 
         return np.asarray([find(pos) for pos in range(count)], dtype=np.int64)
 
+    def _thermal_source_injection(self, source_pos: int, flow: float):
+        """Return the thermal inlet represented by a signed source flow."""
+        net = self.network
+        if flow > 1.0e-12:
+            node_pos = int(net.source_supply_node_pos[source_pos])
+            state = int(net.supply_temperature_state_by_node[node_pos])
+            return (
+                state,
+                float(flow),
+                float(net.source_supply_temperature_set[source_pos]),
+                1.0,
+            )
+        if (
+            flow < -1.0e-12
+            and bool(net.source_is_storage[source_pos])
+            and bool(net.source_explicit_return[source_pos])
+        ):
+            node_pos = int(net.source_return_node_pos[source_pos])
+            state = int(net.return_temperature_state_by_node[node_pos])
+            return (
+                state,
+                float(-flow),
+                float(net.source_return_temperature_set[source_pos]),
+                -1.0,
+            )
+        return None
+
     def _unanchored_pressure_source_groups(
         self,
         edge_flow: np.ndarray,
@@ -651,11 +707,25 @@ class FluidPowerFlowCalc:
         """Find zero-flow pressure sources in transport components without a boundary."""
         labels = self._transport_state_components(edge_flow, incoming_mass.size)
         anchored = set(labels[np.flatnonzero(incoming_mass <= 1e-12)].tolist())
-        positive_sources = np.flatnonzero(source_flow > 1e-12)
-        anchored.update(labels[source_state[positive_sources]].tolist())
+        injection_state = source_state.copy()
+        reverse_storage = (
+            (source_flow < -1.0e-12)
+            & self.network.source_is_storage
+            & self.network.source_explicit_return
+        )
+        if np.any(reverse_storage):
+            injection_state[reverse_storage] = (
+                self.network.return_temperature_state_by_node[
+                    self.network.source_return_node_pos[reverse_storage]
+                ]
+            )
+        injecting_sources = np.flatnonzero(
+            (source_flow > 1.0e-12) | reverse_storage
+        )
+        anchored.update(labels[injection_state[injecting_sources]].tolist())
         candidates = np.flatnonzero(
             (self.network.source_control_type == PRESSURE_CONTROL)
-            & (source_flow <= 1e-12)
+            & (np.abs(source_flow) <= 1e-12)
         )
         groups = []
         for label in np.unique(labels[source_state[candidates]]).tolist():
@@ -747,14 +817,14 @@ class FluidPowerFlowCalc:
 
         source_state = net.supply_temperature_state_by_node[net.source_supply_node_pos]
         for source_pos, flow in enumerate(source_flow.tolist()):
-            if flow <= 1e-12:
+            injection = self._thermal_source_injection(source_pos, flow)
+            if injection is None:
                 continue
-            supply_node = int(net.source_supply_node_pos[source_pos])
-            state = int(net.supply_temperature_state_by_node[supply_node])
-            gap = float(temperature[state] - net.source_supply_temperature[source_pos])
-            incoming_mass[state] += flow
-            residual[state] += flow * gap
-            add_temp(state, state, flow)
+            state, mass, temperature_set, flow_derivative_scale = injection
+            gap = float(temperature[state] - temperature_set)
+            incoming_mass[state] += mass
+            residual[state] += mass * gap
+            add_temp(state, state, mass)
             if return_jacobian:
                 self._append_scaled_sparse_row(
                     cross_rows,
@@ -762,7 +832,7 @@ class FluidPowerFlowCalc:
                     cross_data,
                     state,
                     source_jacobian.getrow(source_pos),
-                    gap,
+                    flow_derivative_scale * gap,
                 )
 
         for load_pos in range(len(net.loads)):
@@ -1290,11 +1360,12 @@ class FluidPowerFlowCalc:
                     factor,
                 )
         for source_pos, flow in enumerate(self.source_flow.tolist()):
-            if flow > 1e-12:
-                supply_node = int(net.source_supply_node_pos[source_pos])
-                supply_state = int(net.supply_temperature_state_by_node[supply_node])
-                incoming_mass[supply_state] += flow
-                rhs[supply_state] += flow * net.source_supply_temperature[source_pos]
+            injection = self._thermal_source_injection(source_pos, flow)
+            if injection is None:
+                continue
+            state, mass, temperature_set, _flow_derivative_scale = injection
+            incoming_mass[state] += mass
+            rhs[state] += mass * temperature_set
         for load_pos in range(len(net.loads)):
             mass = float(net.load_flow_set[load_pos])
             if mass <= 1e-12:
@@ -1482,6 +1553,23 @@ class FluidPowerFlowCalc:
             arrays["node_return_temperature"] = self.return_temperature.copy()
             arrays["node_temperature"] = self.temperature.copy()
             arrays["node_explicit_return"] = net.node_explicit_return.copy()
+            source_supply_temperature = self.supply_temperature[
+                net.source_supply_node_pos
+            ].copy()
+            source_return_temperature = self.return_temperature[
+                net.source_return_node_pos
+            ].copy()
+            source_heat_power = (
+                self.source_flow
+                * float(net.medium.heat_capacity)
+                * (source_supply_temperature - source_return_temperature)
+            )
+            arrays["source_supply_temperature"] = source_supply_temperature
+            arrays["source_return_temperature"] = source_return_temperature
+            arrays["source_heat_power"] = source_heat_power
+            arrays["storage_heat_power"] = source_heat_power[
+                net.storage_source_pos
+            ].copy()
             if net.exchanger_i.size:
                 primary_heat, secondary_heat, primary_out, secondary_out = self._heat_exchanger_quantities()
                 arrays["exchanger_primary_heat"] = primary_heat

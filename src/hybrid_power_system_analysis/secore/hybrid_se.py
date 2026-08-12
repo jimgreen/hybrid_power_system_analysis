@@ -25,8 +25,13 @@ from model.multi_energy_model import (
     attach_multi_energy_context,
     build_multi_energy_context_from_rows,
     electric_heat_balance_residual,
+    gas_electric_balance_residual,
+    gas_electric_dependent_value,
+    gas_heat_balance_residual,
     hydrogen_electric_balance_residual,
     hydrogen_electric_dependent_value,
+    steam_electric_balance_residual,
+    steam_electric_dependent_value,
 )
 from model.ac_array_model import (
     BRANCH_COLS as AC_BRANCH_COLS,
@@ -691,21 +696,29 @@ class _MultiEnergySECouplingPlan:
     measurement_row: int
     control_col: int = -1
     prior_measurement_row: int = -1
+    prior_state_col: int = -1
     electric_heat: bool = False
+    gas_heat: bool = False
     hydrogen_electric: bool = False
+    gas_electric: bool = False
+    steam_electric: bool = False
     controlled: Optional[_MultiEnergySEEndpoint] = None
     dependent: Optional[_MultiEnergySEEndpoint] = None
     electric: Optional[_MultiEnergySEEndpoint] = None
+    gas: Optional[_MultiEnergySEEndpoint] = None
     heat_flow: Optional[_MultiEnergySEEndpoint] = None
     heat_temperature: Optional[_MultiEnergySEEndpoint] = None
     controlled_setpoint: float = 0.0
     controlled_measurement_rows: Tuple[int, ...] = ()
     dependent_measurement_rows: Tuple[int, ...] = ()
     electric_setpoint: float = 0.0
+    gas_setpoint: float = 0.0
     return_temperature_col: int = -1
     supply_temperature_set: float = 0.0
     heat_capacity: float = 1.0
     power_scale: float = 1.0
+    steam_enthalpy_col: int = -1
+    condensate_enthalpy: float = 0.0
 
 
 class HybridStateEstimator:
@@ -1410,6 +1423,62 @@ class HybridStateEstimator:
             (measurement_slice.start + np.flatnonzero(mask)).astype(np.int64).tolist()
         )
 
+    def _multi_energy_local_measurement_value(self, row: int) -> float:
+        row = int(row)
+        if self.electric_measurement_slice.start <= row < self.electric_measurement_slice.stop:
+            return float(
+                self.active_measurements.table.value[
+                    row - self.electric_measurement_slice.start
+                ]
+            )
+        for name, measurement_slice in self.fluid_measurement_slices.items():
+            if measurement_slice.start <= row < measurement_slice.stop:
+                return float(
+                    self.fluid_estimators[name].active_measurements.table.value[
+                        row - measurement_slice.start
+                    ]
+                )
+        raise IndexError(f"measurement row {row} is outside local measurement slices")
+
+    def _multi_energy_measured_state_prior_value(
+        self,
+        state_col: int,
+        fallback: float,
+    ) -> float:
+        """Return a direct electric-state measurement without using device names."""
+        state_col = int(state_col)
+        if not self.electric_state_slice.start <= state_col < self.electric_state_slice.stop:
+            return float(fallback)
+        meta = state_meta_at(
+            self.state_meta,
+            state_col - self.electric_state_slice.start,
+        )
+        if meta is None:
+            return float(fallback)
+        device_type_code = int(getattr(meta, "device_type_code", -1))
+        device_pos = int(getattr(meta, "device_pos", -1))
+        meas_type_code = int(getattr(meta, "meas_type_code", -1))
+        if min(device_type_code, device_pos, meas_type_code) < 0:
+            return float(fallback)
+
+        table = self.active_measurements.table
+        table_meas_type = getattr(table, "meas_type_code", None)
+        table_device_pos = getattr(table, "device_pos", None)
+        if table_meas_type is None or table_device_pos is None:
+            return float(fallback)
+        mask = (
+            np.asarray(table.valid, dtype=bool)
+            & (np.asarray(table.device_type_code, dtype=np.int64) == device_type_code)
+            & (np.asarray(table_device_pos, dtype=np.int64) == device_pos)
+            & (np.asarray(table_meas_type, dtype=np.int64) == meas_type_code)
+            & np.isfinite(np.asarray(table.value, dtype=np.float64))
+        )
+        rows = np.flatnonzero(mask)
+        if rows.size == 0:
+            return float(fallback)
+        best_row = int(rows[np.argmax(np.asarray(table.weight, dtype=np.float64)[rows])])
+        return float(table.value[best_row])
+
     def _prepare_multi_energy_se_layout(self) -> None:
         if self._multi_energy_se_layout_ready or not self.fluid_estimators:
             return
@@ -1535,13 +1604,18 @@ class HybridStateEstimator:
                         t1_scale=1.0,
                         t2_scale=1.0,
                         electric_heat=True,
+                        gas_heat=False,
                         hydrogen_electric=False,
+                        gas_electric=False,
+                        steam_electric=False,
                         controlled=controlled,
                         dependent=dependent,
                         electric=electric,
+                        gas=None,
                         heat_flow=heat_flow,
                         heat_temperature=heat_temperature,
                         electric_setpoint=float(electric_setpoint),
+                        gas_setpoint=0.0,
                         supply_temperature_set=supply_temperature_set,
                         controlled_setpoint=(
                             float(electric_setpoint)
@@ -1555,6 +1629,83 @@ class HybridStateEstimator:
                             1.0e-12,
                         ),
                         power_scale=electric_scale,
+                        steam_enthalpy_col=-1,
+                        condensate_enthalpy=0.0,
+                    )
+                )
+                continue
+            if coupling.is_gas_heat_control:
+                gas_terminal = coupling.gas_terminal
+                heat_terminal = coupling.heat_terminal
+                if gas_terminal is None or heat_terminal is None:
+                    self._add_multi_energy_warning(
+                        f"{coupling.table_name}:{coupling.name}: missing gas or heat endpoint"
+                    )
+                    continue
+                gas, reason = register(gas_terminal)
+                if gas is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                heat_flow, reason = register(heat_terminal)
+                if heat_flow is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                heat_temperature, reason = register(heat_terminal, "temperature")
+                if heat_temperature is None:
+                    self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+                    continue
+                heat_estimator = self.fluid_estimators["heat"]
+                heat_network = heat_estimator.network
+                source_pos = int(heat_flow.device_pos)
+                return_node = int(heat_network.source_return_node_pos[source_pos])
+                return_temperature_col = (
+                    self.fluid_state_slices["heat"].start
+                    + heat_estimator.base_temperature
+                    + int(heat_network.return_temperature_state_by_node[return_node])
+                )
+                gas_setpoint = self._multi_energy_terminal_setpoint(gas_terminal)
+                supply_temperature_set = float(
+                    heat_network.source_supply_temperature_set[source_pos]
+                )
+                controlled = gas if coupling.control_type == "FLOW" else heat_temperature
+                dependent = heat_temperature if coupling.control_type == "FLOW" else gas
+                t1 = gas if coupling.t1 == gas_terminal else heat_temperature
+                t2 = heat_temperature if coupling.t2 == heat_terminal else gas
+                pending.append(
+                    SimpleNamespace(
+                        coupling=coupling,
+                        t1=t1,
+                        t2=t2,
+                        t1_scale=1.0,
+                        t2_scale=1.0,
+                        electric_heat=False,
+                        gas_heat=True,
+                        hydrogen_electric=False,
+                        gas_electric=False,
+                        steam_electric=False,
+                        controlled=controlled,
+                        dependent=dependent,
+                        electric=None,
+                        gas=gas,
+                        heat_flow=heat_flow,
+                        heat_temperature=heat_temperature,
+                        gas_setpoint=float(gas_setpoint),
+                        controlled_setpoint=(
+                            float(gas_setpoint)
+                            if coupling.control_type == "FLOW"
+                            else supply_temperature_set
+                        ),
+                        dependent_setpoint=0.0,
+                        return_temperature_col=return_temperature_col,
+                        supply_temperature_set=supply_temperature_set,
+                        heat_capacity=max(
+                            float(heat_network.medium.heat_capacity),
+                            1.0e-12,
+                        ),
+                        power_scale=1.0,
+                        electric_setpoint=0.0,
+                        steam_enthalpy_col=-1,
+                        condensate_enthalpy=0.0,
                     )
                 )
                 continue
@@ -1566,7 +1717,11 @@ class HybridStateEstimator:
             if t2 is None:
                 self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
                 continue
-            if coupling.is_hydrogen_electric_control:
+            if (
+                coupling.is_hydrogen_electric_control
+                or coupling.is_gas_electric_control
+                or coupling.is_steam_electric_control
+            ):
                 controlled_terminal = coupling.controlled_terminal
                 dependent_terminal = coupling.dependent_terminal
                 controlled = t1 if coupling.t1 == controlled_terminal else t2
@@ -1574,11 +1729,47 @@ class HybridStateEstimator:
                 controlled_setpoint = self._multi_energy_terminal_setpoint(
                     controlled_terminal
                 )
-                dependent_setpoint = hydrogen_electric_dependent_value(
-                    coupling,
-                    controlled_setpoint,
-                    electric_scale,
-                )
+                steam_enthalpy_col = -1
+                condensate_enthalpy = 0.0
+                if coupling.is_hydrogen_electric_control:
+                    dependent_setpoint = hydrogen_electric_dependent_value(
+                        coupling,
+                        controlled_setpoint,
+                        electric_scale,
+                    )
+                elif coupling.is_gas_electric_control:
+                    dependent_setpoint = gas_electric_dependent_value(
+                        coupling,
+                        controlled_setpoint,
+                        electric_scale,
+                    )
+                else:
+                    steam_endpoint = t1 if t1.domain == "steam" else t2
+                    steam_estimator = self.fluid_estimators["steam"]
+                    steam_network = steam_estimator.network
+                    device_pos = int(steam_endpoint.device_pos)
+                    if steam_endpoint.device_type.endswith("Load"):
+                        steam_node = int(steam_network.load_supply_node_pos[device_pos])
+                        condensate_enthalpy = float(
+                            steam_network.load_condensate_enthalpy[device_pos]
+                        )
+                    else:
+                        steam_node = int(steam_network.source_supply_node_pos[device_pos])
+                        condensate_enthalpy = float(
+                            steam_network.medium.feedwater_enthalpy
+                        )
+                    steam_enthalpy_col = (
+                        self.fluid_state_slices["steam"].start
+                        + steam_estimator.base_enthalpy
+                        + steam_node
+                    )
+                    dependent_setpoint = steam_electric_dependent_value(
+                        coupling,
+                        controlled_setpoint,
+                        electric_scale,
+                        float(steam_network.node_enthalpy[steam_node]),
+                        condensate_enthalpy,
+                    )
                 pending.append(
                     SimpleNamespace(
                         coupling=coupling,
@@ -1587,11 +1778,26 @@ class HybridStateEstimator:
                         t1_scale=1.0,
                         t2_scale=1.0,
                         electric_heat=False,
-                        hydrogen_electric=True,
+                        gas_heat=False,
+                        hydrogen_electric=coupling.is_hydrogen_electric_control,
+                        gas_electric=coupling.is_gas_electric_control,
+                        steam_electric=coupling.is_steam_electric_control,
                         controlled=controlled,
                         dependent=dependent,
                         controlled_setpoint=float(controlled_setpoint),
                         dependent_setpoint=float(dependent_setpoint),
+                        electric=None,
+                        gas=None,
+                        heat_flow=None,
+                        heat_temperature=None,
+                        electric_setpoint=0.0,
+                        gas_setpoint=0.0,
+                        return_temperature_col=-1,
+                        supply_temperature_set=0.0,
+                        heat_capacity=1.0,
+                        power_scale=electric_scale,
+                        steam_enthalpy_col=steam_enthalpy_col,
+                        condensate_enthalpy=condensate_enthalpy,
                     )
                 )
                 continue
@@ -1604,11 +1810,26 @@ class HybridStateEstimator:
                     t1_scale=electric_scale if t1.domain in {"ac", "dc"} else factor,
                     t2_scale=electric_scale if t2.domain in {"ac", "dc"} else factor,
                     electric_heat=False,
+                    gas_heat=False,
                     hydrogen_electric=False,
+                    gas_electric=False,
+                    steam_electric=False,
                     controlled=None,
                     dependent=None,
                     controlled_setpoint=0.0,
                     dependent_setpoint=0.0,
+                    electric=None,
+                    gas=None,
+                    heat_flow=None,
+                    heat_temperature=None,
+                    electric_setpoint=0.0,
+                    gas_setpoint=0.0,
+                    return_temperature_col=-1,
+                    supply_temperature_set=0.0,
+                    heat_capacity=1.0,
+                    power_scale=electric_scale,
+                    steam_enthalpy_col=-1,
+                    condensate_enthalpy=0.0,
                 )
             )
 
@@ -1669,6 +1890,28 @@ class HybridStateEstimator:
                 )
                 control_col = self.multi_energy_state_count + len(control_initial)
                 control_initial.append(float(dependent_setpoint))
+                controlled_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(item.controlled)
+                )
+                dependent_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(item.dependent)
+                )
+                prior_measurement_row = -1
+                if not dependent_measurement_rows:
+                    prior_measurement_row = measurement_offset + len(control_measurements)
+                    control_measurements.append(
+                        Measurement(
+                            prior_measurement_row + 1,
+                            f"coupling_state_prior_{coupling.table_name}_{coupling.idx}",
+                            str(coupling.table_name),
+                            str(coupling.name),
+                            "COUPLING_STATE_PRIOR",
+                            self.multi_energy_coupling_prior_weight,
+                            True,
+                            float(dependent_setpoint),
+                            status=MEAS_STATUS_PSEUDO,
+                        )
+                    )
                 prepared.append(
                     SimpleNamespace(
                         coupling=coupling,
@@ -1678,55 +1921,183 @@ class HybridStateEstimator:
                         t2_scale=1.0,
                         normalization=float(normalization),
                         control_col=control_col,
-                        prior_measurement_row=-1,
+                        prior_measurement_row=prior_measurement_row,
                         electric_heat=True,
+                        gas_heat=False,
                         hydrogen_electric=False,
+                        gas_electric=False,
+                        steam_electric=False,
                         controlled=item.controlled,
                         dependent=item.dependent,
                         electric=item.electric,
+                        gas=None,
                         heat_flow=item.heat_flow,
                         heat_temperature=item.heat_temperature,
                         controlled_setpoint=float(item.controlled_setpoint),
-                        controlled_measurement_rows=(
-                            self._multi_energy_endpoint_measurement_rows(item.controlled)
-                        ),
-                        dependent_measurement_rows=(
-                            self._multi_energy_endpoint_measurement_rows(item.dependent)
-                        ),
+                        controlled_measurement_rows=controlled_measurement_rows,
+                        dependent_measurement_rows=dependent_measurement_rows,
                         return_temperature_col=item.return_temperature_col,
                         supply_temperature_set=item.supply_temperature_set,
                         heat_capacity=item.heat_capacity,
                         power_scale=item.power_scale,
                         electric_setpoint=item.electric_setpoint,
+                        gas_setpoint=0.0,
+                        steam_enthalpy_col=-1,
+                        condensate_enthalpy=0.0,
+                    )
+                )
+                continue
+            if item.gas_heat:
+                heat_flow = float(
+                    endpoint_values[item.heat_flow.provider][item.heat_flow.row]
+                )
+                t_return = float(initial_state[item.return_temperature_col])
+                coefficient = float(coupling.g2h_coeff)
+                if coupling.control_type == "FLOW":
+                    dependent_setpoint = (
+                        t_return
+                        + item.gas_setpoint
+                        * coefficient
+                        / (heat_flow * item.heat_capacity)
+                        if abs(heat_flow) > 1.0e-12
+                        else item.supply_temperature_set
+                    )
+                    thermal_gap = dependent_setpoint - t_return
+                else:
+                    dependent_setpoint = (
+                        heat_flow
+                        * item.heat_capacity
+                        * (item.supply_temperature_set - t_return)
+                        / coefficient
+                    )
+                    thermal_gap = item.supply_temperature_set - t_return
+                normalization = max(
+                    1.0,
+                    abs(item.gas_setpoint * coefficient),
+                    abs(heat_flow * item.heat_capacity * thermal_gap),
+                )
+                control_col = self.multi_energy_state_count + len(control_initial)
+                control_initial.append(float(dependent_setpoint))
+                controlled_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(item.controlled)
+                )
+                dependent_measurement_rows = (
+                    self._multi_energy_endpoint_measurement_rows(item.dependent)
+                )
+                prior_measurement_row = -1
+                if not dependent_measurement_rows:
+                    prior_measurement_row = measurement_offset + len(control_measurements)
+                    control_measurements.append(
+                        Measurement(
+                            prior_measurement_row + 1,
+                            f"coupling_state_prior_{coupling.table_name}_{coupling.idx}",
+                            str(coupling.table_name),
+                            str(coupling.name),
+                            "COUPLING_STATE_PRIOR",
+                            self.multi_energy_coupling_prior_weight,
+                            True,
+                            float(dependent_setpoint),
+                            status=MEAS_STATUS_PSEUDO,
+                        )
+                    )
+                prepared.append(
+                    SimpleNamespace(
+                        coupling=coupling,
+                        t1=item.t1,
+                        t2=item.t2,
+                        t1_scale=1.0,
+                        t2_scale=1.0,
+                        normalization=float(normalization),
+                        control_col=control_col,
+                        prior_measurement_row=prior_measurement_row,
+                        electric_heat=False,
+                        gas_heat=True,
+                        hydrogen_electric=False,
+                        gas_electric=False,
+                        steam_electric=False,
+                        controlled=item.controlled,
+                        dependent=item.dependent,
+                        electric=None,
+                        gas=item.gas,
+                        heat_flow=item.heat_flow,
+                        heat_temperature=item.heat_temperature,
+                        controlled_setpoint=float(item.controlled_setpoint),
+                        controlled_measurement_rows=controlled_measurement_rows,
+                        dependent_measurement_rows=dependent_measurement_rows,
+                        return_temperature_col=item.return_temperature_col,
+                        supply_temperature_set=item.supply_temperature_set,
+                        heat_capacity=item.heat_capacity,
+                        power_scale=1.0,
+                        electric_setpoint=0.0,
+                        gas_setpoint=item.gas_setpoint,
+                        steam_enthalpy_col=-1,
+                        condensate_enthalpy=0.0,
                     )
                 )
                 continue
             t1_value = float(endpoint_values[t1.provider][t1.row])
             t2_value = float(endpoint_values[t2.provider][t2.row])
-            endpoint = item.dependent if item.hydrogen_electric else t1
+            direct_fluid_electric = (
+                item.hydrogen_electric
+                or item.gas_electric
+                or item.steam_electric
+            )
+            dependent_setpoint = float(item.dependent_setpoint)
+            if item.steam_electric:
+                dependent_setpoint = steam_electric_dependent_value(
+                    coupling,
+                    item.controlled_setpoint,
+                    item.power_scale,
+                    float(initial_state[item.steam_enthalpy_col]),
+                    item.condensate_enthalpy,
+                )
+            endpoint = item.dependent if direct_fluid_electric else t1
             endpoint_value = (
                 float(endpoint_values[endpoint.provider][endpoint.row])
-                if item.hydrogen_electric
+                if direct_fluid_electric
                 else t1_value
             )
-            normalization = (
-                max(1.0, abs(endpoint_value), abs(item.dependent_setpoint))
-                if item.hydrogen_electric
-                else max(
+            if item.steam_electric:
+                electric_value = (
+                    item.controlled_setpoint
+                    if item.controlled.domain in {"ac", "dc"}
+                    else dependent_setpoint
+                )
+                steam_flow = (
+                    item.controlled_setpoint
+                    if item.controlled.domain == "steam"
+                    else dependent_setpoint
+                )
+                steam_kw = (
+                    steam_flow
+                    * (
+                        float(initial_state[item.steam_enthalpy_col])
+                        - item.condensate_enthalpy
+                    )
+                    / 3.6
+                )
+                normalization = max(
+                    1.0,
+                    abs(electric_value * item.power_scale),
+                    abs(steam_kw * float(coupling.steam_electric_coeff)),
+                )
+            elif direct_fluid_electric:
+                normalization = max(1.0, abs(endpoint_value), abs(dependent_setpoint))
+            else:
+                normalization = max(
                     1.0,
                     abs(t1_value * t1_scale),
                     abs(t2_value * t2_scale),
                 )
-            )
             endpoint_row = endpoint_jacobians[endpoint.provider].getrow(endpoint.row)
             control_col = -1
             prior_measurement_row = -1
-            if item.hydrogen_electric or endpoint_row.nnz == 0:
+            if direct_fluid_electric or endpoint_row.nnz == 0:
                 control_col = self.multi_energy_state_count + len(control_initial)
                 control_initial.append(
-                    item.dependent_setpoint if item.hydrogen_electric else t1_value
+                    dependent_setpoint if direct_fluid_electric else t1_value
                 )
-                if not item.hydrogen_electric:
+                if not direct_fluid_electric:
                     prior_measurement_row = measurement_offset + len(control_measurements)
                     control_measurements.append(
                         Measurement(
@@ -1741,6 +2112,55 @@ class HybridStateEstimator:
                             status=MEAS_STATUS_PSEUDO,
                         )
                     )
+            controlled_measurement_rows = (
+                self._multi_energy_endpoint_measurement_rows(item.controlled)
+                if direct_fluid_electric else ()
+            )
+            dependent_measurement_rows = (
+                self._multi_energy_endpoint_measurement_rows(item.dependent)
+                if direct_fluid_electric else ()
+            )
+            prior_state_col = -1
+            if (
+                item.hydrogen_electric
+                and coupling.hydrogen_electric_direction == "E2H"
+                and coupling.control_type == "P"
+            ):
+                controlled_row = endpoint_jacobians[item.controlled.provider].getrow(
+                    item.controlled.row
+                )
+                if controlled_row.nnz:
+                    local_pos = int(
+                        np.argmax(np.abs(controlled_row.data))
+                    )
+                    state_slice = (
+                        self.electric_state_slice
+                        if item.controlled.provider == "electric"
+                        else self.fluid_state_slices[item.controlled.provider]
+                    )
+                    prior_state_col = (
+                        state_slice.start
+                        + int(controlled_row.indices[local_pos])
+                    )
+                if prior_state_col >= 0:
+                    prior_measurement_row = measurement_offset + len(control_measurements)
+                    prior_value = self._multi_energy_measured_state_prior_value(
+                        prior_state_col,
+                        float(initial_state[prior_state_col]),
+                    )
+                    control_measurements.append(
+                        Measurement(
+                            prior_measurement_row + 1,
+                            f"coupling_state_prior_{coupling.table_name}_{coupling.idx}",
+                            str(coupling.table_name),
+                            str(coupling.name),
+                            "OBSERVABILITY_STATE_PRIOR",
+                            min(self.multi_energy_coupling_prior_weight, 1.0e-6),
+                            True,
+                            prior_value,
+                            status=MEAS_STATUS_PSEUDO,
+                        )
+                    )
             prepared.append(
                 SimpleNamespace(
                     coupling=coupling,
@@ -1751,27 +2171,29 @@ class HybridStateEstimator:
                     normalization=float(normalization),
                     control_col=control_col,
                     prior_measurement_row=prior_measurement_row,
+                    prior_state_col=prior_state_col,
                     electric_heat=False,
+                    gas_heat=False,
                     hydrogen_electric=item.hydrogen_electric,
+                    gas_electric=item.gas_electric,
+                    steam_electric=item.steam_electric,
                     controlled=item.controlled,
                     dependent=item.dependent,
                     controlled_setpoint=item.controlled_setpoint,
-                    controlled_measurement_rows=(
-                        self._multi_energy_endpoint_measurement_rows(item.controlled)
-                        if item.hydrogen_electric else ()
-                    ),
-                    dependent_measurement_rows=(
-                        self._multi_energy_endpoint_measurement_rows(item.dependent)
-                        if item.hydrogen_electric else ()
-                    ),
+                    controlled_measurement_rows=controlled_measurement_rows,
+                    dependent_measurement_rows=dependent_measurement_rows,
                     electric=None,
+                    gas=None,
                     heat_flow=None,
                     heat_temperature=None,
                     return_temperature_col=-1,
                     supply_temperature_set=0.0,
                     heat_capacity=1.0,
-                    power_scale=1.0,
+                    power_scale=item.power_scale,
                     electric_setpoint=0.0,
+                    gas_setpoint=0.0,
+                    steam_enthalpy_col=item.steam_enthalpy_col,
+                    condensate_enthalpy=item.condensate_enthalpy,
                 )
             )
 
@@ -1802,21 +2224,29 @@ class HybridStateEstimator:
                     measurement_row=measurement_row,
                     control_col=item.control_col,
                     prior_measurement_row=item.prior_measurement_row,
+                    prior_state_col=getattr(item, "prior_state_col", -1),
                     electric_heat=item.electric_heat,
+                    gas_heat=item.gas_heat,
                     hydrogen_electric=item.hydrogen_electric,
+                    gas_electric=item.gas_electric,
+                    steam_electric=item.steam_electric,
                     controlled=item.controlled,
                     dependent=item.dependent,
                     electric=item.electric,
+                    gas=item.gas,
                     heat_flow=item.heat_flow,
                     heat_temperature=item.heat_temperature,
                     controlled_setpoint=item.controlled_setpoint,
                     controlled_measurement_rows=item.controlled_measurement_rows,
                     dependent_measurement_rows=item.dependent_measurement_rows,
                     electric_setpoint=item.electric_setpoint,
+                    gas_setpoint=item.gas_setpoint,
                     return_temperature_col=item.return_temperature_col,
                     supply_temperature_set=item.supply_temperature_set,
                     heat_capacity=item.heat_capacity,
                     power_scale=item.power_scale,
+                    steam_enthalpy_col=item.steam_enthalpy_col,
+                    condensate_enthalpy=item.condensate_enthalpy,
                 )
             )
             energy_measurements.append(
@@ -1866,7 +2296,7 @@ class HybridStateEstimator:
             for label in estimator.state_labels
         ] + [
             f"Coupling:{plan.coupling.table_name}:{plan.coupling.name}:"
-            f"{('TEMPERATURE' if plan.coupling.control_type == 'P' else 'POWER') if plan.electric_heat else 'DEPENDENT' if plan.hydrogen_electric else 'T1_CONTROL'}"
+            f"{'TEMPERATURE' if (plan.electric_heat and plan.coupling.control_type == 'P') or (plan.gas_heat and plan.coupling.control_type == 'FLOW') else 'POWER' if plan.electric_heat else 'GAS_FLOW' if plan.gas_heat else 'DEPENDENT' if plan.hydrogen_electric or plan.gas_electric or plan.steam_electric else 'T1_CONTROL'}"
             for plan in self.multi_energy_se_coupling_plans
             if plan.control_col >= 0
         ]
@@ -1958,6 +2388,8 @@ class HybridStateEstimator:
         for plan in self.multi_energy_se_coupling_plans:
             if plan.electric_heat:
                 dependent_value = float(state[plan.control_col])
+                if plan.prior_measurement_row >= 0:
+                    values[plan.prior_measurement_row] = dependent_value
                 source_flow = float(
                     endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
                 )
@@ -1986,19 +2418,20 @@ class HybridStateEstimator:
                     plan.power_scale,
                 ) / plan.normalization
                 continue
-            if plan.hydrogen_electric:
-                dependent_value = (
-                    float(state[plan.control_col])
-                    if plan.control_col >= 0
-                    else float(
-                        endpoint_values[plan.dependent.provider][plan.dependent.row]
-                    )
+            if plan.gas_heat:
+                dependent_value = float(state[plan.control_col])
+                if plan.prior_measurement_row >= 0:
+                    values[plan.prior_measurement_row] = dependent_value
+                heat_flow = float(
+                    endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
                 )
-                expected = hydrogen_electric_dependent_value(
-                    plan.coupling,
-                    plan.controlled_setpoint,
-                    float(getattr(self.network, "p_base_kW", self.p_base_kW)),
-                )
+                t_return = float(state[plan.return_temperature_col])
+                if plan.coupling.control_type == "FLOW":
+                    gas_flow = plan.gas_setpoint
+                    t_out = dependent_value
+                else:
+                    gas_flow = dependent_value
+                    t_out = plan.supply_temperature_set
                 if plan.controlled_measurement_rows:
                     values[np.asarray(plan.controlled_measurement_rows, dtype=np.int64)] = (
                         plan.controlled_setpoint
@@ -2007,9 +2440,62 @@ class HybridStateEstimator:
                     values[np.asarray(plan.dependent_measurement_rows, dtype=np.int64)] = (
                         dependent_value
                     )
-                values[plan.measurement_row] = (
-                    dependent_value - expected
+                values[plan.measurement_row] = gas_heat_balance_residual(
+                    plan.coupling,
+                    gas_flow,
+                    heat_flow,
+                    t_out,
+                    t_return,
+                    plan.heat_capacity,
                 ) / plan.normalization
+                continue
+            if plan.hydrogen_electric or plan.gas_electric or plan.steam_electric:
+                dependent_value = (
+                    float(state[plan.control_col])
+                    if plan.control_col >= 0
+                    else float(
+                        endpoint_values[plan.dependent.provider][plan.dependent.row]
+                    )
+                )
+                if plan.prior_measurement_row >= 0:
+                    prior_col = (
+                        plan.prior_state_col
+                        if plan.prior_state_col >= 0
+                        else plan.control_col
+                    )
+                    values[plan.prior_measurement_row] = state[prior_col]
+                if plan.hydrogen_electric and plan.controlled_measurement_rows:
+                    values[np.asarray(plan.controlled_measurement_rows, dtype=np.int64)] = (
+                        plan.controlled_setpoint
+                    )
+                if plan.dependent_measurement_rows:
+                    values[np.asarray(plan.dependent_measurement_rows, dtype=np.int64)] = (
+                        dependent_value
+                    )
+                if plan.hydrogen_electric:
+                    expected = hydrogen_electric_dependent_value(
+                        plan.coupling,
+                        plan.controlled_setpoint,
+                        plan.power_scale,
+                    )
+                    coupling_residual = dependent_value - expected
+                elif plan.gas_electric:
+                    expected = gas_electric_dependent_value(
+                        plan.coupling,
+                        plan.controlled_setpoint,
+                        plan.power_scale,
+                    )
+                    coupling_residual = dependent_value - expected
+                else:
+                    expected = steam_electric_dependent_value(
+                        plan.coupling,
+                        plan.controlled_setpoint,
+                        plan.power_scale,
+                        float(state[plan.steam_enthalpy_col]),
+                        plan.condensate_enthalpy,
+                    )
+                    coupling_residual = dependent_value - expected
+                values[plan.measurement_row] = coupling_residual / plan.normalization
                 continue
             if plan.control_col >= 0:
                 t1_value = float(state[plan.control_col])
@@ -2075,16 +2561,27 @@ class HybridStateEstimator:
                 format="csr",
             )
         if any(
-            plan.hydrogen_electric or plan.electric_heat
+            plan.hydrogen_electric
+            or plan.gas_electric
+            or plan.steam_electric
+            or plan.electric_heat
+            or plan.gas_heat
             for plan in self.multi_energy_se_coupling_plans
         ):
             local_jacobian = local_jacobian.tolil()
             for plan in self.multi_energy_se_coupling_plans:
-                if not (plan.hydrogen_electric or plan.electric_heat):
+                if not (
+                    plan.hydrogen_electric
+                    or plan.gas_electric
+                    or plan.steam_electric
+                    or plan.electric_heat
+                    or plan.gas_heat
+                ):
                     continue
-                for row in plan.controlled_measurement_rows:
-                    local_jacobian.rows[row] = []
-                    local_jacobian.data[row] = []
+                if plan.electric_heat or plan.gas_heat or plan.hydrogen_electric:
+                    for row in plan.controlled_measurement_rows:
+                        local_jacobian.rows[row] = []
+                        local_jacobian.data[row] = []
                 if plan.control_col < 0:
                     continue
                 for row in plan.dependent_measurement_rows:
@@ -2102,6 +2599,14 @@ class HybridStateEstimator:
         for plan in self.multi_energy_se_coupling_plans:
             local_row = plan.measurement_row - added_row_offset
             if plan.electric_heat:
+                if plan.prior_measurement_row >= 0:
+                    rows.append(plan.prior_measurement_row - added_row_offset)
+                    cols.append(
+                        plan.prior_state_col
+                        if plan.prior_state_col >= 0
+                        else plan.control_col
+                    )
+                    data.append(1.0)
                 source_flow = float(
                     endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
                 )
@@ -2139,11 +2644,81 @@ class HybridStateEstimator:
                     / plan.normalization
                 )
                 continue
-            if plan.hydrogen_electric:
+            if plan.gas_heat:
+                if plan.prior_measurement_row >= 0:
+                    rows.append(plan.prior_measurement_row - added_row_offset)
+                    cols.append(plan.control_col)
+                    data.append(1.0)
+                heat_flow = float(
+                    endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
+                )
+                t_return = float(state[plan.return_temperature_col])
+                t_out = (
+                    float(state[plan.control_col])
+                    if plan.coupling.control_type == "FLOW"
+                    else plan.supply_temperature_set
+                )
+                heat_slice = self.fluid_state_slices[plan.heat_flow.provider]
+                self._append_multi_energy_endpoint_jacobian(
+                    rows,
+                    cols,
+                    data,
+                    target_row=local_row,
+                    endpoint=plan.heat_flow,
+                    endpoint_jacobians=endpoint_jacobians,
+                    state_slice=heat_slice,
+                    scale=(
+                        -plan.heat_capacity
+                        * (t_out - t_return)
+                        / plan.normalization
+                    ),
+                )
+                rows.append(local_row)
+                cols.append(plan.return_temperature_col)
+                data.append(heat_flow * plan.heat_capacity / plan.normalization)
+                rows.append(local_row)
+                cols.append(plan.control_col)
+                data.append(
+                    -heat_flow * plan.heat_capacity / plan.normalization
+                    if plan.coupling.control_type == "FLOW"
+                    else float(plan.coupling.g2h_coeff) / plan.normalization
+                )
+                continue
+            if plan.hydrogen_electric or plan.gas_electric or plan.steam_electric:
+                if plan.prior_measurement_row >= 0:
+                    rows.append(plan.prior_measurement_row - added_row_offset)
+                    cols.append(
+                        plan.prior_state_col
+                        if plan.prior_state_col >= 0
+                        else plan.control_col
+                    )
+                    data.append(1.0)
                 if plan.control_col >= 0:
                     rows.append(local_row)
                     cols.append(plan.control_col)
-                    data.append(1.0 / plan.normalization)
+                    if not plan.steam_electric:
+                        data.append(1.0 / plan.normalization)
+                    else:
+                        enthalpy_gap = (
+                            float(state[plan.steam_enthalpy_col])
+                            - plan.condensate_enthalpy
+                        )
+                        expected = steam_electric_dependent_value(
+                            plan.coupling,
+                            plan.controlled_setpoint,
+                            plan.power_scale,
+                            float(state[plan.steam_enthalpy_col]),
+                            plan.condensate_enthalpy,
+                        )
+                        data.append(1.0 / plan.normalization)
+                        rows.append(local_row)
+                        cols.append(plan.steam_enthalpy_col)
+                        enthalpy_derivative = (
+                            expected / enthalpy_gap
+                            if plan.coupling.control_type == "P"
+                            else -expected / enthalpy_gap
+                        )
+                        data.append(enthalpy_derivative / plan.normalization)
                 else:
                     dependent_slice = (
                         self.electric_state_slice
@@ -2239,6 +2814,29 @@ class HybridStateEstimator:
             x[self._multi_energy_fluid_potential_cols] = np.maximum(
                 x[self._multi_energy_fluid_potential_cols],
                 1.0e-12,
+            )
+        steam_estimator = self.fluid_estimators.get("steam")
+        if steam_estimator is not None:
+            state_slice = self.fluid_state_slices["steam"]
+            enthalpy_start = state_slice.start + steam_estimator.base_enthalpy
+            minimum_enthalpy = max(
+                float(steam_estimator.network.medium.feedwater_enthalpy),
+                float(np.max(steam_estimator.network.load_condensate_enthalpy))
+                if steam_estimator.network.load_condensate_enthalpy.size
+                else -np.inf,
+            ) + 1.0e-6
+            maximum_enthalpy = max(
+                float(np.max(steam_estimator.network.source_enthalpy_set))
+                if steam_estimator.network.source_enthalpy_set.size
+                else -np.inf,
+                float(np.max(steam_estimator.network.node_enthalpy))
+                if steam_estimator.network.node_enthalpy.size
+                else -np.inf,
+            )
+            x[enthalpy_start:state_slice.stop] = np.clip(
+                x[enthalpy_start:state_slice.stop],
+                minimum_enthalpy,
+                maximum_enthalpy,
             )
         return x
 
@@ -8484,6 +9082,9 @@ class HybridStateEstimator:
             t1_value = None
             t2_value = None
             residual = None
+            source_flow = None
+            t_out = None
+            t_return = None
             if not coupling.active:
                 status = "inactive"
             elif plan is not None and endpoint_values:
@@ -8516,7 +9117,35 @@ class HybridStateEstimator:
                         plan.heat_capacity,
                         plan.power_scale,
                     )
-                elif plan.hydrogen_electric:
+                elif plan.gas_heat:
+                    dependent_value = float(
+                        self.multi_energy_estimate_result.x[plan.control_col]
+                    )
+                    source_flow = float(
+                        endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
+                    )
+                    t_return = float(
+                        self.multi_energy_estimate_result.x[plan.return_temperature_col]
+                    )
+                    if coupling.control_type == "FLOW":
+                        gas_value = plan.gas_setpoint
+                        t_out = dependent_value
+                    else:
+                        gas_value = dependent_value
+                        t_out = plan.supply_temperature_set
+                    if plan.t1 == plan.gas:
+                        t1_value, t2_value = gas_value, t_out
+                    else:
+                        t1_value, t2_value = t_out, gas_value
+                    residual = gas_heat_balance_residual(
+                        coupling,
+                        gas_value,
+                        source_flow,
+                        t_out,
+                        t_return,
+                        plan.heat_capacity,
+                    )
+                elif plan.hydrogen_electric or plan.gas_electric or plan.steam_electric:
                     dependent_value = (
                         float(self.multi_energy_estimate_result.x[plan.control_col])
                         if plan.control_col >= 0
@@ -8532,13 +9161,36 @@ class HybridStateEstimator:
                     electric_value = (
                         t1_value if plan.t1.domain in {"ac", "dc"} else t2_value
                     )
-                    hydro_value = t1_value if plan.t1.domain == "hydro" else t2_value
-                    residual = hydrogen_electric_balance_residual(
-                        coupling,
-                        electric_value,
-                        hydro_value,
-                        float(getattr(self.network, "p_base_kW", self.p_base_kW)),
-                    )
+                    if plan.hydrogen_electric:
+                        fluid_value = t1_value if plan.t1.domain == "hydro" else t2_value
+                        residual = hydrogen_electric_balance_residual(
+                            coupling,
+                            electric_value,
+                            fluid_value,
+                            plan.power_scale,
+                        )
+                    elif plan.gas_electric:
+                        fluid_value = t1_value if plan.t1.domain == "gas" else t2_value
+                        residual = gas_electric_balance_residual(
+                            coupling,
+                            electric_value,
+                            fluid_value,
+                            plan.power_scale,
+                        )
+                    else:
+                        fluid_value = t1_value if plan.t1.domain == "steam" else t2_value
+                        residual = steam_electric_balance_residual(
+                            coupling,
+                            electric_value,
+                            fluid_value,
+                            float(
+                                self.multi_energy_estimate_result.x[
+                                    plan.steam_enthalpy_col
+                                ]
+                            ),
+                            plan.condensate_enthalpy,
+                            plan.power_scale,
+                        )
                 else:
                     t1_value = (
                         float(self.multi_energy_estimate_result.x[plan.control_col])
@@ -8570,23 +9222,28 @@ class HybridStateEstimator:
                     control_type=coupling.control_type,
                     e2h_coeff=coupling.e2h_coeff,
                     h2e_coeff=coupling.h2e_coeff,
+                    e2g_coeff=coupling.e2g_coeff,
+                    g2e_coeff=coupling.g2e_coeff,
+                    e2s_coeff=coupling.e2s_coeff,
+                    s2e_coeff=coupling.s2e_coeff,
+                    g2h_coeff=coupling.g2h_coeff,
                     efficiency=coupling.efficiency,
                     energy_factor=coupling.energy_factor,
                     t1_value=t1_value,
                     t2_value=t2_value,
                     source_flow=(
                         source_flow
-                        if plan is not None and plan.electric_heat and endpoint_values
+                        if plan is not None and (plan.electric_heat or plan.gas_heat) and endpoint_values
                         else None
                     ),
                     supply_temperature=(
                         t_out
-                        if plan is not None and plan.electric_heat and endpoint_values
+                        if plan is not None and (plan.electric_heat or plan.gas_heat) and endpoint_values
                         else None
                     ),
                     return_temperature=(
                         t_return
-                        if plan is not None and plan.electric_heat and endpoint_values
+                        if plan is not None and (plan.electric_heat or plan.gas_heat) and endpoint_values
                         else None
                     ),
                     residual=residual,

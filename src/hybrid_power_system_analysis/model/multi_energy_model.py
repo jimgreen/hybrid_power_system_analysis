@@ -18,7 +18,10 @@ from model.effective_state import propagate_composite_run_states
 FLUID_SYSTEM_PREFIXES = ("Heat", "Gas", "Hydro", "Steam")
 FLUID_SYSTEM_KEYS = tuple(prefix.lower() for prefix in FLUID_SYSTEM_PREFIXES)
 HYDROGEN_ELECTRIC_CONTROL_TYPES = frozenset(("P", "FLOW"))
+GAS_ELECTRIC_CONTROL_TYPES = frozenset(("P", "FLOW"))
+STEAM_ELECTRIC_CONTROL_TYPES = frozenset(("P", "FLOW"))
 ELECTRIC_HEAT_CONTROL_TYPES = frozenset(("P", "T_OUT"))
+GAS_HEAT_CONTROL_TYPES = frozenset(("FLOW", "T_OUT"))
 
 _NETWORK_BUILDERS = {
     "heat": build_heat_network_from_model,
@@ -64,6 +67,11 @@ class EnergyCoupling:
     efficiency: float = 1.0
     e2h_coeff: Optional[float] = None
     h2e_coeff: Optional[float] = None
+    e2g_coeff: Optional[float] = None
+    g2e_coeff: Optional[float] = None
+    e2s_coeff: Optional[float] = None
+    s2e_coeff: Optional[float] = None
+    g2h_coeff: Optional[float] = None
     energy_factor: Optional[float] = None
     control_type: str = "MONITOR"
     active: bool = True
@@ -75,6 +83,14 @@ class EnergyCoupling:
         if self.is_hydrogen_electric_control:
             coefficient = self.hydrogen_electric_coeff
             return coefficient is not None and coefficient > 0.0
+        if self.is_gas_electric_control:
+            coefficient = self.gas_electric_coeff
+            return coefficient is not None and coefficient > 0.0
+        if self.is_steam_electric_control:
+            coefficient = self.steam_electric_coeff
+            return coefficient is not None and coefficient > 0.0
+        if self.is_gas_heat_control:
+            return self.g2h_coeff is not None and self.g2h_coeff > 0.0
         return self.energy_factor is not None
 
     @property
@@ -98,6 +114,46 @@ class EnergyCoupling:
         )
 
     @property
+    def gas_electric_direction(self) -> Optional[str]:
+        match = _COUPLING_TABLE_RE.match(self.table_name)
+        if match is None:
+            return None
+        source_domain = _normalize_domain(match.group(1))
+        target_domain = _normalize_domain(match.group(2))
+        if source_domain in {"ac", "dc"} and target_domain == "gas":
+            return "E2G"
+        if source_domain == "gas" and target_domain in {"ac", "dc"}:
+            return "G2E"
+        return None
+
+    @property
+    def is_gas_electric_control(self) -> bool:
+        return (
+            self.gas_electric_direction is not None
+            and self.control_type in GAS_ELECTRIC_CONTROL_TYPES
+        )
+
+    @property
+    def steam_electric_direction(self) -> Optional[str]:
+        match = _COUPLING_TABLE_RE.match(self.table_name)
+        if match is None:
+            return None
+        source_domain = _normalize_domain(match.group(1))
+        target_domain = _normalize_domain(match.group(2))
+        if source_domain in {"ac", "dc"} and target_domain == "steam":
+            return "E2S"
+        if source_domain == "steam" and target_domain in {"ac", "dc"}:
+            return "S2E"
+        return None
+
+    @property
+    def is_steam_electric_control(self) -> bool:
+        return (
+            self.steam_electric_direction is not None
+            and self.control_type in STEAM_ELECTRIC_CONTROL_TYPES
+        )
+
+    @property
     def electric_heat_direction(self) -> Optional[str]:
         match = _COUPLING_TABLE_RE.match(self.table_name)
         if match is None:
@@ -116,11 +172,43 @@ class EnergyCoupling:
         )
 
     @property
+    def gas_heat_direction(self) -> Optional[str]:
+        match = _COUPLING_TABLE_RE.match(self.table_name)
+        if match is None:
+            return None
+        source_domain = _normalize_domain(match.group(1))
+        target_domain = _normalize_domain(match.group(2))
+        return "G2HEAT" if source_domain == "gas" and target_domain == "heat" else None
+
+    @property
+    def is_gas_heat_control(self) -> bool:
+        return (
+            self.gas_heat_direction is not None
+            and self.control_type in GAS_HEAT_CONTROL_TYPES
+        )
+
+    @property
     def hydrogen_electric_coeff(self) -> Optional[float]:
         if self.hydrogen_electric_direction == "E2H":
             return self.e2h_coeff
         if self.hydrogen_electric_direction == "H2E":
             return self.h2e_coeff
+        return None
+
+    @property
+    def gas_electric_coeff(self) -> Optional[float]:
+        if self.gas_electric_direction == "E2G":
+            return self.e2g_coeff
+        if self.gas_electric_direction == "G2E":
+            return self.g2e_coeff
+        return None
+
+    @property
+    def steam_electric_coeff(self) -> Optional[float]:
+        if self.steam_electric_direction == "E2S":
+            return self.e2s_coeff
+        if self.steam_electric_direction == "S2E":
+            return self.s2e_coeff
         return None
 
     @property
@@ -138,6 +226,20 @@ class EnergyCoupling:
         return None
 
     @property
+    def gas_terminal(self) -> Optional[EnergyTerminal]:
+        for terminal in (self.t1, self.t2):
+            if terminal.domain == "gas":
+                return terminal
+        return None
+
+    @property
+    def steam_terminal(self) -> Optional[EnergyTerminal]:
+        for terminal in (self.t1, self.t2):
+            if terminal.domain == "steam":
+                return terminal
+        return None
+
+    @property
     def heat_terminal(self) -> Optional[EnergyTerminal]:
         for terminal in (self.t1, self.t2):
             if terminal.domain == "heat":
@@ -148,17 +250,33 @@ class EnergyCoupling:
     def controlled_terminal(self) -> Optional[EnergyTerminal]:
         if self.is_electric_heat_control:
             return self.electric_terminal if self.control_type == "P" else self.heat_terminal
-        if not self.is_hydrogen_electric_control:
+        if self.is_gas_heat_control:
+            return self.gas_terminal if self.control_type == "FLOW" else self.heat_terminal
+        if self.is_hydrogen_electric_control:
+            fluid_terminal = self.hydro_terminal
+        elif self.is_gas_electric_control:
+            fluid_terminal = self.gas_terminal
+        elif self.is_steam_electric_control:
+            fluid_terminal = self.steam_terminal
+        else:
             return None
-        return self.electric_terminal if self.control_type == "P" else self.hydro_terminal
+        return self.electric_terminal if self.control_type == "P" else fluid_terminal
 
     @property
     def dependent_terminal(self) -> Optional[EnergyTerminal]:
         if self.is_electric_heat_control:
             return self.heat_terminal if self.control_type == "P" else self.electric_terminal
-        if not self.is_hydrogen_electric_control:
+        if self.is_gas_heat_control:
+            return self.heat_terminal if self.control_type == "FLOW" else self.gas_terminal
+        if self.is_hydrogen_electric_control:
+            fluid_terminal = self.hydro_terminal
+        elif self.is_gas_electric_control:
+            fluid_terminal = self.gas_terminal
+        elif self.is_steam_electric_control:
+            fluid_terminal = self.steam_terminal
+        else:
             return None
-        return self.hydro_terminal if self.control_type == "P" else self.electric_terminal
+        return fluid_terminal if self.control_type == "P" else self.electric_terminal
 
 
 @dataclass
@@ -276,6 +394,153 @@ def hydrogen_electric_balance_residual(
     if coupling.hydrogen_electric_direction == "H2E":
         return power_kw - flow * coefficient
     raise ValueError(f"{coupling.table_name}:{coupling.name} is not an electric/H2 coupling")
+
+
+def gas_electric_dependent_value(
+    coupling: EnergyCoupling,
+    controlled_value: float,
+    p_base_kw: float,
+) -> float:
+    """Convert a P/FLOW gas-electric setpoint into its dependent endpoint."""
+    if not coupling.is_gas_electric_control:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} is not P/FLOW controlled")
+    coefficient = coupling.gas_electric_coeff
+    power_base = float(p_base_kw)
+    value = float(controlled_value)
+    if coefficient is None or coefficient <= 0.0:
+        field = "e2g_coeff" if coupling.gas_electric_direction == "E2G" else "g2e_coeff"
+        raise ValueError(f"{coupling.table_name}:{coupling.name} {field} must be positive")
+    if power_base <= 0.0:
+        raise ValueError("electric power base must be positive")
+    if value < 0.0:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} setpoint must be non-negative")
+
+    if coupling.control_type == "P":
+        power_kw = value * power_base
+        return (
+            power_kw * coefficient
+            if coupling.gas_electric_direction == "E2G"
+            else power_kw / coefficient
+        )
+    return (
+        value / coefficient / power_base
+        if coupling.gas_electric_direction == "E2G"
+        else value * coefficient / power_base
+    )
+
+
+def gas_electric_balance_residual(
+    coupling: EnergyCoupling,
+    electric_power_pu: float,
+    gas_flow: float,
+    p_base_kw: float,
+) -> float:
+    """Return gas/electric conversion mismatch in flow or kW units."""
+    power_kw = float(electric_power_pu) * float(p_base_kw)
+    flow = float(gas_flow)
+    coefficient = coupling.gas_electric_coeff
+    if coefficient is None or coefficient <= 0.0:
+        field = "e2g_coeff" if coupling.gas_electric_direction == "E2G" else "g2e_coeff"
+        raise ValueError(f"{coupling.table_name}:{coupling.name} {field} must be positive")
+    if coupling.gas_electric_direction == "E2G":
+        return flow - power_kw * coefficient
+    if coupling.gas_electric_direction == "G2E":
+        return power_kw - flow * coefficient
+    raise ValueError(f"{coupling.table_name}:{coupling.name} is not an electric/gas coupling")
+
+
+def steam_electric_dependent_value(
+    coupling: EnergyCoupling,
+    controlled_value: float,
+    p_base_kw: float,
+    steam_enthalpy: float,
+    condensate_enthalpy: float,
+) -> float:
+    """Convert a steam/electric setpoint using mass flow and specific enthalpy.
+
+    Steam flow is interpreted as t/h and enthalpy as kJ/kg. ``e2s_coeff`` and
+    ``s2e_coeff`` are dimensionless conversion efficiencies.
+    """
+    if not coupling.is_steam_electric_control:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} is not P/FLOW controlled")
+    coefficient = coupling.steam_electric_coeff
+    power_base = float(p_base_kw)
+    value = float(controlled_value)
+    enthalpy_power = (
+        float(steam_enthalpy) - float(condensate_enthalpy)
+    ) / 3.6
+    if coefficient is None or coefficient <= 0.0:
+        field = "e2s_coeff" if coupling.steam_electric_direction == "E2S" else "s2e_coeff"
+        raise ValueError(f"{coupling.table_name}:{coupling.name} {field} must be positive")
+    if power_base <= 0.0:
+        raise ValueError("electric power base must be positive")
+    if enthalpy_power <= 0.0:
+        raise ValueError(
+            f"{coupling.table_name}:{coupling.name} steam enthalpy must exceed condensate enthalpy"
+        )
+    if value < 0.0:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} setpoint must be non-negative")
+
+    if coupling.control_type == "P":
+        power_kw = value * power_base
+        return (
+            power_kw * coefficient / enthalpy_power
+            if coupling.steam_electric_direction == "E2S"
+            else power_kw / (enthalpy_power * coefficient)
+        )
+    return (
+        value * enthalpy_power / coefficient / power_base
+        if coupling.steam_electric_direction == "E2S"
+        else value * enthalpy_power * coefficient / power_base
+    )
+
+
+def steam_electric_balance_residual(
+    coupling: EnergyCoupling,
+    electric_power_pu: float,
+    steam_flow: float,
+    steam_enthalpy: float,
+    condensate_enthalpy: float,
+    p_base_kw: float,
+) -> float:
+    """Return steam/electric conversion mismatch in kW."""
+    power_kw = float(electric_power_pu) * float(p_base_kw)
+    steam_kw = (
+        float(steam_flow)
+        * (float(steam_enthalpy) - float(condensate_enthalpy))
+        / 3.6
+    )
+    coefficient = coupling.steam_electric_coeff
+    if coefficient is None or coefficient <= 0.0:
+        field = "e2s_coeff" if coupling.steam_electric_direction == "E2S" else "s2e_coeff"
+        raise ValueError(f"{coupling.table_name}:{coupling.name} {field} must be positive")
+    if coupling.steam_electric_direction == "E2S":
+        return steam_kw - power_kw * coefficient
+    if coupling.steam_electric_direction == "S2E":
+        return power_kw - steam_kw * coefficient
+    raise ValueError(f"{coupling.table_name}:{coupling.name} is not an electric/steam coupling")
+
+
+def gas_heat_balance_residual(
+    coupling: EnergyCoupling,
+    gas_flow: float,
+    heat_flow: float,
+    supply_temperature: float,
+    return_temperature: float,
+    heat_capacity: float,
+) -> float:
+    """Return gas input minus delivered heat in kW."""
+    if not coupling.is_gas_heat_control:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} is not gas/heat controlled")
+    coefficient = coupling.g2h_coeff
+    if coefficient is None or coefficient <= 0.0:
+        raise ValueError(f"{coupling.table_name}:{coupling.name} g2h_coeff must be positive")
+    return (
+        float(gas_flow) * float(coefficient)
+        - float(heat_flow)
+        * float(heat_capacity)
+        * (float(supply_temperature) - float(return_temperature))
+    )
 
 
 def electric_heat_balance_residual(
@@ -401,45 +666,70 @@ def _parse_couplings(model) -> Tuple[List[EnergyCoupling], List[str]]:
                 for endpoint in (t1_row, t2_row)
             )
             direction = None
-            if t1_domain in {"ac", "dc"} and t2_domain == "hydro":
-                direction = "E2H"
-            elif t1_domain == "hydro" and t2_domain in {"ac", "dc"}:
-                direction = "H2E"
+            for fluid_domain, token in (("hydro", "H"), ("gas", "G"), ("steam", "S")):
+                if t1_domain in {"ac", "dc"} and t2_domain == fluid_domain:
+                    direction = f"E2{token}"
+                    break
+                if t1_domain == fluid_domain and t2_domain in {"ac", "dc"}:
+                    direction = f"{token}2E"
+                    break
             electric_heat = t1_domain in {"ac", "dc"} and t2_domain == "heat"
-            coefficient_names = (
-                ("e2h_coeff",)
-                if direction == "E2H" or electric_heat
-                else ("h2e_coeff",)
+            gas_heat = t1_domain == "gas" and t2_domain == "heat"
+            coefficient_field = {
+                "E2H": "e2h_coeff",
+                "H2E": "h2e_coeff",
+                "E2G": "e2g_coeff",
+                "G2E": "g2e_coeff",
+                "E2S": "e2s_coeff",
+                "S2E": "s2e_coeff",
+            }.get(direction)
+            if electric_heat:
+                coefficient_field = "e2h_coeff"
+            elif gas_heat:
+                coefficient_field = "g2h_coeff"
+            coefficient = (
+                _float(row, (coefficient_field,), None)
+                if coefficient_field is not None
+                else None
             )
-            coefficient = _float(row, coefficient_names, None)
             default_control_type = (
                 "P"
                 if electric_heat and coefficient is not None
+                else "FLOW"
+                if gas_heat and coefficient is not None
                 else
                 "FLOW"
-                if direction == "E2H" and coefficient is not None
+                if direction in {"E2H", "E2G", "E2S"} and coefficient is not None
                 else "P"
-                if direction == "H2E" and coefficient is not None
+                if direction in {"H2E", "G2E", "S2E"} and coefficient is not None
                 else "MONITOR"
             )
             control_type = normalize_energy_coupling_control_type(
                 _text(row, "control_type", default_control_type)
             )
             direct_control = (
-                (direction is not None and control_type in HYDROGEN_ELECTRIC_CONTROL_TYPES)
+                (direction in {"E2H", "H2E"} and control_type in HYDROGEN_ELECTRIC_CONTROL_TYPES)
+                or (direction in {"E2G", "G2E"} and control_type in GAS_ELECTRIC_CONTROL_TYPES)
+                or (direction in {"E2S", "S2E"} and control_type in STEAM_ELECTRIC_CONTROL_TYPES)
                 or (electric_heat and control_type in ELECTRIC_HEAT_CONTROL_TYPES)
+                or (gas_heat and control_type in GAS_HEAT_CONTROL_TYPES)
             )
             if direct_control and (coefficient is None or coefficient <= 0.0):
                 unit = (
                     "kWh/kWh"
                     if electric_heat
+                    else "kWh/Nm3"
+                    if direction == "G2E" or gas_heat
+                    else "Nm3/kWh"
+                    if direction == "E2G"
+                    else "dimensionless"
+                    if direction in {"E2S", "S2E"}
                     else "Nm3/kWh"
                     if direction == "E2H"
                     else "kWh/Nm3"
                 )
-                field = "e2h_coeff" if direction == "E2H" or electric_heat else "h2e_coeff"
                 warnings.append(
-                    f"{table_name}:{coupling_name} requires positive {field} ({unit})"
+                    f"{table_name}:{coupling_name} requires positive {coefficient_field} ({unit})"
                 )
                 coefficient = 0.0
             generic_efficiency = _float(
@@ -464,6 +754,31 @@ def _parse_couplings(model) -> Tuple[List[EnergyCoupling], List[str]]:
                     h2e_coeff=(
                         float(coefficient)
                         if direction == "H2E" and coefficient is not None
+                        else None
+                    ),
+                    e2g_coeff=(
+                        float(coefficient)
+                        if direction == "E2G" and coefficient is not None
+                        else None
+                    ),
+                    g2e_coeff=(
+                        float(coefficient)
+                        if direction == "G2E" and coefficient is not None
+                        else None
+                    ),
+                    e2s_coeff=(
+                        float(coefficient)
+                        if direction == "E2S" and coefficient is not None
+                        else None
+                    ),
+                    s2e_coeff=(
+                        float(coefficient)
+                        if direction == "S2E" and coefficient is not None
+                        else None
+                    ),
+                    g2h_coeff=(
+                        float(coefficient)
+                        if gas_heat and coefficient is not None
                         else None
                     ),
                     energy_factor=_float(

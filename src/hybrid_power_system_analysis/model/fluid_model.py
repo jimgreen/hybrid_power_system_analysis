@@ -138,6 +138,7 @@ class FluidSource:
     flow_max: float = np.inf
     supply_temperature: float = 80.0
     supply_temperature_set: Optional[float] = None
+    return_temperature_set: float = 50.0
     enthalpy_set: float = 3000.0
     run_stat: int = 1
     supply_node: Optional[int] = None
@@ -149,11 +150,16 @@ class FluidSource:
         else:
             self.supply_temperature_set = float(self.supply_temperature_set)
             self.supply_temperature = self.supply_temperature_set
+        self.return_temperature_set = float(self.return_temperature_set)
 
 
 @dataclass(slots=True)
 class FluidStorage(FluidSource):
-    """Bidirectional source-equivalent storage; positive flow discharges to the node."""
+    """Bidirectional source equivalent; positive flow discharges to the network.
+
+    In an explicit-return heat network, discharge injects at the supply port and
+    charge injects the cooled medium at the return port.
+    """
 
 
 @dataclass(slots=True)
@@ -571,6 +577,9 @@ class FluidNetwork:
         self.source_supply_temperature_set = np.asarray(
             [item.supply_temperature_set for item in self.sources], dtype=np.float64
         )
+        self.source_return_temperature_set = np.asarray(
+            [item.return_temperature_set for item in self.sources], dtype=np.float64
+        )
         # Compatibility view for thermal transport code and existing result APIs.
         self.source_supply_temperature = self.source_supply_temperature_set
         self.source_enthalpy_set = np.asarray([item.enthalpy_set for item in self.sources], dtype=np.float64)
@@ -883,6 +892,11 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
             "supply_temperature_set",
             legacy_temperature,
         )
+        return_temperature_set = _float(
+            row,
+            "return_temperature_set",
+            _float(row, "return_temperature", 50.0 if thermal else 20.0),
+        )
         sources.append(
             FluidSource(
                 idx=_int(row, "idx"),
@@ -896,6 +910,7 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
                 flow_max=_float(row, "flow_max", np.inf),
                 supply_temperature=supply_temperature_set,
                 supply_temperature_set=supply_temperature_set,
+                return_temperature_set=return_temperature_set,
                 enthalpy_set=_float(row, "enthalpy_set", _float(row, "h_set", 3000.0)),
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int(row, "supply_node"),
@@ -920,6 +935,11 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
             "supply_temperature_set",
             legacy_temperature,
         )
+        return_temperature_set = _float(
+            row,
+            "return_temperature_set",
+            _float(row, "return_temperature", 50.0 if thermal else 20.0),
+        )
         storages.append(
             FluidStorage(
                 idx=_int(row, "idx"),
@@ -936,6 +956,7 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
                 flow_max=_float(row, "flow_max", max_discharge_flow),
                 supply_temperature=supply_temperature_set,
                 supply_temperature_set=supply_temperature_set,
+                return_temperature_set=return_temperature_set,
                 enthalpy_set=_float(row, "enthalpy_set", _float(row, "h_set", 3000.0)),
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int(row, "supply_node"),

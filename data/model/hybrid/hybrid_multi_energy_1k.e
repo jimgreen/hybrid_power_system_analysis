@@ -2658,12 +2658,12 @@
 </DcE2Heat>
 
 <Gas2DcE>
-@ idx name run_stat idx_gas_load_t1 idx_dc_unit_t2 efficiency energy_factor
-# 1 gas2dce_1 1 1 15 0.4 750.0
-# 2 gas2dce_2 1 2 16 0.4 750.0
-# 3 gas2dce_3 1 3 17 0.4 750.0
-# 4 gas2dce_4 1 4 18 0.4 750.0
-# 5 gas2dce_5 1 5 19 0.4 750.0
+@ idx name run_stat control_type idx_gas_load_t1 idx_dc_unit_t2 g2e_coeff
+# 1 gas2dce_1 1 P 1 15 300.0
+# 2 gas2dce_2 1 FLOW 2 16 300.0
+# 3 gas2dce_3 1 P 3 17 300.0
+# 4 gas2dce_4 1 FLOW 4 18 300.0
+# 5 gas2dce_5 1 P 5 19 300.0
 </Gas2DcE>
 
 <DcE2Hydro>
@@ -2676,21 +2676,21 @@
 </DcE2Hydro>
 
 <Steam2AcE>
-@ idx name run_stat idx_steam_load_t1 idx_ac_unit_t2 efficiency energy_factor
-# 1 steam2ace_1 1 1 5 0.35 857.1428571428571
-# 2 steam2ace_2 1 2 6 0.35 857.1428571428571
-# 3 steam2ace_3 1 3 7 0.35 857.1428571428571
-# 4 steam2ace_4 1 4 8 0.35 857.1428571428571
-# 5 steam2ace_5 1 5 9 0.35 857.1428571428571
+@ idx name run_stat control_type idx_steam_load_t1 idx_ac_unit_t2 s2e_coeff
+# 1 steam2ace_1 1 P 1 5 0.35
+# 2 steam2ace_2 1 FLOW 2 6 0.35
+# 3 steam2ace_3 1 P 3 7 0.35
+# 4 steam2ace_4 1 FLOW 4 8 0.35
+# 5 steam2ace_5 1 P 5 9 0.35
 </Steam2AcE>
 
 <Gas2AcE>
-@ idx name run_stat idx_gas_load_t1 idx_ac_unit_t2 efficiency energy_factor
-# 1 gas2ace_1 1 6 10 0.4 750.0
-# 2 gas2ace_2 1 7 11 0.4 750.0
-# 3 gas2ace_3 1 8 12 0.4 750.0
-# 4 gas2ace_4 1 9 13 0.4 750.0
-# 5 gas2ace_5 1 10 14 0.4 750.0
+@ idx name run_stat control_type idx_gas_load_t1 idx_ac_unit_t2 g2e_coeff
+# 1 gas2ace_1 1 P 6 10 300.0
+# 2 gas2ace_2 1 FLOW 7 11 300.0
+# 3 gas2ace_3 1 P 8 12 300.0
+# 4 gas2ace_4 1 FLOW 9 13 300.0
+# 5 gas2ace_5 1 P 10 14 300.0
 </Gas2AcE>
 
 <Hydro2AcE>
@@ -2730,19 +2730,19 @@
 </AcE2Hydro>
 
 <Steam2DcE>
-@ idx name run_stat idx_steam_load_t1 idx_dc_unit_t2 efficiency energy_factor
-# 1 steam2dce_1 1 6 25 0.35 857.1428571428571
-# 2 steam2dce_2 1 7 26 0.35 857.1428571428571
-# 3 steam2dce_3 1 8 27 0.35 857.1428571428571
-# 4 steam2dce_4 1 9 28 0.35 857.1428571428571
-# 5 steam2dce_5 1 10 29 0.35 857.1428571428571
+@ idx name run_stat control_type idx_steam_load_t1 idx_dc_unit_t2 s2e_coeff
+# 1 steam2dce_1 1 P 6 25 0.35
+# 2 steam2dce_2 1 FLOW 7 26 0.35
+# 3 steam2dce_3 1 P 8 27 0.35
+# 4 steam2dce_4 1 FLOW 9 28 0.35
+# 5 steam2dce_5 1 P 10 29 0.35
 </Steam2DcE>
 
 <Gas2Heat>
-@ idx name run_stat idx_gas_load_t1 idx_heat_unit_t2 efficiency energy_factor
-# 1 gas2heat_1 1 11 12 0.9 750.0
-# 2 gas2heat_2 1 12 13 0.9 750.0
-# 3 gas2heat_3 1 13 14 0.9 750.0
-# 4 gas2heat_4 1 14 15 0.9 750.0
-# 5 gas2heat_5 1 15 16 0.9 750.0
+@ idx name run_stat control_type idx_gas_load_t1 idx_heat_unit_t2 g2h_coeff
+# 1 gas2heat_1 1 FLOW 11 12 86.64
+# 2 gas2heat_2 1 T_OUT 12 13 86.64
+# 3 gas2heat_3 1 FLOW 13 14 86.64
+# 4 gas2heat_4 1 T_OUT 14 15 86.64
+# 5 gas2heat_5 1 FLOW 15 16 86.64
 </Gas2Heat>

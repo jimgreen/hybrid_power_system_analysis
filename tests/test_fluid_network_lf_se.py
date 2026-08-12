@@ -218,8 +218,16 @@ def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_f
         for measurement in measurements
         if measurement.device_type == f"{prefix}Storage"
     ]
-    assert len(storage_measurements) == 1
-    assert storage_measurements[0].value == pytest.approx(storage_flow)
+    expected_types = (
+        {"FLOW", "T_SUPPLY", "T_RETURN", "HEAT"}
+        if case_type == "heat"
+        else {"FLOW"}
+    )
+    assert {item.meas_type for item in storage_measurements} == expected_types
+    flow_measurement = next(
+        item for item in storage_measurements if item.meas_type == "FLOW"
+    )
+    assert flow_measurement.value == pytest.approx(storage_flow)
 
     estimator = estimator_class(
         network,
@@ -234,6 +242,111 @@ def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_f
         measurement.device_type == f"{prefix}Storage"
         for measurement, _reason in estimator.prefiltered_measurements
     )
+
+
+def test_heat_storage_e_file_models_charge_discharge_and_heat_measurements():
+    from heat_lf import HeatPowerFlowCalc
+    from heat_se import HeatStateEstimator
+    from model.heat_model import load_heat_network_from_e_file
+    from scripts.check_fluid_scale_lf_se import build_measurements_from_lf
+
+    case_file = ROOT / "data" / "model" / "heat" / "heat_storage.e"
+    network = load_heat_network_from_e_file(case_file)
+
+    assert [item.name for item in network.storages] == [
+        "heat_storage_discharge",
+        "heat_storage_charge",
+    ]
+    assert network.source_is_storage.tolist() == [False, True, True]
+    np.testing.assert_allclose(network.source_flow_set, [0.0, 0.2, -0.1])
+    np.testing.assert_allclose(
+        network.source_return_temperature_set,
+        [50.0, 55.0, 60.0],
+    )
+
+    calc = HeatPowerFlowCalc(
+        network,
+        tol=1.0e-10,
+        max_iter=100,
+        result_mode="full",
+    )
+    assert calc.run() == 0
+    np.testing.assert_allclose(calc.source_flow, [0.9, 0.2, -0.1], atol=1.0e-9)
+    np.testing.assert_allclose(calc.lf_result.arrays["storage_flow"], [0.2, -0.1])
+    assert calc.lf_result.storages["heat_storage_discharge"].heat_power > 0.0
+    assert calc.lf_result.storages["heat_storage_charge"].heat_power < 0.0
+
+    return_pipe = network.edge_pos_by_name["heat_return_pipe"]
+    upstream_node = int(network.edge_i[return_pipe])
+    storage_return_node = int(network.source_return_node_pos[2])
+    expected_return_temperature = (
+        calc.temperature[upstream_node] + 0.1 * 60.0
+    ) / 1.1
+    assert calc.temperature[storage_return_node] == pytest.approx(
+        expected_return_temperature,
+        abs=1.0e-9,
+    )
+
+    measurements = build_measurements_from_lf(network, calc)
+    for storage_name in ("heat_storage_discharge", "heat_storage_charge"):
+        storage_types = {
+            item.meas_type
+            for item in measurements
+            if item.device_type == "HeatStorage" and item.device_name == storage_name
+        }
+        assert storage_types == {"FLOW", "T_SUPPLY", "T_RETURN", "HEAT"}
+
+    measurement_file = ROOT / "data" / "meas" / "heat" / "heat_storage.meas"
+    stored_measurements = list(Measurement.read_from_file(measurement_file))
+    assert [
+        (item.device_type, item.device_name, item.meas_type)
+        for item in stored_measurements
+    ] == [
+        (item.device_type, item.device_name, item.meas_type)
+        for item in measurements
+    ]
+    np.testing.assert_allclose(
+        [item.value for item in stored_measurements],
+        [item.value for item in measurements],
+        atol=1.0e-12,
+    )
+
+    estimator = HeatStateEstimator(
+        load_heat_network_from_e_file(case_file),
+        measurement_file,
+        flat_start=True,
+        tol=1.0e-9,
+        max_iter=100,
+    )
+    assert estimator.run() == 0
+    assert estimator.result.converged
+    assert estimator.result.observability.observable
+    assert estimator.result.residual_inf < 1.0e-8
+    assert not any(
+        item.device_type == "HeatStorage"
+        for item, _reason in estimator.prefiltered_measurements
+    )
+    heat_rows = np.asarray(
+        [
+            row
+            for row, item in enumerate(estimator.active_measurements)
+            if item.device_type == "HeatStorage" and item.meas_type == "HEAT"
+        ],
+        dtype=np.int64,
+    )
+    analytic = estimator.jacobian_sparse(estimator.result.x).toarray()[heat_rows]
+    numeric = np.zeros_like(analytic)
+    for column in range(estimator.state_count):
+        step = 1.0e-6 * max(1.0, abs(float(estimator.result.x[column])))
+        upper = estimator.result.x.copy()
+        lower = estimator.result.x.copy()
+        upper[column] += step
+        lower[column] -= step
+        numeric[:, column] = (
+            estimator.evaluate(upper)[heat_rows]
+            - estimator.evaluate(lower)[heat_rows]
+        ) / (2.0 * step)
+    np.testing.assert_allclose(analytic, numeric, rtol=2.0e-6, atol=1.0e-7)
 
 
 def test_heat_load_flow_solves_hydraulics_supply_and_return_temperature():

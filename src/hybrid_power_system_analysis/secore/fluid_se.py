@@ -488,6 +488,16 @@ class FluidStateEstimator:
                     values[row] = supply[supply_node]
                 elif meas_type == "T_RETURN" and return_temperature is not None:
                     values[row] = return_temperature[return_node]
+                elif (
+                    meas_type == "HEAT"
+                    and supply is not None
+                    and return_temperature is not None
+                ):
+                    values[row] = (
+                        source_flow[pos]
+                        * float(net.medium.heat_capacity)
+                        * (supply[supply_node] - return_temperature[return_node])
+                    )
                 elif meas_type == "ENTHALPY" and enthalpy is not None:
                     values[row] = enthalpy[supply_node]
                 elif meas_type == "TEMPERATURE" and steam_temperature is not None:
@@ -596,7 +606,7 @@ class FluidStateEstimator:
     def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> csr_matrix:
         active = self.active_measurements if measurements is None else measurements
         potential, flow, flow_derivative = self._flow_state(x)
-        _, source_derivatives = self._source_flow_and_derivative(
+        source_flow, source_derivatives = self._source_flow_and_derivative(
             x, flow, flow_derivative
         )
         net = self.network
@@ -789,6 +799,40 @@ class FluidStateEstimator:
                     rows.append(row)
                     cols.append(self.base_temperature + int(state_map[node_pos]))
                     data.append(1.0)
+                elif net.thermal and meas_type == "HEAT":
+                    supply_col = (
+                        self.base_temperature
+                        + int(net.supply_temperature_state_by_node[supply_node])
+                    )
+                    return_col = (
+                        self.base_temperature
+                        + int(net.return_temperature_state_by_node[return_node])
+                    )
+                    source_value = float(source_flow[pos])
+                    heat_capacity = float(net.medium.heat_capacity)
+                    temperature = x[self.base_temperature : self.base_enthalpy]
+                    supply_state = int(
+                        net.supply_temperature_state_by_node[supply_node]
+                    )
+                    return_state = int(
+                        net.return_temperature_state_by_node[return_node]
+                    )
+                    temperature_gap = float(
+                        temperature[supply_state] - temperature[return_state]
+                    )
+                    append_sparse_row(
+                        row,
+                        source_derivatives[pos],
+                        heat_capacity * temperature_gap,
+                    )
+                    rows.extend((row, row))
+                    cols.extend((supply_col, return_col))
+                    data.extend(
+                        (
+                            source_value * heat_capacity,
+                            -source_value * heat_capacity,
+                        )
+                    )
                 elif net.steam and meas_type in {"ENTHALPY", "TEMPERATURE"}:
                     rows.append(row)
                     cols.append(self.base_enthalpy + supply_node)
