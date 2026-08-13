@@ -194,13 +194,14 @@ def test_rich_5k_lf_is_one_global_problem_with_storage_results(monkeypatch):
 
     assert calc.run() == 0
     assert calc.converged
-    assert calc.total_vars == calc.total_eq == 8916
+    expected_size = 8916 - STORAGE_COUNTS["HydroStorage"]
+    assert calc.total_vars == calc.total_eq == expected_size
     assert calc.iterations <= 15
     residual = calc.get_f(calc.x)
     jacobian = calc.get_jacobi(calc.x)
     assert float(np.max(np.abs(residual))) < 1.0e-8
-    assert jacobian.shape == (8916, 8916)
-    assert jacobian.nnz > 33000
+    assert jacobian.shape == (expected_size, expected_size)
+    assert jacobian.nnz > 32000
     assert len(calc.coupling_results) == len(COUPLING_TYPES) * COUPLINGS_PER_TYPE
     assert {result.status for result in calc.coupling_results} == {"balanced"}
 
@@ -209,8 +210,22 @@ def test_rich_5k_lf_is_one_global_problem_with_storage_results(monkeypatch):
         assert len(fluid_calc.lf_result.storages) == expected_count
         storage_flow = fluid_calc.lf_result.arrays["storage_flow"]
         assert storage_flow.size == expected_count
-        assert np.any(storage_flow > 0.0)
-        assert np.any(storage_flow < 0.0)
+        assert np.all(np.isfinite(storage_flow))
+        assert np.any(np.abs(storage_flow) > 1.0e-12)
+        if domain != "hydro":
+            assert np.any(storage_flow > 0.0)
+            assert np.any(storage_flow < 0.0)
+    hydro_calc = calc.fluid_calcs["hydro"]
+    hydro_network = hydro_calc.network
+    hydro_storage_sources = hydro_network.storage_source_pos
+    np.testing.assert_allclose(
+        hydro_calc.pressure[
+            hydro_network.source_node_pos[hydro_storage_sources]
+        ],
+        hydro_network.source_pressure_set[hydro_storage_sources],
+        rtol=0.0,
+        atol=1.0e-10,
+    )
     heat_arrays = calc.fluid_calcs["heat"].lf_result.arrays
     assert heat_arrays["storage_heat_power"].size == STORAGE_COUNTS["HeatStorage"]
 

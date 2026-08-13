@@ -569,6 +569,14 @@ class FluidNetwork:
         self.source_control_type = np.asarray(
             [normalize_control_type(item.control_type, FLOW_CONTROL) for item in self.sources], dtype=object
         )
+        self.source_is_pressure_controlled = (
+            self.source_control_type == PRESSURE_CONTROL
+        )
+        if self.prefix == "Hydro":
+            # A connected hydrogen tank fixes its node pressure regardless of
+            # the legacy source-flow control field. Its flow becomes the
+            # balancing output required to hold that pressure.
+            self.source_is_pressure_controlled |= self.source_is_storage
         self.source_pressure_set = np.asarray([item.pressure_set for item in self.sources], dtype=np.float64)
         self.source_flow_set = np.asarray([item.flow_set for item in self.sources], dtype=np.float64)
         self.source_alpha = np.asarray([max(item.alpha, 0.0) for item in self.sources], dtype=np.float64)
@@ -673,9 +681,52 @@ class FluidNetwork:
             [min(max(item.heat_loss, 0.0), 1.0) for item in self.heat_exchangers], dtype=np.float64
         )
 
+        self.warnings = []
+        fixed_temperature_by_state: Dict[int, List[float]] = {}
+        if self.thermal:
+            for source_pos in self.storage_source_pos.tolist():
+                supply_node = int(self.source_supply_node_pos[source_pos])
+                return_node = int(self.source_return_node_pos[source_pos])
+                supply_state = int(
+                    self.supply_temperature_state_by_node[supply_node]
+                )
+                return_state = int(
+                    self.return_temperature_state_by_node[return_node]
+                )
+                fixed_temperature_by_state.setdefault(supply_state, []).append(
+                    float(self.source_supply_temperature_set[source_pos])
+                )
+                fixed_temperature_by_state.setdefault(return_state, []).append(
+                    float(self.source_return_temperature_set[source_pos])
+                )
+        self.fixed_temperature_state_pos = np.asarray(
+            sorted(fixed_temperature_by_state), dtype=np.int64
+        )
+        self.fixed_temperature = np.asarray(
+            [
+                np.mean(fixed_temperature_by_state[int(state)])
+                for state in self.fixed_temperature_state_pos.tolist()
+            ],
+            dtype=np.float64,
+        )
+        if self.fixed_temperature_state_pos.size:
+            self.initial_temperature_state[
+                self.fixed_temperature_state_pos
+            ] = self.fixed_temperature
+        for state, values in fixed_temperature_by_state.items():
+            if len(values) <= 1:
+                continue
+            self.warnings.append(
+                f"temperature state {state} has {len(values)} HeatStorage anchors; "
+                f"using average temperature {np.mean(values):.6f}"
+            )
+
         self.fixed_injection = np.zeros(n_node, dtype=np.float64)
         self.demand = np.zeros(n_node, dtype=np.float64)
-        flow_sources = np.flatnonzero(self.source_control_type == FLOW_CONTROL)
+        flow_sources = np.flatnonzero(
+            (self.source_control_type == FLOW_CONTROL)
+            & ~self.source_is_pressure_controlled
+        )
         if self.thermal:
             if flow_sources.size:
                 explicit = flow_sources[self.source_explicit_return[flow_sources]]
@@ -762,12 +813,20 @@ class FluidNetwork:
             if self.load_node_pos.size:
                 np.add.at(self.demand, self.load_node_pos, self.load_flow_set)
 
-        pressure_sources = np.flatnonzero(self.source_control_type == PRESSURE_CONTROL).astype(np.int64)
+        pressure_sources = np.flatnonzero(
+            self.source_is_pressure_controlled
+        ).astype(np.int64)
         fixed_pressure_by_node: Dict[int, List[float]] = {}
         for source_pos in pressure_sources.tolist():
             node_pos = int(self.source_node_pos[source_pos])
             fixed_pressure_by_node.setdefault(node_pos, []).append(float(self.source_pressure_set[source_pos]))
-        self.warnings = []
+        for node_pos, values in fixed_pressure_by_node.items():
+            if len(values) <= 1:
+                continue
+            self.warnings.append(
+                f"node {self.node_name[node_pos]} has {len(values)} pressure anchors; "
+                f"using average pressure {np.mean(values):.6f}"
+            )
         for island in range(int(self.island_count)):
             island_nodes = np.flatnonzero(self.node_island == island)
             if any(int(node) in fixed_pressure_by_node for node in island_nodes.tolist()):
@@ -922,6 +981,14 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
 
 def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
     storages = []
+    node_pressure_by_idx = {
+        _int(node, "idx"): _float(
+            node,
+            "pressure",
+            _float(node, "p_set", 1.0),
+        )
+        for node in getattr(model, f"{prefix}Node", ()) or ()
+    }
     for row in getattr(model, f"{prefix}Storage", ()) or ():
         max_charge_flow = abs(_float(row, "max_charge_flow", np.inf))
         max_discharge_flow = abs(_float(row, "max_discharge_flow", np.inf))
@@ -940,16 +1007,29 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
             "return_temperature_set",
             _float(row, "return_temperature", 50.0 if thermal else 20.0),
         )
+        node_idx = _optional_int(row, "node")
+        pressure_set = _float(
+            row,
+            "pressure_set",
+            _float(row, "p_set", np.nan),
+        )
+        if not np.isfinite(pressure_set) or pressure_set <= 0.0:
+            pressure_node_idx = (
+                _optional_int(row, "supply_node")
+                if node_idx is None
+                else node_idx
+            )
+            pressure_set = float(node_pressure_by_idx.get(pressure_node_idx, 1.0))
         storages.append(
             FluidStorage(
                 idx=_int(row, "idx"),
                 name=_text(row, "name", f"{prefix.lower()}_storage_{_int(row, 'idx')}"),
-                node=_optional_int(row, "node"),
+                node=node_idx,
                 control_type=normalize_control_type(
                     _text(row, "control_type", FLOW_CONTROL),
                     FLOW_CONTROL,
                 ),
-                pressure_set=_float(row, "pressure_set", _float(row, "p_set", 1.0)),
+                pressure_set=pressure_set,
                 flow_set=_float(row, "flow_set", _float(row, "mass_flow", 0.0)),
                 alpha=_float(row, "alpha", 1.0),
                 flow_min=_float(row, "flow_min", -max_charge_flow),

@@ -227,6 +227,149 @@ def test_single_node_hydrogen_storage_balances_net_flow_without_newton_states():
     )
 
 
+def test_hydrogen_storage_makes_its_node_a_fixed_pressure_boundary():
+    from hydro_lf import HydroPowerFlowCalc
+    from model.hydro_model import build_hydro_network_from_model
+
+    model = SimpleNamespace(
+        HydroMedium=[],
+        HydroNode=[
+            SimpleNamespace(idx=1, name="tank_bus", pressure=20.0, run_stat=1),
+            SimpleNamespace(idx=2, name="load_bus", pressure=19.0, run_stat=1),
+        ],
+        HydroSource=[],
+        HydroStorage=[
+            SimpleNamespace(
+                idx=1,
+                name="hydrogen_tank",
+                node=1,
+                control_type="FLOW",
+                pressure_set=35.0,
+                flow_set=0.0,
+                alpha=1.0,
+                flow_min=-10.0,
+                flow_max=10.0,
+                run_stat=1,
+            )
+        ],
+        HydroLoad=[
+            SimpleNamespace(
+                idx=1,
+                name="fuel_cell",
+                node=2,
+                flow_set=0.5,
+                run_stat=1,
+            )
+        ],
+        HydroPipe=[
+            SimpleNamespace(
+                idx=1,
+                name="tank_pipe",
+                i_node=1,
+                j_node=2,
+                conductance=1.0,
+                run_stat=1,
+            )
+        ],
+        HydroValve=[],
+        HydroCompressor=[],
+    )
+    network = build_hydro_network_from_model(model)
+    calc = HydroPowerFlowCalc(network, tol=1e-10, max_iter=100, result_mode="full")
+
+    assert network.fixed_node_pos.tolist() == [0]
+    np.testing.assert_allclose(network.fixed_pressure, [35.0])
+    assert calc.run() == 0
+    assert calc.pressure[0] == pytest.approx(35.0, abs=1e-12)
+    assert calc.lf_result.pipes["tank_pipe"].i_pressure == pytest.approx(
+        35.0, abs=1e-12
+    )
+    np.testing.assert_allclose(calc.source_flow, [0.5], atol=1e-9)
+    np.testing.assert_allclose(calc.edge_flow, [0.5], atol=1e-9)
+
+
+def test_multiple_hydrogen_storages_share_one_averaged_pressure_boundary():
+    from hydro_lf import HydroPowerFlowCalc
+    from lfcore.common import allocate_limited_residual
+    from model.hydro_model import build_hydro_network_from_model
+
+    model = SimpleNamespace(
+        HydroMedium=[],
+        HydroNode=[
+            SimpleNamespace(idx=1, name="tank_bus", pressure=20.0, run_stat=1),
+            SimpleNamespace(idx=2, name="load_bus", pressure=19.0, run_stat=1),
+        ],
+        HydroSource=[],
+        HydroStorage=[
+            SimpleNamespace(
+                idx=1,
+                name="tank_1",
+                node=1,
+                control_type="FLOW",
+                pressure_set=30.0,
+                flow_set=0.1,
+                alpha=1.0,
+                flow_min=-10.0,
+                flow_max=10.0,
+                run_stat=1,
+            ),
+            SimpleNamespace(
+                idx=2,
+                name="tank_2",
+                node=1,
+                control_type="FLOW",
+                pressure_set=34.0,
+                flow_set=0.2,
+                alpha=3.0,
+                flow_min=-10.0,
+                flow_max=10.0,
+                run_stat=1,
+            ),
+        ],
+        HydroLoad=[
+            SimpleNamespace(
+                idx=1,
+                name="load",
+                node=2,
+                flow_set=1.1,
+                run_stat=1,
+            )
+        ],
+        HydroPipe=[
+            SimpleNamespace(
+                idx=1,
+                name="pipe",
+                i_node=1,
+                j_node=2,
+                conductance=1.0,
+                run_stat=1,
+            )
+        ],
+        HydroValve=[],
+        HydroCompressor=[],
+    )
+    network = build_hydro_network_from_model(model)
+    calc = HydroPowerFlowCalc(network, tol=1e-10, max_iter=100, result_mode="full")
+
+    assert network.fixed_node_pos.tolist() == [0]
+    np.testing.assert_allclose(network.fixed_pressure, [32.0])
+    assert any("2 pressure anchors" in warning for warning in network.warnings)
+    assert calc.run() == 0
+    assert calc.pressure[0] == pytest.approx(32.0, abs=1e-12)
+    assert calc.lf_result.pipes["pipe"].i_pressure == pytest.approx(
+        32.0, abs=1e-12
+    )
+    expected_source_flow = allocate_limited_residual(
+        [0.1, 0.2],
+        1.1,
+        lower=[-10.0, -10.0],
+        upper=[10.0, 10.0],
+        alpha=[1.0, 3.0],
+    )
+    np.testing.assert_allclose(calc.source_flow, expected_source_flow, atol=1e-9)
+    np.testing.assert_allclose(calc.edge_flow, [1.1], atol=1e-9)
+
+
 @pytest.mark.parametrize("case_type", ("heat", "gas", "hydro", "steam"))
 @pytest.mark.parametrize("storage_flow", (0.1, -0.1))
 def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_flow):
@@ -259,23 +402,38 @@ def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_f
     )
     assert calc.run() == 0
     assert calc.converged
+    if case_type == "hydro":
+        storage_source_pos = int(network.storage_source_pos[0])
+        storage_node = int(network.source_node_pos[storage_source_pos])
+        assert calc.pressure[storage_node] == pytest.approx(
+            network.source_pressure_set[storage_source_pos], abs=1e-12
+        )
+        np.testing.assert_allclose(
+            np.sum(calc.source_flow), base_source_flow, atol=1e-9
+        )
+    else:
+        np.testing.assert_allclose(
+            calc.source_flow,
+            [base_source_flow - storage_flow, storage_flow],
+            rtol=0.0,
+            atol=1e-9,
+        )
+    actual_storage_flow = calc.source_flow[network.storage_source_pos]
     np.testing.assert_allclose(
-        calc.source_flow,
-        [base_source_flow - storage_flow, storage_flow],
-        rtol=0.0,
-        atol=1e-9,
+        calc.lf_result.arrays["storage_flow"], actual_storage_flow
     )
-    np.testing.assert_allclose(calc.lf_result.arrays["storage_flow"], [storage_flow])
     assert storage_name in calc.lf_result.storages
     assert storage_name not in calc.lf_result.sources
-    assert calc.lf_result.storages[storage_name].flow == pytest.approx(storage_flow)
+    assert calc.lf_result.storages[storage_name].flow == pytest.approx(
+        actual_storage_flow[0]
+    )
 
     node_balance = (
         network.fixed_injection
         - network.demand
         + np.asarray(network.incidence @ calc.edge_flow, dtype=np.float64)
     )
-    pressure_sources = np.flatnonzero(network.source_control_type == PRESSURE_CONTROL)
+    pressure_sources = np.flatnonzero(network.source_is_pressure_controlled)
     for source_pos in pressure_sources.tolist():
         flow = float(calc.source_flow[source_pos])
         if network.thermal and network.source_explicit_return[source_pos]:
@@ -300,7 +458,7 @@ def test_fluid_storage_is_bidirectional_source_in_lf_and_se(case_type, storage_f
     flow_measurement = next(
         item for item in storage_measurements if item.meas_type == "FLOW"
     )
-    assert flow_measurement.value == pytest.approx(storage_flow)
+    assert flow_measurement.value == pytest.approx(actual_storage_flow[0])
 
     estimator = estimator_class(
         network,
@@ -349,15 +507,12 @@ def test_heat_storage_e_file_models_charge_discharge_and_heat_measurements():
     assert calc.lf_result.storages["heat_storage_discharge"].heat_power > 0.0
     assert calc.lf_result.storages["heat_storage_charge"].heat_power < 0.0
 
-    return_pipe = network.edge_pos_by_name["heat_return_pipe"]
-    upstream_node = int(network.edge_i[return_pipe])
-    storage_return_node = int(network.source_return_node_pos[2])
-    expected_return_temperature = (
-        calc.temperature[upstream_node] + 0.1 * 60.0
-    ) / 1.1
-    assert calc.temperature[storage_return_node] == pytest.approx(
-        expected_return_temperature,
-        abs=1.0e-9,
+    storage_supply_node = int(network.source_supply_node_pos[1])
+    storage_return_node = int(network.source_return_node_pos[1])
+    assert calc.supply_temperature[storage_supply_node] == pytest.approx(82.5)
+    assert calc.return_temperature[storage_return_node] == pytest.approx(57.5)
+    assert any(
+        "HeatStorage anchors" in warning for warning in network.warnings
     )
 
     measurements = build_measurements_from_lf(network, calc)
@@ -420,6 +575,94 @@ def test_heat_storage_e_file_models_charge_discharge_and_heat_measurements():
             - estimator.evaluate(lower)[heat_rows]
         ) / (2.0 * step)
     np.testing.assert_allclose(analytic, numeric, rtol=2.0e-6, atol=1.0e-7)
+
+
+def test_heat_storage_fixes_connected_node_temperatures_independent_of_flow():
+    from heat_lf import HeatPowerFlowCalc
+    from model.heat_model import build_heat_network_from_model
+
+    model = SimpleNamespace(
+        HeatMedium=[],
+        HeatNode=[
+            SimpleNamespace(
+                idx=1,
+                name="tank_node",
+                pressure=10.0,
+                supply_temperature=65.0,
+                return_temperature=45.0,
+                run_stat=1,
+            ),
+            SimpleNamespace(
+                idx=2,
+                name="load_node",
+                pressure=9.0,
+                supply_temperature=60.0,
+                return_temperature=40.0,
+                run_stat=1,
+            ),
+        ],
+        HeatSource=[],
+        HeatStorage=[
+            SimpleNamespace(
+                idx=1,
+                name="heat_tank",
+                node=1,
+                control_type="FLOW",
+                pressure_set=10.0,
+                flow_set=0.0,
+                alpha=1.0,
+                flow_min=-10.0,
+                flow_max=10.0,
+                supply_temperature_set=88.0,
+                return_temperature_set=52.0,
+                run_stat=1,
+            )
+        ],
+        HeatLoad=[
+            SimpleNamespace(
+                idx=1,
+                name="heat_load",
+                node=2,
+                flow_set=1.0,
+                heat_power=20.0,
+                run_stat=1,
+            )
+        ],
+        HeatPipe=[
+            SimpleNamespace(
+                idx=1,
+                name="tank_pipe",
+                i_node=1,
+                j_node=2,
+                conductance=1.0,
+                heat_loss=0.0,
+                run_stat=1,
+            )
+        ],
+        HeatValve=[],
+        HeatPump=[],
+        HeatExchanger=[],
+    )
+    network = build_heat_network_from_model(model)
+    calc = HeatPowerFlowCalc(network, tol=1e-10, max_iter=100, result_mode="full")
+
+    supply_state = int(network.supply_temperature_state_by_node[0])
+    return_state = int(network.return_temperature_state_by_node[0])
+    assert set(network.fixed_temperature_state_pos.tolist()) == {
+        supply_state,
+        return_state,
+    }
+    assert calc.run() == 0
+    assert calc.supply_temperature[0] == pytest.approx(88.0, abs=1e-10)
+    assert calc.return_temperature[0] == pytest.approx(52.0, abs=1e-10)
+    pipe = calc.lf_result.pipes["tank_pipe"]
+    assert pipe.i_supply_temperature == pytest.approx(88.0, abs=1e-10)
+    # Positive edge flow leaves the tank node on the supply side. Return flow
+    # reaches that node from the load side, so the edge arrival temperature may
+    # differ while the mixed node return state remains fixed at 52 C.
+    assert pipe.j_return_temperature == pytest.approx(
+        calc.return_temperature[1], abs=1e-10
+    )
 
 
 def test_heat_load_flow_solves_hydraulics_supply_and_return_temperature():

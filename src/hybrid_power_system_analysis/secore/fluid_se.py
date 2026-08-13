@@ -21,7 +21,7 @@ for path in (ROOT_DIR, ROOT_DIR / "model", ROOT_DIR / "lfcore", ROOT_DIR / "seco
 
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from lfcore.common import allocate_limited_residual
-from model.fluid_model import PRESSURE_CONTROL, FluidNetwork
+from model.fluid_model import FluidNetwork
 from model.meas_model import (
     MEAS_STATUS_PSEUDO,
     BadDataItem,
@@ -231,12 +231,17 @@ class FluidStateEstimator:
         net = self.network
         use_flat = self.params.flat_start if flat_start is None else bool(flat_start)
         if use_flat:
-            pressure_sources = np.flatnonzero(net.source_control_type == PRESSURE_CONTROL)
-            if pressure_sources.size:
-                pressure_value = float(np.mean(net.source_pressure_set[pressure_sources]))
-            else:
-                pressure_value = float(np.mean(net.node_pressure))
-            pressure = np.full(len(net.nodes), max(pressure_value, 1e-6), dtype=np.float64)
+            pressure = np.empty(len(net.nodes), dtype=np.float64)
+            for island in range(int(net.island_count)):
+                island_nodes = np.flatnonzero(net.node_island == island)
+                fixed_rows = np.flatnonzero(
+                    net.node_island[net.fixed_node_pos] == island
+                )
+                if fixed_rows.size:
+                    pressure_value = float(np.mean(net.fixed_pressure[fixed_rows]))
+                else:
+                    pressure_value = float(np.mean(net.node_pressure[island_nodes]))
+                pressure[island_nodes] = max(pressure_value, 1e-6)
         else:
             pressure = np.maximum(net.node_pressure, 1e-6).copy()
         x = np.empty(self.state_count, dtype=np.float64)
@@ -261,6 +266,10 @@ class FluidStateEstimator:
                     net.return_temperature_state_by_node[~net.node_explicit_return]
                 )
                 temperature[implicit_return_states] = return_value
+                if net.fixed_temperature_state_pos.size:
+                    temperature[
+                        net.fixed_temperature_state_pos
+                    ] = net.fixed_temperature
                 x[self.base_temperature : self.base_enthalpy] = temperature
             else:
                 x[self.base_temperature : self.base_enthalpy] = net.initial_temperature_state
@@ -346,7 +355,9 @@ class FluidStateEstimator:
                 source_derivatives[source_pos] = target_row * float(shares[local])
         for node_pos in range(len(net.nodes)):
             positions = np.flatnonzero(net.source_node_pos == node_pos)
-            pressure_positions = positions[net.source_control_type[positions] == PRESSURE_CONTROL]
+            pressure_positions = positions[
+                net.source_is_pressure_controlled[positions]
+            ]
             if net.thermal and pressure_positions.size:
                 pressure_positions = pressure_positions[
                     ~net.source_explicit_return[pressure_positions]

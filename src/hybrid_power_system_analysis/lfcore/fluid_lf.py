@@ -259,7 +259,7 @@ class FluidPowerFlowCalc:
             activity[island] = max(activity[island], abs(float(flow)))
         for source_pos, flow in enumerate(source_flow.tolist()):
             magnitude = abs(float(flow))
-            if str(net.source_control_type[source_pos]) != PRESSURE_CONTROL:
+            if not bool(net.source_is_pressure_controlled[source_pos]):
                 magnitude = max(
                     magnitude,
                     abs(float(net.source_flow_set[source_pos])),
@@ -386,6 +386,7 @@ class FluidPowerFlowCalc:
         self.network.incidence = csr_matrix((0, 0), dtype=np.float64)
         self.network.source_name = np.empty(0, dtype=object)
         self.network.source_is_storage = np.empty(0, dtype=bool)
+        self.network.source_is_pressure_controlled = np.empty(0, dtype=bool)
         self.network.storage_source_pos = np.empty(0, dtype=np.int64)
         self.network.load_name = np.empty(0, dtype=object)
         self.network.load_flow_set = np.empty(0, dtype=np.float64)
@@ -396,6 +397,8 @@ class FluidPowerFlowCalc:
         self.network.load_return_node_pos = np.empty(0, dtype=np.int64)
         self.network.exchanger_i = np.empty(0, dtype=np.int64)
         self.network.exchanger_j = np.empty(0, dtype=np.int64)
+        self.network.fixed_temperature_state_pos = np.empty(0, dtype=np.int64)
+        self.network.fixed_temperature = np.empty(0, dtype=np.float64)
         self.network.free_node_pos = np.empty(0, dtype=np.int64)
         self.network.pressure_source_group_nodes = np.empty(0, dtype=np.int64)
         self.hydraulic_state_count = 0
@@ -915,7 +918,7 @@ class FluidPowerFlowCalc:
                     data.append(float(shares[local_pos]))
 
         pressure_sources = np.flatnonzero(
-            net.source_control_type == PRESSURE_CONTROL
+            net.source_is_pressure_controlled
         ).astype(np.int64)
         pressure_sources = pressure_sources[~handled[pressure_sources]]
         node_edge_balance = np.asarray(net.incidence @ edge_flow, dtype=np.float64)
@@ -1153,7 +1156,7 @@ class FluidPowerFlowCalc:
         )
         anchored.update(labels[injection_state[injecting_sources]].tolist())
         candidates = np.flatnonzero(
-            (self.network.source_control_type == PRESSURE_CONTROL)
+            self.network.source_is_pressure_controlled
             & (np.abs(source_flow) <= THERMAL_ZERO_FLOW_TOLERANCE)
         )
         groups = []
@@ -1358,20 +1361,50 @@ class FluidPowerFlowCalc:
             residual[state_pos] = temperature[state_pos] - net.initial_temperature_state[state_pos]
             add_temp(state_pos, state_pos, 1.0)
 
+        fixed_states = net.fixed_temperature_state_pos
+        if fixed_states.size:
+            residual[fixed_states] = temperature[fixed_states] - net.fixed_temperature
+
         if not return_jacobian:
             return residual, None, None
 
+        fixed_mask = np.zeros(count, dtype=bool)
+        fixed_mask[fixed_states] = True
+        temp_rows_array = np.asarray(temp_rows, dtype=np.int64)
+        temp_cols_array = np.asarray(temp_cols, dtype=np.int64)
+        temp_data_array = np.asarray(temp_data, dtype=np.float64)
+        if temp_rows_array.size:
+            keep = ~fixed_mask[temp_rows_array]
+            temp_rows_array = temp_rows_array[keep]
+            temp_cols_array = temp_cols_array[keep]
+            temp_data_array = temp_data_array[keep]
+        if fixed_states.size:
+            temp_rows_array = np.concatenate((temp_rows_array, fixed_states))
+            temp_cols_array = np.concatenate((temp_cols_array, fixed_states))
+            temp_data_array = np.concatenate(
+                (temp_data_array, np.ones(fixed_states.size, dtype=np.float64))
+            )
+
+        cross_rows_array = np.asarray(cross_rows, dtype=np.int64)
+        cross_cols_array = np.asarray(cross_cols, dtype=np.int64)
+        cross_data_array = np.asarray(cross_data, dtype=np.float64)
+        if cross_rows_array.size:
+            keep = ~fixed_mask[cross_rows_array]
+            cross_rows_array = cross_rows_array[keep]
+            cross_cols_array = cross_cols_array[keep]
+            cross_data_array = cross_data_array[keep]
+
         cross = coo_matrix(
             (
-                np.asarray(cross_data, dtype=np.float64),
-                (np.asarray(cross_rows), np.asarray(cross_cols)),
+                cross_data_array,
+                (cross_rows_array, cross_cols_array),
             ),
             shape=(count, self.hydraulic_state_count),
         ).tocsr()
         local = coo_matrix(
             (
-                np.asarray(temp_data, dtype=np.float64),
-                (np.asarray(temp_rows), np.asarray(temp_cols)),
+                temp_data_array,
+                (temp_rows_array, temp_cols_array),
             ),
             shape=(count, count),
         ).tocsc()
@@ -1734,7 +1767,7 @@ class FluidPowerFlowCalc:
             if source_positions.size == 0:
                 continue
             pressure_positions = source_positions[
-                net.source_control_type[source_positions] == PRESSURE_CONTROL
+                net.source_is_pressure_controlled[source_positions]
             ]
             if net.thermal and pressure_positions.size:
                 pressure_positions = pressure_positions[
@@ -1984,6 +2017,21 @@ class FluidPowerFlowCalc:
                 rhs[state_pos] = net.initial_temperature_state[state_pos]
             else:
                 add(state_pos, state_pos, incoming_mass[state_pos])
+        fixed_states = net.fixed_temperature_state_pos
+        if fixed_states.size:
+            fixed_mask = np.zeros(n_temperature, dtype=bool)
+            fixed_mask[fixed_states] = True
+            row_array = np.asarray(rows, dtype=np.int64)
+            col_array = np.asarray(cols, dtype=np.int64)
+            data_array = np.asarray(data, dtype=np.float64)
+            keep = ~fixed_mask[row_array]
+            rows = row_array[keep].tolist()
+            cols = col_array[keep].tolist()
+            data = data_array[keep].tolist()
+            rows.extend(fixed_states.tolist())
+            cols.extend(fixed_states.tolist())
+            data.extend(np.ones(fixed_states.size, dtype=np.float64).tolist())
+            rhs[fixed_states] = net.fixed_temperature
         matrix = coo_matrix(
             (data, (rows, cols)), shape=(n_temperature, n_temperature)
         ).tocsc()

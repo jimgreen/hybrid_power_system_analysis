@@ -1,23 +1,23 @@
 <Measurement>
 @ idx name dev_type dev_name meas_type weight valid value
 # 1 scale_meas_1 HeatNode heat_source_supply PRESSURE 10 1 10
-# 2 scale_meas_2 HeatNode heat_source_supply TEMPERATURE 10 1 89.090909090909093
+# 2 scale_meas_2 HeatNode heat_source_supply TEMPERATURE 10 1 82.5
 # 3 scale_meas_3 HeatNode heat_load_supply PRESSURE 10 1 9
-# 4 scale_meas_4 HeatNode heat_load_supply TEMPERATURE 10 1 89.090909090909093
+# 4 scale_meas_4 HeatNode heat_load_supply TEMPERATURE 10 1 82.5
 # 5 scale_meas_5 HeatNode heat_load_return PRESSURE 10 1 5
-# 6 scale_meas_6 HeatNode heat_load_return TEMPERATURE 10 1 77.146331928940626
+# 6 scale_meas_6 HeatNode heat_load_return TEMPERATURE 10 1 70.555422838031532
 # 7 scale_meas_7 HeatNode heat_source_return PRESSURE 10 1 4
-# 8 scale_meas_8 HeatNode heat_source_return TEMPERATURE 10 1 75.58757448085511
+# 8 scale_meas_8 HeatNode heat_source_return TEMPERATURE 10 1 57.5
 # 9 scale_meas_9 HeatPipe heat_supply_pipe FLOW_FROM 10 1 1
 # 10 scale_meas_10 HeatPipe heat_return_pipe FLOW_FROM 10 1 1
 # 11 scale_meas_11 HeatSource heat_source FLOW 10 1 0.90000000000000002
 # 12 scale_meas_12 HeatStorage heat_storage_discharge FLOW 10 1 0.20000000000000001
-# 13 scale_meas_13 HeatStorage heat_storage_discharge T_SUPPLY 10 1 89.090909090909093
-# 14 scale_meas_14 HeatStorage heat_storage_discharge T_RETURN 10 1 75.58757448085511
-# 15 scale_meas_15 HeatStorage heat_storage_discharge HEAT 10 1 11.304991735537195
+# 13 scale_meas_13 HeatStorage heat_storage_discharge T_SUPPLY 10 1 82.5
+# 14 scale_meas_14 HeatStorage heat_storage_discharge T_RETURN 10 1 57.5
+# 15 scale_meas_15 HeatStorage heat_storage_discharge HEAT 10 1 20.93
 # 16 scale_meas_16 HeatStorage heat_storage_charge FLOW 10 1 -0.10000000000000001
-# 17 scale_meas_17 HeatStorage heat_storage_charge T_SUPPLY 10 1 89.090909090909093
-# 18 scale_meas_18 HeatStorage heat_storage_charge T_RETURN 10 1 75.58757448085511
-# 19 scale_meas_19 HeatStorage heat_storage_charge HEAT 10 1 -5.6524958677685975
+# 17 scale_meas_17 HeatStorage heat_storage_charge T_SUPPLY 10 1 82.5
+# 18 scale_meas_18 HeatStorage heat_storage_charge T_RETURN 10 1 57.5
+# 19 scale_meas_19 HeatStorage heat_storage_charge HEAT 10 1 -10.465
 # 20 scale_meas_20 HeatLoad heat_load FLOW 10 1 1
 </Measurement>

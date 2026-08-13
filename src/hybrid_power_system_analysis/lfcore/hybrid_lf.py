@@ -1268,11 +1268,13 @@ class HybridPowerFlowCalc:
         if is_load:
             node_pos = int(network.load_node_pos[device_pos])
             explicit_return = bool(network.load_explicit_return[device_pos])
-            control_type = "FLOW"
+            pressure_controlled = False
         else:
             node_pos = int(network.source_node_pos[device_pos])
             explicit_return = bool(network.source_explicit_return[device_pos])
-            control_type = str(network.source_control_type[device_pos])
+            pressure_controlled = bool(
+                network.source_is_pressure_controlled[device_pos]
+            )
         if adjustable and network.thermal:
             return None, (
                 f"{device_type} idx={terminal.device_idx} changes transport energy equations; "
@@ -1288,7 +1290,7 @@ class HybridPowerFlowCalc:
                 f"{device_type} idx={terminal.device_idx} has explicit return flow and "
                 "cannot yet be released as one scalar coupling control"
             )
-        if adjustable and not is_load and control_type != "FLOW":
+        if adjustable and pressure_controlled:
             return None, (
                 f"{device_type} idx={terminal.device_idx} is pressure-controlled; "
                 "use it as the dependent endpoint, not the released endpoint"
@@ -1349,7 +1351,7 @@ class HybridPowerFlowCalc:
         network = calc.network
         if endpoint.kind == "load":
             return float(network.load_flow_set[endpoint.device_pos]), (), ()
-        if str(network.source_control_type[endpoint.device_pos]) != "PRESSURE":
+        if not bool(network.source_is_pressure_controlled[endpoint.device_pos]):
             return float(network.source_flow_set[endpoint.device_pos]), (), ()
         state_slice = self.fluid_state_slices[domain]
         source_flow, source_jacobian = calc.source_flows_and_jacobian(x[state_slice])
@@ -1701,7 +1703,11 @@ class HybridPowerFlowCalc:
                     continue
                 if controlled.domain not in {"ac", "dc"} and controlled.kind != "load":
                     controlled_network = self.fluid_calcs[controlled.domain].network
-                    if str(controlled_network.source_control_type[controlled.device_pos]) != "FLOW":
+                    if bool(
+                        controlled_network.source_is_pressure_controlled[
+                            controlled.device_pos
+                        ]
+                    ):
                         self._add_multi_energy_warning(
                             f"{coupling.table_name}:{coupling.name}: FLOW control requires a flow-controlled fluid endpoint"
                         )
@@ -1809,19 +1815,53 @@ class HybridPowerFlowCalc:
                 released_endpoints.add(key)
                 initial.append(float(dependent_initial))
                 continue
-            t1, reason = self._resolve_energy_endpoint(coupling.t1, adjustable=True)
-            if t1 is None:
-                self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
+            t1, t1_adjustable_reason = self._resolve_energy_endpoint(
+                coupling.t1,
+                adjustable=True,
+            )
+            t2 = None
+            if t1 is not None:
+                adjustable = t1
+                t2, reason = self._resolve_energy_endpoint(
+                    coupling.t2,
+                    adjustable=False,
+                )
+            else:
+                t1, reason = self._resolve_energy_endpoint(
+                    coupling.t1,
+                    adjustable=False,
+                )
+                t1_is_fixed_hydrogen_storage = bool(
+                    t1 is not None
+                    and t1.domain == "hydro"
+                    and t1.kind == "storage"
+                    and self.fluid_calcs["hydro"]
+                    .network.source_is_pressure_controlled[t1.device_pos]
+                )
+                if t1_is_fixed_hydrogen_storage:
+                    t2, reason = self._resolve_energy_endpoint(
+                        coupling.t2,
+                        adjustable=True,
+                    )
+                    adjustable = t2
+                else:
+                    adjustable = None
+                    reason = t1_adjustable_reason
+            if t1 is None or t2 is None or adjustable is None:
+                detail = reason or t1_adjustable_reason
+                self._add_multi_energy_warning(
+                    f"{coupling.table_name}:{coupling.name}: {detail}"
+                )
                 continue
-            key = (t1.domain, t1.device_type, t1.device_idx)
+            key = (
+                adjustable.domain,
+                adjustable.device_type,
+                adjustable.device_idx,
+            )
             if key in released_endpoints:
                 self._add_multi_energy_warning(
                     f"{coupling.table_name}:{coupling.name}: endpoint {key} is already controlled by another coupling"
                 )
-                continue
-            t2, reason = self._resolve_energy_endpoint(coupling.t2, adjustable=False)
-            if t2 is None:
-                self._add_multi_energy_warning(f"{coupling.table_name}:{coupling.name}: {reason}")
                 continue
             t1_value, _columns, _derivatives = self._energy_endpoint_value_and_derivative(
                 t1,
@@ -1841,6 +1881,7 @@ class HybridPowerFlowCalc:
                 t2,
                 uncoupled_state,
             )
+            adjustable_value = t1_value if adjustable is t1 else t2_value
             normalization = max(
                 1.0,
                 abs(t1_value * t1.energy_scale),
@@ -1852,6 +1893,7 @@ class HybridPowerFlowCalc:
                     coupling=coupling,
                     t1=t1,
                     t2=t2,
+                    adjustable=adjustable,
                     state_col=state_offset + plan_pos,
                     eq_row=eq_offset + plan_pos,
                     normalization=normalization,
@@ -1863,7 +1905,7 @@ class HybridPowerFlowCalc:
                 )
             )
             released_endpoints.add(key)
-            initial.append(float(t1_value))
+            initial.append(float(adjustable_value))
         return np.asarray(initial, dtype=np.float64)
 
     def _apply_energy_coupling_terms(
@@ -2128,45 +2170,67 @@ class HybridPowerFlowCalc:
                     data.append(enthalpy_derivative / plan.normalization)
                 continue
             base_value, base_cols, base_derivatives = (
-                self._energy_endpoint_value_and_derivative(plan.t1, x)
+                self._energy_endpoint_value_and_derivative(plan.adjustable, x)
             )
             correction = controlled_value - base_value
-            residual[plan.t1.balance_row] += plan.t1.correction_sign * correction
-            if jacobian is not None:
-                rows.append(plan.t1.balance_row)
-                cols.append(plan.state_col)
-                data.append(plan.t1.correction_sign)
-                for column, derivative in zip(base_cols, base_derivatives):
-                    rows.append(plan.t1.balance_row)
-                    cols.append(int(column))
-                    data.append(-plan.t1.correction_sign * float(derivative))
-
-            dependent_value, dependent_cols, dependent_derivatives = (
-                self._energy_endpoint_value_and_derivative(plan.t2, x)
+            residual[plan.adjustable.balance_row] += (
+                plan.adjustable.correction_sign * correction
             )
+            if jacobian is not None:
+                rows.append(plan.adjustable.balance_row)
+                cols.append(plan.state_col)
+                data.append(plan.adjustable.correction_sign)
+                for column, derivative in zip(base_cols, base_derivatives):
+                    rows.append(plan.adjustable.balance_row)
+                    cols.append(int(column))
+                    data.append(
+                        -plan.adjustable.correction_sign * float(derivative)
+                    )
+
+            if plan.adjustable is plan.t1:
+                t1_value = controlled_value
+                t2_value, other_cols, other_derivatives = (
+                    self._energy_endpoint_value_and_derivative(plan.t2, x)
+                )
+            else:
+                t1_value, other_cols, other_derivatives = (
+                    self._energy_endpoint_value_and_derivative(plan.t1, x)
+                )
+                t2_value = controlled_value
             efficiency = float(plan.coupling.efficiency)
             residual[plan.eq_row] = (
-                abs(dependent_value) * plan.t2.energy_scale
-                - efficiency * abs(controlled_value) * plan.t1.energy_scale
+                abs(t2_value) * plan.t2.energy_scale
+                - efficiency * abs(t1_value) * plan.t1.energy_scale
             ) / plan.normalization
             if jacobian is None:
                 continue
-            controlled_sign = 1.0 if controlled_value >= 0.0 else -1.0
-            dependent_sign = 1.0 if dependent_value >= 0.0 else -1.0
             rows.append(plan.eq_row)
             cols.append(plan.state_col)
-            data.append(
-                -efficiency
-                * controlled_sign
-                * plan.t1.energy_scale
-                / plan.normalization
-            )
-            for column, derivative in zip(dependent_cols, dependent_derivatives):
+            if plan.adjustable is plan.t1:
+                controlled_sign = 1.0 if t1_value >= 0.0 else -1.0
+                data.append(
+                    -efficiency
+                    * controlled_sign
+                    * plan.t1.energy_scale
+                    / plan.normalization
+                )
+                other_scale = plan.t2.energy_scale
+                other_sign = 1.0 if t2_value >= 0.0 else -1.0
+            else:
+                controlled_sign = 1.0 if t2_value >= 0.0 else -1.0
+                data.append(
+                    controlled_sign
+                    * plan.t2.energy_scale
+                    / plan.normalization
+                )
+                other_scale = -efficiency * plan.t1.energy_scale
+                other_sign = 1.0 if t1_value >= 0.0 else -1.0
+            for column, derivative in zip(other_cols, other_derivatives):
                 rows.append(plan.eq_row)
                 cols.append(int(column))
                 data.append(
-                    dependent_sign
-                    * plan.t2.energy_scale
+                    other_sign
+                    * other_scale
                     * float(derivative)
                     / plan.normalization
                 )
@@ -2298,7 +2362,7 @@ class HybridPowerFlowCalc:
                 )
             else:
                 self._apply_final_energy_endpoint_value(
-                    plan.t1,
+                    plan.adjustable,
                     self.x[plan.state_col],
                     ac_result,
                     dc_result,
@@ -3876,12 +3940,23 @@ class HybridPowerFlowCalc:
                 t1_unit = "pu" if plan.t1.domain in {"ac", "dc"} else fluid_unit
                 t2_unit = "pu" if plan.t2.domain in {"ac", "dc"} else fluid_unit
             else:
-                t1_value = float(self.x[plan.state_col])
+                if plan.adjustable is plan.t1:
+                    t1_value = float(self.x[plan.state_col])
+                    t2_value, _columns, _derivatives = (
+                        self._energy_endpoint_value_and_derivative(
+                            plan.t2,
+                            self.x,
+                        )
+                    )
+                else:
+                    t1_value, _columns, _derivatives = (
+                        self._energy_endpoint_value_and_derivative(
+                            plan.t1,
+                            self.x,
+                        )
+                    )
+                    t2_value = float(self.x[plan.state_col])
                 t1_unit = "pu" if plan.t1.domain in {"ac", "dc"} else "flow"
-                t2_value, _columns, _derivatives = self._energy_endpoint_value_and_derivative(
-                    plan.t2,
-                    self.x,
-                )
                 t2_unit = "pu" if plan.t2.domain in {"ac", "dc"} else "flow"
             residual = None
             status = "inactive" if not coupling.active else "linked"

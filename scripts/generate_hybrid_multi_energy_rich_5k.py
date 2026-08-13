@@ -231,12 +231,18 @@ def _storage_blocks() -> str:
     def compressible_rows(prefix: str, count: int, *, steam: bool = False) -> list[str]:
         rows = []
         for pos in range(1, count + 1):
+            node_idx = 500 + pos
+            pressure_set = (
+                10.0 - 0.015 * (node_idx.bit_length() - 1)
+                if prefix == "hydro"
+                else 0.0
+            )
             values: tuple[object, ...] = (
                 pos,
                 f"rich_{prefix.lower()}_storage_{pos}",
-                500 + pos,
+                node_idx,
                 "FLOW",
-                0.0,
+                pressure_set,
                 _alternating_flow(pos),
                 1.0,
                 -0.01,

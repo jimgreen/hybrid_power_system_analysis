@@ -12628,26 +12628,26 @@
 
 <HydroStorage>
 @ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat
-# 1 rich_hydro_storage_1 501 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 2 rich_hydro_storage_2 502 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 3 rich_hydro_storage_3 503 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 4 rich_hydro_storage_4 504 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 5 rich_hydro_storage_5 505 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 6 rich_hydro_storage_6 506 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 7 rich_hydro_storage_7 507 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 8 rich_hydro_storage_8 508 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 9 rich_hydro_storage_9 509 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 10 rich_hydro_storage_10 510 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 11 rich_hydro_storage_11 511 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 12 rich_hydro_storage_12 512 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 13 rich_hydro_storage_13 513 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 14 rich_hydro_storage_14 514 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 15 rich_hydro_storage_15 515 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 16 rich_hydro_storage_16 516 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 17 rich_hydro_storage_17 517 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 18 rich_hydro_storage_18 518 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
-# 19 rich_hydro_storage_19 519 FLOW 0.0 0.0001 1.0 -0.01 0.01 1
-# 20 rich_hydro_storage_20 520 FLOW 0.0 -0.0001 1.0 -0.01 0.01 1
+# 1 rich_hydro_storage_1 501 FLOW 9.88 0.0001 1.0 -0.01 0.01 1
+# 2 rich_hydro_storage_2 502 FLOW 9.88 -0.0001 1.0 -0.01 0.01 1
+# 3 rich_hydro_storage_3 503 FLOW 9.88 0.0001 1.0 -0.01 0.01 1
+# 4 rich_hydro_storage_4 504 FLOW 9.88 -0.0001 1.0 -0.01 0.01 1
+# 5 rich_hydro_storage_5 505 FLOW 9.88 0.0001 1.0 -0.01 0.01 1
+# 6 rich_hydro_storage_6 506 FLOW 9.88 -0.0001 1.0 -0.01 0.01 1
+# 7 rich_hydro_storage_7 507 FLOW 9.88 0.0001 1.0 -0.01 0.01 1
+# 8 rich_hydro_storage_8 508 FLOW 9.88 -0.0001 1.0 -0.01 0.01 1
+# 9 rich_hydro_storage_9 509 FLOW 9.88 0.0001 1.0 -0.01 0.01 1
+# 10 rich_hydro_storage_10 510 FLOW 9.88 -0.0001 1.0 -0.01 0.01 1
+# 11 rich_hydro_storage_11 511 FLOW 9.88 0.0001 1.0 -0.01 0.01 1
+# 12 rich_hydro_storage_12 512 FLOW 9.865 -0.0001 1.0 -0.01 0.01 1
+# 13 rich_hydro_storage_13 513 FLOW 9.865 0.0001 1.0 -0.01 0.01 1
+# 14 rich_hydro_storage_14 514 FLOW 9.865 -0.0001 1.0 -0.01 0.01 1
+# 15 rich_hydro_storage_15 515 FLOW 9.865 0.0001 1.0 -0.01 0.01 1
+# 16 rich_hydro_storage_16 516 FLOW 9.865 -0.0001 1.0 -0.01 0.01 1
+# 17 rich_hydro_storage_17 517 FLOW 9.865 0.0001 1.0 -0.01 0.01 1
+# 18 rich_hydro_storage_18 518 FLOW 9.865 -0.0001 1.0 -0.01 0.01 1
+# 19 rich_hydro_storage_19 519 FLOW 9.865 0.0001 1.0 -0.01 0.01 1
+# 20 rich_hydro_storage_20 520 FLOW 9.865 -0.0001 1.0 -0.01 0.01 1
 </HydroStorage>
 
 <SteamStorage>

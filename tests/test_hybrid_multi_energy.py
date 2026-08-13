@@ -1273,7 +1273,11 @@ def test_hybrid_storage_endpoint_keeps_storage_identity_and_source_balance(tmp_p
     )
     assert plan.t1.kind == "storage"
     assert plan.t1.device_type == "HydroStorage"
-    storage_flow = float(calc.x[plan.state_col])
+    assert plan.adjustable is plan.t2
+    assert plan.adjustable.domain == "dc"
+    storage_flow, _columns, _derivatives = (
+        calc._energy_endpoint_value_and_derivative(plan.t1, calc.x)
+    )
     assert calc.fluid_calcs["hydro"].lf_result.storages["hydrogen_buffer"].flow == pytest.approx(
         storage_flow
     )
