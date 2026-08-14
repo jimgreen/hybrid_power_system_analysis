@@ -91,6 +91,7 @@ from model.dc_array_model import (
     build_dc_network_from_ppc,
     build_dc_ppc_from_e_file,
     build_dc_ppc_from_network,
+    sanitize_dc_voltage_setpoints,
 )
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 try:
@@ -612,6 +613,7 @@ class DCPowerFlowCalc:
     def _prepare_from_ppc(self):
         """Prepare a Newton system from an already arrayized DC ppc dictionary."""
         ensure_dc_ppc_topology(self.ppc)
+        sanitize_dc_voltage_setpoints(self.ppc)
         self._prepare_direct_ppc_topology()
 
         if self.N == 0:

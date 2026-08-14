@@ -137,7 +137,7 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 </DCBreak>
 <DCDCConverter>
 @ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_set v_set run_stat
-# 1 conv 1 2 0.01 0.01 NONE V 0 0 100 1
+# 1 conv 1 2 0.01 0.01 NONE V 0 0 0 1
 </DCDCConverter>
 """
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -154,6 +154,15 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
 
         self.assertEqual(CTRL_NONE, int(row[DCDC_COLS["i_control_type"]]))
         self.assertAlmostEqual(1.0, calc.result["bus"][1, 2], places=9)
+        corrections = [
+            item
+            for item in ppc.get("_setpoint_corrections", [])
+            if item.get("device_type") == "DCDCConverter"
+        ]
+        self.assertEqual(1, len(corrections))
+        self.assertEqual("j", corrections[0]["side"])
+        self.assertEqual(0.0, corrections[0]["original"])
+        self.assertEqual(1.0, corrections[0]["replacement"])
 
     def test_dc_array_network_replaces_object_model_loader(self):
         from model.dc_array_model import build_dc_network_from_ppc, build_dc_ppc_from_e_file
@@ -507,25 +516,31 @@ class DCLargeCaseGenerationTest(unittest.TestCase):
         self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "V_FROM"))
         self.assertIsNotNone(snapshot.value("DCBreak", breaker.name, "I_FROM"))
 
-    def test_update_meas_hybrid_snapshot_reconstructs_contracted_ideal_edge_flows(self):
+    def test_update_meas_hybrid_snapshot_reconstructs_explicit_ideal_edge_flows(self):
         import update_meas_from_lf
 
         snapshot, _info = update_meas_from_lf.solve_hybrid(
             ROOT_DIR / "data" / "model" / "hybrid" / "qinling.e"
         )
-        ac_switch = next(dev for dev in snapshot.ac.switches if dev.name == "sw_load1_ac")
-        dc_switch = next(dev for dev in snapshot.dc.switches if dev.name == "sw_wt02_dc")
+        ac_zero = next(
+            dev for dev in snapshot.ac.zero_branches if getattr(dev, "is_alive", False)
+        )
+        dc_breaker = next(
+            dev for dev in snapshot.dc.breakers if getattr(dev, "is_alive", False)
+        )
 
-        self.assertGreater(abs(ac_switch.current), 1e-6)
-        self.assertGreater(abs(dc_switch.current), 1e-6)
+        self.assertEqual([], list(snapshot.ac.switches))
+        self.assertEqual([], list(snapshot.dc.switches))
+        self.assertGreater(abs(ac_zero.current), 1e-6)
+        self.assertGreater(abs(dc_breaker.current), 1e-6)
         self.assertAlmostEqual(
-            abs(complex(ac_switch.p, ac_switch.q)) / ac_switch.i_node_obj.voltage,
-            ac_switch.current,
+            abs(complex(ac_zero.p, ac_zero.q)) / ac_zero.i_node_obj.voltage,
+            ac_zero.current,
             places=8,
         )
         self.assertAlmostEqual(
-            dc_switch.p / dc_switch.i_node_obj.voltage,
-            dc_switch.current,
+            abs(dc_breaker.p) / dc_breaker.i_node_obj.voltage,
+            dc_breaker.current,
             places=8,
         )
 

@@ -16,6 +16,10 @@ for path in (MODEL_DIR, ROOT_DIR):
 
 from topology import build_ac_topology_input_ppc
 from model.effective_state import propagate_composite_run_states
+from model.setpoint_validation import (
+    append_setpoint_corrections,
+    sanitize_fixed_setpoints,
+)
 from model.array_common import (
     _assign_current_if_present,
     _assign_power_if_present,
@@ -299,6 +303,66 @@ ACAC_COLS = {
     "i_i": 17,
     "j_i": 18,
 }
+
+
+def sanitize_ac_voltage_setpoints(ppc: Dict) -> list[dict]:
+    """Normalize every active AC voltage-control setpoint in place."""
+
+    corrections = []
+    gen = np.asarray(ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
+    if gen.size:
+        control = gen[:, GEN_COLS["control_type"]].astype(np.int8, copy=False)
+        active = gen[:, GEN_COLS["run_stat"]] == 1
+        voltage_control = active & np.isin(control, (CTRL_PV, CTRL_SLACK))
+        auto_slack = np.asarray(ppc.get("_auto_slack_gen_rows", ()), dtype=np.int64)
+        if auto_slack.size:
+            valid = auto_slack[(auto_slack >= 0) & (auto_slack < gen.shape[0])]
+            voltage_control[valid] = active[valid]
+        _, items = sanitize_fixed_setpoints(
+            gen[:, GEN_COLS["v_set"]],
+            voltage_control,
+            device_type="ACGenerator",
+            field="v_set",
+            indices=gen[:, GEN_COLS["idx"]],
+        )
+        corrections.extend(items)
+
+    shunt = np.asarray(ppc.get("shunt", _empty(len(SHUNT_COLS))), dtype=np.float64)
+    if shunt.size:
+        voltage_control = (
+            (shunt[:, SHUNT_COLS["run_stat"]] == 1)
+            & (shunt[:, SHUNT_COLS["control_type"]].astype(np.int8, copy=False) == SHUNT_V)
+        )
+        _, items = sanitize_fixed_setpoints(
+            shunt[:, SHUNT_COLS["v_set"]],
+            voltage_control,
+            device_type="ACShuntCompensator",
+            field="v_set",
+            indices=shunt[:, SHUNT_COLS["idx"]],
+        )
+        corrections.extend(items)
+
+    acac = np.asarray(ppc.get("acac", _empty(len(ACAC_COLS))), dtype=np.float64)
+    if acac.size:
+        active = acac[:, ACAC_COLS["run_stat"]] == 1
+        voltage_codes = (ACAC_SIDE_CONTROL_CODE["PV"], ACAC_SIDE_CONTROL_CODE["PH"])
+        for side in ("i", "j"):
+            voltage_control = active & np.isin(
+                acac[:, ACAC_COLS[f"{side}_control_type"]].astype(np.int8, copy=False),
+                voltage_codes,
+            )
+            _, items = sanitize_fixed_setpoints(
+                acac[:, ACAC_COLS[f"{side}_v_set"]],
+                voltage_control,
+                device_type="ACACConverter",
+                field=f"{side}_v_set",
+                indices=acac[:, ACAC_COLS["idx"]],
+                side=side,
+            )
+            corrections.extend(items)
+
+    append_setpoint_corrections(ppc, corrections)
+    return corrections
 
 MP_BUS_I = 0
 MP_BUS_TYPE = 1
@@ -884,6 +948,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "break_name": breaker_names,
         "acac_name": acac_names,
     }
+    sanitize_ac_voltage_setpoints(ppc)
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
@@ -1652,6 +1717,7 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
     }
+    sanitize_ac_voltage_setpoints(ppc)
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
@@ -1927,6 +1993,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         break_name=_name_array(breakers, "break"),
         acac_name=_name_array(acac_converters, "acac"),
     )
+    sanitize_ac_voltage_setpoints(ppc)
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 

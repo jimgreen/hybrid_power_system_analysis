@@ -44,6 +44,7 @@ from ac_array_model import (
     THREE_WINDING_TRANSFORMER_COLS,
     TRANSFORMER_COLS,
     ZERO_BRANCH_COLS,
+    sanitize_ac_voltage_setpoints,
 )
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
 from model.meas_array_model import (
@@ -6547,6 +6548,7 @@ class ACStateEstimator:
         if not (isinstance(ppc, dict) and ppc.get("format") == "ac_ppc_v1"):
             self._warn_required_runtime_missing("PPC-backed network", "AC PPC access")
         ensure_ac_ppc_topology(ppc)
+        sanitize_ac_voltage_setpoints(ppc)
         return ppc
 
     @staticmethod

@@ -2097,11 +2097,32 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             online_balance_islands = online_gen_islands[balance_mask]
         else:
             online_balance_islands = _EMPTY_INT
+        dcdc_balance_islands = _EMPTY_INT
+        if dcdc_nodes.size:
+            dcdc_v_mask = dcdc_run_mask & valid_dcdc & (i_v_mask | j_v_mask)
+            if np.any(dcdc_v_mask):
+                controlled_islands = np.where(
+                    i_v_mask[dcdc_v_mask],
+                    dcdc_i_islands[dcdc_v_mask],
+                    dcdc_j_islands[dcdc_v_mask],
+                )
+                dcdc_balance_islands = controlled_islands[
+                    controlled_islands >= 0
+                ].astype(np.int32, copy=False)
+        if dcdc_balance_islands.size:
+            online_balance_islands = np.concatenate(
+                (online_balance_islands, dcdc_balance_islands)
+            ).astype(np.int32, copy=False)
+            online_source_islands = np.concatenate(
+                (online_gen_islands, dcdc_balance_islands)
+            ).astype(np.int32, copy=False)
+        else:
+            online_source_islands = online_gen_islands
         _unused_ac, operational = hybrid_operational_island_masks(
             None,
             topology,
             dc_balance_generator_islands=online_balance_islands,
-            dc_generator_islands=online_gen_islands,
+            dc_generator_islands=online_source_islands,
             dc_load_islands=online_load_islands,
             dc_linked_terminals=(terminals.get("dcdc"),),
         )

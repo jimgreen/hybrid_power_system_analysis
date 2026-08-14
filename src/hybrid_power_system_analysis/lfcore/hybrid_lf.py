@@ -116,8 +116,10 @@ from hybrid_array_model import (
     DCAC_DC_CONTROL_CODE,
     DCAC_DC_CONTROL_LABEL,
     DCAC_DEVICE_TYPE_LABEL,
+    sanitize_dcac_voltage_setpoints,
     validate_dcac_control_types,
 )
+from model.setpoint_validation import sanitize_fixed_setpoints
 from model.ppc_topology import (
     build_ac_ppc_with_topology_from_e_file,
     build_ac_ppc_with_topology_from_efile_rows,
@@ -2489,6 +2491,8 @@ class HybridPowerFlowCalc:
         HybridPowerFlowCalc.prepare() 会直接准备 AC/DC 子求解器和全局状态布局。
         """
         self._sync_sub_result_modes()
+        if self._converter_ppc_mode:
+            sanitize_dcac_voltage_setpoints(self.network.ppc)
         self._install_ac_converter_voltage_control_nodes()
         parts = []
         if self.ac_calc is not None:
@@ -2590,6 +2594,26 @@ class HybridPowerFlowCalc:
                 getattr(conv, "ac_control_type", "NONE"),
                 getattr(conv, "dc_control_type", "NONE"),
             )
+            if ac_ctrl in {"PV", "PH"}:
+                value, _ = sanitize_fixed_setpoints(
+                    np.asarray([conv.v_ac_set], dtype=np.float64),
+                    np.asarray([True]),
+                    device_type="DCACConverter",
+                    field="v_ac_set",
+                    indices=np.asarray([conv.idx]),
+                    side="ac",
+                )
+                conv.v_ac_set = float(value[0])
+            if dc_ctrl == "V":
+                value, _ = sanitize_fixed_setpoints(
+                    np.asarray([conv.v_dc_set], dtype=np.float64),
+                    np.asarray([True]),
+                    device_type="DCACConverter",
+                    field="v_dc_set",
+                    indices=np.asarray([conv.idx]),
+                    side="dc",
+                )
+                conv.v_dc_set = float(value[0])
             self._validate_dcac_ac_terminal_control(conv.idx, ac_pos, ac_ctrl)
             conv.is_alive = True
             self.dcac_converters.append((conv, ac_pos, dc_pos))
@@ -4260,7 +4284,12 @@ class HybridPowerFlowCalc:
         return -1
 
     def _validate_initial_jacobian_columns(self, jacobian, tol=1e-14):
-        """Reject states that have no effective equation at the initial point."""
+        """Reject states missing from the complete coupled Newton system.
+
+        AC/DC subblocks can be rank deficient when converter or multi-energy
+        controls close their state directions in the coupling block.  Only the
+        assembled global Jacobian is valid for this diagnostic.
+        """
         csc = jacobian if getattr(jacobian, "format", None) == "csc" else jacobian.tocsc()
         zero_columns = []
         for col in range(csc.shape[1]):

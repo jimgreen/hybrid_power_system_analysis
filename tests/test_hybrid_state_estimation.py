@@ -461,6 +461,12 @@ class HybridStateEstimationTest(unittest.TestCase):
                 meas_type_code=MEAS_TYPE_CODES["I_GEN"],
                 device_pos=0,
             ),
+            Measurement(
+                5, "dcac_i_ac", "DCACConverter", "dcac_1", "I_AC", 1.0, True, 1.0,
+                device_type_code=DEVICE_TYPE_CODES["DCACConverter"],
+                meas_type_code=MEAS_TYPE_CODES["I_AC"],
+                device_pos=0,
+            ),
         ]
         table = measurement_table_from_measurements(rows)
         estimator = HybridStateEstimator.__new__(HybridStateEstimator)
@@ -477,6 +483,8 @@ class HybridStateEstimationTest(unittest.TestCase):
         self.assertEqual(MEAS_STATUS_NORMAL, int(status[2]))
         self.assertFalse(bool(table.valid[3]))
         self.assertEqual(MEAS_STATUS_INVALID, int(status[3]))
+        self.assertTrue(bool(table.valid[4]))
+        self.assertEqual(MEAS_STATUS_NORMAL, int(status[4]))
 
     def test_hybrid_prepare_keeps_ac_break_current_measurements_active(self):
         from model.meas_array_model import build_meas_ppc_from_e_file

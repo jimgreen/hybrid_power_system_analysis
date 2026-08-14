@@ -64,6 +64,7 @@ from ac_array_model import (
     build_ac_ppc_from_e_file,
     build_ac_ppc_from_mat_file,
     build_ac_ppc_from_network,
+    sanitize_ac_voltage_setpoints,
 )
 from ac_model import ACAC_SIDE_CONTROL_TYPES
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
@@ -962,6 +963,7 @@ class ACPowerFlowCalc:
             else:
                 self._ppc_node_row_by_id = {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
         ensure_ac_ppc_topology(ppc)
+        sanitize_ac_voltage_setpoints(ppc)
         topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
         active_node = np.asarray(topology.node_alive_mask, dtype=bool)

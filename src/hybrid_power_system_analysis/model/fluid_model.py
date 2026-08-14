@@ -12,6 +12,7 @@ from scipy.sparse.csgraph import connected_components
 
 from efile_read import efile_factory_from_file
 from paths import resolve_project_file
+from model.setpoint_validation import sanitize_fixed_setpoints
 
 
 PRESSURE_CONTROL = "PRESSURE"
@@ -228,6 +229,175 @@ class FluidNetwork:
     explicit_return: bool = False
     source: Optional[Path] = None
 
+    def _record_setpoint_corrections(self, corrections) -> None:
+        existing = getattr(self, "setpoint_corrections", [])
+        known = {
+            (
+                item.get("device_type"),
+                item.get("index"),
+                item.get("field"),
+                item.get("original"),
+                item.get("replacement"),
+            )
+            for item in existing
+        }
+        for item in corrections:
+            key = (
+                item.get("device_type"),
+                item.get("index"),
+                item.get("field"),
+                item.get("original"),
+                item.get("replacement"),
+            )
+            if key not in known:
+                existing.append(item)
+                known.add(key)
+        self.setpoint_corrections = existing
+
+    def _sanitize_node_initial_boundaries(self, live_nodes) -> None:
+        node_indices = np.asarray([node.idx for node in live_nodes], dtype=np.int64)
+        pressure = np.asarray([node.pressure for node in live_nodes], dtype=np.float64)
+        pressure, corrections = sanitize_fixed_setpoints(
+            pressure,
+            np.ones(pressure.size, dtype=bool),
+            fallback=1.0,
+            minimum=np.finfo(np.float64).eps,
+            maximum=np.inf,
+            device_type=f"{self.prefix}Node",
+            field="pressure",
+            indices=node_indices,
+        )
+        for pos, value in enumerate(pressure.tolist()):
+            live_nodes[pos].pressure = float(value)
+        self._record_setpoint_corrections(corrections)
+
+        if self.thermal:
+            temperature_specs = (
+                ("supply_temperature", 80.0),
+                ("return_temperature", 50.0),
+                ("temperature", 80.0),
+            )
+            for field_name, default in temperature_specs:
+                values = np.asarray(
+                    [getattr(node, field_name) for node in live_nodes],
+                    dtype=np.float64,
+                )
+                fallback = default
+                if field_name == "temperature":
+                    fallback = np.asarray(
+                        [node.supply_temperature for node in live_nodes],
+                        dtype=np.float64,
+                    )
+                values, corrections = sanitize_fixed_setpoints(
+                    values,
+                    np.ones(values.size, dtype=bool),
+                    fallback=fallback,
+                    minimum=np.finfo(np.float64).eps,
+                    maximum=np.inf,
+                    default_fallback=default,
+                    device_type=f"{self.prefix}Node",
+                    field=field_name,
+                    indices=node_indices,
+                )
+                for pos, value in enumerate(values.tolist()):
+                    setattr(live_nodes[pos], field_name, float(value))
+                self._record_setpoint_corrections(corrections)
+
+        if self.steam:
+            enthalpy = np.asarray(
+                [node.enthalpy for node in live_nodes],
+                dtype=np.float64,
+            )
+            enthalpy, corrections = sanitize_fixed_setpoints(
+                enthalpy,
+                np.ones(enthalpy.size, dtype=bool),
+                fallback=3000.0,
+                minimum=np.finfo(np.float64).eps,
+                maximum=np.inf,
+                default_fallback=3000.0,
+                device_type=f"{self.prefix}Node",
+                field="enthalpy",
+                indices=node_indices,
+            )
+            for pos, value in enumerate(enthalpy.tolist()):
+                live_nodes[pos].enthalpy = float(value)
+            self._record_setpoint_corrections(corrections)
+
+    def _sanitize_source_boundaries(self) -> None:
+        source_indices = np.asarray([item.idx for item in self.sources], dtype=np.int64)
+        pressure_fallback = self.node_pressure[self.source_node_pos]
+        pressure, corrections = sanitize_fixed_setpoints(
+            self.source_pressure_set,
+            self.source_is_pressure_controlled,
+            fallback=pressure_fallback,
+            minimum=np.finfo(np.float64).eps,
+            maximum=np.inf,
+            default_fallback=1.0,
+            device_type=f"{self.prefix}Source",
+            field="pressure_set",
+            indices=source_indices,
+        )
+        self.source_pressure_set = pressure
+        for pos, value in enumerate(pressure.tolist()):
+            self.sources[pos].pressure_set = float(value)
+        self._record_setpoint_corrections(corrections)
+
+        if self.steam:
+            enthalpy_fallback = self.node_enthalpy[self.source_node_pos]
+            enthalpy, corrections = sanitize_fixed_setpoints(
+                self.source_enthalpy_set,
+                np.ones(self.source_enthalpy_set.size, dtype=bool),
+                fallback=enthalpy_fallback,
+                minimum=np.finfo(np.float64).eps,
+                maximum=np.inf,
+                default_fallback=3000.0,
+                device_type=f"{self.prefix}Source",
+                field="enthalpy_set",
+                indices=source_indices,
+            )
+            self.source_enthalpy_set = enthalpy
+            for pos, value in enumerate(enthalpy.tolist()):
+                self.sources[pos].enthalpy_set = float(value)
+            self._record_setpoint_corrections(corrections)
+
+        if not self.thermal:
+            return
+        temperature_specs = (
+            (
+                "supply_temperature_set",
+                self.source_supply_temperature_set,
+                self.source_supply_node_pos,
+                self.supply_temperature_state_by_node,
+            ),
+            (
+                "return_temperature_set",
+                self.source_return_temperature_set,
+                self.source_return_node_pos,
+                self.return_temperature_state_by_node,
+            ),
+        )
+        for field_name, values, node_positions, state_by_node in temperature_specs:
+            fallback = self.initial_temperature_state[state_by_node[node_positions]]
+            default = 80.0 if field_name == "supply_temperature_set" else 50.0
+            values, corrections = sanitize_fixed_setpoints(
+                values,
+                np.ones(values.size, dtype=bool),
+                fallback=fallback,
+                minimum=np.finfo(np.float64).eps,
+                maximum=np.inf,
+                default_fallback=default,
+                device_type=f"{self.prefix}Source",
+                field=field_name,
+                indices=source_indices,
+            )
+            setattr(self, f"source_{field_name}", values)
+            for pos, value in enumerate(values.tolist()):
+                setattr(self.sources[pos], field_name, float(value))
+                if field_name == "supply_temperature_set":
+                    self.sources[pos].supply_temperature = float(value)
+            self._record_setpoint_corrections(corrections)
+        self.source_supply_temperature = self.source_supply_temperature_set
+
     def prepare(self) -> "FluidNetwork":
         known_sources = {id(item) for item in self.sources}
         self.sources.extend(
@@ -236,6 +406,7 @@ class FluidNetwork:
         live_nodes = [node for node in self.nodes if int(node.run_stat) == 1]
         if not live_nodes:
             raise RuntimeError(f"{self.prefix} network has no live nodes")
+        self._sanitize_node_initial_boundaries(live_nodes)
         self.nodes = live_nodes
         self.node_idx = np.asarray([node.idx for node in live_nodes], dtype=np.int64)
         self.node_name = np.asarray([node.name for node in live_nodes], dtype=object)
@@ -591,6 +762,7 @@ class FluidNetwork:
         # Compatibility view for thermal transport code and existing result APIs.
         self.source_supply_temperature = self.source_supply_temperature_set
         self.source_enthalpy_set = np.asarray([item.enthalpy_set for item in self.sources], dtype=np.float64)
+        self._sanitize_source_boundaries()
         self.load_flow_set = np.asarray([max(item.flow_set, 0.0) for item in self.loads], dtype=np.float64)
         self.load_heat_power = np.asarray([max(item.heat_power, 0.0) for item in self.loads], dtype=np.float64)
         self.load_condensate_enthalpy = np.asarray(
@@ -681,7 +853,13 @@ class FluidNetwork:
             [min(max(item.heat_loss, 0.0), 1.0) for item in self.heat_exchangers], dtype=np.float64
         )
 
-        self.warnings = []
+        self.warnings = [
+            (
+                f"{item['device_type']}[{item['index']}] {item['field']} "
+                f"was {item['original']!r}; using {item['replacement']:.6g}"
+            )
+            for item in getattr(self, "setpoint_corrections", [])
+        ]
         fixed_temperature_by_state: Dict[int, List[float]] = {}
         if self.thermal:
             for source_pos in self.storage_source_pos.tolist():

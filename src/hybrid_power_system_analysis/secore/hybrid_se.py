@@ -4276,7 +4276,11 @@ class HybridStateEstimator:
         )
 
     def _disable_ac_current_measurements(self) -> None:
-        """Disable unsupported AC currents while retaining ideal-edge flow measurements."""
+        """Disable unsupported AC-subsystem currents.
+
+        DCAC ``I_AC`` belongs to the coupling block and has its own direct
+        measurement/Jacobian plan, so it must remain active here.
+        """
         table = getattr(self.measurements, "table", None)
         if table is None:
             warnings.warn(
@@ -4312,7 +4316,6 @@ class HybridStateEstimator:
             np.isin(device_type_code, ac_single_devices)
             & np.isin(meas_type_code, np.asarray((MEAS_TYPE_I_LOAD, MEAS_TYPE_I_GEN), dtype=np.int16))
         )
-        ac_current_mask |= (device_type_code == DEVICE_TYPE_DCACConverter) & (meas_type_code == MEAS_TYPE_I_AC)
         if not np.any(ac_current_mask):
             return
         table.valid[ac_current_mask] = False

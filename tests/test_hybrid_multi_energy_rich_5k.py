@@ -261,7 +261,8 @@ def test_rich_5k_se_is_observable_accurate_joint_and_storage_aware(monkeypatch):
     assert result.iterations <= 12
     assert result.residual_inf < 5.0e-8
     assert result.objective < 1.0e-10
-    assert result.H.shape == (26845, 9184)
+    # All 80 DCAC AC-terminal current measurements are active coupling rows.
+    assert result.H.shape == (26925, 9184)
     assert result.H.nnz > 53700
     coupling_rows = estimator.multi_energy_coupling_measurement_slice
     assert float(np.max(np.abs(result.residual[coupling_rows]))) < 1.0e-10

@@ -26,6 +26,10 @@ from dc_array_model import (
 )
 from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
 from model.effective_state import propagate_composite_run_states
+from model.setpoint_validation import (
+    append_setpoint_corrections,
+    sanitize_fixed_setpoints,
+)
 from unit_system import normalize_model_named_units
 from unit_system import ac_current_base_ka, dc_current_base_ka
 
@@ -129,6 +133,53 @@ DCAC_COLS = {
     "dev_type": 17,
     "p_dc_set": 18,
 }
+
+
+def sanitize_dcac_voltage_setpoints(ppc: Dict) -> list[dict]:
+    """Normalize active DCAC voltage-control setpoints in place."""
+
+    dcac = np.asarray(ppc.get("dcac", _empty(len(DCAC_COLS))), dtype=np.float64)
+    if not dcac.size:
+        return []
+    active = dcac[:, DCAC_COLS["run_stat"]] == 1
+    corrections = []
+    controls = (
+        (
+            "ac",
+            "v_ac_set",
+            active
+            & np.isin(
+                dcac[:, DCAC_COLS["ac_control_type"]].astype(np.int8, copy=False),
+                (DCAC_AC_CONTROL_CODE["PV"], DCAC_AC_CONTROL_CODE["PH"]),
+            ),
+        ),
+        (
+            "dc",
+            "v_dc_set",
+            active
+            & (
+                dcac[:, DCAC_COLS["dc_control_type"]].astype(np.int8, copy=False)
+                == DCAC_DC_CONTROL_CODE["V"]
+            ),
+        ),
+    )
+    for side, field, mask in controls:
+        _, items = sanitize_fixed_setpoints(
+            dcac[:, DCAC_COLS[field]],
+            mask,
+            device_type="DCACConverter",
+            field=field,
+            indices=dcac[:, DCAC_COLS["idx"]],
+            side=side,
+        )
+        corrections.extend(items)
+    append_setpoint_corrections(ppc, corrections)
+    objects = list(ppc.get("dcac_objects") or ())
+    if len(objects) == dcac.shape[0]:
+        for pos, obj in enumerate(objects):
+            obj.v_ac_set = float(dcac[pos, DCAC_COLS["v_ac_set"]])
+            obj.v_dc_set = float(dcac[pos, DCAC_COLS["v_dc_set"]])
+    return corrections
 
 
 def _attr(obj, attr: str, default=""):
@@ -597,6 +648,7 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
     }
+    sanitize_dcac_voltage_setpoints(ppc)
     ppc["_effective_run_state_overrides"] = overrides
     ac_ppc["_effective_run_state_overrides"] = overrides
     dc_ppc["_effective_run_state_overrides"] = overrides
@@ -641,6 +693,7 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
         "acac_cols": ACAC_COLS,
         "_effective_run_state_overrides": overrides,
     }
+    sanitize_dcac_voltage_setpoints(ppc)
     ac_ppc["_effective_run_state_overrides"] = overrides
     dc_ppc["_effective_run_state_overrides"] = overrides
     network = build_hybrid_model_from_ppc(ppc)
@@ -675,6 +728,7 @@ def build_hybrid_ppc_from_model(file_path, model):
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
     }
+    sanitize_dcac_voltage_setpoints(ppc)
     network = build_hybrid_model_from_ppc(ppc)
     return network, ppc
 

@@ -16,6 +16,10 @@ for path in (MODEL_DIR, ROOT_DIR):
 
 from topology import build_dc_topology_input_ppc
 from model.effective_state import propagate_composite_run_states
+from model.setpoint_validation import (
+    append_setpoint_corrections,
+    sanitize_fixed_setpoints,
+)
 from model.array_common import (
     _assign_current_if_present,
     _assign_power_if_present,
@@ -195,6 +199,51 @@ DCDC_COLS = {
     "i_c": 13,
     "j_c": 14,
 }
+
+
+def sanitize_dc_voltage_setpoints(ppc: Dict) -> list[dict]:
+    """Normalize every active DC voltage-control setpoint in place."""
+
+    corrections = []
+    gen = np.asarray(ppc.get("gen", _empty(len(GEN_COLS))), dtype=np.float64)
+    if gen.size:
+        voltage_control = (
+            (gen[:, GEN_COLS["run_stat"]] == 1)
+            & (gen[:, GEN_COLS["control_type"]].astype(np.int8, copy=False) == CTRL_V)
+        )
+        _, items = sanitize_fixed_setpoints(
+            gen[:, GEN_COLS["v_set"]],
+            voltage_control,
+            device_type="DCGenerator",
+            field="v_set",
+            indices=gen[:, GEN_COLS["idx"]],
+        )
+        corrections.extend(items)
+
+    dcdc = np.asarray(ppc.get("dcdc", _empty(len(DCDC_COLS))), dtype=np.float64)
+    if dcdc.size:
+        active = dcdc[:, DCDC_COLS["run_stat"]] == 1
+        i_voltage = (
+            dcdc[:, DCDC_COLS["i_control_type"]].astype(np.int8, copy=False) == CTRL_V
+        )
+        j_voltage = (
+            dcdc[:, DCDC_COLS["j_control_type"]].astype(np.int8, copy=False) == CTRL_V
+        )
+        voltage_control = active & (i_voltage | j_voltage)
+        _, items = sanitize_fixed_setpoints(
+            dcdc[:, DCDC_COLS["v_set"]],
+            voltage_control,
+            device_type="DCDCConverter",
+            field="v_set",
+            indices=dcdc[:, DCDC_COLS["idx"]],
+        )
+        for item in items:
+            row = item["row"]
+            item["side"] = "i" if i_voltage[row] else "j"
+        corrections.extend(items)
+
+    append_setpoint_corrections(ppc, corrections)
+    return corrections
 
 def _build_switch_like_from_rows(
     table_rows,
@@ -477,6 +526,7 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "break_name": breaker_names,
         "dcdc_name": dcdc_names,
     }
+    sanitize_dc_voltage_setpoints(ppc)
     ppc["_topology_input"] = build_dc_topology_input_ppc(ppc)
     return ppc
 
@@ -750,6 +800,7 @@ def build_dc_ppc_from_network(network) -> Dict:
         break_name=_name_array(breakers, "break"),
         dcdc_name=_name_array(dcdcs, "dcdc"),
     )
+    sanitize_dc_voltage_setpoints(ppc)
     ppc["_topology_input"] = build_dc_topology_input_ppc(ppc)
     return ppc
 

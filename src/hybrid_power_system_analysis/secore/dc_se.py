@@ -34,6 +34,7 @@ from model.dc_array_model import (
     LOAD_COLS as DC_LOAD_COLS,
     SWITCH_COLS as DC_SWITCH_COLS,
     ZERO_BRANCH_COLS as DC_ZERO_BRANCH_COLS,
+    sanitize_dc_voltage_setpoints,
 )
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
 from model.meas_array_model import (
@@ -459,6 +460,7 @@ class DCStateEstimator:
             ppc = getattr(self.network, "_array_model", None)
         if not isinstance(ppc, dict):
             raise RuntimeError("DC SE requires a PPC-backed DC network")
+        sanitize_dc_voltage_setpoints(ppc)
         return ppc
 
     @staticmethod
