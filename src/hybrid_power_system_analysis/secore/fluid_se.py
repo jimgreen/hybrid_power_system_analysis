@@ -58,6 +58,10 @@ SUPPORTED_MEASUREMENT_TYPES = frozenset(
         "T_TO",
     }
 )
+_DEVICE_TYPE_ALIASES = {
+    "HeatSource2": "HeatSource",
+    "HeatLoad2": "HeatLoad",
+}
 
 
 class FluidStateEstimator:
@@ -155,7 +159,10 @@ class FluidStateEstimator:
 
     def _device_position(self, measurement: Measurement) -> int:
         net = self.network
-        device_type = str(measurement.device_type)
+        device_type = _DEVICE_TYPE_ALIASES.get(
+            str(measurement.device_type),
+            str(measurement.device_type),
+        )
         name = str(measurement.device_name)
         prefix = net.prefix
         if device_type == f"{prefix}Node":
@@ -192,6 +199,10 @@ class FluidStateEstimator:
         active = []
         prefiltered = []
         for measurement in self.measurements:
+            measurement.device_type = _DEVICE_TYPE_ALIASES.get(
+                str(measurement.device_type),
+                str(measurement.device_type),
+            )
             measurement.meas_type = str(measurement.meas_type).upper()
             measurement.device_type_code = int(DEVICE_TYPE_CODES.get(str(measurement.device_type), 0))
             measurement.meas_type_code = int(MEAS_TYPE_CODES.get(measurement.meas_type, 0))

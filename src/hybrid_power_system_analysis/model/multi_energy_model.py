@@ -616,9 +616,14 @@ def _endpoint_reference_fields(row) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _device_row_by_idx(model, device_type: str, device_idx: int):
-    for row in getattr(model, device_type, ()) or ():
-        if _int(row, "idx", -1) == int(device_idx):
-            return row
+    table_names = {
+        "HeatSource": ("HeatSource", "HeatSource2"),
+        "HeatLoad": ("HeatLoad", "HeatLoad2"),
+    }.get(device_type, (device_type,))
+    for table_name in table_names:
+        for row in getattr(model, table_name, ()) or ():
+            if _int(row, "idx", -1) == int(device_idx):
+                return row
     return None
 
 

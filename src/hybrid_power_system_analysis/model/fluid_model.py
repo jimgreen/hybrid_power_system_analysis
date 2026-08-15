@@ -44,6 +44,19 @@ def _optional_int(row, name: str) -> Optional[int]:
     return int(value)
 
 
+def _optional_int_alias(row, *names: str) -> Optional[int]:
+    for name in names:
+        value = _optional_int(row, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _model_rows(model, *table_names: str):
+    for table_name in table_names:
+        yield from getattr(model, table_name, ()) or ()
+
+
 def _text(row, name: str, default: str = "") -> str:
     value = getattr(row, name, default)
     return str(default if value in (None, "") else value)
@@ -1118,7 +1131,10 @@ def _parse_nodes(model, prefix: str, thermal: bool) -> List[FluidNode]:
 
 def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
     sources = []
-    for row in getattr(model, f"{prefix}Source", ()) or ():
+    table_names = [f"{prefix}Source"]
+    if thermal and prefix == "Heat":
+        table_names.append("HeatSource2")
+    for row in _model_rows(model, *table_names):
         legacy_temperature = _float(
             row,
             "supply_temperature",
@@ -1150,8 +1166,8 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
                 return_temperature_set=return_temperature_set,
                 enthalpy_set=_float(row, "enthalpy_set", _float(row, "h_set", 3000.0)),
                 run_stat=_int(row, "run_stat", 1),
-                supply_node=_optional_int(row, "supply_node"),
-                return_node=_optional_int(row, "return_node"),
+                supply_node=_optional_int_alias(row, "supply_node", "i_node"),
+                return_node=_optional_int_alias(row, "return_node", "j_node"),
             )
         )
     return sources
@@ -1226,7 +1242,10 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
 
 def _parse_loads(model, prefix: str) -> List[FluidLoad]:
     loads = []
-    for row in getattr(model, f"{prefix}Load", ()) or ():
+    table_names = [f"{prefix}Load"]
+    if prefix == "Heat":
+        table_names.append("HeatLoad2")
+    for row in _model_rows(model, *table_names):
         loads.append(
             FluidLoad(
                 idx=_int(row, "idx"),
@@ -1236,8 +1255,8 @@ def _parse_loads(model, prefix: str) -> List[FluidLoad]:
                 heat_power=_float(row, "heat_power", 0.0),
                 condensate_enthalpy=_float(row, "condensate_enthalpy", 419.0),
                 run_stat=_int(row, "run_stat", 1),
-                supply_node=_optional_int(row, "supply_node"),
-                return_node=_optional_int(row, "return_node"),
+                supply_node=_optional_int_alias(row, "supply_node", "i_node"),
+                return_node=_optional_int_alias(row, "return_node", "j_node"),
             )
         )
     return loads

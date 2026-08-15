@@ -63,6 +63,12 @@ The detailed layout lists both the supply and return hydraulic networks:
 - `HeatLoad.supply_node/return_node`: water enters at the supply port and leaves at the return port
 - `HeatExchanger.primary_supply_node/primary_return_node/secondary_return_node/secondary_supply_node`: four physical terminals
 
+The explicit-return parser also accepts modeling-platform aliases `HeatSource2`
+and `HeatLoad2`. Their `i_node/j_node` fields are mapped to
+`supply_node/return_node`; canonical port names remain valid in either block.
+Measurements named `HeatSource2` or `HeatLoad2` are normalized to the shared
+`HeatSource`/`HeatLoad` calculation devices.
+
 Every explicit `HeatNode` has one `TEMPERATURE` state. Supply and return pipes are both ordinary `HeatPipe`, `HeatValve`, or `HeatPump` rows with their actual terminal nodes. The source, load, and heat-exchanger terminal flows participate directly in node mass balance.
 
 An explicit pressure-controlled heat source fixes its supply-port pressure. Its circulation flow is solved from the combined supply/return KCL. If several such sources control the same supply node, `flow_set`, directional limits, and `alpha` determine the flow sharing.
@@ -81,7 +87,9 @@ Each side must define exactly one complete layout. A pipe-connected hydraulic co
 
 Sparse mixing equations determine all compact temperature states. Heat loads withdraw specified mass flow and heat power; in the implicit layout the local load outlet temperature can differ from the mixed return-node temperature.
 
-Supported E blocks are `HeatMedium`, `HeatNode`, `HeatSource`, `HeatLoad`, `HeatPipe`, `HeatValve`, `HeatPump`, and `HeatExchanger`.
+Supported E blocks are `HeatMedium`, `HeatNode`, `HeatSource`, `HeatSource2`,
+`HeatLoad`, `HeatLoad2`, `HeatPipe`, `HeatValve`, `HeatPump`, and
+`HeatExchanger`.
 
 The heat-exchanger thermal equations support:
 

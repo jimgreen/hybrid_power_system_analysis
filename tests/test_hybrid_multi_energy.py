@@ -590,6 +590,99 @@ def test_direct_electric_heat_supports_explicit_return_source(tmp_path, control_
         assert calc.x[plan.supply_temperature_col] == pytest.approx(90.0, abs=1.0e-8)
 
 
+def test_direct_electric_heat_supports_source2_and_load2_blocks(tmp_path):
+    case_file = _build_explicit_return_electric_heat_case(
+        tmp_path,
+        control_type="P",
+    )
+    text = case_file.read_text(encoding="utf8")
+    text = text.replace("<HeatSource>", "<HeatSource2>")
+    text = text.replace("</HeatSource>", "</HeatSource2>")
+    text = text.replace("<HeatLoad>", "<HeatLoad2>")
+    text = text.replace("</HeatLoad>", "</HeatLoad2>")
+    case_file.write_text(text, encoding="utf8")
+
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+
+    assert calc.run() == 0
+    heat_calc = calc.fluid_calcs["heat"]
+    assert [item.name for item in heat_calc.network.sources] == ["primary_source"]
+    assert [item.name for item in heat_calc.network.loads] == ["secondary_load"]
+    coupling = next(
+        item for item in calc.multi_energy.couplings if item.name == "explicit_return_heater"
+    )
+    result = next(
+        item for item in calc.coupling_results if item.name == "explicit_return_heater"
+    )
+    assert coupling.active
+    assert result.status == "balanced"
+    assert abs(float(result.residual)) < 1.0e-8
+
+
+def test_hybrid_se_supports_source2_and_load2_blocks_and_measurements(tmp_path):
+    case_file = _build_explicit_return_electric_heat_case(
+        tmp_path,
+        control_type="P",
+    )
+    text = case_file.read_text(encoding="utf8")
+    text = text.replace("<HeatSource>", "<HeatSource2>")
+    text = text.replace("</HeatSource>", "</HeatSource2>")
+    text = text.replace("<HeatLoad>", "<HeatLoad2>")
+    text = text.replace("</HeatLoad>", "</HeatLoad2>")
+    case_file.write_text(text, encoding="utf8")
+
+    rows = []
+    for measurement_file in (
+        ROOT / "data" / "meas" / "hybrid" / "hybrid_net_40.meas",
+        ROOT / "data" / "meas" / "heat" / "heat_explicit_return.meas",
+    ):
+        rows.extend(_measurement_rows(measurement_file))
+    for row in rows:
+        if row[2] == "HeatSource":
+            row[2] = "HeatSource2"
+        elif row[2] == "HeatLoad":
+            row[2] = "HeatLoad2"
+    meas_file = tmp_path / "hybrid_source2_load2.meas"
+    output = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value",
+    ]
+    for idx, row in enumerate(rows, start=1):
+        row[0] = str(idx)
+        output.append("# " + " ".join(row))
+    output.append("</Measurement>")
+    meas_file.write_text("\n".join(output) + "\n", encoding="utf8")
+
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        tol=1.0e-8,
+        max_iter=50,
+    )
+    estimator.run(skip_bad_data=True)
+
+    assert estimator.multi_energy_result.converged
+    assert estimator.multi_energy_result.observable
+    assert estimator.fluid_se_rc == {"heat": 0}
+    heat_estimator = estimator.fluid_estimators["heat"]
+    assert not heat_estimator.prefiltered_measurements
+    assert [item.name for item in heat_estimator.network.sources] == ["primary_source"]
+    assert [item.name for item in heat_estimator.network.loads] == ["secondary_load"]
+    coupling = next(
+        item
+        for item in estimator.multi_energy_result.couplings
+        if item.name == "explicit_return_heater"
+    )
+    assert coupling.active
+    assert coupling.status == "balanced"
+
+
 @pytest.mark.parametrize(
     "table_name",
     ("AcE2Heat", "AcE2Heat2", "DcE2Heat", "DcE2Heat2"),

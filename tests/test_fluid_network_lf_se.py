@@ -11,6 +11,57 @@ from model.meas_model import Measurement
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _write_two_port_heat_alias_case(tmp_path: Path) -> Path:
+    case_file = tmp_path / "heat_source2_load2.e"
+    case_file.write_text(
+        """
+<HeatMedium>
+@ density heat_capacity ambient_temperature temperature flow_factor
+# 998.0 4.186 20.0 353.15 1.0
+</HeatMedium>
+
+<HeatNode>
+@ idx name pressure supply_temperature return_temperature run_stat
+# 1 load_supply 9.0 95.0 70.0 1
+# 2 load_return 5.0 95.0 70.0 1
+# 3 source_supply 10.0 95.0 70.0 1
+# 4 source_return 4.0 95.0 70.0 1
+</HeatNode>
+
+<HeatSource2>
+@ idx name dev_type i_node j_node control_type pressure_set flow_set alpha flow_min flow_max supply_temperature_set return_temperature_set run_stat
+# 1 dual_port_source two-port-heat-source 3 4 PRESSURE 10.0 0.0 1.0 0.0 2.0 95.0 70.0 1
+</HeatSource2>
+
+<HeatLoad2>
+@ idx name dev_type i_node j_node mass_flow heat_power run_stat
+# 1 dual_port_load two-port-heat-load 1 2 1.0 104.65 1
+</HeatLoad2>
+
+<HeatPipe>
+@ idx name dev_type i_node j_node control_type conductance flow_set heat_loss run_stat
+# 1 supply_pipe heat-pipe 3 1 PASSIVE 1.0 0.0 0.0 1
+# 2 return_pipe heat-pipe 2 4 PASSIVE 1.0 0.0 0.0 1
+</HeatPipe>
+""".strip()
+        + "\n",
+        encoding="utf8",
+    )
+    return case_file
+
+
+def _two_port_alias_measurements(network, calc):
+    from scripts.check_fluid_scale_lf_se import build_measurements_from_lf
+
+    measurements = build_measurements_from_lf(network, calc)
+    for measurement in measurements:
+        if measurement.device_type == "HeatSource":
+            measurement.device_type = "HeatSource2"
+        elif measurement.device_type == "HeatLoad":
+            measurement.device_type = "HeatLoad2"
+    return measurements
+
+
 def _fluid_storage_case(case_type):
     if case_type == "heat":
         from heat_lf import HeatPowerFlowCalc
@@ -977,6 +1028,146 @@ def test_explicit_return_heat_network_solves_dual_port_devices_and_four_port_exc
     assert exchanger.secondary_heat == pytest.approx(50.0, abs=1e-10)
     assert exchanger.primary_out_temperature == pytest.approx(calc.temperature[2])
     assert exchanger.secondary_out_temperature == pytest.approx(calc.temperature[4])
+
+
+def test_heat_source2_and_load2_work_in_standalone_lf_and_se(tmp_path):
+    from heat_lf import HeatPowerFlowCalc
+    from heat_se import HeatStateEstimator
+    from model.heat_model import load_heat_network_from_e_file
+
+    case_file = _write_two_port_heat_alias_case(tmp_path)
+    network = load_heat_network_from_e_file(case_file)
+
+    assert network.explicit_return
+    assert [item.name for item in network.sources] == ["dual_port_source"]
+    assert [item.name for item in network.loads] == ["dual_port_load"]
+    assert network.source_supply_node_pos.tolist() == [2]
+    assert network.source_return_node_pos.tolist() == [3]
+    assert network.load_supply_node_pos.tolist() == [0]
+    assert network.load_return_node_pos.tolist() == [1]
+
+    calc = HeatPowerFlowCalc(
+        network,
+        tol=1.0e-12,
+        max_iter=50,
+        result_mode="full",
+    )
+    assert calc.run() == 0
+    np.testing.assert_allclose(calc.source_flow, [1.0], atol=1.0e-12)
+    np.testing.assert_allclose(calc.edge_flow, [1.0, 1.0], atol=1.0e-12)
+
+    measurements = _two_port_alias_measurements(network, calc)
+    estimator = HeatStateEstimator(
+        load_heat_network_from_e_file(case_file),
+        measurements=measurements,
+        flat_start=True,
+        tol=1.0e-10,
+        max_iter=30,
+    )
+    assert estimator.run() == 0
+    assert estimator.result.converged
+    assert estimator.result.observability.observable
+    assert not estimator.prefiltered_measurements
+    assert any(item.device_type == "HeatSource" for item in estimator.active_measurements)
+    assert any(item.device_type == "HeatLoad" for item in estimator.active_measurements)
+
+
+def test_heat_source2_and_load2_work_in_hybrid_lf_and_se(tmp_path):
+    from heat_lf import HeatPowerFlowCalc
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+    from model.heat_model import load_heat_network_from_e_file
+    from scripts.check_fluid_scale_lf_se import write_measurement_file
+    from secore.hybrid_se import HybridStateEstimator
+
+    case_file = _write_two_port_heat_alias_case(tmp_path)
+    calc = HybridPowerFlowCalc.from_file_fast(
+        case_file,
+        tol=1.0e-12,
+        max_iter=50,
+        result_mode="full",
+        linear_solver="scipy",
+        verbose=False,
+    )
+    assert calc.run() == 0
+    assert set(calc.fluid_calcs) == {"heat"}
+    heat_calc = calc.fluid_calcs["heat"]
+    assert [item.name for item in heat_calc.network.sources] == ["dual_port_source"]
+    assert [item.name for item in heat_calc.network.loads] == ["dual_port_load"]
+    np.testing.assert_allclose(heat_calc.source_flow, [1.0], atol=1.0e-12)
+
+    standalone_network = load_heat_network_from_e_file(case_file)
+    standalone_calc = HeatPowerFlowCalc(
+        standalone_network,
+        tol=1.0e-12,
+        max_iter=50,
+        result_mode="full",
+    )
+    assert standalone_calc.run() == 0
+    measurements = _two_port_alias_measurements(standalone_network, standalone_calc)
+    meas_file = write_measurement_file(measurements, tmp_path / "heat_source2_load2.meas")
+
+    estimator = HybridStateEstimator(
+        e_file=case_file,
+        meas_file=meas_file,
+        flat_start=True,
+        tol=1.0e-10,
+        max_iter=30,
+    )
+    result = estimator.run(skip_bad_data=True)
+    assert result is None
+    assert estimator.multi_energy_result.converged
+    assert estimator.multi_energy_result.observable
+    assert estimator.fluid_se_rc == {"heat": 0}
+    heat_estimator = estimator.fluid_estimators["heat"]
+    assert not heat_estimator.prefiltered_measurements
+    assert [item.name for item in heat_estimator.network.sources] == ["dual_port_source"]
+    assert [item.name for item in heat_estimator.network.loads] == ["dual_port_load"]
+
+
+def test_heat_source2_and_load2_are_resolved_as_hybrid_coupling_endpoints(tmp_path):
+    from efile_read import _read_efile_rows
+    from model.multi_energy_model import build_multi_energy_context_from_rows
+
+    case_file = _write_two_port_heat_alias_case(tmp_path)
+    case_file.write_text(
+        case_file.read_text(encoding="utf8")
+        + """
+
+<ACLoad>
+@ idx name run_stat
+# 1 electric_heater 1
+</ACLoad>
+
+<AcE2Heat>
+@ idx name run_stat idx_ac_load_t1 idx_heat_source2_t2 efficiency energy_factor
+# 1 source2_coupling 1 1 1 0.95 100.0
+</AcE2Heat>
+
+<GasSource>
+@ idx name node run_stat
+# 1 gas_boiler 1 1
+</GasSource>
+
+<Gas2Heat>
+@ idx name run_stat idx_gas_source_t1 idx_heat_load2_t2 efficiency energy_factor
+# 1 load2_coupling 1 1 1 0.90 100.0
+</Gas2Heat>
+""",
+        encoding="utf8",
+    )
+
+    context = build_multi_energy_context_from_rows(
+        _read_efile_rows(case_file),
+        source=case_file,
+    )
+    couplings = {item.name: item for item in context.couplings}
+
+    assert couplings["source2_coupling"].active
+    assert couplings["source2_coupling"].t2.device_type == "HeatSource"
+    assert couplings["load2_coupling"].active
+    assert couplings["load2_coupling"].t2.device_type == "HeatLoad"
+    assert not any("missing HeatSource" in warning for warning in context.warnings)
+    assert not any("missing HeatLoad" in warning for warning in context.warnings)
 
 
 def test_three_port_heat_exchanger_couples_explicit_and_implicit_return_networks():
