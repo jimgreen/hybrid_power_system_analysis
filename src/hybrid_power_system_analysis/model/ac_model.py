@@ -164,11 +164,23 @@ class ACZeroBranch:
         self.j_node_obj = None
 
 class ACSwitch:
-    def __init__(self, idx, i_node, j_node, status, run_stat=1):
+    def __init__(
+        self,
+        idx,
+        i_node,
+        j_node,
+        status=1,
+        run_stat=1,
+        *,
+        closed_status_set=None,
+        closed_status=None,
+    ):
         self.idx = idx
         self.i_node = i_node
         self.j_node = j_node
         self.status = status
+        self.closed_status_set = status if closed_status_set is None else closed_status_set
+        self.closed_status = status if closed_status is None else closed_status
         self.run_stat = run_stat
         self.current = None
         self.p = None
@@ -377,6 +389,7 @@ class ACACConverter:
         self.j_control_type = j_control_type
 
 from efile_read import efile_factory_from_file, efile_factory_from_rows
+from model.switching_status import normalize_switching_device_fields
 from unit_system import normalize_model_named_units
 
 
@@ -496,6 +509,8 @@ _AC_ROW_DEFAULT_ATTRS = {
         "i_node": 0,
         "j_node": 0,
         "status": 1,
+        "closed_status_set": 1,
+        "closed_status": 1,
         "run_stat": 1,
         "p": None,
         "q": None,
@@ -509,6 +524,8 @@ _AC_ROW_DEFAULT_ATTRS = {
         "i_node": 0,
         "j_node": 0,
         "status": 1,
+        "closed_status_set": 1,
+        "closed_status": 1,
         "run_stat": 1,
         "p": None,
         "q": None,
@@ -659,6 +676,8 @@ def _coerce_ac_rows(rows, table_name):
     output = []
     for row in rows:
         if isinstance(row, row_cls):
+            if table_name in {"ACSwitch", "ACBreak"}:
+                normalize_switching_device_fields(row)
             if table_name == "ACTransformer":
                 if not hasattr(row, "gt"):
                     row.gt = 0.0
@@ -684,6 +703,8 @@ def _coerce_ac_rows(rows, table_name):
         obj = row_cls.__new__(row_cls)
         obj.__dict__.update(defaults)
         obj.__dict__.update(row_values)
+        if table_name in {"ACSwitch", "ACBreak"}:
+            normalize_switching_device_fields(obj, row_values)
         if table_name == "ACLoad" and row_values.get("p_set") not in (None, "", "-"):
             obj.pbase = float(row_values["p_set"])
         if table_name == "ACTransformer":
@@ -798,13 +819,49 @@ class ACPowerNetwork:
         self.zero_branches.append(zb)
         return zb
 
-    def add_switch(self, idx, i_node, j_node, status, run_stat=1):
-        sw = ACSwitch(idx, i_node, j_node, status, run_stat)
+    def add_switch(
+        self,
+        idx,
+        i_node,
+        j_node,
+        status=1,
+        run_stat=1,
+        *,
+        closed_status_set=None,
+        closed_status=None,
+    ):
+        sw = ACSwitch(
+            idx,
+            i_node,
+            j_node,
+            status,
+            run_stat,
+            closed_status_set=closed_status_set,
+            closed_status=closed_status,
+        )
         self.switches.append(sw)
         return sw
 
-    def add_break(self, idx, i_node, j_node, status, run_stat=1):
-        brk = ACBreak(idx, i_node, j_node, status, run_stat)
+    def add_break(
+        self,
+        idx,
+        i_node,
+        j_node,
+        status=1,
+        run_stat=1,
+        *,
+        closed_status_set=None,
+        closed_status=None,
+    ):
+        brk = ACBreak(
+            idx,
+            i_node,
+            j_node,
+            status,
+            run_stat,
+            closed_status_set=closed_status_set,
+            closed_status=closed_status,
+        )
         self.breakers.append(brk)
         return brk
 
@@ -1139,7 +1196,7 @@ class ACPowerNetwork:
         for switch in self.switches:
             if switch.i_node_obj is None or switch.j_node_obj is None:
                 continue
-            if switch.run_stat == 0 or switch.status == 0:
+            if switch.run_stat == 0 or switch.closed_status == 0:
                 continue
             if switch.i_node_obj.isl_obj and switch.j_node_obj.isl_obj and switch.i_node_obj.isl_obj ==  switch.j_node_obj.isl_obj:
                 switch.i_node_obj.isl_obj.switches.append(switch)
@@ -1180,7 +1237,7 @@ class ACPowerNetwork:
                 zbr.i_node_obj.isl_obj.zero_branches.append(zbr)
 
         for brk in self.breakers:
-            if brk.run_stat == 0 or brk.status == 0:
+            if brk.run_stat == 0 or brk.closed_status == 0:
                 continue
             if brk.i_node_obj is None or brk.j_node_obj is None:
                 continue
@@ -1263,13 +1320,13 @@ class ACPowerNetwork:
             zbr.is_alive = zbr.i_node_obj.is_alive and zbr.j_node_obj.is_alive
 
         for brk in self.breakers:
-            if brk.i_node_obj is None or brk.j_node_obj is None or brk.run_stat == 0 or brk.status == 0:
+            if brk.i_node_obj is None or brk.j_node_obj is None or brk.run_stat == 0 or brk.closed_status == 0:
                 brk.is_alive = False
                 continue
             brk.is_alive = brk.i_node_obj.is_alive and brk.j_node_obj.is_alive
 
         for sw in self.switches:
-            if sw.i_node_obj is None or sw.j_node_obj is None or sw.status == 0 or sw.run_stat == 0:
+            if sw.i_node_obj is None or sw.j_node_obj is None or sw.closed_status == 0 or sw.run_stat == 0:
                 sw.is_alive = False
                 continue
             sw.is_alive = sw.i_node_obj.is_alive and sw.j_node_obj.is_alive
@@ -1369,7 +1426,7 @@ class ACPowerNetwork:
             check_node(zb.j_node, 'ZeroBranch', zb)
 
         for brk in self.breakers:
-            if brk.run_stat == 0 or brk.status == 0:
+            if brk.run_stat == 0 or brk.closed_status == 0:
                 continue
             check_node(brk.i_node, 'Break', brk)
             check_node(brk.j_node, 'Break', brk)
@@ -1461,7 +1518,7 @@ class ACPowerNetwork:
                 errors.append(str_info)
 
         for dev in self.breakers:
-            if dev.run_stat != 1 or dev.status != 1:
+            if dev.run_stat != 1 or dev.closed_status != 1:
                 continue
             if dev.i_node_obj is None or dev.j_node_obj is None:
                 continue

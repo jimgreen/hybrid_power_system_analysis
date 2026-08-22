@@ -20,6 +20,7 @@ from model.setpoint_validation import (
     append_setpoint_corrections,
     sanitize_fixed_setpoints,
 )
+from model.switching_status import switching_status_columns
 from model.array_common import (
     _assign_current_if_present,
     _assign_power_if_present,
@@ -180,6 +181,8 @@ SWITCH_COLS = {
     "run_stat": 4,
     "p": 5,
     "current": 6,
+    "closed_status_set": 7,
+    "closed_status": 8,
 }
 BREAK_COLS = SWITCH_COLS
 DCDC_COLS = {
@@ -260,7 +263,10 @@ def _build_switch_like_from_rows(
     out[:, SWITCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
     out[:, SWITCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
     out[:, SWITCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
-    out[:, SWITCH_COLS["status"]] = _float_column(table_rows, columns, "status", 1.0)
+    status, closed_status_set, closed_status = switching_status_columns(table_rows, columns)
+    out[:, SWITCH_COLS["status"]] = status
+    out[:, SWITCH_COLS["closed_status_set"]] = closed_status_set
+    out[:, SWITCH_COLS["closed_status"]] = closed_status
     out[:, SWITCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
     if scale_optional_power:
         _assign_power_if_present(out, SWITCH_COLS["p"], table_rows, columns, "p", p_base)
@@ -697,7 +703,7 @@ def build_dc_ppc_from_network(network) -> Dict:
     )
 
     def build_switch_like(devices):
-        return _device_array(
+        out = _device_array(
             devices,
             len(SWITCH_COLS),
             (
@@ -712,6 +718,19 @@ def build_dc_ppc_from_network(network) -> Dict:
                 (SWITCH_COLS["current"], "current", 0.0, _VALUE_FLOAT),
             ),
         )
+        for row, dev in enumerate(devices):
+            status = out[row, SWITCH_COLS["status"]]
+            out[row, SWITCH_COLS["closed_status_set"]] = _float_value(
+                dev,
+                "closed_status_set",
+                status,
+            )
+            out[row, SWITCH_COLS["closed_status"]] = _float_value(
+                dev,
+                "closed_status",
+                status,
+            )
+        return out
 
     dcdc = _device_array(
         dcdcs,
@@ -943,6 +962,8 @@ def build_dc_network_from_ppc(ppc: Dict):
             int(row[SWITCH_COLS["j_node"]]),
             int(row[SWITCH_COLS["status"]]),
             int(row[SWITCH_COLS["run_stat"]]),
+            closed_status_set=int(row[SWITCH_COLS["closed_status_set"]]),
+            closed_status=int(row[SWITCH_COLS["closed_status"]]),
         )
         for row in ppc["switch"]
     ]
@@ -954,6 +975,8 @@ def build_dc_network_from_ppc(ppc: Dict):
             int(row[BREAK_COLS["j_node"]]),
             int(row[BREAK_COLS["status"]]),
             int(row[BREAK_COLS["run_stat"]]),
+            closed_status_set=int(row[BREAK_COLS["closed_status_set"]]),
+            closed_status=int(row[BREAK_COLS["closed_status"]]),
         )
         for row in ppc.get("break", _empty(len(BREAK_COLS)))
     ]

@@ -15,6 +15,10 @@ HYBRID_DCAC_DC_REFERENCE_NODE_IDS_KEY = "_hybrid_dcac_voltage_reference_node_ids
 HYBRID_DCAC_DC_REFERENCE_VALUES_KEY = "_hybrid_dcac_voltage_reference_pu"
 
 
+def _device_closed_status(device) -> int:
+    return int(getattr(device, "closed_status", getattr(device, "status", 1)))
+
+
 def _reference_metadata_arrays(ppc: Dict, node_key: str, value_key: str):
     nodes = np.asarray(ppc.get(node_key, ()), dtype=np.int64).reshape(-1)
     raw_values = np.asarray(ppc.get(value_key, ()), dtype=np.float64).reshape(-1)
@@ -1320,7 +1324,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             SWITCH_COLS["j_node"],
             SWITCH_COLS["run_stat"],
             node_lookup,
-            status_col=SWITCH_COLS["status"],
+            status_col=SWITCH_COLS["closed_status"],
         ),
         "break": _terminal_topology_input(
             breaker,
@@ -1328,7 +1332,7 @@ def build_ac_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             BREAK_COLS["j_node"],
             BREAK_COLS["run_stat"],
             node_lookup,
-            status_col=BREAK_COLS["status"],
+            status_col=BREAK_COLS["closed_status"],
         ),
         "acac": _terminal_topology_input(
             acac,
@@ -1418,7 +1422,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 SWITCH_COLS["i_node"],
                 SWITCH_COLS["j_node"],
                 SWITCH_COLS["run_stat"],
-                SWITCH_COLS["status"],
+                SWITCH_COLS["closed_status"],
                 terminals.get("switch"),
             ),
         ),
@@ -1428,7 +1432,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 SWITCH_COLS["i_node"],
                 SWITCH_COLS["j_node"],
                 SWITCH_COLS["run_stat"],
-                SWITCH_COLS["status"],
+                SWITCH_COLS["closed_status"],
                 terminals.get("switch"),
             ),
             (branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], None, terminals.get("branch")),
@@ -1469,7 +1473,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 BREAK_COLS["i_node"],
                 BREAK_COLS["j_node"],
                 BREAK_COLS["run_stat"],
-                BREAK_COLS["status"],
+                BREAK_COLS["closed_status"],
                 terminals.get("break"),
             ),
         ),
@@ -1660,7 +1664,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             SWITCH_COLS["run_stat"],
             node_lookup,
             topology,
-            status_col=SWITCH_COLS["status"],
+            status_col=SWITCH_COLS["closed_status"],
             precomputed=terminals.get("switch"),
         ),
         "break": _terminal_device_arrays(
@@ -1670,7 +1674,7 @@ def prepare_ac_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             BREAK_COLS["run_stat"],
             node_lookup,
             topology,
-            status_col=BREAK_COLS["status"],
+            status_col=BREAK_COLS["closed_status"],
             precomputed=terminals.get("break"),
         ),
         "acac": _terminal_device_arrays(
@@ -1802,7 +1806,7 @@ def build_dc_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             SWITCH_COLS["j_node"],
             SWITCH_COLS["run_stat"],
             node_lookup,
-            status_col=SWITCH_COLS["status"],
+            status_col=SWITCH_COLS["closed_status"],
         ),
         "break": _terminal_topology_input(
             breaker,
@@ -1810,7 +1814,7 @@ def build_dc_topology_input_ppc(ppc: Dict) -> GridTopologyInput:
             BREAK_COLS["j_node"],
             BREAK_COLS["run_stat"],
             node_lookup,
-            status_col=BREAK_COLS["status"],
+            status_col=BREAK_COLS["closed_status"],
         ),
         "dcdc": _terminal_topology_input(
             dcdc,
@@ -1882,7 +1886,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 SWITCH_COLS["i_node"],
                 SWITCH_COLS["j_node"],
                 SWITCH_COLS["run_stat"],
-                SWITCH_COLS["status"],
+                SWITCH_COLS["closed_status"],
                 terminals.get("switch"),
             ),
         ),
@@ -1892,7 +1896,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 SWITCH_COLS["i_node"],
                 SWITCH_COLS["j_node"],
                 SWITCH_COLS["run_stat"],
-                SWITCH_COLS["status"],
+                SWITCH_COLS["closed_status"],
                 terminals.get("switch"),
             ),
             (branch, BRANCH_COLS["i_node"], BRANCH_COLS["j_node"], BRANCH_COLS["run_stat"], None, terminals.get("branch")),
@@ -1909,7 +1913,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
                 BREAK_COLS["i_node"],
                 BREAK_COLS["j_node"],
                 BREAK_COLS["run_stat"],
-                BREAK_COLS["status"],
+                BREAK_COLS["closed_status"],
                 terminals.get("break"),
             ),
         ),
@@ -2055,7 +2059,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             SWITCH_COLS["run_stat"],
             node_lookup,
             topology,
-            status_col=SWITCH_COLS["status"],
+            status_col=SWITCH_COLS["closed_status"],
             precomputed=terminals.get("switch"),
         ),
         "break": _terminal_device_arrays(
@@ -2065,7 +2069,7 @@ def prepare_dc_topology_ppc(ppc: Dict) -> GridTopologyArrays:
             BREAK_COLS["run_stat"],
             node_lookup,
             topology,
-            status_col=BREAK_COLS["status"],
+            status_col=BREAK_COLS["closed_status"],
             precomputed=terminals.get("break"),
         ),
         "dcdc": _terminal_device_arrays(
@@ -2172,7 +2176,7 @@ def _terminal_pair(dev, running_ids, require_closed=False):
     right = int(dev.j_node)
     if (
         dev.run_stat == 1
-        and (not require_closed or getattr(dev, "status", 1) == 1)
+        and (not require_closed or _device_closed_status(dev) == 1)
         and _parent_contains(running_ids, left)
         and _parent_contains(running_ids, right)
         and left != right
@@ -3082,7 +3086,7 @@ def prepare_ac_topology(network) -> None:
         right = int(dev.j_node)
         if (
             dev.run_stat == 1
-            and (not require_closed or getattr(dev, "status", 1) == 1)
+            and (not require_closed or _device_closed_status(dev) == 1)
             and left != right
             and contains_running_node(left)
             and contains_running_node(right)
@@ -3243,7 +3247,7 @@ def prepare_ac_topology(network) -> None:
     def finalize_branch_like(dev, attr_name, require_closed=False):
         dev.i_node_obj = node_dict.get(dev.i_node)
         dev.j_node_obj = node_dict.get(dev.j_node)
-        closed = (not require_closed) or getattr(dev, "status", 1) == 1
+        closed = (not require_closed) or _device_closed_status(dev) == 1
         dev.is_alive = (
             dev.i_node_obj is not None
             and dev.j_node_obj is not None
@@ -3380,7 +3384,7 @@ def prepare_dc_topology(network) -> None:
         right = int(dev.j_node)
         if (
             dev.run_stat == 1
-            and (not require_closed or getattr(dev, "status", 1) == 1)
+            and (not require_closed or _device_closed_status(dev) == 1)
             and left != right
             and contains_running_node(left)
             and contains_running_node(right)
@@ -3512,7 +3516,7 @@ def prepare_dc_topology(network) -> None:
             i_node.switches.append(dev)
         if j_node is not None:
             j_node.switches.append(dev)
-        if i_node is None or j_node is None or dev.run_stat == 0 or dev.status == 0:
+        if i_node is None or j_node is None or dev.run_stat == 0 or _device_closed_status(dev) == 0:
             continue
         if i_node.isl_obj and j_node.isl_obj and i_node.isl_obj == j_node.isl_obj:
             i_node.isl_obj.switches.append(dev)
@@ -3551,7 +3555,7 @@ def prepare_dc_topology(network) -> None:
             i_node.breakers.append(dev)
         if j_node is not None:
             j_node.breakers.append(dev)
-        if i_node is None or j_node is None or dev.run_stat == 0 or dev.status == 0:
+        if i_node is None or j_node is None or dev.run_stat == 0 or _device_closed_status(dev) == 0:
             continue
         if i_node.isl_obj and j_node.isl_obj and i_node.isl_obj == j_node.isl_obj:
             i_node.isl_obj.breakers.append(dev)
@@ -3618,7 +3622,7 @@ def prepare_dc_topology(network) -> None:
             dev.i_node_obj is not None
             and dev.j_node_obj is not None
             and dev.run_stat == 1
-            and dev.status == 1
+            and _device_closed_status(dev) == 1
             and dev.i_node_obj.is_alive
             and dev.j_node_obj.is_alive
         )
@@ -3626,7 +3630,7 @@ def prepare_dc_topology(network) -> None:
         dev.is_alive = (
             dev.i_node_obj is not None
             and dev.j_node_obj is not None
-            and dev.status == 1
+            and _device_closed_status(dev) == 1
             and dev.run_stat == 1
             and dev.i_node_obj.is_alive
             and dev.j_node_obj.is_alive

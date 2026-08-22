@@ -68,6 +68,10 @@ from ac_array_model import (
 )
 from ac_model import ACAC_SIDE_CONTROL_TYPES
 from model.ppc_topology import build_ac_ppc_with_topology_from_e_file, ensure_ac_ppc_topology
+from model.switching_status import (
+    apply_lf_closed_status_boundaries,
+    finalize_lf_closed_status_results,
+)
 from model.topology import build_lf_control_bus_groups
 try:
     from lfcore.common import (
@@ -930,6 +934,7 @@ class ACPowerFlowCalc:
     def _prepare_from_ppc(self):
         """Prepare a Newton system from an already arrayized AC ppc dictionary."""
         ppc = self.ppc
+        apply_lf_closed_status_boundaries(ppc, SWITCH_COLS)
         bus = np.asarray(ppc["bus"], dtype=np.float64)
         branch = np.asarray(ppc.get("branch", np.zeros((0, len(BRANCH_COLS)))), dtype=np.float64)
         transformer = np.asarray(ppc.get("transformer", np.zeros((0, len(TRANSFORMER_COLS)))), dtype=np.float64)
@@ -1413,7 +1418,7 @@ class ACPowerFlowCalc:
             j_rows = self._ppc_node_rows(breaker[:, SWITCH_COLS["j_node"]])
             live = (
                 (breaker[:, SWITCH_COLS["run_stat"]] == 1)
-                & (breaker[:, SWITCH_COLS["status"]] == 1)
+                & (breaker[:, SWITCH_COLS["closed_status"]] == 1)
                 & active_bus[i_rows]
                 & active_bus[j_rows]
             )
@@ -1426,7 +1431,7 @@ class ACPowerFlowCalc:
             j_rows = self._ppc_node_rows(switch[:, SWITCH_COLS["j_node"]])
             live = (
                 (switch[:, SWITCH_COLS["run_stat"]] == 1)
-                & (switch[:, SWITCH_COLS["status"]] == 1)
+                & (switch[:, SWITCH_COLS["closed_status"]] == 1)
                 & active_bus[i_rows]
                 & active_bus[j_rows]
             )
@@ -3229,7 +3234,17 @@ class ACPowerFlowCalc:
                     j_v=jv,
                 )
 
-        def _build_single_port(rows, name_key, p_col, q_col, c_col, node_col, target):
+        def _build_single_port(
+            rows,
+            name_key,
+            p_col,
+            q_col,
+            c_col,
+            node_col,
+            target,
+            *,
+            status_cols=None,
+        ):
             if rows is None or len(rows) == 0:
                 return
             names = _name_list(name_key, len(rows))
@@ -3237,8 +3252,12 @@ class ACPowerFlowCalc:
             i_q = rows[:, q_col].tolist()
             i_c = rows[:, c_col].tolist()
             i_v = _lookup_voltage(rows[:, node_col]).tolist()
-            for name, p, q, c, v in zip(names, i_p, i_q, i_c, i_v):
-                target[name] = SimpleNamespace(i_p=p, i_q=q, i_c=c, i_v=v)
+            for pos, (name, p, q, c, v) in enumerate(zip(names, i_p, i_q, i_c, i_v)):
+                values = {"i_p": p, "i_q": q, "i_c": c, "i_v": v}
+                if status_cols is not None:
+                    values["closed_status_set"] = int(rows[pos, status_cols[0]])
+                    values["closed_status"] = int(rows[pos, status_cols[1]])
+                target[name] = SimpleNamespace(**values)
 
         _build_single_port(
             self.result.get("zero_branch"), "zero_branch_name",
@@ -3251,6 +3270,10 @@ class ACPowerFlowCalc:
             SWITCH_COLS["p"], SWITCH_COLS["q"],
             SWITCH_COLS["current"], SWITCH_COLS["i_node"],
             result.breakers,
+            status_cols=(
+                SWITCH_COLS["closed_status_set"],
+                SWITCH_COLS["closed_status"],
+            ),
         )
         _build_single_port(
             self.result.get("gen"), "gen_name",
@@ -3411,13 +3434,23 @@ class ACPowerFlowCalc:
         copy_fields(
             getattr(network, "switches", []),
             rows_by_idx("switch", SWITCH_COLS["idx"]),
-            (("p", SWITCH_COLS["p"]), ("q", SWITCH_COLS["q"]), ("current", SWITCH_COLS["current"])),
+            (
+                ("p", SWITCH_COLS["p"]),
+                ("q", SWITCH_COLS["q"]),
+                ("current", SWITCH_COLS["current"]),
+                ("closed_status", SWITCH_COLS["closed_status"]),
+            ),
             alive_by_idx("switch", "switch", SWITCH_COLS),
         )
         copy_fields(
             getattr(network, "breakers", []),
             rows_by_idx("break", SWITCH_COLS["idx"]),
-            (("p", SWITCH_COLS["p"]), ("q", SWITCH_COLS["q"]), ("current", SWITCH_COLS["current"])),
+            (
+                ("p", SWITCH_COLS["p"]),
+                ("q", SWITCH_COLS["q"]),
+                ("current", SWITCH_COLS["current"]),
+                ("closed_status", SWITCH_COLS["closed_status"]),
+            ),
             alive_by_idx("break", "break", BREAK_COLS),
         )
         copy_fields(
@@ -3735,8 +3768,14 @@ class ACPowerFlowCalc:
                 )
 
         zero_branch = self.ppc["zero_branch"].copy()
-        switch = self.ppc["switch"].copy()
-        breaker = self.ppc.get("break", np.zeros((0, len(SWITCH_COLS)))).copy()
+        switch = finalize_lf_closed_status_results(self.ppc["switch"].copy(), SWITCH_COLS)
+        breaker = finalize_lf_closed_status_results(
+            self.ppc.get(
+                "break",
+                np.zeros((0, len(SWITCH_COLS)), dtype=np.float64),
+            ).copy(),
+            SWITCH_COLS,
+        )
         if zero_branch.size:
             zero_branch[:, [
                 ZERO_BRANCH_COLS["p"],
@@ -3924,7 +3963,7 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     switch_names = _names("switch_name", switch.shape[0])
     print("\n5. 开关信息:")
     for row, name in zip(switch, switch_names):
-        status = "闭合" if int(row[SWITCH_COLS["status"]]) == 1 else "断开"
+        status = "闭合" if int(row[SWITCH_COLS["closed_status"]]) == 1 else "断开"
         print(
             f"   开关 {int(row[SWITCH_COLS['idx']])} {name} "
             f"(状态:{status}): 电流={row[SWITCH_COLS['current']]:.6f} pu"
@@ -3935,7 +3974,7 @@ def print_ac_result(calc: ACPowerFlowCalc, rc: int) -> None:
     if breaker.shape[0]:
         print("\n5.1 刀闸信息:")
         for row, name in zip(breaker, breaker_names):
-            status = "闭合" if int(row[BREAK_COLS["status"]]) == 1 else "断开"
+            status = "闭合" if int(row[BREAK_COLS["closed_status"]]) == 1 else "断开"
             print(
                 f"   刀闸 {int(row[BREAK_COLS['idx']])} {name} "
                 f"(状态:{status}): 电流={row[BREAK_COLS['current']]:.6f} pu, "

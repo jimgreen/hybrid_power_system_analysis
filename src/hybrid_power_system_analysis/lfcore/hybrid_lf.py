@@ -120,6 +120,7 @@ from hybrid_array_model import (
     validate_dcac_control_types,
 )
 from model.setpoint_validation import sanitize_fixed_setpoints
+from model.switching_status import apply_lf_closed_status_boundaries
 from model.ppc_topology import (
     build_ac_ppc_with_topology_from_e_file,
     build_ac_ppc_with_topology_from_efile_rows,
@@ -127,6 +128,7 @@ from model.ppc_topology import (
     build_dc_ppc_with_topology_from_efile_rows,
     build_hybrid_ppc_with_topology_from_efile_rows,
     ensure_ac_ppc_topology,
+    ensure_dc_ppc_topology,
     ensure_hybrid_ppc_topology,
 )
 
@@ -420,6 +422,8 @@ def _ppc_device(static_row, row, name, cols, node_by_idx, *, table_key=None, ali
         "j_node",
         "k_node",
         "status",
+        "closed_status_set",
+        "closed_status",
         "run_stat",
         "control_type",
         "ac_control_type",
@@ -466,7 +470,7 @@ def _ppc_device(static_row, row, name, cols, node_by_idx, *, table_key=None, ali
     if "k_node" in values:
         values["k_node_obj"] = node_by_idx.get(int(values["k_node"]))
     run_stat = int(values.get("run_stat", 1))
-    status = int(values.get("status", 1))
+    status = int(values.get("closed_status", values.get("status", 1)))
     values["is_alive"] = (run_stat == 1 and status == 1) if alive is None else bool(alive)
     if table_key == "dcdc":
         values["i_control_type"] = DCDC_SIDE_CONTROL_LABEL.get(values["i_control_type"], "P")
@@ -709,6 +713,8 @@ def _build_lf_network_from_single_ac_file(file_name, rows=None) -> _LightweightH
         if rows is None
         else build_ac_ppc_with_topology_from_efile_rows(file_name, rows)
     )
+    apply_lf_closed_status_boundaries(ac_ppc, AC_SWITCH_COLS)
+    ensure_ac_ppc_topology(ac_ppc)
     return _build_lf_network_from_single_ac_ppc(file_name, ac_ppc)
 
 
@@ -766,6 +772,8 @@ def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightH
         dcac_converters=[],
         hybrid_islands=[],
     )
+    apply_lf_closed_status_boundaries(dc_ppc, DC_SWITCH_COLS)
+    ensure_dc_ppc_topology(dc_ppc)
     network.ppc = {"format": "hybrid_ppc_v1", "source": str(file_name), "base": dc_ppc["base"], "ac": None, "dc": dc_ppc}
     network._dc_ppc = dc_ppc
     network.p_base = float(base["p_base"])
@@ -778,6 +786,9 @@ def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightH
 
 def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNetwork:
     ppc = build_hybrid_ppc_with_topology_from_efile_rows(file_name, rows)
+    apply_lf_closed_status_boundaries(ppc["ac"], AC_SWITCH_COLS)
+    apply_lf_closed_status_boundaries(ppc["dc"], DC_SWITCH_COLS)
+    ensure_hybrid_ppc_topology(ppc)
     ac_network = _lightweight_ac_network(ppc["ac"])
     dc_network = _lightweight_dc_network(ppc["dc"])
     network = _LightweightHybridNetwork(
@@ -2492,6 +2503,17 @@ class HybridPowerFlowCalc:
         """
         self._sync_sub_result_modes()
         if self._converter_ppc_mode:
+            if self.network.ppc.get("ac") is not None:
+                apply_lf_closed_status_boundaries(
+                    self.network.ppc["ac"],
+                    AC_SWITCH_COLS,
+                )
+            if self.network.ppc.get("dc") is not None:
+                apply_lf_closed_status_boundaries(
+                    self.network.ppc["dc"],
+                    DC_SWITCH_COLS,
+                )
+            ensure_hybrid_ppc_topology(self.network.ppc)
             sanitize_dcac_voltage_setpoints(self.network.ppc)
         self._install_ac_converter_voltage_control_nodes()
         parts = []

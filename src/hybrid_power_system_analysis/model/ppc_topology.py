@@ -121,7 +121,7 @@ def _ac_topology_signature(ppc: Dict) -> bytes:
             [
                 AC_SWITCH_COLS["i_node"],
                 AC_SWITCH_COLS["j_node"],
-                AC_SWITCH_COLS["status"],
+                AC_SWITCH_COLS["closed_status"],
                 AC_SWITCH_COLS["run_stat"],
             ],
         ),
@@ -130,7 +130,7 @@ def _ac_topology_signature(ppc: Dict) -> bytes:
             [
                 AC_BREAK_COLS["i_node"],
                 AC_BREAK_COLS["j_node"],
-                AC_BREAK_COLS["status"],
+                AC_BREAK_COLS["closed_status"],
                 AC_BREAK_COLS["run_stat"],
             ],
         ),
@@ -210,7 +210,7 @@ def _dc_topology_signature(ppc: Dict) -> bytes:
             [
                 DC_SWITCH_COLS["i_node"],
                 DC_SWITCH_COLS["j_node"],
-                DC_SWITCH_COLS["status"],
+                DC_SWITCH_COLS["closed_status"],
                 DC_SWITCH_COLS["run_stat"],
             ],
         ),
@@ -219,7 +219,7 @@ def _dc_topology_signature(ppc: Dict) -> bytes:
             [
                 DC_BREAK_COLS["i_node"],
                 DC_BREAK_COLS["j_node"],
-                DC_BREAK_COLS["status"],
+                DC_BREAK_COLS["closed_status"],
                 DC_BREAK_COLS["run_stat"],
             ],
         ),

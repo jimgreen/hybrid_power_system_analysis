@@ -20,6 +20,7 @@ from model.setpoint_validation import (
     append_setpoint_corrections,
     sanitize_fixed_setpoints,
 )
+from model.switching_status import switching_status_columns
 from model.array_common import (
     _assign_current_if_present,
     _assign_power_if_present,
@@ -225,6 +226,8 @@ SWITCH_COLS = {
     "p": 5,
     "q": 6,
     "current": 7,
+    "closed_status_set": 8,
+    "closed_status": 9,
 }
 BREAK_COLS = SWITCH_COLS
 ACAC_LEGACY_CONTROL_CODE = {"PQQ": 0, "PVQ": 1, "PQV": 2, "PVV": 3}
@@ -472,7 +475,10 @@ def _build_switch_like_from_rows(
     out[:, SWITCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
     out[:, SWITCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
     out[:, SWITCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
-    out[:, SWITCH_COLS["status"]] = _float_column(table_rows, columns, "status", 1.0)
+    status, closed_status_set, closed_status = switching_status_columns(table_rows, columns)
+    out[:, SWITCH_COLS["status"]] = status
+    out[:, SWITCH_COLS["closed_status_set"]] = closed_status_set
+    out[:, SWITCH_COLS["closed_status"]] = closed_status
     out[:, SWITCH_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
     if scale_optional_power:
         _assign_power_if_present(out, SWITCH_COLS["p"], table_rows, columns, "p", p_base)
@@ -1153,7 +1159,9 @@ def _build_matpower_components(ac_ppc: Dict) -> Tuple[np.ndarray, List[List[int]
             dsu.union(left, right)
 
     if switch.size:
-        live = (switch[:, SWITCH_COLS["run_stat"]] == 1) & (switch[:, SWITCH_COLS["status"]] == 1)
+        live = (switch[:, SWITCH_COLS["run_stat"]] == 1) & (
+            switch[:, SWITCH_COLS["closed_status"]] == 1
+        )
         for row in switch[live]:
             left = row_by_node.get(int(row[SWITCH_COLS["i_node"]]))
             right = row_by_node.get(int(row[SWITCH_COLS["j_node"]]))
@@ -1161,7 +1169,9 @@ def _build_matpower_components(ac_ppc: Dict) -> Tuple[np.ndarray, List[List[int]
                 dsu.union(left, right)
 
     if breaker.size:
-        live = (breaker[:, BREAK_COLS["run_stat"]] == 1) & (breaker[:, BREAK_COLS["status"]] == 1)
+        live = (breaker[:, BREAK_COLS["run_stat"]] == 1) & (
+            breaker[:, BREAK_COLS["closed_status"]] == 1
+        )
         for row in breaker[live]:
             left = row_by_node.get(int(row[BREAK_COLS["i_node"]]))
             right = row_by_node.get(int(row[BREAK_COLS["j_node"]]))
@@ -1907,7 +1917,18 @@ def build_ac_ppc_from_network(network) -> Dict:
             out[row, SWITCH_COLS["idx"]] = _int_value(dev, "idx")
             out[row, SWITCH_COLS["i_node"]] = _int_value(dev, "i_node")
             out[row, SWITCH_COLS["j_node"]] = _int_value(dev, "j_node")
-            out[row, SWITCH_COLS["status"]] = _float_value(dev, "status", 1.0)
+            status = _float_value(dev, "status", 1.0)
+            out[row, SWITCH_COLS["status"]] = status
+            out[row, SWITCH_COLS["closed_status_set"]] = _float_value(
+                dev,
+                "closed_status_set",
+                status,
+            )
+            out[row, SWITCH_COLS["closed_status"]] = _float_value(
+                dev,
+                "closed_status",
+                status,
+            )
             out[row, SWITCH_COLS["run_stat"]] = _float_value(dev, "run_stat", 1.0)
         for attr in ("p", "q", "current"):
             _fill_float_column_if_present(out, devices, SWITCH_COLS[attr], attr)
@@ -2214,6 +2235,8 @@ def build_ac_network_from_ppc(ppc: Dict):
             int(row[SWITCH_COLS["j_node"]]),
             int(row[SWITCH_COLS["status"]]),
             int(row[SWITCH_COLS["run_stat"]]),
+            closed_status_set=int(row[SWITCH_COLS["closed_status_set"]]),
+            closed_status=int(row[SWITCH_COLS["closed_status"]]),
         )
         for row in ppc["switch"]
     ]
@@ -2224,6 +2247,8 @@ def build_ac_network_from_ppc(ppc: Dict):
             int(row[BREAK_COLS["j_node"]]),
             int(row[BREAK_COLS["status"]]),
             int(row[BREAK_COLS["run_stat"]]),
+            closed_status_set=int(row[BREAK_COLS["closed_status_set"]]),
+            closed_status=int(row[BREAK_COLS["closed_status"]]),
         )
         for row in ppc.get("break", _empty(len(BREAK_COLS)))
     ]

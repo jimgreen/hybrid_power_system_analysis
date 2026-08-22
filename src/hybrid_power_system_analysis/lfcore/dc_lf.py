@@ -94,6 +94,10 @@ from model.dc_array_model import (
     sanitize_dc_voltage_setpoints,
 )
 from model.ppc_topology import build_dc_ppc_with_topology_from_e_file, ensure_dc_ppc_topology
+from model.switching_status import (
+    apply_lf_closed_status_boundaries,
+    finalize_lf_closed_status_results,
+)
 try:
     from lfcore.common import (
         allocate_limited_residual,
@@ -612,6 +616,7 @@ class DCPowerFlowCalc:
 
     def _prepare_from_ppc(self):
         """Prepare a Newton system from an already arrayized DC ppc dictionary."""
+        apply_lf_closed_status_boundaries(self.ppc, DC_SWITCH_COLS)
         ensure_dc_ppc_topology(self.ppc)
         sanitize_dc_voltage_setpoints(self.ppc)
         self._prepare_direct_ppc_topology()
@@ -762,8 +767,8 @@ class DCPowerFlowCalc:
                     & (j_all >= 0)
                     & (i_all != j_all)
                 )
-                if "status" in cols:
-                    mask &= table[:, cols["status"]] == 1
+                if "closed_status" in cols:
+                    mask &= table[:, cols["closed_status"]] == 1
                 rows = np.nonzero(mask)[0].astype(np.int32)
                 i_pos = i_all[mask].astype(np.int32, copy=False)
                 j_pos = j_all[mask].astype(np.int32, copy=False)
@@ -1769,8 +1774,11 @@ class DCPowerFlowCalc:
         load = ppc["load"].copy()
         gen = ppc["gen"].copy()
         zero_branch = ppc["zero_branch"].copy()
-        switch = ppc["switch"].copy()
-        breaker = ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)).copy()
+        switch = finalize_lf_closed_status_results(ppc["switch"].copy(), DC_SWITCH_COLS)
+        breaker = finalize_lf_closed_status_results(
+            ppc.get("break", np.zeros((0, len(DC_BREAK_COLS)), dtype=np.float64)).copy(),
+            DC_BREAK_COLS,
+        )
         dcdc = ppc["dcdc"].copy()
 
         if bus.size:
@@ -1975,7 +1983,9 @@ class DCPowerFlowCalc:
                 for attr, col in attrs:
                     setattr(dev, attr, float(row[col]))
                 run_stat = int(getattr(dev, "run_stat", 1)) == 1
-                status_ok = int(getattr(dev, "status", 1)) == 1
+                status_ok = int(
+                    getattr(dev, "closed_status", getattr(dev, "status", 1))
+                ) == 1
                 i_node = getattr(dev, "i_node", getattr(dev, "node", None))
                 j_node = getattr(dev, "j_node", i_node)
                 dev.is_alive = (
@@ -2001,13 +2011,21 @@ class DCPowerFlowCalc:
             getattr(network, "switches", []),
             "switch",
             DC_SWITCH_COLS["idx"],
-            (("p", DC_SWITCH_COLS["p"]), ("current", DC_SWITCH_COLS["current"])),
+            (
+                ("p", DC_SWITCH_COLS["p"]),
+                ("current", DC_SWITCH_COLS["current"]),
+                ("closed_status", DC_SWITCH_COLS["closed_status"]),
+            ),
         )
         assign_devices(
             getattr(network, "breakers", []),
             "break",
             DC_BREAK_COLS["idx"],
-            (("p", DC_BREAK_COLS["p"]), ("current", DC_BREAK_COLS["current"])),
+            (
+                ("p", DC_BREAK_COLS["p"]),
+                ("current", DC_BREAK_COLS["current"]),
+                ("closed_status", DC_BREAK_COLS["closed_status"]),
+            ),
         )
         assign_devices(
             getattr(network, "loads", []),
@@ -2107,15 +2125,28 @@ class DCPowerFlowCalc:
                     j_p=jp, j_c=jc, j_v=jv,
                 )
 
-        def _build_single_port(rows, name_key, p_col, c_col, n_col, target):
+        def _build_single_port(
+            rows,
+            name_key,
+            p_col,
+            c_col,
+            n_col,
+            target,
+            *,
+            status_cols=None,
+        ):
             if rows is None or len(rows) == 0:
                 return
             names = _name_list(name_key, len(rows))
             i_p = rows[:, p_col].tolist()
             i_c = rows[:, c_col].tolist()
             i_v = _lookup_voltage(rows[:, n_col]).tolist()
-            for name, p, c, v in zip(names, i_p, i_c, i_v):
-                target[name] = SimpleNamespace(i_p=p, i_c=c, i_v=v)
+            for pos, (name, p, c, v) in enumerate(zip(names, i_p, i_c, i_v)):
+                values = {"i_p": p, "i_c": c, "i_v": v}
+                if status_cols is not None:
+                    values["closed_status_set"] = int(rows[pos, status_cols[0]])
+                    values["closed_status"] = int(rows[pos, status_cols[1]])
+                target[name] = SimpleNamespace(**values)
 
         _build_two_port(
             self.result.get("branch"), "branch_name",
@@ -2139,6 +2170,10 @@ class DCPowerFlowCalc:
             self.result.get("break"), "break_name",
             DC_BREAK_COLS["p"], DC_BREAK_COLS["current"],
             DC_BREAK_COLS["i_node"], result.breakers,
+            status_cols=(
+                DC_BREAK_COLS["closed_status_set"],
+                DC_BREAK_COLS["closed_status"],
+            ),
         )
         _build_single_port(
             self.result.get("gen"), "gen_name",
@@ -2340,7 +2375,7 @@ def print_dc_result(calc: DCPowerFlowCalc, rc: int) -> None:
         switch_names = _names("switch_name", switch.shape[0])
         print("\n4. 开关信息:")
         for row, name in zip(switch, switch_names):
-            status = "闭合" if int(row[DC_SWITCH_COLS["status"]]) == 1 else "断开"
+            status = "闭合" if int(row[DC_SWITCH_COLS["closed_status"]]) == 1 else "断开"
             i_node = int(row[DC_SWITCH_COLS["i_node"]])
             j_node = int(row[DC_SWITCH_COLS["j_node"]])
             print(
@@ -2354,7 +2389,7 @@ def print_dc_result(calc: DCPowerFlowCalc, rc: int) -> None:
         if breaker.shape[0]:
             print("\n4.1 刀闸信息:")
             for row, name in zip(breaker, breaker_names):
-                status = "闭合" if int(row[DC_BREAK_COLS["status"]]) == 1 else "断开"
+                status = "闭合" if int(row[DC_BREAK_COLS["closed_status"]]) == 1 else "断开"
                 i_node = int(row[DC_BREAK_COLS["i_node"]])
                 j_node = int(row[DC_BREAK_COLS["j_node"]])
                 print(
