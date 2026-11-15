@@ -48,6 +48,12 @@ _MEAS_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in MEAS_
 _REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
 _REQUIRED_COLUMNS_BYTES = tuple(name.encode("utf8") for name in _REQUIRED_COLUMNS)
 
+# Parsed measurement files are immutable source data.  Estimator preparation
+# still receives a private copy (see ``copy_meas_ppc``), so runtime status,
+# values and topology-position arrays can never leak between estimators.
+_MEAS_PPC_FILE_CACHE: Dict[Tuple[Path, int, int, bool, bool], Dict] = {}
+_MEAS_PPC_FILE_CACHE_MAXSIZE = 16
+
 
 def _file_cache_key(file_path) -> Tuple[Path, int, int]:
     path = resolve_project_file(file_path).resolve()
@@ -1003,15 +1009,24 @@ def build_meas_ppc_from_e_file(
 ) -> Dict:
     """Read a measurement file directly into a PPC-style NumPy dictionary."""
     source = resolve_project_file(file_path).resolve()
-    return _build_meas_ppc_from_measurement_file(
-        source,
-        include_strings=bool(include_strings),
-        include_matrix=bool(include_matrix),
-    )
+    include_strings = bool(include_strings)
+    include_matrix = bool(include_matrix)
+    cache_key = (*_file_cache_key(source), include_strings, include_matrix)
+    cached = _MEAS_PPC_FILE_CACHE.get(cache_key)
+    if cached is None:
+        cached = _build_meas_ppc_from_measurement_file(
+            source,
+            include_strings=include_strings,
+            include_matrix=include_matrix,
+        )
+        if len(_MEAS_PPC_FILE_CACHE) >= _MEAS_PPC_FILE_CACHE_MAXSIZE:
+            _MEAS_PPC_FILE_CACHE.pop(next(iter(_MEAS_PPC_FILE_CACHE)))
+        _MEAS_PPC_FILE_CACHE[cache_key] = cached
+    return copy_meas_ppc(cached)
 
 
 def copy_meas_ppc(ppc: Dict) -> Dict:
-    """Return a shallow PPC copy with mutable measurement arrays copied."""
+    """Return a PPC copy whose source and runtime arrays are independent."""
     copied = dict(ppc)
     for key in (
         "meas",
@@ -1029,10 +1044,24 @@ def copy_meas_ppc(ppc: Dict) -> Dict:
         "from_pos",
         "to_pos",
         "available",
+        "name",
+        "device_type",
+        "device_name",
+        "device_names",
+        "meas_type",
     ):
         value = ppc.get(key)
         if isinstance(value, np.ndarray):
             copied[key] = value.copy()
+    rows_by_code = ppc.get("rows_by_device_type_code")
+    if isinstance(rows_by_code, dict):
+        copied["rows_by_device_type_code"] = {
+            code: rows.copy() if isinstance(rows, np.ndarray) else rows
+            for code, rows in rows_by_code.items()
+        }
+    name_ids = ppc.get("device_name_id_by_name")
+    if isinstance(name_ids, dict):
+        copied["device_name_id_by_name"] = dict(name_ids)
     return copied
 
 

@@ -10,6 +10,35 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 class MeasurementArrayModelTest(unittest.TestCase):
+    def test_file_parser_cache_returns_private_arrays_and_invalidates_on_change(self):
+        from model.meas_array_model import build_meas_ppc_from_e_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meas_file = Path(tmp_dir) / "cached.meas"
+            header = (
+                "<Measurement>\n"
+                "@ idx name dev_type dev_name meas_type weight valid value\n"
+            )
+            meas_file.write_text(
+                header + "# 1 v1 ACNode n1 V 1.0 1 110.0\n</Measurement>\n",
+                encoding="utf-8",
+            )
+            first = build_meas_ppc_from_e_file(meas_file)
+            first["value_array"][0] = -999.0
+            second = build_meas_ppc_from_e_file(meas_file)
+
+            self.assertEqual(110.0, float(second["value_array"][0]))
+            self.assertIsNot(first["value_array"], second["value_array"])
+
+            meas_file.write_text(
+                header
+                + "# 1 v1 ACNode n1 V 1.0 1 220.0\n"
+                + "</Measurement>\n",
+                encoding="utf-8",
+            )
+            changed = build_meas_ppc_from_e_file(meas_file)
+            self.assertEqual(220.0, float(changed["value_array"][0]))
+
     def test_build_meas_ppc_from_e_file_parses_standard_rows_without_measurement_objects(self):
         from model.meas_model import DEVICE_TYPE_CODES, MEAS_STATUS_INVALID, MEAS_STATUS_NORMAL, Measurement
         from model.meas_array_model import MEAS_COLS, MEAS_TYPE_CODES, build_meas_ppc_from_e_file

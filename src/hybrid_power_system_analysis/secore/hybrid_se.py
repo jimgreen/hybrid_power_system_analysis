@@ -8442,24 +8442,21 @@ class HybridStateEstimator:
         Cache invalidation is driven by ``_refresh_active_measurement_state_layout``
         and friends, which reset ``self._sub_jacobian_stamp_cache`` whenever the
         active partition changes. We additionally guard against unexpected
-        pattern shifts by checking nnz on every reuse.
+        pattern shifts by checking the child CSR structure on every reuse.
         """
         if estimator is None or len(block.measurements) == 0:
             return
-        builder = getattr(estimator, "_jacobian_builder", None)
-        previous_fixed_pattern = getattr(builder, "_assume_fixed_pattern", None)
-        if builder is not None:
-            builder._assume_fixed_pattern = False
-        try:
-            sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
-        finally:
-            if builder is not None and previous_fixed_pattern is not None:
-                builder._assume_fixed_pattern = previous_fixed_pattern
+        # The child estimator installs a fixed-pattern SparseJacobianBuilder
+        # for this delegated measurement block. Keep that mode enabled: after
+        # the first iteration the child refreshes only CSR data while retaining
+        # its symbolic sparse structure. Forcing dynamic mode here rebuilt the
+        # COO/CSR pattern on every Hybrid WLS iteration.
+        sub_csr = estimator.jacobian_sparse(sub_x, self._sub_measurement_runtime_input(block))
         if sub_csr.nnz == 0:
             return
         cache_store = self._sub_jacobian_stamp_cache if cache_key is not None else None
         cached = cache_store.get(cache_key) if cache_store is not None else None
-        if cached is not None and cached["nnz"] == sub_csr.nnz:
+        if cached is not None and self._sub_jacobian_pattern_matches(cached, sub_csr):
             target.add_many(cached["parent_rows"], cached["parent_cols"], sub_csr.data)
             return
 
@@ -8478,7 +8475,28 @@ class HybridStateEstimator:
                 "parent_rows": parent_rows,
                 "parent_cols": parent_cols,
                 "nnz": int(sub_csr.nnz),
+                "shape": tuple(int(item) for item in sub_csr.shape),
+                "indptr": sub_csr.indptr,
+                "indices": sub_csr.indices,
             }
+
+    @staticmethod
+    def _sub_jacobian_pattern_matches(cached: Dict[str, object], sub_csr) -> bool:
+        """Return whether a cached child-to-parent stamp is still valid."""
+        if int(cached.get("nnz", -1)) != int(sub_csr.nnz):
+            return False
+        if tuple(cached.get("shape", ())) != tuple(int(item) for item in sub_csr.shape):
+            return False
+        cached_indptr = cached.get("indptr")
+        cached_indices = cached.get("indices")
+        if cached_indptr is sub_csr.indptr and cached_indices is sub_csr.indices:
+            return True
+        return bool(
+            cached_indptr is not None
+            and cached_indices is not None
+            and np.array_equal(cached_indptr, sub_csr.indptr)
+            and np.array_equal(cached_indices, sub_csr.indices)
+        )
 
     @staticmethod
     def _append_vector_jacobian_entries(
