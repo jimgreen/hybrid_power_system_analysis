@@ -133,6 +133,10 @@ class MeasurementTable:
     device_name_id: Optional[np.ndarray] = None
     meas_type_code: Optional[np.ndarray] = None
     device_pos: Optional[np.ndarray] = None
+    # Compact parser-owned device-name dictionary.  Array-only tables omit
+    # per-row object/string columns but can still materialize a row without
+    # rereading the measurement file.
+    device_names: Optional[np.ndarray] = None
 
 
 class MeasurementList(list):
@@ -181,12 +185,22 @@ def measurement_from_table_row(table: MeasurementTable, row: int) -> Measurement
     if int(table.device_name.size) > pos:
         device_name = str(table.device_name[pos])
     else:
-        device_pos = getattr(table, "device_pos", None)
-        device_name = (
-            f"pos:{int(device_pos[pos])}"
-            if device_pos is not None and int(np.asarray(device_pos).size) > pos and int(device_pos[pos]) >= 0
-            else ""
-        )
+        device_name_id = getattr(table, "device_name_id", None)
+        device_names = getattr(table, "device_names", None)
+        if (
+            device_name_id is not None
+            and device_names is not None
+            and int(np.asarray(device_name_id).size) > pos
+            and 0 <= int(device_name_id[pos]) < int(np.asarray(device_names).size)
+        ):
+            device_name = str(np.asarray(device_names, dtype=object)[int(device_name_id[pos])])
+        else:
+            device_pos = getattr(table, "device_pos", None)
+            device_name = (
+                f"pos:{int(device_pos[pos])}"
+                if device_pos is not None and int(np.asarray(device_pos).size) > pos and int(device_pos[pos]) >= 0
+                else ""
+            )
     if int(table.meas_type.size) > pos:
         meas_type = str(table.meas_type[pos])
     else:

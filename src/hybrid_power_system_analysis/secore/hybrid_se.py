@@ -2,7 +2,7 @@ import argparse
 import sys
 import time
 import warnings
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -1128,8 +1128,12 @@ class HybridStateEstimator:
             self._prepare_defer_finalize = bool(defer_prepare_finalize)
         result = self._prepare_electric()
         if self._prepared and self._prepare_active_measurements:
+            stage_start = time.perf_counter()
             self._prepare_fluid_estimators()
+            self._record_profile_time("init.prepare_fluid_estimators", time.perf_counter() - stage_start)
+            stage_start = time.perf_counter()
             self._prepare_multi_energy_se_layout()
+            self._record_profile_time("init.multi_energy_se_layout", time.perf_counter() - stage_start)
         return result
 
     def _prepare_measurement_source(self):
@@ -1156,6 +1160,25 @@ class HybridStateEstimator:
             normalized=bool(getattr(source, "normalized", False)),
         )
         return None, measurements
+
+    @staticmethod
+    def _snapshot_measurement_table(table: MeasurementTable) -> MeasurementTable:
+        """Copy only runtime-mutated columns for the fluid-side source.
+
+        Electric preparation changes validity, weights, values and status
+        codes.  The topology/name/code arrays are immutable during prepare and
+        can be shared, avoiding a second full object/string-array copy while
+        keeping the fluid source isolated from electric-side mutations.
+        """
+        snapshot = copy(table)
+        for field_name in ("weight", "valid", "value"):
+            values = getattr(table, field_name, None)
+            if values is not None:
+                setattr(snapshot, field_name, np.asarray(values).copy())
+        status_code = getattr(table, "status_code", None)
+        if status_code is not None:
+            snapshot.status_code = np.asarray(status_code).copy()
+        return snapshot
 
     def _prepare_electric(self) -> "HybridStateEstimator":
         if self._prepared:
@@ -1238,6 +1261,25 @@ class HybridStateEstimator:
         self.u_scale = float(getattr(self.network, "u_scale", 1.0))
         self.p_scale = float(getattr(self.network, "p_scale", 1.0))
         self.i_scale = float(getattr(self.network, "i_scale", 1.0))
+        # Keep the original table-backed measurement source available for
+        # fluid estimators.  It is owned by this estimator and lets pure-fluid
+        # and coupled cases share one parse without depending on the later
+        # active/pseudo-measurement table.
+        if not hasattr(self, "measurements"):
+            stage_start = time.perf_counter()
+            self.meas_ppc, self.measurements = self._prepare_measurement_source()
+            # Keep an estimator-private snapshot.  Electric-side preparation
+            # mutates ``self.measurements.table`` (status/value/active rows),
+            # while fluid preparation must see the original measurement
+            # validity and names.  The snapshot removes the old second file
+            # parse without allowing those mutations to leak across domains.
+            self._source_measurement_table = self._snapshot_measurement_table(self.measurements.table)
+            self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
+        else:
+            source_table = getattr(self.measurements, "table", None)
+            self._source_measurement_table = (
+                None if source_table is None else self._snapshot_measurement_table(source_table)
+            )
         if self._fluid_only:
             self._ac_sub_estimator = None
             self._dc_sub_estimator = None
@@ -1248,9 +1290,11 @@ class HybridStateEstimator:
             return self
         if rows_kind in ("ac", "dc"):
             return self._prepare_uncoupled_direct_delegate(rows_kind, profile_start)
-        stage_start = time.perf_counter()
-        self.meas_ppc, self.measurements = self._prepare_measurement_source()
-        self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
+        if not hasattr(self, "measurements"):
+            stage_start = time.perf_counter()
+            self.meas_ppc, self.measurements = self._prepare_measurement_source()
+            self._source_measurement_table = self._snapshot_measurement_table(self.measurements.table)
+            self._record_profile_time("init.load_measurements", time.perf_counter() - stage_start)
         self._sub_measurement_sources_by_side = None
         self._sub_measurement_source_rows_by_side = None
         self._sub_measurement_summary_attrs_by_side = {}
@@ -1314,8 +1358,12 @@ class HybridStateEstimator:
             self._prepared = True
         self._defer_prepare_finalize_pending = False
         if prepare_active_measurements:
+            stage_start = time.perf_counter()
             self._prepare_fluid_estimators()
+            self._record_profile_time("init.prepare_fluid_estimators", time.perf_counter() - stage_start)
+            stage_start = time.perf_counter()
             self._prepare_multi_energy_se_layout()
+            self._record_profile_time("init.multi_energy_se_layout", time.perf_counter() - stage_start)
         return self
 
     def _finalize_electric_prepare(self, profile_start: float) -> "HybridStateEstimator":
@@ -1376,11 +1424,20 @@ class HybridStateEstimator:
     def _prepare_fluid_estimators(self) -> None:
         if self.fluid_estimators or not self.multi_energy.fluid_networks:
             return
-        if self._prepare_measurements is None:
-            all_measurements = Measurement.read_from_file(self.meas_file)
-        else:
+        # Reuse the already parsed table-backed source.  The array parser keeps
+        # a compact device-name dictionary, so fluid estimators can materialize
+        # only their rows without a second file read or a second full object
+        # parse.  This is per-estimator data, not a process-wide file cache.
+        source_table = getattr(self, "_source_measurement_table", None)
+        if source_table is None:
+            source_table = getattr(getattr(self, "measurements", None), "table", None)
+        if source_table is None:
             _, source = self._prepare_measurement_source()
-            all_measurements = [measurement_from_table_row(source.table, row) for row in range(len(source))]
+            source_table = source.table
+        all_measurements = [
+            measurement_from_table_row(source_table, row)
+            for row in range(int(source_table.idx.size))
+        ]
         estimator_types = {
             "heat": HeatStateEstimator,
             "gas": GasStateEstimator,
@@ -4067,6 +4124,8 @@ class HybridStateEstimator:
 
     def _install_compatibility_device_views(self) -> None:
         """Expose lightweight legacy lookup views without rebuilding network objects."""
+        if getattr(self, "_compatibility_device_views_ready", False):
+            return
         ac_ppc = getattr(getattr(self, "network", None), "_ac_ppc", None)
         dc_ppc = getattr(getattr(self, "network", None), "_dc_ppc", None)
 
@@ -4172,6 +4231,7 @@ class HybridStateEstimator:
         for conv in self.dcac_converters:
             conv.ac_node_obj = self.ac_node_by_idx.get(int(conv.ac_node))
             conv.dc_node_obj = self.dc_node_by_idx.get(int(conv.dc_node))
+        self._compatibility_device_views_ready = True
 
     def _try_delegate_uncoupled_single_side(self) -> bool:
         if self.dcac_converters:

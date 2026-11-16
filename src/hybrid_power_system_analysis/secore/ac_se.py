@@ -214,8 +214,6 @@ _PSEUDO_MEASUREMENT_SUMMARY_TYPES = {
     ),
 }
 
-_OBSERVABILITY_RESULT_CACHE = {}
-
 _MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
 _TERMINAL_POWER_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_TERMINAL_POWER_MEASUREMENT_TYPES), dtype=np.int16)
 _VOLTAGE_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_VOLTAGE_MEASUREMENT_TYPES), dtype=np.int16)
@@ -9470,21 +9468,13 @@ class ACStateEstimator:
             if cache is not None and cache.get("result") is self._initial_observability_cache:
                 self._restore_active_lower_normal_plan_from_observability_cache(self._initial_observability_cache)
                 return self._initial_observability_cache
-        use_default_cache = (
+        default_active_request = (
             x is None
             and measurements is None
             and H is None
             and normal_matrix is None
             and normal_factor_diag is None
         )
-        if use_default_cache:
-            cached = _OBSERVABILITY_RESULT_CACHE.get(self._default_observability_cache_key())
-            if cached is not None:
-                cache = getattr(self, "_observability_matrix_cache", None)
-                if cache is not None and cache.get("result") is cached:
-                    self._initial_observability_cache = cached
-                    self._restore_active_lower_normal_plan_from_observability_cache(cached)
-                    return cached
         x = self.initial_state() if x is None else x
         measurement_plan_tables = self._measurement_plan_tables_for(measurements)
         H = self.jacobian_sparse(x, measurement_plan_tables) if H is None else H
@@ -9511,10 +9501,7 @@ class ACStateEstimator:
                         singular_values=np.array([], dtype=np.float64),
                         weak_states=[],
                     )
-                    if use_default_cache:
-                        if len(_OBSERVABILITY_RESULT_CACHE) > 32:
-                            _OBSERVABILITY_RESULT_CACHE.clear()
-                        _OBSERVABILITY_RESULT_CACHE[self._default_observability_cache_key()] = result
+                    if default_active_request:
                         self._initial_observability_cache = result
                     self._cache_observability_matrix(result, x, measurement_plan_tables, H)
                     return result
@@ -9538,10 +9525,7 @@ class ACStateEstimator:
             singular_values=s,
             weak_states=weak_states,
         )
-        if use_default_cache:
-            if len(_OBSERVABILITY_RESULT_CACHE) > 32:
-                _OBSERVABILITY_RESULT_CACHE.clear()
-            _OBSERVABILITY_RESULT_CACHE[self._default_observability_cache_key()] = result
+        if default_active_request:
             self._initial_observability_cache = result
         self._cache_observability_matrix(result, x, measurement_plan_tables, H)
         return result

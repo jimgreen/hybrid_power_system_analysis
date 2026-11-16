@@ -636,6 +636,7 @@ class ACPowerFlowCalc:
         self.full_jac_csc_indices = np.array([], dtype=np.int32)
         self.full_jac_csc_indptr = np.array([], dtype=np.int32)
         self.full_jac_csc_data = np.array([], dtype=np.float64)
+        self._full_jac_csc_matrix = None
         self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, 0)
         self.full_jac_standard_slice = slice(0, 0)
         self.full_jac_zero_top_left_slice = slice(0, 0)
@@ -2109,6 +2110,7 @@ class ACPowerFlowCalc:
         self.full_jac_csc_indices = np.array([], dtype=np.int32)
         self.full_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
         self.full_jac_csc_data = np.array([], dtype=np.float64)
+        self._full_jac_csc_matrix = None
         self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, 0)
         self.full_jac_standard_slice = slice(0, 0)
         self.full_jac_zero_top_left_slice = slice(0, 0)
@@ -2821,11 +2823,18 @@ class ACPowerFlowCalc:
             apply_raw_sum_plan(self.full_jac_csc_data, raw, self.full_jac_csc_sum_plan)
             if not build_matrix:
                 return self.full_jac_csc_data
-            return csc_matrix(
-                (self.full_jac_csc_data, self.full_jac_csc_indices, self.full_jac_csc_indptr),
-                shape=(self.total_eq, self.total_vars),
-                copy=False,
-            )
+            # The sparsity arrays are immutable after prepare(); retain one
+            # CSC wrapper and refresh only its data values each Newton step.
+            # This avoids allocating a new sparse matrix object on every
+            # iteration while preserving the existing numeric factorization
+            # and solver fallback behavior.
+            if self._full_jac_csc_matrix is None:
+                self._full_jac_csc_matrix = csc_matrix(
+                    (self.full_jac_csc_data, self.full_jac_csc_indices, self.full_jac_csc_indptr),
+                    shape=(self.total_eq, self.total_vars),
+                    copy=False,
+                )
+            return self._full_jac_csc_matrix
         if not self.full_jac_raw_to_csr_pos.size:
             return None
 

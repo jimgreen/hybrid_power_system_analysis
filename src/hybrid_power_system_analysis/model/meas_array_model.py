@@ -51,8 +51,12 @@ _REQUIRED_COLUMNS_BYTES = tuple(name.encode("utf8") for name in _REQUIRED_COLUMN
 # Parsed measurement files are immutable source data.  Estimator preparation
 # still receives a private copy (see ``copy_meas_ppc``), so runtime status,
 # values and topology-position arrays can never leak between estimators.
-_MEAS_PPC_FILE_CACHE: Dict[Tuple[Path, int, int, bool, bool], Dict] = {}
-_MEAS_PPC_FILE_CACHE_MAXSIZE = 16
+#
+# Deliberately do not keep a process-wide file cache here.  State-estimation
+# callers use a fresh network/measurement load per estimator; a global cache
+# makes cold-start timings depend on an earlier request and can retain large
+# PPC arrays for unrelated cases.  Reuse inside one estimator is handled by
+# its table-backed measurement plan instead.
 _MEAS_PARSE_CHUNK_SIZE = 16384
 
 
@@ -980,18 +984,12 @@ def build_meas_ppc_from_e_file(
     source = resolve_project_file(file_path).resolve()
     include_strings = bool(include_strings)
     include_matrix = bool(include_matrix)
-    cache_key = (*_file_cache_key(source), include_strings, include_matrix)
-    cached = _MEAS_PPC_FILE_CACHE.get(cache_key)
-    if cached is None:
-        cached = _build_meas_ppc_from_measurement_file(
-            source,
-            include_strings=include_strings,
-            include_matrix=include_matrix,
-        )
-        if len(_MEAS_PPC_FILE_CACHE) >= _MEAS_PPC_FILE_CACHE_MAXSIZE:
-            _MEAS_PPC_FILE_CACHE.pop(next(iter(_MEAS_PPC_FILE_CACHE)))
-        _MEAS_PPC_FILE_CACHE[cache_key] = cached
-    return copy_meas_ppc(cached)
+    parsed = _build_meas_ppc_from_measurement_file(
+        source,
+        include_strings=include_strings,
+        include_matrix=include_matrix,
+    )
+    return copy_meas_ppc(parsed)
 
 
 def copy_meas_ppc(ppc: Dict) -> Dict:
@@ -1118,6 +1116,7 @@ def measurement_table_from_meas_ppc(ppc: Dict, *, include_strings: bool = True) 
         device_name_id=device_name_id.astype(np.int64, copy=False),
         meas_type_code=meas_type_code.astype(np.int16, copy=False),
         device_pos=device_pos,
+        device_names=np.asarray(ppc.get("device_names", ()), dtype=object),
     )
     for key in ("scale", "from_pos", "to_pos", "available"):
         value = ppc.get(key)

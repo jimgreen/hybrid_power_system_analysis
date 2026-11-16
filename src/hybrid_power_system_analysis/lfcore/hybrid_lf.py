@@ -881,7 +881,25 @@ def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
         network = _build_lf_network_from_fluid_only(file_name)
     else:
         network = _build_lf_network_from_hybrid_rows(file_name, efile_rows)
-    context = build_multi_energy_context_from_rows(efile_rows, source=file_name)
+    # Electric-only LF files do not contain fluid devices or cross-energy
+    # coupling tables.  Avoid constructing an intermediate E-file model for
+    # those cases; the empty context has the same public contract and keeps
+    # all multi-energy work opt-in by input content.
+    has_multi_energy_rows = any(
+        str(key).startswith(("Heat", "Gas", "Hydro", "Steam"))
+        or "2Heat" in str(key)
+        or "2Gas" in str(key)
+        or "2Hydro" in str(key)
+        or "2H2" in str(key)
+        or "2Steam" in str(key)
+        for key, value in efile_rows.items()
+        if value.get("rows")
+    )
+    context = (
+        build_multi_energy_context_from_rows(efile_rows, source=file_name)
+        if has_multi_energy_rows
+        else MultiEnergyContext(source=Path(file_name))
+    )
     return attach_multi_energy_context(network, context)
 
 
@@ -987,7 +1005,7 @@ class HybridPowerFlowCalc:
         parameter_file=DEFAULT_LF_PARAMETER_FILE,
         parameters: Optional[PowerFlowParameters] = None,
         keep_node_objects: bool = True,
-        linear_solver: Optional[str] = None,
+        linear_solver: str = "pyklu",
         result_mode: str = "full",
         verbose: bool = False,
     ):
@@ -2455,7 +2473,7 @@ class HybridPowerFlowCalc:
 
     def prepare(self):
         if self._prepared:
-            return self.x
+            return None
         electric_x = self._prepare_electric().copy()
         self.electric_vars = int(self.total_vars)
         self.electric_eq = int(self.total_eq)
@@ -2517,7 +2535,7 @@ class HybridPowerFlowCalc:
                 f"total_eq={self.total_eq}",
             )
         self._prepared = True
-        return self.x
+        return None
 
     def _prepare_electric(self):
         """Build the global hybrid state vector and block equation layout.
@@ -2628,14 +2646,19 @@ class HybridPowerFlowCalc:
             conv.is_alive = False
             if conv.run_stat != 1:
                 continue
-            if conv.ac_node not in self.ac_calc.node_pos:
+            # The array-backed AC solver may expose an empty legacy ``node_pos``
+            # dictionary while its dense topology lookup is fully prepared.
+            # Resolve both object and PPC-backed paths through the same solver
+            # position helpers so ordinary and ``from_file_fast`` calls keep
+            # identical DCAC participation semantics.
+            ac_pos = self._ac_solver_pos(conv.ac_node)
+            if ac_pos < 0:
                 continue
-            if conv.dc_node not in self.dc_calc.alive_node_dict:
+            dc_pos = self._dc_solver_pos(conv.dc_node)
+            if dc_pos < 0:
                 continue
             conv.ac_node_obj = self._ac_node_obj_by_idx.get(int(conv.ac_node))
             conv.dc_node_obj = self._dc_node_obj_by_idx.get(int(conv.dc_node))
-            ac_pos = self.ac_calc.node_pos[conv.ac_node]
-            dc_pos = self.dc_calc.alive_node_dict[conv.dc_node]
             ac_ctrl, dc_ctrl = validate_dcac_control_types(
                 getattr(conv, "ac_control_type", "NONE"),
                 getattr(conv, "dc_control_type", "NONE"),
@@ -2754,22 +2777,35 @@ class HybridPowerFlowCalc:
         valid = dc_pos >= 0
         rows, candidates = rows[valid], candidates[valid]
         ac_pos, dc_pos = ac_pos[valid], dc_pos[valid]
-        ac_control_codes = []
-        dc_control_codes = []
-        # Retain row order and the existing per-terminal conflict validation;
-        # NumPy scalar conversion and node lookup are done in bulk above.
-        for idx, ac_solver_pos, ac_control_code, dc_control_code in zip(
-            candidates[:, DCAC_COLS["idx"]].tolist(), ac_pos.tolist(),
-            candidates[:, DCAC_COLS["ac_control_type"]].tolist(),
-            candidates[:, DCAC_COLS["dc_control_type"]].tolist(),
+        ac_control_values = candidates[:, DCAC_COLS["ac_control_type"]].astype(np.int8, copy=False)
+        dc_control_values = candidates[:, DCAC_COLS["dc_control_type"]].astype(np.int8, copy=False)
+        # The common PQ/NONE converter layout has no voltage-control conflict
+        # to validate.  Handle it in bulk; retain the scalar validation path
+        # for every other combination so invalid modes and duplicate PV/PH
+        # controls keep their existing exceptions.
+        if np.all(
+            (ac_control_values == DCAC_AC_CONTROL_CODE["PQ"])
+            & (dc_control_values == DCAC_DC_CONTROL_CODE["NONE"])
         ):
-            ac_ctrl_label, dc_ctrl_label = validate_dcac_control_types(
-                DCAC_AC_CONTROL_LABEL.get(int(ac_control_code), "NONE"),
-                DCAC_DC_CONTROL_LABEL.get(int(dc_control_code), "NONE"),
-            )
-            self._validate_dcac_ac_terminal_control(int(idx), ac_solver_pos, ac_ctrl_label)
-            ac_control_codes.append(DCAC_AC_CONTROL_CODE[ac_ctrl_label])
-            dc_control_codes.append(DCAC_DC_CONTROL_CODE[dc_ctrl_label])
+            ac_control_codes = ac_control_values.copy()
+            dc_control_codes = dc_control_values.copy()
+        else:
+            ac_control_codes = []
+            dc_control_codes = []
+            # Retain row order and the existing per-terminal conflict
+            # validation; NumPy scalar conversion and node lookup are done in
+            # bulk above.
+            for idx, ac_solver_pos, ac_control_code, dc_control_code in zip(
+                candidates[:, DCAC_COLS["idx"]].tolist(), ac_pos.tolist(),
+                ac_control_values.tolist(), dc_control_values.tolist(),
+            ):
+                ac_ctrl_label, dc_ctrl_label = validate_dcac_control_types(
+                    DCAC_AC_CONTROL_LABEL.get(int(ac_control_code), "NONE"),
+                    DCAC_DC_CONTROL_LABEL.get(int(dc_control_code), "NONE"),
+                )
+                self._validate_dcac_ac_terminal_control(int(idx), ac_solver_pos, ac_ctrl_label)
+                ac_control_codes.append(DCAC_AC_CONTROL_CODE[ac_ctrl_label])
+                dc_control_codes.append(DCAC_DC_CONTROL_CODE[dc_ctrl_label])
         self.N_dcac = len(rows)
         if self.N_dcac == 0:
             return
@@ -2912,6 +2948,7 @@ class HybridPowerFlowCalc:
         self.global_jac_csc_indptr = np.array([], dtype=np.int32)
         self.global_jac_csc_data = np.array([], dtype=np.float64)
         self.global_jac_csc_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csc_pos, 0)
+        self._dcac_loss_work = np.array([], dtype=np.float64)
         self.global_jac_ac_slice = slice(0, 0)
         self.global_jac_dc_slice = slice(0, 0)
         self.global_jac_dcac_ac_p_slice = slice(0, 0)
@@ -3406,15 +3443,22 @@ class HybridPowerFlowCalc:
         dc_p2 = dc_p * dc_p
         ac_i2_num = ac_p * ac_p + ac_q * ac_q
         d_va = 2.0 * va * vd2 * (dc_p + ac_p) - 2.0 * self.dcac_r1 * dc_p2 * va
-        raw[self.global_jac_dcac_loss_slice] = np.concatenate(
-            (
-                vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2,
-                vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2,
-                -2.0 * self.dcac_r2 * ac_q * vd2,
-                d_va[self.dcac_ac_q_eq_mask],
-                2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd,
-            )
-        )
+        loss_size = int(self.global_jac_dcac_loss_slice.stop - self.global_jac_dcac_loss_slice.start)
+        if self._dcac_loss_work.size != loss_size:
+            self._dcac_loss_work = np.empty(loss_size, dtype=np.float64)
+        loss = self._dcac_loss_work
+        cursor = 0
+        for values in (
+            vd2 * va2 - 2.0 * self.dcac_r1 * dc_p * va2,
+            vd2 * va2 - 2.0 * self.dcac_r2 * ac_p * vd2,
+            -2.0 * self.dcac_r2 * ac_q * vd2,
+            d_va[self.dcac_ac_q_eq_mask],
+            2.0 * vd * va2 * (dc_p + ac_p) - 2.0 * self.dcac_r2 * ac_i2_num * vd,
+        ):
+            stop = cursor + values.size
+            loss[cursor:stop] = values
+            cursor = stop
+        raw[self.global_jac_dcac_loss_slice] = loss
 
     def _assemble_jacobian_from_precomputed_pattern(
         self,
