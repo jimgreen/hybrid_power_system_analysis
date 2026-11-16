@@ -53,6 +53,7 @@ _REQUIRED_COLUMNS_BYTES = tuple(name.encode("utf8") for name in _REQUIRED_COLUMN
 # values and topology-position arrays can never leak between estimators.
 _MEAS_PPC_FILE_CACHE: Dict[Tuple[Path, int, int, bool, bool], Dict] = {}
 _MEAS_PPC_FILE_CACHE_MAXSIZE = 16
+_MEAS_PARSE_CHUNK_SIZE = 16384
 
 
 def _file_cache_key(file_path) -> Tuple[Path, int, int]:
@@ -497,7 +498,12 @@ def _build_meas_ppc_from_measurement_file_array_only(
     *,
     include_matrix: bool = True,
 ) -> Dict:
-    """Read measurement rows into numeric arrays using one variable-width byte scan."""
+    """Parse numeric columns in bounded batches during one byte scan.
+
+    Converting whole columns avoids Python float/int conversion followed by a
+    NumPy scalar write for every row. Batches bound temporary Python objects;
+    no parsed network, measurement result, or previous solve is reused here.
+    """
     header = ()
     idx_col = device_type_col = device_name_col = meas_type_col = -1
     weight_col = valid_col = value_col = -1
@@ -509,22 +515,34 @@ def _build_meas_ppc_from_measurement_file_array_only(
     raw_weight_col = raw_valid_col = raw_value_col = raw_status_col = -1
     standard_raw_no_status = False
     has_status = False
+    idx_values, weight_values, valid_values, value_values = [], [], [], []
+    status_values, device_type_code_values, meas_type_code_values, device_name_id = [], [], [], []
+    columns = (idx_values, weight_values, valid_values, value_values, status_values,
+               device_type_code_values, meas_type_code_values, device_name_id)
+    dtypes = (np.int64, np.float64, bool, np.float64, np.int16, np.int16, np.int16, np.int32)
     capacity = _initial_measurement_capacity(source)
-    idx_values = np.empty(capacity, dtype=np.int64)
-    weight_values = np.empty(capacity, dtype=np.float64)
-    valid_values = np.empty(capacity, dtype=bool)
-    value_values = np.empty(capacity, dtype=np.float64)
-    status_values = np.empty(capacity, dtype=np.int16)
-    device_type_code_values = np.empty(capacity, dtype=np.int16)
-    meas_type_code_values = np.empty(capacity, dtype=np.int16)
-    device_name_id = np.empty(capacity, dtype=np.int32)
+    arrays = tuple(np.empty(capacity, dtype=dtype) for dtype in dtypes)
+    written = 0
+    chunk_size = max(1, int(_MEAS_PARSE_CHUNK_SIZE))
+    next_flush = chunk_size
+
+    def flush_columns():
+        nonlocal capacity, written
+        if not idx_values:
+            return
+        end = written + len(idx_values)
+        if end > capacity:
+            capacity = max(2 * capacity, end)
+            _grow_measurement_arrays(arrays, capacity)
+        for array, column in zip(arrays, columns):
+            array[written:end] = column
+            column.clear()
+        written = end
     row_count = 0
     device_names_list = []
     device_name_lookup = {}
 
     intern = sys.intern
-    to_int = int
-    to_float = float
     device_code_get = _DEVICE_TYPE_CODES_BYTES.get
     meas_code_get = _MEAS_TYPE_CODES_BYTES.get
     device_name_lookup_get = device_name_lookup.get
@@ -614,39 +632,13 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     fields = raw_line.split(None, 8)
                     if len(fields) <= 8:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
-                    if row_count >= capacity:
-                        capacity *= 2
-                        grow_arrays = (
-                            idx_values,
-                            weight_values,
-                            valid_values,
-                            value_values,
-                            status_values,
-                            device_type_code_values,
-                            meas_type_code_values,
-                            device_name_id,
-                        )
-                        grown = _grow_measurement_arrays(grow_arrays, capacity)
-                        (
-                            idx_values,
-                            weight_values,
-                            valid_values,
-                            value_values,
-                            status_values,
-                            device_type_code_values,
-                            meas_type_code_values,
-                            device_name_id,
-                        ) = grown[:8]
+                    if row_count >= next_flush:
+                        flush_columns()
+                        next_flush += chunk_size
 
-                    idx_values[row_count] = to_int(fields[1])
+                    idx_values.append(fields[1])
                     device_type = fields[3]
-                    if device_type == last_device_type:
-                        device_code = last_device_type_code
-                    else:
-                        device_code = device_code_get(device_type, 0)
-                        last_device_type = device_type
-                        last_device_type_code = device_code
-                    device_type_code_values[row_count] = device_code
+                    device_type_code_values.append(device_code_get(device_type, 0))
 
                     device_name = fields[4]
                     if device_name == last_device_name:
@@ -660,25 +652,20 @@ def _build_meas_ppc_from_measurement_file_array_only(
                             device_names_list_append(device_name_text)
                         last_device_name = device_name
                         last_device_name_id = name_id
-                    device_name_id[row_count] = name_id
+                    device_name_id.append(name_id)
 
                     meas_type = fields[5]
-                    if meas_type == last_meas_type:
-                        meas_code = last_meas_type_code
-                    else:
-                        meas_code = meas_code_get(meas_type, 0)
-                        if meas_code == 0:
-                            meas_code = meas_code_get(meas_type.upper(), 0)
-                        last_meas_type = meas_type
-                        last_meas_type_code = meas_code
-                    meas_type_code_values[row_count] = meas_code
+                    meas_code = meas_code_get(meas_type, 0)
+                    if meas_code == 0:
+                        meas_code = meas_code_get(meas_type.upper(), 0)
+                    meas_type_code_values.append(meas_code)
 
                     weight_field = fields[6]
-                    weight_values[row_count] = 1.0 if weight_field == b"1.0" or weight_field == b"1" else to_float(weight_field)
+                    weight_values.append(1.0 if weight_field == b"1.0" or weight_field == b"1" else weight_field)
                     valid = fields[7] == b"1"
-                    value_values[row_count] = to_float(fields[8])
-                    valid_values[row_count] = valid
-                    status_values[row_count] = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+                    value_values.append(fields[8])
+                    valid_values.append(valid)
+                    status_values.append(MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID)
                     row_count += 1
                     continue
                 if first == b"#" and raw_line[:1] == b"#":
@@ -707,31 +694,11 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     required_len = required_max_col
                 if len(fields) <= required_len:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
-                if row_count >= capacity:
-                    capacity *= 2
-                    grow_arrays = (
-                        idx_values,
-                        weight_values,
-                        valid_values,
-                        value_values,
-                        status_values,
-                        device_type_code_values,
-                        meas_type_code_values,
-                        device_name_id,
-                    )
-                    grown = _grow_measurement_arrays(grow_arrays, capacity)
-                    (
-                        idx_values,
-                        weight_values,
-                        valid_values,
-                        value_values,
-                        status_values,
-                        device_type_code_values,
-                        meas_type_code_values,
-                        device_name_id,
-                    ) = grown[:8]
+                if row_count >= next_flush:
+                    flush_columns()
+                    next_flush += chunk_size
 
-                idx_values[row_count] = to_int(fields[idx_pos])
+                idx_values.append(fields[idx_pos])
                 device_type = fields[device_type_pos]
                 if device_type == last_device_type:
                     device_code = last_device_type_code
@@ -739,7 +706,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     device_code = device_code_get(device_type, 0)
                     last_device_type = device_type
                     last_device_type_code = device_code
-                device_type_code_values[row_count] = device_code
+                device_type_code_values.append(device_code)
                 device_name = fields[device_name_pos]
                 if device_name == last_device_name:
                     name_id = last_device_name_id
@@ -752,7 +719,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                         device_names_list_append(device_name_text)
                     last_device_name = device_name
                     last_device_name_id = name_id
-                device_name_id[row_count] = name_id
+                device_name_id.append(name_id)
                 meas_type = fields[meas_type_pos]
                 if meas_type == last_meas_type:
                     meas_code = last_meas_type_code
@@ -762,20 +729,21 @@ def _build_meas_ppc_from_measurement_file_array_only(
                         meas_code = meas_code_get(meas_type.upper(), 0)
                     last_meas_type = meas_type
                     last_meas_type_code = meas_code
-                meas_type_code_values[row_count] = meas_code
+                meas_type_code_values.append(meas_code)
                 weight_field = fields[weight_pos]
-                weight_values[row_count] = 1.0 if weight_field == b"1.0" or weight_field == b"1" else to_float(weight_field)
+                weight_values.append(1.0 if weight_field == b"1.0" or weight_field == b"1" else weight_field)
                 valid = fields[valid_pos] == b"1"
-                value_values[row_count] = to_float(fields[value_pos])
+                value_values.append(fields[value_pos])
                 if has_status and len(fields) > status_pos:
                     status = _normalize_status_bytes(fields[status_pos], valid)
                     if not status_is_active(status):
                         valid = False
                 else:
                     status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
-                valid_values[row_count] = valid
-                status_values[row_count] = status
+                valid_values.append(valid)
+                status_values.append(status)
                 row_count += 1
+            flush_columns()
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Malformed Measurement row in {source}") from exc
 
@@ -783,9 +751,10 @@ def _build_meas_ppc_from_measurement_file_array_only(
         raise RuntimeError(f"{source} does not contain a <Measurement> block")
     if row_count == 0:
         return _empty_meas_ppc(source, include_matrix=include_matrix)
-    idx_array = idx_values[:row_count]
-    device_type_code_array = device_type_code_values[:row_count]
-    meas_type_code_array = meas_type_code_values[:row_count]
+    (idx_array, weight_values, valid_values, value_values, status_values,
+     device_type_code_array, meas_type_code_array, device_name_id) = tuple(
+         array[:row_count] for array in arrays
+     )
     rows_by_code = {
         int(code): np.flatnonzero(device_type_code_array == int(code)).astype(np.int64, copy=False)
         for code in np.unique(device_type_code_array)
@@ -798,15 +767,15 @@ def _build_meas_ppc_from_measurement_file_array_only(
         device_type=None,
         device_name=None,
         meas_type=None,
-        weight=weight_values[:row_count],
-        valid=valid_values[:row_count],
-        value=value_values[:row_count],
-        status=status_values[:row_count],
+        weight=weight_values,
+        valid=valid_values,
+        value=value_values,
+        status=status_values,
         include_strings=False,
         rows_by_device_type_code=rows_by_code,
         device_type_code=device_type_code_array,
         meas_type_code=meas_type_code_array,
-        device_name_id=device_name_id[:row_count],
+        device_name_id=device_name_id,
         device_names=np.asarray(device_names_list, dtype=object),
         device_name_id_by_name=device_name_id_by_name,
         include_matrix=include_matrix,

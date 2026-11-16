@@ -26,6 +26,7 @@ from dc_array_model import (
 )
 from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
 from model.effective_state import propagate_composite_run_states
+from model.array_common import _current_scale_by_node
 from model.setpoint_validation import (
     append_setpoint_corrections,
     sanitize_fixed_setpoints,
@@ -287,22 +288,14 @@ def _raw_vbase_maps(ac_ppc: Dict, dc_ppc: Dict) -> Tuple[Dict[int, float], Dict[
     dc_base = dc_ppc["base"]
     dc_u_scale = float(dc_base["u_scale"])
     dc_i_scale = float(dc_base["i_scale"])
-    ac_raw_vbase = {
-        int(row[AC_BUS_COLS["idx"]]): float(row[AC_BUS_COLS["vbase"]]) * ac_u_scale
-        for row in ac_ppc["bus"]
-    }
-    dc_raw_vbase = {
-        int(row[DC_BUS_COLS["idx"]]): float(row[DC_BUS_COLS["vbase"]]) * dc_u_scale
-        for row in dc_ppc["bus"]
-    }
-    ac_current = {
-        int(row[AC_BUS_COLS["idx"]]): ac_i_scale * ac_current_base_ka(p_base_kW, float(row[AC_BUS_COLS["vbase"]]))
-        for row in ac_ppc["bus"]
-    }
-    dc_current = {
-        int(row[DC_BUS_COLS["idx"]]): dc_i_scale * dc_current_base_ka(p_base_kW, float(row[DC_BUS_COLS["vbase"]]))
-        for row in dc_ppc["bus"]
-    }
+    ac_ids = ac_ppc["bus"][:, AC_BUS_COLS["idx"]]
+    dc_ids = dc_ppc["bus"][:, DC_BUS_COLS["idx"]]
+    ac_vbase = ac_ppc["bus"][:, AC_BUS_COLS["vbase"]]
+    dc_vbase = dc_ppc["bus"][:, DC_BUS_COLS["vbase"]]
+    ac_raw_vbase = dict(zip(map(int, ac_ids.tolist()), (ac_vbase * ac_u_scale).tolist()))
+    dc_raw_vbase = dict(zip(map(int, dc_ids.tolist()), (dc_vbase * dc_u_scale).tolist()))
+    ac_current = _current_scale_by_node(ac_ids, ac_vbase, p_base_kW, ac_i_scale, ac=True)
+    dc_current = _current_scale_by_node(dc_ids, dc_vbase, p_base_kW, dc_i_scale)
     return ac_raw_vbase, dc_raw_vbase, ac_current, dc_current
 
 

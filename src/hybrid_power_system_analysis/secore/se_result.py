@@ -571,6 +571,70 @@ def build_seresult_summary_from_table(
     return se_result
 
 
+def _measurement_rows_from_table(
+    table: MeasurementTable, rows, *, estimated=None, residual=None,
+    normalized=None, source="", reasons=None,
+):
+    """Materialize ordinary result rows in bounded column batches.
+
+    The public row/list types stay unchanged. Only the conversion work moves
+    outside the per-row constructor; no table or result survives this call.
+    """
+    rows = np.asarray(rows, dtype=np.intp)
+    row_type = SEResult.MeasurementRow
+    device_pos = getattr(table, "device_pos", None)
+    meas_codes = getattr(table, "meas_type_code", None)
+
+    def text_column(values, positions, fallback):
+        if values.size > int(positions[-1]):
+            selected = values[positions]
+            # Object/string arrays retain the same string conversion after
+            # tolist; numerical metadata keeps NumPy scalar formatting.
+            if values.dtype.kind in "OUS":
+                selected = selected.tolist()
+            return list(map(str, selected))
+        return [str(values[p]) if p < values.size else fallback(int(p)) for p in positions]
+
+    def coded_text(values, codes, positions, names):
+        if values.size == 0 and codes is not None and len(codes) > int(positions[-1]):
+            lookup = names.get
+            return [lookup(code, "") for code in codes[positions].tolist()]
+        return text_column(values, positions, lambda p: names.get(int(codes[p]), "") if codes is not None and len(codes) > p else "")
+
+    def optional_column(values, positions):
+        if values is None:
+            return [None] * len(positions)
+        values = np.asarray(values, dtype=np.float64)
+        if values.size > int(positions[-1]):
+            return values[positions].tolist()
+        return [float(values[p]) if p < len(values) else None for p in positions]
+
+    def missing_device_name(p):
+        return f"pos:{int(device_pos[p])}" if device_pos is not None and len(device_pos) > p and int(device_pos[p]) >= 0 else ""
+
+    for start in range(0, rows.size, 8192):
+        positions = rows[start:start + 8192]
+        ids = table.idx[positions].astype(np.int64).tolist()
+        names = ([f"m{idx}" for idx in ids] if table.name.size == 0 else
+                 text_column(table.name, positions, lambda p: f"m{int(table.idx[p])}"))
+        device_types = coded_text(table.device_type, table.device_type_code, positions, DEVICE_TYPE_NAMES)
+        if table.device_name.size == 0 and device_pos is not None and len(device_pos) > int(positions[-1]):
+            device_names = [f"pos:{pos}" if pos >= 0 else "" for pos in device_pos[positions].tolist()]
+        else:
+            device_names = text_column(table.device_name, positions, missing_device_name)
+        meas_types = coded_text(table.meas_type, meas_codes, positions, MEAS_TYPE_NAMES)
+        weights = table.weight[positions].astype(np.float64, copy=False).tolist()
+        valid = table.valid[positions].astype(bool, copy=False).tolist()
+        values = table.value[positions].astype(np.float64, copy=False).tolist()
+        estimates = optional_column(estimated, positions)
+        residuals = optional_column(residual, positions)
+        normalized_values = optional_column(normalized, positions)
+        reason_values = [""] * len(positions) if reasons is None else reasons[start:start + 8192]
+        for fields in zip(ids, names, device_types, device_names, meas_types, weights,
+                          valid, values, estimates, residuals, normalized_values, reason_values):
+            yield row_type(*fields, source)
+
+
 def build_seresult_full_from_table(
     result: EstimateResult,
     *,
@@ -601,36 +665,19 @@ def build_seresult_full_from_table(
                 | (np.asarray(all_measurement_table.weight, dtype=np.float64) <= 0.0)
             )
         )
-        for row in prefiltered.tolist():
-            reason = _table_prefiltered_reason(all_measurement_table, row)
-            if reason:
-                se_result.prefiltered_measurements.append_row(
-                    SEResult.MeasurementRow.from_table_row(
-                        all_measurement_table,
-                        row,
-                        reason=reason,
-                        source="prefiltered",
-                    )
-                )
+        reasons = np.where(all_measurement_table.valid[prefiltered], "zero weight", "invalid").tolist()
+        se_result.prefiltered_measurements.extend(_measurement_rows_from_table(
+            all_measurement_table, prefiltered, reasons=reasons, source="prefiltered"))
 
-    for pos in range(int(table.idx.size)):
-        estimated = SEResult._array_value(result.z_est, pos)
-        residual = SEResult._array_value(result.residual, pos)
-        normalized_value = SEResult._array_value(normalized, pos)
-        row = SEResult.MeasurementRow.from_table_row(
-            table,
-            pos,
-            estimated_value=estimated,
-            residual=residual,
-            normalized_residual=normalized_value,
-            source="pseudo" if int(status_code[pos]) == MEAS_STATUS_PSEUDO else "normal",
-        )
-        if int(status_code[pos]) == MEAS_STATUS_PSEUDO:
-            se_result.pseudo_measurements.append_row(row)
-            continue
-        if pos in bad_positions:
-            continue
-        se_result.normal_measurements.append_row(row)
+    pseudo_mask = status_code == MEAS_STATUS_PSEUDO
+    normal_mask = ~pseudo_mask
+    if bad_positions:
+        normal_mask[list(bad_positions)] = False
+    for target, mask, source in ((se_result.pseudo_measurements, pseudo_mask, "pseudo"),
+                                 (se_result.normal_measurements, normal_mask, "normal")):
+        target.extend(_measurement_rows_from_table(
+            table, np.flatnonzero(mask), estimated=result.z_est, residual=result.residual,
+            normalized=normalized, source=source))
 
     for item in bad_items:
         row_pos = int(getattr(item, "row_pos", -1))

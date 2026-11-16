@@ -14,19 +14,38 @@ for path in (ROOT_DIR, LFCORE_DIR, MODEL_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ac_lf import (
-    ACLFResult,
-    AC_NODE_TYPE_PQ,
-    ACPowerFlowCalc,
-    ac_node_type_label,
-    coo_matrix,
-    csc_matrix,
-    csr_matrix,
-)
 try:
-    from lfcore.common import device_key as _lf_device_key, normalize_result_mode as _normalize_lf_result_mode
+    from .ac_lf import (
+        ACLFResult,
+        AC_NODE_TYPE_PQ,
+        ACPowerFlowCalc,
+        ac_node_type_label,
+        coo_matrix,
+        csc_matrix,
+        csr_matrix,
+    )
 except ImportError:  # pragma: no cover - direct script import path
-    from common import device_key as _lf_device_key, normalize_result_mode as _normalize_lf_result_mode
+    from ac_lf import (
+        ACLFResult,
+        AC_NODE_TYPE_PQ,
+        ACPowerFlowCalc,
+        ac_node_type_label,
+        coo_matrix,
+        csc_matrix,
+        csr_matrix,
+    )
+try:
+    from lfcore.common import (
+        device_key as _lf_device_key,
+        normalize_result_mode as _normalize_lf_result_mode,
+        result_name_list,
+    )
+except ImportError:  # pragma: no cover - direct script import path
+    from common import (
+        device_key as _lf_device_key,
+        normalize_result_mode as _normalize_lf_result_mode,
+        result_name_list,
+    )
 try:
     from lfcore.solver_common import (
         OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
@@ -44,11 +63,18 @@ except ImportError:  # pragma: no cover - direct script import path
         resolve_linear_solver as _resolve_linear_solver,
     )
 from scipy.sparse.linalg import spsolve as _scipy_spsolve
-from dc_lf import DCLFResult, DCPowerFlowCalc
-from gas_lf import GasPowerFlowCalc
-from heat_lf import HeatPowerFlowCalc
-from hydro_lf import HydroPowerFlowCalc
-from steam_lf import SteamPowerFlowCalc
+try:
+    from .dc_lf import DCLFResult, DCPowerFlowCalc
+    from .gas_lf import GasPowerFlowCalc
+    from .heat_lf import HeatPowerFlowCalc
+    from .hydro_lf import HydroPowerFlowCalc
+    from .steam_lf import SteamPowerFlowCalc
+except ImportError:  # pragma: no cover - direct script import path
+    from dc_lf import DCLFResult, DCPowerFlowCalc
+    from gas_lf import GasPowerFlowCalc
+    from heat_lf import HeatPowerFlowCalc
+    from hydro_lf import HydroPowerFlowCalc
+    from steam_lf import SteamPowerFlowCalc
 from scipy.sparse import block_diag
 try:
     from _sparse_pattern import (
@@ -1066,10 +1092,8 @@ class HybridPowerFlowCalc:
         self._single_ac_newton_block = False
         self._single_dc_newton_block = False
         self.result = {}
-        self.multi_energy: MultiEnergyContext = getattr(
-            network,
-            "multi_energy",
-            MultiEnergyContext(),
+        self.multi_energy: MultiEnergyContext = (
+            getattr(network, "multi_energy", None) or MultiEnergyContext()
         )
         self.fluid_calcs = self._build_fluid_subcalcs()
         self.fluid_state_slices: Dict[str, slice] = {}
@@ -2689,36 +2713,61 @@ class HybridPowerFlowCalc:
         table = self.network.ppc.get("dcac")
         if table is None or table.size == 0:
             return
-        rows = []
-        ac_pos = []
-        dc_pos = []
+        run_status = table[:, DCAC_COLS["run_stat"]]
+        invalid_status = np.flatnonzero(~np.isfinite(run_status))
+        if invalid_status.size:
+            int(run_status[invalid_status[0]])  # Preserve scalar ValueError/OverflowError.
+        rows = np.flatnonzero(np.trunc(run_status) == 1)
+        candidates = table[rows]
+        terminal_ids = candidates[:, [DCAC_COLS["ac_node"], DCAC_COLS["dc_node"]]]
+        invalid_terminal = np.flatnonzero(~np.isfinite(terminal_ids))
+        if invalid_terminal.size:
+            int(terminal_ids.flat[invalid_terminal[0]])
+
+        def terminal_positions(node_ids, lookup, fallback):
+            positions = np.full(node_ids.size, -1, dtype=np.int32)
+            if isinstance(lookup, np.ndarray) and lookup.size:
+                # int() truncates toward zero, including IDs in (-1, 0).
+                # Only cast in-range IDs; large IDs retain Python int fallback.
+                valid = (node_ids > -1) & (node_ids < lookup.size)
+                positions[valid] = lookup[node_ids[valid].astype(np.intp)]
+            # Preserve scalar fallbacks for custom maps and IDs not in the
+            # dense topology map, including grouped buses and inactive nodes.
+            missing = np.flatnonzero(positions < 0)
+            for pos in missing:
+                positions[pos] = fallback(int(node_ids[pos]))
+            return positions
+
+        ac_pos = terminal_positions(
+            candidates[:, DCAC_COLS["ac_node"]],
+            getattr(self.ac_calc, "_active_node_solver_lookup", None),
+            self._ac_solver_pos,
+        )
+        # Resolve DC positions only after filtering missing AC terminals.
+        valid_ac = ac_pos >= 0
+        rows, candidates, ac_pos = rows[valid_ac], candidates[valid_ac], ac_pos[valid_ac]
+        dc_pos = terminal_positions(
+            candidates[:, DCAC_COLS["dc_node"]],
+            getattr(self.dc_calc, "_alive_node_lookup", None),
+            self._dc_solver_pos,
+        )
+        valid = dc_pos >= 0
+        rows, candidates = rows[valid], candidates[valid]
+        ac_pos, dc_pos = ac_pos[valid], dc_pos[valid]
         ac_control_codes = []
         dc_control_codes = []
-        for row_pos, row in enumerate(table):
-            if int(row[DCAC_COLS["run_stat"]]) != 1:
-                continue
-            ac_node = int(row[DCAC_COLS["ac_node"]])
-            dc_node = int(row[DCAC_COLS["dc_node"]])
-            ac_solver_pos = self._ac_solver_pos(ac_node)
-            if ac_solver_pos < 0:
-                continue
-            dc_solver_pos = self._dc_solver_pos(dc_node)
-            if dc_solver_pos < 0:
-                continue
-            ac_control_code = int(row[DCAC_COLS["ac_control_type"]])
-            dc_control_code = int(row[DCAC_COLS["dc_control_type"]])
+        # Retain row order and the existing per-terminal conflict validation;
+        # NumPy scalar conversion and node lookup are done in bulk above.
+        for idx, ac_solver_pos, ac_control_code, dc_control_code in zip(
+            candidates[:, DCAC_COLS["idx"]].tolist(), ac_pos.tolist(),
+            candidates[:, DCAC_COLS["ac_control_type"]].tolist(),
+            candidates[:, DCAC_COLS["dc_control_type"]].tolist(),
+        ):
             ac_ctrl_label, dc_ctrl_label = validate_dcac_control_types(
-                DCAC_AC_CONTROL_LABEL.get(ac_control_code, "NONE"),
-                DCAC_DC_CONTROL_LABEL.get(dc_control_code, "NONE"),
+                DCAC_AC_CONTROL_LABEL.get(int(ac_control_code), "NONE"),
+                DCAC_DC_CONTROL_LABEL.get(int(dc_control_code), "NONE"),
             )
-            self._validate_dcac_ac_terminal_control(
-                int(row[DCAC_COLS["idx"]]),
-                ac_solver_pos,
-                ac_ctrl_label,
-            )
-            rows.append(row_pos)
-            ac_pos.append(ac_solver_pos)
-            dc_pos.append(dc_solver_pos)
+            self._validate_dcac_ac_terminal_control(int(idx), ac_solver_pos, ac_ctrl_label)
             ac_control_codes.append(DCAC_AC_CONTROL_CODE[ac_ctrl_label])
             dc_control_codes.append(DCAC_DC_CONTROL_CODE[dc_ctrl_label])
         self.N_dcac = len(rows)
@@ -3490,11 +3539,16 @@ class HybridPowerFlowCalc:
         ac_f = ac_j = None
         dc_f = dc_j = None
         if self.ac_calc is not None:
-            ac_f, ac_j = self.ac_calc._build_newton_system(
-                ac_x,
-                return_jacobian=False,
-                jacobian_format="csc",
-            )
+            if return_jacobian:
+                # A global Jacobian needs numerical sub-block data, not a
+                # temporary sparse matrix. Residual-only trials need neither.
+                ac_f, ac_j = self.ac_calc._build_newton_system(
+                    ac_x,
+                    return_jacobian=False,
+                    jacobian_format="csc",
+                )
+            else:
+                ac_f = self.ac_calc.get_f(ac_x)
             if return_jacobian and ac_j is None and self._slice_len(self.global_jac_ac_slice):
                 ac_j = self._sub_jacobian_cached_values(self.ac_calc, is_dc=False)
             if return_jacobian and (
@@ -3506,11 +3560,14 @@ class HybridPowerFlowCalc:
             ):
                 ac_j = self.ac_calc.get_jacobi(ac_x)
         if self.dc_calc is not None:
-            dc_f, dc_j = self.dc_calc._build_newton_system(
-                dc_x,
-                return_jacobian=False,
-                jacobian_format="csc",
-            )
+            if return_jacobian:
+                dc_f, dc_j = self.dc_calc._build_newton_system(
+                    dc_x,
+                    return_jacobian=False,
+                    jacobian_format="csc",
+                )
+            else:
+                dc_f = self.dc_calc.get_f(dc_x)
             if return_jacobian and dc_j is None and self._slice_len(self.global_jac_dc_slice):
                 dc_j = self._sub_jacobian_cached_values(self.dc_calc, is_dc=True)
             if return_jacobian and (
@@ -4107,6 +4164,13 @@ class HybridPowerFlowCalc:
         return results
 
     def _attach_multi_energy_results(self) -> None:
+        # Keep the electric-only result contract compact.  In particular,
+        # ``none`` must remain an empty result and array/summary modes must not
+        # grow fluid-only keys when no fluid solver or coupling is present.
+        if self.result_mode == "none":
+            return
+        if not self.fluid_calcs and not self.coupling_results:
+            return
         fluid_results = {
             name: calc.lf_result for name, calc in self.fluid_calcs.items()
         }
@@ -4313,16 +4377,22 @@ class HybridPowerFlowCalc:
         assembled global Jacobian is valid for this diagnostic.
         """
         csc = jacobian if getattr(jacobian, "format", None) == "csc" else jacobian.tocsc()
-        zero_columns = []
-        for col in range(csc.shape[1]):
-            start, stop = int(csc.indptr[col]), int(csc.indptr[col + 1])
-            data = csc.data[start:stop]
-            if data.size == 0 or np.max(np.abs(data)) <= tol:
-                zero_columns.append(col)
-        if not zero_columns:
+        column_nnz = np.diff(csc.indptr)
+        empty_columns = np.flatnonzero(column_nnz == 0)
+        nonempty_columns = np.flatnonzero(column_nnz)
+        zero_numeric_columns = np.empty(0, dtype=np.int64)
+        if nonempty_columns.size:
+            # CSC stores each column contiguously.  Empty columns have no data,
+            # so reduceat over the starts of non-empty columns computes the
+            # per-column maximum without a Python loop.
+            starts = csc.indptr[:-1][nonempty_columns]
+            max_abs = np.maximum.reduceat(np.abs(csc.data), starts)
+            zero_numeric_columns = nonempty_columns[max_abs <= tol]
+        zero_columns = np.union1d(empty_columns, zero_numeric_columns)
+        if zero_columns.size == 0:
             return True
 
-        labels = [self._global_state_label(col) for col in zero_columns]
+        labels = [self._global_state_label(int(col)) for col in zero_columns]
         self.failure_reason = (
             "初始雅可比矩阵存在零列，以下状态缺少独立控制方程: "
             + ", ".join(labels)
@@ -4443,6 +4513,7 @@ class HybridPowerFlowCalc:
         ac_x, dc_x, dcac_x = self._split_x(x)
         ac_result = self._skipped_ac_result
         dc_result = self._skipped_dc_result
+
         if self.ac_calc is not None:
             self._set_ac_dcac_power_injections(dcac_x)
             self.ac_calc.x = ac_x
@@ -4628,19 +4699,45 @@ class HybridPowerFlowCalc:
                 dc_v_by_row[self.dcac_row_pos] = dc_V[self.dcac_dc_pos]
                 ac_v_by_row[self.dcac_row_pos] = ac_V[self.dcac_ac_pos]
             names = ppc.get("dcac_name")
-            for row_pos, row in enumerate(dcac_table):
-                if int(row[DCAC_COLS["run_stat"]]) != 1:
-                    continue
-                key = self._ppc_converter_key(names, row_pos, row[DCAC_COLS["idx"]])
-                result.dcac.dcac_converters[key] = SimpleNamespace(
-                    i_p=float(row[DCAC_COLS["dc_p"]]),
-                    i_c=float(row[DCAC_COLS["dc_i"]]),
-                    i_v=float(dc_v_by_row[row_pos]),
-                    j_p=float(row[DCAC_COLS["ac_p"]]),
-                    j_q=float(row[DCAC_COLS["ac_q"]]),
-                    j_c=float(row[DCAC_COLS["ac_i"]]),
-                    j_v=float(ac_v_by_row[row_pos]),
+            active = dcac_table[:, DCAC_COLS["run_stat"]] == 1
+            active_rows = np.flatnonzero(active)
+            if active_rows.size == 0:
+                return
+            if names is not None and len(names) == dcac_table.shape[0]:
+                row_names = result_name_list(names, dcac_table.shape[0])
+                keys = [
+                    row_names[pos] or str(int(dcac_table[pos, DCAC_COLS["idx"]]))
+                    for pos in active_rows
+                ]
+            else:
+                keys = [str(int(dcac_table[pos, DCAC_COLS["idx"]])) for pos in active_rows]
+
+            dc_p = dcac_table[active, DCAC_COLS["dc_p"]].tolist()
+            dc_i = dcac_table[active, DCAC_COLS["dc_i"]].tolist()
+            ac_p = dcac_table[active, DCAC_COLS["ac_p"]].tolist()
+            ac_q = dcac_table[active, DCAC_COLS["ac_q"]].tolist()
+            ac_i = dcac_table[active, DCAC_COLS["ac_i"]].tolist()
+            dc_v = dc_v_by_row[active].tolist()
+            ac_v = ac_v_by_row[active].tolist()
+            result.dcac.dcac_converters.update(
+                zip(
+                    keys,
+                    [
+                        SimpleNamespace(
+                            i_p=p_dc,
+                            i_c=i_dc,
+                            i_v=v_dc,
+                            j_p=p_ac,
+                            j_q=q_ac,
+                            j_c=i_ac,
+                            j_v=v_ac,
+                        )
+                        for p_dc, i_dc, v_dc, p_ac, q_ac, i_ac, v_ac in zip(
+                            dc_p, dc_i, dc_v, ac_p, ac_q, ac_i, ac_v
+                        )
+                    ],
                 )
+            )
 
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
         ac_result = self.ac_calc._build_lf_result_from_ppc() if self.ac_calc is not None else None

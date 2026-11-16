@@ -810,12 +810,23 @@ class ACStateEstimator:
                 measurement_table_from_meas_ppc(self.meas_ppc, include_strings=False),
                 normalized=bool(self.meas_ppc.get("normalized", False)),
             )
-        elif isinstance(measurements, MeasurementList):
+        elif isinstance(measurements, MeasurementList) and getattr(measurements.table, "device_pos", None) is None:
             table = _measurement_table_from_measurements(measurements)
             self.meas_ppc = self._measurement_table_to_meas_ppc(table)
             self.measurements = self._measurement_sequence_from_table(
                 table,
                 normalized=getattr(measurements, "normalized", False),
+            )
+        elif isinstance(measurements, MeasurementTable) or isinstance(getattr(measurements, "table", None), MeasurementTable):
+            # Preserve numeric device/type indexes from table-backed inputs;
+            # materializing their optional string fields can lose that data.
+            table = measurements if isinstance(measurements, MeasurementTable) else measurements.table
+            self.meas_ppc = self._measurement_table_to_meas_ppc(table)
+            if table.device_pos is not None:
+                self.meas_ppc["device_pos"] = np.asarray(table.device_pos, dtype=np.int64).copy()
+            self.meas_ppc["normalized"] = bool(getattr(measurements, "normalized", False))
+            self.measurements = self._measurement_sequence_from_table(
+                table, normalized=getattr(measurements, "normalized", False),
             )
         else:
             table = _measurement_table_from_measurements(list(measurements))
@@ -6326,8 +6337,9 @@ class ACStateEstimator:
             self._y_row_nodes.append(nodes)
             self._y_row_y_conj.append(y_conj)
 
-    def initial_state(self) -> np.ndarray:
-        if self.flat_start:
+    def initial_state(self, flat: Optional[bool] = None) -> np.ndarray:
+        flat = self.flat_start if flat is None else bool(flat)
+        if flat:
             theta = np.zeros(self.n_nodes, dtype=np.float64)
             voltage = np.ones(self.n_nodes, dtype=np.float64)
             return self._pack_state(theta, voltage, rebase_angles=False)
@@ -7623,7 +7635,14 @@ class ACStateEstimator:
         measurement_plan_tables=None,
         *,
         out: Optional[np.ndarray] = None,
+        measurements=None,
     ) -> np.ndarray:
+        # Common public keyword; retain the original plan keyword for callers
+        # that already pass compiled AC measurement plans.
+        if measurements is not None:
+            if measurement_plan_tables is not None:
+                raise TypeError('Pass either measurements or measurement_plan_tables, not both')
+            measurement_plan_tables = measurements
         measurement_plan_tables = self._measurement_plan_tables_for(measurement_plan_tables)
         vector_plans = self._vector_plans_for_measurement_plan_tables(measurement_plan_tables)
         theta, voltage = self._unpack_state(x)
@@ -9356,7 +9375,11 @@ class ACStateEstimator:
                 H.reset()
             else:
                 H = SparseJacobianBuilder((n_meas, self.n_state))
-                H._assume_fixed_pattern = False
+                # External plan tables (notably Hybrid's side blocks) retain
+                # identity and row layout across Newton iterations.  Keep the
+                # same fixed CSR pattern path as the active plan; callers that
+                # replace the table receive a new builder through this cache.
+                H._assume_fixed_pattern = True
                 if len(cache) > 4:
                     cache.clear()
                 cache[key] = (measurement_plan_tables, H)

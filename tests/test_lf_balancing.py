@@ -901,6 +901,32 @@ def test_residual_allocator_exceeds_bounds_only_after_headroom_is_exhausted():
         rtol=0.0,
         atol=1e-12,
     )
+
+
+def test_residual_allocator_fast_paths_preserve_target_and_validation():
+    from lfcore.common import allocate_limited_residual
+
+    # A single balancing device must receive the complete target, including
+    # when its optional operating limits would otherwise require overflow.
+    np.testing.assert_allclose(
+        allocate_limited_residual([0.2], 1.5, lower=[0.0], upper=[0.3], alpha=[2.0]),
+        [1.5],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    # Legacy files often omit every limit; the vectorized path keeps the
+    # weighted allocation and exact total while accepting NaN placeholders.
+    result = allocate_limited_residual(
+        [0.2, 0.1, 0.0],
+        1.0,
+        lower=[np.nan, -np.inf, np.nan],
+        upper=[np.inf, np.nan, np.inf],
+        alpha=[1.0, 2.0, 0.0],
+    )
+    np.testing.assert_allclose(result, [0.43333333333333335, 0.5666666666666667, 0.0], atol=1e-12)
+    assert float(np.sum(result)) == pytest.approx(1.0, abs=1e-12)
+    with pytest.raises(ValueError, match="上限"):
+        allocate_limited_residual([0.0], 1.0, upper=[1.0, 2.0])
     np.testing.assert_allclose(
         allocate_limited_residual(
             [0.0, 0.0],

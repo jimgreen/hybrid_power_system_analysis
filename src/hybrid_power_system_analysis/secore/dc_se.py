@@ -4476,8 +4476,9 @@ class DCStateEstimator:
             return add(DEVICE_TYPE_DCGenerator, "DCGenerator", name, device_pos, MEAS_TYPE_P_GEN, "P_GEN", value)
         return next_idx, 0
 
-    def initial_state(self) -> np.ndarray:
-        seed = self._initial_state_flat if self.flat_start else self._initial_state_nonflat
+    def initial_state(self, flat: Optional[bool] = None) -> np.ndarray:
+        flat = self.flat_start if flat is None else bool(flat)
+        seed = self._initial_state_flat if flat else self._initial_state_nonflat
         return seed.copy()
 
     def state_layout(self) -> Dict[str, object]:
@@ -4977,8 +4978,13 @@ class DCStateEstimator:
         measurement_plan_tables=None,
         *,
         out: Optional[np.ndarray] = None,
+        measurements=None,
     ) -> np.ndarray:
         """Evaluate h(x): estimated values for each active DC measurement."""
+        if measurements is not None:
+            if measurement_plan_tables is not None:
+                raise TypeError('Pass either measurements or measurement_plan_tables, not both')
+            measurement_plan_tables = measurements
         measurement_plan_tables = self._measurement_plan_tables_for(measurement_plan_tables)
         vector_plans = self._vector_plans_for_measurement_plan_tables(measurement_plan_tables)
         voltage, switch_current, dcdc_power, v_generator_power = self._unpack_state(x)

@@ -75,17 +75,23 @@ from model.switching_status import (
 from model.topology import build_lf_control_bus_groups
 try:
     from lfcore.common import (
+        allocate_grouped_residual,
         allocate_limited_residual,
+        build_result_voltage_lookup,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
+        result_name_list,
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
+        allocate_grouped_residual,
         allocate_limited_residual,
+        build_result_voltage_lookup,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
+        result_name_list,
     )
 try:
     from lfcore.solver_common import (
@@ -2038,148 +2044,57 @@ class ACPowerFlowCalc:
         if self.N_phi <= 0:
             return
 
-        top_left_rows, top_left_cols, top_left_edge, top_left_kind = [], [], [], []
-        top_right_rows, top_right_cols, top_right_edge, top_right_kind = [], [], [], []
-        for edge_pos, (a_raw, b_raw, phi_a_raw, phi_b_raw) in enumerate(
-            zip(self.zero_a, self.zero_b, self.zero_phi_a, self.zero_phi_b)
-        ):
-            a = int(a_raw)
-            b = int(b_raw)
-            phi_a = int(phi_a_raw)
-            phi_b = int(phi_b_raw)
-            phi_cols = (phi_a, self.N_phi + phi_a, phi_b, self.N_phi + phi_b)
+        # Each edge contributes the same small stencil, filtered by terminal
+        # bus type. Flatten in edge-major order to preserve the original raw
+        # entry order (and therefore duplicate summation/rounding).
+        a, b = self.zero_a, self.zero_b
+        ta, tb = self.theta_idx[a], self.theta_idx[b]
+        va, vb = self.n_theta + self.V_idx[a], self.n_theta + self.V_idx[b]
+        ap, bp = self.node_type[a] != AC_NODE_TYPE_SLACK, self.node_type[b] != AC_NODE_TYPE_SLACK
+        aq, bq = self.node_type[a] == AC_NODE_TYPE_PQ, self.node_type[b] == AC_NODE_TYPE_PQ
 
-            if self.node_type[a] != AC_NODE_TYPE_SLACK:
-                eq_a = self.theta_idx[a]
-                top_left_rows.append(eq_a)
-                top_left_cols.append(eq_a)
-                top_left_edge.append(edge_pos)
-                top_left_kind.append(0)
-                if self.node_type[a] == AC_NODE_TYPE_PQ:
-                    top_left_rows.append(eq_a)
-                    top_left_cols.append(self.n_theta + self.V_idx[a])
-                    top_left_edge.append(edge_pos)
-                    top_left_kind.append(1)
-                top_right_rows.extend([eq_a] * 4)
-                top_right_cols.extend(phi_cols)
-                top_right_edge.extend([edge_pos] * 4)
-                top_right_kind.extend([0, 1, 2, 3])
+        mask = np.column_stack((ap, aq, aq, aq, bp, bq, bq, bq))
+        edge, kind = np.nonzero(mask)
+        self.zero_top_left_rows = np.column_stack((ta, ta, va, va, tb, tb, vb, vb))[mask].astype(np.int32)
+        self.zero_top_left_cols = np.column_stack((ta, va, ta, va, tb, vb, tb, vb))[mask].astype(np.int32)
+        self.zero_top_left_edge = edge
+        self.zero_top_left_kind = kind.astype(np.int8)
+        self.zero_top_left_data = np.empty(edge.size, dtype=np.float64)
 
-            if self.node_type[a] == AC_NODE_TYPE_PQ:
-                eq_a = self.n_theta + self.V_idx[a]
-                top_left_rows.extend([eq_a, eq_a])
-                top_left_cols.extend([self.theta_idx[a], self.n_theta + self.V_idx[a]])
-                top_left_edge.extend([edge_pos, edge_pos])
-                top_left_kind.extend([2, 3])
-                top_right_rows.extend([eq_a] * 4)
-                top_right_cols.extend(phi_cols)
-                top_right_edge.extend([edge_pos] * 4)
-                top_right_kind.extend([4, 5, 6, 7])
-
-            if self.node_type[b] != AC_NODE_TYPE_SLACK:
-                eq_b = self.theta_idx[b]
-                top_left_rows.append(eq_b)
-                top_left_cols.append(eq_b)
-                top_left_edge.append(edge_pos)
-                top_left_kind.append(4)
-                if self.node_type[b] == AC_NODE_TYPE_PQ:
-                    top_left_rows.append(eq_b)
-                    top_left_cols.append(self.n_theta + self.V_idx[b])
-                    top_left_edge.append(edge_pos)
-                    top_left_kind.append(5)
-                top_right_rows.extend([eq_b] * 4)
-                top_right_cols.extend(phi_cols)
-                top_right_edge.extend([edge_pos] * 4)
-                top_right_kind.extend([8, 9, 10, 11])
-
-            if self.node_type[b] == AC_NODE_TYPE_PQ:
-                eq_b = self.n_theta + self.V_idx[b]
-                top_left_rows.extend([eq_b, eq_b])
-                top_left_cols.extend([self.theta_idx[b], self.n_theta + self.V_idx[b]])
-                top_left_edge.extend([edge_pos, edge_pos])
-                top_left_kind.extend([6, 7])
-                top_right_rows.extend([eq_b] * 4)
-                top_right_cols.extend(phi_cols)
-                top_right_edge.extend([edge_pos] * 4)
-                top_right_kind.extend([12, 13, 14, 15])
-
-        self.zero_top_left_rows = np.asarray(top_left_rows, dtype=np.int32)
-        self.zero_top_left_cols = np.asarray(top_left_cols, dtype=np.int32)
-        self.zero_top_left_edge = np.asarray(top_left_edge, dtype=np.intp)
-        self.zero_top_left_kind = np.asarray(top_left_kind, dtype=np.int8)
-        self.zero_top_left_data = np.empty(self.zero_top_left_rows.size, dtype=np.float64)
-        self.zero_top_right_rows = np.asarray(top_right_rows, dtype=np.int32)
-        self.zero_top_right_cols = np.asarray(top_right_cols, dtype=np.int32)
-        self.zero_top_right_edge = np.asarray(top_right_edge, dtype=np.intp)
-        self.zero_top_right_kind = np.asarray(top_right_kind, dtype=np.int8)
+        mask = np.column_stack((ap, aq, bp, bq))
+        edge, group = np.nonzero(mask)
+        phi_cols = np.column_stack((
+            self.zero_phi_a, self.N_phi + self.zero_phi_a,
+            self.zero_phi_b, self.N_phi + self.zero_phi_b,
+        ))
+        self.zero_top_right_rows = np.repeat(np.column_stack((ta, va, tb, vb))[mask], 4).astype(np.int32)
+        self.zero_top_right_cols = phi_cols[edge].reshape(-1).astype(np.int32)
+        self.zero_top_right_edge = np.repeat(edge, 4)
+        self.zero_top_right_kind = (group[:, None] * 4 + np.arange(4)).reshape(-1).astype(np.int8)
         self.zero_top_right_data = np.empty(self.zero_top_right_rows.size, dtype=np.float64)
 
-        bottom_left_rows, bottom_left_cols, bottom_left_node, bottom_left_kind = [], [], [], []
-        eq_idx = 0
-        for edges in self.comp_tree_edges:
-            for edge_idx in edges:
-                _, _, a, b = self.zero_edges[edge_idx]
-                a = int(a)
-                b = int(b)
-                if self.node_type[a] != AC_NODE_TYPE_SLACK:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[a])
-                    bottom_left_node.append(a)
-                    bottom_left_kind.append(0)
-                if self.node_type[a] == AC_NODE_TYPE_PQ:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[a])
-                    bottom_left_node.append(a)
-                    bottom_left_kind.append(1)
-                if self.node_type[b] != AC_NODE_TYPE_SLACK:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[b])
-                    bottom_left_node.append(b)
-                    bottom_left_kind.append(2)
-                if self.node_type[b] == AC_NODE_TYPE_PQ:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[b])
-                    bottom_left_node.append(b)
-                    bottom_left_kind.append(3)
-                eq_idx += 1
+        # Tree constraints retain the original component and edge ordering.
+        tree_edges = [self.zero_edges[idx][2:] for edges in self.comp_tree_edges for idx in edges]
+        terminals = np.asarray(tree_edges, dtype=np.int32).reshape(-1, 2)
+        a, b = terminals[:, 0], terminals[:, 1]
+        ta, tb = self.theta_idx[a], self.theta_idx[b]
+        va, vb = self.n_theta + self.V_idx[a], self.n_theta + self.V_idx[b]
+        mask4 = np.column_stack((
+            self.node_type[a] != AC_NODE_TYPE_SLACK, self.node_type[a] == AC_NODE_TYPE_PQ,
+            self.node_type[b] != AC_NODE_TYPE_SLACK, self.node_type[b] == AC_NODE_TYPE_PQ,
+        ))
+        mask = np.tile(mask4, (1, 2))
+        edge, kind = np.nonzero(mask)
+        self.zero_bottom_left_rows = (edge * 2 + kind // 4).astype(np.int32)
+        self.zero_bottom_left_cols = np.tile(np.column_stack((ta, va, tb, vb)), (1, 2))[mask].astype(np.int32)
+        self.zero_bottom_left_node = np.tile(np.column_stack((a, a, b, b)), (1, 2))[mask].astype(np.int32)
+        self.zero_bottom_left_kind = kind.astype(np.int8)
+        self.zero_bottom_left_data = np.empty(edge.size, dtype=np.float64)
 
-                if self.node_type[a] != AC_NODE_TYPE_SLACK:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[a])
-                    bottom_left_node.append(a)
-                    bottom_left_kind.append(4)
-                if self.node_type[a] == AC_NODE_TYPE_PQ:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[a])
-                    bottom_left_node.append(a)
-                    bottom_left_kind.append(5)
-                if self.node_type[b] != AC_NODE_TYPE_SLACK:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.theta_idx[b])
-                    bottom_left_node.append(b)
-                    bottom_left_kind.append(6)
-                if self.node_type[b] == AC_NODE_TYPE_PQ:
-                    bottom_left_rows.append(eq_idx)
-                    bottom_left_cols.append(self.n_theta + self.V_idx[b])
-                    bottom_left_node.append(b)
-                    bottom_left_kind.append(7)
-                eq_idx += 1
-
-        self.zero_bottom_left_rows = np.asarray(bottom_left_rows, dtype=np.int32)
-        self.zero_bottom_left_cols = np.asarray(bottom_left_cols, dtype=np.int32)
-        self.zero_bottom_left_node = np.asarray(bottom_left_node, dtype=np.int32)
-        self.zero_bottom_left_kind = np.asarray(bottom_left_kind, dtype=np.int8)
-        self.zero_bottom_left_data = np.empty(self.zero_bottom_left_rows.size, dtype=np.float64)
-
-        bottom_right_rows, bottom_right_cols = [], []
-        for c, idx_phi in enumerate(self.ref_phi_idx):
-            bottom_right_rows.append(eq_idx + 2 * c)
-            bottom_right_cols.append(int(idx_phi))
-            bottom_right_rows.append(eq_idx + 2 * c + 1)
-            bottom_right_cols.append(self.N_phi + int(idx_phi))
-        self.zero_bottom_right_rows = np.asarray(bottom_right_rows, dtype=np.int32)
-        self.zero_bottom_right_cols = np.asarray(bottom_right_cols, dtype=np.int32)
-        self.zero_bottom_right_data = np.ones(len(bottom_right_rows), dtype=np.float64)
+        ref_phi = np.asarray(self.ref_phi_idx, dtype=np.int32)
+        self.zero_bottom_right_rows = 2 * len(tree_edges) + np.arange(2 * ref_phi.size, dtype=np.int32)
+        self.zero_bottom_right_cols = np.column_stack((ref_phi, self.N_phi + ref_phi)).reshape(-1)
+        self.zero_bottom_right_data = np.ones(self.zero_bottom_right_rows.size, dtype=np.float64)
         self._cache_zero_jacobian_runtime_arrays()
 
     def _cache_full_jacobian_pattern(self):
@@ -3123,6 +3038,8 @@ class ACPowerFlowCalc:
         self._write_ppc_result_to_network()
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
+        else:
+            self.lf_result = None
         return
 
     def _build_lf_result(self) -> ACLFResult:
@@ -3140,31 +3057,12 @@ class ACPowerFlowCalc:
 
         bus_volt = bus[:, BUS_COLS["voltage"]]
         bus_angle = bus[:, BUS_COLS["angle"]]
-        bus_idx_col = bus[:, BUS_COLS["idx"]].astype(np.int64)
-        sort_order = np.argsort(bus_idx_col, kind="stable")
-        sorted_idx = bus_idx_col[sort_order]
-
-        def _lookup_voltage(col_array):
-            """Return bus voltage for an array of node ids (0.0 when missing)."""
-            if col_array.size == 0:
-                return np.zeros(0, dtype=np.float64)
-            nids = col_array.astype(np.int64)
-            if sorted_idx.size == 0:
-                return np.zeros(nids.shape, dtype=np.float64)
-            pos = np.searchsorted(sorted_idx, nids)
-            pos_clip = np.clip(pos, 0, sorted_idx.size - 1)
-            hit = sorted_idx[pos_clip] == nids
-            bus_row = np.where(hit, sort_order[pos_clip], 0)
-            return np.where(hit, bus_volt[bus_row], 0.0)
+        _lookup_voltage = build_result_voltage_lookup(
+            bus, BUS_COLS["idx"], BUS_COLS["voltage"]
+        )
 
         def _name_list(key, n):
-            names = self.ppc.get(key)
-            if names is None or len(names) != n:
-                # np.arange(...).astype(str).tolist() 比 [str(i) for i in range(n)] 显著更快。
-                return np.arange(n).astype(str).tolist()
-            if isinstance(names, np.ndarray):
-                return names.astype(str).tolist()
-            return [str(x) for x in names]
+            return result_name_list(self.ppc.get(key), n)
 
         n_bus = len(bus)
         bus_names = _name_list("bus_name", n_bus)
@@ -3252,12 +3150,19 @@ class ACPowerFlowCalc:
             i_q = rows[:, q_col].tolist()
             i_c = rows[:, c_col].tolist()
             i_v = _lookup_voltage(rows[:, node_col]).tolist()
-            for pos, (name, p, q, c, v) in enumerate(zip(names, i_p, i_q, i_c, i_v)):
-                values = {"i_p": p, "i_q": q, "i_c": c, "i_v": v}
-                if status_cols is not None:
-                    values["closed_status_set"] = int(rows[pos, status_cols[0]])
-                    values["closed_status"] = int(rows[pos, status_cols[1]])
-                target[name] = SimpleNamespace(**values)
+            if status_cols is None:
+                for name, p, q, c, v in zip(names, i_p, i_q, i_c, i_v):
+                    target[name] = SimpleNamespace(i_p=p, i_q=q, i_c=c, i_v=v)
+            else:
+                for pos, (name, p, q, c, v) in enumerate(zip(names, i_p, i_q, i_c, i_v)):
+                    target[name] = SimpleNamespace(
+                        i_p=p,
+                        i_q=q,
+                        i_c=c,
+                        i_v=v,
+                        closed_status_set=int(rows[pos, status_cols[0]]),
+                        closed_status=int(rows[pos, status_cols[1]]),
+                    )
 
         _build_single_port(
             self.result.get("zero_branch"), "zero_branch_name",
@@ -3486,6 +3391,12 @@ class ACPowerFlowCalc:
 
     def _write_back_ppc(self):
         """Write array-mode results to self.result without mutating the input ppc."""
+        # ``summary`` and ``none`` never expose device result tables.  Keep the
+        # compatibility call to this method, but avoid copying and rebuilding
+        # every PPC table when only the state summary (or no result) is needed.
+        if self.result_mode in {"summary", "none"}:
+            self.result = {}
+            return
         theta, V, phi_re, phi_im = self._extract_state_vars(self.x)
         Vc = self._cache['Vc']
         P_load, Q_load = self._cache['P_load'], self._cache['Q_load']
@@ -3587,59 +3498,36 @@ class ACPowerFlowCalc:
                 gen_q[pq_mask] = live_gen[pq_mask, GEN_COLS["q_set"]]
             if np.any(pv_mask):
                 gen_p[pv_mask] = live_gen[pv_mask, GEN_COLS["p_set"]]
-            controlled_node_parts = [self.ppc_gen_pos]
-            if np.any(shunt_v_mask):
-                controlled_node_parts.append(self.ppc_shunt_pos[shunt_v_mask])
-            for node_pos in np.unique(np.concatenate(controlled_node_parts)):
-                on_node = self.ppc_gen_pos == node_pos
-                slack_on_node = on_node & slack_mask
-                pv_on_node = on_node & pv_mask
-                voltage_gen_on_node = slack_on_node | pv_on_node
-                voltage_shunt_on_node = (self.ppc_shunt_pos == node_pos) & shunt_v_mask
-                if np.any(voltage_gen_on_node) or np.any(voltage_shunt_on_node):
-                    fixed_gen_q = np.sum(gen_q[on_node & ~voltage_gen_on_node])
-                    fixed_shunt_q = np.sum(
-                        shunt_control_q[(self.ppc_shunt_pos == node_pos) & shunt_q_mask]
-                    )
-                    q_target = Q_gen[node_pos] - fixed_gen_q - fixed_shunt_q
-                    q_baseline = np.concatenate(
-                        (
-                            live_gen[voltage_gen_on_node, GEN_COLS["q_set"]],
-                            shunt[self.ppc_shunt_rows[voltage_shunt_on_node], SHUNT_COLS["q_set"]],
-                        )
-                    )
-                    q_lower = np.concatenate(
-                        (
-                            self.ppc_gen_q_min[voltage_gen_on_node],
-                            np.full(np.count_nonzero(voltage_shunt_on_node), -np.inf),
-                        )
-                    )
-                    q_upper = np.concatenate(
-                        (
-                            self.ppc_gen_q_max[voltage_gen_on_node],
-                            np.full(np.count_nonzero(voltage_shunt_on_node), np.inf),
-                        )
-                    )
-                    allocated_q = allocate_limited_residual(
-                        q_baseline,
-                        q_target,
-                        lower=q_lower,
-                        upper=q_upper,
-                    )
-                    gen_count = np.count_nonzero(voltage_gen_on_node)
-                    gen_q[voltage_gen_on_node] = allocated_q[:gen_count]
-                    shunt_control_q[voltage_shunt_on_node] = allocated_q[gen_count:]
-                if np.any(slack_on_node):
-                    fixed_p = gen_p[on_node & ~slack_on_node]
-                    p_target = P_gen[node_pos] - np.sum(fixed_p)
-                    p_baseline = live_gen[slack_on_node, GEN_COLS["p_set"]]
-                    gen_p[slack_on_node] = allocate_limited_residual(
-                        p_baseline,
-                        p_target,
-                        lower=self.ppc_gen_p_min[slack_on_node],
-                        upper=live_gen[slack_on_node, GEN_COLS["p_max"]],
-                        alpha=live_gen[slack_on_node, GEN_COLS["alpha"]],
-                    )
+            # Group participants once instead of scanning every device for each bus.
+            voltage_gen = slack_mask | pv_mask
+            fixed_gen_q = np.bincount(
+                self.ppc_gen_pos[~voltage_gen], weights=gen_q[~voltage_gen], minlength=self.N,
+            )
+            fixed_shunt_q = np.bincount(
+                self.ppc_shunt_pos[shunt_q_mask], weights=shunt_control_q[shunt_q_mask], minlength=self.N,
+            )
+            shunt_count = np.count_nonzero(shunt_v_mask)
+            gen_count = np.count_nonzero(voltage_gen)
+            allocated_q = allocate_grouped_residual(
+                np.r_[self.ppc_gen_pos[voltage_gen], self.ppc_shunt_pos[shunt_v_mask]],
+                np.r_[live_gen[voltage_gen, GEN_COLS["q_set"]],
+                      shunt[self.ppc_shunt_rows[shunt_v_mask], SHUNT_COLS["q_set"]]],
+                Q_gen - fixed_gen_q - fixed_shunt_q,
+                lower=np.r_[self.ppc_gen_q_min[voltage_gen], np.full(shunt_count, -np.inf)],
+                upper=np.r_[self.ppc_gen_q_max[voltage_gen], np.full(shunt_count, np.inf)],
+            )
+            gen_q[voltage_gen] = allocated_q[:gen_count]
+            shunt_control_q[shunt_v_mask] = allocated_q[gen_count:]
+            fixed_gen_p = np.bincount(
+                self.ppc_gen_pos[~slack_mask], weights=gen_p[~slack_mask], minlength=self.N,
+            )
+            gen_p[slack_mask] = allocate_grouped_residual(
+                self.ppc_gen_pos[slack_mask], live_gen[slack_mask, GEN_COLS["p_set"]],
+                P_gen - fixed_gen_p,
+                lower=self.ppc_gen_p_min[slack_mask],
+                upper=live_gen[slack_mask, GEN_COLS["p_max"]],
+                alpha=live_gen[slack_mask, GEN_COLS["alpha"]],
+            )
             gen_v = V[self.ppc_gen_pos]
             gen_current = np.divide(
                 np.hypot(gen_p, gen_q),

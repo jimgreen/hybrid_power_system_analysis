@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 from typing import Dict, Tuple
 
 import numpy as np
@@ -292,6 +293,22 @@ def _base_from_rows(data: Dict) -> Tuple[float, float, float, float, float]:
 
 def _scale_by_node(node_values: np.ndarray, scales_by_idx: Dict[int, float]) -> np.ndarray:
     return np.asarray([scales_by_idx.get(int(node), 1.0) for node in node_values], dtype=np.float64)
+
+
+def _current_scale_by_node(node_ids, voltage_bases, power_base_kW, i_scale, *, ac=False):
+    """Compute unit bases by column, preserving scalar operation order.
+
+    The dictionary is local to input conversion, including last-row-wins for
+    duplicate IDs. No network or result is retained across calls.
+    """
+    voltage = np.abs(np.asarray(voltage_bases, dtype=np.float64))
+    factor = 1000.0 * math.sqrt(3.0) if ac else 1000.0
+    current = np.divide(
+        power_base_kW, factor * voltage, out=np.ones_like(voltage),
+        where=~(voltage <= 1e-12),
+    )
+    current *= i_scale
+    return dict(zip(map(int, np.asarray(node_ids).tolist()), current.tolist()))
 
 
 def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:

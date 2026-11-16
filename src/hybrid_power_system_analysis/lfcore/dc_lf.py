@@ -100,17 +100,23 @@ from model.switching_status import (
 )
 try:
     from lfcore.common import (
+        allocate_grouped_residual,
         allocate_limited_residual,
+        build_result_voltage_lookup,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
+        result_name_list,
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
+        allocate_grouped_residual,
         allocate_limited_residual,
+        build_result_voltage_lookup,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
+        result_name_list,
     )
 try:
     from lfcore.solver_common import (
@@ -1758,6 +1764,11 @@ class DCPowerFlowCalc:
 
     def _write_back_ppc(self):
         """Write array-mode DC LF results to self.result without object topology."""
+        # Preserve the private compatibility hook used by callers/tests while
+        # skipping large table copies for modes that do not expose device rows.
+        if self.result_mode in {"summary", "none"}:
+            self.result = {}
+            return
         x = self.x
         ppc = self.ppc
         V_final = x[:self.N]
@@ -1912,23 +1923,26 @@ class DCPowerFlowCalc:
         gen_p_min_all = optional_ppc_vector(ppc, "_gen_p_min", gen.shape[0])
         gen_p_max_all = optional_ppc_vector(ppc, "_gen_p_max", gen.shape[0])
         gen_alpha_all = optional_ppc_vector(ppc, "_gen_alpha", gen.shape[0], default=1.0)
-        for node, gens in self.slack_gen_info.items():
-            if not gens:
-                continue
-            gen_refs = np.asarray(gens, dtype=np.int32)
-            allocated = allocate_limited_residual(
+        participants = np.asarray(
+            [(node, row) for node, gens in self.slack_gen_info.items() for row in gens],
+            dtype=np.intp,
+        ).reshape(-1, 2)
+        if participants.size:
+            nodes, gen_refs = participants.T
+            allocated = allocate_grouped_residual(
+                nodes,
                 gen[gen_refs, DC_GEN_COLS["p_set"]],
-                P_inj[node],
+                P_inj,
                 lower=gen_p_min_all[gen_refs],
                 upper=gen_p_max_all[gen_refs],
                 alpha=gen_alpha_all[gen_refs],
             )
-            v = V_final[node]
+            v = V_final[nodes]
             current = np.divide(
                 allocated,
                 v,
                 out=np.zeros_like(allocated),
-                where=abs(v) > self.min_voltage,
+                where=np.abs(v) > self.min_voltage,
             )
             gen[gen_refs, DC_GEN_COLS["p"]] = allocated
             gen[gen_refs, DC_GEN_COLS["current"]] = current
@@ -1968,7 +1982,14 @@ class DCPowerFlowCalc:
             node.is_slack = int(getattr(node, "idx", -1)) in slack_node_ids
 
         def assign_devices(devices, key, idx_col, attrs):
-            row_by_idx = rows_by_idx(key, idx_col)
+            rows = self.result.get(key)
+            # Convert output columns in one NumPy operation, avoiding a NumPy
+            # scalar lookup/conversion for every attribute of every device.
+            names, columns = zip(*attrs)
+            row_by_idx = {} if rows is None or not len(rows) else dict(zip(
+                rows[:, idx_col].astype(np.int64).tolist(),
+                rows[:, columns].tolist(),
+            ))
             try:
                 device_iter = iter(devices)
             except Exception:
@@ -1980,8 +2001,8 @@ class DCPowerFlowCalc:
                         setattr(dev, attr, 0.0)
                     dev.is_alive = False
                     continue
-                for attr, col in attrs:
-                    setattr(dev, attr, float(row[col]))
+                for attr, value in zip(names, row):
+                    setattr(dev, attr, value)
                 run_stat = int(getattr(dev, "run_stat", 1)) == 1
                 status_ok = int(
                     getattr(dev, "closed_status", getattr(dev, "status", 1))
@@ -2061,29 +2082,12 @@ class DCPowerFlowCalc:
             return result
 
         bus_volt = bus_rows[:, DC_BUS_COLS["voltage"]]
-        bus_idx_col = bus_rows[:, DC_BUS_COLS["idx"]].astype(np.int64)
-        sort_order = np.argsort(bus_idx_col, kind="stable")
-        sorted_idx = bus_idx_col[sort_order]
-
-        def _lookup_voltage(col_array):
-            if col_array.size == 0:
-                return np.zeros(0, dtype=np.float64)
-            nids = col_array.astype(np.int64)
-            if sorted_idx.size == 0:
-                return np.zeros(nids.shape, dtype=np.float64)
-            pos = np.searchsorted(sorted_idx, nids)
-            pos_clip = np.clip(pos, 0, sorted_idx.size - 1)
-            hit = sorted_idx[pos_clip] == nids
-            bus_row = np.where(hit, sort_order[pos_clip], 0)
-            return np.where(hit, bus_volt[bus_row], 0.0)
+        _lookup_voltage = build_result_voltage_lookup(
+            bus_rows, DC_BUS_COLS["idx"], DC_BUS_COLS["voltage"]
+        )
 
         def _name_list(key, n):
-            names = self.ppc.get(key)
-            if names is None or len(names) != n:
-                return np.arange(n).astype(str).tolist()
-            if isinstance(names, np.ndarray):
-                return names.astype(str).tolist()
-            return [str(x) for x in names]
+            return result_name_list(self.ppc.get(key), n)
 
         n_bus = len(bus_rows)
         bus_names = _name_list("bus_name", n_bus)
@@ -2141,12 +2145,18 @@ class DCPowerFlowCalc:
             i_p = rows[:, p_col].tolist()
             i_c = rows[:, c_col].tolist()
             i_v = _lookup_voltage(rows[:, n_col]).tolist()
-            for pos, (name, p, c, v) in enumerate(zip(names, i_p, i_c, i_v)):
-                values = {"i_p": p, "i_c": c, "i_v": v}
-                if status_cols is not None:
-                    values["closed_status_set"] = int(rows[pos, status_cols[0]])
-                    values["closed_status"] = int(rows[pos, status_cols[1]])
-                target[name] = SimpleNamespace(**values)
+            if status_cols is None:
+                for name, p, c, v in zip(names, i_p, i_c, i_v):
+                    target[name] = SimpleNamespace(i_p=p, i_c=c, i_v=v)
+            else:
+                for pos, (name, p, c, v) in enumerate(zip(names, i_p, i_c, i_v)):
+                    target[name] = SimpleNamespace(
+                        i_p=p,
+                        i_c=c,
+                        i_v=v,
+                        closed_status_set=int(rows[pos, status_cols[0]]),
+                        closed_status=int(rows[pos, status_cols[1]]),
+                    )
 
         _build_two_port(
             self.result.get("branch"), "branch_name",
@@ -2231,6 +2241,8 @@ class DCPowerFlowCalc:
             self._write_ppc_result_to_network()
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
+        else:
+            self.lf_result = None
         return
 
     def _build_lf_result(self) -> DCLFResult:

@@ -28,6 +28,7 @@ from model.array_common import (
     _cell,
     _code_column,
     _code_value,
+    _current_scale_by_node,
     _empty,
     _fill_float_column_if_present,
     _float_cell,
@@ -604,10 +605,9 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     def get_current_scale_by_node():
         nonlocal current_scale_by_node
         if current_scale_by_node is None:
-            current_scale_by_node = {
-                int(row[BUS_COLS["idx"]]): i_scale * ac_current_base_ka(p_base_kW, float(row[BUS_COLS["vbase"]]))
-                for row in bus
-            }
+            current_scale_by_node = _current_scale_by_node(
+                bus[:, BUS_COLS["idx"]], bus[:, BUS_COLS["vbase"]], p_base_kW, i_scale, ac=True,
+            )
         return current_scale_by_node
 
     columns, table_rows = _rows_for(rows, "ACBranch")
