@@ -1,1 +1,0 @@
-"""Time-domain simulation helpers."""
